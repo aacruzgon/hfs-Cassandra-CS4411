@@ -89,4 +89,4 @@
 - **Links:**
     - **Files:** `docs/Cassandra/schema/schema.cql` (`resources_by_type.fhir_version`, `resource_versions.write_id`, the statement rules); `schema/walkthrough.md` (3.1 size check and unknown outcome, 5.4, 5.8, 5.9, 5.11, G32 to G37); `schema/coverage.md` (sections 2, 5, 6 and 7); `schema/README.md`; `cassandra-discussion.md` (scope note, FHIR versions, data model, write path steps 1 and 4, unknown outcome, sweeper, capabilities and rejection, open questions); `development-roadmap.md` (Step 1 checklist, cursor task, rows 6.4, 6a and 6b, Steps 6 and 6a to 6d, section 5); `spike-findings.md` (B1 note); `.github/workflows/fmt-clippy-cassandra.yml` (the schema job's assertions).
     - **Refines:** ADR-aacruzgon-0024 (the unknown-outcome rule). **Revises:** walkthrough G16 (from ADR-aacruzgon-0013).
-    - **Pull request:** the schema audit fixes PR from branch `docs/schema-audit-fixes` (number assigned on opening).
+    - **Pull request:** [PR #33](https://github.com/aacruzgon/hfs-Cassandra-CS4411/pull/33), from branch `docs/schema-audit-fixes`.

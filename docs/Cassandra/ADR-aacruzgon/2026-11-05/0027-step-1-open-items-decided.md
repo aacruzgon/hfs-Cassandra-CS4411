@@ -182,4 +182,4 @@
         - `development-roadmap.md`: rows 5.2 and 6a, Step 1 checklist, Steps 5, 6, 6a, 6b and 8, sections 5 and 6.
     - **Builds on:** ADR-aacruzgon-0009, 0012, 0013, 0017, 0024, 0026.
     - **Sources:** [R4 search.html](https://hl7.org/fhir/R4/search.html); [Discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28).
-    - **Pull request:** #33.
+    - **Pull request:** [PR #33](https://github.com/aacruzgon/hfs-Cassandra-CS4411/pull/33), from branch `docs/schema-audit-fixes`.

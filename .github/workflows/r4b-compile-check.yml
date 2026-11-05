@@ -2,7 +2,8 @@ name: R4B compile check
 
 # Roadmap item 0.4: proves the Cassandra backend assumes nothing R4-specific
 # by compiling helios-persistence with R4B as the only FHIR version. Runs on
-# the team's self-hosted runner (ADR-aacruzgon-0018, ADR-sam-michaels-0001).
+# the team's self-hosted runners (ADR-aacruzgon-0018, ADR-sam-michaels-0001);
+# a light job, so on either one (ADR-aacruzgon-0023).
 
 on:
   push:
@@ -32,7 +33,7 @@ jobs:
     # Fork guard (ADR-aacruzgon-0018). It only keeps this unmodified workflow
     # from running a fork's code; approval is what keeps forks off the runner.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, hfs-cassandra]
+    runs-on: [self-hosted, hfs-cassandra-light]
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -47,7 +48,7 @@ jobs:
         with:
           toolchain: stable
 
-      # No rust-cache: the runner is one fixed machine (ADR-sam-michaels-0002).
+      # No rust-cache: each runner is one fixed machine (ADR-sam-michaels-0002).
       # The cargo registry already persists in the runner user's ~/.cargo, and
       # the target directory lives next to the checkout, not in it, so the
       # checkout's git clean leaves it alone and cargo reuses every unchanged

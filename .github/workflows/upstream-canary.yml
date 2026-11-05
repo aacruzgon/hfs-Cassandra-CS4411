@@ -11,8 +11,9 @@ name: Upstream canary
 on:
   schedule:
     # Daily 02:00 UTC: 22:00 Eastern the evening before in summer time, 21:00
-    # in winter (cron is UTC). Sam's rig is usually on then; a run queued while
-    # it is off or asleep waits up to 24 h for the runner (ADR-sam-michaels-0005).
+    # in winter (cron is UTC). A light job, so either runner takes it; a run
+    # queued while both are off waits up to 24 h (ADR-sam-michaels-0005,
+    # ADR-aacruzgon-0023).
     - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
@@ -41,7 +42,7 @@ jobs:
     name: upstream canary (merge + cassandra,R4B check)
     # Fork guard (ADR-aacruzgon-0018); schedule and dispatch always pass it.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, hfs-cassandra]
+    runs-on: [self-hosted, hfs-cassandra-light]
     timeout-minutes: 30
     permissions:
       contents: read

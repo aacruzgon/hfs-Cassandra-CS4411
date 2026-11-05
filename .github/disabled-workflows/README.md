@@ -4,10 +4,13 @@ These inherited workflows are outside the Cassandra project scope and are
 preserved here for reference. GitHub Actions only loads workflows from
 `.github/workflows/`, so the YAML files in this directory do not run.
 
-Two workflows are active. `.github/workflows/r4b-compile-check.yml` (roadmap
-item 0.4) runs on the team's self-hosted runner, `[self-hosted, hfs-cassandra]`
-(ADR-aacruzgon-0018, ADR-sam-michaels-0001), and keeps a bounded cargo target
-directory on that machine instead of a cache (ADR-sam-michaels-0002).
+Five workflows are active. Four run on the team's self-hosted runners
+(ADR-aacruzgon-0018, ADR-sam-michaels-0001, ADR-aacruzgon-0023):
+`r4b-compile-check.yml` (roadmap item 0.4), `fmt-clippy-cassandra.yml` (0.5),
+`upstream-canary.yml` (0.11) and `runner-docker-prune.yml`. Light jobs use
+`[self-hosted, hfs-cassandra-light]`, the two clippy jobs
+`[self-hosted, hfs-cassandra-heavy]`, and the Rust jobs keep a bounded cargo
+target directory on each machine instead of a cache (ADR-sam-michaels-0002).
 
 The standalone `.github/workflows/coverage.yml` workflow runs on standard
 GitHub-hosted Linux runners. It measures the default Rust workspace
@@ -24,13 +27,15 @@ the service setup. Coverage runs on pushes to `main`, pull requests targeting
 archived as well: every job in them targets `self-hosted` runner labels, and
 `ci.yml` also needs a remote Docker host (`DOCKER_HOST` secret) for
 testcontainers. When they were archived this fork had no self-hosted runner, so
-their jobs queued indefinitely. Since #16 it has one, `sam-7900x`
-(ADR-sam-michaels-0001), but `ci.yml` still lacks the remote Docker host. Several
-`ci.yml` jobs target plain `[self-hosted]` or `[self-hosted, Linux]`, which that
-runner matches, so a restored copy must be retargeted to
-`[self-hosted, hfs-cassandra]` and given the fork guard from ADR-aacruzgon-0018
-first. Follow-up CI, including adapting the benchmark to Cassandra/PostgreSQL,
-runs on the self-hosted runner (ADR-aacruzgon-0018).
+their jobs queued indefinitely. Since #16 it has `sam-7900x`
+(ADR-sam-michaels-0001), and since 2026-11-04 also `acruzdebian`
+(ADR-aacruzgon-0023), but `ci.yml` still lacks the remote Docker host. Several
+`ci.yml` jobs target plain `[self-hosted]` or `[self-hosted, Linux]`, which both
+runners match, so a restored copy must be retargeted to
+`[self-hosted, hfs-cassandra-light]` or `[self-hosted, hfs-cassandra-heavy]` and
+given the fork guard from ADR-aacruzgon-0018 first. Follow-up CI, including
+adapting the benchmark to Cassandra/PostgreSQL, runs on the self-hosted runners
+(ADR-aacruzgon-0018).
 
 `cassandra-integration.yml` is intentionally empty. Implement its triggers and
 jobs before moving it into `.github/workflows/`; an empty active workflow would

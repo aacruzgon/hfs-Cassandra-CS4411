@@ -1,8 +1,13 @@
-# The self-hosted runner's custom label (ADR-sam-michaels-0001), so actionlint
-# does not report it as unknown.
+# The self-hosted runners' custom labels, so actionlint does not report them as
+# unknown: hfs-cassandra (ADR-sam-michaels-0001), the light and heavy job labels
+# and each runner's own hfs-runner-* label (ADR-aacruzgon-0023).
 self-hosted-runner:
   labels:
     - hfs-cassandra
+    - hfs-cassandra-light
+    - hfs-cassandra-heavy
+    - hfs-runner-sam-7900x
+    - hfs-runner-acruzdebian
 
 # actionlint configuration. Read by the "FHIR benchmark scripts" workflow
 # (.github/workflows/fhir-bench-tests.yml), which runs actionlint 1.7.12 with

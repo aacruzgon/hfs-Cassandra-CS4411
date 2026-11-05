@@ -89,10 +89,15 @@
 //!   ([`ResourceStorage::latest_write_marker`]) is read around every totals
 //!   read, and probed once per pass for a tenant that is not due: a change
 //!   this process did not record (a sibling instance, a direct database edit)
-//!   labels the figures approximate and makes the totals due at once. The
+//!   labels the figures approximate and makes the totals due at once. Due
+//!   totals that are still exact, with the marker where their count left it,
+//!   are not re-read (up to [`UNCHANGED_TOTALS_MAX_AGE`]): the count would
+//!   only confirm them. The
 //!   history rings of its charted types that are no longer exact are re-seeded
 //!   when the tenant is quiet, or once their history is older than
-//!   [`RESEED_MAX_AGE_FACTOR`] intervals even under continuous writes.
+//!   [`RESEED_MAX_AGE_FACTOR`] intervals even under continuous writes — each
+//!   window's under the same duty-cycle bound as the totals, so a slow
+//!   30-day history read is not repeated every few passes (#2107).
 //! - **Ring seeds.** A page load that charts a ring without storage history
 //!   queues it and wakes the loop, which loads it after a short debounce —
 //!   deferred while a bulk submit is active for the tenant. The queued rings of
@@ -197,7 +202,22 @@ const SLOW_RECONCILE_LOG: StdDuration = StdDuration::from_secs(5);
 /// tenant with no figures, or stale ones after a purge, is read right away),
 /// but they do record their read in it. A change the storage write marker
 /// detects makes the totals due at once.
+///
+/// The same bound applies to the re-seed of a tenant's history rings, per
+/// window (#2107): after a grouped history read of one window took `t`, the
+/// tenant's already loaded rings of that window are not re-read for
+/// `t × RECONCILE_DUTY_FACTOR` when that is longer than the interval. A 30-day window that takes ten seconds over a
+/// bulk-imported history is reloaded at most every 100 seconds, while the
+/// one-hour window, a few milliseconds, still follows every write. A ring
+/// that was never loaded (or was invalidated by a purge) is not held back.
 const RECONCILE_DUTY_FACTOR: u32 = 10;
+
+/// Longest a seeded tenant's totals go without a `count_all_types` while its
+/// write marker stays where the last exact count left it (#2107). An exact
+/// tenant whose marker has not moved has nothing to correct, so a due
+/// reconcile is skipped then; this backstop still recounts now and then, for
+/// changes the marker cannot see.
+const UNCHANGED_TOTALS_MAX_AGE: Duration = Duration::hours(1);
 
 /// How far before the previous totals reconcile began the write marker counts
 /// recent writes. Covers writes committed with an earlier timestamp than the
@@ -660,15 +680,15 @@ fn reindex_activity_of(
     // rebuild before it, not that rebuild's permanent ones: look past it.
     let mut retried_cleanly = false;
     for job in finished {
-        let clean = job.status == ReindexStatus::Completed && job.errors.is_empty();
+        let clean = job.status == ReindexStatus::Completed && job.error_count() == 0;
         if job.resource_scoped && clean {
             retried_cleanly = true;
             continue;
         }
         let errors = if retried_cleanly {
-            job.errors.iter().filter(|error| !error.retryable).count()
+            job.permanent_error_count()
         } else {
-            job.errors.len()
+            job.error_count()
         };
         let unindexed = match job.status {
             ReindexStatus::Failed => true,
@@ -677,7 +697,7 @@ fn reindex_activity_of(
         };
         return unindexed.then(|| ReindexActivity::Failed {
             job_id: job.job_id.clone(),
-            errors: errors as u64,
+            errors,
         });
     }
     None
@@ -744,6 +764,10 @@ pub(crate) struct ReconcileReport {
     pub(crate) skipped_active_import: Vec<String>,
     /// Seeded tenants whose totals reconcile is not due yet (duty cycle).
     pub(crate) not_due: Vec<String>,
+    /// Seeded tenants whose totals were due but not re-read: exact, and the
+    /// storage write marker unchanged since they were counted (see
+    /// [`UNCHANGED_TOTALS_MAX_AGE`]).
+    pub(crate) totals_unchanged: Vec<String>,
     /// Seeded tenants whose storage write marker showed a change this process
     /// did not record; their totals were made due at once.
     pub(crate) external_changes: Vec<String>,
@@ -757,6 +781,23 @@ pub(crate) struct ReconcileReport {
     pub(crate) job_counts_refreshed: Vec<String>,
     /// History rings loaded from storage during the pass.
     pub(crate) rings_seeded: usize,
+    /// Inexact history rings whose re-seed waits for their window's duty
+    /// cycle (see [`RECONCILE_DUTY_FACTOR`]).
+    pub(crate) rings_not_due: usize,
+}
+
+impl ReconcileReport {
+    /// Whether the pass ran a totals or history query against storage —
+    /// including one that failed — rather than only reading the counters.
+    /// Those are the multi-second aggregates on a large database, and the
+    /// heap they free is what the loop hands back to the OS afterwards
+    /// (#2106).
+    pub(crate) fn read_storage(&self) -> bool {
+        !self.seeded.is_empty()
+            || !self.seed_failed.is_empty()
+            || !self.reconciled.is_empty()
+            || self.rings_seeded > 0
+    }
 }
 
 /// The reconcile loop's own per-tenant bookkeeping: when each tenant's totals
@@ -766,6 +807,9 @@ pub(crate) struct ReconcileReport {
 pub(crate) struct ReconcileSchedule {
     interval: StdDuration,
     next_due: HashMap<String, Instant>,
+    /// When each tenant's loaded rings of a window may next be re-seeded (see
+    /// [`RECONCILE_DUTY_FACTOR`]).
+    ring_due: HashMap<(String, DashboardWindow), Instant>,
     /// When each tenant's last totals reconcile began.
     last_begin: HashMap<String, DateTime<Utc>>,
     /// The `recent_since` bound the counters' current marker for the tenant
@@ -788,6 +832,7 @@ impl ReconcileSchedule {
         Self {
             interval,
             next_due: HashMap::new(),
+            ring_due: HashMap::new(),
             last_begin: HashMap::new(),
             marker_bound: HashMap::new(),
             carried_over: Vec::new(),
@@ -815,6 +860,27 @@ impl ReconcileSchedule {
             .max(elapsed.saturating_mul(RECONCILE_DUTY_FACTOR));
         self.next_due
             .insert(tenant.to_string(), Instant::now() + pause);
+    }
+
+    /// Whether `tenant`'s loaded rings of `window` may be re-seeded now.
+    fn rings_due(&self, tenant: &str, window: DashboardWindow) -> bool {
+        self.ring_due
+            .get(&(tenant.to_string(), window))
+            .is_none_or(|due| Instant::now() >= *due)
+    }
+
+    /// Records a grouped history read of `window` for `tenant` that took
+    /// `elapsed`, holding that window's re-seeds back for
+    /// `elapsed × RECONCILE_DUTY_FACTOR`. A pause shorter than the interval
+    /// holds nothing back: passes are that far apart anyway.
+    fn record_rings(&mut self, tenant: &str, window: DashboardWindow, elapsed: StdDuration) {
+        let key = (tenant.to_string(), window);
+        let pause = elapsed.saturating_mul(RECONCILE_DUTY_FACTOR);
+        if pause < self.interval {
+            self.ring_due.remove(&key);
+        } else {
+            self.ring_due.insert(key, Instant::now() + pause);
+        }
     }
 
     /// The bound a between-reconcile marker probe of `tenant` uses: the one
@@ -905,6 +971,7 @@ impl ReconcileSchedule {
     /// Drops everything kept for `tenant`.
     fn forget(&mut self, tenant: &str) {
         self.next_due.remove(tenant);
+        self.ring_due.retain(|(t, _), _| t != tenant);
         self.last_begin.remove(tenant);
         self.marker_bound.remove(tenant);
         self.carried_over.retain(|t| t != tenant);
@@ -913,6 +980,7 @@ impl ReconcileSchedule {
     fn tenants(&self) -> impl Iterator<Item = &String> {
         self.next_due
             .keys()
+            .chain(self.ring_due.keys().map(|(tenant, _)| tenant))
             .chain(self.last_begin.keys())
             .chain(self.marker_bound.keys())
             .chain(self.carried_over.iter())
@@ -1641,6 +1709,7 @@ where
         tenant: &str,
         window: DashboardWindow,
         types: &[String],
+        schedule: &mut ReconcileSchedule,
     ) -> Option<usize> {
         if types.is_empty() {
             return Some(0);
@@ -1666,6 +1735,7 @@ where
             )
             .await;
         let elapsed = started.elapsed();
+        schedule.record_rings(tenant, window, elapsed);
         dashboard_metrics::record_storage_query(StorageQuery::History, elapsed, result.is_ok());
         debug!(
             tenant = %tenant,
@@ -1706,11 +1776,16 @@ where
     /// [`seed_window_rings`](Self::seed_window_rings) query per window for all
     /// of that window's types. Returns how many rings were seeded; a window
     /// whose query failed seeds none.
-    async fn seed_rings(&self, tenant: &str, rings: Vec<(String, DashboardWindow)>) -> usize {
+    async fn seed_rings(
+        &self,
+        tenant: &str,
+        rings: Vec<(String, DashboardWindow)>,
+        schedule: &mut ReconcileSchedule,
+    ) -> usize {
         let mut seeded = 0usize;
         for (window, types) in rings_by_window(rings) {
             seeded += self
-                .seed_window_rings(tenant, window, &types)
+                .seed_window_rings(tenant, window, &types, schedule)
                 .await
                 .unwrap_or(0);
         }
@@ -1742,7 +1817,7 @@ where
             }
         }
         let rings_seeded = self
-            .seed_rings(tenant, self.inexact_charted_rings(tenant))
+            .seed_rings(tenant, self.inexact_charted_rings(tenant), schedule)
             .await;
         debug!(
             tenant = %tenant,
@@ -1943,7 +2018,10 @@ where
                 continue;
             }
             for (window, types) in rings_by_window(rings) {
-                let Some(n) = self.seed_window_rings(&tenant, window, &types).await else {
+                let Some(n) = self
+                    .seed_window_rings(&tenant, window, &types, schedule)
+                    .await
+                else {
                     // Still queued: the next drain retries the window.
                     continue;
                 };
@@ -1981,15 +2059,20 @@ where
     ///      write marker is probed once; a change this process did not record
     ///      makes them due now.
     ///    - **Totals.** When due (see [`RECONCILE_DUTY_FACTOR`]),
-    ///      `count_all_types` is re-read as a counters reconcile. An error logs
-    ///      and keeps the previous counters.
+    ///      `count_all_types` is re-read as a counters reconcile, unless the
+    ///      totals are exact and the write marker, probed first, is the one
+    ///      their count stored (within [`UNCHANGED_TOTALS_MAX_AGE`]): nothing
+    ///      changed, so nothing is read. An error logs and keeps the previous
+    ///      counters.
     ///    - **Rings.** When the tenant is quiet — its totals exact — each
     ///      recently charted ring that is not exact is re-seeded (one grouped
     ///      history query per window), which is what lets the snapshot become
     ///      exact after an import. Under continuous writes the rings
     ///      [`DashboardCounters::rings_to_reseed`] names are re-seeded instead:
     ///      those whose history is older than [`RESEED_MAX_AGE_FACTOR`]
-    ///      intervals, or that only an external change made inexact.
+    ///      intervals, or that only an external change made inexact. Either
+    ///      way a ring already loaded waits for its window's duty cycle
+    ///      ([`RECONCILE_DUTY_FACTOR`]).
     /// 5. **Ring seeds.** The queued ring seeds are drained.
     ///
     /// Only the job counts are refreshed when the backend cannot count.
@@ -2036,19 +2119,39 @@ where
             }
 
             let mut due = schedule.is_due(&tenant);
-            if !due
+            // Exact totals counted recently enough to be vouched for by an
+            // unchanged marker (#2107).
+            let vouchable = self.counters.totals_view(&tenant).is_some_and(|totals| {
+                totals.exact
+                    && Utc::now().signed_duration_since(totals.reconciled_at)
+                        < UNCHANGED_TOTALS_MAX_AGE
+            });
+            if (!due || vouchable)
                 && let Some(marker) = self
                     .read_marker(&tenant, schedule.probe_bound(&tenant))
                     .await
-                && self.counters.note_marker(&tenant, marker)
             {
-                debug!(
-                    tenant = %tenant,
-                    "dashboard reconcile: storage changed outside this process; totals due now"
-                );
-                schedule.force_due(&tenant);
-                report.external_changes.push(tenant.clone());
-                due = true;
+                if self.counters.note_marker(&tenant, marker) {
+                    debug!(
+                        tenant = %tenant,
+                        "dashboard reconcile: storage changed outside this process; totals due now"
+                    );
+                    schedule.force_due(&tenant);
+                    report.external_changes.push(tenant.clone());
+                    due = true;
+                } else if due
+                    && vouchable
+                    && self.counters.matches_reconciled_marker(&tenant, marker)
+                {
+                    // No write recorded, none detected: a count would read
+                    // back exactly the figures on show.
+                    debug!(
+                        tenant = %tenant,
+                        "dashboard reconcile: write marker unchanged; totals still exact"
+                    );
+                    report.totals_unchanged.push(tenant.clone());
+                    due = false;
+                }
             }
             if due {
                 match self.reconcile_totals(&tenant, schedule).await {
@@ -2062,7 +2165,7 @@ where
                         "dashboard reconcile: count_all_types failed; keeping the previous counters"
                     ),
                 }
-            } else {
+            } else if !report.totals_unchanged.contains(&tenant) {
                 debug!(
                     tenant = %tenant,
                     "dashboard reconcile: totals reconcile not due yet (duty-cycle back-off)"
@@ -2074,7 +2177,7 @@ where
                 .counters
                 .totals_view(&tenant)
                 .is_some_and(|totals| totals.exact);
-            let rings = if quiet {
+            let mut rings = if quiet {
                 self.inexact_charted_rings(&tenant)
             } else {
                 self.counters.rings_to_reseed(
@@ -2084,8 +2187,20 @@ where
                     Utc::now(),
                 )
             };
+            // A loaded ring waits for its window's duty cycle; one without
+            // storage history is loaded at once.
+            rings.retain(|(resource_type, window)| {
+                let due = schedule.rings_due(&tenant, *window)
+                    || !self
+                        .ring_view(&tenant, resource_type, *window)
+                        .is_some_and(|view| view.history_seeded);
+                if !due {
+                    report.rings_not_due += 1;
+                }
+                due
+            });
             if !rings.is_empty() {
-                report.rings_seeded += self.seed_rings(&tenant, rings).await;
+                report.rings_seeded += self.seed_rings(&tenant, rings, schedule).await;
             }
         }
 
@@ -2102,11 +2217,13 @@ where
             reconciled = report.reconciled.len(),
             skipped_active_import = report.skipped_active_import.len(),
             not_due = report.not_due.len(),
+            totals_unchanged = report.totals_unchanged.len(),
             external_changes = report.external_changes.len(),
             budget_skipped = report.budget_skipped.len(),
             dropped = report.dropped.len(),
             job_counts_refreshed = report.job_counts_refreshed.len(),
             rings_seeded = report.rings_seeded,
+            rings_not_due = report.rings_not_due,
             elapsed_ms = elapsed.as_millis() as u64,
             "dashboard reconcile: pass completed"
         );
@@ -2332,7 +2449,8 @@ async fn run_reconcile_loop<S>(
             return;
         }
         Some(provider) => {
-            provider.seed_default_tenant(&mut schedule).await;
+            let report = provider.seed_default_tenant(&mut schedule).await;
+            release_memory_after(&report);
         }
         None => return,
     }
@@ -2350,12 +2468,26 @@ async fn run_reconcile_loop<S>(
             debug!("dashboard reconcile: provider no longer registered; stopping");
             return;
         };
-        if woken {
-            provider.drain_pending_seeds(&mut schedule).await;
+        let report = if woken {
+            provider.drain_pending_seeds(&mut schedule).await
         } else {
-            provider.reconcile_pass(&mut schedule).await;
+            let report = provider.reconcile_pass(&mut schedule).await;
             next_pass = tokio::time::Instant::now() + interval;
-        }
+            report
+        };
+        release_memory_after(&report);
+    }
+}
+
+/// Returns the heap a pass's storage queries freed to the OS (#2106). On a
+/// large SQLite database the totals and history aggregates run for seconds
+/// on Tokio's blocking pool, and each pooled connection can grow a 64 MiB
+/// page cache. glibc keeps what they free in per-thread arenas, so without a
+/// trim a process that only serves the dashboard climbed to its 12 GB limit.
+/// A pass that read nothing from storage skips the trim.
+fn release_memory_after(report: &ReconcileReport) {
+    if report.read_storage() {
+        crate::memory_trim::release_free_memory();
     }
 }
 
@@ -2574,6 +2706,43 @@ mod tests {
 
     fn schedule() -> ReconcileSchedule {
         ReconcileSchedule::new(StdDuration::from_secs(30))
+    }
+
+    #[test]
+    fn only_a_pass_that_queried_storage_asks_for_a_trim() {
+        let quiet = ReconcileReport {
+            not_due: vec!["default".to_string()],
+            skipped_active_import: vec!["a".to_string()],
+            seed_deferred: vec!["b".to_string()],
+            budget_skipped: vec!["c".to_string()],
+            dropped: vec!["d".to_string()],
+            job_counts_refreshed: vec!["e".to_string()],
+            ..ReconcileReport::default()
+        };
+        assert!(!ReconcileReport::default().read_storage());
+        assert!(!quiet.read_storage());
+
+        let queried = [
+            ReconcileReport {
+                seeded: vec!["default".to_string()],
+                ..ReconcileReport::default()
+            },
+            ReconcileReport {
+                seed_failed: vec!["default".to_string()],
+                ..ReconcileReport::default()
+            },
+            ReconcileReport {
+                reconciled: vec!["default".to_string()],
+                ..ReconcileReport::default()
+            },
+            ReconcileReport {
+                rings_seeded: 1,
+                ..ReconcileReport::default()
+            },
+        ];
+        for report in queried {
+            assert!(report.read_storage(), "{report:?}");
+        }
     }
 
     /// The tenants waiting for a background seed, sorted.
@@ -3199,7 +3368,12 @@ mod tests {
                 now: DateTime<Utc>,
                 ttl: StdDuration,
                 limit: u32,
-            ) -> StorageResult<Vec<(TenantContext, SubmissionId)>>;
+            ) -> StorageResult<Vec<helios_persistence::core::bulk_submit_worker::ExpiredSubmission>>;
+            async fn purge_submission(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+                cutoff: DateTime<Utc>,
+            ) -> StorageResult<bool>;
             async fn ensure_transaction_time(
                 tenant: &TenantContext,
                 id: &SubmissionId,
@@ -4975,9 +5149,24 @@ mod tests {
             .await,
             "the background loop refreshes both wired job stores"
         );
+        // Later real intervals probe the write marker, but an exact tenant
+        // whose marker has not moved is not recounted (#2107)…
+        let totals = storage.totals_calls.load(Ordering::SeqCst);
+        let markers = storage.marker_calls.load(Ordering::SeqCst);
         assert!(
-            eventually(|| storage.totals_calls.load(Ordering::SeqCst) >= 2).await,
-            "a later real interval recounts the seeded tenant"
+            eventually(|| storage.marker_calls.load(Ordering::SeqCst) > markers).await,
+            "a later real interval probes the write marker"
+        );
+        assert_eq!(
+            storage.totals_calls.load(Ordering::SeqCst),
+            totals,
+            "an unchanged marker needs no recount"
+        );
+        // …until storage changes behind the counters.
+        create_in(storage.inner.as_ref(), "Patient").await;
+        assert!(
+            eventually(|| storage.totals_calls.load(Ordering::SeqCst) > totals).await,
+            "a later real interval recounts the changed tenant"
         );
         let snapshot = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
@@ -5070,6 +5259,33 @@ mod tests {
                 .series_view("default", *window, types, Utc::now())
                 .is_some_and(|views| views.iter().all(|v| v.history_seeded && v.exact))
         })
+    }
+
+    /// The instants until which `schedule` holds back the re-seed of `tenant`'s
+    /// loaded rings, per window (`ReconcileSchedule::record_rings`). A window
+    /// that is not held back has no entry.
+    fn rings_held_until(
+        schedule: &ReconcileSchedule,
+        tenant: &str,
+    ) -> HashMap<DashboardWindow, Instant> {
+        schedule
+            .ring_due
+            .iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|((_, window), due)| (*window, *due))
+            .collect()
+    }
+
+    /// Waits until no window of `tenant` is held back any more: past the latest
+    /// of the instants the schedule derived from the measured reads, however
+    /// long a loaded host made those reads (#2147).
+    async fn wait_until_rings_due(schedule: &ReconcileSchedule, tenant: &str) {
+        if let Some(latest) = rings_held_until(schedule, tenant).into_values().max() {
+            // `rings_due` tests `Instant::now() >= due`.
+            while Instant::now() < latest {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(latest)).await;
+            }
+        }
     }
 
     /// #1078: a tenant seed loads its rings with one grouped history query per
@@ -5485,6 +5701,9 @@ mod tests {
         assert_eq!(seeded_at(), Some(first_seed));
 
         tokio::time::sleep(interval * RESEED_MAX_AGE_FACTOR + StdDuration::from_millis(100)).await;
+        // A window whose seed read was slow enough to be held back (rarely, on
+        // a loaded host, #2147) is waited for as well; usually none is.
+        wait_until_rings_due(&schedule, "default").await;
         write();
         let report = provider.reconcile_pass(&mut schedule).await;
         assert_eq!(
@@ -5500,6 +5719,146 @@ mod tests {
             snapshot.figures.is_approximate(),
             "the totals still carry unreconciled writes"
         );
+    }
+
+    /// #2107: a due totals reconcile of an exact tenant whose write marker has
+    /// not moved since its count reads nothing — the count would only confirm
+    /// the figures. A recorded write or a moved marker still re-reads them.
+    #[tokio::test]
+    async fn exact_totals_with_an_unchanged_marker_are_not_recounted() {
+        let storage = InstrumentedStorage::over(sqlite());
+        create_in(storage.as_ref(), "Patient").await;
+        let marker = |millis: i64| {
+            Some(WriteMarker {
+                latest: DateTime::from_timestamp_millis(millis),
+                recent_writes: None,
+            })
+        };
+        storage.set_marker(marker(1_000));
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+            .with_counters(Arc::clone(&counters));
+        let mut schedule = schedule();
+        provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        provider.drain_pending_seeds(&mut schedule).await;
+        let totals = || storage.totals_calls.load(Ordering::SeqCst);
+        assert_eq!(totals(), 1);
+
+        // Due, exact, marker unchanged: probed, not counted.
+        schedule.force_due("default");
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.totals_unchanged, strings(&["default"]));
+        assert!(report.reconciled.is_empty() && report.not_due.is_empty());
+        assert_eq!(totals(), 1);
+        assert_eq!(report.rings_seeded, 0);
+
+        // A write this process recorded: the totals are re-read.
+        counters.record("default", "Patient", 1, Utc::now());
+        create_in(storage.inner.as_ref(), "Patient").await;
+        schedule.force_due("default");
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.reconciled, strings(&["default"]));
+        assert_eq!(totals(), 2);
+
+        // Exact again; a marker moved by another instance is re-read too.
+        create_in(storage.inner.as_ref(), "Patient").await;
+        storage.set_marker(marker(2_000));
+        schedule.force_due("default");
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.external_changes, strings(&["default"]));
+        assert_eq!(report.reconciled, strings(&["default"]));
+        assert_eq!(totals(), 3);
+        let snapshot = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        assert_eq!(snapshot.total_resources, 3);
+    }
+
+    /// #2107: a window whose grouped history read is slow is not re-read for
+    /// [`RECONCILE_DUTY_FACTOR`] times its duration, even when its rings are
+    /// inexact; once that pause has passed it is. The pause is measured, so the
+    /// test waits on the instants the schedule recorded rather than a fixed
+    /// sleep: on a loaded host a 50 ms read takes longer (#2147).
+    #[tokio::test]
+    async fn slow_history_windows_are_reseeded_on_their_duty_cycle() {
+        let storage = InstrumentedStorage::over(sqlite());
+        create_in(storage.as_ref(), "Patient").await;
+        let marker = |millis: i64| {
+            Some(WriteMarker {
+                latest: DateTime::from_timestamp_millis(millis),
+                recent_writes: None,
+            })
+        };
+        storage.set_marker(marker(1_000));
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+            .with_counters(Arc::clone(&counters));
+        // Every read takes at least 50 ms, so each window is held back for at
+        // least 500 ms, ten times its own measured read and longer than the
+        // 100 ms interval.
+        let read_ms = 50;
+        storage.delay_ms.store(read_ms, Ordering::SeqCst);
+        let mut schedule = ReconcileSchedule::new(StdDuration::from_millis(100));
+        // The interval also caps a pass's time budget at 100 ms; budgets are
+        // not under test, so a stalled host must not turn the tenant away.
+        schedule.pass_time = MAX_PASS_TIME;
+        let seed_began = Instant::now();
+        provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        let report = provider.drain_pending_seeds(&mut schedule).await;
+        assert_eq!(report.rings_seeded, DashboardWindow::ALL.len());
+        let history = storage.grouped_history_calls();
+        let held = rings_held_until(&schedule, "default");
+        assert_eq!(
+            held.len(),
+            DashboardWindow::ALL.len(),
+            "every window is held back"
+        );
+        let minimum = StdDuration::from_millis(read_ms) * RECONCILE_DUTY_FACTOR;
+        assert!(
+            held.values().all(|until| *until >= seed_began + minimum),
+            "each window for ten times its read at least: {held:?}"
+        );
+        let earliest = held.values().min().copied().expect("held back");
+
+        // Another instance writes: the totals are re-read at once, but the
+        // inexact rings wait for their windows' duty cycle.
+        create_in(storage.inner.as_ref(), "Patient").await;
+        storage.set_marker(marker(2_000));
+        let report = provider.reconcile_pass(&mut schedule).await;
+        let now = Instant::now();
+        let when = if now < earliest {
+            format!("{:?} before", earliest - now)
+        } else {
+            format!("{:?} after", now - earliest)
+        };
+        assert_eq!(report.reconciled, strings(&["default"]));
+        assert_eq!(
+            report.rings_seeded, 0,
+            "the pass ended {when} the first window came due"
+        );
+        assert_eq!(
+            report.rings_not_due,
+            DashboardWindow::ALL.len(),
+            "the pass ended {when} the first window came due"
+        );
+        assert_eq!(storage.grouped_history_calls(), history);
+        assert!(!all_rings_exact(&counters, &["Patient"]));
+        assert_eq!(
+            rings_held_until(&schedule, "default"),
+            held,
+            "nothing was re-read, so nothing was re-recorded"
+        );
+
+        // Once every window's own hold-back has passed, each is re-read.
+        wait_until_rings_due(&schedule, "default").await;
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.rings_seeded, DashboardWindow::ALL.len());
+        assert_eq!(report.rings_not_due, 0);
+        assert!(all_rings_exact(&counters, &["Patient"]));
     }
 
     /// #1078 decision (e): a pass visits at most its budget of tenants, most
@@ -5529,6 +5888,11 @@ mod tests {
             provider
                 .snapshot(DashboardWindow::LastHour, tenant, &[], false)
                 .await;
+        }
+        // A recorded write each, so every due tenant's totals are re-read
+        // (an exact one with an unchanged marker would not be, #2107).
+        for tenant in ["a", "b", "c"] {
+            counters.record(tenant, "Patient", 1, Utc::now());
         }
         let mut schedule = schedule();
         schedule.max_tenants_per_pass = 2;

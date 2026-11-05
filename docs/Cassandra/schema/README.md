@@ -35,7 +35,7 @@ These are the items the roadmap's Step 1 checklist asks `schema.cql` to state. "
 | Common types | `id text`, `version_id int`, timestamps in milliseconds, `fhir_version text` as `as_mime_param()`, `write_ts bigint` in microseconds and always `last_updated × 1000`, `write_id uuid` | As the checklist says; the `write_ts` rule is ADR-0016 | As designed |
 | `resources` columns | `data text`, `last_updated`, `created_at`, `deleted_at`, `fhir_version`, `write_ts`, `write_id`, `version_id` | `text` is the checklist's default; table compression (LZ4) is on anyway | As designed |
 | `created_at` | Only on `resources`. Kept when a resource is revived. `vread` passes the version's own `last_updated`. | MongoDB keeps the original `created_at`; PostgreSQL stores none and passes `last_updated`. Both backends give a historical version its own `last_updated`. | Accepted |
-| `resource_versions` columns | `data` (unset for a delete marker), `last_updated`, `deleted_at`, `fhir_version`, `write_ts`, **`write_id`** | As the checklist says. A delete marker has no content, as in PostgreSQL. `write_id` decides an unknown CAS outcome that a later version superseded, whenever that version's rewrite of row `V` came from a read of `resources` (walkthrough G36) | As designed; `write_id` added by ADR-0026 |
+| `resource_versions` columns | `data` (unset for a delete marker), `last_updated`, `deleted_at`, `fhir_version`, `write_ts`, **`write_id`**, **`index_keys blob`** | As the checklist says. A delete marker has no content, as in PostgreSQL. `write_id` decides an unknown CAS outcome that a later version superseded, whenever that version's rewrite of row `V` came from a read of `resources` (walkthrough G36). `index_keys` holds the index rows the version wrote, in the versioned encoding `schema.cql` documents (289 bytes for the worked example's 8 rows), so old keys are read back, not re-extracted with a registry that may have changed (walkthrough G22) | As designed; `write_id` added by ADR-0026, `index_keys` by ADR-0027 |
 | `resources_by_type` and the token, date and URI tables | Keys and clustering order exactly as the checklist; **`fhir_version text` on `resources_by_type`**, so `count` can apply `SearchQuery.fhir_version` (G34); `param text` in every index partition key; `''` for "no system" | As designed. A node confirmed `start` and `end` work as column names; `token` is reserved and is not used. | As designed; `fhir_version` added by ADR-0026 |
 | `pending_index_writes` | Clustering `(enqueued_at, tenant_id, resource_type, id)`; `write_id` and `version_id`; `default_time_to_live = 86400` | The key order is ADR-0015 and `version_id` is ADR-0013 | As designed |
 | `gc_grace_seconds` | 10,800 s (3 h) on the six index tables, `resources_by_type` **and `pending_index_writes`**; the 10-day default on `resources` and `resource_versions` | 3 h equals the node's `max_hint_window`, so a replica that was down for less than that still receives its hinted deletes. A resurrected row is harmless here: the tag check hides index rows, and a resurrected intent row makes the sweeper either delete it or replay writes that change nothing. `resources` keeps 10 days for a second reason: with the default `paxos_state_purging` (legacy), Paxos state for a table lives for `max(3 h, gc_grace_seconds)`. | Accepted (ADR-0009); the roadmap checklist now lists `pending_index_writes` too |
@@ -68,26 +68,43 @@ The walk-through found places where the design document was wrong. These are now
 | 0017 | **Repair on read could delete a key the current version needs (G10),** because a delete wins a timestamp tie with the writer's insert. | Repair deletes a stale key only if the current version does not produce it; otherwise it upserts the key with the current tag. | None |
 | 0024 | **Lost PUT races and unknown CAS outcomes (G13, G25, G26; upstream #2111).** The design retried `create_or_update` only for batch, mapped a missed CAS straight to 404 or 409, answered an unknown CAS outcome that was not ours with 503, and both deleted and rewrote one intent row across attempts. | `create_or_update` is one bounded loop over create, update and revive: a fresh read, `write_id` and intent row per attempt, at most 3 immediate retries after a definite miss (4 attempts in all), and 2 re-runs after a timed-out or failed CAS the serial read proves did not apply (5 to 25 ms pause), on every CAS, `create` included. An undecidable outcome is 504 after a timeout and 503 after a replica failure. A plain delete that loses to an update retries once. A revive keeps the original `fhir_version`, and its literal `deleted_at = null` is the one allowed null. | Comments only (`write_id`, `pending_index_writes`, the null exception) |
 | 0026 | **The schema audit (2026-11-05)** found five gaps. The compartment filter was neither served nor refused (G33). `count` could not apply `SearchQuery.fhir_version` (G34). An index value over Cassandra's 64 KiB key limit made a committed write unindexable (G35). A superseded unknown CAS outcome was always undecidable (G36). A second `_id` parameter was not defined (G37). | The compartment filter is a residual on each loaded row, under the candidate cap, with `TooManyResults` (422) past it. A write with an indexed value over 2,048 bytes is refused with 400 before step 2. A superseded unknown outcome is decided by row `V`'s `write_id` where it is set. Every `_id` parameter is intersected. ADR-aacruzgon-0026 refines ADR-0024's unknown-outcome rule. | `fhir_version text` on `resources_by_type`; `write_id uuid` on `resource_versions` |
+| 0027 | **Every open item (2026-11-05).** G7, G8, G12, G17, G18, G20, G22, G23, G27, G32, C1, C2, C4 to C11, P5 and P6 were open. Re-extracting a version's old keys with today's registry left orphans after a `SearchParameter` change (G22). | Decided as listed under "Decisions the team made". Each version row stores the index rows it wrote, and deletes, the sweeper and repair read them back. | `resource_versions.index_keys blob` |
 
 Two corrections need no ADR because they fix a statement, not a decision:
 - **The sweeper does compare clocks.** "No clocks are compared" was wrong: the grace period is a clock comparison. The design now states its assumption (G11).
 - **A write is 404, never 410, when the resource was deleted in the gap** (G9). 410 is for `read` and `vread` only.
 
-## Still proposed
+## Proposals, decided
 
-| # | Problem (walk-through gap) | Proposal | Schema change |
+| # | Problem (walk-through gap) | Decision (ADR-aacruzgon-0027) | Schema change |
 | --- | --- | --- | --- |
-| P5 | **Index rows nobody reads (G17, G18).** The extractor emits `_id` and `_lastUpdated` (served by `resources` and `resources_by_type`), display-only tokens with an empty code, and implicit-system rows in `token_system_index`. | Drop them before computing index keys | None |
-| P6 | **Several Helios processes would apply the schema at once.** Roadmap Step 2 has `initialize` apply `schema.cql`. The Apache docs say nothing about concurrent schema changes; driver documentation advises waiting for schema agreement. | Apply the schema from one process (a setup command or the test harness). `initialize` only checks that the tables exist. | None |
+| P5 | **Index rows nobody reads (G17, G18).** The extractor emits `_id` and `_lastUpdated` (served by `resources` and `resources_by_type`), display-only tokens with an empty code, and implicit-system rows in `token_system_index`. | Drop them before computing index keys, and also the `''`-system rows in `token_system_index` and the empty URIs, which P5's first wording did not name. | None |
+| P6 | **Several Helios processes would apply the schema at once.** The Apache docs say nothing about concurrent schema changes; driver documentation advises waiting for schema agreement. | Apply the schema from one process (a setup command or the test harness). `initialize` only checks that the tables exist; roadmap Step 2 says so. | None |
 
-## Decisions only the team can make
+## Decisions the team made
 
-The full list is the "Decisions to record" group in [`walkthrough.md`](walkthrough.md#8-gaps-and-questions-for-the-session), plus the coverage-specific points in [`coverage.md`](coverage.md#7-open-points-for-the-session). The ones that change what `schema.cql` says, or what a test expects:
+ADR-aacruzgon-0027 records these. The walk-through's section 8 and `coverage.md` section 7 give each one's status.
 
-- **`count` (G7).** `count` reads `resources_by_type` without the tag check. So it counts writes in flight, orphans a crash left until the sweeper removes them, and, on the cluster, any row resurrected because `gc_grace_seconds` was lowered. Either accept that and document it, or tag-check `count`, which costs one point read per row.
-- **`count(tenant, None)`** (all types) is called by the console metrics. No table can answer it without a list of resource types.
-- **Too costly (G27).** The design returns `too-costly` for a date-only search over the candidate cap, but no search error produces that issue code. The nearest is `TooManyResults`, which gives 422. The one `too-costly` in Helios is a 500 for a transaction Bundle too large for MongoDB's cache (`crates/rest/src/handlers/batch.rs`).
-- **`_profile`, `_source`, `_tag`, `_security`.** The extractor indexes them. Patient and Observation have no URI parameter of their own in R4, so `_profile` and `_source` are the only URI rows the coverage table has.
+- **`count` (G7).** `gc_grace_seconds` stays at 3 h on `resources_by_type`, with an operations rule: a replica down longer than `max_hint_window` is replaced, not rejoined. A filtered `search_count` uses tag checks and the candidate cap; an unfiltered `count` scans `resources_by_type`. `count(tenant, None)` loops over every enabled FHIR version's resource type names. The two counts may differ while a write is in flight, while a crashed write waits for the sweeper, and in the design's stated limitations.
+- **Mass-update tombstones (G8).** A named benchmark case in roadmap Step 8.
+- **Several sweepers (G12).** Accepted, with no lease row: this project runs one process, and the sweeper's writes are idempotent.
+- **Date-only paging (G20).** Pages come in the date table's own order, with the table named in the cursor. `ge` is the single slice `end > s`. With several dates, one is sliced and the rest are residuals. `ne` and comma lists over both tables read `date_index`, then `date_index_by_end`.
+- **Old keys after a registry change (G22).** Each version row stores the index rows it wrote (`index_keys`); deletes, the sweeper and repair read them back. Adding a SearchParameter does not index existing resources until their next write.
+- **The write that applied but was not indexed (G23).** It returns success, and the sweeper finishes it.
+- **Too costly (G27).** The error is 422 `SearchError::TooManyResults`; no search produces `too-costly`. The cap counts distinct candidates point-read.
+- **The intent row's `write_id` (G32).** It is kept as a diagnostic.
+- **`_profile`, `_source`, `_tag`, `_security` (C1).** In scope.
+- **`_id=sys|abc` and `_id=|abc` (C2).** Compared whole with the id, as SQLite and PostgreSQL do, so they match nothing.
+- **Pipe form on ContactPoint and boolean (C4).** Matched as SQLite and PostgreSQL do.
+- **The AND driver (C5).** A fixed order, no statistics: `_id`; `system|code` and `|code`; identity URIs (a canonical resource's own `url`); code-only tokens, `_profile`, `_source` and other URIs; `system|`; `_lastUpdated` only when nothing else can drive. Ties by query order.
+- **`MaxPageSize` (C6).** REST's `HFS_MAX_PAGE_SIZE` (default 1000); no backend limit.
+- **Composite part count and `_has` (C7).** The 400s the shared code returns today, pinned by Step 6 tests. `_has` is served through the shared resolver when its terminal parameter is token, date or URI; a broad terminal is a Step 8 benchmark case.
+- **Terminology modifiers (C8).** The design matches the REST code.
+- **`_sort` (C9).** Accepted only when equal to the native order.
+- **`_text`/`_content` (C10).** 501 by name in the backend, before the type check.
+- **`_filter` (C11).** 501 by name in the Cassandra backend (`BackendError::UnsupportedCapability`); REST unchanged.
+
+Nothing is open.
 
 ## What the Apache Cassandra 5.0 docs say
 

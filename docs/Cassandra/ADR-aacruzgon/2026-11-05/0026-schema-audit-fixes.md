@@ -73,9 +73,7 @@
         - `fhir_version_filter_suite.rs` needs an R4+R5 test build that no CI job makes, and it also uses `_offset` and `_contained`. Its in-scope cases run by hand from a copy in `tests/cassandra/`. No CI job is added.
         - The roadmap's Step 6 gates now name only suites, or parts of suites, that can pass in scope; `total_mode_suite.rs` was added.
     - **CI:** the `Cassandra schema (single node)` job now asserts table names, key and clustering columns with their order, and the table options the design relies on, read from `system_schema`.
-    - **Left open (not decided here):**
-        - whether the intent row keeps its unread `write_id` (G32);
-        - G7, G20, G23, G27, C1, C4, C8 to C11, P5 and P6.
+    - **Left open here, and decided in ADR-aacruzgon-0027:** whether the intent row keeps its unread `write_id` (G32), and G7, G20, G23, G27, C1, C4, C8 to C11, P5 and P6. That entry also records where the code did not fit the recommendations and what replaced them.
 - **AI involvement:**
     - **Tools:** Claude Code (Opus 5.5). An orchestrating Claude Code session ran a Rex worker session in its own worktree, which used web-fetch subagents for the FHIR R4 and R4B search pages and the R4 Patient CompartmentDefinition.
     - **What the AI proposed:**
@@ -83,7 +81,7 @@
         - For each question it listed options. For the compartment filter: refuse, residual, or a reference table. For the version filter: a column or tag-checked reads. For oversized values: skip, reject or hash. For G36: add `write_id` to version rows.
         - The orchestrating Claude Code session recommended, for each question: the residual, with an error rather than a partial result at the cap and a count that is correct or rejected; the column; rejection with 400 at 2 KiB; and adding `write_id` now.
         - The worker then drafted the edits and this entry.
-    - **What the human changed:** Alan accepted these recommendations. He confirmed that an unknown outcome stays undecidable only when the version that superseded ours came from `update`. He left Q5 (the intent row's `write_id`) and Q6 (the existing open points) open.
+    - **What the human changed:** Alan accepted these recommendations. The orchestrating session confirmed the worker's reading that an unknown outcome stays undecidable only when the version that superseded ours came from `update`; Alan approved the ADR with it. Q5 (the intent row's `write_id`) and Q6 (the existing open points) were left to ADR-aacruzgon-0027.
     - **Verified:**
         - Code read at `main` (`15f2850d9`): `SearchQuery.fhir_version` and `compartment`; the REST code that sets them; the SQLite and MongoDB membership filters; the `ValidationError` and `SearchError` variants and their REST mapping; `MAX_TENANT_ID_LEN`; and every suite named in the roadmap's Step 6 gate.
         - On a fresh 5.0.9 node, the key-size limits and batch-size behaviour were measured as quoted above. The revised `schema.cql` was applied twice, the changed statements were run, and the CI assertions passed, then failed when a key or clustering order was altered. The node was removed afterwards.

@@ -25,6 +25,7 @@ resource_versions data regular -1 none text
 resource_versions deleted_at regular -1 none timestamp
 resource_versions fhir_version regular -1 none text
 resource_versions id partition_key 2 none text
+resource_versions index_keys regular -1 none blob
 resource_versions last_updated regular -1 none timestamp
 resource_versions resource_type partition_key 1 none text
 resource_versions tenant_id partition_key 0 none text

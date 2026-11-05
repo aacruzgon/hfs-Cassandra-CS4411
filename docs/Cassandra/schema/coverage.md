@@ -38,9 +38,12 @@ The "Stored system" column is what the shared converter (`ValueConverter::conver
 | Observation | `code`, `category`, `method`, `data-absent-reason`, `value-concept` | CodeableConcept | `Coding.system` or `''` | all four |
 | Observation | `component-code`, `component-data-absent-reason`, `component-value-concept` | `Observation.component.*` (CodeableConcept) | as above | all four |
 | Observation | `combo-code`, `combo-data-absent-reason`, `combo-value-concept` | the element on Observation **and** its components (CodeableConcept) | as above | all four |
-| both | `_id` | `Resource.id` (id) | The extractor returns it as a token today; dropping those rows before the write is G17. Served by point reads on `resources`, never from an index table | `code` only (C2) |
+| both | `_id` | `Resource.id` (id) | The extractor returns it as a token; those rows are dropped before the write (P5, ADR-aacruzgon-0027). Served by point reads on `resources`, never from an index table | `code`; a value with a pipe is compared whole and matches nothing (C2, section 2) |
 
-That is 9 Patient, 13 Observation and 1 shared token parameter (plus `_tag` and `_security` if C1 brings them in).
+| both | `_tag` | `Resource.meta.tag` (Coding) | `Coding.system` or `''` | all four (in scope, C1) |
+| both | `_security` | `Resource.meta.security` (Coding) | `Coding.system` or `''` | all four (in scope, C1) |
+
+That is 9 Patient, 13 Observation and 3 shared token parameters (`_id`, `_tag`, `_security`). `_tag` and `_security` are served by the three token tables like any Coding (`meta_params_suite.rs` asserts both directions).
 
 ### Date ([R4 search.html#date](https://hl7.org/fhir/R4/search.html#date))
 
@@ -50,11 +53,11 @@ That is 9 Patient, 13 Observation and 1 shared token parameter (plus `_tag` and 
 | Patient | `death-date` | `Patient.deceased as dateTime` |
 | Observation | `date` | `Observation.effective` (dateTime, Period, Timing or instant) |
 | Observation | `value-date` | `Observation.value as dateTime` or `as Period` |
-| both | `_lastUpdated` | `Resource.meta.lastUpdated` (instant). The extractor returns it as a date today; dropping those rows is G17. Served from `resources_by_type`, never from the date tables |
+| both | `_lastUpdated` | `Resource.meta.lastUpdated` (instant). The extractor returns it as a date; those rows are dropped before the write (P5). Served from `resources_by_type`, never from the date tables |
 
 ### URI ([R4 search.html#uri](https://hl7.org/fhir/R4/search.html#uri))
 
-**Neither Patient nor Observation has a uri parameter in R4.** The only uri parameters that apply to them are the Resource-level `_profile` (`Resource.meta.profile`, canonical) and `_source` (`Resource.meta.source`). Section 4 uses them. The extractor already indexes `_profile`, `_source` and the Resource-level tokens `_tag` and `_security` (`search/extractor.rs`; its tests assert it). Whether they are in scope is C1.
+**Neither Patient nor Observation has a uri parameter in R4.** The only uri parameters that apply to them are the Resource-level `_profile` (`Resource.meta.profile`, canonical) and `_source` (`Resource.meta.source`). Section 4 uses them. The extractor already indexes `_profile`, `_source` and the Resource-level tokens `_tag` and `_security` (`search/extractor.rs`; its tests assert it). They are in scope (C1, ADR-aacruzgon-0027), so section 4 stands.
 
 ## 2. Token forms
 
@@ -71,8 +74,9 @@ Forms that read two partitions run one query per partition and merge the sorted 
 | case | `Patient?gender=Female` | `token_code_index` | cursor | — | 200, no match: matching is case-sensitive (design decision) |
 | boolean | `Patient?active=true` | `token_code_index`, `(param, 'true')` | cursor | — | 200; matches `active: true` |
 | ContactPoint | `Patient?phone=555-0100` | `token_code_index`, `(param, '555-0100')` | cursor | — | 200; exact, case-sensitive value |
-| pipe on ContactPoint or boolean | `Patient?phone=phone\|555-0100`, `Patient?active=\|true` | as the form says | cursor | — | The spec says the pipe form SHALL NOT be used here. The shared converter makes both match today. Accept, or reject with 400? (C4) |
+| pipe on ContactPoint or boolean | `Patient?phone=phone\|555-0100`, `Patient?active=\|true` | as the form says | cursor | — | 200, matched by the general token rules, as SQLite and PostgreSQL do: neither has a case for ContactPoint or boolean (`backends/sqlite/search/parameter_handlers/token.rs:12-19`, `86-120`; `backends/postgres/search/query_builder.rs:2344-2394`). A ContactPoint is stored with its own `system` (`phone`), and a boolean with no system. So `phone\|555-0100` matches the phone `555-0100`, `\|true` matches `active: true`, and `email\|` matches any email. The spec says clients SHALL NOT send the pipe here; the server does not refuse it (C4, decided) |
 | `_id` | `Patient?_id=abc` | `resources`, point read `(id)` | — | `deleted_at` unset | 200; zero or one entry; case-sensitive |
+| `_id` with a pipe | `Patient?_id=sys\|abc`, `Patient?_id=\|abc` | `resources`, point read of the whole value as the id | — | — | 200, empty searchset. The value is compared whole with `Resource.id`, pipe included, as SQLite and PostgreSQL do (`backends/sqlite/search/query_builder.rs:1159-1224`, `backends/postgres/search/query_builder.rs:1870-1929`, both `id IN (…)` on `value.value`); an id never contains `\|` ([R4 datatypes.html#id](https://hl7.org/fhir/R4/datatypes.html#id)), so nothing matches (C2, decided) |
 | `_id` list | `Patient?_id=a,b,c` | `resources`, concurrent point reads (`read_batch`) | — | sort in Rust, cut at cursor | 200; existing, live ids |
 | two `_id` parameters (AND) | `Patient?_id=a,b&_id=b`; every Patient search under a `patient/` scope, to which REST appends `_id=<patient>` | intersect the id sets in Rust, then point-read only the intersection; never an index table | — | sort in Rust, cut at cursor | 200; only ids in every `_id` parameter (`b` here); disjoint sets give an empty searchset (walkthrough 5.4, G37) |
 
@@ -88,15 +92,20 @@ The stored value is the half-open range `[ts, te)` from `indexed_range(…, Mill
 | `ne` | `ts < s` or `te > e` | `date_index` ∪ `date_index_by_end` | `start < s`; `end > e` | dedupe |
 | `gt` | `te > e` | `date_index_by_end` | `end > e` | — |
 | `lt` | `ts < s` | `date_index` | `start < s` | — |
-| `ge` | `te > e`, or `ts ≥ s` and `te ≤ e` | `date_index_by_end` ∪ `date_index` | `end > e`; `start ≥ s AND start < e` | `te ≤ e` on the second; dedupe |
+| `ge` | `te > e`, or `ts ≥ s` and `te ≤ e` | `date_index_by_end` | `end > s` (every match has `te > s`) | full predicate |
 | `le` | `ts < s`, or `ts ≥ s` and `te ≤ e` | `date_index` | `start < e` | full predicate |
 | `sa` | `ts ≥ e` | `date_index` | `start ≥ e` | — |
 | `eb` | `te ≤ s` | `date_index_by_end` | `end ≤ s` | — |
 | `ap` | `ts < high` and `te > low`; the window widens `[s, e)` by 12 months (year), 1 month (month), 1 day (day), 10 min (minute) or 10 s (finer) | `date_index` | `start < high` | `te > low` |
 
-`ge` is the design's union of an `end` slice and the `eq` slice; walkthrough G20 records a single-slice option. Every row is also checked with `RangePredicate::matches`, whatever the slice. **Expected for all nine:** 200 searchset. The page is sorted in Rust by `(last_updated DESC, id DESC)`, using the `resources` rows already loaded for the tag check, and cut at the cursor. If the candidates exceed the configured cap the search is refused; which error and status is G27 (today's closest, `SearchError::TooManyResults`, is 422, not `too-costly`). Comma OR (`birthdate=1970,1980`) is a union of slices, deduplicated. A Period with no end is stored with the `open_end` sentinel, so it falls in every `end >` slice.
+`ge` is the single slice `end > s` (ADR-aacruzgon-0027). Every row is also checked with `RangePredicate::matches`, whatever the slice. **Expected for all nine:** 200 searchset.
+- **Paging.** The page comes in its date table's own order, `(start, id)` or `(end, id)` ascending, keyset-paged with the table named in the cursor's third element. A resource with several values appears once, at its first matching row (walkthrough 5.7).
+- **Cap.** The search counts distinct candidates point-read per page; over the cap it is refused with 422 `SearchError::TooManyResults` (G27).
+- **`ne`.** It reads `date_index`'s slice `start < s` to the end, then `date_index_by_end`'s slice `end > e`, each in its own order. A resource is emitted once, at its first matching row in that order, and the cursor's third element names the table being read (G20, ADR-aacruzgon-0027; walkthrough 5.7).
+- **Comma OR** (`birthdate=1970,1980`). Slices on one table are merged in its order. A list that spans both tables pages like `ne`: all of `date_index`'s slices, then all of `date_index_by_end`'s.
+- **Open Periods.** A Period with no end is stored with the `open_end` sentinel, so it falls in every `end >` slice.
 
-**Date with any other parameter** (`Patient?gender=female&birthdate=ge1970`): the date tables are not read. The other parameter drives. The date is a residual filter: re-extract the date values from the loaded `resources` row and apply `RangePredicate::matches`. Expected: 200, keyset-paged. Two date parameters, a repeated date, or a date with `_lastUpdated` is G20.
+**Date with any other parameter** (`Patient?gender=female&birthdate=ge1970`): the date tables are not read. The other parameter drives. The date is a residual filter: re-extract the date values from the loaded `resources` row and apply `RangePredicate::matches`. Expected: 200, keyset-paged. Two date parameters, a repeated date, or a date with `_lastUpdated`, with nothing else, is still date-only. `_lastUpdated` is sliced if present, otherwise the first date parameter in query order, and the rest are residuals (G20, walkthrough 5.7).
 
 **`_lastUpdated`.** One partition of `resources_by_type`, clustered on `last_updated DESC, id DESC`. A stored `last_updated` `t` is a millisecond point, the range `[t, t + 1 ms)`; the query value `[s, e)` comes from `FhirDateValue::range_at(StorageResolution::Millis)`. Putting that range into `range_predicate` gives one or two bounds on `last_updated`, so paging stays native.
 
@@ -127,22 +136,22 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 
 | Case | Request | Tables and method | Expected |
 | --- | --- | --- | --- |
-| AND of parameters | `Observation?code=8867-4&status=final` | One token partition drives from the cursor. Each candidate is checked against the other with a clustering point read (`… AND last_updated = ? AND id = ?`). How the driver is chosen with no statistics is C5 | 200; intersection; keyset-paged |
+| AND of parameters | `Observation?code=8867-4&status=final` | One token partition drives from the cursor. Each candidate is checked against the other with a clustering point read (`… AND last_updated = ? AND id = ?`). The driver is the first parameter in this order: `_id`; `system\|code` and `\|code` tokens; identity URIs (a canonical resource's own `url`); code-only tokens, `_profile`, `_source` and other URIs; `system\|` tokens; `_lastUpdated` only when nothing else can drive. Ties by query order (C5; walkthrough 5.8 lists the identity URIs) | 200; intersection; keyset-paged |
 | repeated parameter | `Observation?code=8867-4&code=8310-5` | as AND | 200; resources having both |
 | comma OR | `Observation?code=8867-4,8310-5` | union of partitions, one query each, merged in the shared order, deduped | 200; union |
 | OR across forms | `code=http://loinc.org\|8867-4,8310-5` | three partitions in two tables, merged | 200; union |
 | token + URI | `Patient?gender=female&_profile=…` | either drives; the other is a point read | 200 |
 | `_id` + other | `Patient?_id=a,b&gender=female` | `_id` drives; others checked | 200 |
 | token + date, or token + `_lastUpdated` | see section 3 | the date is a residual filter | 200 |
-| two date parameters, or a repeated date (`date=ge2020&date=lt2021`) | — | is this "date-only"? (G20) | 200 |
+| two date parameters, or a repeated date (`date=ge2020&date=lt2021`) | — | date-only: the first date parameter is sliced, the rest are residuals; with `_lastUpdated` among them, `_lastUpdated` is sliced (G20) | 200; paged in the sliced table's order |
 | unfiltered type search | `GET /Patient` | `resources_by_type`, one partition, cursor slice | 200; all live Patients |
-| `_count=n` | `Patient?gender=female&_count=50` | `LIMIT` is a batch size; read until 51 distinct matches | 200; at most 50 entries. REST defaults are 20 and max 1000 (`crates/rest/src/config.rs`); the value Cassandra declares as `MaxPageSize` is C6 |
-| `_count=0` | `Patient?gender=female&_count=0` | `search_count`: stream every match | 200 searchset with `total` and no entries (behaves as `_summary=count`). Tag checks and the cap here: G7 |
+| `_count=n` | `Patient?gender=female&_count=50` | `LIMIT` is a batch size; read until 51 distinct matches | 200; at most 50 entries. REST clamps `_count` to `HFS_MAX_PAGE_SIZE` (default 1000, `crates/rest/src/config.rs:1331-1332`) before the backend is called (`handlers/search.rs:606-612`); the backend has no limit of its own and declares `MaxPageSize(1000)`, as the other backends do (C6, decided) |
+| `_count=0` | `Patient?gender=female&_count=0` | `search_count`: stream every match | 200 searchset with `total` and no entries (behaves as `_summary=count`). Tag checks and the candidate cap apply (G7, ADR-aacruzgon-0027); over the cap, 422 |
 | `_count=0`, unfiltered | `GET /Patient?_count=0` | full scan of the `resources_by_type` partition, reading its tombstones | 200; `total` only |
 | next page | the `next` link | `PageCursor` with `sort_values = [last_updated RFC 3339 ms, reserved bucket slot]`, `resource_id = id`; slice `(last_updated, id) < (?, ?)`. The page key is `(last_updated, id, bucket)`; `id` travels in `resource_id`, so the design's "third slot" is the second element of `sort_values` | 200; no duplicates or gaps; no `previous` on page 1; no `next` after the last page |
 | malformed cursor | `_cursor=garbage` | backend | 400 `InvalidCursor` |
-| `count(tenant, Some(type))` | internal | full scan of `resources_by_type`, no tag check | the number of live rows; in-flight and orphan miscounts are G7 |
-| `count(tenant, None)` | internal (all types) | no table serves this (G7) | the number of live rows |
+| `count(tenant, Some(type))` | internal | full scan of `resources_by_type`, no tag check | the number of live rows; it differs from a filtered `search_count` only while a write is in flight, while a crashed write waits for the sweeper, and in the design's stated limitations (G7, walkthrough 5.9) |
+| `count(tenant, None)` | internal (all types) | the scan above for each resource type name of every enabled FHIR version (`FhirResourceTypeProvider::get_resource_type_names`, `crates/persistence/src/search/type_qualifier.rs:98-118`), each name once (G7, decided) | the number of live rows |
 | `_total=accurate` or `_total=estimate` | `Patient?gender=female&_total=accurate` | the page as usual, plus one `search_count` of the same query (`SearchQuery::wants_total()`); costs and caveats as `_count=0` | 200; `Bundle.total` set. `_total=none` or absent: no `total` |
 | FHIR version named | `GET /Patient?gender=female` with `Accept: application/fhir+json; fhirVersion=4.0` (`query.fhir_version`, upstream #2254) | as the search; residual `resources.fhir_version = '4.0'` after the tag check | 200; only resources stored under that version (walkthrough 5.9, G34) |
 | FHIR version named, unfiltered count | `GET /Patient?_count=0` with `fhirVersion=4.0` | `resources_by_type`, whole partition, counting rows whose `fhir_version` column is `'4.0'`, in Rust; no point reads | 200; `total` of that version only |
@@ -151,7 +160,7 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 | compartment, no other parameter | `GET /Patient/123/Observation` | `resources_by_type` drives; residual as above | 200, or the cap row below |
 | compartment count | `GET /Patient/123/Observation?_count=0`, or `_total=accurate` | the residual stream run to the end, under the cap | 200 with the members' `total`; over the cap, the cap row below. Never a partial count |
 | compartment over the cap | a compartment search or count that reads more candidates than the cap before it finishes | — | 422 `SearchError::TooManyResults` (issue `processing`, `crates/rest/src/error.rs:1123-1125`); never a page or count that was only partly filtered |
-| candidate cap exceeded | e.g. `Observation?date=lt2030` on a large tenant | date tables or a filtered `search_count` | An OperationOutcome. The design asks for issue type `too-costly`; no search error produces it today (G27) |
+| candidate cap exceeded | e.g. `Observation?date=lt2030` on a large tenant | date tables, a compartment search or a filtered `search_count`; the cap counts distinct candidates point-read, per page or per count | 422 `SearchError::TooManyResults`, issue `processing` (`crates/rest/src/error.rs:1123-1125`). No search produces `too-costly` (G27, ADR-aacruzgon-0027) |
 
 ## 6. Rejections
 
@@ -162,7 +171,8 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 | String: `Patient?name=smith`, `family=`, `address-city=` | backend | 400 | `UnsupportedParameterType` ([#string](https://hl7.org/fhir/R4/search.html#string)) |
 | Reference: `Observation?subject=Patient/1`, `patient=`, `Patient?general-practitioner=` | backend | 400 | `UnsupportedParameterType` ([#reference](https://hl7.org/fhir/R4/search.html#reference)) |
 | Quantity: `Observation?value-quantity=gt5.4\|http://unitsofmeasure.org\|mg` | backend | 400 | `UnsupportedParameterType` ([#quantity](https://hl7.org/fhir/R4/search.html#quantity)) |
-| Composite: `Observation?code-value-quantity=8480-6$gt100` | backend | 400 | `UnsupportedParameterType` ([#composite](https://hl7.org/fhir/R4/search.html#composite)). REST checks the `$` part count first, so a malformed value gets a REST 400 instead (C7) |
+| Composite: `Observation?code-value-quantity=8480-6$gt100` | backend | 400 | `UnsupportedParameterType` ([#composite](https://hl7.org/fhir/R4/search.html#composite)) |
+| Composite with the wrong part count: `Observation?code-value-quantity=8480-6` | REST, before the backend | 400 | `SearchError::InvalidComposite` ("composite value '8480-6' has 1 component(s) separated by '$', but this parameter expects 2"), from the shared gate `validate_composite_values` (`crates/persistence/src/search/composite_value.rs:127-141`), which REST runs in `search_query_builder.rs:243`; REST maps it to `BadRequest`, issue `invalid` (`crates/rest/src/error.rs:1109-1115`, `570-571`). Pinned by a Step 6 test row (C7, decided) |
 | Number: none on Patient or Observation in R4; e.g. `RiskAssessment?probability=gt0.8` | backend | 400 | `UnsupportedParameterType` ([#number](https://hl7.org/fhir/R4/search.html#number)) |
 | `:exact` on token, date or uri: `gender:exact=female` | REST (`validate_modifier`) | 400 | `RestError::InvalidParameter` ([#modifiers](https://hl7.org/fhir/R4/search.html#modifiers)) |
 | `:exact` on string: `name:exact=Smith` | backend | 400 | `UnsupportedParameterType` (the type check runs first) |
@@ -173,16 +183,17 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 | `:text`, `:of-type`, `:code-text`, `:text-advanced` on token: `code:text=glucose` | backend | 400 | `UnsupportedModifier` |
 | `:identifier` or `:[type]` on token | REST | 400 | `InvalidParameter` |
 | `:in`, `:above`, `:below` on token, no `HFS_TERMINOLOGY_SERVER` | REST | 501 | `SearchError::TerminologyRequired` → `NotImplemented` |
-| the same with a terminology server set | REST expands to a plain comma OR | 200 | served as `system\|code` OR. The design says 400 (C8) |
+| the same with a terminology server set | REST expands to a plain comma OR (`crates/rest/src/handlers/search.rs:428-429`) | 200 | served as `system\|code` OR; the design now says the same (C8, decided) |
 | `:not-in` | REST | 501 | `NotImplemented`, always |
-| `_sort=birthdate` | backend | 400 | `QueryParseError` ([#sort](https://hl7.org/fhir/R4/search.html#sort)). Is `_sort=-_lastUpdated`, the default order, accepted? (C9) |
+| `_sort=birthdate` | backend | 400 | `QueryParseError` ([#sort](https://hl7.org/fhir/R4/search.html#sort)). Only a `_sort` equal to the search's native order is accepted: none, or `-_lastUpdated` where the order is `(last_updated DESC, id DESC)`. On a date-only search sliced on a date table, `-_lastUpdated` is refused too (C9, decided) |
 | `_offset=20` | backend | 400 | `QueryParseError` |
 | `_include=Observation:patient`, `_revinclude=Provenance:target` | backend (`query.includes` non-empty) | 501 | `IncludeNotSupported` ([#include](https://hl7.org/fhir/R4/search.html#include), [#revinclude](https://hl7.org/fhir/R4/search.html#revinclude)) |
-| `_text=fever`, `_content=fever` | backend | 501 | `TextSearchNotAvailable` ([#text](https://hl7.org/fhir/R4/search.html#text), [#content](https://hl7.org/fhir/R4/search.html#content)). The R4 registry types both as string, so the type check may answer 400 first (C10) |
-| `_filter=…` | ? | ? | The design scope table says "rejected" but not how (C11) |
+| `_text=fever`, `_content=fever` | backend | 501 | `TextSearchNotAvailable` ([#text](https://hl7.org/fhir/R4/search.html#text), [#content](https://hl7.org/fhir/R4/search.html#content)). The backend's `search()` and `search_count()` check both by name before the type check, so the registry's typing does not turn them into 400. REST passes both through: they are in `GLOBAL_SEARCH_PARAMS` (`crates/rest/src/extractors/search_query_builder.rs:297-298`), and SQLite serves them (C10, decided) |
+| `_filter=…` | backend | 501 | `BackendError::UnsupportedCapability`, which REST maps to 501, issue `not-supported` (`crates/rest/src/error.rs:1209-1211`, `656-659`). The backend's `search()` and `search_count()` check it by name with `_text` and `_content`, before the type check. REST is unchanged: it passes `_filter` through (`search_query_builder.rs:184`, `299`), and SQLite (`backends/sqlite/search/query_builder.rs:1237-1240`) and MongoDB serve it (C11, decided) |
 | `_query=…` | REST | 400 | `InvalidParameter` |
 | Chain: `Observation?subject.name=smith`, `subject:Patient.gender=male` | REST chain resolver, then backend | 400 | `UnsupportedParameterType` from the hop that needs a reference parameter, not 501 `ChainedSearchNotSupported` ([#chaining](https://hl7.org/fhir/R4/search.html#chaining)) |
-| `_has`: `Patient?_has:Observation:patient:code=8867-4` | REST chain resolver, then backend | 400 | `UnsupportedParameterType`, as for chains ([#has](https://hl7.org/fhir/R4/search.html#has)); which hop fails is C7 |
+| `_has` with a served terminal: `Patient?_has:Observation:patient:code=8867-4` | REST chain resolver, through the backend's ordinary `search()` | 200 | Served, not refused. The resolver searches `Observation?code=8867-4` page by page through our `search()` (`crates/persistence/src/search/chain_resolver.rs:693-735`, `268-310`), extracts each match's `patient` references in Rust (`758-770`), and REST passes the ids on as `_id` (`crates/rest/src/handlers/search.rs:642-680`). The backend sees only a token search and an `_id` search, so it cannot refuse this, and need not: R4 says "Servers are not required to implement any of the standard search parameters" and has no `_has`-specific rule ([R4 search.html](https://hl7.org/fhir/R4/search.html), [#has](https://hl7.org/fhir/R4/search.html#has)), and [Discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28) puts chaining in an extension trait above our base `SearchProvider`. The resolver drains every page of the terminal search into memory (`search_all_pages`, `chain_resolver.rs:268`, called at `758`), so a broad terminal is costly; it is a Step 8 benchmark case (C7, decided) |
+| `_has` with an unserved terminal: `Patient?_has:Observation:patient:value-quantity=gt5` | REST chain resolver, then backend | 400 | `UnsupportedParameterType` from the terminal hop's search, mapped through `RestError::from` (`handlers/search.rs:678`) to `BadRequest`, issue `invalid` (`crates/rest/src/error.rs:1109-1115`). Pinned by a Step 6 test row (C7, decided) |
 | Transaction Bundle, `POST /` with `type: transaction` | REST batch handler (`supports_atomic_transactions()` is false) | 501 | `TransactionError::AtomicityUnsupported`, issue `not-supported`, before any entry is applied ([http.html#transaction](https://hl7.org/fhir/R4/http.html#transaction)). A batch Bundle works. |
 | Invalid date: `birthdate=1970-13` | REST, then backend | 400 | `InvalidParameter` at REST; `InvalidDateValue` if the backend is called directly |
 | Empty OR value: `gender=male,` | REST, then backend | 400 | `InvalidParameter`; `validate_value_presence` in the backend |
@@ -195,17 +206,17 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 
 | ID | Point | Status |
 | --- | --- | --- |
-| C1 | **URI and Resource-level scope.** R4 Patient and Observation have no uri parameter of their own. The extractor already indexes `_profile`, `_source`, `_tag` and `_security`. Scope them in (section 4 then stands), or say there are no URI rows. | open |
-| C2 | **`_id` forms.** Only `code` is covered; what `_id=sys\|abc` or `_id=\|abc` should do is not. | open |
-| C3 | **`system\|` on code elements** never matches, as in PostgreSQL and MongoDB. Confirm. The write-side consequence (rows nobody reads) is G18. | open |
-| C4 | **Pipe form on ContactPoint and boolean.** Accept, or 400? The converter stores a ContactPoint's own `system` and a boolean with no system. | open |
-| C5 | **AND driver choice.** No selectivity source exists. | open |
-| C6 | **`MaxPageSize`.** Pick the value; the REST maximum is 1000. | open |
-| C7 | **Composite part-count check and `_has` failing hop.** Confirm the exact 400 by test. | open |
-| C8 | **Terminology modifiers.** The design says 400. The code gives a REST 501 for token `:in`/`:above`/`:below` without a terminology server, serves them as a plain OR with one, and always gives 501 for `:not-in`. | open |
-| C9 | **`_sort` default.** Which values count as the default order is undefined. | open |
-| C10 | **`_text`/`_content`.** Typed string in R4, so the type check answers 400 before the intended 501 unless they are checked by name first. | open |
-| C11 | **`_filter`.** The design says "rejected" but names no layer, status or error. | open |
+| C1 | **URI and Resource-level scope.** R4 Patient and Observation have no uri parameter of their own. The extractor already indexes `_profile`, `_source`, `_tag` and `_security`. Scope them in (section 4 then stands), or say there are no URI rows. In scope: section 4 stands, and the token tables serve `_tag` and `_security`. | **decided** (ADR-aacruzgon-0027) |
+| C2 | **`_id` forms.** Only `code` is covered; what `_id=sys\|abc` or `_id=\|abc` should do is not. As SQLite and PostgreSQL: the value is compared whole with the id, so both match nothing (200, empty; section 2). | **decided** (ADR-aacruzgon-0027) |
+| C3 | **`system\|` on code elements** never matches, as in PostgreSQL and MongoDB. Confirm. The write-side consequence (rows nobody reads) is G18. | **decided** (design, "Shared helpers": `sys\|` matches `sys` only, as PostgreSQL, SQLite and MongoDB do) |
+| C4 | **Pipe form on ContactPoint and boolean.** Accept, or 400? The converter stores a ContactPoint's own `system` and a boolean with no system. Accepted, and matched by the general token rules, as SQLite and PostgreSQL do (section 2). | **decided** (ADR-aacruzgon-0027) |
+| C5 | **AND driver choice.** No selectivity source exists. A fixed order with no statistics, so the most specific key drives: `_id`; `system\|code` and `\|code` tokens; identity URIs (a canonical resource's own `url`, walkthrough 5.8); code-only tokens, `_profile`, `_source` and other URIs (shared values); `system\|` tokens; `_lastUpdated` only when nothing else can drive. Ties by query order; revisited only if the Step 8 benchmarks show it matters. The spec leaves the order to the server, and [Discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28) asks for a lightweight planner without the cost hooks it sketches, which do not exist in the code. | **decided** (ADR-aacruzgon-0027) |
+| C6 | **`MaxPageSize`.** Pick the value; the REST maximum is 1000. REST's `HFS_MAX_PAGE_SIZE` (default 1000, `crates/rest/src/config.rs:1331-1332`) clamps `_count` before the backend is called; no separate backend limit. The backend declares `MaxPageSize(1000)` as every other backend does (`backends/sqlite/backend.rs:936`). | **decided** (ADR-aacruzgon-0027) |
+| C7 | **Composite part-count check and `_has` failing hop.** Confirm the exact 400 by test. The part count: 400 `InvalidComposite`, issue `invalid`, from REST's shared gate. A `_has` fails at its terminal hop only when the terminal's type is not served: 400 `UnsupportedParameterType`, issue `invalid`. A `_has` whose terminal is served is answered (200; section 6). Both 400s are pinned by Step 6 test rows. | **decided** (ADR-aacruzgon-0027) |
+| C8 | **Terminology modifiers.** The design says 400. The code gives a REST 501 for token `:in`/`:above`/`:below` without a terminology server, serves them as a plain OR with one, and always gives 501 for `:not-in`. The design now matches the code: `crates/rest/src/handlers/search.rs:411-426` (`:not-in`), `428-466` (expansion, or `TerminologyRequired` without a server). | **decided** (ADR-aacruzgon-0027) |
+| C9 | **`_sort` default.** Which values count as the default order is undefined. Accepted only when equal to the native order: absent, or `-_lastUpdated`. Anything else is the design's existing rule: 400 `QueryParseError`. | **decided** (ADR-aacruzgon-0027) |
+| C10 | **`_text`/`_content`.** Typed string in R4, so the type check answers 400 before the intended 501 unless they are checked by name first. Checked by name in the backend's `search()` and `search_count()`, before the type check: 501. | **decided** (ADR-aacruzgon-0027) |
+| C11 | **`_filter`.** The design says "rejected" but names no layer, status or error. Refused by name in the Cassandra backend with `BackendError::UnsupportedCapability`: 501, issue `not-supported`; REST unchanged (section 6). | **decided** (ADR-aacruzgon-0027) |
 
 ### Already in the walk-through's gap list
 
@@ -213,11 +224,11 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 | --- | --- | --- |
 | `_lastUpdated` beside the cursor | G19 | **resolved** on the node: lower bound plus cursor in one query; for an upper bound, send the tighter of bound and cursor |
 | `_lastUpdated` combined with another parameter | G19 | **resolved**: a residual filter, as the design says; a token-table slice is an optional optimisation |
-| `_id` and `_lastUpdated` index rows from the extractor | G17 | open |
-| Display-only tokens (`CodeableConcept.text`, empty code) and other rows no query reads | G18 | open |
-| "Date-only" with two date parameters, a repeated date, or a date with `_lastUpdated` | G20 | open |
-| `count(tenant, None)`; filtered `search_count` and the candidate cap | G7 | open |
-| The candidate cap's error and status (`too-costly`) | G27 | open; code fact: `TooManyResults` maps to 422, and no search path produces `too-costly`. The compartment cap uses `TooManyResults` today (G33) and follows G27 if it changes |
+| `_id` and `_lastUpdated` index rows from the extractor | G17 | **resolved** (P5, ADR-aacruzgon-0027): dropped |
+| Display-only tokens (`CodeableConcept.text`, empty code) and other rows no query reads | G18 | **resolved** (P5, ADR-aacruzgon-0027): display-only tokens, the `IMPLICIT` and `''` rows in `token_system_index`, and empty URIs are dropped |
+| "Date-only" with two date parameters, a repeated date, or a date with `_lastUpdated` | G20 | **resolved** (ADR-aacruzgon-0027), `ne` and cross-table comma lists included (section 3) |
+| `count(tenant, None)`; filtered `search_count` and the candidate cap | G7 | **resolved** (ADR-aacruzgon-0027): tag checks and the cap for a filtered `search_count`; `count(tenant, None)` over every enabled version's type names |
+| The candidate cap's error and status (`too-costly`) | G27 | **resolved** (ADR-aacruzgon-0027): 422 `TooManyResults`, issue `processing`; no `too-costly`; the cap counts distinct candidates point-read; the compartment cap follows it |
 | Compartment filter (`query.compartment`) | G33 | **resolved** (ADR-aacruzgon-0026): residual on each loaded row, under the cap |
 | `query.fhir_version` on searches and counts | G34 | **resolved** (ADR-aacruzgon-0026): residual, and `resources_by_type.fhir_version` for counts |
 | Index values over 2,048 bytes | G35 | **resolved** (ADR-aacruzgon-0026): the write is refused with 400 `InvalidResource` before step 2 (section 6) |

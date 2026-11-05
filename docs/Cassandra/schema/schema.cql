@@ -23,6 +23,15 @@
 --     resources (delete, create_or_update, update_with_match) also carries
 --     that read's write_id, one built from update's StoredResource leaves it
 --     unset (ADR-aacruzgon-0026);
+--   * every resource_versions row carries index_keys, the key set its version
+--     wrote, never unset: V1 and V2 write the writer's own K(V), the sweeper's
+--     replay of a missing row writes the K(V) it extracts, and a rewrite of
+--     row N writes the blob read from row N, or, when row N is missing, the
+--     K(N) re-extracted from the content the writer holds. The rewrite is one
+--     microsecond older, so it never replaces a stored blob (ADR-aacruzgon-0027);
+--   * the old keys of a write, the sweeper's K(V-1) and repair's keys come
+--     from that version's stored index_keys, never from re-extraction, except
+--     when its row is missing (ADR-aacruzgon-0027);
 --   * every write to resource_versions and the index tables carries USING
 --     TIMESTAMP derived from write_ts; a plain write would lose to them;
 --   * never bind null; leave absent columns unset (null writes a cell tombstone).
@@ -80,6 +89,26 @@ CREATE TABLE IF NOT EXISTS resources (
 
 -- Every version, newest first: vread, list_versions, and delete markers
 -- (a version row with deleted_at set and no data).
+--
+-- index_keys (ADR-aacruzgon-0027, walkthrough G22) is K(V), the exact index
+-- rows version V wrote, so that a later write, the sweeper and repair delete
+-- what was written, not what today's registry would extract. Encoding,
+-- format 1:
+--   byte    format version, 0x01
+--   varint  row count (unsigned LEB128)
+--   rows, each a table tag byte followed by the key columns that are not
+--   implied by the version row (tenant_id, resource_type, id, and
+--   last_updated = this row's last_updated are implied):
+--     0x01 resources_by_type        nothing
+--     0x02 token_code_index         param, code, system
+--     0x03 token_system_code_index  param, system, code
+--     0x04 token_system_index       param, system, code
+--     0x05 date_index               param, start, end
+--     0x06 date_index_by_end        param, end, start
+--     0x07 uri_index                param, uri
+--   text = varint byte length + UTF-8 bytes; timestamp = 8-byte big-endian
+--   signed milliseconds. A delete marker's K(V) is empty: 0x01 0x00.
+-- The worked example's K(1) (walkthrough section 7, 8 rows) is 289 bytes.
 CREATE TABLE IF NOT EXISTS resource_versions (
     tenant_id     text,
     resource_type text,
@@ -94,6 +123,8 @@ CREATE TABLE IF NOT EXISTS resource_versions (
                               -- the row came from a rewrite built from update's
                               -- StoredResource. Decides an unknown CAS outcome
                               -- that a later version superseded (ADR-aacruzgon-0026)
+    index_keys    blob,       -- the index rows this version wrote, encoded as
+                              -- below; never unset (ADR-aacruzgon-0027)
     PRIMARY KEY ((tenant_id, resource_type, id), version_id)
 ) WITH CLUSTERING ORDER BY (version_id DESC)
    AND comment = 'All versions per resource; vread, list_versions, delete markers';
@@ -112,8 +143,9 @@ CREATE TABLE IF NOT EXISTS resource_versions (
 -- version_id is the version the attempt's CAS will create. The sweeper
 -- replays that version's index writes while it is current, and only deletes
 -- the previous version's keys once it is superseded (ADR-aacruzgon-0013).
--- write_id is kept for diagnostics only; the sweeper never reads it (whether
--- to keep it is open, walkthrough G32).
+-- write_id is kept for diagnostics only, so an operator can match a stuck
+-- intent to the request that wrote it; the sweeper never reads it
+-- (ADR-aacruzgon-0027, walkthrough G32).
 -- gc_grace_seconds is lowered here too, which the roadmap checklist does not
 -- list: a resurrected intent row is harmless, because the sweeper either
 -- deletes it or replays writes that change nothing.

@@ -1,0 +1,185 @@
+# ADR-aacruzgon-0027: The open items are decided: `count`, date-only paging, stored index keys, the cap, the unread rows, `_sort`, the rejections, the sweeper and the schema's setup
+
+- **Date:** 2026-11-05
+- **Status:** accepted
+- **Context:**
+    - **Why now.** PR #33 (ADR-aacruzgon-0026) fixed the schema audit's findings. It left open the items that the walk-through, the coverage table and the schema README had carried since the Step 1 design sessions, plus older ones. Alan wants none of them left open before the team's sign-off (roadmap row 1.4).
+    - **Why each is a decision.** Each item has workable alternatives:
+        - Q5 / G32: the intent row's unread `write_id`.
+        - G7: `count` without the tag check, `count(tenant, None)`, and how far a filtered count may differ.
+        - G8: the mass-update tombstone case.
+        - G12: several sweepers.
+        - G18 and P5: index rows nobody reads.
+        - G20: date-only paging, `ne`, and "date-only" with several dates.
+        - G22: old keys recomputed with a registry that may have changed.
+        - G23: what a write returns when its index writes fail after its compare-and-swap applied.
+        - G27: the candidate cap's error and what it counts.
+        - C1: the Resource-level parameters.
+        - C2: `_id` with a pipe.
+        - C4: the pipe form on ContactPoint and boolean elements.
+        - C5: the AND driver.
+        - C6: `MaxPageSize`.
+        - C7: the composite part count, a failing `_has` hop, and `_has` itself.
+        - C8: the terminology modifiers.
+        - C9: which `_sort` counts as the default.
+        - C10: `_text` and `_content`.
+        - C11: `_filter`.
+        - P6: who applies the schema.
+        - Roadmap section 6, "To consider": a node-kill test, and a clean restart.
+    - **Checked against the code before it was written.** Every answer below was checked against `main` and the R4 spec. Where a recommendation did not fit, a proposal that does was put to Alan and accepted. For C5 and C7 the orchestrating session also checked the spec and #28 before Alan decided.
+- **Decision:**
+    - **Q5 / G32.** `pending_index_writes.write_id` is kept as a diagnostic, so an operator can match a stuck intent to a request's log. The sweeper still never reads it.
+    - **G7.**
+        - `gc_grace_seconds` stays at 3 h on `resources_by_type` (ADR-aacruzgon-0009).
+        - Operations rule: on the cluster, a replica down longer than `max_hint_window` (3 h) is replaced, not rejoined, so a resurrected row cannot outlive `gc_grace_seconds`.
+        - A filtered `search_count` uses tag checks and the candidate cap. An unfiltered `count` scans `resources_by_type`.
+        - `count(tenant, None)` sums `count` over the resource type names of every enabled FHIR version: `FhirVersion::enabled_versions()` with `FhirResourceTypeProvider::get_resource_type_names`, as `ResourceTypeScope` does (`crates/persistence/src/search/type_qualifier.rs:98-118`), each name once. No new table.
+        - `count` and a filtered `search_count` may differ in three cases: while a write is in flight; while a crashed write waits for the sweeper; and in the design's stated limitations (an intent that expired during a sweeper outage over 24 h, a request stalled past the grace period, or one paused past `gc_grace_seconds`), where an orphan row stays counted until a search repairs it.
+    - **G8.** A named benchmark case in roadmap Step 8: update every resource of one type once, then, within 3 h, run `count` and page an unfiltered search to its last page, recording tombstones scanned per read against `tombstone_warn_threshold` (1,000) and `tombstone_failure_threshold` (100,000).
+    - **G12.** Duplicate sweepers are accepted, with no lease row. This project runs one process. Every sweeper write carries the version's fixed timestamp, so extra sweepers write the same cells and only add duplicate reads.
+    - **G18 and P5.** These rows are dropped before index keys are computed:
+        - the extractor's `_id` token and `_lastUpdated` date rows;
+        - display-only tokens. The converter emits an empty code only for `CodeableConcept.text` with no coding, with no system (`search/converters.rs:189-197`). It skips a Coding without a code and an Identifier without a value (`converters.rs:444-445`, `502`);
+        - `token_system_index` rows for the implicit-system marker, and for system `''`;
+        - URI rows whose URI is empty, which `convert_to_uri` writes for an empty string (`search/converters.rs:670-678`).
+    - **G20.**
+        - **Paging.** Date-only searches page natively in the table's own order: `(start, id)` ascending on `date_index`, `(end, id)` ascending on `date_index_by_end`.
+        - **Cursor.** `sort_values = [<start or end>, <reserved bucket slot>, "start" | "end"]`. The third element names the table, so a cursor from another order is `InvalidCursor`. The `(last_updated, id)` cursor keeps its two elements.
+        - **Several rows per resource.** A resource with several values is emitted once, at its first matching row in slice order.
+        - **`ge`** is the single slice `end > s`, with the full predicate as residual.
+        - **`ne`, and a comma list whose values slice both tables.** They read `date_index`'s slices first, then `date_index_by_end`'s, each in its own order. A resource is emitted at its first matching row in that concatenated order, and the cursor's third element names the table being read.
+        - **Several dates.** With two or more date parameters, a repeated date, or a date with `_lastUpdated`, one is sliced and the rest are residuals. The sliced one is `_lastUpdated` if present, which then pages in the default order. Otherwise it is the first date parameter in query order, and the first occurrence of a repeated one.
+    - **G22.** Each version stores the index rows it wrote.
+        - **The column.** `resource_versions.index_keys blob`, written in the same row and statement as the version: V1 and V2 at step 4, the V3 rewrite, and the sweeper's replay of a missing row. It adds no write.
+        - **The encoding.** Format 1, documented in `schema.cql` and the walk-through: a format byte `0x01`, a varint row count, then per row a table tag and the key columns the version row does not imply (`tenant_id`, `resource_type`, `id` and `last_updated` are the row's own). Strings are varint-length-prefixed UTF-8; timestamps are 8-byte milliseconds. A delete marker's set is `0x01 0x00`.
+        - **Deletes use the stored set, not re-extraction.** So do the sweeper's `K(V−1)`, the sweeper's `K(V)` when row V exists, and repair on read.
+        - **When row N is missing**, its writer crashed before step 4 or is still running. `K(N)` is then re-extracted from the content the writer holds, as before. Deleting keys that were never written costs only tombstones, and a slow writer's late insert loses to the deletes at `write_ts(N+1)`.
+        - **The V3 rewrite of row N** carries the blob read from row N, or, when row N was missing, the re-extracted `K(N)`. It is never left unset. It is written one microsecond below `write_ts(N)`, and every stored blob is written at `write_ts(N)`, so the rewrite never replaces one: the original wins every cell, as the existing V3 rule says.
+        - **Versions written before the column.** None exist: no Cassandra data predates this schema, so every version row has `index_keys`.
+        - **Reads.** One extra point read of row N (R3, `LOCAL_QUORUM`) for `update`, whose `StoredResource` has no blob; for `update_with_match`, `delete` and `delete_versioned`, whose pre-read is of `resources`, which has no blob; for each `create_or_update` turn on a live row; for the sweeper when V is current (R3 for V); and for repair on read. None for `create`, for a `create_or_update` turn on an absent id or a delete marker, for a superseded intent, or for an unknown CAS outcome.
+    - **G23.** When the compare-and-swap applied but the index writes failed after retries, the write returns success, and the sweeper finishes it. The design's claim is narrowed to "searchable within poll interval plus grace when the index writes fail".
+    - **G27.** The cap's error is 422 `SearchError::TooManyResults`, issue `processing` (`crates/rest/src/error.rs:1123-1125`, `591-595`).
+        - No new variant is added.
+        - No search produces `too-costly`; its one producer is the batch handler's 500 for a transaction too large for MongoDB's cache (`crates/rest/src/handlers/batch.rs:3745`).
+        - The cap counts distinct candidates point-read, per page or per `search_count`.
+        - The compartment cap (ADR-aacruzgon-0026) follows this rule.
+    - **C1.** `_profile`, `_source`, `_tag` and `_security` are in scope. `coverage.md` section 4 stands. `_tag` and `_security` are Codings, served by the three token tables (`meta_params_suite.rs` asserts both directions).
+    - **C2.** An `_id` value is compared whole with the id, pipe included, as SQLite and PostgreSQL do: both bind `value.value` into `id IN (…)` (`backends/sqlite/search/query_builder.rs:1159-1224`, `backends/postgres/search/query_builder.rs:1870-1929`). A FHIR id cannot contain `|`, so `_id=sys|abc` and `_id=|abc` return an empty searchset.
+    - **C4.** The pipe form on ContactPoint and boolean elements is accepted and matched by the general token rules. Neither SQLite nor PostgreSQL has a case for those types (`backends/sqlite/search/parameter_handlers/token.rs:12-19`, `86-120`; `backends/postgres/search/query_builder.rs:2344-2394`). So `phone|555-0100` matches a phone ContactPoint, and `|true` matches a boolean.
+    - **C5.** The AND driver is the first parameter in a fixed order, with no statistics, so that the most specific key drives:
+        1. `_id`;
+        2. `system|code` and `|code` tokens;
+        3. identity URIs;
+        4. code-only tokens, `_profile`, `_source` and every other URI parameter, whose values many resources share (every US Core Patient carries the same profile);
+        5. `system|` tokens;
+        6. `_lastUpdated`, only when nothing else can drive.
+
+      Ties go by query order. Dates beside another parameter never drive (they are residuals), and other types are refused before any read. The order is revisited only if the Step 8 benchmark shows it matters.
+        - **Identity URI:** a registered `uri` parameter whose expression is the resource's own canonical `url`. Checked against the R4 registry (`data/search-parameters-r4.json`): `url` on 28 types (ActivityDefinition, CapabilityStatement, ChargeItemDefinition, CodeSystem, CompartmentDefinition, ConceptMap, EffectEvidenceSynthesis, EventDefinition, Evidence, EvidenceVariable, ExampleScenario, GraphDefinition, ImplementationGuide, Library, Measure, MessageDefinition, OperationDefinition, PlanDefinition, Questionnaire, ResearchDefinition, ResearchElementDefinition, RiskEvidenceSynthesis, SearchParameter, StructureDefinition, StructureMap, TerminologyCapabilities, TestScript, ValueSet), and `system` on CodeSystem, whose expression is `CodeSystem.url`. Not `url` on Device (`Device.url`, a network address), Contract (`Contract.url`, the basal contract definition) or Subscription (`Subscription.channel.endpoint`).
+        - **Why fixed.** The spec defines only the result: every parameter must match, and the order without `_sort` is the server's choice ([R4 search.html](https://hl7.org/fhir/R4/search.html)). [Discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28) asks for "a (hopefully lightweight) query planner", warns against post-filtering "millions of rows only to discard most of them", and notes that "Cassandra's data model essentially forces you to pre-plan your queries". The cost hooks it sketches (`QueryCostEstimator`, `estimated_cost`) do not exist in the code.
+    - **C6.** `MaxPageSize` is REST's `HFS_MAX_PAGE_SIZE` (default 1000, `crates/rest/src/config.rs:1331-1332`), which clamps `_count` before the backend is called (`crates/rest/src/handlers/search.rs:606-612`). The backend has no limit of its own and declares `MaxPageSize(1000)`, as every other backend does (`backends/sqlite/backend.rs:936`).
+    - **C7.** The 400s are what the shared code returns today, pinned by Step 6 tests (roadmap section 5):
+        - a composite value with the wrong `$` part count is `SearchError::InvalidComposite` from the shared gate `validate_composite_values` (`crates/persistence/src/search/composite_value.rs:127-141`), which REST runs while building the query (`crates/rest/src/extractors/search_query_builder.rs:243`). REST maps it to `BadRequest`, 400, issue `invalid` (`crates/rest/src/error.rs:1109-1115`, `570-571`);
+        - a `_has` fails at its terminal hop when the terminal's parameter type is not served: the resolver's search through our `search()` returns `UnsupportedParameterType`, which REST maps the same way (`crates/rest/src/handlers/search.rs:678`).
+    - **C7, `_has`.** `_has` is served when its terminal parameter is token, date or URI. REST's shared resolver (`crates/persistence/src/search/chain_resolver.rs`) runs the terminal search through our base `search()` page by page and reads the references in Rust (`chain_resolver.rs:693-771`), so the backend never sees `_has`.
+        - **The spec allows answering it.** [R4 search.html](https://hl7.org/fhir/R4/search.html) says "Servers are not required to implement any of the standard search parameters", and gives no `_has`-specific rule. Unknown and unsupported parameters are already handled in REST: ignored by default, an error under `Prefer: handling=strict`.
+        - **#28 places it above the backend.** [Discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28): "Search is a base trait plus extension traits", with chaining an extension; the design implements base `SearchProvider` only. #28's work-in-progress matrix marks `_has` unsupported for Cassandra, and the design already says the persistence README matrix supersedes it. That matrix's Cassandra `_has` row becomes ◐, "through the shared resolver, when its terminal parameter is token, date or URI", at roadmap Step 8.
+        - **Its cost.** The resolver drains every page of the terminal search into memory (`search_all_pages`, `chain_resolver.rs:268`, called at line 758), so a broad terminal, such as a common Observation code, is expensive. Roadmap Step 8 names it as a benchmark case.
+        - The Step 6 test that pins it stays (roadmap section 5).
+    - **C8.** The design matches the REST code, which runs before the backend is called:
+        - 501 `TerminologyRequired` for token `:in`, `:above` and `:below` without a terminology server (`crates/rest/src/handlers/search.rs:430-466`);
+        - a plain comma OR with one (`expand_terminology_params`, line 429);
+        - 501 for `:not-in` always (lines 411-426).
+    - **C9.** `_sort` counts as the default only when it equals the search's native order:
+        - absent, or `-_lastUpdated` where the order is `(last_updated DESC, id DESC)`;
+        - on a date-only search sliced on a date table, `-_lastUpdated` is not the native order.
+
+      Every other value follows the design's existing rule: `QueryParseError`, 400.
+    - **C10.** `_text` and `_content` are checked by name in the Cassandra backend's `search()` and `search_count()`, before the type check, so they get 501 `TextSearchNotAvailable`. REST passes both through: they are in `GLOBAL_SEARCH_PARAMS` (`crates/rest/src/extractors/search_query_builder.rs:297-298`), and SQLite serves them.
+    - **C11.** `_filter` is refused by name in the Cassandra backend's `search()` and `search_count()`, with `_text` and `_content` and before the type check, as `BackendError::UnsupportedCapability`. REST maps that to 501, issue `not-supported` (`crates/rest/src/error.rs:1209-1211`, `656-659`). REST is unchanged: it passes `_filter` through (`search_query_builder.rs:184`, `299`), and SQLite (`backends/sqlite/search/query_builder.rs:1237-1240`) and MongoDB serve it.
+    - **P6.** The schema is applied from one process, a setup command or the test harness. `initialize` only checks that the ten tables exist (roadmap Step 2).
+    - **Roadmap section 6.**
+        - A node-kill test: Cassandra killed with `kill -9` under write load on the single node. Expected: up to one `commitlog_sync_period` of acknowledged writes lost, no half-applied batch, and no index row for a resource whose CAS was lost.
+        - The Restart row is a clean restart: `nodetool drain`, then stop.
+- **Alternatives considered:**
+    - **Q5:** drop the column. This lost: it costs 16 bytes per intent row, and it is the only link from a stuck intent to the request that wrote it.
+    - **G7:**
+        - Tag-check `count`. This lost: one point read per row.
+        - Raise `gc_grace_seconds` on `resources_by_type` back to 10 days. This lost: tombstones there are the G8 cost, and the replace-not-rejoin rule closes the resurrection case instead.
+        - `count(tenant, None)` over the registry's `resource_types()`, the first recommendation. This lost: it returns the bases of registered parameters (`crates/fhir/src/search/registry.rs:538-541`), which in R4 include the abstract `Resource` and `DomainResource` and miss `Binary`, `Parameters` and `OperationOutcome` (`data/search-parameters-r4.json`), so it would undercount.
+        - A per-tenant types table. This lost: another write on every create, for one internal caller.
+    - **G12:** a lease row taken with an LWT. This lost: an LWT per poll, and a lease outliving a crashed holder would stall every intent until it expired.
+    - **G20:**
+        - Keep reading the whole candidate set on every page and sorting in Rust. This lost: the cost on page k is that of all k pages, and every one-sided prefix reaches the cap on large tenants.
+        - Keep `ge` as a union. This lost: two tables with no shared order cannot page natively.
+        - Merge `ne`'s two slices by one key. This lost: the tables share no order, so a merge would need the whole candidate set.
+    - **G22:**
+        - Accept the orphans, the earlier proposal. This lost: the registry changes at runtime per tenant (a `SearchParameter` write invalidates it, `crates/persistence/src/backends/sqlite/storage.rs:520-529`), and the orphans waste point reads, count against the cap, and are never cleaned.
+        - Store the key set on `resources` too, where `delete`, `create_or_update` and repair already read. Raised by the worker, not chosen: it would save their extra read, but every compare-and-swap would carry the blob through Paxos, and `update` would still need a read. The decision keeps it with the version it describes.
+    - **G23:** 5xx. This lost: a client's retried POST would create a second resource.
+    - **G27:** a new variant mapped to `too-costly`. This lost: it is an upstream change for the same status class, and 422 already tells the client the request was too broad.
+    - **C1:** say there are no URI rows. This lost: the extractor already indexes all four, `meta_params_suite.rs` expects them, and no table change is needed.
+    - **C2:** 400 for a pipe in `_id`. This lost: SQLite and PostgreSQL return an empty result, and the backends should agree.
+    - **C4:** 400 for the pipe form. This lost: SQLite and PostgreSQL accept it, and refusing it would make the backends disagree.
+    - **C5:**
+        - Choose the driver from statistics. This lost: no selectivity source exists, #28's cost hooks are not in the code, and the benchmarks may show the fixed order is enough.
+        - The first recommendation, `_id`, `system|code`, code-only tokens, string, date. This lost: string and date never drive here, and it did not place URI, `|code`, `system|` or `_lastUpdated`.
+        - All URIs in one rank. This lost: a canonical `url` names one resource, while `_profile` and `_source` are tags thousands share.
+    - **C7:** refuse `_has`. This lost: the backend never sees it, so it could not, and the spec does not require it.
+    - **C6:** a separate, lower backend limit. This lost: REST already clamps, and two limits could disagree.
+    - **C8:** the design's earlier 400. This lost: REST decides these before the backend is called, so the backend cannot change them.
+    - **C9:** accept `_sort=_lastUpdated` (ascending), or `_sort=date` on a date-only search. This lost: the rule stays "only the native order", stated once.
+    - **C11:** a REST-layer 501 checked by name, the first recommendation. This lost: REST passes `_filter` through and SQLite and MongoDB serve it, so a REST-layer refusal would break them.
+    - **P5:** keep writing every extracted row. This lost: one row in three for every `code`-typed element, and `_lastUpdated` rows that move on every update.
+    - **P6:** `initialize` applies the schema. This lost: several processes would change the schema at once, which the Apache docs do not cover.
+    - **Roadmap section 6:** kill the node on Restart. This lost: at RF 1 it would fail by design, so the loss gets its own row.
+- **Consequences:**
+    - **Easier:**
+        - date-only searches page at the cost of one page, not of every earlier page;
+        - fewer index rows and tombstones per write;
+        - deletes remove exactly what a version wrote, whatever the registry says now, so a `SearchParameter` change leaves no orphans;
+        - every error the cap produces is the same 422;
+        - the schema has one owner at setup.
+    - **Harder or costlier:**
+        - a date-only page comes in date order, not in the default order, so a client that pages a date-only search and then a token search sees two orders. The scope table says so;
+        - a `_has` with a broad terminal reads every page of it; a Step 8 benchmark case;
+        - one extra point read per `update`, `update_with_match`, `delete` and live `create_or_update` turn, per current-version sweep, and per repair;
+        - `index_keys` costs about 289 bytes per version in the worked example (8 rows), and at most about 4 KB more per row with the 2 KiB rule;
+        - **known limitation:** adding a `SearchParameter` does not index existing resources. They are found by it only after their next write, and no reindex exists.
+    - **Schema:** `resource_versions.index_keys blob`. `expected-schema.txt` has 91 rows; the CI assertion checks the new column.
+    - **Settled by earlier decisions, now marked as such in the walk-through:** G14 (ADR-aacruzgon-0011), G15 (ADR-aacruzgon-0025), G19 (the design's `_lastUpdated` rule), G21 (roadmap 6d), G24 and G28 (ADR-aacruzgon-0024), G29 (design step 4), G30 (the design's measure-first decision), C3 (the design's token rules).
+    - **To measure:** date-only page latency in the table's order; how often the cap's 422 fires; the mass-update case (G8); the broad `_has` case and the AND driver (C5, C7); `index_keys` sizes on the fixtures (roadmap sections 7 and Step 8).
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5). An orchestrating Claude Code session ran a Rex worker session in its own worktree.
+    - **What the AI proposed:**
+        - The audit worker identified the open items in its report and in the PR #33 description.
+        - The orchestrating Claude Code session recommended each answer, in two rounds.
+        - The worker checked each answer against the code and the spec, wrote the ones that fit, and reported the ones that did not, with evidence and a proposal. It also drafted this entry.
+    - **Where the code did not fit the recommendations, and what replaced them:**
+        - `count(tenant, None)` over the registry's `resource_types()`: replaced by every enabled version's resource type names.
+        - "`count` and `search_count` differ only while writes are in flight": replaced by the three cases above.
+        - G20's "the table's own order" for `ne` and cross-table comma lists: replaced by reading `date_index`, then `date_index_by_end`.
+        - C11's REST-layer 501: replaced by a backend-layer `BackendError::UnsupportedCapability`, REST unchanged.
+        - C5's order naming string and date, which never drive here, and not placing URI, `|code`, `system|` or `_lastUpdated`: the worker proposed a full order with URI as one rank.
+        - C7's "failing `_has` hop": the example the coverage table gave does not fail; `_has` with a served terminal is answered through the shared resolver.
+    - **C5 and C7, checked against the spec and #28.** At Alan's request, the orchestrating Claude Code session checked the R4 search page, Discussion #28 and the design's polyglot table for both. C5 changed as a result: URI is split into identity URIs (rank 3) and shared tags (`_profile`, `_source`, rank 4). The worker checked the identity URIs against the R4 registry and the `search_all_pages` line numbers.
+    - **What the human changed:**
+        - Alan accepted all the recommendations, then accepted the worker's four proposals for the first round's misfits, then the C5 and C7 conclusions.
+        - G22 was reversed after Alan asked "why would we leave orphan rows?". The earlier proposal had been to accept them; Alan decided to store each version's key set instead.
+    - **Verified:**
+        - Code read at the PR #33 head (`1a838beca`): the registry's `resource_types()` and the R4 parameter bases; `ResourceTypeScope` and `FhirResourceTypeProvider`; the token converter; the SQLite and PostgreSQL token and `_id` predicates; the SQLite registry invalidation; REST's `_count` clamp and `HFS_MAX_PAGE_SIZE`; the composite gate; the chain resolver; the REST terminology, `_text`, `_content` and `_filter` handling; the error mappings; `PageCursor`.
+        - Spec: [R4 search.html](https://hl7.org/fhir/R4/search.html) #token (the pipe rule), #prefix (`ge`, `ne`), #has, and "Servers are not required to implement any of the standard search parameters"; [R4 datatypes.html#id](https://hl7.org/fhir/R4/datatypes.html#id). Discussion #28's quotes, as cited above.
+        - The R4 registry's `uri` parameters (`data/search-parameters-r4.json`), for the identity URIs.
+        - The `index_keys` sizes were computed by encoding the worked example's key sets: `K(1)` 289 bytes, `K(2)` 293, the empty set 2.
+        - On a fresh 5.0.9 node: `keyspace-single-node.cql` and the revised `schema.cql` applied twice, silently, with ten tables. The CI assertion passed with 91 rows. It failed with a one-line diff when `index_keys` was typed `text` or left out, and passed again after the real schema was restored. V1 with the 289-byte `K(1)`, then a V3 at `write_ts(1) − 1` with another blob: row 1 kept the original blob and data. A V3 for a missing row 2 restored it, and the original written afterwards at `write_ts(2)` replaced every cell. The node was removed afterwards.
+- **Links:**
+    - **Files:**
+        - `docs/Cassandra/schema/schema.cql` (`resource_versions.index_keys`, its encoding, the statement rules) and `schema/expected-schema.txt`;
+        - `docs/Cassandra/schema/walkthrough.md`: section 1, section 2 ("Stored key sets"), 3.1 to 3.5, 5.1, 5.7, 5.9, 5.11, section 6, the worked example, section 8;
+        - `schema/coverage.md`: sections 1 to 7;
+        - `schema/README.md`: checklist, changes table, proposals and decisions;
+        - `cassandra-discussion.md`: scope table, `_id` note, paging capability, data model, token rules, write path steps 1 and 4, sweeper, repair, tombstones, capabilities and rejection, open questions, `count`;
+        - `development-roadmap.md`: rows 5.2 and 6a, Step 1 checklist, Steps 5, 6, 6a, 6b and 8, sections 5 and 6.
+    - **Builds on:** ADR-aacruzgon-0009, 0012, 0013, 0017, 0024, 0026.
+    - **Sources:** [R4 search.html](https://hl7.org/fhir/R4/search.html); [Discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28).
+    - **Pull request:** #33.

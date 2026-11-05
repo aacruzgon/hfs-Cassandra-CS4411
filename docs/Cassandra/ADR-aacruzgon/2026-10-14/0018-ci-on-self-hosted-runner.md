@@ -8,7 +8,7 @@
     - **No runner is registered yet.** `gh api repos/aacruzgon/hfs-Cassandra-CS4411/actions/runners` returned 0 runners on 2026-10-14.
     - **The inherited `ci.yml` is the precedent.** Every job in it targets `self-hosted` labels; it was archived to `.github/disabled-workflows/` because this fork had no such runner and its jobs queued forever.
 - **Decision:**
-    - Every workflow added for Step 0 (0.4, 0.5, 0.11) runs on the team's self-hosted runner, a machine with 32 GB of RAM and an AMD 7900X CPU. *Corrected 2026-10-14:* this first said "the team's own server, separate from the five team machines". The machine is Sam's own desktop, which he also develops on, registered as `sam-7900x` (ADR-sam-michaels-0001).
+    - Every workflow added for Step 0 (0.4, 0.5, 0.11) runs on the team's self-hosted runner, a machine with 32 GB of RAM and an AMD 7900X CPU. *Corrected 2026-10-14:* this first said "the team's own server, separate from the five team machines". The machine is Sam's own desktop, which he also develops on, registered as `sam-7900x` (ADR-sam-michaels-0001). *Update 2026-11-04:* a second runner, `acruzdebian` (Alan's 15 GB Debian desktop), takes the light jobs alongside `sam-7900x`; the clippy jobs stay on `sam-7900x` (ADR-aacruzgon-0023).
     - Its `runs-on` labels and OS are recorded in the roadmap Step 0 bullet when the runner is registered, and no CI workflow is written before then.
     - The CI items are built in this order: register the runner, then 0.4, then 0.5 (fmt, clippy, Cassandra job), then 0.11. Roadmap Step 0 lists the reasons.
 - **Alternatives considered:**

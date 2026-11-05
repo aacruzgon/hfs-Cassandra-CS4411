@@ -17,7 +17,7 @@
 - **Consequences:**
     - **Every pull request runs CI, docs ones included.** On the runner this costs about 3 s once the target directory is warm (ADR-sam-michaels-0002). `.github/workflows/coverage.yml` also runs on GitHub-hosted runners, which are free for a public repository.
     - **This deviates from `CONTRIBUTING.md`,** which still asks for `[skip ci]`. That file is upstream's and is merged weekly from `upstream/main`, so it is left unchanged. This repository's rule is recorded instead in the roadmap's ground rules and in the "Commits and CI" section of `AGENTS.md` and `CLAUDE.md`, which the AI assistants read.
-    - **The runner must be on for a pull request to merge.** The required check only runs on `sam-7900x` (ADR-sam-michaels-0001). If Sam's desktop is off, pull requests wait; an admin can still bypass in an emergency.
+    - **The runner must be on for a pull request to merge.** The required check only runs on `sam-7900x` (ADR-sam-michaels-0001). If Sam's desktop is off, pull requests wait; an admin can still bypass in an emergency. *Update 2026-11-04:* the light checks also run on `acruzdebian`; only the two clippy checks still need `sam-7900x` (ADR-aacruzgon-0023).
     - **The check's name is now a contract.** Renaming the job's `name:` in `r4b-compile-check.yml` breaks the ruleset until the required check is renamed in the same change.
 - **AI involvement:**
     - **Tool and model:** Claude Code (Opus 5.5).

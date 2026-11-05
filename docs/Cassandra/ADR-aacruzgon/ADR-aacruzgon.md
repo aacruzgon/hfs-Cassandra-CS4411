@@ -69,3 +69,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0022](2026-10-15/0022-require-sha-pinned-actions.md) | 2026-10-15 | Every action is pinned to a commit SHA, and the repository requires it | accepted |
 | [0023](2026-11-04/0023-light-heavy-runners-acruzdebian.md) | 2026-11-04 | CI splits into light and heavy jobs, and `acruzdebian` joins as a second runner for light jobs only | accepted |
 | [0024](2026-11-05/0024-create-or-update-race-loop.md) | 2026-11-05 | `create_or_update` is a bounded CAS loop on every branch, with one intent row per attempt and a fixed rule for unknown outcomes | accepted |
+| [0025](2026-11-05/0025-readhistory-stays-true.md) | 2026-11-05 | `readHistory` stays `true` on Cassandra; only the history interactions are omitted | accepted |

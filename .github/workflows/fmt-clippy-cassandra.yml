@@ -25,7 +25,7 @@ concurrency:
 env:
   # Pinned by environment, which rustup ranks above any directory override left
   # on the runner (the inherited ci.yml hit exactly that). Cargo itself refuses
-  # a toolchain older than the workspace rust-version, 1.90.
+  # a toolchain older than the workspace rust-version, 1.91.1.
   RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
 

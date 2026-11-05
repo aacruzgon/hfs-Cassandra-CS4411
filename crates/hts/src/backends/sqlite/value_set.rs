@@ -44,6 +44,7 @@ use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
+use crate::backends::hierarchy::ConceptKey;
 use crate::ecl;
 use crate::error::HtsError;
 use crate::traits::ValueSetOperations;
@@ -244,7 +245,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         // `http://hl7.org/fhir/test/ValueSet/version`).  Falling through to
         // `spawn_blocking` ensures `resolve_value_set_versioned` filters on
         // version correctly.
-        if req.value_set.is_none() && req.value_set_version.is_none() {
+        if req.value_set.is_none()
+            && req.value_set_version.is_none()
+            && req.selected_value_set_id.is_none()
+        {
             if let Some(url) = req.url.as_deref() {
                 if let Ok(guard) = self.implicit_index.read() {
                     if let Some(concept_idx) = guard.get(url).cloned() {
@@ -807,14 +811,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 // `resolve_value_set_versioned` win would expand its empty/skeleton
                 // compose and silently return zero codes for SNOMED — masking the
                 // working `bfs_isa_page`/implicit-cache traversal below.
-                let implicit_short_circuit = parse_fhir_vs_url(url).is_some();
+                let implicit_short_circuit = req.selected_value_set_id.is_none()
+                    && parse_fhir_vs_url(url).is_some();
                 let resolution = if implicit_short_circuit {
                     Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
                 } else {
-                    resolve_value_set_versioned(
+                    resolve_selected_value_set(
                         &conn,
                         url,
                         req.value_set_version.as_deref(),
+                        req.selected_value_set_id.as_deref(),
                         req.date.as_deref(),
                     )
                 };
@@ -993,7 +999,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             cached
                         }
                     }
-                    Err(HtsError::NotFound(_)) => {
+                    Err(HtsError::NotFound(_)) if req.selected_value_set_id.is_none() => {
                         // ── BFS fast path for cold-cache implicit ValueSets ───────────
                         // When the cache is empty and the client requested a bounded page
                         // (count > 0), serve it immediately from BFS/SQL traversal and
@@ -1336,7 +1342,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         // rare on the hot path.
         let cache_key: Option<String> = if req.default_value_set_versions.is_empty() {
             Some(format!(
-                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                req.selected_value_set_id.as_deref().unwrap_or(""),
                 url,
                 req.value_set_version.as_deref().unwrap_or(""),
                 req.system.as_deref().unwrap_or(""),
@@ -1378,9 +1385,19 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-            if let Some(resp) = crate::bcp13::validate_mimetypes_code(&url, &req) {
-                return Ok(resp);
-            }
+            let selected_vs_version = if let Some(id) = req.selected_value_set_id.as_deref() {
+                conn.query_row(
+                    "SELECT version FROM value_sets WHERE \
+                     COALESCE(json_extract(resource_json, '$.id'), id) = ?1",
+                    [id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|error| HtsError::StorageError(error.to_string()))?
+                .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?
+            } else {
+                lookup_value_set_version(&backend, &conn, &url)
+            };
 
             // Resolve the expansion — try explicit ValueSet first, then the two
             // implicit-ValueSet fallbacks used by $expand.
@@ -1392,20 +1409,38 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // `resolve_value_set_versioned` win would expand its empty/skeleton
             // compose to zero codes and force `result=false` for every input —
             // masking the targeted `validate_fhir_vs` lookup below.
-            let implicit_short_circuit = parse_fhir_vs_url(&url).is_some();
+            let implicit_short_circuit =
+                req.selected_value_set_id.is_none() && parse_fhir_vs_url(&url).is_some();
             let resolution = if implicit_short_circuit {
                 Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
             } else {
-                resolve_value_set_versioned(
+                resolve_selected_value_set(
                     &conn,
                     &url,
                     req.value_set_version.as_deref(),
+                    req.selected_value_set_id.as_deref(),
                     req.date.as_deref(),
                 )
             };
             let (all_codes, compose_json_for_version): (Vec<ExpansionContains>, Option<String>) =
                 match resolution {
                     Ok((vs_id, compose_json)) => {
+                        if let Some(response) = crate::bcp13::validate_stored_mimetypes_code(
+                            &url,
+                            compose_json.as_deref(),
+                            &req,
+                        ) {
+                            let bcp13_loaded: bool = conn
+                                .query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = ?1)",
+                                    [crate::bcp13::BCP13_SYSTEM],
+                                    |row| row.get(0),
+                                )
+                                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+                            if !bcp13_loaded {
+                                return Ok(response);
+                            }
+                        }
                         let saved = compose_json.clone();
                         // Bypass the `value_set_expansions` cache when the
                         // compose describes a multi-version overload — the
@@ -1465,7 +1500,21 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         };
                         (codes, saved)
                     }
-                    Err(HtsError::NotFound(_)) => {
+                    Err(error @ HtsError::NotFound(_)) if req.selected_value_set_id.is_none() => {
+                        // A version or date miss must not bypass a stored definition.
+                        if let Some(response) = crate::bcp13::validate_mimetypes_code(&url, &req) {
+                            let has_stored_definition: bool = conn
+                                .query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM value_sets WHERE url = ?1)",
+                                    [&url],
+                                    |row| row.get(0),
+                                )
+                                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+                            if has_stored_definition {
+                                return Err(error);
+                            }
+                            return Ok(response);
+                        }
                         // ?fhir_vs implicit ValueSet: do a targeted O(1)/O(depth) lookup
                         // instead of materializing all concepts (which times out for large
                         // code systems like SNOMED CT with ~350k concepts).
@@ -1512,7 +1561,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 .as_deref()
                                 .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
                                 .unwrap_or(false);
-                            let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
+                            let vs_version_owned = selected_vs_version.clone();
                             return finish_validate_code_response(
                                 found,
                                 &req.code,
@@ -1574,7 +1623,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             .as_deref()
                             .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
                             .unwrap_or(false);
-                        let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
+                        let vs_version_owned = selected_vs_version.clone();
                         return finish_validate_code_response(
                             found,
                             &req.code,
@@ -1689,7 +1738,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .collect();
                 if distinct_systems.len() >= 2 {
                     distinct_systems.sort();
-                    let vs_v = lookup_value_set_version(&backend, &conn,&url);
+                    let vs_v = selected_vs_version.clone();
                     let vs_canonical = match vs_v.as_deref() {
                         Some(v) if !v.is_empty() => format!("{url}|{v}"),
                         _ => url.clone(),
@@ -1861,7 +1910,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // supplied) against stored CS versions and the VS include pin.
             // Also fires when the caller supplies no version but the VS pins
             // a version that doesn't exist in the DB.
-            let vs_version_for_mismatch = lookup_value_set_version(&backend, &conn,&url);
+            let vs_version_for_mismatch = selected_vs_version.clone();
             let mismatch = if let (Some(req_ver), Some(system)) =
                 (req.version.as_deref(), effective_system.as_deref())
             {
@@ -2026,7 +2075,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .or(from_compose)
                     .or_else(|| cs_version_for_msg(&backend, &conn,s))
             });
-            let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
+            let vs_version_owned = selected_vs_version.clone();
             let cs_is_fragment = system_for_msg
                 .as_deref()
                 .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
@@ -2149,7 +2198,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             {
                 let mut stmt = conn
                     .prepare_cached(
-                        "SELECT id, url, version, name, title, status
+                        "SELECT COALESCE(json_extract(resource_json, '$.id'), id), url, version, \
+                         name, title, status
                          FROM value_sets
                          WHERE (?1 IS NULL OR url = ?1)
                            AND (?2 IS NULL OR version = ?2)
@@ -2202,7 +2252,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, url, version, name, title, status, resource_json
+                    "SELECT COALESCE(json_extract(resource_json, '$.id'), id), url, version, name, \
+                     title, status, resource_json
                      FROM value_sets
                      WHERE (?1 IS NULL OR url = ?1)
                        AND (?2 IS NULL OR version = ?2)
@@ -2244,7 +2295,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 let (id, url, version, name, title, status, resource_json) =
                     row.map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-                let resource = resource_json
+                let mut resource = resource_json
                     .and_then(|j| serde_json::from_str(&j).ok())
                     .unwrap_or_else(|| {
                         super::code_system::build_synthetic_resource(
@@ -2257,6 +2308,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             &status,
                         )
                     });
+                resource["id"] = serde_json::Value::String(id);
                 results.push(resource);
             }
             Ok(results)
@@ -2282,6 +2334,30 @@ fn resolve_value_set(
     date: Option<&str>,
 ) -> Result<(String, Option<String>), HtsError> {
     resolve_value_set_versioned(conn, url, None, date)
+}
+
+/// Exact instance lookup uses the public-ID index and rejoins the stored
+/// expansion path, including its persistent cache and version overrides.
+fn resolve_selected_value_set(
+    conn: &Connection,
+    url: &str,
+    version: Option<&str>,
+    selected_id: Option<&str>,
+    date: Option<&str>,
+) -> Result<(String, Option<String>), HtsError> {
+    let Some(id) = selected_id else {
+        return resolve_value_set_versioned(conn, url, version, date);
+    };
+    conn.query_row(
+        "SELECT id, compose_json FROM value_sets
+         WHERE COALESCE(json_extract(resource_json, '$.id'), id) = ?1
+           AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2)",
+        rusqlite::params![id, date],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|e| HtsError::StorageError(e.to_string()))?
+    .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))
 }
 
 /// Look up a ValueSet by canonical URL with an optional version pin.
@@ -4226,11 +4302,17 @@ fn apply_compose_filters(
                 ));
             }
             any_filter_seen = true;
-            let closure: HashSet<String> =
-                ecl::parse_and_evaluate(conn, system_id, &format!("<< {value}"))?
-                    .into_iter()
-                    .map(|c| c.code)
-                    .collect();
+            // Evaluate the closure on the AST rather than an `<< {value}` ECL
+            // string so non-SNOMED codes (e.g. `E11.6`) survive (#2114).
+            let closure: HashSet<String> = ecl::evaluate_hierarchy(
+                conn,
+                system_id,
+                ecl::ConceptOperator::DescendantOrSelf,
+                value,
+            )?
+            .into_iter()
+            .map(|c| c.code)
+            .collect();
             match result.as_mut() {
                 Some(prev) => prev.retain(|c| !closure.contains(&c.code)),
                 None => {
@@ -4253,12 +4335,16 @@ fn apply_compose_filters(
         } else {
             property
         };
-        let ecl_expr: String = match (property_norm, op) {
-            ("constraint", "=") => value.to_owned(),
-            ("concept", "is-a") => format!("<< {value}"),
-            ("concept", "descendent-of") => format!("< {value}"),
+        // `constraint =` carries a real ECL expression and goes through the
+        // parser (`None`). The concept hierarchy ops carry a bare code from an
+        // arbitrary code system — ICD-10-CM `E11.6` is not a valid ECL concept
+        // id — so they map to an operator applied to the code directly (#2114).
+        let hierarchy_op: Option<ecl::ConceptOperator> = match (property_norm, op) {
+            ("constraint", "=") => None,
+            ("concept", "is-a") => Some(ecl::ConceptOperator::DescendantOrSelf),
+            ("concept", "descendent-of") => Some(ecl::ConceptOperator::DescendantOf),
             // generalizes: all X such that value is-a X (ancestors of value + self).
-            ("concept", "generalizes") => format!(">> {value}"),
+            ("concept", "generalizes") => Some(ecl::ConceptOperator::AncestorOrSelf),
             _ => {
                 tracing::warn!(
                     property,
@@ -4320,8 +4406,11 @@ fn apply_compose_filters(
             continue;
         }
 
-        // Slow path: no prior bounded set — compute the full ECL expansion.
-        let resolved = ecl::parse_and_evaluate(conn, system_id, &ecl_expr)?;
+        // Slow path: no prior bounded set — compute the full expansion.
+        let resolved = match hierarchy_op {
+            Some(hierarchy_op) => ecl::evaluate_hierarchy(conn, system_id, hierarchy_op, value)?,
+            None => ecl::parse_and_evaluate(conn, system_id, value)?,
+        };
         let concepts: Vec<ExpansionContains> = resolved
             .into_iter()
             .map(|c| ExpansionContains {
@@ -4366,7 +4455,7 @@ fn apply_compose_filters(
             if prev.is_empty() {
                 continue;
             }
-            if property == "code" || property.is_empty() {
+            if is_concept_prop(property) || property.is_empty() {
                 prev.retain(|c| regex.is_match(&c.code));
             } else {
                 let codes: Vec<String> = prev.iter().map(|c| c.code.clone()).collect();
@@ -4966,8 +5055,8 @@ fn compile_vs_regex(pattern: &str) -> Result<Regex, HtsError> {
 }
 
 /// Evaluate a `regex` compose filter — returns concepts in `system_id` whose
-/// `code` (when `property == "code"`) or whose `concept_properties` value for
-/// `property` fully matches `pattern`.
+/// code (when `property` is `code` or `concept`) or whose `concept_properties`
+/// value for `property` fully matches `pattern`.
 ///
 /// The match is performed in Rust after the candidate rows have been loaded.
 /// For property-value regex we narrow at the SQL level to rows that even have
@@ -4981,7 +5070,7 @@ fn query_regex_match(
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let regex = compile_vs_regex(pattern)?;
 
-    if property == "code" || property.is_empty() {
+    if is_concept_prop(property) || property.is_empty() {
         // Match against the concept code itself.  Load all concepts for the
         // system and filter in Rust — there is no cheap SQL primitive for an
         // arbitrary regex, and concept counts in tx-ecosystem fixtures are
@@ -5368,7 +5457,7 @@ fn apply_compose_filters_to_candidates(
             }
             (_, "regex") => {
                 let regex = compile_vs_regex(value)?;
-                if property == "code" || property.is_empty() {
+                if is_concept_prop(property) || property.is_empty() {
                     candidates.retain(|c| regex.is_match(&c.code));
                 } else {
                     let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
@@ -6277,46 +6366,41 @@ fn build_hierarchical_expansion(
         return Ok(flat);
     }
 
-    // Build lookup: (system_url, code) → ExpansionContains.
-    let items_map: HashMap<(String, String), ExpansionContains> = flat
+    let expansion_set: HashSet<ConceptKey> = flat
         .iter()
-        .cloned()
-        .map(|c| ((c.system.clone(), c.code.clone()), c))
+        .map(|c| (c.system.clone(), c.code.clone(), c.version.clone()))
         .collect();
 
-    // Set of all (system_url, code) pairs in the expansion for fast membership checks.
-    let expansion_set: HashSet<(String, String)> = flat
+    // Use the version already resolved for each concept, including compose
+    // pins and request overrides. Only concepts with no version metadata keep
+    // the existing precedence fallback.
+    let systems: HashSet<(String, Option<String>)> = flat
         .iter()
-        .map(|c| (c.system.clone(), c.code.clone()))
+        .map(|c| (c.system.clone(), c.version.clone()))
         .collect();
-
-    // For each unique system URL, pick the latest-versioned id so the
-    // hierarchy edges we walk reflect the most recent revision when the
-    // expansion combines codes from multiple versions of the same URL.
-    let system_urls: HashSet<String> = flat.iter().map(|c| c.system.clone()).collect();
-    let mut system_id_map: HashMap<String, String> = HashMap::new();
-    for sys_url in &system_urls {
+    let mut system_id_map: HashMap<(String, Option<String>), String> = HashMap::new();
+    for (sys_url, version) in &systems {
         let sql = format!(
-            "SELECT id FROM code_systems WHERE url = ?1 ORDER BY {} LIMIT 1",
+            "SELECT id FROM code_systems WHERE url = ?1 AND (?2 IS NULL OR version = ?2) \
+             ORDER BY {} LIMIT 1",
             crate::backends::cs_precedence_order_by("code_systems")
         );
         if let Some(id) = conn
-            .query_row(&sql, [sys_url], |row| row.get::<_, String>(0))
+            .query_row(&sql, rusqlite::params![sys_url, version], |row| {
+                row.get::<_, String>(0)
+            })
             .optional()
             .map_err(|e| HtsError::StorageError(e.to_string()))?
         {
-            system_id_map.insert(sys_url.clone(), id);
+            system_id_map.insert((sys_url.clone(), version.clone()), id);
         }
     }
 
     // For each system, query all parent-child edges; keep only those where
     // both endpoints are in the expansion.
-    // parent_to_children: (system_url, parent_code) → Vec<(system_url, child_code)>
-    let mut parent_to_children: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
-    // has_parent: tracks which codes have a parent within the expansion.
-    let mut has_parent: HashSet<(String, String)> = HashSet::new();
+    let mut parent_to_children: HashMap<ConceptKey, Vec<ConceptKey>> = HashMap::new();
 
-    for (sys_url, sys_id) in &system_id_map {
+    for ((sys_url, version), sys_id) in &system_id_map {
         let mut stmt = conn
             .prepare_cached(
                 "SELECT parent_code, child_code
@@ -6334,63 +6418,21 @@ fn build_hierarchical_expansion(
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
         for (parent_code, child_code) in edges {
-            let parent_key = (sys_url.clone(), parent_code);
-            let child_key = (sys_url.clone(), child_code);
+            let parent_key = (sys_url.clone(), parent_code, version.clone());
+            let child_key = (sys_url.clone(), child_code, version.clone());
             if expansion_set.contains(&parent_key) && expansion_set.contains(&child_key) {
                 parent_to_children
                     .entry(parent_key)
                     .or_default()
-                    .push(child_key.clone());
-                has_parent.insert(child_key);
+                    .push(child_key);
             }
         }
     }
 
-    // Roots: concepts that appear in the expansion but have no parent within it.
-    let mut roots: Vec<ExpansionContains> = flat
-        .iter()
-        .filter(|c| !has_parent.contains(&(c.system.clone(), c.code.clone())))
-        .map(|c| {
-            build_subtree(
-                &(c.system.clone(), c.code.clone()),
-                &items_map,
-                &parent_to_children,
-            )
-        })
-        .collect();
-
-    roots.sort_by(|a, b| a.code.cmp(&b.code));
-    Ok(roots)
-}
-
-/// Recursively build an [`ExpansionContains`] node with all its nested children.
-///
-/// Looks up `key` in `items_map` to get the base node, then checks
-/// `parent_to_children` for any children of that node, recursing into each
-/// child.  Children are sorted by code before being attached, producing a
-/// deterministic tree order regardless of the order edges were stored in
-/// `concept_hierarchy`.
-///
-/// ## Parameters
-/// - `key` — `(system_url, code)` of the concept to build.
-/// - `items_map` — flat `(system_url, code)` → [`ExpansionContains`] lookup.
-/// - `parent_to_children` — adjacency map built from `concept_hierarchy` edges
-///   that are fully contained within the expansion set.
-fn build_subtree(
-    key: &(String, String),
-    items_map: &HashMap<(String, String), ExpansionContains>,
-    parent_to_children: &HashMap<(String, String), Vec<(String, String)>>,
-) -> ExpansionContains {
-    let mut item = items_map[key].clone();
-    if let Some(children) = parent_to_children.get(key) {
-        let mut child_items: Vec<ExpansionContains> = children
-            .iter()
-            .map(|ck| build_subtree(ck, items_map, parent_to_children))
-            .collect();
-        child_items.sort_by(|a, b| a.code.cmp(&b.code));
-        item.contains = child_items;
-    }
-    item
+    Ok(crate::backends::hierarchy::nest_expansion(
+        flat,
+        &parent_to_children,
+    ))
 }
 
 /// Write computed expansion entries into the `value_set_expansions` cache.
@@ -11493,6 +11535,107 @@ mod tests {
         );
     }
 
+    /// #2115: `property: "concept"` names the concept identifier just like
+    /// `code` (VCL emits it for `concept/"re"`).  A regex on it must match
+    /// codes on every path: with no earlier candidate set (full scan), after
+    /// an `is-a` filter has built a candidate set, and on the FTS-first path
+    /// taken when a text filter accompanies the compose filters.
+    #[tokio::test]
+    async fn expand_inline_regex_filter_on_concept_property() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-concept-regex",
+              "url": "http://example.org/cs-concept-regex",
+              "status": "active", "content": "complete",
+              "concept": [
+                { "code": "body", "display": "Body",
+                  "concept": [
+                    { "code": "head", "display": "Head" },
+                    { "code": "limb", "display": "Limb",
+                      "concept": [
+                        { "code": "arm", "display": "Arm" },
+                        { "code": "leg", "display": "Leg" }
+                      ]
+                    }
+                  ]
+                },
+                { "code": "lung", "display": "Lung" }
+              ]
+            }
+          }]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        async fn expand(
+            b: &SqliteTerminologyBackend,
+            filters: serde_json::Value,
+            text: Option<&str>,
+        ) -> Vec<String> {
+            let inline_vs = serde_json::json!({
+                "resourceType": "ValueSet",
+                "compose": { "include": [{
+                    "system": "http://example.org/cs-concept-regex",
+                    "filter": filters
+                }]}
+            });
+            let resp = b
+                .expand(
+                    &ctx(),
+                    ExpandRequest {
+                        value_set: Some(inline_vs),
+                        filter: text.map(str::to_string),
+                        count: Some(50),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut codes: Vec<String> = resp.contains.into_iter().map(|c| c.code).collect();
+            codes.sort();
+            codes
+        }
+
+        // No prior candidate set: full scan of the system.
+        for property in ["concept", "code"] {
+            let codes = expand(
+                &b,
+                serde_json::json!([{ "property": property, "op": "regex", "value": "l.*" }]),
+                None,
+            )
+            .await;
+            assert_eq!(codes, ["leg", "limb", "lung"], "property={property}");
+        }
+
+        // Prior candidate set from `is-a`: regex narrows it in place.
+        for property in ["concept", "code"] {
+            let codes = expand(
+                &b,
+                serde_json::json!([
+                    { "property": "concept", "op": "is-a", "value": "limb" },
+                    { "property": property, "op": "regex", "value": "l.*" }
+                ]),
+                None,
+            )
+            .await;
+            assert_eq!(codes, ["leg", "limb"], "property={property}");
+        }
+
+        // Text filter → FTS-first candidates → compose filters in Rust.
+        for property in ["concept", "code"] {
+            let codes = expand(
+                &b,
+                serde_json::json!([{ "property": property, "op": "regex", "value": "l.*" }]),
+                Some("lung"),
+            )
+            .await;
+            assert_eq!(codes, ["lung"], "property={property}");
+        }
+    }
+
     /// Regex `(a+)+` on the regex-bad code system: only the pure `aaaa…` code
     /// (no trailing chars) matches a full-string anchored pattern.  The codes
     /// with trailing `Y` / `Z` must NOT match.  Rust's RE2-style engine handles
@@ -12668,5 +12811,146 @@ mod tests {
         )
         .await;
         assert_eq!(codes, vec!["child2", "orphan"]);
+    }
+
+    // ── is-a / descendent-of / is-not-a on dotted codes (#2114) ─────────────
+    // ICD-10-CM style codes such as `E11.6` are not valid ECL concept ids, so
+    // the hierarchy filters must not route the raw code through the ECL parser.
+
+    const DOTTED_SYS: &str = "http://example.org/cs-dotted";
+
+    fn bundle_with_dotted_hierarchy() -> &'static str {
+        r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "cs-dotted",
+                "url": "http://example.org/cs-dotted",
+                "status": "active",
+                "content": "complete",
+                "concept": [
+                  {
+                    "code": "E11",
+                    "display": "Type 2 diabetes mellitus",
+                    "concept": [
+                      {
+                        "code": "E11.6",
+                        "display": "Type 2 diabetes mellitus with other specified complications",
+                        "concept": [
+                          { "code": "E11.65", "display": "With hyperglycemia" },
+                          { "code": "E11.69", "display": "With other specified complication" }
+                        ]
+                      },
+                      { "code": "E11.9", "display": "Without complications" }
+                    ]
+                  },
+                  { "code": "E10", "display": "Type 1 diabetes mellitus" }
+                ]
+              }
+            }
+          ]
+        }"#
+    }
+
+    async fn dotted_compose_codes(filters: serde_json::Value) -> Vec<String> {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_with_dotted_hierarchy().as_bytes())
+            .await
+            .unwrap();
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(serde_json::json!({
+                        "resourceType": "ValueSet",
+                        "compose": {"include": [{"system": DOTTED_SYS, "filter": filters}]}
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut codes: Vec<String> = resp.contains.iter().map(|c| c.code.clone()).collect();
+        codes.sort();
+        codes
+    }
+
+    #[tokio::test]
+    async fn dotted_code_is_a_without_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "is-a", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11.6", "E11.65", "E11.69"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_descendent_of_without_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "descendent-of", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11.65", "E11.69"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_is_not_a_without_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "is-not-a", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E10", "E11", "E11.9"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_generalizes_without_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "generalizes", "value": "E11.65"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11", "E11.6", "E11.65"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_is_a_with_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+            {"property": "concept", "op": "is-a", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11.6", "E11.65"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_descendent_of_with_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+            {"property": "concept", "op": "descendent-of", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11.65"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_is_not_a_with_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+            {"property": "concept", "op": "is-not-a", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E10", "E11"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_generalizes_with_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+            {"property": "concept", "op": "generalizes", "value": "E11.65"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11", "E11.6", "E11.65"]);
     }
 }

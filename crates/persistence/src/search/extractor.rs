@@ -154,7 +154,22 @@ pub struct ExtractionWithMissing {
     /// Parameters that support absence metadata and produced values.
     pub present: Vec<PresentParameter>,
     /// Extraction failures, retained for reindex reporting.
-    pub failures: Vec<String>,
+    pub failures: Vec<ExtractionFailure>,
+}
+
+/// One search parameter whose extraction failed on one resource (#2002).
+#[derive(Debug, Clone)]
+pub struct ExtractionFailure {
+    /// The failing parameter's code.
+    pub code: String,
+    /// The extraction error.
+    pub error: String,
+}
+
+impl std::fmt::Display for ExtractionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.error)
+    }
 }
 
 /// Removes the composite groups that can never match a composite search.
@@ -300,6 +315,16 @@ fn parse_prepared(expr: &str) -> Result<Arc<FhirPathExpression>, String> {
     helios_fhirpath::parse_expression(expr).map(Arc::new)
 }
 
+/// See [`SearchParameterExtractor::missing_fingerprint`].
+#[cfg(feature = "mongodb")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingFingerprint {
+    /// Stamped next to each `missing_params` array.
+    pub fingerprint: String,
+    /// Parameter code → digest of its definition(s).
+    pub params: std::collections::BTreeMap<String, String>,
+}
+
 /// Extracts searchable values from FHIR resources using FHIRPath.
 pub struct SearchParameterExtractor {
     registry: Arc<RwLock<SearchParameterRegistry>>,
@@ -320,6 +345,66 @@ impl SearchParameterExtractor {
         resource_type: &str,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
         self.extract_internal(resource, resource_type, None)
+    }
+
+    /// The definitions `missing_params` of `resource_type` is computed from:
+    /// one digest per parameter code, and the type's fingerprint over all of
+    /// them. Backends stamp the fingerprint on each array and keep the
+    /// per-code digests so an unchanged parameter stays trusted after
+    /// another one changes (#1999).
+    #[cfg(feature = "mongodb")]
+    pub(crate) fn missing_fingerprint(&self, resource_type: &str) -> MissingFingerprint {
+        use sha2::{Digest, Sha256};
+
+        let params = {
+            let registry = self.registry.read();
+            let mut params = registry.get_active_params(resource_type);
+            for base in ABSTRACT_BASE_TYPES {
+                params.extend(registry.get_active_params(base));
+            }
+            params
+        };
+        let mut entries: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for param in params
+            .iter()
+            .filter(|param| self.supports_missing(resource_type, param))
+        {
+            let mut entry = format!("{:?}\u{1}{}", param.param_type, param.expression);
+            if let Some(components) = &param.component {
+                for component in components {
+                    entry.push('\u{1}');
+                    entry.push_str(&component.definition);
+                    entry.push('\u{1}');
+                    entry.push_str(&component.expression);
+                }
+            }
+            entries.entry(param.code.clone()).or_default().push(entry);
+        }
+        let hex = |digest: &[u8]| digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let mut type_hasher = Sha256::new();
+        let params = entries
+            .into_iter()
+            .map(|(code, mut definitions)| {
+                definitions.sort();
+                let mut hasher = Sha256::new();
+                hasher.update(code.as_bytes());
+                for definition in &definitions {
+                    hasher.update([0u8]);
+                    hasher.update(definition.as_bytes());
+                }
+                let digest: String = hex(&hasher.finalize());
+                type_hasher.update(code.as_bytes());
+                type_hasher.update([1u8]);
+                type_hasher.update(digest.as_bytes());
+                type_hasher.update([0u8]);
+                (code, digest)
+            })
+            .collect();
+        MissingFingerprint {
+            fingerprint: hex(&type_hasher.finalize()),
+            params,
+        }
     }
 
     /// Also report absent parameters for backends that index absence.
@@ -416,7 +501,10 @@ impl SearchParameterExtractor {
                 }
                 Err(e) => {
                     if let Some(extraction) = extraction.as_deref_mut() {
-                        extraction.failures.push(format!("{}: {e}", param.code));
+                        extraction.failures.push(ExtractionFailure {
+                            code: param.code.clone(),
+                            error: e.to_string(),
+                        });
                     }
                     // Log the error but continue with other parameters
                     tracing::warn!(
@@ -456,7 +544,10 @@ impl SearchParameterExtractor {
                     }
                     Err(e) => {
                         if let Some(extraction) = extraction.as_deref_mut() {
-                            extraction.failures.push(format!("{}: {e}", param.code));
+                            extraction.failures.push(ExtractionFailure {
+                                code: param.code.clone(),
+                                error: e.to_string(),
+                            });
                         }
                         tracing::warn!(
                             "Failed to extract values for common parameter '{}': {}",
@@ -1163,13 +1254,15 @@ pub(crate) fn split_union_members(expression: &str) -> Vec<&str> {
 /// expression, returning the resource-relative remainder.
 ///
 /// The `Resource`-level SearchParameters carry expressions like
-/// `Resource.meta.source` (`_source`) and `Resource.id` (`_id`). Evaluated
-/// against a concrete resource these resolve to nothing — FHIRPath matches the
-/// leading identifier against the resource's own type, so `Patient.meta.source`
-/// and `meta.source` both work but `Resource.meta.source` yields an empty
-/// collection, and the parameter is never indexed (#523). Since these
-/// expressions apply to every resource, the prefix is dropped and the rest is
-/// evaluated relative to the resource.
+/// `Resource.meta.source` (`_source`) and `Resource.id` (`_id`). The FHIRPath
+/// evaluator now resolves a leading `Resource.`/`DomainResource.` against any
+/// resource that conforms to it (#640), so evaluation no longer needs this
+/// strip. It is kept because the extractor uses it as a union-member
+/// selector, not only as an evaluator workaround: `retained_parts` treats an
+/// abstract member as "applies to every type" (so `Patient.name |
+/// Resource.meta.source` keeps the abstract member on a Patient and drops
+/// foreign-type members), and `resolve_target_types` and the composite-base
+/// memo key are derived from the same filtered text (#523, #535).
 ///
 /// Leading parentheses are carried across, so a parenthesized member
 /// (`(Resource.meta.source)`) strips to `(meta.source)` rather than falling
@@ -1560,7 +1653,7 @@ mod tests {
                 extraction
                     .failures
                     .iter()
-                    .any(|error| error.starts_with(name)),
+                    .any(|failure| failure.code == name),
                 "extraction failure must remain visible: {name}"
             );
         }
@@ -2236,6 +2329,62 @@ mod tests {
             .evaluate_fhirpath(&patient, &filtered)
             .expect("the filtered expression must parse");
         assert!(!values.is_empty());
+    }
+
+    /// When no union member names the resource type, the whole union is
+    /// evaluated, so foreign-type heads (`Observation.code`) run against a
+    /// Patient. That cross-type silence is load-bearing (#640): it must stay an
+    /// `Ok` and the matching member must still extract.
+    #[test]
+    fn fallback_union_with_foreign_heads_still_extracts() {
+        let extractor = create_test_extractor();
+        let expr = "Observation.code.text | Condition.code.text | (Patient.name.family)";
+
+        // No member is retained for Encounter, so the full union is the fallback.
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "e1",
+            "status": "finished"
+        });
+        assert_eq!(
+            extractor.filter_expression_for_resource(expr, "Encounter"),
+            expr
+        );
+        let values = extractor
+            .evaluate_fhirpath(&encounter, expr)
+            .expect("foreign-type heads must not fail the evaluation");
+        assert!(values.is_empty());
+
+        // A member naming a type other than the context's still contributes
+        // when that is the resource at hand.
+        let observation = json!({
+            "resourceType": "Observation",
+            "id": "o1",
+            "code": {"text": "BP"}
+        });
+        let values = extractor
+            .evaluate_fhirpath(&observation, expr)
+            .expect("the union must evaluate against an Observation");
+        assert_eq!(values.len(), 1);
+    }
+
+    /// An identifier that is neither a known type nor an element is diagnosed
+    /// by the evaluator (warn by default in the extractor's context). It must
+    /// not turn into an error that drops the whole parameter, or valid union
+    /// members would lose their index rows.
+    #[test]
+    fn unknown_leading_identifier_does_not_discard_the_parameter() {
+        let extractor = create_test_extractor();
+        let patient = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "name": [{"family": "Smith"}]
+        });
+
+        let values = extractor
+            .evaluate_fhirpath(&patient, "Bogus.name.family | Patient.name.family")
+            .expect("an unknown leading identifier must not fail extraction");
+        assert_eq!(values.len(), 1);
     }
 
     /// The `DomainResource` half of `ABSTRACT_BASE_TYPES` has to be reachable:

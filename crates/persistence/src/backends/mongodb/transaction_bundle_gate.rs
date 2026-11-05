@@ -113,6 +113,18 @@ impl TransactionBundleGate {
         self.capacity
     }
 
+    /// The room in entries when the gate is on and entry-weighted, or `None`
+    /// when it is off or counts Bundles (`weight_entries == 0`), where the
+    /// capacity is a number of Bundles, not entries. The default size from
+    /// which a Bundle writes its search rows after the commit (#1975).
+    pub(super) fn entry_capacity(&self) -> Option<usize> {
+        if self.weight_entries > 0 {
+            self.capacity
+        } else {
+            None
+        }
+    }
+
     /// The permits a Bundle of `entries` entries takes: 1 when the weight is
     /// `0` (every Bundle is one slot), otherwise its entry count, at least 1
     /// and at most the whole capacity so that it can always be admitted.
@@ -178,6 +190,15 @@ impl Admission<'_> {
             since_call: self.called.elapsed(),
             since_admission: self.admitted.elapsed(),
         }
+    }
+
+    /// When a Bundle with the call deadline `deadline` must be answered: the
+    /// call plus `deadline`, the wait for room included. This is the clock the
+    /// replay check uses (#1806), and the one the commit re-sends keep to
+    /// (#2320). `None` without a deadline, or when it is too far off to be
+    /// represented.
+    pub(super) fn deadline_at(&self, deadline: Option<Duration>) -> Option<Instant> {
+        super::commit_deadline::deadline_after(self.called, deadline)
     }
 
     /// Whether the Bundle holds the whole room, so it runs alone (#1895): the
@@ -511,6 +532,19 @@ mod tests {
     }
 
     #[test]
+    fn entry_capacity_is_the_room_only_for_an_entry_weighted_gate() {
+        assert_eq!(
+            TransactionBundleGate::new(4, 1000).entry_capacity(),
+            Some(4000)
+        );
+        assert_eq!(TransactionBundleGate::new(1, 2).entry_capacity(), Some(2));
+        // Off: no room at all.
+        assert_eq!(TransactionBundleGate::new(0, 1000).entry_capacity(), None);
+        // Counting Bundles: the capacity is a number of Bundles, not entries.
+        assert_eq!(TransactionBundleGate::new(4, 0).entry_capacity(), None);
+    }
+
+    #[test]
     fn zero_weight_entries_counts_bundles() {
         let gate = TransactionBundleGate::new(2, 0);
         assert_eq!(gate.capacity(), Some(2));
@@ -534,5 +568,24 @@ mod tests {
         assert_eq!(gate.limit(), Some(Semaphore::MAX_PERMITS));
         assert_eq!(gate.capacity(), Some(capacity));
         assert_eq!(gate.weight(usize::MAX) as usize, capacity);
+    }
+
+    /// #2320: the commit re-sends keep to the replay check's clock, which
+    /// counts from the call (the wait for room included).
+    #[tokio::test(start_paused = true)]
+    async fn deadline_at_counts_from_the_call() {
+        let gate = TransactionBundleGate::new(2, 10);
+        let admission = gate.admit(1).await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+
+        let at = admission
+            .deadline_at(Some(Duration::from_secs(10)))
+            .expect("a deadline is set");
+        assert_eq!(
+            at.saturating_duration_since(Instant::now()),
+            Duration::from_millis(9_700)
+        );
+        assert_eq!(admission.deadline_at(None), None);
+        assert_eq!(admission.deadline_at(Some(Duration::MAX)), None);
     }
 }

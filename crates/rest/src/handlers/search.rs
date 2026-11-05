@@ -37,8 +37,9 @@ use crate::extractors::query_pairs::{last_value, parse_query_pairs};
 use crate::extractors::{
     SearchParams, TenantExtractor, build_search_query_for_version, unknown_search_params,
 };
-use crate::middleware::content_type::{FhirFormat, negotiate_format};
+use crate::middleware::content_type::{FhirFormat, get_accept_fhir_version, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::subsetting::{SummaryMode, apply_elements, apply_summary};
 use crate::state::AppState;
@@ -59,6 +60,7 @@ pub async fn search_get_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
@@ -80,10 +82,12 @@ where
     execute_search(
         &state,
         tenant,
+        &compartment,
         &resource_type,
         pairs,
         negotiated.format,
         strict,
+        get_accept_fhir_version(&req_headers),
     )
     .await
 }
@@ -101,6 +105,7 @@ pub async fn search_post_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawForm(form): RawForm,
 ) -> RestResult<Response>
@@ -122,10 +127,12 @@ where
     execute_search(
         &state,
         tenant,
+        &compartment,
         &resource_type,
         pairs,
         negotiated.format,
         strict,
+        get_accept_fhir_version(&req_headers),
     )
     .await
 }
@@ -259,18 +266,30 @@ where
 }
 
 /// Executes a type-level search and returns a Bundle response.
+#[allow(clippy::too_many_arguments)]
 async fn execute_search<S>(
     state: &AppState<S>,
     tenant: TenantExtractor,
+    compartment: &PatientCompartment,
     resource_type: &str,
     pairs: Vec<(String, String)>,
     format: FhirFormat,
     strict: bool,
+    requested_version: Option<FhirVersion>,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
-    let bundle_json = execute_search_bundle(state, &tenant, resource_type, pairs, strict).await?;
+    let bundle_json = execute_search_bundle(
+        state,
+        &tenant,
+        compartment,
+        resource_type,
+        pairs,
+        strict,
+        requested_version,
+    )
+    .await?;
     format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format)
 }
 
@@ -279,23 +298,33 @@ where
 /// The HTTP search handlers wrap this in content negotiation; bundle
 /// processing (`GET [type]?params` entries in batch/transaction Bundles,
 /// #478) embeds the returned Bundle as an entry resource.
+///
+/// Under a compartment-confined grant (`patient/` scope, #1618) `compartment`
+/// filters the query to the launch patient's compartment and drops included
+/// resources outside it; see [`PatientCompartment`].
 pub(crate) async fn execute_search_bundle<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
     resource_type: &str,
     pairs: Vec<(String, String)>,
     strict: bool,
+    requested_version: Option<FhirVersion>,
 ) -> RestResult<serde_json::Value>
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    // A search resolves in the version the client named with the `fhirVersion`
+    // MIME parameter on `Accept`, else in the server default (#2254). Naming
+    // one also restricts the matches to resources stored under it (set on the
+    // query below); naming none keeps the version-blind search.
+    let fhir_version = requested_version.unwrap_or(state.config().default_fhir_version);
+
     // Direct requests were already judged by the router's resource-type gate
     // (`middleware::resource_type`); a `GET [type]?[params]` entry inside a
     // batch or transaction Bundle arrives here without passing through it, and
     // must not answer an unknown type with an empty `200` searchset either
-    // (#989). Searches resolve against the server default version (see the
-    // subsetting below), so the type is judged against that same version.
-    let fhir_version = state.config().default_fhir_version;
+    // (#989). The type is judged against the version the search resolves in.
     if !crate::fhir_types::is_valid_resource_type_for_version(resource_type, fhir_version) {
         return Err(RestError::UnknownResourceType {
             resource_type: resource_type.to_string(),
@@ -525,6 +554,12 @@ where
         }
         built
     };
+    query.fhir_version = requested_version;
+
+    // A `patient/` scope sees the launch patient's compartment only (#1618):
+    // the filter is ANDed with everything the client asked for, before list,
+    // chain and `_has` resolution narrow the query further.
+    compartment.confine_query(fhir_version, &mut query)?;
 
     // `_contained=true|both` requires contained-resource indexing. Gate it on the
     // backend's capability so unsupported backends return a clear 501 rather than
@@ -703,6 +738,13 @@ where
         }
     }
 
+    // An include follows references wherever they lead; under a compartment-
+    // confined grant only the launch patient's resources may come back (#1618).
+    compartment.retain_members(
+        || state.storage().search_param_registry(tenant.context()),
+        &mut result.included,
+    );
+
     // Drain any include-truncation marker(s) (#1061) out of `included` before
     // counting or building the bundle. The marker is control-plane
     // information about the search, not an included resource, and
@@ -750,9 +792,6 @@ where
         elements = ?elements,
         "Search completed"
     );
-
-    // Get FHIR version from config for subsetting
-    let fhir_version = state.config().default_fhir_version;
 
     // Whether the resolved query actually requires an accurate total: either
     // requested explicitly via `_total=accurate` or implied by

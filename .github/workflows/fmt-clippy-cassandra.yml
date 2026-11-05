@@ -3,7 +3,9 @@ name: fmt, clippy and Cassandra schema
 # Roadmap item 0.5 on the team's self-hosted runner (ADR-aacruzgon-0018,
 # ADR-sam-michaels-0001): rustfmt, the CONTRIBUTING.md clippy command split
 # into two jobs, and a single-node Cassandra that the schema is applied to.
-# The runner has one executor, so the jobs run one after another.
+# fmt and the Cassandra job are light and run on either runner; the clippy
+# pair is heavy and runs only on sam-7900x (ADR-aacruzgon-0023). Each runner
+# has one executor, so the jobs on one machine run one after another.
 
 on:
   push:
@@ -33,7 +35,7 @@ jobs:
     # Fork guard (ADR-aacruzgon-0018). It only keeps this unmodified workflow
     # from running a fork's code; approval is what keeps forks off the runner.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, hfs-cassandra]
+    runs-on: [self-hosted, hfs-cassandra-light]
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -64,7 +66,7 @@ jobs:
     name: cargo clippy (helios-fhir)
     # Fork guard (ADR-aacruzgon-0018).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, hfs-cassandra]
+    runs-on: [self-hosted, hfs-cassandra-heavy]
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -117,7 +119,7 @@ jobs:
     needs: clippy-fhir
     # Fork guard (ADR-aacruzgon-0018).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, hfs-cassandra]
+    runs-on: [self-hosted, hfs-cassandra-heavy]
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -172,7 +174,7 @@ jobs:
     name: Cassandra schema (single node)
     # Fork guard (ADR-aacruzgon-0018).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, hfs-cassandra]
+    runs-on: [self-hosted, hfs-cassandra-light]
     timeout-minutes: 15
     env:
       COMPOSE_FILE: docker/cassandra/docker-compose.yml

@@ -1,15 +1,17 @@
 name: Runner Docker prune
 
-# Weekly clean-up of the self-hosted runner's own rootless Docker daemon
-# (ADR-sam-michaels-0001, ADR-sam-michaels-0002). The runner reaches it through
-# DOCKER_HOST in its .env, so this never touches any other user's Docker.
+# Weekly clean-up of each self-hosted runner's own rootless Docker daemon
+# (ADR-sam-michaels-0001, ADR-sam-michaels-0002). Each runner reaches its daemon
+# through DOCKER_HOST in its .env, so this never touches any other user's Docker.
+# A label shared by both runners would reach only one of them, so the job is a
+# matrix over each runner's own label (ADR-aacruzgon-0023).
 # Scheduled workflows run from the default branch only.
 
 on:
   schedule:
     # Saturdays 20:00 UTC: 16:00 Eastern in summer time, 15:00 in winter
-    # (cron is UTC). Sam's rig is usually on then; a run queued while it is
-    # off waits up to 24 h for the runner (ADR-sam-michaels-0003).
+    # (cron is UTC). Sam's rig is usually on then; a run queued while a
+    # runner is off waits up to 24 h for it (ADR-sam-michaels-0003).
     - cron: "0 20 * * 6"
   workflow_dispatch:
 
@@ -25,7 +27,12 @@ jobs:
     name: docker system prune (gh-runner)
     # Fork guard (ADR-aacruzgon-0018); schedule and dispatch always pass it.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, hfs-cassandra]
+    strategy:
+      # One runner being off must not cancel the prune on the other.
+      fail-fast: false
+      matrix:
+        runner: [hfs-runner-sam-7900x, hfs-runner-acruzdebian]
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
     timeout-minutes: 15
     steps:
       # Without --all, tagged images such as the pinned cassandra image stay,

@@ -48,7 +48,7 @@ jobs:
         with:
           toolchain: stable
 
-      # No rust-cache: the runner is one fixed machine (ADR-sam-michaels-0002).
+      # No rust-cache: each runner is one fixed machine (ADR-sam-michaels-0002).
       # The cargo registry already persists in the runner user's ~/.cargo, and
       # the target directory lives next to the checkout, not in it, so the
       # checkout's git clean leaves it alone and cargo reuses every unchanged

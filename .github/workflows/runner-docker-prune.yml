@@ -28,7 +28,7 @@ jobs:
     # Fork guard (ADR-aacruzgon-0018); schedule and dispatch always pass it.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
-      # One runner being off must not cancel the prune on the other.
+      # One runner's prune failing must not cancel the other's.
       fail-fast: false
       matrix:
         runner: [hfs-runner-sam-7900x, hfs-runner-acruzdebian]

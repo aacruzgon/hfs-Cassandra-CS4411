@@ -66,6 +66,7 @@ The walk-through found places where the design document was wrong. These are now
 | 0015 | **Each sweeper read scanned every finished intent (G5). Measured:** 3,000 tombstones and a logged warning on one read. | `enqueued_at` leads the clustering key, and the sweeper reads only a time slice past a low-water mark. On a node that read scanned 0 tombstones. | Clustering `(enqueued_at, tenant_id, resource_type, id)` |
 | 0016 | **The `write_ts` formula could not be computed (G4).** `update` receives a `StoredResource`, which has no `write_ts`. | `last_updated(N+1) = max(now_ms, last_updated(N) + 1 ms)` and `write_ts = last_updated × 1000`, so any version's `write_ts` can be recomputed. | None |
 | 0017 | **Repair on read could delete a key the current version needs (G10),** because a delete wins a timestamp tie with the writer's insert. | Repair deletes a stale key only if the current version does not produce it; otherwise it upserts the key with the current tag. | None |
+| 0024 | **Lost PUT races and unknown CAS outcomes (G13, G25, G26; upstream #2111).** The design retried `create_or_update` only for batch, mapped a missed CAS straight to 404 or 409, answered an unknown CAS outcome that was not ours with 503, and both deleted and rewrote one intent row across attempts. | `create_or_update` is one bounded loop over create, update and revive: a fresh read, `write_id` and intent row per attempt, at most 3 immediate retries after a definite miss, and 2 after a timed-out CAS the serial read proves did not apply (5 to 25 ms pause). An undecidable or timed-out serial read is 504. A plain delete that loses to an update retries once. A revive keeps the original `fhir_version`, and its literal `deleted_at = null` is the one allowed null. | Comments only (`write_id`, `pending_index_writes`, the null exception) |
 
 Two corrections need no ADR because they fix a statement, not a decision:
 - **The sweeper does compare clocks.** "No clocks are compared" was wrong: the grace period is a clock comparison. The design now states its assumption (G11).
@@ -82,11 +83,9 @@ Two corrections need no ADR because they fix a statement, not a decision:
 
 The full list is the "Decisions to record" group in [`walkthrough.md`](walkthrough.md#8-gaps-and-questions-for-the-session), plus the coverage-specific points in [`coverage.md`](coverage.md#7-open-points-for-the-session). The ones that change what `schema.cql` says, or what a test expects:
 
-- **Revive (G13).** The revive compare-and-swap clears `deleted_at` with a literal `SET deleted_at = null`. That works on a node and writes one cell tombstone. Does revive keep the original `fhir_version`, as PostgreSQL does, or take the request's, as the design implies?
 - **`count` (G7).** `count` reads `resources_by_type` without the tag check. So it counts writes in flight, orphans a crash left until the sweeper removes them, and, on the cluster, any row resurrected because `gc_grace_seconds` was lowered. Either accept that and document it, or tag-check `count`, which costs one point read per row.
 - **`count(tenant, None)`** (all types) is called by the console metrics. No table can answer it without a list of resource types.
 - **Too costly (G27).** The design returns `too-costly` for a date-only search over the candidate cap, but no search error produces that issue code. The nearest is `TooManyResults`, which gives 422. The one `too-costly` in Helios is a 500 for a transaction Bundle too large for MongoDB's cache (`crates/rest/src/handlers/batch.rs`).
-- **503 or 504 (G26).** Helios maps `BackendError::Timeout` to 504 and `Unavailable` to 503; the design says 503 throughout.
 - **`_profile`, `_source`, `_tag`, `_security`.** The extractor indexes them. Patient and Observation have no URI parameter of their own in R4, so `_profile` and `_source` are the only URI rows the coverage table has.
 
 ## What the Apache Cassandra 5.0 docs say

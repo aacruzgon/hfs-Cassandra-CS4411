@@ -82,8 +82,8 @@ One row per checkable item, grouped by step; the milestone column says which gat
 | 2.6 | Conformance-seeder boot time measured and recorded | A | A | ☐ | | |
 | 2.7 | **Milestone A** script passes: create then read through REST, `versionId` 1, `ETag W/"1"`; `/_readiness` down when Cassandra is stopped | A | W | ☐ | | |
 | 3.1 | Six-step write path: intent row, CAS with `write_ts`/`write_id`, versions row, index batches, intent delete | B | A | ☐ | | |
-| 3.2 | CAS outcome mapping (404/409 from condition columns; 410 only from `read`/`vread`) and timeout handling (`CAS`, `CAS_WRITE_UNKNOWN`, `SIMPLE`, serial-read timeout) | B | A | ☐ | | |
-| 3.3 | `crud_suite.rs` and `search/versioned_write_race_suite.rs` pass | B | A | ☐ | | |
+| 3.2 | CAS outcome mapping (404/409 from condition columns; 410 only from `read`/`vread`), timeout handling (`CAS`, `CAS_WRITE_UNKNOWN`, `SIMPLE`, serial-read timeout; 504), the `create_or_update` retry loop and the plain-delete retry (ADR-aacruzgon-0024) | B | A | ☐ | | |
+| 3.3 | `crud_suite.rs` and every test in `search/versioned_write_race_suite.rs` pass, `concurrent_puts_onto_a_tombstone_all_succeed` included | B | A | ☐ | | |
 | 3.4 | 410 after delete, 200 after revive; no CQL `DELETE` ever issued against `resources` | B | A | ☐ | | |
 | 4.1 | `VersionedStorage` real; `versioning_suite.rs` and `search/conditional_if_match_suite.rs` pass; `list_versions` numeric order past 9 | B | A | ☐ | | |
 | 5.1 | Index maintenance on every write with fixed timestamps; every batch under 5 KiB on the fixtures | B | A | ☐ | | |
@@ -158,7 +158,7 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 | --- | --- |
 | Keyspace | `CREATE KEYSPACE … WITH replication = {'class': 'NetworkTopologyStrategy', '<dc>': 1}` locally and `3` on the cluster; the DC name must match the Compose files' `GossipingPropertyFileSnitch` setting |
 | Common types | `tenant_id text`, `resource_type text`, `id text` (never `uuid`), `version_id int`, `last_updated timestamp` (milliseconds), `fhir_version text` (`as_mime_param()` form), `write_ts bigint` (microseconds, used in `USING TIMESTAMP`; always `last_updated × 1000`, ADR-aacruzgon-0016), `write_id uuid` |
-| `resources` regular columns | `data` (choose `text` holding the JSON, or `blob` if compression measurements favour it; `text` is the default), `created_at timestamp`, `deleted_at timestamp` (unset, never bound null), `fhir_version`, `write_ts`, `write_id` |
+| `resources` regular columns | `data` (choose `text` holding the JSON, or `blob` if compression measurements favour it; `text` is the default), `created_at timestamp`, `deleted_at timestamp` (unset, never bound null; the one exception is the revive CAS's literal `SET deleted_at = null`, which writes one cell tombstone on purpose, ADR-aacruzgon-0024), `fhir_version`, `write_ts`, `write_id` |
 | `resource_versions` regular columns | `data` (unset for a delete marker), `last_updated`, `deleted_at`, `fhir_version`, `write_ts` |
 | `resources_by_type` | clustering `WITH CLUSTERING ORDER BY (last_updated DESC, id DESC)`; regular `version_id` |
 | Token tables | `token_code_index` clustering `(last_updated DESC, id DESC, system ASC)`; `token_system_code_index` `(last_updated DESC, id DESC)`; `token_system_index` `(last_updated DESC, id DESC, code ASC)`; `param text` in every partition key; regular `version_id` |
@@ -212,15 +212,25 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 **Tasks.**
 - `update`, `delete`, `create_or_update`, `delete_versioned`, `exists`, `count`, `read_batch` (concurrent point reads).
 - The six-step write path from the design: permission check and extraction; intent row; CAS with `last_updated(N+1) = max(now_ms, last_updated(N) + 1 ms)`, `write_ts = last_updated × 1000` and `write_id`; `resource_versions` row for N+1, plus a rewrite of the row for N from `current` at `write_ts(N) − 1` (ADR-aacruzgon-0012); index batches under 5 KiB (empty until step 5); intent delete and return.
-- CAS outcome handling: not-applied rows mapped to 404 (no row, or deleted in the gap) or 409 (other version) from the returned condition columns, and the intent row deleted; `WriteTimeout` with `write_type = CAS` or `CAS_WRITE_UNKNOWN` resolved by a `LOCAL_SERIAL` read and `write_id` match; `SIMPLE` treated as applied; serial-read timeout → `BackendError::Timeout` (504).
-- Revive via `create_or_update` with `IF version_id = N` and no `deleted_at` condition; `create` via `INSERT … IF NOT EXISTS`.
+- CAS outcome handling (ADR-aacruzgon-0024):
+    - not-applied rows are mapped from the returned condition columns to 404 (no row, or deleted in the gap) or 409 (other version, or an existing row on `IF NOT EXISTS`), and that attempt's intent row is deleted;
+    - `WriteTimeout` with `write_type = CAS` or `CAS_WRITE_UNKNOWN` is resolved by a `LOCAL_SERIAL` read and the design's table:
+        - our `write_id` at the target version: applied, continue;
+        - unchanged: run again after a 5 to 25 ms random pause, budget 2;
+        - another writer at the target version: a definite miss;
+        - past the target version, or the serial read timed out: `BackendError::Timeout` (504);
+    - `SIMPLE` is treated as applied;
+    - every timeout is 504 and every unavailable node 503, as `crates/rest/src/error.rs` maps them.
+- `create_or_update` is one loop over create, update and revive. Each attempt does a fresh read, takes a fresh `write_id`, writes its own intent row (new `enqueued_at`), and runs the CAS. A definite miss retries at once, at most 3 times; then the result is `VersionConflict` (409).
+- A plain `delete` that loses to an update retries once from its pre-read (G25); `delete_versioned` never retries.
+- Revive via `create_or_update` with `IF version_id = N` and no `deleted_at` condition, returning `created = true` (201); `create` via `INSERT … IF NOT EXISTS`.
 - `tenant.check_permission` at the start of every write.
 
 **Spec.** [R4 http.html#create](https://hl7.org/fhir/R4/http.html#create), [#update](https://hl7.org/fhir/R4/http.html#update) (client `id` must match the URL; update of a deleted resource brings it back; a server may reject an update that creates), [#delete](https://hl7.org/fhir/R4/http.html#delete) (delete of an unknown or already-deleted id returns 200 or 204 and changes nothing; a later read is 410 Gone; servers keeping history record the delete as an entry with no content) and [#concurrency](https://hl7.org/fhir/R4/http.html#concurrency) (`ETag: W/"vid"`; `If-Match` mismatch is 412 and nothing changes; 409 is permitted for other conflicts, which is where Helios puts the lost CAS race). `meta.versionId` and `meta.lastUpdated` rules are in [R4 resource.html#metadata](https://hl7.org/fhir/R4/resource.html#metadata). Error bodies are [OperationOutcome](https://hl7.org/fhir/R4/operationoutcome.html) with codes from [issue-type](https://hl7.org/fhir/R4/valueset-issue-type.html) (`not-found`, `deleted`, `conflict`). The build weakens the 410 wording and the ETag-on-update requirement ([build http.html#update](https://build.fhir.org/http.html#update), [#delete](https://build.fhir.org/http.html#delete)); we follow R4.
 
 **Cassandra docs.** [INSERT](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/dml.html#insert-statement) (`IF NOT EXISTS`), [UPDATE](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/dml.html#update-statement) (`IF` conditions; "a non-negligible performance cost, because Paxos is used") and [DELETE](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/dml.html#delete_statement) (which we never run against `resources`). [Update parameters](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/dml.html#update-parameters) for `USING TIMESTAMP`, which a lightweight transaction rejects. [Lightweight transactions](https://cassandra.apache.org/doc/5.0/cassandra/architecture/guarantees.html#lightweight-transactions-with-linearizable-consistency), [`paxos_variant`](https://cassandra.apache.org/doc/5.0/cassandra/managing/configuration/cass_yaml_file.html#paxos_variant) and [CEP-14: Paxos Improvements](https://cwiki.apache.org/confluence/display/CASSANDRA/CEP-14%3A+Paxos+Improvements) for v2. The docs do not say what a failed compare-and-swap returns; `spike-findings.md` (A1) does.
 
-**Exit criterion.** `crud_suite.rs` passes; `search/versioned_write_race_suite.rs` passes (two concurrent updates produce N+1 and N+2, never two N+1); a read after delete is 410 and after revive is 200; `cqlsh` shows no CQL `DELETE` was ever issued against `resources`.
+**Exit criterion.** `crud_suite.rs` passes; every test in `search/versioned_write_race_suite.rs` passes on Cassandra, including `concurrent_puts_onto_a_tombstone_all_succeed` (4 unconditional PUTs onto a delete marker all succeed with versions 3 to 6, exactly one `created`, and the marker kept in history); a read after delete is 410 and after revive is 200; `cqlsh` shows no CQL `DELETE` was ever issued against `resources`.
 
 **Who.** **A**, with **W** reviewing the CAS code.
 
@@ -326,6 +336,10 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 
 **Tasks.**
 - Benchmarks per the proposal: 10,000 and 100,000 resources; create, read-by-ID, update, token, date and URI searches; concurrency 1, 8, 32; warm-up then three runs; single node (RF 1, `LOCAL_QUORUM` = `ONE`) against single PostgreSQL under the same limits. Before each run: load, `nodetool flush`, wait for pending compactions to reach zero, JIT warm-up. Reset data between runs. Record `paxos_variant`, commit-log and fsync settings, JVM heap, image tags, dataset checksums. Collect `nodetool proxyhistograms` and `tablestats` to split Helios time from database time. Record tombstones scanned per read and batch sizes.
+- Hot-key write benchmark (ADR-aacruzgon-0024): 2, 4, 8 and 16 clients sending unconditional PUTs to one id, once on a live resource and once on a delete marker, against both backends.
+    - Report the success rate, p50 and p99 latency, and retries per request.
+    - Count the 409s from unconditional PUTs (the 3 definite-miss retries exhausted) and the 504s from unresolved CAS timeouts (the 2 unknown-outcome retries exhausted).
+    - Record `cas_contention_timeout` alongside `paxos_variant`.
 - Failure tests from section 6, on the single node and on the three-node Compose cluster.
 - Demonstration script: one HTTP session covering create, read, vread, update with an `If-Match` conflict, a batch bundle, token, date and URI searches with cursor paging, a rejected `:exact`, deletion with 410, two-tenant isolation; the same script against PostgreSQL; passes when every step returns the documented status.
 - Inferno test kit, built from `inferno-template` in `utils/inferno-test-kit/` (a Ruby gem outside the cargo workspace). Four groups, each test written from the rejection table in the design document and citing the spec sentence it enforces: (1) capability truth: `GET /metadata` lists only token, date and URI parameters, no string or reference parameters, no `_include` or `_revinclude`, no `transaction` interaction, no history; (2) CRUD and versioning: create, read, update, vread, `If-Match` mismatch 412, delete then read 410; (3) supported search: `_id`, identifier with and without system, date prefixes and `_lastUpdated`, URI, and keyset paging that follows `next` links and asserts no duplicate or missing ids; (4) declared rejections: string and reference parameters 400, `:exact` 400, `_sort` and `_offset` 400, chain and `_has` 400, `_include` and `_text` 501, transaction bundle refused, each with an OperationOutcome and a cross-check that the parameter is absent from the CapabilityStatement. The kit calls no profile validation, so the validator service is removed from its Compose file and it runs on the 16 GB laptops. A GitHub-hosted workflow runs it headless with `inferno execute` and uploads the results JSON. Run it against PostgreSQL once: groups 1 to 3 must pass there too, which validates the kit; group 4 fails there by design and the diff goes in the report.
@@ -392,7 +406,7 @@ All run against the single node first, then the three-node cluster (RF 3, `LOCAL
 
 ## 7. Measure-first triggers
 
-These decide whether the time-bucket and tombstone work in the design is done in this project. If a trigger fires, the bucket is added to the affected partition key, carried in the reserved cursor slot, and walked newest first; otherwise the design stays as is and the measurement goes in the report.
+These decide whether the time-bucket and tombstone work in the design is done in this project, and whether the `create_or_update` retry budgets change (last row). If a bucket trigger fires, the bucket is added to the affected partition key, carried in the reserved cursor slot, and walked newest first; otherwise the design stays as is and the measurement goes in the report.
 
 **Cassandra docs.** [Tombstones](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/compaction/tombstones.html) and [`tombstone_warn_threshold`](https://cassandra.apache.org/doc/5.0/cassandra/managing/configuration/cass_yaml_file.html#tombstone_warn_threshold), [`nodetool tablestats`](https://cassandra.apache.org/doc/5.0/cassandra/managing/tools/nodetool/tablestats.html) and [`tablehistograms`](https://cassandra.apache.org/doc/5.0/cassandra/managing/tools/nodetool/tablehistograms.html) for the numbers, [calculating partition size](https://cassandra.apache.org/doc/5.0/cassandra/developing/data-modeling/data-modeling_refining.html#calculating-partition-size) and [breaking up large partitions](https://cassandra.apache.org/doc/5.0/cassandra/developing/data-modeling/data-modeling_refining.html#breaking-up-large-partitions) for the bucket itself, and [UCS compaction](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/compaction/ucs.html) for the `L4` option in `schema/README.md`.
 
@@ -403,6 +417,7 @@ These decide whether the time-bucket and tombstone work in the design is done in
 | Largest partition (`tablestats`) | above 100 MiB | bucket, regardless of latency |
 | Batch size per write | any fixture above 5 KiB per batch | split batches further; never raise the threshold |
 | Boot time from the conformance seeder | above the agreed startup budget | concurrent `create_many` |
+| Retries running out in the hot-key write benchmark (step 8): 409 from an unconditional PUT, or 504 from an unresolved CAS timeout | any at 4 clients or fewer, the most the upstream race test guarantees | revisit the budgets of 3 definite-miss and 2 unknown-outcome retries, and the 5 to 25 ms pause (ADR-aacruzgon-0024) |
 
 ## 8. Upstream touch list
 

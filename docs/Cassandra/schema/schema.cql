@@ -24,7 +24,8 @@
 --     TIMESTAMP derived from write_ts; a plain write would lose to them;
 --   * never bind null; leave absent columns unset (null writes a cell tombstone).
 --     The one deliberate null is the literal "SET deleted_at = null" in the
---     revive CAS, which clears the delete;
+--     revive CAS, which clears the delete and writes exactly one cell
+--     tombstone, on purpose (checked on 5.0.9, 2026-10-13; ADR-aacruzgon-0024);
 --   * never ALLOW FILTERING.
 --
 -- Common types:
@@ -38,7 +39,7 @@
 --   write_ts                       bigint, microseconds, used in USING TIMESTAMP;
 --                                  always last_updated x 1000, and
 --                                  last_updated(N+1) = max(now, last_updated(N) + 1 ms)
---   write_id                       uuid, one per request, set by the CAS
+--   write_id                       uuid, one per CAS attempt, set by the CAS
 --
 -- Compaction: no table sets it, so every table gets the node default from
 -- cassandra_latest.yaml: UnifiedCompactionStrategy (UCS) with scaling
@@ -61,7 +62,7 @@ CREATE TABLE IF NOT EXISTS resources (
     deleted_at    timestamp,  -- unset while live; set by a delete
     fhir_version  text,
     write_ts      bigint,     -- timestamp of this version's index writes
-    write_id      uuid,       -- the request that wrote this version; read back
+    write_id      uuid,       -- the CAS attempt that wrote this version; read back
                               -- after an LWT timeout to learn the outcome
     PRIMARY KEY ((tenant_id, resource_type, id))
 ) WITH comment = 'Current version per resource; LWT target for every write';
@@ -85,14 +86,16 @@ CREATE TABLE IF NOT EXISTS resource_versions (
 
 
 -- Outbox for the index sweeper. One intent row is written before every CAS
--- and deleted after the index writes. Not led by tenant_id: the sweeper must
--- find work without a tenant list. Hourly buckets (a 24 h TTL spans up to 25)
--- x 16 shards.
+-- attempt and deleted after the index writes, or at once when that attempt's
+-- CAS is not applied. A create_or_update retry writes a new row with its own
+-- enqueued_at and never rewrites an earlier attempt's row (ADR-aacruzgon-0024).
+-- Not led by tenant_id: the sweeper must find work without a tenant list.
+-- Hourly buckets (a 24 h TTL spans up to 25) x 16 shards.
 -- bucket = UTC hour 'YYYY-MM-DDTHH'; shard = hash(tenant_id, id) mod 16.
 -- enqueued_at leads the clustering key so the sweeper reads only a time
 -- slice past its low-water mark, never the tombstones of finished intents
 -- (measured on a node: a whole-partition read scanned 3,000 of them).
--- version_id is the version the request's CAS will create; the sweeper
+-- version_id is the version the attempt's CAS will create; the sweeper
 -- replays that version's index writes whenever it exists.
 -- gc_grace_seconds is lowered here too, which the roadmap checklist does not
 -- list: a resurrected intent row is harmless, because the sweeper either

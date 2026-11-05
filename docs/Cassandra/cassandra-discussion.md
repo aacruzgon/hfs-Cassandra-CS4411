@@ -210,8 +210,8 @@ The data model splits a resource across several tables, so the resource row and 
 - **`create_or_update` absorbs the race.** Every unconditional PUT goes through `create_or_update`: a single PUT without `If-Match`, and every batch PUT, with or without `ifMatch`. Its trait contract (`crates/persistence/src/core/storage.rs`, "# Concurrency", upstream #2111) makes an unconditional PUT last-writer-wins. Callers racing on one id must all succeed, with distinct versions and a complete history, and a `VersionConflict`, `AlreadyExists` or `NotFound` from a lost race must never reach the caller (ADR-aacruzgon-0024). So `create_or_update` is a loop of attempts:
     - **Each attempt** reads the row and picks create (C1), update (C2) or revive (C4). It takes a fresh `write_id`, computes `last_updated` and `write_ts` from that read, writes its own intent row (step 2, with a new `enqueued_at`), and runs the compare-and-swap.
     - **A definite miss** deletes that attempt's intent row and starts the next attempt at once, with no pause. A miss means another writer has committed, so the next read sees it.
-    - **The bound.** After 3 retries on definite misses, the last miss is returned as `VersionConflict` (409). That is 4 attempts, the bound SQLite, PostgreSQL and MongoDB use, and the bound `tests/search/versioned_write_race_suite.rs` relies on.
-    - **An unknown outcome** is resolved before any further attempt, as in "When the LWT outcome is unknown" below. It has its own budget of 2 retries.
+    - **The bound.** At most 3 retries after definite misses, so 4 attempts in all. A fourth definite miss is returned as `VersionConflict` (409). This is the bound SQLite, PostgreSQL and MongoDB use (`MAX_CAS_RETRIES = 3`), and the one `tests/search/versioned_write_race_suite.rs` relies on: a writer can lose three times and succeed on its fourth attempt.
+    - **An unknown outcome** is resolved before any further attempt, as in "When the LWT outcome is unknown" below. It has its own budget of 2 re-runs, separate from the 3 retries.
     - **Why it matters on one node.** Batch entries run concurrently (`bulk_write_concurrency` 8), so two entries on one id race through this loop inside a single request.
 - **Why every write.** Without an LWT on every write, two concurrent unconditional PUTs would both write version N+1. The cost is a Paxos round on every write, which our benchmarks will show next to PostgreSQL.
 
@@ -254,14 +254,40 @@ The data model splits a resource across several tables, so the resource row and 
 
 **Why the fixed timestamp matters.** Two concurrent updates N+1 and N+2 are ordered by the LWT, but their index writes race. Without a fixed timestamp, each batch would get the coordinator's clock and last-write-wins would let a late N+1 batch resurrect rows N+2 deleted, or overwrite tag N+2 with N+1 in a table whose key did not change. With `write_ts` strictly increasing per version, a delete at `write_ts(N+2)` beats an insert at `write_ts(N+1)` whatever order they arrive in, and a retry is genuinely idempotent. Separately, do not bind `null` for absent columns; leave them unset, or every write adds cell tombstones.
 
-**When the LWT outcome is unknown.** A `WriteTimeout` with `write_type = CAS` (or protocol v5's `CAS_WRITE_UNKNOWN`) leaves the outcome open. We read the row back at `LOCAL_SERIAL`, which completes or permanently cancels the in-flight proposal, and compare `version_id` and `write_id` with what this attempt wrote. Contention alone can end a CAS this way with nothing committed, so this is expected under concurrent writes, not only during failures. For an attempt that targeted version V (ADR-aacruzgon-0024):
-- **Our `write_id` at version V:** the write succeeded, and we continue at step 4.
-- **Version still N, or no row for a create:** ours did not apply, and after the serial read it never will. Nothing else has changed either, so the same write runs again as a new attempt, after a random pause of 5 to 25 ms. Its intent row is left for the sweeper. These retries have their own budget of 2, separate from the 3 for definite misses, because they are not caused by another writer's commit and must not use up those 3.
-- **Another `write_id` at version V:** another writer won V, and ours did not apply. This is a definite miss and is handled as in step 3: `update` and `delete_versioned` return 409, and `create_or_update` and a plain `delete` retry as described above.
-- **A version past V:** ours may have applied and been superseded, and nothing this request holds tells the two apart. Retrying could write our body as a second version, so we return `BackendError::Timeout` (504) and leave the intent row to the sweeper.
-- **The serial read also times out:** we return `BackendError::Timeout` (504) rather than retrying and reporting a false 409 against our own success.
+**When the LWT outcome is unknown.** Three kinds of error leave a compare-and-swap's outcome open (ADR-aacruzgon-0024, amended 2026-11-05):
+- a `WriteTimeout` with `write_type = CAS`;
+- a `WriteFailure` with `write_type = CAS`;
+- a client-side timeout or a dropped connection after the CAS was sent. This is treated exactly like a server `WriteTimeout`/CAS. In cdrs-tokio 8.1.9 it is:
+    - `Error::General("Connection closed when writing data!")` or `Error::General("Connection closed while waiting for response!")`;
+    - `Error::Io`;
+    - `Error::Timeout`, which the driver raises only while connecting, so before anything was sent;
+    - the backend's own request deadline elapsing around the CAS.
 
-Both 504 cases are the mapping Helios already gives every timeout (`crates/rest/src/error.rs`, `From<BackendError>`): `BackendError::Timeout` is 504, and `Unavailable`, `ConnectionFailed` and `PoolExhausted` are 503 (G26). A `WriteTimeout` with `write_type = SIMPLE` means the CAS was decided and only the commit timed out, so the write is applied.
+Every CAS statement is sent as non-idempotent. The driver's default retry session re-sends an idempotent statement to the next node after `Io`, `General`, `Overloaded`, `Server` or `Truncate`, and speculative execution runs only for idempotent statements. A CAS re-sent that way, after it may have applied, is the duplicate this rule exists to prevent.
+
+`WriteFailure` is real on 5.0.9: with `paxos_variant: v2`, `Paxos.java` throws it when replicas answer with failures, including in the commit phase after the proposal has reached consensus (`markAndThrowAsTimeoutOrFailure`, called at lines 794-799). Returning an error there without resolving it would let a client's retry write a second version.
+
+What cdrs-tokio 8.1.9 surfaces for each (it re-exports `cassandra-protocol` 3.3.0's error types): `error::Error::Server { body, .. }` with `body.ty` either `frame::message_error::ErrorType::WriteTimeout(WriteTimeoutError { write_type: WriteType::Cas, contentions, .. })` or `ErrorType::WriteFailure(WriteFailureError { write_type: WriteType::Cas, failure_info, .. })`.
+
+Protocol v5's `CAS_WRITE_UNKNOWN` (0x1700) is sent only by the legacy Paxos v1 path (`StorageProxy.java:771` on 5.0.9), so with v2 it does not occur. `cassandra-protocol` 3.3.0 has no variant for it; were it ever sent, it would not decode (`Error::UnexpectedErrorCode`), and the backend treats that code as unknown too.
+
+On every compare-and-swap (`create`, `create_or_update`, `update`, `delete` and `delete_versioned`) we read the row back at `LOCAL_SERIAL`, which completes or permanently cancels the in-flight proposal, and compare `version_id` and `write_id` with what this attempt wrote. Contention alone can end a CAS this way with nothing committed, so this is expected under concurrent writes, not only during failures. For an attempt that targeted version V (version 1 for a create):
+- **Our `write_id` at version V:** the write succeeded, and we continue at step 4. A create returns 201.
+- **Version still N, or no row for a create:** ours did not apply, and after the serial read it never will. Nothing else has changed either, so the same write runs again as a new attempt, after a random pause of 5 to 25 ms. A create runs again with the same `id`, so its retry can never make a second resource. Its intent row is left for the sweeper. These re-runs have their own budget of 2, separate from the 3 retries for definite misses, because they are not caused by another writer's commit and must not use up those 3. When the 2 re-runs are used up, the last error is returned, mapped as below.
+- **Another `write_id` at version V:** another writer won V, and ours did not apply. This is a definite miss and is handled as in step 3:
+    - `create` returns `AlreadyExists`, which REST answers with 409 (`crates/rest/src/error.rs`, `From<ResourceError>`);
+    - `update` and `delete_versioned` return 409;
+    - `create_or_update` and a plain `delete` retry as described above.
+- **A version past V:** ours may have applied and been superseded, and nothing this request holds tells the two apart. Retrying could write our body as a second version, so we do not retry; we return an error and leave the intent row to the sweeper.
+- **The serial read times out, or fails:** we return an error rather than retrying and reporting a false 409 against our own success. The intent row is kept.
+
+**Which error, and why.** The status follows the mapping Helios already gives (`crates/rest/src/error.rs`, `From<BackendError>`): `BackendError::Timeout` is 504, and `Unavailable`, `ConnectionFailed` and `PoolExhausted` are 503 (G26). So an outcome left open by a timeout is a timeout, and one left open by replica failures is unavailability:
+- after a `WriteTimeout`/CAS, a client-side timeout or a dropped connection, the undecidable case is `BackendError::Timeout` (504);
+- after a `WriteFailure`/CAS, it is `BackendError::Unavailable` (503), because `Write_failure` is "a non-timeout exception during a write request": replicas answered with failures, which is the 503 family ("this instance cannot serve right now");
+- a serial read that times out is 504, and one that fails (`ReadFailure`, `Unavailable`) is 503;
+- when the 2 re-runs are used up, the last attempt's error decides the same way: 504 after a `WriteTimeout`, 503 after a `WriteFailure`.
+
+A `WriteTimeout` with `write_type = SIMPLE` means the CAS was decided and only the commit timed out, so the write is applied.
 
 **The failure window.** In Cassandra 4.x and 5.0 an LWT is limited to one partition, and a logged batch is atomic (eventually all or nothing) but isolated only within a single partition. Multi-partition ACID transactions (Accord, CEP-15) are targeted at 6.0, which is not generally available, and we do not depend on them. So step 3 and steps 4 to 6 cannot be one operation, and nothing in Cassandra replays steps 4 to 6 if the Helios process dies between them.
 
@@ -318,8 +344,8 @@ A related default also needs justification. The default no-op `ensure_writes_vis
 - **`_lastUpdated` with the cursor (G19).** A `_lastUpdated` upper bound and the keyset cursor are both end bounds on `last_updated`, and Cassandra rejects two; the backend sends only the tighter one. A lower bound plus the cursor works (checked on a 5.0.9 node).
 - **What counts as "date-only" (G20).** Two date parameters, a repeated date parameter, or a date with `_lastUpdated` are not defined yet.
 - **CAS applied, index writes failed (G23).** If step 6's retries run out after the compare-and-swap applied, returning 5xx makes a retried POST create a duplicate, and returning success means the write is searchable only after the sweeper runs (one poll interval plus the 30 s grace). Proposed: return success.
-- **`too-costly` (G27).** Which error a search over the candidate cap returns. The error mapping per step (G26) is decided: a timeout is `BackendError::Timeout` (504), and an unavailable node or connection is `BackendError::Unavailable` (503), as `crates/rest/src/error.rs` already maps them (ADR-aacruzgon-0024).
-- **Batch `ifMatch` (G28).** The REST layer checks a batch entry's `ifMatch` and then calls `create_or_update`, whose retry loop can overwrite a version the entry never saw. The window is upstream (`crates/rest/src/handlers/batch.rs`); our retry loop widens it. The `create_or_update` contract (upstream #2111) makes the retry mandatory, so the backend cannot close this window; the bound of 3 keeps it small.
+- **`too-costly` (G27).** Which error a search over the candidate cap returns. The error mapping per step (G26) is decided: a timeout is `BackendError::Timeout` (504), and an unavailable node or connection, or a replica failure (`WriteFailure`, `ReadFailure`), is `BackendError::Unavailable` (503), as `crates/rest/src/error.rs` already maps them (ADR-aacruzgon-0024).
+- **Batch `ifMatch` (G28).** The REST layer checks a batch entry's `ifMatch` and then calls `create_or_update`, whose retry loop can overwrite a version the entry never saw. The window is upstream (`crates/rest/src/handlers/batch.rs`); our retry loop widens it. The `create_or_update` contract (upstream #2111) makes the retry mandatory, so the backend cannot close this window; the bound of 3 retries (4 attempts) keeps it small.
 
 ## What else the server expects from a primary backend
 

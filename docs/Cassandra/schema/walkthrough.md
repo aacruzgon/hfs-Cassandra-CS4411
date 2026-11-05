@@ -252,17 +252,25 @@ Every write first calls `tenant.check_permission(Operation::…, resource_type)`
 
 **Timestamps** (ADR-aacruzgon-0016). `lu(1) = now_ms`; `lu(N+1) = max(now_ms, lu(N) + 1 ms)`; `ts(V) = lu(V) · 1000`. `lu(N)` comes from `current.last_modified()` on update and from R1 on delete and revive, so V3's timestamp is exact with no extra read. `w(N+1)` is a fresh uuid per CAS attempt (ADR-aacruzgon-0024), and `lu` and `ts` are computed from that attempt's R1.
 
-**Unknown CAS outcome** (ADR-aacruzgon-0024). `WriteTimeout` with `write_type = CAS` (or `CAS_WRITE_UNKNOWN` on protocol v5): run R2. Contention alone can cause it, with nothing committed. For an attempt that targeted version `V`:
+**Unknown CAS outcome** (ADR-aacruzgon-0024, amended 2026-11-05).
+- **Triggers:** `WriteTimeout` or `WriteFailure` with `write_type = CAS`, on any of C1 to C4, so for `create`, `create_or_update`, `update`, `delete` and `delete_versioned`.
+    - With `paxos_variant: v2`, 5.0.9 throws `WriteFailure`/CAS when replicas fail, even in the commit phase after consensus (`Paxos.java:794-799`).
+    - `CAS_WRITE_UNKNOWN` comes only from the legacy v1 path, and cdrs-tokio 8.1.9 cannot decode it; if it ever arrives, it is treated the same way.
+    - A client-side timeout or a dropped connection after the CAS was sent is treated exactly like `WriteTimeout`/CAS. In cdrs-tokio that is `Error::General("Connection closed …")`, `Error::Io`, `Error::Timeout` (raised only while connecting), or the backend's own request deadline.
+    - Every CAS is sent as non-idempotent, so neither the driver's retry policy nor speculative execution ever re-sends one.
+- **What to do:** run R2. Contention alone can cause it, with nothing committed.
+
+For an attempt that targeted version `V` (1 for C1):
 
 | R2 shows | Meaning | Action |
 | --- | --- | --- |
-| `version_id = V`, our `write_id` | applied | continue at step 4 |
-| `version_id = N`, or no row for C1 | not applied, and never will be | run again as a new attempt after a random 5 to 25 ms pause, from a budget of 2; the attempt's I1 is left for the sweeper |
-| `version_id = V`, another `write_id` | another writer won `V` | a definite miss: 409 from `update` and `delete_versioned`; next attempt in `create_or_update` and a plain `delete` |
-| `version_id > V` | undecidable: ours may have applied and been superseded | `BackendError::Timeout`, 504; no retry, which could write the body twice; I1 left for the sweeper |
-| R2 times out | unknown | `BackendError::Timeout`, 504 |
+| `version_id = V`, our `write_id` | applied | continue at step 4; a create returns 201 |
+| `version_id = N`, or no row for C1 | not applied, and never will be | run again as a new attempt after a random 5 to 25 ms pause, from a budget of 2 re-runs; a create keeps the same `id`; the attempt's I1 is left for the sweeper |
+| `version_id = V`, another `write_id` | another writer won `V` | a definite miss: `AlreadyExists`, 409, from `create`; 409 from `update` and `delete_versioned`; the next attempt in `create_or_update` and a plain `delete` |
+| `version_id > V` | undecidable: ours may have applied and been superseded | after `WriteTimeout`, a client-side timeout or a dropped connection: `BackendError::Timeout`, 504; after `WriteFailure`: `BackendError::Unavailable`, 503. No retry, which could write the body twice; I1 left for the sweeper |
+| R2 times out, or fails | unknown | timed out: `BackendError::Timeout`, 504; failed (`ReadFailure`, `Unavailable`): `BackendError::Unavailable`, 503; I1 kept |
 
-Every timeout is 504 and every unavailable node 503, as `crates/rest/src/error.rs` maps them (G26). `write_type = SIMPLE`: the CAS was decided and only the commit timed out, so treat it as applied.
+Every timeout is 504 and every unavailable node or replica failure 503, as `crates/rest/src/error.rs` maps them (G26). When the 2 re-runs are used up, the last attempt's error decides the same way: 504 after a `WriteTimeout`, 503 after a `WriteFailure`. `write_type = SIMPLE`: the CAS was decided and only the commit timed out, so treat it as applied.
 
 ### 3.2 Create (`ResourceStorage::create`, `POST /Patient`)
 
@@ -272,6 +280,7 @@ Every timeout is 504 and every unavailable node 503, as `crates/rest/src/error.r
 | --- | --- |
 | applied | 201 Created, `ETag: W/"1"` |
 | not applied (row returned): id collision, reachable only with a client-chosen id | `ResourceError::AlreadyExists`, 409 (inside `create_or_update` the loop restarts as an update) |
+| unknown (`WriteTimeout` or `WriteFailure`, `write_type = CAS`) | R2 on the same `id`, then the table in 3.1: our `write_id` is 201; no row is a re-run with the same `id` and a fresh `w`, so a client never gets two resources from one `POST`; another `write_id` is `AlreadyExists`, 409 |
 
 ### 3.3 Update (`ResourceStorage::update(tenant, current, resource)`, `PUT /Patient/id`)
 
@@ -317,9 +326,9 @@ The REST update handler maps `Gone` to "no current resource" and calls `create_o
 | b | live | C2 with `IF version_id = N AND deleted_at = null` | `VersionConflict`, or `NotFound` if deleted in the gap; I2, next turn |
 | c | deleted (revive) | C4 with `IF version_id = N`; `K(N)` is empty (delete marker) | `VersionConflict`; I2, next turn |
 
-A definite miss starts the next turn at once, with no pause, at most 3 times. An unknown outcome is settled first by the table in 3.1, from its own budget of 2.
+A definite miss starts the next turn at once, with no pause, for at most 3 retries, so 4 turns in all. An unknown outcome is settled first by the table in 3.1, from its own budget of 2 re-runs.
 
-After the CAS applies, steps 4 to 6 run as for update: V1 for `N+1`; V3 for `N` (branch b a content row from R1; branch c a delete marker, `deleted_at` set and `data` unset, although `resources.data` still holds the old content); inserts of `K(N+1)` (branch b also deletes `K(N) \ K(N+1)`), I2. Returned: branch a 201 (`created = true`); branch b 200 (`created = false`); branch c 201 (`created = true`, PostgreSQL parity; R4 and R4B http.html#update require 201 for a resource "brought back to life"); after 3 definite misses, `VersionConflict`, 409 (that turn's I2 already ran). On revive, `fhir_version` is the original from R1 (G13, ADR-aacruzgon-0024) and `created_at` is kept (G14, ADR-aacruzgon-0011).
+After the CAS applies, steps 4 to 6 run as for update: V1 for `N+1`; V3 for `N` (branch b a content row from R1; branch c a delete marker, `deleted_at` set and `data` unset, although `resources.data` still holds the old content); inserts of `K(N+1)` (branch b also deletes `K(N) \ K(N+1)`), I2. Returned: branch a 201 (`created = true`); branch b 200 (`created = false`); branch c 201 (`created = true`, PostgreSQL parity; R4 and R4B http.html#update require 201 for a resource "brought back to life"); a fourth definite miss is `VersionConflict`, 409 (that turn's I2 already ran). On revive, `fhir_version` is the original from R1 (G13, ADR-aacruzgon-0024) and `created_at` is kept (G14, ADR-aacruzgon-0011).
 
 ## 4. Reads
 
@@ -651,8 +660,8 @@ G numbers are stable references; the list is grouped by severity, not sorted.
 - A delete of an unknown or already-deleted id stays 404, matching Helios (`delete.rs`), not the spec's 200/204 (3.4).
 
 **G26. 503 or 504.** *Resolved in the design (ADR-aacruzgon-0024).* The rule is the one `crates/rest/src/error.rs` already applies:
-- a timeout (`WriteTimeout`, `ReadTimeout`, an undecidable or timed-out serial read) is `BackendError::Timeout`, 504;
-- an unavailable node or connection is `BackendError::Unavailable`, 503.
+- a timeout (`WriteTimeout`, `ReadTimeout`, a timed-out serial read, or an outcome a timeout left undecidable) is `BackendError::Timeout`, 504;
+- an unavailable node or connection, or a replica failure (`WriteFailure`, `ReadFailure`, or an outcome a `WriteFailure`/CAS left undecidable), is `BackendError::Unavailable`, 503 (amended 2026-11-05 after review on PR #32).
 
 The failed intent write (3.1, step 2) and the unknown CAS outcome (3.1) now say so.
 
@@ -736,6 +745,6 @@ The failed intent write (3.1, step 2) and the unknown CAS outcome (3.1) now say 
 
 **G27. `too-costly` has no search error.** *Severity: low.* `SearchError::TooManyResults`, the closest variant, maps to 422 `UnprocessableEntity` (`crates/rest/src/error.rs`). No search path produces issue code `too-costly`; its only producer is the batch handler's 500 for a transaction Bundle too large for MongoDB's cache (`handlers/batch.rs`). Accept 422, or add a variant for the upstream touch list. Also define what the cap counts: index rows read, or distinct candidates.
 
-**G28. Batch `ifMatch` plus the `create_or_update` retry is last-writer-wins.** *Severity: low (upstream limitation).* REST checks a batch entry's `ifMatch` with a read, then calls `create_or_update` (`batch.rs` documents this window). Our loop retries on a newer version, so an entry conditioned on `W/"1"` can overwrite a version 2 it never saw. The router cannot call `update_with_match`, but our retry widens the window. Recorded in the design; the upstream `create_or_update` contract (#2111) makes the retry mandatory, and the bound is 3 (ADR-aacruzgon-0024).
+**G28. Batch `ifMatch` plus the `create_or_update` retry is last-writer-wins.** *Severity: low (upstream limitation).* REST checks a batch entry's `ifMatch` with a read, then calls `create_or_update` (`batch.rs` documents this window). Our loop retries on a newer version, so an entry conditioned on `W/"1"` can overwrite a version 2 it never saw. The router cannot call `update_with_match`, but our retry widens the window. Recorded in the design; the upstream `create_or_update` contract (#2111) makes the retry mandatory, and the bound is 3 retries, or 4 attempts (ADR-aacruzgon-0024).
 
 **G29. Does a delete keep `data` in `resources`?** *Severity: low.* Keeping it costs nothing and writes no tombstone, and `read` never returns it; clearing it writes a cell tombstone. The walk-through keeps it. A revive must not read it as `K(N)` (the marker's key set is empty), and its V3 must leave `data` unset, as design step 4 now says.

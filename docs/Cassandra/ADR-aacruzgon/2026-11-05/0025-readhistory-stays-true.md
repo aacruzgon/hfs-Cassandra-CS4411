@@ -1,0 +1,60 @@
+# ADR-aacruzgon-0025: `readHistory` stays `true` on Cassandra; only the history interactions are omitted
+
+- **Date:** 2026-11-05
+- **Status:** accepted
+- **Context:**
+    - **The current plan.** The design's CapabilityStatement patch (`cassandra-discussion.md`, "Capabilities and rejection", the `supports_history()` bullet; roadmap Step 7) had Cassandra return `false` from a new `InstanceHistoryProvider::supports_history()` hook. The handler would then:
+        - omit `history-instance`, `history-type` and `history-system`;
+        - set `readHistory: false`;
+        - keep `vread` and `versioning: versioned`.
+    - **The spec does not support the `readHistory` part.** The same definition is in all three versions the fork builds or may build:
+        - **R4** (https://hl7.org/fhir/R4/capabilitystatement-definitions.html#CapabilityStatement.rest.resource.readHistory). Definition: "A flag for whether the server is able to return past versions as part of the vRead operation." Comments: "It is useful to support the vRead operation for current operations, even if past versions aren't available."
+        - **R4B** (https://hl7.org/fhir/R4B/capabilitystatement-definitions.html#CapabilityStatement.rest.resource.readHistory): the same Definition and Comments.
+        - **R5** (https://hl7.org/fhir/R5/capabilitystatement-definitions.html#CapabilityStatement.rest.resource.readHistory): the same Definition and Comments, plus the Short Display "Whether vRead can return past versions".
+    - **The history interactions are a separate element.** They are interaction codes in `rest.resource.interaction` and `rest.interaction` (https://hl7.org/fhir/R4/valueset-type-restful-interaction.html):
+        - `vread`: "Read the state of a specific version of the resource."
+        - `history-instance`: "Retrieve the change history for a particular resource."
+        - `history-type`: "Retrieve the change history for all resources of a particular type."
+    - **So `readHistory` is about vread, not about history.** Cassandra's `vread` reads any past version from `resource_versions`, with a delete marker answering 410. That is exactly "able to return past versions as part of the vRead operation".
+    - **What HFS advertises today**, checked again in the code at `5b69583be`:
+        - `crates/rest/src/handlers/capabilities.rs:442-443` hard-codes `"versioning": "versioned"` and `"readHistory": true` for every resource type;
+        - lines 416-436 list `vread`, `history-instance` and `history-type` for every type;
+        - line 214 always adds the system interaction `history-system`;
+        - no `supports_history` hook exists yet: `grep supports_history` finds nothing in `crates/rest/src` or `crates/persistence/src/core`;
+        - `create_app` already requires `InstanceHistoryProvider` (`crates/rest/src/lib.rs:268`), while `build_capability_statement`'s bound (`capabilities.rs:129-136`) does not include it yet.
+    - **Found by** the 2026-11-05 investigation of the `create_or_update` race contract (ADR-aacruzgon-0024), as a side finding. Kept as a separate entry because it is a different decision.
+- **Decision:**
+    - **Cassandra keeps advertising `readHistory: true`.**
+    - **The rest of the plan stands:**
+        - `supports_history()` defaulted to `true`, with Cassandra returning `false`;
+        - the handler omits `history-instance`, `history-type` and `history-system`;
+        - it keeps `vread` and `versioning: versioned`;
+        - it adds `InstanceHistoryProvider` to `build_capability_statement`'s bound.
+    - **Only the `readHistory: false` step is dropped.**
+- **Alternatives considered:**
+    - **`readHistory: false`, as planned:** lost. It tells clients that vread returns only the current version, which is false for Cassandra and contradicts the element's definition in R4, R4B and R5. A client that trusts the statement would never vread a past version that we do serve.
+    - **Keep the history interactions too:** lost. Cassandra does not implement the history providers (design scope table: history is ✗), and advertising them would bring back the over-reporting the Step 7 patch exists to remove.
+    - **Tie `readHistory` to `supports_history()`, so other backends could turn it off:** lost for now. No backend in the workspace has history interactions but lacks versioned vread, so the hook would conflate two capabilities. If such a backend appears, it needs its own hook.
+- **Consequences:**
+    - **Easier:** the Step 7 patch is smaller. The handler change touches only the interaction lists, not `readHistory`. Its upstream pull request is easier to argue, because every change it makes follows a spec definition.
+    - **To test:** the Step 7 tests (`crates/rest/tests/capabilities_search_params.rs`, `rest_conformance.rs`) assert, for the stub backend that returns `false`:
+        - `readHistory: true`;
+        - `vread` present;
+        - `history-instance`, `history-type` and `history-system` absent.
+    - **Inferno and the exit criterion.** The capability-truth group in the Inferno kit (roadmap Step 8) checks "no history" as the absence of the history interactions, not `readHistory`. The roadmap Step 7 exit criterion now names `readHistory: true` explicitly.
+    - **Nothing changes** in the schema or the write path.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), working as a worker agent in its own worktree, with web-fetch subagents for the HL7 definition pages.
+    - **What the AI proposed:**
+        - While checking the CapabilityStatement elements for ADR-aacruzgon-0024, the AI noticed that the R4 definition of `readHistory` is about vread, and that this contradicts the design's plan.
+        - It proposed keeping `readHistory: true` and offered it as an open question rather than deciding it.
+    - **What the human changed:** Alan decided to keep `readHistory: true`, reversing the plan in the design and roadmap. He asked for a separate ADR with the R4, R4B and R5 definitions and URLs, what HFS advertises today, and which part of the plan still stands, checked against the code again.
+    - **Verified:**
+        - **FHIR:** the R4, R4B and R5 `readHistory` Definition and Comments, and the R4 TypeRestfulInteraction code definitions, read verbatim from the URLs above.
+        - **Code:** HFS's current statement in `capabilities.rs` (lines 214, 416-436, 442-443, and the bound at 129-136) and `lib.rs:268`, read at `5b69583be`; the absence of `supports_history`, checked by grep.
+    - **Not verified:** the handler change itself. It is Step 7 work and has not been written.
+- **Links:**
+    - `cassandra-discussion.md`, "Capabilities and rejection" (the `supports_history()` bullet and its new sub-bullets);
+    - `development-roadmap.md` Step 7 (tasks, spec and exit criterion);
+    - `crates/rest/src/handlers/capabilities.rs`; `crates/rest/src/lib.rs`;
+    - ADR-aacruzgon-0024 (the investigation this came from).

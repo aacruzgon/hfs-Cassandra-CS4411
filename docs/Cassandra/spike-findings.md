@@ -65,7 +65,7 @@ Keyset paging with `(last_updated, id) < (?, ?)` on the `DESC, DESC` order exclu
 | Unlogged, 60 partitions | 64 KiB | `Batch too large` |
 | Logged, **1 partition**, 60 rows | 64 KiB | **Succeeds, no warning** |
 
-The index batches are multi-partition, so the design's rule stands: keep each under 5 KiB, and never raise the threshold. A batch to a single partition is not size-checked at all.
+The index batches are multi-partition, so the design's rule stands: keep each under 5 KiB, and never raise the threshold. A batch to a single partition is not size-checked at all. **Added 2026-11-05 (schema audit, ADR-aacruzgon-0026):** these batches carried their bytes in a regular `data` column. The check does not count partition-key bytes. On a 5.0.9 node, a 30-partition logged batch to `uri_index` with about 120 KB of partition keys was accepted with no warning, while a `token_code_index` batch with 78 KiB of clustering values was refused. Index rows are mostly key bytes, so the backend sizes its batches itself; the thresholds do not catch an oversized index batch.
 
 ## Tombstones and timestamps (B2, B3)
 

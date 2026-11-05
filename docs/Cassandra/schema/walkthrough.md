@@ -6,9 +6,9 @@ This walks every in-scope operation through the ten tables, statement by stateme
 
 **This file holds the statements; [`coverage.md`](coverage.md) holds the expected results**: the per-parameter tables (token forms, date prefixes, `_lastUpdated`, `_id`, AND, cursor, count) and every rejection. Neither repeats the other.
 
-Code facts were checked against the working tree on 2026-10-13 (`crates/persistence`, `crates/rest`). "Checked on a 5.0.9 node, 2026-10-13" marks live tests on a single Cassandra 5.0.9 node. Revised on 2026-10-14 for the design changes in ADR-aacruzgon-0012 to 0017.
+Code facts were checked against the working tree on 2026-10-13 (`crates/persistence`, `crates/rest`). "Checked on a 5.0.9 node, 2026-10-13" marks live tests on a single Cassandra 5.0.9 node. Revised on 2026-10-14 for the design changes in ADR-aacruzgon-0012 to 0017, and on 2026-11-05 for ADR-aacruzgon-0024 and 0026. For ADR-0026 the code facts it relies on were re-checked on 2026-11-05 against `main` after the upstream sync (PR #28): `SearchQuery.fhir_version` and `SearchQuery.compartment`, the compartment membership rule of SQLite and MongoDB, the error variants, and every line reference in section 8. "Checked on a 5.0.9 node, 2026-11-05" marks the tests for ADR-0026.
 
-> **Read this first.** The seven most serious gaps of the first draft (G1, G2, G4, G5, G6, G10, G11) are now resolved in the design, with G3, G9 and G16; section 8 says how. The most serious gaps still open:
+> **Read this first.** The seven most serious gaps of the first draft (G1, G2, G4, G5, G6, G10, G11) are now resolved in the design, with G3, G9, G13, G16, G25, G26 and G31, and the schema audit's G33 to G37 (ADR-aacruzgon-0026); section 8 says how. The most serious gaps still open:
 >
 > 1. **G7.** `count` has no tag check, so it counts writes in flight, crash orphans until the sweep, and rows resurrected on the cluster.
 > 2. **G12.** Several Helios processes run several sweepers, each re-reading and replaying the same intents.
@@ -40,7 +40,7 @@ Code facts were checked against the working tree on 2026-10-13 (`crates/persiste
 | `lu(V)` | `last_updated` of version `V`, a `timestamp` in milliseconds: `lu(1) = now_ms`, `lu(N+1) = max(now_ms, lu(N) + 1 ms)` (ADR-aacruzgon-0016) |
 | `w(V)` | `write_id` (uuid) of the request that wrote version `V` |
 | `tu(V)` | `enqueued_at` (timeuuid) of the intent row for version `V` |
-| `K(V)` | the index keys version `V` produces: one `resources_by_type` row, plus every token, date and URI row from `SearchParameterExtractor::extract` on `V`'s content. Empty when `V` is a delete marker. |
+| `K(V)` | the index keys version `V` produces: one `resources_by_type` row, plus every token, date and URI row from `SearchParameterExtractor::extract` on `V`'s content. Empty when `V` is a delete marker. No `code`, `system` or `uri` value in it is longer than 2,048 bytes (step 1, G35). |
 | `IMPLICIT` | the marker system for `code`-typed elements: `IMPLICIT_TOKEN_SYSTEM` = `"urn:x-helios:implicit code system"` (`search/converters.rs`) |
 | `''` | the "no system" sentinel |
 
@@ -82,6 +82,7 @@ DELETE FROM pending_index_writes
 
 -- I3: sweeper read, one time slice of one partition. LOCAL_QUORUM.
 -- Lower bound: the partition's low-water mark. Upper bound: now minus the grace period.
+-- write_id is not selected: the sweeper never reads it (G32).
 SELECT enqueued_at, tenant_id, resource_type, id, version_id
   FROM pending_index_writes
  WHERE bucket = ? AND shard = ?
@@ -134,33 +135,35 @@ UPDATE resources
 ### Version rows (`resource_versions`)
 
 ```sql
--- V1: content version. Plain write, LOCAL_QUORUM.
+-- V1: content version. Plain write, LOCAL_QUORUM. write_id = w(V) (ADR-aacruzgon-0026).
 INSERT INTO resource_versions
-       (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version, write_ts)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version, write_ts, write_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 USING TIMESTAMP ?;                       -- ts(V)
 
 -- V2: delete marker. data is left unset.
 INSERT INTO resource_versions
-       (tenant_id, resource_type, id, version_id, last_updated, deleted_at, fhir_version, write_ts)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       (tenant_id, resource_type, id, version_id, last_updated, deleted_at, fhir_version, write_ts, write_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 USING TIMESTAMP ?;                       -- ts(V)
 
 -- V3: rewrite of row N on update, delete and revive (ADR-aacruzgon-0012).
 -- V1, or V2 for a marker (deleted_at set, data unset), from what the writer holds,
 -- USING TIMESTAMP ts(N) - 1.  One microsecond older than the original row.
+-- Built from R1 (delete, create_or_update, update_with_match): write_id = R1's write_id.
+-- Built from update's StoredResource, which has no write_id: write_id left unset (G36).
 ```
 
-Partition: `(T, P, id)` of `resource_versions`, a different table from `resources`. Every version row carries the resource's own `fhir_version`, the one it was created with (G13). V3 and the `N+1` row may share one single-partition batch, each with its own `USING TIMESTAMP`. If row `N` exists, the original wins every cell, even if the content re-serialises differently; if `N`'s request crashed before its step 4, V3 restores it.
+Partition: `(T, P, id)` of `resource_versions`, a different table from `resources`. Every version row carries the resource's own `fhir_version`, the one it was created with (G13), and the `write_id` of the CAS that created it, except a V3 built from `update`'s `StoredResource` (G36). V3 and the `N+1` row may share one single-partition batch, each with its own `USING TIMESTAMP`. If row `N` exists, the original wins every cell, even if the content re-serialises differently; if `N`'s request crashed before its step 4, V3 restores it.
 
 ### Index rows
 
-Every index statement carries `USING TIMESTAMP ts(V)` of the version being written. One version's inserts and deletes go in logged batches, each under 5 KiB (`batch_size_warn_threshold`), sent concurrently at `LOCAL_QUORUM`. The batches are multi-partition, so they are size-checked (spike B1).
+Every index statement carries `USING TIMESTAMP ts(V)` of the version being written. One version's inserts and deletes go in logged batches, each under 5 KiB (`batch_size_warn_threshold`), sent concurrently at `LOCAL_QUORUM`. The backend measures each batch itself, from every byte of its statements: the node's size check does not count partition-key bytes, which are most of an index row (checked on a 5.0.9 node, 2026-11-05: a 30-partition `uri_index` batch carrying about 120 KB of partition keys was accepted with no warning, while a `token_code_index` batch with 78 KiB of clustering values was refused as "Batch too large"). With the 2 KiB rule (G35) the largest single index row is about 4.3 KB, so every row fits in one batch.
 
 ```sql
--- X1 resources_by_type
-INSERT INTO resources_by_type (tenant_id, resource_type, last_updated, id, version_id)
-VALUES (?, ?, ?, ?, ?) USING TIMESTAMP ?;
+-- X1 resources_by_type. fhir_version is the resource's, fixed at create (G34).
+INSERT INTO resources_by_type (tenant_id, resource_type, last_updated, id, version_id, fhir_version)
+VALUES (?, ?, ?, ?, ?, ?) USING TIMESTAMP ?;
 DELETE FROM resources_by_type USING TIMESTAMP ?
  WHERE tenant_id = ? AND resource_type = ? AND last_updated = ? AND id = ?;
 
@@ -224,8 +227,8 @@ SELECT version_id, data, last_updated, created_at, deleted_at, fhir_version, wri
 -- R2: the same SELECT at LOCAL_SERIAL. Completes or cancels an in-flight Paxos proposal.
 -- Used after an unknown CAS outcome, and by the sweeper for every intent.
 
--- R3: one version. LOCAL_QUORUM.
-SELECT data, last_updated, deleted_at, fhir_version, write_ts
+-- R3: one version. LOCAL_QUORUM. write_id decides a superseded unknown outcome (3.1).
+SELECT data, last_updated, deleted_at, fhir_version, write_ts, write_id
   FROM resource_versions
  WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?;
 
@@ -243,12 +246,14 @@ Every write first calls `tenant.check_permission(Operation::…, resource_type)`
 
 | Step | Statement | Partition | On failure |
 | --- | --- | --- | --- |
-| 1 | permission check; extract `K(N+1)`; compute `K(N)` from the old content | — | `TenantError` |
+| 1 | permission check; extract `K(N+1)`; compute `K(N)` from the old content; size check of `K(N+1)` (below) | — | `TenantError`; a value over 2,048 bytes is `ValidationError::InvalidResource`, 400, nothing written |
 | 2 | I1, with `version_id = N+1` | `(bucket, shard)` | `Unavailable`: 503, nothing changed. `WriteTimeout`: an unused intent is swept, so harmless; 504 (`BackendError::Timeout`, G26) |
 | 3 | C1 to C4 | `resources (T,P,id)` | not applied: I2, then the mapped error; unknown outcome below |
 | 4 | V1 or V2 for `N+1` at `ts(N+1)`; on update, delete and revive also V3 for `N` at `ts(N) − 1` | `resource_versions (T,P,id)` | retry with the same timestamps |
 | 5 | index batches, at `ts(N+1)` | index partitions | retry with the same timestamps; `WriteTimeout` type `BATCH` needs no retry (batchlog replays), `BATCH_LOG` does. Retries exhausted: G23 |
 | 6 | I2 | `(bucket, shard)` | ignored: return success; the sweeper replays the same writes, which changes nothing, and deletes the intent |
+
+**Size check** (ADR-aacruzgon-0026, G35). Before step 2, every `code`, `system` and `uri` value in `K(N+1)` is measured in UTF-8 bytes. One over 2,048 bytes refuses the whole write with `StorageError::Validation(ValidationError::InvalidResource { message, details })`, one `ValidationDetail` per offending element (its FHIRPath, the parameter and the byte length, severity `Error`). REST answers 400 with OperationOutcome issue code `invalid` (`crates/rest/src/error.rs:1048`, `570-571`). The values are measured one by one, not as a whole composite key: they are what the client controls, and the other components are bounded by the server (`tenant_id` at most 64 bytes, `MAX_TENANT_ID_LEN` in `tenant/id.rs:34`; `id` at most 64; `resource_type` and `param` from the registry; timestamps fixed). So the largest partition key, `token_system_code_index`'s with a 2,048-byte `system` and `code`, is about 4.3 KB, far below Cassandra's 65,535-byte key limit, and the same resource is accepted or refused the same way in every tenant. `K(N)`, the old keys, is never checked: it was checked when `N` was written.
 
 **Timestamps** (ADR-aacruzgon-0016). `lu(1) = now_ms`; `lu(N+1) = max(now_ms, lu(N) + 1 ms)`; `ts(V) = lu(V) · 1000`. `lu(N)` comes from `current.last_modified()` on update and from R1 on delete and revive, so V3's timestamp is exact with no extra read. `w(N+1)` is a fresh uuid per CAS attempt (ADR-aacruzgon-0024), and `lu` and `ts` are computed from that attempt's R1.
 
@@ -267,8 +272,13 @@ For an attempt that targeted version `V` (1 for C1):
 | `version_id = V`, our `write_id` | applied | continue at step 4; a create returns 201 |
 | `version_id = N`, or no row for C1 | not applied, and never will be | run again as a new attempt after a random 5 to 25 ms pause, from a budget of 2 re-runs; a create keeps the same `id`; the attempt's I1 is left for the sweeper |
 | `version_id = V`, another `write_id` | another writer won `V` | a definite miss: `AlreadyExists`, 409, from `create`; 409 from `update` and `delete_versioned`; the next attempt in `create_or_update` and a plain `delete` |
-| `version_id > V` | undecidable: ours may have applied and been superseded | after `WriteTimeout`, a client-side timeout or a dropped connection: `BackendError::Timeout`, 504; after `WriteFailure`: `BackendError::Unavailable`, 503. No retry, which could write the body twice; I1 left for the sweeper |
+| `version_id > V` | ours may have applied and been superseded | R3 on row `V`, which now selects `write_id` (ADR-aacruzgon-0026, G36); see the next three rows |
+| `version_id > V`; row `V` has our `write_id` | applied, then superseded | success with version `V`, as for "applied" (201 for a create or revive, 200 for an update, 204 for a delete); steps 4 and 5 are skipped, since a late insert of `K(V)` could outlive a later version's tombstones; I1 is left for the sweeper, whose superseded case deletes `K(V-1)` |
+| `version_id > V`; row `V` has another `write_id` | another writer won `V` | a definite miss, as the third row |
+| `version_id > V`; row `V` missing, or its `write_id` unset | undecidable | after `WriteTimeout`, a client-side timeout or a dropped connection: `BackendError::Timeout`, 504; after `WriteFailure`: `BackendError::Unavailable`, 503. No retry, which could write the body twice; I1 left for the sweeper |
 | R2 times out, or fails | unknown | timed out: `BackendError::Timeout`, 504; failed (`ReadFailure`, `Unavailable`): `BackendError::Unavailable`, 503; I1 kept |
+
+Row `V`'s `write_id` is set by `V`'s own step 4 (V1 or V2), by the sweeper's replay of `V`, or by the next writer's V3 when that writer built it from R1: a `delete`, a `create_or_update` or an `update_with_match`. So the outcome is decided whenever the version that superseded ours came from one of those paths. It stays undecidable when it came from `update`, whose V3 is built from a `StoredResource` without a `write_id`, or when row `V` is not written yet.
 
 Every timeout is 504 and every unavailable node or replica failure 503, as `crates/rest/src/error.rs` maps them (G26). When the 2 re-runs are used up, the last attempt's error decides the same way: 504 after a `WriteTimeout`, 503 after a `WriteFailure`. `write_type = SIMPLE`: the CAS was decided and only the commit timed out, so treat it as applied.
 
@@ -293,7 +303,7 @@ REST has already read the row, checked `If-Match` (412 on a mismatch, before sto
 | `deleted_at` set | soft-deleted after REST's read | `NotFound`, 404 (design step 3; the race suite also accepts `Gone`, G9) |
 | `version_id ≠ N`, `deleted_at` null | lost the race | `ConcurrencyError::VersionConflict`, 409 |
 
-`update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `OptimisticLockFailure` (412) without a CAS; a CAS miss after that is 409.
+`update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `OptimisticLockFailure` (412) without a CAS; a CAS miss after that is 409. Its V3 is built from that R1, so it carries R1's `write_id`; plain `update`'s V3 leaves `write_id` unset (G36).
 
 ### 3.4 Delete (`delete` and `delete_versioned`, `DELETE /Patient/id`)
 
@@ -363,7 +373,7 @@ Expected results for every case are in [`coverage.md`](coverage.md). This sectio
 2. Stream candidates from one or more index partitions, in the shared order `(last_updated DESC, id DESC)` where the table has it.
 3. Collapse rows with the same `(last_updated, id)`.
 4. **Tag check:** R1 for the candidate. Keep it only if the row exists, `deleted_at` is unset and `resources.version_id` equals the index row's `version_id`. A mismatch hides the candidate and triggers repair on read (ADR-aacruzgon-0017): maintenance for the current version at its `ts`, from the row just loaded. A stale key the current version does not produce is deleted; one it produces is upserted with the current tag. Repair is logged as a write made from a read.
-5. Apply residual filters.
+5. Apply residual filters: dates and `_lastUpdated` combined with another parameter (5.8); `query.fhir_version`, kept only if `resources.fhir_version` equals `as_mime_param()` of it (5.9, G34); `query.compartment` (5.11, G33).
 6. Stop at `_count + 1` kept resources; the extra one decides whether `next` exists. `LIMIT` is a batch size, not the page size.
 
 Index and R1 reads are `LOCAL_QUORUM`. A candidate whose index tag is `N` while `resources` is at `N+1` (a write between steps 3 and 5) is hidden: the design's in-flight window.
@@ -409,6 +419,8 @@ SELECT last_updated, id, version_id FROM uri_index
 ### 5.4 `_id`
 
 `_id=a,b,c`: R1 for each id, concurrently (`read_batch`), one `resources (T,P,id)` partition per id. No index table and no tag check: the `resources` row is the truth. Drop absent and deleted rows, sort by `(last_updated DESC, id DESC)` in Rust, cut at the cursor. With other parameters, `_id` drives and each other token or URI parameter is a point read (5.8).
+
+**Several `_id` parameters are ANDed (G37).** Their id sets are intersected in Rust before any read, and only the intersection is point-read: `_id=a,b&_id=b` reads `b` only, and disjoint sets read nothing. `_id` is never checked against an index table. REST relies on this: under a `patient/` scope it appends `_id=<launch patient>` to every Patient search, "so `GET /Patient?_id=<other>` matches nothing rather than leaking" (`crates/rest/src/patient_compartment.rs:172-181`).
 
 ### 5.5 `_lastUpdated`
 
@@ -481,6 +493,8 @@ SELECT version_id FROM token_system_code_index
    AND last_updated = ? AND id = ?;
 ```
 
+A non-driving parameter whose form reads two partitions takes one point read per partition, and a match in either counts: `system|code` reads the named system and `IMPLICIT`, `|code` reads `''` and `IMPLICIT`. A comma list takes one point read per value (and per partition of each), ORed. `code` and `system|` read a clustering prefix (`last_updated = ? AND id = ?` without the third column) of `token_code_index` or `token_system_index`, one partition each.
+
 Dates and `_lastUpdated` are residual filters on the loaded `resources` row, as the design says ("Date predicates combined with any other parameter are residual filters"): re-extract the dates and apply `RangePredicate::matches`; compare `resources.last_updated` for `_lastUpdated`. A slice on the driving partition's `last_updated` is an optimisation option (G19).
 
 ### 5.9 `count`, `search_count`, `_count`
@@ -489,9 +503,14 @@ Dates and `_lastUpdated` are residual filters on the loaded `resources` row, as 
 | --- | --- | --- |
 | `count(tenant, Some(P))` | `SELECT id FROM resources_by_type WHERE tenant_id=? AND resource_type=?`, paged by the driver and counted in Rust (or `SELECT COUNT(*)`, which pages internally); no tag check | one, read whole, tombstones included |
 | `count(tenant, None)` | one scan per known resource type (G7) | one per type |
-| `search_count` with filters (`_count=0`, `_summary=count`) | the stream of 5.1 run to the end, with tag checks | as the search |
+| `search_count` with filters (`_count=0`, `_summary=count`, `_total=accurate` or `estimate`) | the stream of 5.1 run to the end, with tag checks, under the candidate cap | as the search |
 | `search_count` with no filters | `count`, or the stream of 5.6 (G7) | one |
+| `search_count` with no filters and `query.fhir_version` set | `SELECT id, fhir_version FROM resources_by_type WHERE tenant_id=? AND resource_type=?`, counting only rows whose `fhir_version` equals `as_mime_param()` of the requested version, in Rust; no `ALLOW FILTERING`, no point reads (G34) | one, read whole |
+| `search_count` with `query.compartment` set | the stream of 5.1 with the compartment residual (5.11) run to the end, under the cap; over the cap is `TooManyResults`, never a partial count | as the search |
 | `_count=n` | page size `n`; read until `n + 1` resources pass | as the search |
+| `_total=accurate` or `estimate` on a search | `SearchQuery::wants_total()` is true (`types/search_params.rs:844-849`): the page as above, plus one `search_count` of the same query for `Bundle.total`; `_total=none` or absent computes no total | as the search, twice |
+
+**`query.fhir_version` (G34).** Set when the client names a `fhirVersion` MIME parameter (`crates/rest/src/handlers/search.rs:557`, upstream #2254). Every tag-checked search applies it as a residual on `resources.fhir_version` (5.1, step 5). An unfiltered search with it set reads `resources_by_type` with `fhir_version` and drops other versions before the tag check, so it costs no extra reads. `None` matches every version.
 
 ### 5.10 A cursor page
 
@@ -506,6 +525,23 @@ Page 2 of `GET /Patient?gender=female&_count=20`:
 
 The tuple relation compares by value on the `DESC, DESC` order, so it excludes every row of the cursor's own resource and places ties exactly (spike A3). A resource updated during paging moves ahead of the cursor and is not seen again (G21).
 
+### 5.11 Compartment filter (`query.compartment`, G33)
+
+REST sets `query.compartment = Some(CompartmentMembership { params, reference })`:
+- for every non-Patient search under a `patient/` scope (`crates/rest/src/patient_compartment.rs:183-201`);
+- for a compartment search, `GET /Patient/123/Observation` (`handlers/compartment.rs:142`), and each type of `GET /Patient/123/*` (`compartment.rs:331`);
+- for `$everything` (`handlers/everything/scope.rs:92`).
+
+`params` are the reference search parameters of the bundled CompartmentDefinition for that compartment and target type (`helios_fhir::get_compartment_params`; for R4 Patient and Observation, `subject` and `performer`, `crates/fhir/src/r4.rs:168626`), and `reference` is `Patient/123`.
+
+No table indexes references, so membership is a residual filter on each candidate that passed the tag check (5.1, step 5). The rule is the one SQLite and MongoDB apply to their reference index rows (`backends/sqlite/search/query_builder.rs:863-896`, `backends/mongodb/search_impl.rs:847-862`):
+- re-extract the row with `SearchParameterExtractor::extract`, under the resource's own `fhir_version` and the tenant's registry, and keep the `IndexValue::Reference` values of the parameters named in `params`;
+- the candidate is a member if any of them equals `strip_reference_version(reference)` or starts with it followed by `/_history/`.
+
+The other parameters drive as usual, in the shared order, so paging stays keyset. With no other parameter, the driver is `resources_by_type`.
+
+**Cap.** The rows read for one page, or for one `search_count`, count against the same candidate cap as a date-only search (what the cap counts is G27). Past the cap the search fails with `SearchError::TooManyResults`. REST answers 422 with issue `processing` (`crates/rest/src/error.rs:1123-1125`, `591-595`). The search never returns a page or a count that was only partly filtered, and never ignores the filter. A page that fills before the cap is returned normally.
+
 ## 6. The sweeper
 
 A background task in each Helios process (ADR-aacruzgon-0013 to 0015). It never compares `write_id`.
@@ -517,7 +553,7 @@ A background task in each Helios process (ADR-aacruzgon-0013 to 0015). It never 
 | Case | Reads | Writes |
 | --- | --- | --- |
 | no row, or `version_id < V`: the CAS never applied | — | none |
-| `V` current: a crashed or slow request | R3 for `V-1` (not for `V = 1`) | step 4 for `V`'s own row (never V3) and step 5, at `ts(V)`: V1, or V2 with `K(V)` empty if `deleted_at` is set; delete `K(V-1) \ K(V)`, insert `K(V)` |
+| `V` current: a crashed or slow request | R3 for `V-1` (not for `V = 1`) | step 4 for `V`'s own row (never V3) and step 5, at `ts(V)`: V1, or V2 with `K(V)` empty if `deleted_at` is set, with `write_id` from the `resources` row; delete `K(V-1) \ K(V)`, insert `K(V)` |
 | `V` superseded | R3 for `V` (for `ts(V)`) and `V-1` | delete all of `K(V-1)` at `ts(V)`; no inserts, since a later version already deleted `K(V)` and a late insert would outlive those tombstones (3 h) |
 | `V` superseded, row `V` missing (two crashes in a row) | R3 for `V-1` | delete all of `K(V-1)` at `ts(V-1) + 1`, and log; `V` never reached step 5 |
 
@@ -547,7 +583,7 @@ Extraction gives three parameters: `identifier` (token, system `http://hospital.
 
 ### Version 1: create
 
-I1 inserts `(tu(1), acme, Patient, p1)` with `w1` and `version_id 1` into `('2026-10-14T10', 7)`. C1 applies: `version_id 1`, `last_updated` and `created_at` `lu(1)`, `fhir_version '4.0'`, `write_ts ts(1)`, `write_id w1`, `data`. V1 writes version 1 at `ts(1)`. Then 9 index inserts, all `USING TIMESTAMP 1791972000123000`, tag 1; then I2.
+I1 inserts `(tu(1), acme, Patient, p1)` with `w1` and `version_id 1` into `('2026-10-14T10', 7)`. C1 applies: `version_id 1`, `last_updated` and `created_at` `lu(1)`, `fhir_version '4.0'`, `write_ts ts(1)`, `write_id w1`, `data`. V1 writes version 1 at `ts(1)`, with `write_id w1`. The `resources_by_type` row carries `fhir_version '4.0'`. Then 9 index inserts, all `USING TIMESTAMP 1791972000123000`, tag 1; then I2.
 
 | Table | Partition key (after `acme, Patient`) | Clustering key |
 | --- | --- | --- |
@@ -616,10 +652,10 @@ The two date keys are the ones version 3 deleted. They come back because the ins
 
 G numbers are stable references; the list is grouped by severity, not sorted.
 
-- **Resolved in the design** (kept short, so a reader sees why it changed): G1, G2, G3, G4, G5, G6, G9, G10, G11, G13, G16, G25, G26, G31.
+- **Resolved in the design** (kept short, so a reader sees why it changed): G1, G2, G3, G4, G5, G6, G9, G10, G11, G13, G16, G25, G26, G31, and from the schema audit G33, G34, G35, G36, G37 (ADR-aacruzgon-0026).
 - **Correctness bugs** (open): G7, G22.
 - **Performance**: G8, G12, G17, G18, G20, G30.
-- **Decisions to record**: G14, G15, G19, G21, G23, G24, G27, G28, G29.
+- **Decisions to record**: G14, G15, G19, G21, G23, G24, G27, G28, G29, G32.
 
 ### Resolved in the design
 
@@ -635,13 +671,13 @@ G numbers are stable references; the list is grouped by severity, not sorted.
 
 **G6. The sweeper polled 2 buckets, but intents live 24 h.** *Resolved in the design (ADR-aacruzgon-0014).* After an outage over an hour, a crashed create stayed unsearchable for good. Now the sweeper walks the 25 most recent buckets at startup. Past the TTL a crashed create stays unsearchable (readable by id) until next written, a limitation the design now states.
 
-**G9. The CAS result mapping depends on the operation.** *Resolved in the design (step 3; a correction, no ADR).* `deleted_at` set is 410 for `read` and `vread` only; every write maps it to `NotFound`, 404, which the race suite allows (lines 92 to 93 and 436 to 443). `spike-findings.md` point 3 is corrected.
+**G9. The CAS result mapping depends on the operation.** *Resolved in the design (step 3; a correction, no ADR).* `deleted_at` set is 410 for `read` and `vread` only; every write maps it to `NotFound`, 404, which the race suite allows (`versioned_write_race_suite.rs:94-95`, and the deleted-row arms at 262, 369 and 541). `spike-findings.md` point 3 is corrected.
 
 **G10. Repair on read could delete a key the in-flight writer needs.** *Resolved in the design (ADR-aacruzgon-0017).* A delete wins a timestamp tie, so deleting a stale date key at `ts(N+1)` beat the writer's insert. Now repair deletes only keys the current version does not produce and upserts the rest (5.1). Its read-latency cost is unmeasured.
 
 **G11. The grace period is a clock comparison.** *Resolved in the design (documented).* The design said "no clocks are compared". It now states the assumption: clock skew plus intent-to-CAS latency stays under the grace period, which also guards the mark. A request that stalls longer and then crashes before its index writes is left to repair on read; a create or revive in that state stays unsearchable until next written, a stated limitation. So does a pause past `gc_grace_seconds` that resurrects rows `count` then includes. Deployment requirement: NTP, skew well under 30 s.
 
-**G16. Columns on `resource_versions` and the intent row.** *Resolved in the design (ADR-aacruzgon-0013).* The intent row gained `version_id int`. `resource_versions` needs no `write_id`, since the sweeper no longer compares it, and no `created_at` (G14).
+**G16. Columns on `resource_versions` and the intent row.** *Resolved in the design (ADR-aacruzgon-0013); revised by G36.* The intent row gained `version_id int`. `resource_versions` needs no `created_at` (G14). It was first left without a `write_id`, since the sweeper no longer compares it; ADR-aacruzgon-0026 added one for the unknown-outcome rule (G36).
 
 **G31. Sweeper edge cases found in the revision.** *Resolved in the design (ADR-aacruzgon-0013, 0015).* A late replay could resurrect `K(V)`: a superseded `V` now gets deletes only. A double crash: intent `V` deletes `K(V-1)` at `ts(V-1) + 1`, and a missing previous row means empty previous keys. A stuck intent pinned its mark, and an empty slice never moved it: now a retry list, and the mark moves to each poll's upper bound. Marks are per `(bucket, shard)`, with `bucket` from `enqueued_at`.
 
@@ -664,6 +700,24 @@ G numbers are stable references; the list is grouped by severity, not sorted.
 - an unavailable node or connection, or a replica failure (`WriteFailure`, `ReadFailure`, or an outcome a `WriteFailure`/CAS left undecidable), is `BackendError::Unavailable`, 503 (amended 2026-11-05 after review on PR #32).
 
 The failed intent write (3.1, step 2) and the unknown CAS outcome (3.1) now say so.
+
+**G33. The compartment filter was neither served nor refused.** *Resolved in the design (ADR-aacruzgon-0026).* Under a `patient/` scope, and for compartment searches and `$everything`, REST sets `query.compartment` and relies on the backend to apply it. No table indexes references, and ignoring the field would have returned other patients' resources. It is now a residual filter on every loaded row, with SQLite's and MongoDB's membership rule and the search's candidate cap, and `TooManyResults` (422) past the cap. A count under a compartment runs the same filter (5.9, 5.11).
+
+**G34. `query.fhir_version` could not be applied by `count`.** *Resolved in the design (ADR-aacruzgon-0026).* Upstream #2254 added `SearchQuery.fhir_version`. Tag-checked searches apply it to `resources.fhir_version`. The `count` path reads no `resources` rows, so `resources_by_type` now carries `fhir_version`, written by X1 and the sweeper, and an unfiltered `search_count` drops other versions while it scans (5.9).
+
+**G35. An index value over Cassandra's key limit made a committed write unindexable.** *Resolved in the design (ADR-aacruzgon-0026).* Checked on a 5.0.9 node, 2026-11-05:
+- a 70,000-byte `code` in a partition key fails with "Key length of 70021 is longer than maximum of 65535";
+- so does a 70,000-byte `system` in a clustering key ("Key length of 70010");
+- so does a composite partition key of a 40,000-byte `system` plus a 40,000-byte `code` (80,021).
+
+The CAS had already applied when step 5 failed, so no retry, sweep or repair could ever finish the write. Now step 1 refuses any `code`, `system` or `uri` value over 2,048 UTF-8 bytes with `ValidationError::InvalidResource`, 400, before the intent row (3.1, "Size check").
+
+**G36. A superseded unknown outcome was always undecidable.** *Resolved in the design (ADR-aacruzgon-0026, refining ADR-aacruzgon-0024).*
+- `resource_versions` gains `write_id`, written by V1 and V2 and by any V3 built from R1.
+- When the serial read finds a version past ours, R3 on row `V` decides it: our `write_id` is success with no index writes; another is a definite miss.
+- It stays undecidable (504 or 503) when row `V` is missing or has no `write_id`, which is the case when `update`, whose `StoredResource` has no `write_id`, superseded it (3.1).
+
+**G37. Two `_id` parameters must intersect.** *Resolved in the design (ADR-aacruzgon-0026).* A `patient/` scope appends `_id=<patient>` to every Patient search. If it had been checked against an index table, P5 would have made such searches empty; if only the first `_id` had been used, they would have leaked other patients. All `_id` parameters are now intersected before any read (5.4).
 
 ### Correctness bugs
 
@@ -689,10 +743,10 @@ The failed intent write (3.1, step 2) and the unknown CAS outcome (3.1) now say 
 
 **G12. Several Helios processes means several sweepers.** *Severity: low (one process in this project).* Each polls all 32 partitions with its own marks, runs its own startup scan, and races the others on the same intents. The writes are idempotent, so the cost is duplicate I3 reads, Paxos reads and replays. Accept it, or take a lease row with an LWT.
 
-**G17. `_id` and `_lastUpdated` from the extractor.** *Severity: medium.* `SearchParameterExtractor::extract` returns `_id` (token) and `_lastUpdated` (date) for every resource, and also `_profile`, `_source` (URI) and `_tag`, `_security` (token) (`search/extractor.rs`, comments around lines 1066 to 1072; tests around 2358 to 2401 assert they are indexed).
+**G17. `_id` and `_lastUpdated` from the extractor.** *Severity: medium.* `SearchParameterExtractor::extract` returns `_id` (token) and `_lastUpdated` (date) for every resource, and also `_profile`, `_source` (URI) and `_tag`, `_security` (token) (`search/extractor.rs`, the comment at line 1257; the tests at 2507 to 2521 assert `_source` and `_profile` are indexed).
 
 - If written, every resource gets three `_id` token rows no query reads, and a `_lastUpdated` row in both date tables whose key changes on every update: two more tombstones per update, in partitions holding every resource of the type.
-- Proposed: drop `_id` and `_lastUpdated` before computing `K(V)`; `coverage.md` serves both without index rows. Scope of the other four: `coverage.md` C1.
+- Proposed: drop `_id` and `_lastUpdated` before computing `K(V)`; `coverage.md` serves both without index rows. Scope of the other four: `coverage.md` C1. This is safe only because `_id` is never checked against an index table, a second `_id` parameter included (G37).
 
 **G18. Rows that no query reads.** *Severity: medium.*
 
@@ -746,5 +800,7 @@ The failed intent write (3.1, step 2) and the unknown CAS outcome (3.1) now say 
 **G27. `too-costly` has no search error.** *Severity: low.* `SearchError::TooManyResults`, the closest variant, maps to 422 `UnprocessableEntity` (`crates/rest/src/error.rs`). No search path produces issue code `too-costly`; its only producer is the batch handler's 500 for a transaction Bundle too large for MongoDB's cache (`handlers/batch.rs`). Accept 422, or add a variant for the upstream touch list. Also define what the cap counts: index rows read, or distinct candidates.
 
 **G28. Batch `ifMatch` plus the `create_or_update` retry is last-writer-wins.** *Severity: low (upstream limitation).* REST checks a batch entry's `ifMatch` with a read, then calls `create_or_update` (`batch.rs` documents this window). Our loop retries on a newer version, so an entry conditioned on `W/"1"` can overwrite a version 2 it never saw. The router cannot call `update_with_match`, but our retry widens the window. Recorded in the design; the upstream `create_or_update` contract (#2111) makes the retry mandatory, and the bound is 3 retries, or 4 attempts (ADR-aacruzgon-0024).
+
+**G32. Does the intent row need `write_id`?** *Severity: low; open.* I1 writes it and the table has the column, but I3 does not select it and the sweeper never compares it (section 6). Keep it as a diagnostic (an operator can match a stuck intent to a request's log), or drop the column and the bind from I1. Dropping it later is a schema change, though one with no data to migrate, since intent rows live 24 h.
 
 **G29. Does a delete keep `data` in `resources`?** *Severity: low.* Keeping it costs nothing and writes no tombstone, and `read` never returns it; clearing it writes a cell tombstone. The walk-through keeps it. A revive must not read it as `K(N)` (the marker's key set is empty), and its V3 must leave `data` unset, as design step 4 now says.

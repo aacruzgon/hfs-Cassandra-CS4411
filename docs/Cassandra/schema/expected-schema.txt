@@ -1,0 +1,92 @@
+# columns: table column kind position clustering_order type
+date_index end clustering 2 asc timestamp
+date_index id clustering 1 asc text
+date_index param partition_key 2 none text
+date_index resource_type partition_key 1 none text
+date_index start clustering 0 asc timestamp
+date_index tenant_id partition_key 0 none text
+date_index version_id regular -1 none int
+date_index_by_end end clustering 0 asc timestamp
+date_index_by_end id clustering 1 asc text
+date_index_by_end param partition_key 2 none text
+date_index_by_end resource_type partition_key 1 none text
+date_index_by_end start clustering 2 asc timestamp
+date_index_by_end tenant_id partition_key 0 none text
+date_index_by_end version_id regular -1 none int
+pending_index_writes bucket partition_key 0 none text
+pending_index_writes enqueued_at clustering 0 asc timeuuid
+pending_index_writes id clustering 3 asc text
+pending_index_writes resource_type clustering 2 asc text
+pending_index_writes shard partition_key 1 none smallint
+pending_index_writes tenant_id clustering 1 asc text
+pending_index_writes version_id regular -1 none int
+pending_index_writes write_id regular -1 none uuid
+resource_versions data regular -1 none text
+resource_versions deleted_at regular -1 none timestamp
+resource_versions fhir_version regular -1 none text
+resource_versions id partition_key 2 none text
+resource_versions last_updated regular -1 none timestamp
+resource_versions resource_type partition_key 1 none text
+resource_versions tenant_id partition_key 0 none text
+resource_versions version_id clustering 0 desc int
+resource_versions write_id regular -1 none uuid
+resource_versions write_ts regular -1 none bigint
+resources created_at regular -1 none timestamp
+resources data regular -1 none text
+resources deleted_at regular -1 none timestamp
+resources fhir_version regular -1 none text
+resources id partition_key 2 none text
+resources last_updated regular -1 none timestamp
+resources resource_type partition_key 1 none text
+resources tenant_id partition_key 0 none text
+resources version_id regular -1 none int
+resources write_id regular -1 none uuid
+resources write_ts regular -1 none bigint
+resources_by_type fhir_version regular -1 none text
+resources_by_type id clustering 1 desc text
+resources_by_type last_updated clustering 0 desc timestamp
+resources_by_type resource_type partition_key 1 none text
+resources_by_type tenant_id partition_key 0 none text
+resources_by_type version_id regular -1 none int
+token_code_index code partition_key 3 none text
+token_code_index id clustering 1 desc text
+token_code_index last_updated clustering 0 desc timestamp
+token_code_index param partition_key 2 none text
+token_code_index resource_type partition_key 1 none text
+token_code_index system clustering 2 asc text
+token_code_index tenant_id partition_key 0 none text
+token_code_index version_id regular -1 none int
+token_system_code_index code partition_key 4 none text
+token_system_code_index id clustering 1 desc text
+token_system_code_index last_updated clustering 0 desc timestamp
+token_system_code_index param partition_key 2 none text
+token_system_code_index resource_type partition_key 1 none text
+token_system_code_index system partition_key 3 none text
+token_system_code_index tenant_id partition_key 0 none text
+token_system_code_index version_id regular -1 none int
+token_system_index code clustering 2 asc text
+token_system_index id clustering 1 desc text
+token_system_index last_updated clustering 0 desc timestamp
+token_system_index param partition_key 2 none text
+token_system_index resource_type partition_key 1 none text
+token_system_index system partition_key 3 none text
+token_system_index tenant_id partition_key 0 none text
+token_system_index version_id regular -1 none int
+uri_index id clustering 1 desc text
+uri_index last_updated clustering 0 desc timestamp
+uri_index param partition_key 2 none text
+uri_index resource_type partition_key 1 none text
+uri_index tenant_id partition_key 0 none text
+uri_index uri partition_key 3 none text
+uri_index version_id regular -1 none int
+# options: table gc_grace_seconds default_time_to_live compaction_class scaling_parameters
+date_index 10800 0 org.apache.cassandra.db.compaction.UnifiedCompactionStrategy T4
+date_index_by_end 10800 0 org.apache.cassandra.db.compaction.UnifiedCompactionStrategy T4
+pending_index_writes 10800 86400 org.apache.cassandra.db.compaction.UnifiedCompactionStrategy T4
+resource_versions 864000 0 org.apache.cassandra.db.compaction.UnifiedCompactionStrategy T4
+resources 864000 0 org.apache.cassandra.db.compaction.UnifiedCompactionStrategy T4
+resources_by_type 10800 0 org.apache.cassandra.db.compaction.UnifiedCompactionStrategy T4
+token_code_index 10800 0 org.apache.cassandra.db.compaction.UnifiedCompactionStrategy T4
+token_system_code_index 10800 0 org.apache.cassandra.db.compaction.UnifiedCompactionStrategy T4
+token_system_index 10800 0 org.apache.cassandra.db.compaction.UnifiedCompactionStrategy T4
+uri_index 10800 0 org.apache.cassandra.db.compaction.UnifiedCompactionStrategy T4

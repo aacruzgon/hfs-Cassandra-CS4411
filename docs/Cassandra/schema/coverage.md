@@ -14,7 +14,7 @@ This file holds expected results. The CQL for each case is in [`walkthrough.md`]
 - **Residual**: what is checked in Rust after the read.
 - **Expected**: the HTTP result.
 
-**True of every row that returns results.** Each candidate's `resources` row is loaded. It is dropped if its `version_id` differs from the index row's tag or if `deleted_at` is set. Results come in `(last_updated DESC, id DESC)` order, deduplicated on `(last_updated, id)`. `_count` is the page size, and `next` is minted only when a `_count + 1`th match exists.
+**True of every row that returns results.** Each candidate's `resources` row is loaded. It is dropped if its `version_id` differs from the index row's tag or if `deleted_at` is set. It is also dropped if the query names a FHIR version (`query.fhir_version`) that differs from `resources.fhir_version`, or carries a compartment filter (`query.compartment`) the resource is not a member of (section 5). Results come in `(last_updated DESC, id DESC)` order, deduplicated on `(last_updated, id)`. `_count` is the page size, and `next` is minted only when a `_count + 1`th match exists.
 
 ## 1. The parameters
 
@@ -74,6 +74,7 @@ Forms that read two partitions run one query per partition and merge the sorted 
 | pipe on ContactPoint or boolean | `Patient?phone=phone\|555-0100`, `Patient?active=\|true` | as the form says | cursor | — | The spec says the pipe form SHALL NOT be used here. The shared converter makes both match today. Accept, or reject with 400? (C4) |
 | `_id` | `Patient?_id=abc` | `resources`, point read `(id)` | — | `deleted_at` unset | 200; zero or one entry; case-sensitive |
 | `_id` list | `Patient?_id=a,b,c` | `resources`, concurrent point reads (`read_batch`) | — | sort in Rust, cut at cursor | 200; existing, live ids |
+| two `_id` parameters (AND) | `Patient?_id=a,b&_id=b`; every Patient search under a `patient/` scope, to which REST appends `_id=<patient>` | intersect the id sets in Rust, then point-read only the intersection; never an index table | — | sort in Rust, cut at cursor | 200; only ids in every `_id` parameter (`b` here); disjoint sets give an empty searchset (walkthrough 5.4, G37) |
 
 ## 3. Date prefixes ([R4 search.html#prefix](https://hl7.org/fhir/R4/search.html#prefix))
 
@@ -142,6 +143,14 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 | malformed cursor | `_cursor=garbage` | backend | 400 `InvalidCursor` |
 | `count(tenant, Some(type))` | internal | full scan of `resources_by_type`, no tag check | the number of live rows; in-flight and orphan miscounts are G7 |
 | `count(tenant, None)` | internal (all types) | no table serves this (G7) | the number of live rows |
+| `_total=accurate` or `_total=estimate` | `Patient?gender=female&_total=accurate` | the page as usual, plus one `search_count` of the same query (`SearchQuery::wants_total()`); costs and caveats as `_count=0` | 200; `Bundle.total` set. `_total=none` or absent: no `total` |
+| FHIR version named | `GET /Patient?gender=female` with `Accept: application/fhir+json; fhirVersion=4.0` (`query.fhir_version`, upstream #2254) | as the search; residual `resources.fhir_version = '4.0'` after the tag check | 200; only resources stored under that version (walkthrough 5.9, G34) |
+| FHIR version named, unfiltered count | `GET /Patient?_count=0` with `fhirVersion=4.0` | `resources_by_type`, whole partition, counting rows whose `fhir_version` column is `'4.0'`, in Rust; no point reads | 200; `total` of that version only |
+| compartment search | `GET /Patient/123/Observation?code=8867-4` | the token partition drives; residual: re-extract `subject` and `performer` (R4 Patient compartment for Observation) and keep members of `Patient/123` (walkthrough 5.11, G33) | 200; members only, keyset-paged |
+| `patient/` scope | `GET /Observation?status=final` with a token scoped `patient/Observation.rs` and launch patient 123 | as the compartment search: REST sets `query.compartment` | 200; the patient's Observations only. Never unfiltered |
+| compartment, no other parameter | `GET /Patient/123/Observation` | `resources_by_type` drives; residual as above | 200, or the cap row below |
+| compartment count | `GET /Patient/123/Observation?_count=0`, or `_total=accurate` | the residual stream run to the end, under the cap | 200 with the members' `total`; over the cap, the cap row below. Never a partial count |
+| compartment over the cap | a compartment search or count that reads more candidates than the cap before it finishes | — | 422 `SearchError::TooManyResults` (issue `processing`, `crates/rest/src/error.rs:1123-1125`); never a page or count that was only partly filtered |
 | candidate cap exceeded | e.g. `Observation?date=lt2030` on a large tenant | date tables or a filtered `search_count` | An OperationOutcome. The design asks for issue type `too-costly`; no search error produces it today (G27) |
 
 ## 6. Rejections
@@ -178,6 +187,7 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 | Invalid date: `birthdate=1970-13` | REST, then backend | 400 | `InvalidParameter` at REST; `InvalidDateValue` if the backend is called directly |
 | Empty OR value: `gender=male,` | REST, then backend | 400 | `InvalidParameter`; `validate_value_presence` in the backend |
 | Unknown parameter: `Patient?foo=bar` | REST | 200, ignored; 400 with `Prefer: handling=strict` | ([#errors](https://hl7.org/fhir/R4/search.html#errors)) |
+| A write whose indexed `code`, `system` or `uri` value is longer than 2,048 bytes in UTF-8, e.g. an `Identifier.value` of 3,000 characters | backend, step 1, before the intent row | 400 | `StorageError::Validation(ValidationError::InvalidResource)`, one detail per element, OperationOutcome issue `invalid` (`crates/rest/src/error.rs:1048`, `570-571`); nothing is written (walkthrough 3.1, G35) |
 
 ## 7. Open points for the session
 
@@ -207,4 +217,8 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 | Display-only tokens (`CodeableConcept.text`, empty code) and other rows no query reads | G18 | open |
 | "Date-only" with two date parameters, a repeated date, or a date with `_lastUpdated` | G20 | open |
 | `count(tenant, None)`; filtered `search_count` and the candidate cap | G7 | open |
-| The candidate cap's error and status (`too-costly`) | G27 | open; code fact: `TooManyResults` maps to 422, and no search path produces `too-costly` |
+| The candidate cap's error and status (`too-costly`) | G27 | open; code fact: `TooManyResults` maps to 422, and no search path produces `too-costly`. The compartment cap uses `TooManyResults` today (G33) and follows G27 if it changes |
+| Compartment filter (`query.compartment`) | G33 | **resolved** (ADR-aacruzgon-0026): residual on each loaded row, under the cap |
+| `query.fhir_version` on searches and counts | G34 | **resolved** (ADR-aacruzgon-0026): residual, and `resources_by_type.fhir_version` for counts |
+| Index values over 2,048 bytes | G35 | **resolved** (ADR-aacruzgon-0026): the write is refused with 400 `InvalidResource` before step 2 (section 6) |
+| Two `_id` parameters | G37 | **resolved** (ADR-aacruzgon-0026): intersected before any read |

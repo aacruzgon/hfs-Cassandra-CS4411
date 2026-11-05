@@ -19,14 +19,20 @@
 --   * never a CQL DELETE against resources (soft delete only: 410 needs the row);
 --   * every update, delete and revive also rewrites resource_versions row N
 --     from current, USING TIMESTAMP write_ts(N) - 1, so a crash cannot lose
---     it and an existing row always wins;
+--     it and an existing row always wins; a rewrite built from a read of
+--     resources (delete, create_or_update, update_with_match) also carries
+--     that read's write_id, one built from update's StoredResource leaves it
+--     unset (ADR-aacruzgon-0026);
 --   * every write to resource_versions and the index tables carries USING
 --     TIMESTAMP derived from write_ts; a plain write would lose to them;
 --   * never bind null; leave absent columns unset (null writes a cell tombstone).
 --     The one deliberate null is the literal "SET deleted_at = null" in the
 --     revive CAS, which clears the delete and writes exactly one cell
 --     tombstone, on purpose (checked on 5.0.9, 2026-10-13; ADR-aacruzgon-0024);
---   * never ALLOW FILTERING.
+--   * never ALLOW FILTERING;
+--   * never write an index row whose code, system or uri value is longer than
+--     2,048 bytes in UTF-8: the write is refused with 400 before its intent
+--     row, so nothing is written (ADR-aacruzgon-0026).
 --
 -- Common types:
 --   tenant_id, resource_type, id   text (id is never uuid: FHIR ids are
@@ -35,11 +41,15 @@
 --   version_id                     int (sorts numerically)
 --   last_updated, created_at,
 --   deleted_at, start, end         timestamp (milliseconds)
---   fhir_version                   text, FhirVersion::as_mime_param() ("4.0")
+--   fhir_version                   text, FhirVersion::as_mime_param() ("4.0");
+--                                  fixed at create, so it is the same on every
+--                                  row of a resource
 --   write_ts                       bigint, microseconds, used in USING TIMESTAMP;
 --                                  always last_updated x 1000, and
 --                                  last_updated(N+1) = max(now, last_updated(N) + 1 ms)
 --   write_id                       uuid, one per CAS attempt, set by the CAS
+--                                  and copied into that version's
+--                                  resource_versions row
 --
 -- Compaction: no table sets it, so every table gets the node default from
 -- cassandra_latest.yaml: UnifiedCompactionStrategy (UCS) with scaling
@@ -80,6 +90,10 @@ CREATE TABLE IF NOT EXISTS resource_versions (
     deleted_at    timestamp,  -- set only on a delete marker
     fhir_version  text,
     write_ts      bigint,
+    write_id      uuid,       -- the CAS attempt that wrote this version; unset when
+                              -- the row came from a rewrite built from update's
+                              -- StoredResource. Decides an unknown CAS outcome
+                              -- that a later version superseded (ADR-aacruzgon-0026)
     PRIMARY KEY ((tenant_id, resource_type, id), version_id)
 ) WITH CLUSTERING ORDER BY (version_id DESC)
    AND comment = 'All versions per resource; vread, list_versions, delete markers';
@@ -95,8 +109,11 @@ CREATE TABLE IF NOT EXISTS resource_versions (
 -- enqueued_at leads the clustering key so the sweeper reads only a time
 -- slice past its low-water mark, never the tombstones of finished intents
 -- (measured on a node: a whole-partition read scanned 3,000 of them).
--- version_id is the version the attempt's CAS will create; the sweeper
--- replays that version's index writes whenever it exists.
+-- version_id is the version the attempt's CAS will create. The sweeper
+-- replays that version's index writes while it is current, and only deletes
+-- the previous version's keys once it is superseded (ADR-aacruzgon-0013).
+-- write_id is kept for diagnostics only; the sweeper never reads it (whether
+-- to keep it is open, walkthrough G32).
 -- gc_grace_seconds is lowered here too, which the roadmap checklist does not
 -- list: a resurrected intent row is harmless, because the sweeper either
 -- deletes it or replays writes that change nothing.
@@ -122,6 +139,9 @@ CREATE TABLE IF NOT EXISTS pending_index_writes (
 -- tag check), so a stale or resurrected row never surfaces. That is why
 -- these seven tables lower gc_grace_seconds to 10800 s (3 h, the node's
 -- max_hint_window). resources and resource_versions keep the 10-day default.
+-- resources_by_type also carries fhir_version, so count can apply the
+-- request's FHIR version (SearchQuery.fhir_version, upstream #2254) without a
+-- point read per row (ADR-aacruzgon-0026).
 -- '' stands for "no system" (key columns cannot be null).
 -- ---------------------------------------------------------------------------
 
@@ -132,6 +152,7 @@ CREATE TABLE IF NOT EXISTS resources_by_type (
     last_updated  timestamp,
     id            text,
     version_id    int,
+    fhir_version  text,       -- the resource's, as on resources; read by count
     PRIMARY KEY ((tenant_id, resource_type), last_updated, id)
 ) WITH CLUSTERING ORDER BY (last_updated DESC, id DESC)
    AND gc_grace_seconds = 10800

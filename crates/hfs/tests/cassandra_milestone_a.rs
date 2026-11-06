@@ -54,6 +54,13 @@
 //! 7). Over the budget is a warning in the report, never a failure; the test
 //! fails only if `hfs` does not boot or a log line it needs is missing.
 //!
+//! # The REST latency report
+//!
+//! `rest_latency_report` runs only when `HFS_TEST_LATENCY_REPORT` names a
+//! directory, and otherwise returns without a line. It boots `hfs` once on a
+//! fresh tenant without the seed and times 50 `POST /Patient` + `GET` round
+//! trips, one at a time: a smoke trend for CI, not the Step 8 benchmark.
+//!
 //! Run with:
 //! `HFS_TEST_CASSANDRA_URL=127.0.0.1:59042 cargo test -p helios-hfs --features cassandra --test cassandra_milestone_a`
 //!
@@ -1243,4 +1250,185 @@ async fn docker_output(args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+// The REST latency report (CI's per-operation latency, layer L10).
+
+/// The directory `rest_latency_report` writes to; unset, it returns at once.
+/// The same variable as `helios-persistence`'s `cassandra_latency_report`, so
+/// one CI setting asks for both.
+const LATENCY_REPORT_VAR: &str = "HFS_TEST_LATENCY_REPORT";
+
+/// Measured `POST /Patient` + `GET /Patient/{id}` round trips.
+const REST_ROUND_TRIPS: usize = 50;
+/// Unmeasured round trips first: the first of each statement prepares it.
+const REST_WARM_UP: usize = 5;
+
+/// Nearest-rank percentile of sorted samples, `p` in (0, 1].
+fn percentile(sorted: &[Duration], p: f64) -> Duration {
+    let rank = ((p * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+    sorted[rank - 1]
+}
+
+fn ms(d: Duration) -> f64 {
+    (d.as_secs_f64() * 1_000_000.0).round() / 1000.0
+}
+
+fn latency_row(operation: &str, samples: &[Duration]) -> Value {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    json!({
+        "operation": operation,
+        "n": sorted.len(),
+        "p50_ms": ms(percentile(&sorted, 0.50)),
+        "p95_ms": ms(percentile(&sorted, 0.95)),
+        "p99_ms": ms(percentile(&sorted, 0.99)),
+        "max_ms": ms(*sorted.last().expect("samples")),
+    })
+}
+
+/// A smoke trend of REST latency through the real `hfs` binary, **not** the
+/// Step 8 benchmark: on a fresh tenant, without the conformance seed,
+/// [`REST_WARM_UP`] unmeasured round trips, then [`REST_ROUND_TRIPS`] of
+/// `POST /Patient` then `GET /Patient/{id}`, one request at a time over
+/// loopback. Writes `hfs-rest-latency.json` and `.md` into the directory
+/// `HFS_TEST_LATENCY_REPORT` names. No figure fails it; a request that does not
+/// answer 201 or 200 does, since that is a broken measurement.
+#[tokio::test]
+async fn rest_latency_report() {
+    let Some(dir) = std::env::var_os(LATENCY_REPORT_VAR)
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty())
+    else {
+        // Not requested; deliberately no skip line, because this is a report,
+        // not a live test the CI node should have run.
+        return;
+    };
+    let _lock;
+    let _container;
+    let contact_point = match test_url() {
+        Some(url) => url,
+        None => {
+            _lock = CONTAINER_LOCK.lock().await;
+            let node = OwnNode::start().await.unwrap_or_else(|| {
+                panic!("{LATENCY_REPORT_VAR} is set, but {URL_VAR} is unset and Docker cannot be reached")
+            });
+            let contact_point = node.contact_point();
+            _container = node;
+            contact_point
+        }
+    };
+
+    let mut hfs = Hfs::start(&contact_point, &unique_tenant("rest-latency"), false);
+    hfs.wait_until_serving().await;
+    let client = http();
+    let started = Instant::now();
+    let mut posts = Vec::with_capacity(REST_ROUND_TRIPS);
+    let mut gets = Vec::with_capacity(REST_ROUND_TRIPS);
+    for i in 0..REST_WARM_UP + REST_ROUND_TRIPS {
+        let t = Instant::now();
+        let created = client
+            .post(format!("{}/Patient", hfs.base))
+            .header(CONTENT_TYPE, "application/fhir+json")
+            .json(&json!({"resourceType": "Patient", "name": [{"family": format!("Latency-{i}")}]}))
+            .send()
+            .await
+            .expect("POST /Patient");
+        let status = created.status();
+        let body: Value = created.json().await.expect("the create's body is JSON");
+        let post = t.elapsed();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "POST {i}: {body}; hfs output:\n{}",
+            hfs.output()
+        );
+        let id = body["id"].as_str().expect("the created resource has an id");
+
+        let t = Instant::now();
+        let read = client
+            .get(format!("{}/Patient/{id}", hfs.base))
+            .send()
+            .await
+            .expect("GET /Patient/{id}");
+        let status = read.status();
+        let _ = read.bytes().await.expect("the read's body");
+        let get = t.elapsed();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET Patient/{id}; hfs output:\n{}",
+            hfs.output()
+        );
+
+        if i >= REST_WARM_UP {
+            posts.push(post);
+            gets.push(get);
+        }
+    }
+    let total = started.elapsed();
+    drop(hfs);
+
+    let rows = [
+        latency_row("POST /Patient", &posts),
+        latency_row("GET /Patient/{id}", &gets),
+    ];
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let report = json!({
+        "report": "hfs-rest-latency",
+        "caveat": "single node, debug build, not the Step 8 benchmark",
+        "through": "the hfs binary over loopback HTTP, one request at a time",
+        "build_profile": profile,
+        "contact_point": contact_point,
+        "warm_up_round_trips": REST_WARM_UP,
+        "total_s": (total.as_secs_f64() * 10.0).round() / 10.0,
+        "operations": rows,
+    });
+    let mut md = format!(
+        "_Single node, {profile} build, not the Step 8 benchmark._ Through the `hfs` binary \
+         over loopback, one request at a time, on a fresh tenant without the conformance \
+         seed, after {REST_WARM_UP} unmeasured round trips. Total {:.1} s (boot not \
+         included).\n\n\
+         | Operation | n | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) |\n\
+         | --- | ---: | ---: | ---: | ---: | ---: |\n",
+        total.as_secs_f64()
+    );
+    for row in &rows {
+        md.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} |\n",
+            row["operation"].as_str().expect("operation"),
+            row["n"],
+            row["p50_ms"],
+            row["p95_ms"],
+            row["p99_ms"],
+            row["max_ms"],
+        ));
+    }
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    let json_path = dir.join("hfs-rest-latency.json");
+    let md_path = dir.join("hfs-rest-latency.md");
+    std::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&report).expect("the report serialises") + "\n",
+    )
+    .unwrap_or_else(|e| panic!("write {}: {e}", json_path.display()));
+    std::fs::write(&md_path, &md).unwrap_or_else(|e| panic!("write {}: {e}", md_path.display()));
+    eprintln!("{md}");
+    eprintln!("Wrote {} and {}", json_path.display(), md_path.display());
+}
+
+#[test]
+fn percentile_is_nearest_rank() {
+    let samples: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
+    assert_eq!(percentile(&samples, 0.50), Duration::from_millis(50));
+    assert_eq!(percentile(&samples, 0.99), Duration::from_millis(99));
+    assert_eq!(percentile(&samples, 1.0), Duration::from_millis(100));
+    assert_eq!(
+        percentile(&[Duration::from_millis(7)], 0.5),
+        Duration::from_millis(7)
+    );
 }

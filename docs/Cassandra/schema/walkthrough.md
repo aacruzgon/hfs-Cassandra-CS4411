@@ -310,6 +310,13 @@ SELECT data, last_updated, deleted_at, fhir_version, write_ts, write_id, index_k
 SELECT version_id FROM resource_versions
  WHERE tenant_id = ? AND resource_type = ? AND id = ?
  ORDER BY version_id ASC;
+
+-- R5: every partition key of resources_by_type, paged (5,000 rows), LOCAL_QUORUM. The one
+-- read that crosses tenants: the stored-SearchParameter reload, at startup and on each TTL
+-- refresh, keeps the SearchParameter rows client-side to list the tenants to reload.
+-- A key-range read, valid without ALLOW FILTERING; it changes no table or key
+-- (ADR-aacruzgon-0041).
+SELECT DISTINCT tenant_id, resource_type FROM resources_by_type;
 ```
 
 ## 3. Writes
@@ -334,20 +341,20 @@ Every write first calls `tenant.check_permission(Operation::…, resource_type)`
 **Timestamps** (ADR-aacruzgon-0016). `lu(1) = now_ms`; `lu(N+1) = max(now_ms, lu(N) + 1 ms)`; `ts(V) = lu(V) · 1000`. `lu(N)` comes from `current.last_modified()` on update and from R1 on delete and revive, so V3's timestamp is exact with no extra read. `K(N)` comes from R1's `index_keys`; only `update` runs an R1 for it (G22). `w(N+1)` is a fresh uuid per CAS attempt (ADR-aacruzgon-0024), and `lu` and `ts` are computed from that attempt's R1.
 
 **Unknown CAS outcome** (ADR-aacruzgon-0024, amended 2026-11-05).
-- **Triggers:** `WriteTimeout` or `WriteFailure` with `write_type = CAS`, on any of C1 to C4, so for `create`, `create_or_update`, `update`, `delete` and `delete_versioned`.
+- **Triggers:** `WriteTimeout` with `write_type = CAS` or `SIMPLE`, or `WriteFailure` with `write_type = CAS`, on any of C1 to C4, so for `create`, `create_or_update`, `update`, `delete` and `delete_versioned`.
     - With `paxos_variant: v2`, 5.0.9 throws `WriteFailure`/CAS when replicas fail, even in the commit phase after consensus (`Paxos.java:794-799`).
-    - `CAS_WRITE_UNKNOWN` comes only from the legacy v1 path, and cdrs-tokio 8.1.9 cannot decode it; if it ever arrives, it is treated the same way.
-    - A client-side timeout or a dropped connection after the CAS was sent is treated exactly like `WriteTimeout`/CAS. In cdrs-tokio that is `Error::General("Connection closed …")`, `Error::Io`, `Error::Timeout` (raised only while connecting), or the backend's own request deadline.
-    - Every CAS is sent as non-idempotent, so neither the driver's retry policy nor speculative execution ever re-sends one.
+    - `CAS_WRITE_UNKNOWN` comes only from the legacy v1 path; cdrs-tokio 10 decodes it as `ErrorType::CasWriteUnknown` (8.1.9 could not, ADR-aacruzgon-0044), and if it ever arrives, it is treated the same way.
+    - A client-side timeout or a dropped connection after the CAS was sent is treated exactly like `WriteTimeout`/CAS. In cdrs-tokio that is `Error::General("Connection closed …")`, `Error::Io`, or the backend's own request deadline once the CAS was sent. `Error::Timeout` (raised only while connecting) and a deadline that elapsed while preparing prove nothing was sent, and are mapped directly (ADR-aacruzgon-0034).
+    - Every CAS is sent as non-idempotent and with `FallthroughRetryPolicy`, so neither the driver's retry policy nor speculative execution ever re-sends one (ADR-aacruzgon-0032).
 - **What to do:** run R2. Contention alone can cause it, with nothing committed.
 
 For an attempt that targeted version `V` (1 for C1):
 
 | R2 shows | Meaning | Action |
 | --- | --- | --- |
-| `version_id = V`, our `write_id` | applied | continue at step 4; a create returns 201 |
+| `version_id = V`, our `write_id` (this or any earlier attempt of the request, ADR-aacruzgon-0034) | applied | continue at step 4; a create returns 201 |
 | `version_id = N`, or no row for C1 | not applied, and never will be | run again as a new attempt after a random 5 to 25 ms pause, from a budget of 2 re-runs; a create keeps the same `id`; the attempt's I1 is left for the sweeper |
-| `version_id = V`, another `write_id` | another writer won `V` | a definite miss: `AlreadyExists`, 409, from `create`; 409 from `update` and `delete_versioned`; the next attempt in `create_or_update` and a plain `delete` |
+| `version_id = V`, another `write_id` (none of this request's attempts', ADR-aacruzgon-0034) | another writer won `V` | a definite miss: `AlreadyExists`, 409, from `create`; 409 from `update` and `delete_versioned`; the next attempt in `create_or_update` and a plain `delete` |
 | `version_id > V` | ours may have applied and been superseded | R3 on row `V`, which now selects `write_id` (ADR-aacruzgon-0026, G36); see the next three rows |
 | `version_id > V`; row `V` has our `write_id` | applied, then superseded | success with version `V`, as for "applied" (201 for a create or revive, 200 for an update, 204 for a delete); steps 4 and 5 are skipped, since a late insert of `K(V)` could outlive a later version's tombstones; I1 is left for the sweeper, whose superseded case deletes `K(V-1)` |
 | `version_id > V`; row `V` has another `write_id` | another writer won `V` | a definite miss, as the third row |
@@ -356,7 +363,7 @@ For an attempt that targeted version `V` (1 for C1):
 
 Row `V`'s `write_id` is set by `V`'s own step 4 (V1 or V2), by the sweeper's replay of `V`, or by the next writer's V3 when that writer built it from R1: a `delete`, a `create_or_update` or an `update_with_match`. So the outcome is decided whenever the version that superseded ours came from one of those paths. It stays undecidable when it came from `update`, whose V3 is built from a `StoredResource` without a `write_id`. Row `V` always exists once a later CAS has applied, because that writer's V3 ran before its CAS (G40).
 
-Every timeout is 504 and every unavailable node or replica failure 503, as `crates/rest/src/error.rs` maps them (G26). When the 2 re-runs are used up, the last attempt's error decides the same way: 504 after a `WriteTimeout`, 503 after a `WriteFailure`. `write_type = SIMPLE`: the CAS was decided and only the commit timed out, so treat it as applied.
+Every timeout is 504 and every unavailable node or replica failure 503, as `crates/rest/src/error.rs` maps them (G26). When the 2 re-runs are used up, the last attempt's error decides the same way: 504 after a `WriteTimeout`, 503 after a `WriteFailure`. `write_type = SIMPLE` is a trigger like `WriteTimeout`/CAS, confirmed by R2, never taken as applied (ADR-aacruzgon-0035).
 
 ### 3.2 Create (`ResourceStorage::create`, `POST /Patient`)
 

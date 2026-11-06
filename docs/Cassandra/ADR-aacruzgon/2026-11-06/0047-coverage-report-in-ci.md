@@ -1,0 +1,108 @@
+# ADR-aacruzgon-0047: A Cassandra coverage report in CI, in its own workflow, not required and with no threshold
+
+- **Date:** 2026-11-06
+- **Status:** accepted (written after Alan approved the other Step 2 records; he approved it on 2026-11-06)
+- **Context:**
+    - Alan asked for every report CI can build, so that the work from Step 2 on is measured, not estimated. Two other pull requests already add reports, mostly to the required job `Cassandra schema (single node)`, through the helper `.github/scripts/ci-report.py`:
+        - PR #46 (ADR-aacruzgon-0045): boot and seed, build memory, tests and skips, readiness, node statistics;
+        - PR #47 (ADR-aacruzgon-0046): latency, dependency freshness and advisories (in the fmt job), artifact sizes, step timings.
+
+      Nothing measures how much of the backend those tests actually run.
+    - Upstream's `coverage.yml` measures the default R4/SQLite build on GitHub-hosted runners with `cargo-llvm-cov` 0.8.7 and uploads to Codecov. Cassandra is not in it: the backend needs a node, and a hosted job has none.
+    - **The tests that reach the backend need a node:**
+        - `tests/cassandra_tests.rs`;
+        - `tests/backend_capability_contract.rs`, whose Cassandra instance tests skip without `HFS_TEST_CASSANDRA_URL` (ADR-aacruzgon-0036);
+        - the backend's own `--lib` tests, whose `node_tests` modules also skip without it (`write.rs:1072-1080`, `backend.rs:1126-1133` at PR #48's head). The required job runs no `--lib` tests, so those node tests run in no CI today;
+        - `crates/hfs/tests/cassandra_milestone_a.rs`, which starts the real `hfs` binary.
+    - **`hfs` writes no profile under the Milestone A test.** The test kills `hfs` with `Child::kill`, which sends SIGKILL, when it drops it (`cassandra_milestone_a.rs:525-530` at PR #48's head). `hfs` drains on SIGTERM (`main.rs:1663-1665`, `crates/observability/src/shutdown.rs:33-58`), but SIGKILL cannot be caught. An instrumented program writes its profile only when it exits (clang, [SourceBasedCodeCoverage#running-the-instrumented-program](https://clang.llvm.org/docs/SourceBasedCodeCoverage.html#running-the-instrumented-program)), so a plain instrumented run records nothing of `hfs`'s `main.rs`.
+    - **An instrumented build is a full extra build.** `acruzdebian`'s runner service is capped at 9 GiB (ADR-aacruzgon-0023), and the required job's ordinary build already peaks at 4.6 GiB anon there on a partly warm build (run 42246830973), and at 4,872 MiB cold (ADR-aacruzgon-0042).
+    - Five checks are required, by job name (ADR-aacruzgon-0019, 0021). The ruleset is Alan's.
+- **Decision:**
+    - **The workflow:**
+        - A new workflow, `.github/workflows/cassandra-coverage.yml`, with one job, `Cassandra coverage (report only)`.
+        - Its name is in no ruleset, so it is not required.
+        - It runs on `pull_request` to `main` and on `workflow_dispatch`. It has no `paths:` filter, the fork guard, `permissions: contents: read`, and no `pull_request_target` or `workflow_run` (ADR-aacruzgon-0018).
+    - **No threshold.** No figure fails the job. It fails only if the build, a test or the report itself breaks.
+    - **Tool: `cargo-llvm-cov` 0.9.1** (2026-09-06; MSRV 1.87, its `Cargo.toml:6`; the runners have 1.99.1).
+        - It installs as a checksum-verified prebuilt binary through `taiki-e/install-action`, at the pin `coverage.yml` already uses (`1168f68…`, v2.87.28, ADR-aacruzgon-0022). That version's manifest lists 0.9.1.
+        - A step checks the installed version, since `~/.cargo/bin` is shared by every job on the runner.
+        - `llvm-tools-preview` is added to the existing `dtolnay/rust-toolchain` pin.
+        - The one breaking change in 0.9.0, the `--show-missing-lines` format, is not used.
+    - **Plain cargo under `cargo llvm-cov show-env`.** This is cargo-llvm-cov's documented flow for tests it does not run itself ([README#get-coverage-of-external-tests](https://github.com/taiki-e/cargo-llvm-cov/blob/main/README.md#get-coverage-of-external-tests)).
+        - The test commands are the required job's, with two differences: the build adds `--lib`, and there is a `--lib` test step against the node.
+        - The Milestone A steps set their own `LLVM_PROFILE_FILE`.
+        - The wrapper show-env installs instruments the workspace's crates only; dependencies are built normally.
+        - `cargo llvm-cov clean --workspace` runs at the start of the build step, where show-env's variables are set, and a check fails the step if any old profile survives. The target directory persists, so without the clean, a report would merge earlier runs' profiles.
+    - **`%c` (continuous mode) for the Milestone A steps, so a killed `hfs` still leaves its counters.** The build adds `RUSTFLAGS=-C llvm-args=-runtime-counter-relocation`, the LLVM backend option that continuous mode needs off Darwin (same clang page). Run 42253148327 showed it works on Linux: `start_cassandra` and its async bodies have counts.
+    - **The report's scope:**
+        - Every file under `crates/persistence/src/backends/cassandra/`, plus `crates/hfs/src/main.rs`.
+        - `main.rs` also gets a row of its own for its Cassandra path, because most of the file is not Cassandra code. The row covers `start_cassandra`, `cassandra_sof_enabled`, `build_cassandra_config` and `spawn_cassandra_search_param_refresh`, with their closures, plus the `CassandraBackend` instances of `provisioned_tenants` and `seed_conformance_resources`.
+        - The section says whether `hfs`'s coverage was recorded at all.
+        - An ignore regex built from the checkout's directory listing removes every other file, since llvm-cov's regex has no negative lookahead.
+    - **Its own node:**
+        - Compose project `hfs-cassandra-cov`, host port 59242.
+        - Leftovers are removed first, and `down -v` under `if: always()` names only that project (ADR-sam-michaels-0001, ADR-aacruzgon-0020).
+        - The readiness test, which stops and starts the node, is the last test step, as in the required job (ADR-aacruzgon-0042).
+    - **Output through ADR-aacruzgon-0045's helper, `ci-report.py`:**
+        - `build` for the two instrumented builds (wall time, peak `memory.current` and `anon`, OOM kills);
+        - `context` with the node's Cassandra version;
+        - `tests` for counts and skips;
+        - `add` for the coverage section, whose table and JSON come from a standard-library script, `.github/scripts/cassandra-coverage-summary.py`.
+
+      The artifact `ci-report-coverage` holds every section's Markdown and JSON, the raw test logs, the HTML report and `lcov.info`. The full llvm-cov JSON export (about 23 MB) stays out of it.
+    - **Runner: `[self-hosted, hfs-cassandra-light]`.**
+        - The cold instrumented build peaked at 4821 MiB anon on `acruzdebian` (run 42254248131, 249 s, no OOM kill) and at 4709 MiB on `sam-7900x` with 24 jobs (run 42253148327, 194 s).
+        - That leaves 4.3 GiB under the 9 GiB cap, more than the 2 GiB margin ADR-aacruzgon-0042 adopts for a light job.
+        - Light also keeps the job out of the heavy queue, where only `sam-7900x` runs the required clippy pair.
+    - **A target directory of its own,** bounded and persistent like the others (ADR-sam-michaels-0002). It is capped at 15 GB, and its stamp adds cargo-llvm-cov's version to `rustc -V` and `Cargo.lock`.
+- **Alternatives considered:**
+    - **Add coverage to the required Cassandra job:** lost.
+        - The required job would rebuild everything instrumented, roughly doubling its build (194 to 249 s cold, against its warm 12 to 98 s).
+        - Every required run would pay for a report.
+        - PRs #46 and #47 own that job's report steps.
+    - **Extend upstream's `coverage.yml`:** lost. It runs on GitHub-hosted runners with no node, and uploads to Codecov. It is upstream's file, kept in step with upstream (ADR-aacruzgon-0022).
+    - **`cargo llvm-cov test` instead of `show-env` and plain cargo:** lost. It sets `LLVM_PROFILE_FILE` itself, so the Milestone A steps could not add `%c`. Its commands would also differ from the required job's.
+    - **`cargo-tarpaulin`:** lost.
+        - On Linux its default engine is ptrace, x86_64 only (its `README.md:19-21`).
+        - It reports line coverage only; branch coverage is "NOT IMPLEMENTED" (`README.md:13,72`), so it gives no region figure.
+        - Its `--engine llvm` is the same LLVM instrumentation cargo-llvm-cov drives, and cargo-llvm-cov is already the repository's tool (`coverage.yml`).
+    - **A coverage threshold (`--fail-under-lines`):** lost. Alan asked for reports, and a threshold is a gate. The backend is two steps old, so any number would be arbitrary.
+    - **Stop `hfs` with SIGTERM, then wait, in the test's `Drop`, so it exits and writes its profile:** lost for this pull request. `hfs` already drains on SIGTERM, so it would work, but `cassandra_milestone_a.rs` belongs to PRs #44 and #46. `%c` needs no code change. If that test later stops `hfs` with SIGTERM, `%c` can go.
+- **Consequences:**
+    - **First figures** (run 42253148327 on `sam-7900x`, before the `--lib` node tests ran):
+        - backend: lines 75.7% (1994/2634), regions 73.8%, functions 69.5%;
+        - `main.rs`'s Cassandra path: regions 69.8% (132/189), functions 12/16.
+    - **Final figures** (run 42263389298 on `acruzdebian`, the rebased workflow with the node tests): backend lines 85.1% (2241/2634), regions 83.6% (3051/3651), functions 75.5% (250/331); `main.rs`'s Cassandra path regions 69.8% (132/189), functions 12/16; `hfs` coverage recorded. Warm builds: 38 s and 24 s, peak anon 3587 MiB.
+    - **One live test still skips here, and runs in no CI job (the required job runs no `--lib` tests):** `backend.rs`'s `restart_tests::the_backend_recovers_after_its_node_restarts`, which needs a node of its own to restart and then stays on it for 120 s. The tests section warns about it. Adding it here would cost about 3 minutes a run.
+    - **Gaps the report shows:** `search.rs` (12.9% of lines) and `stubs.rs` (20.8%) are Step 3's, and `backend.rs` is 70%.
+    - **Job time:** about 5 to 6 minutes cold (the build 194 to 249 s) and 3 minutes warm (run 42263389298: builds 62 s, node start 64 s, tests about 40 s, report about 2 s).
+    - **Cost on the runners:**
+        - a fourth persistent target directory per runner, up to 15 GB;
+        - one extra job per pull request on the light runners.
+    - **Two node tests now run in CI for the first time, and one of them was wrong.** `backend.rs`'s `the_partition_key_scan_follows_every_page` created four partitions but asserted more than 14 rows. It failed on this job's fresh node (run 42254248131), so the `--lib` step runs after the integration tests. PR #43 has since fixed the test (`89bbc9acb`: it creates 16 partitions of its own), so the `--lib` step could now run first; the workflow comment at `cassandra-coverage.yml:189-197` still cites the pre-restack `51199208b`.
+    - **The workflow runs for a pull request only when its base is `main`,** so it runs for no stacked pull request until PR #48's base is `main`.
+    - **Running coverage from a branch before the workflow is on `main`:** `workflow_dispatch` returns 404 until the file is on `main`. While PR #48 was built, a temporary `push:` trigger for the branch made its runs, and it was dropped before the final push.
+- **AI involvement:**
+    - **Tool and model:** Claude Code (Opus 5.5), worker `s2-testable`, started by the Step 2 orchestrating session.
+    - **What the AI proposed:**
+        - the separate workflow;
+        - `show-env` with plain cargo;
+        - `%c` with counter relocation for the killed `hfs`;
+        - the regex-limited scope and the `main.rs` Cassandra-path row;
+        - the runner choice from the two measured peaks.
+    - **What Alan changed:** Alan asked for every CI report that can be built so far, and for each to be recorded in an ADR; this report is one of them. This entry was written after his approval of the other Step 2 records; he approved it later on 2026-11-06.
+    - **What the audit changed:** a review subagent read the diff against cargo-llvm-cov 0.9.1's source, the clang docs and the ADRs.
+        - **Blocking:** `clean` had run in the step that wrote `$GITHUB_ENV`, so it cleaned the wrong directory, and stale profiles would have accumulated across runs.
+        - **Corrections:** two false claims in this entry's first version. One was that `hfs` has no SIGTERM handler. The other was that the commands are the required job's "character for character".
+        - **Smaller fixes:** a profile count that included the test binaries, an unanchored symbol regex, and a missing check of the installed version.
+
+      All of these are fixed.
+    - **Verified:**
+        - **Locally, on the shared node `127.0.0.1:59042`:** an instrumented build (689 s, including the wait for the build lock), the tests (38 lib, 10 contract, 65 `cassandra_tests`, the round trip) and the report, through the summary script and `ci-report.py add`.
+        - **`%c` on macOS:** it fails ("Counters section not page-aligned") without relocation, which is why the build adds `-runtime-counter-relocation`.
+        - **In CI:** runs 42253148327, 42254248131 and 42263389298, the last on the final workflow plus a temporary `push:` trigger. Each was checked through its log, its step summary and its downloaded artifact. When it ran, the final commit differed from what 42263389298 ran only by those four trigger lines. Since the restack, PR #48 also sits on PR #43's second round and PR #45's error mapping, so the figures above were measured without them (38 Cassandra lib tests then, 45 now).
+        - **The clean:** run 42263389298 reused `acruzdebian`'s target directory from 42254248131, which had left profiles, and the no-stale-profile guard passed.
+        - **Pins:** each SHA was checked against its tag with `gh api`.
+- **Links:**
+    - PR #48 (branch `cassandra/step2-coverage`, commit `7e3ae3247` on `cassandra/step2-ci-reports` `0733f6e55`; before the restack `aed2db110` on `7cb2f96b8`).
+    - ADR-aacruzgon-0018, 0019, 0021, 0022, 0023, 0036, 0042, 0045, 0046; ADR-sam-michaels-0001, 0002.

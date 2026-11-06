@@ -3,7 +3,8 @@ name: fmt, clippy and Cassandra schema
 # Roadmap item 0.5 on the team's self-hosted runner (ADR-aacruzgon-0018,
 # ADR-sam-michaels-0001): rustfmt, the CONTRIBUTING.md clippy command split
 # into two jobs, and a single-node Cassandra that the schema is applied to and
-# tests/cassandra_tests.rs runs against (ADR-aacruzgon-0020).
+# tests/cassandra_tests.rs and tests/backend_capability_contract.rs run
+# against (ADR-aacruzgon-0020).
 # fmt and the Cassandra job are light and run on either runner; the clippy
 # pair is heavy and runs only on sam-7900x (ADR-aacruzgon-0023). Each runner
 # has one executor, so the jobs on one machine run one after another.
@@ -173,7 +174,8 @@ jobs:
 
   # The job name is a required check (ADR-aacruzgon-0021): it stays
   # "Cassandra schema (single node)" although the job also runs
-  # tests/cassandra_tests.rs against its node (ADR-aacruzgon-0020).
+  # tests/cassandra_tests.rs and tests/backend_capability_contract.rs against
+  # its node (ADR-aacruzgon-0020).
   cassandra:
     name: Cassandra schema (single node)
     # Fork guard (ADR-aacruzgon-0018).
@@ -228,7 +230,7 @@ jobs:
       # kills the cgroup had during the build. The EXIT trap stops the
       # sampler and prints all of it on a failed build too.
       # nice, as for clippy: sam-7900x is also Sam's desktop.
-      - name: Build tests/cassandra_tests.rs and print its memory peak
+      - name: Build tests/cassandra_tests.rs and backend_capability_contract.rs and print the memory peak
         run: |
           cgroup="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
           peaks="$RUNNER_TEMP/build-memory-peaks"
@@ -260,7 +262,8 @@ jobs:
             ) &
             sampler=$!
           fi
-          nice -n 10 cargo test -p helios-persistence --features cassandra --test cassandra_tests --no-run
+          nice -n 10 cargo test -p helios-persistence --features cassandra \
+            --test cassandra_tests --test backend_capability_contract --no-run
 
       # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
       - name: Remove leftovers of an earlier run
@@ -323,11 +326,14 @@ jobs:
 
       # ADR-aacruzgon-0020, Rule 1: the tests use this job's node, with the
       # schema just applied, through its published port, as cqlsh does above.
-      # Already built, so this step only runs the binary.
-      - name: cargo test --test cassandra_tests against this node
+      # Already built, so this step only runs the two binaries. The capability
+      # contract's Cassandra instance tests skip without the variable, so they
+      # run only here.
+      - name: cargo test --test cassandra_tests --test backend_capability_contract against this node
         run: |
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
-            cargo test -p helios-persistence --features cassandra --test cassandra_tests
+            cargo test -p helios-persistence --features cassandra \
+              --test cassandra_tests --test backend_capability_contract
 
       - name: Cassandra logs
         if: failure()

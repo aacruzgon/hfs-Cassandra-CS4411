@@ -190,12 +190,9 @@ impl CassandraConfig {
                         .to_string(),
                 ));
             }
-            let has_port = point
-                .rsplit_once(':')
-                .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
-            if !has_port {
+            if let Err(reason) = check_host_port(point) {
                 return Err(CassandraConfigError(format!(
-                    "contact point '{point}' is not host:port"
+                    "contact point '{point}' is not host:port: {reason}"
                 )));
             }
         }
@@ -234,6 +231,28 @@ fn parse_number<T: std::str::FromStr>(name: &str, raw: &str) -> Result<T, Cassan
     raw.trim()
         .parse::<T>()
         .map_err(|_| CassandraConfigError(format!("{name}='{raw}' is not a number")))
+}
+
+/// Checks one contact point in the form `HFS_TEST_CASSANDRA_URL` takes
+/// (`tests/common/cassandra.rs`, `parse_url`): `host:port` with no scheme, a
+/// port from 1 to 65535, and an IPv6 host in brackets (`[::1]:9042`). The
+/// caller has already split the list on commas and trimmed each entry.
+fn check_host_port(point: &str) -> Result<(), &'static str> {
+    if point.contains(char::is_whitespace) {
+        return Err("it contains whitespace");
+    }
+    let Some((host, port)) = point.rsplit_once(':') else {
+        return Err("the port is required, for example 127.0.0.1:9042");
+    };
+    let bracketed = host.len() > 2 && host.starts_with('[') && host.ends_with(']');
+    let has_bracket = host.contains('[') || host.contains(']');
+    if host.is_empty() || ((host.contains(':') || has_bracket) && !bracketed) {
+        return Err("write an IPv6 host in brackets, for example [::1]:9042");
+    }
+    match port.parse::<u16>() {
+        Ok(0) | Err(_) => Err("the port must be a number from 1 to 65535"),
+        Ok(_) => Ok(()),
+    }
 }
 
 /// Cassandra's rule for an unquoted keyspace name.
@@ -310,6 +329,14 @@ mod tests {
                 "helios:secret@127.0.0.1:9042",
             ),
             ("HFS_CASSANDRA_CONTACT_POINTS", "cassandra://127.0.0.1:9042"),
+            ("HFS_CASSANDRA_CONTACT_POINTS", "127.0.0.1"),
+            ("HFS_CASSANDRA_CONTACT_POINTS", "127.0.0.1:"),
+            ("HFS_CASSANDRA_CONTACT_POINTS", "127.0.0.1:0"),
+            ("HFS_CASSANDRA_CONTACT_POINTS", "127.0.0.1:65536"),
+            ("HFS_CASSANDRA_CONTACT_POINTS", "127.0.0.1:port"),
+            ("HFS_CASSANDRA_CONTACT_POINTS", "::1:9042"),
+            ("HFS_CASSANDRA_CONTACT_POINTS", "[]:9042"),
+            ("HFS_CASSANDRA_CONTACT_POINTS", "a b:9042"),
             ("HFS_CASSANDRA_KEYSPACE", "helios; DROP KEYSPACE helios"),
             ("HFS_CASSANDRA_KEYSPACE", "a-b"),
             ("HFS_CASSANDRA_POOL_SIZE", "0"),
@@ -322,6 +349,21 @@ mod tests {
                 "{name}={value} was accepted"
             );
         }
+    }
+
+    /// Each entry takes `HFS_TEST_CASSANDRA_URL`'s form, so the test URL can be
+    /// used as the contact point unchanged.
+    #[test]
+    fn each_contact_point_takes_the_test_url_form() {
+        let config = CassandraConfig::from_env_with(env_of(&[(
+            "HFS_CASSANDRA_CONTACT_POINTS",
+            " 127.0.0.1:59042 , cassandra:9042,[::1]:9042 ",
+        )]))
+        .unwrap();
+        assert_eq!(
+            config.contact_points,
+            ["127.0.0.1:59042", "cassandra:9042", "[::1]:9042"]
+        );
     }
 
     #[test]

@@ -47,6 +47,11 @@ macro_rules! node_or_skip {
     };
 }
 
+/// Step 2: the backend's connection, `health_check`, `initialize`, the stubs
+/// and the search-parameter registry (items 2.1 and 2.3).
+#[path = "cassandra/backend_skeleton.rs"]
+mod backend_skeleton;
+
 /// The node holds the signed-off schema: the ten tables, and every column,
 /// key position, clustering order and table option recorded in
 /// `docs/Cassandra/schema/expected-schema.txt`. The CI job makes the same

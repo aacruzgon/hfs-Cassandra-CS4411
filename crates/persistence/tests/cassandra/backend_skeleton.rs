@@ -2,10 +2,11 @@
 //! connection, `health_check`, `initialize` on the ten tables, the stubs and
 //! the search-parameter registry.
 //!
-//! The node comes from [`test_node_url`]: `HFS_TEST_CASSANDRA_URL`
-//! (`host:port`), with the schema already applied (ADR-aacruzgon-0020). Every
-//! test here reads only, or names its own tenant, so it can share the node with
-//! any other test (rule 2).
+//! Included by `tests/cassandra_tests.rs`. The node comes from
+//! [`cassandra_node::node`] (`HFS_TEST_CASSANDRA_URL`, or the harness's own
+//! container). Every test here reads only, or names its own tenant
+//! ([`unique_tenant`]), so it can share the node with any other test
+//! (ADR-aacruzgon-0020, rule 2).
 
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::cassandra::{CassandraBackend, CassandraConfig, TABLES};
@@ -14,42 +15,27 @@ use helios_persistence::core::{
     ResourceStorage, SearchProvider, VersionedStorage,
 };
 use helios_persistence::error::{BackendError, StorageError, TransactionError};
-use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::SearchQuery;
 use serde_json::json;
 
-/// The node to test against, or `None` to skip.
-fn test_node_url() -> Option<String> {
-    std::env::var("HFS_TEST_CASSANDRA_URL")
-        .ok()
-        .filter(|url| !url.trim().is_empty())
-}
+use crate::cassandra_node::{self, CassandraNode, URL_VAR, unique_tenant};
 
-fn config_for(url: &str) -> CassandraConfig {
+/// The backend's configuration for the test node: its contact point, which
+/// has `HFS_TEST_CASSANDRA_URL`'s `host:port` form, and the repository's
+/// `data/` directory for the search-parameter registry.
+pub(crate) fn config_for(node: &CassandraNode) -> CassandraConfig {
     CassandraConfig {
-        contact_points: vec![url.to_string()],
+        contact_points: vec![node.contact_point().to_string()],
         data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
         ..CassandraConfig::default()
     }
 }
 
-/// Connects to the test node, or returns `None` (and says why) to skip.
-async fn backend() -> Option<CassandraBackend> {
-    let Some(url) = test_node_url() else {
-        eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
-        return None;
-    };
-    Some(
-        CassandraBackend::connect(config_for(&url))
-            .await
-            .unwrap_or_else(|e| panic!("connect to {url}: {e}")),
-    )
-}
-
-/// A tenant no other test uses (ADR-aacruzgon-0020, rule 2).
-fn own_tenant(test: &str) -> TenantContext {
-    let id = format!("s2-skeleton-{test}-{}", uuid::Uuid::new_v4().simple());
-    TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
+/// Connects the backend to the test node; panics when it cannot.
+pub(crate) async fn backend(node: &CassandraNode) -> CassandraBackend {
+    CassandraBackend::connect(config_for(node))
+        .await
+        .unwrap_or_else(|e| panic!("connect to {}: {e}", node.contact_point()))
 }
 
 fn is_unsupported(error: &StorageError) -> bool {
@@ -62,9 +48,8 @@ fn is_unsupported(error: &StorageError) -> bool {
 
 #[tokio::test]
 async fn cassandra_health_check_and_readiness_answer_from_the_node() {
-    let Some(backend) = backend().await else {
-        return;
-    };
+    let node = node_or_skip!("cassandra_health_check_and_readiness_answer_from_the_node");
+    let backend = backend(node).await;
     assert_eq!(backend.kind(), BackendKind::Cassandra);
     assert_eq!(backend.name(), "cassandra");
     backend.health_check().await.expect("health_check");
@@ -75,9 +60,8 @@ async fn cassandra_health_check_and_readiness_answer_from_the_node() {
 
 #[tokio::test]
 async fn cassandra_initialize_accepts_a_keyspace_with_the_ten_tables() {
-    let Some(backend) = backend().await else {
-        return;
-    };
+    let node = node_or_skip!("cassandra_initialize_accepts_a_keyspace_with_the_ten_tables");
+    let backend = backend(node).await;
     assert_eq!(TABLES.len(), 10);
     backend.initialize().await.expect("initialize on helios");
     backend.migrate().await.expect("migrate only checks");
@@ -85,15 +69,12 @@ async fn cassandra_initialize_accepts_a_keyspace_with_the_ten_tables() {
 
 #[tokio::test]
 async fn cassandra_initialize_refuses_a_keyspace_without_the_tables() {
-    let Some(url) = test_node_url() else {
-        eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
-        return;
-    };
+    let node = node_or_skip!("cassandra_initialize_refuses_a_keyspace_without_the_tables");
     // `system_traces` exists on every node and holds none of the ten tables,
     // so this needs no keyspace of its own and writes nothing.
     let backend = CassandraBackend::connect(CassandraConfig {
         keyspace: "system_traces".to_string(),
-        ..config_for(&url)
+        ..config_for(node)
     })
     .await
     .expect("connect with keyspace system_traces");
@@ -108,10 +89,7 @@ async fn cassandra_initialize_refuses_a_keyspace_without_the_tables() {
 
 #[tokio::test]
 async fn cassandra_connect_to_a_closed_port_fails_as_connection_failed() {
-    if test_node_url().is_none() {
-        eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
-        return;
-    }
+    let _node = node_or_skip!("cassandra_connect_to_a_closed_port_fails_as_connection_failed");
     let started = std::time::Instant::now();
     let result = CassandraBackend::connect(CassandraConfig {
         contact_points: vec!["127.0.0.1:1".to_string()],
@@ -134,10 +112,9 @@ async fn cassandra_connect_to_a_closed_port_fails_as_connection_failed() {
 
 #[tokio::test]
 async fn cassandra_stubs_refuse_with_unsupported_capability() {
-    let Some(backend) = backend().await else {
-        return;
-    };
-    let tenant = own_tenant("stubs");
+    let node = node_or_skip!("cassandra_stubs_refuse_with_unsupported_capability");
+    let backend = backend(node).await;
+    let tenant = unique_tenant("stubs");
     let version = FhirVersion::default_enabled();
 
     let err = backend
@@ -196,9 +173,8 @@ async fn cassandra_stubs_refuse_with_unsupported_capability() {
 
 #[tokio::test]
 async fn cassandra_overrides_the_networked_store_defaults() {
-    let Some(backend) = backend().await else {
-        return;
-    };
+    let node = node_or_skip!("cassandra_overrides_the_networked_store_defaults");
+    let backend = backend(node).await;
     assert!(backend.is_cluster_shared());
     assert_eq!(backend.bulk_write_concurrency(), 8);
     assert!(!backend.supports_tenant_registry());
@@ -206,11 +182,10 @@ async fn cassandra_overrides_the_networked_store_defaults() {
 
 #[tokio::test]
 async fn cassandra_search_param_registry_is_per_tenant_and_populated() {
-    let Some(backend) = backend().await else {
-        return;
-    };
-    let a = own_tenant("registry-a");
-    let b = own_tenant("registry-b");
+    let node = node_or_skip!("cassandra_search_param_registry_is_per_tenant_and_populated");
+    let backend = backend(node).await;
+    let a = unique_tenant("registry-a");
+    let b = unique_tenant("registry-b");
     let registry_a = backend.search_param_registry(&a);
     assert!(
         registry_a.read().get_param("Patient", "gender").is_some(),
@@ -238,13 +213,10 @@ async fn cassandra_search_param_registry_is_per_tenant_and_populated() {
 
 #[tokio::test]
 async fn cassandra_connect_refuses_a_local_dc_the_cluster_does_not_have() {
-    let Some(url) = test_node_url() else {
-        eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
-        return;
-    };
+    let node = node_or_skip!("cassandra_connect_refuses_a_local_dc_the_cluster_does_not_have");
     let result = CassandraBackend::connect(CassandraConfig {
         local_dc: "no-such-dc".to_string(),
-        ..config_for(&url)
+        ..config_for(node)
     })
     .await;
     match result {
@@ -257,14 +229,11 @@ async fn cassandra_connect_refuses_a_local_dc_the_cluster_does_not_have() {
 
 #[tokio::test]
 async fn cassandra_connect_to_a_missing_keyspace_fails_naming_it() {
-    let Some(url) = test_node_url() else {
-        eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
-        return;
-    };
+    let node = node_or_skip!("cassandra_connect_to_a_missing_keyspace_fails_naming_it");
     let result = CassandraBackend::connect(CassandraConfig {
         keyspace: "s2_skeleton_no_such_keyspace".to_string(),
         connect_timeout_ms: 2_000,
-        ..config_for(&url)
+        ..config_for(node)
     })
     .await;
     match result {

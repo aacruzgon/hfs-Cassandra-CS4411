@@ -1,6 +1,7 @@
 //! Roadmap Step 2 (items 2.1 and 2.3) against a running node: the
 //! connection, `health_check`, `initialize` on the ten tables, the stubs and
-//! the search-parameter registry.
+//! the search-parameter registry. `create`, `read` and `count` are in
+//! `create_read.rs` (layer L4).
 //!
 //! Included by `tests/cassandra_tests.rs`. The node comes from
 //! [`cassandra_node::node`] (`HFS_TEST_CASSANDRA_URL`, or the harness's own
@@ -117,25 +118,29 @@ async fn cassandra_stubs_refuse_with_unsupported_capability() {
     let tenant = unique_tenant("stubs");
     let version = FhirVersion::default_enabled();
 
+    // `create`, `read` and `count` are real from L4 on (`create_read.rs`).
     let err = backend
-        .create(
+        .update(
             &tenant,
-            "Patient",
-            json!({"resourceType": "Patient"}),
-            version,
+            &helios_persistence::types::StoredResource::new(
+                "Patient",
+                "p1",
+                tenant.tenant_id().clone(),
+                json!({"resourceType": "Patient", "id": "p1"}),
+                version,
+            ),
+            json!({"resourceType": "Patient", "id": "p1"}),
         )
         .await
         .unwrap_err();
-    assert!(is_unsupported(&err), "create: {err:?}");
-    let err = backend.read(&tenant, "Patient", "p1").await.unwrap_err();
-    assert!(is_unsupported(&err), "read: {err:?}");
+    assert!(is_unsupported(&err), "update: {err:?}");
+    let err = backend.delete(&tenant, "Patient", "p1").await.unwrap_err();
+    assert!(is_unsupported(&err), "delete: {err:?}");
     let err = backend
         .delete_versioned(&tenant, "Patient", "p1", "1")
         .await
         .unwrap_err();
     assert!(is_unsupported(&err), "delete_versioned: {err:?}");
-    let err = backend.count(&tenant, Some("Patient")).await.unwrap_err();
-    assert!(is_unsupported(&err), "count: {err:?}");
     let err = backend
         .vread(&tenant, "Patient", "p1", "1")
         .await

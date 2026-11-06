@@ -246,3 +246,55 @@ async fn cassandra_a_stored_compartment_parameter_applies_after_a_restart() {
     );
     assert!(!member(&restarted, "subject-a"));
 }
+
+/// Two stored SearchParameters with the same `url` and different ids: the one
+/// with the newest `last_updated` is in force, for the process that stored
+/// them and after a restart, however the reload's reads finish. The older one
+/// has the higher id, so the id tie-break would pick it: only `last_updated`
+/// decides here.
+#[tokio::test]
+async fn cassandra_the_newest_of_two_same_url_search_parameters_wins() {
+    let node = node_or_skip!("cassandra_the_newest_of_two_same_url_search_parameters_wins");
+    let writer = backend(node).await;
+    let tenant = unique_tenant("stored-sp-dup-url");
+    let url = format!(
+        "http://example.org/SearchParameter/{}-dup",
+        tenant.tenant_id().as_str()
+    );
+    for id in ["zzz-older", "aaa-newer"] {
+        let mut resource = search_parameter(id, &url, "active");
+        resource["code"] = json!(id);
+        writer
+            .create(
+                &tenant,
+                "SearchParameter",
+                resource,
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create {id}: {e}"));
+        // Distinct `last_updated` milliseconds.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let code = |backend: &CassandraBackend| {
+        backend
+            .search_param_registry(&tenant)
+            .read()
+            .get_by_url(&url)
+            .map(|definition| definition.code.clone())
+    };
+    assert_eq!(code(&writer).as_deref(), Some("aaa-newer"), "the writer");
+
+    for _ in 0..5 {
+        let restarted = backend(node).await;
+        restarted
+            .load_stored_search_parameters(tenant.tenant_id().as_str())
+            .await
+            .expect("load");
+        assert_eq!(
+            code(&restarted).as_deref(),
+            Some("aaa-newer"),
+            "after a restart"
+        );
+    }
+}

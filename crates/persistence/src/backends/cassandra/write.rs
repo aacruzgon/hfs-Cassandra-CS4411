@@ -580,7 +580,7 @@ impl CassandraBackend {
         }
 
         if resource_type == "SearchParameter" {
-            self.note_stored_search_parameter(tenant_id, &resource);
+            self.note_stored_search_parameter(tenant_id, &resource, winner.last_updated);
         }
         Ok(StoredResource::from_storage(
             resource_type,

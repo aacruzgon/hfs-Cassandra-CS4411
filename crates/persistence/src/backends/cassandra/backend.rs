@@ -44,10 +44,18 @@ const SELECT_TENANT_TYPES: &str = "SELECT DISTINCT tenant_id, resource_type FROM
 /// How many SearchParameter reads a reload runs at once.
 const STORED_SEARCH_PARAMETER_READS: usize = 16;
 
+/// Which stored SearchParameter is in force when two of a tenant's carry the
+/// same `url`: the newest `last_updated`, then the higher `id`. Two stored
+/// resources cannot share both, so the choice never depends on the order the
+/// reads finish in.
+type Precedence = (chrono::DateTime<chrono::Utc>, String);
+
 /// One stored, `active` SearchParameter in the overlay.
 #[derive(Clone)]
 struct StoredDefinition {
     definition: SearchParameterDefinition,
+    /// The stored resource's `last_updated` and `id` ([`Precedence`]).
+    precedence: Precedence,
     /// The [`CassandraBackend::note_seq`] value when this process stored it,
     /// or 0 when a reload read it. A reload keeps the definitions noted after
     /// it began (see [`CassandraBackend::load_stored_search_parameters`]).
@@ -67,6 +75,65 @@ pub struct StoredSearchParameterReload {
     /// Stored, `active`, non-spec definitions the overlay now holds across
     /// them.
     pub definitions: usize,
+    /// Tenants whose reload failed and who keep their previous overlay. Only
+    /// a refresh continues past a failure; the startup load stops at the
+    /// first one, so it is always 0 there.
+    pub failed: usize,
+}
+
+/// Puts `candidate` into `defs`, unless a definition with the same `url` and
+/// a higher [`Precedence`] is already there, in which case `defs` is left as
+/// it was. Returns whether `candidate` went in.
+fn insert_by_precedence(defs: &mut Vec<StoredDefinition>, candidate: StoredDefinition) -> bool {
+    match defs
+        .iter()
+        .position(|existing| existing.definition.url == candidate.definition.url)
+    {
+        Some(at) if defs[at].precedence > candidate.precedence => false,
+        Some(at) => {
+            defs[at] = candidate;
+            true
+        }
+        None => {
+            defs.push(candidate);
+            true
+        }
+    }
+}
+
+/// Reloads each of `tenants` with `load`, summing what it returns. With
+/// `fail_fast` the first error is returned; otherwise each failure is logged
+/// with its tenant, counted in [`StoredSearchParameterReload::failed`], and
+/// the next tenant is loaded.
+async fn reload_each<F, Fut>(
+    tenants: &BTreeSet<String>,
+    fail_fast: bool,
+    mut load: F,
+) -> StorageResult<StoredSearchParameterReload>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = StorageResult<usize>>,
+{
+    let mut reload = StoredSearchParameterReload {
+        tenants: tenants.len(),
+        definitions: 0,
+        failed: 0,
+    };
+    for tenant_id in tenants {
+        match load(tenant_id.clone()).await {
+            Ok(count) => reload.definitions += count,
+            Err(error) if fail_fast => return Err(error),
+            Err(error) => {
+                reload.failed += 1;
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    "stored SearchParameter reload failed for this tenant; it keeps its \
+                     previous overlay: {error}"
+                );
+            }
+        }
+    }
+    Ok(reload)
 }
 
 /// The Cassandra backend: a `cdrs-tokio` 8 session over the ten tables of
@@ -212,23 +279,37 @@ impl CassandraBackend {
 
     /// The TTL refresh for the stored SearchParameter overlay
     /// (`HFS_SEARCH_PARAM_CACHE_TTL`, as `spawn_mongodb_search_param_refresh`
-    /// drives MongoDB's): [`Self::load_all_stored_search_parameters`], and
-    /// how many stored definitions the overlay holds afterwards.
+    /// drives MongoDB's): the reload of
+    /// [`Self::load_all_stored_search_parameters`], except that **a tenant
+    /// whose reload fails does not stop the others**. Its failure is logged
+    /// with the tenant, it keeps its previous overlay, and the tenants after
+    /// it are still reloaded; a summary warning gives the count. Returns how
+    /// many stored definitions the reloaded tenants hold.
     ///
     /// # Errors
     ///
-    /// As [`Self::load_all_stored_search_parameters`].
+    /// The tenant scan's error. Without it there is no list to continue
+    /// through, so every overlay stays as it was.
     pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
-        Ok(self.load_all_stored_search_parameters().await?.definitions)
+        let reload = self.reload_stored_search_parameters(false).await?;
+        if reload.failed > 0 {
+            tracing::warn!(
+                failed = reload.failed,
+                tenants = reload.tenants,
+                "SearchParameter refresh: some tenants kept their previous overlay"
+            );
+        }
+        Ok(reload.definitions)
     }
 
     /// Reloads the overlay of every tenant that has stored a SearchParameter,
     /// and of every tenant whose overlay holds a definition (so one whose
     /// SearchParameters are all gone is cleared), with
     /// [`Self::load_stored_search_parameters`]. The server runs it before it
-    /// serves and on every TTL refresh, so a tenant's stored SearchParameters
-    /// are in its registry from its first request after a restart, whatever
-    /// the tenant and even with the refresh off (TTL 0).
+    /// serves, so a tenant's stored SearchParameters are in its registry from
+    /// its first request after a restart, whatever the tenant and even with
+    /// the refresh off (TTL 0). The TTL refresh runs the same reload
+    /// ([`Self::refresh_stored_search_parameters`]).
     ///
     /// Cassandra keeps no table of tenants (design, "Tenant registry"), so
     /// the tenants come from [`Self::stored_search_parameter_tenants`], a
@@ -238,26 +319,33 @@ impl CassandraBackend {
     ///
     /// # Errors
     ///
-    /// The first failed scan or reload. The tenants already reloaded keep
-    /// their new overlay, the others their previous one.
+    /// The first failed scan or reload: **the startup load is fail-fast**, as
+    /// PostgreSQL's and MongoDB's `initialize` are. The tenants already
+    /// reloaded keep their new overlay, the others their previous one.
     pub async fn load_all_stored_search_parameters(
         &self,
     ) -> StorageResult<StoredSearchParameterReload> {
+        self.reload_stored_search_parameters(true).await
+    }
+
+    /// The reload behind [`Self::load_all_stored_search_parameters`]
+    /// (`fail_fast`) and [`Self::refresh_stored_search_parameters`].
+    async fn reload_stored_search_parameters(
+        &self,
+        fail_fast: bool,
+    ) -> StorageResult<StoredSearchParameterReload> {
         let mut tenants = self.stored_search_parameter_tenants().await?;
         tenants.extend(self.stored_by_tenant.read().keys().cloned());
-        let mut definitions = 0;
-        for tenant_id in &tenants {
-            definitions += self.load_stored_search_parameters(tenant_id).await?;
-        }
+        let reload = reload_each(&tenants, fail_fast, |tenant_id| async move {
+            self.load_stored_search_parameters(&tenant_id).await
+        })
+        .await;
         // Every cached registry is rebuilt from the new overlay on its next
         // use, also a tenant's that has no stored definitions, and one cached
         // from an older overlay while this ran (`TenantSearchRegistries::
         // for_tenant` builds outside its lock).
         self.registries.invalidate_all();
-        Ok(StoredSearchParameterReload {
-            tenants: tenants.len(),
-            definitions,
-        })
+        reload
     }
 
     /// Every tenant with a `SearchParameter` partition in `resources_by_type`,
@@ -305,11 +393,13 @@ impl CassandraBackend {
     /// whose `url` the shared base
     /// already holds is skipped, as [`Self::note_stored_search_parameter`]
     /// skips it, so the spec definitions the conformance seed stores never
-    /// enter the overlay.
+    /// enter the overlay. Of two with the same `url`, the one with the newest
+    /// `last_updated`, then the higher `id`, is kept ([`Precedence`]).
     ///
     /// **A concurrent create is kept.** A SearchParameter this process stores
     /// while the reload runs is noted after the reload took `since`, so the
-    /// replacement keeps it, and it wins over the reloaded copy of its `url`.
+    /// replacement keeps it, under the same [`Precedence`] as the reloaded
+    /// definitions.
     /// One noted before `since` was noted after `create` wrote its
     /// `resources_by_type` row, so the id scan, sent after `since`, lists it.
     ///
@@ -359,7 +449,7 @@ impl CassandraBackend {
             .map(|id| async move { self.read_resource(tenant, "SearchParameter", &id).await })
             .collect();
         let mut reads = stream::iter(pending).buffer_unordered(STORED_SEARCH_PARAMETER_READS);
-        let mut defs: Vec<SearchParameterDefinition> = Vec::new();
+        let mut defs: Vec<StoredDefinition> = Vec::new();
         while let Some(read) = reads.next().await {
             let stored = match read {
                 Ok(Some(stored)) => stored,
@@ -382,8 +472,15 @@ impl CassandraBackend {
                 continue;
             }
             definition.source = SearchParameterSource::Stored;
-            defs.retain(|existing| existing.url != definition.url);
-            defs.push(definition);
+            let precedence = (stored.last_modified(), stored.id().to_string());
+            insert_by_precedence(
+                &mut defs,
+                StoredDefinition {
+                    definition,
+                    precedence,
+                    noted_at: 0,
+                },
+            );
         }
 
         let count = {
@@ -395,15 +492,10 @@ impl CassandraBackend {
                 .filter(|d| d.noted_at > since)
                 .cloned()
                 .collect();
-            let mut merged: Vec<StoredDefinition> = defs
-                .into_iter()
-                .filter(|loaded| !noted.iter().any(|n| n.definition.url == loaded.url))
-                .map(|definition| StoredDefinition {
-                    definition,
-                    noted_at: 0,
-                })
-                .collect();
-            merged.extend(noted);
+            let mut merged = defs;
+            for noted in noted {
+                insert_by_precedence(&mut merged, noted);
+            }
             let count = merged.len();
             if merged.is_empty() {
                 stored.remove(tenant_id);
@@ -428,6 +520,7 @@ impl CassandraBackend {
         &self,
         tenant_id: &str,
         resource: &serde_json::Value,
+        last_updated: chrono::DateTime<chrono::Utc>,
     ) {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
@@ -442,17 +535,29 @@ impl CassandraBackend {
             return;
         }
         definition.source = SearchParameterSource::Stored;
-        {
+        let id = resource
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let inserted = {
             let mut stored = self.stored_by_tenant.write();
             let noted_at = self.note_seq.fetch_add(1, Ordering::SeqCst) + 1;
             let defs = stored.entry(tenant_id.to_string()).or_default();
-            defs.retain(|existing| existing.definition.url != definition.url);
-            defs.push(StoredDefinition {
-                definition,
-                noted_at,
-            });
+            insert_by_precedence(
+                defs,
+                StoredDefinition {
+                    definition,
+                    precedence: (last_updated, id),
+                    noted_at,
+                },
+            )
+        };
+        // A newer stored definition of the same `url` stays in force, so the
+        // registry is unchanged.
+        if inserted {
+            self.registries.invalidate(tenant_id);
         }
-        self.registries.invalidate(tenant_id);
     }
 
     /// Lists the tables of the configured keyspace and fails unless all ten
@@ -912,6 +1017,130 @@ mod restart_tests {
     }
 }
 
+/// The overlay's duplicate-`url` rule and the refresh's continue-on-error
+/// loop, without a node.
+#[cfg(test)]
+mod reload_rules {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use std::cell::RefCell;
+
+    fn stored(url: &str, id: &str, millis: i64) -> StoredDefinition {
+        let resource = serde_json::json!({
+            "resourceType": "SearchParameter",
+            "id": id,
+            "url": url,
+            "name": "x",
+            "status": "active",
+            "description": "test",
+            "code": format!("code-{id}"),
+            "base": ["Patient"],
+            "type": "token",
+            "expression": "Patient.gender"
+        });
+        let definition = SearchParameterLoader::new(helios_fhir::FhirVersion::default_enabled())
+            .parse_resource(&resource)
+            .expect("parse");
+        StoredDefinition {
+            definition,
+            precedence: (
+                Utc.timestamp_millis_opt(millis).single().expect("time"),
+                id.to_string(),
+            ),
+            noted_at: 0,
+        }
+    }
+
+    /// The ids in force after inserting `order`, whatever order that is.
+    fn winners(order: &[StoredDefinition]) -> Vec<String> {
+        let mut defs = Vec::new();
+        for candidate in order {
+            insert_by_precedence(&mut defs, candidate.clone());
+        }
+        defs.iter().map(|d| d.precedence.1.clone()).collect()
+    }
+
+    #[test]
+    fn the_newest_last_updated_wins_in_any_order() {
+        let old = stored("http://example.org/sp", "a-old", 1_000);
+        let new = stored("http://example.org/sp", "b-new", 2_000);
+        assert_eq!(winners(&[old.clone(), new.clone()]), ["b-new"]);
+        assert_eq!(winners(&[new, old]), ["b-new"]);
+    }
+
+    #[test]
+    fn the_higher_id_breaks_a_tie() {
+        let low = stored("http://example.org/sp", "aaa", 1_000);
+        let high = stored("http://example.org/sp", "zzz", 1_000);
+        assert_eq!(winners(&[low.clone(), high.clone()]), ["zzz"]);
+        assert_eq!(winners(&[high, low]), ["zzz"]);
+    }
+
+    #[test]
+    fn different_urls_are_kept_side_by_side() {
+        let one = stored("http://example.org/one", "x", 1_000);
+        let two = stored("http://example.org/two", "y", 500);
+        assert_eq!(winners(&[one, two]), ["x", "y"]);
+    }
+
+    #[test]
+    fn an_older_candidate_is_refused() {
+        let mut defs = vec![stored("http://example.org/sp", "new", 2_000)];
+        assert!(!insert_by_precedence(
+            &mut defs,
+            stored("http://example.org/sp", "old", 1_000)
+        ));
+        assert_eq!(defs[0].precedence.1, "new");
+    }
+
+    fn failing_on<'a>(
+        bad: &'static str,
+        loaded: &'a RefCell<Vec<String>>,
+    ) -> impl FnMut(String) -> std::future::Ready<StorageResult<usize>> + 'a {
+        move |tenant: String| {
+            loaded.borrow_mut().push(tenant.clone());
+            std::future::ready(if tenant == bad {
+                Err(StorageError::Backend(BackendError::Internal {
+                    backend_name: BACKEND_NAME.to_string(),
+                    message: "injected".to_string(),
+                    source: None,
+                }))
+            } else {
+                Ok(2)
+            })
+        }
+    }
+
+    fn tenants() -> BTreeSet<String> {
+        ["a", "b", "c"].map(String::from).into()
+    }
+
+    #[tokio::test]
+    async fn a_refresh_continues_past_a_failed_tenant() {
+        let loaded = RefCell::new(Vec::new());
+        let reload = reload_each(&tenants(), false, failing_on("b", &loaded))
+            .await
+            .expect("a refresh does not fail on one tenant");
+        assert_eq!(*loaded.borrow(), ["a", "b", "c"], "c is still reloaded");
+        assert_eq!(
+            reload,
+            StoredSearchParameterReload {
+                tenants: 3,
+                definitions: 4,
+                failed: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn the_startup_load_stops_at_the_first_failure() {
+        let loaded = RefCell::new(Vec::new());
+        let result = reload_each(&tenants(), true, failing_on("b", &loaded)).await;
+        assert!(result.is_err(), "startup is fail-fast");
+        assert_eq!(*loaded.borrow(), ["a", "b"], "nothing after the failure");
+    }
+}
+
 /// The partition-key scan's paging, against the node at
 /// `HFS_TEST_CASSANDRA_URL` (skipped when unset).
 #[cfg(test)]
@@ -954,17 +1183,24 @@ mod node_tests {
             return;
         };
         let page_size = 7;
-        // Enough partitions for several pages, whatever the node held before.
+        // 16 partitions of its own (4 tenants by 4 types, one resource each),
+        // so even an empty node gives more than two pages of 7.
         let version = helios_fhir::FhirVersion::default_enabled();
-        let tenant = crate::tenant::TenantContext::new(
-            crate::tenant::TenantId::new(format!("s2-paging-{}", uuid::Uuid::new_v4().simple())),
-            crate::tenant::TenantPermissions::full_access(),
-        );
-        for resource_type in ["Patient", "Observation", "Encounter", "Condition"] {
-            for _ in 0..3 {
+        let types = ["Patient", "Observation", "Encounter", "Condition"];
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let tenants: Vec<crate::tenant::TenantContext> = (0..4)
+            .map(|n| {
+                crate::tenant::TenantContext::new(
+                    crate::tenant::TenantId::new(format!("s2-paging-{run}-{n}")),
+                    crate::tenant::TenantPermissions::full_access(),
+                )
+            })
+            .collect();
+        for tenant in &tenants {
+            for resource_type in types {
                 crate::core::ResourceStorage::create(
                     &backend,
-                    &tenant,
+                    tenant,
                     resource_type,
                     serde_json::json!({ "resourceType": resource_type }),
                     version,
@@ -997,11 +1233,13 @@ mod node_tests {
         let (whole, paged) = (keys(&whole), keys(&paged));
         // Other tests may add partitions between the two reads, never remove.
         assert!(whole.is_subset(&paged), "a page was dropped");
-        for resource_type in ["Patient", "Observation", "Encounter", "Condition"] {
-            assert!(paged.contains(&(
-                tenant.tenant_id().as_str().to_string(),
-                resource_type.to_string()
-            )));
+        for tenant in &tenants {
+            for resource_type in types {
+                assert!(paged.contains(&(
+                    tenant.tenant_id().as_str().to_string(),
+                    resource_type.to_string()
+                )));
+            }
         }
     }
 }

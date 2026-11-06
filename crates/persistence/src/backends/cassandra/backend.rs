@@ -5,6 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use cdrs_tokio::types::IntoRustByName;
@@ -31,12 +32,42 @@ const HEALTH_CHECK: &str = "SELECT release_version FROM system.local";
 const SELECT_STORED_SEARCH_PARAMETER_IDS: &str =
     "SELECT id FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?";
 
+/// Every partition key of `resources_by_type`, so every tenant that has
+/// stored a resource of a type. `DISTINCT` on the whole partition key is a
+/// key-range read that needs no `ALLOW FILTERING` (Cassandra 5.0
+/// `SelectStatement.java`, `validateDistinctSelection`: a key range must
+/// select every partition key column) and reads one row per partition
+/// (`DataLimits.DISTINCT_NONE`). The `resource_type` filter is applied here,
+/// because a key range cannot restrict half of a composite partition key.
+const SELECT_TENANT_TYPES: &str = "SELECT DISTINCT tenant_id, resource_type FROM resources_by_type";
+
 /// How many SearchParameter reads a reload runs at once.
 const STORED_SEARCH_PARAMETER_READS: usize = 16;
 
+/// One stored, `active` SearchParameter in the overlay.
+#[derive(Clone)]
+struct StoredDefinition {
+    definition: SearchParameterDefinition,
+    /// The [`CassandraBackend::note_seq`] value when this process stored it,
+    /// or 0 when a reload read it. A reload keeps the definitions noted after
+    /// it began (see [`CassandraBackend::load_stored_search_parameters`]).
+    noted_at: u64,
+}
+
 /// Each tenant's stored, `active` SearchParameters, read by the registry
 /// loader. A map lookup cannot fail, so the loader always reports success.
-type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>>>;
+type StoredByTenant = Arc<RwLock<HashMap<String, Vec<StoredDefinition>>>>;
+
+/// What [`CassandraBackend::load_all_stored_search_parameters`] loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredSearchParameterReload {
+    /// Tenants reloaded: those with a stored SearchParameter, plus those this
+    /// process already knew.
+    pub tenants: usize,
+    /// Stored, `active`, non-spec definitions the overlay now holds across
+    /// them.
+    pub definitions: usize,
+}
 
 /// The Cassandra backend: a `cdrs-tokio` 8 session over the ten tables of
 /// `docs/Cassandra/schema/schema.cql`.
@@ -56,9 +87,13 @@ pub struct CassandraBackend {
     /// The overlay the registry loader reads.
     stored_by_tenant: StoredByTenant,
     /// Every tenant this process has built a registry for, loaded the overlay
-    /// of, or stored a SearchParameter in: the tenants the TTL refresh
-    /// reloads. Cassandra cannot list tenants without a full scan.
+    /// of, or stored a SearchParameter in. A reload covers them as well as
+    /// the tenants the scan lists, so a tenant whose SearchParameters are all
+    /// gone has its overlay cleared.
     known_tenants: Arc<RwLock<BTreeSet<String>>>,
+    /// Counts the SearchParameters this process has noted in the overlay
+    /// ([`StoredDefinition::noted_at`]).
+    note_seq: AtomicU64,
 }
 
 impl fmt::Debug for CassandraBackend {
@@ -132,7 +167,7 @@ impl CassandraBackend {
                     loader_cache
                         .read()
                         .get(tenant_id)
-                        .cloned()
+                        .map(|defs| defs.iter().map(|d| d.definition.clone()).collect())
                         .unwrap_or_default(),
                 )
             },
@@ -153,6 +188,7 @@ impl CassandraBackend {
             registries,
             stored_by_tenant,
             known_tenants,
+            note_seq: AtomicU64::new(0),
         })
     }
 
@@ -187,27 +223,77 @@ impl CassandraBackend {
 
     /// The TTL refresh for the stored SearchParameter overlay
     /// (`HFS_SEARCH_PARAM_CACHE_TTL`, as `spawn_mongodb_search_param_refresh`
-    /// drives MongoDB's): reloads the overlay of every tenant this process
-    /// knows (see [`Self::load_stored_search_parameters`]) and returns how many
-    /// stored definitions they hold.
-    ///
-    /// Cassandra has no table of tenants, so a tenant is reloaded once this
-    /// process has seen it: the server loads the default tenant before it
-    /// serves, and any other tenant's first request builds its registry, which
-    /// makes the next refresh load it. Until then that tenant's registry has
-    /// only the shared base.
+    /// drives MongoDB's): [`Self::load_all_stored_search_parameters`], and
+    /// how many stored definitions the overlay holds afterwards.
     ///
     /// # Errors
     ///
-    /// The first failed reload; the tenants already reloaded keep their new
-    /// overlay, the others their previous one.
+    /// As [`Self::load_all_stored_search_parameters`].
     pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
-        let tenants: Vec<String> = self.known_tenants.read().iter().cloned().collect();
-        let mut total = 0;
-        for tenant_id in tenants {
-            total += self.load_stored_search_parameters(&tenant_id).await?;
+        Ok(self.load_all_stored_search_parameters().await?.definitions)
+    }
+
+    /// Reloads the overlay of every tenant that has stored a SearchParameter,
+    /// and of every tenant this process knows, with
+    /// [`Self::load_stored_search_parameters`]. The server runs it before it
+    /// serves and on every TTL refresh, so a tenant's stored SearchParameters
+    /// are in its registry from its first request after a restart, whatever
+    /// the tenant and even with the refresh off (TTL 0).
+    ///
+    /// Cassandra keeps no table of tenants (design, "Tenant registry"), so
+    /// the tenants come from [`Self::stored_search_parameter_tenants`], a
+    /// paged scan of `resources_by_type`'s partition keys.
+    ///
+    /// # Errors
+    ///
+    /// The first failed scan or reload. The tenants already reloaded keep
+    /// their new overlay, the others their previous one.
+    pub async fn load_all_stored_search_parameters(
+        &self,
+    ) -> StorageResult<StoredSearchParameterReload> {
+        let mut tenants = self.stored_search_parameter_tenants().await?;
+        tenants.extend(self.known_tenants.read().iter().cloned());
+        let mut definitions = 0;
+        for tenant_id in &tenants {
+            definitions += self.load_stored_search_parameters(tenant_id).await?;
         }
-        Ok(total)
+        Ok(StoredSearchParameterReload {
+            tenants: tenants.len(),
+            definitions,
+        })
+    }
+
+    /// Every tenant with a `SearchParameter` partition in `resources_by_type`,
+    /// from a paged scan of the table's partition keys (one row per tenant
+    /// and type that has a resource).
+    ///
+    /// # Errors
+    ///
+    /// The mapped driver error of any page.
+    pub async fn stored_search_parameter_tenants(&self) -> StorageResult<BTreeSet<String>> {
+        let rows = self
+            .session
+            .rows_paged(SELECT_TENANT_TYPES, Vec::new(), StatementKind::Read)
+            .await
+            .map_err(|error| {
+                StorageError::Backend(map_driver_error(&error, "SearchParameter tenants"))
+            })?;
+        let mut tenants = BTreeSet::new();
+        for row in &rows {
+            let column = |name: &str| -> StorageResult<String> {
+                row.get_r_by_name(name).map_err(|error| {
+                    StorageError::Backend(BackendError::Internal {
+                        backend_name: BACKEND_NAME.to_string(),
+                        message: format!("SearchParameter tenants: {name}: {error}"),
+                        source: None,
+                    })
+                })
+            };
+            if column("resource_type")? == "SearchParameter" {
+                tenants.insert(column("tenant_id")?);
+            }
+        }
+        Ok(tenants)
     }
 
     /// Reads `tenant_id`'s stored, `active` SearchParameters from Cassandra
@@ -215,13 +301,21 @@ impl CassandraBackend {
     /// cached registry so the next access rebuilds it. Returns how many the
     /// overlay now holds for the tenant.
     ///
-    /// The server calls this for the default tenant before it serves, so a
-    /// stored SearchParameter that changes the patient compartment applies
-    /// from the first request after a restart, as PostgreSQL's and MongoDB's
-    /// startup reloads do. A SearchParameter whose `url` the shared base
+    /// [`Self::load_all_stored_search_parameters`] runs this for every tenant
+    /// before the server serves, so a stored SearchParameter that changes the
+    /// patient compartment applies from the first request after a restart,
+    /// as PostgreSQL's and MongoDB's startup reloads do. A SearchParameter
+    /// whose `url` the shared base
     /// already holds is skipped, as [`Self::note_stored_search_parameter`]
     /// skips it, so the spec definitions the conformance seed stores never
     /// enter the overlay.
+    ///
+    /// **A concurrent create is kept.** A SearchParameter this process stores
+    /// while the reload runs is noted after the reload took `since`, so the
+    /// replacement keeps it, and it wins over the reloaded copy of its `url`.
+    /// One noted before `since` had committed its `resources_by_type` row
+    /// first (`create` notes it after the row), so the id scan, sent after
+    /// `since`, lists it.
     ///
     /// # Errors
     ///
@@ -232,9 +326,10 @@ impl CassandraBackend {
         use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
         self.known_tenants.write().insert(tenant_id.to_string());
+        let since = self.note_seq.load(Ordering::SeqCst);
         let rows = self
             .session
-            .rows(
+            .rows_paged(
                 SELECT_STORED_SEARCH_PARAMETER_IDS,
                 vec![Value::from(tenant_id), Value::from("SearchParameter")],
                 StatementKind::Read,
@@ -290,15 +385,32 @@ impl CassandraBackend {
             defs.push(definition);
         }
 
-        let count = defs.len();
-        {
+        let count = {
             let mut stored = self.stored_by_tenant.write();
-            if defs.is_empty() {
+            let noted: Vec<StoredDefinition> = stored
+                .get(tenant_id)
+                .into_iter()
+                .flatten()
+                .filter(|d| d.noted_at > since)
+                .cloned()
+                .collect();
+            let mut merged: Vec<StoredDefinition> = defs
+                .into_iter()
+                .filter(|loaded| !noted.iter().any(|n| n.definition.url == loaded.url))
+                .map(|definition| StoredDefinition {
+                    definition,
+                    noted_at: 0,
+                })
+                .collect();
+            merged.extend(noted);
+            let count = merged.len();
+            if merged.is_empty() {
                 stored.remove(tenant_id);
             } else {
-                stored.insert(tenant_id.to_string(), defs);
+                stored.insert(tenant_id.to_string(), merged);
             }
-        }
+            count
+        };
         self.registries.invalidate(tenant_id);
         Ok(count)
     }
@@ -332,9 +444,13 @@ impl CassandraBackend {
         self.known_tenants.write().insert(tenant_id.to_string());
         {
             let mut stored = self.stored_by_tenant.write();
+            let noted_at = self.note_seq.fetch_add(1, Ordering::SeqCst) + 1;
             let defs = stored.entry(tenant_id.to_string()).or_default();
-            defs.retain(|existing| existing.url != definition.url);
-            defs.push(definition);
+            defs.retain(|existing| existing.definition.url != definition.url);
+            defs.push(StoredDefinition {
+                definition,
+                noted_at,
+            });
         }
         self.registries.invalidate(tenant_id);
     }
@@ -793,5 +909,99 @@ mod restart_tests {
         // Only the health check and the read ran on the new session: the
         // cache started empty and both were prepared again on it.
         assert_eq!(backend.session.prepared_count(), 2);
+    }
+}
+
+/// The partition-key scan's paging, against the node at
+/// `HFS_TEST_CASSANDRA_URL` (skipped when unset).
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    async fn backend() -> Option<CassandraBackend> {
+        let url = std::env::var("HFS_TEST_CASSANDRA_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())?;
+        Some(
+            CassandraBackend::connect(CassandraConfig {
+                contact_points: vec![url],
+                data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
+                ..CassandraConfig::default()
+            })
+            .await
+            .expect("connect"),
+        )
+    }
+
+    fn keys(rows: &[cdrs_tokio::types::rows::Row]) -> BTreeSet<(String, String)> {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.get_r_by_name("tenant_id").expect("tenant_id"),
+                    row.get_r_by_name("resource_type").expect("resource_type"),
+                )
+            })
+            .collect()
+    }
+
+    /// Small pages return the same partition keys as one unpaged read, so
+    /// the paging state is followed to the end.
+    #[tokio::test]
+    async fn the_partition_key_scan_follows_every_page() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let page_size = 7;
+        // Enough partitions for several pages, whatever the node held before.
+        let version = helios_fhir::FhirVersion::default_enabled();
+        let tenant = crate::tenant::TenantContext::new(
+            crate::tenant::TenantId::new(format!("s2-paging-{}", uuid::Uuid::new_v4().simple())),
+            crate::tenant::TenantPermissions::full_access(),
+        );
+        for resource_type in ["Patient", "Observation", "Encounter", "Condition"] {
+            for _ in 0..3 {
+                crate::core::ResourceStorage::create(
+                    &backend,
+                    &tenant,
+                    resource_type,
+                    serde_json::json!({ "resourceType": resource_type }),
+                    version,
+                )
+                .await
+                .expect("create");
+            }
+        }
+        let whole = backend
+            .session
+            .rows(SELECT_TENANT_TYPES, Vec::new(), StatementKind::Read)
+            .await
+            .expect("unpaged");
+        let paged = backend
+            .session
+            .rows_paged_by(
+                SELECT_TENANT_TYPES,
+                Vec::new(),
+                StatementKind::Read,
+                page_size,
+            )
+            .await
+            .expect("paged");
+        assert!(
+            paged.len() > 2 * page_size as usize,
+            "several pages: {} rows",
+            paged.len()
+        );
+        assert_eq!(paged.len(), keys(&paged).len(), "no partition twice");
+        let (whole, paged) = (keys(&whole), keys(&paged));
+        // Other tests may add partitions between the two reads, never remove.
+        assert!(whole.is_subset(&paged), "a page was dropped");
+        for resource_type in ["Patient", "Observation", "Encounter", "Condition"] {
+            assert!(paged.contains(&(
+                tenant.tenant_id().as_str().to_string(),
+                resource_type.to_string()
+            )));
+        }
     }
 }

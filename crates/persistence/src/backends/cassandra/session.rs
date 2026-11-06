@@ -63,6 +63,7 @@ use cdrs_tokio::query::{PreparedQuery, QueryValues};
 use cdrs_tokio::retry::{DefaultRetryPolicy, FallthroughRetryPolicy, RetryPolicy};
 use cdrs_tokio::statement::{StatementParams, StatementParamsBuilder};
 use cdrs_tokio::transport::TransportTcp;
+use cdrs_tokio::types::CBytes;
 use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
 use parking_lot::{Mutex, RwLock};
@@ -74,6 +75,26 @@ use super::config::CassandraConfig;
 /// The native protocol version the session speaks. Cassandra 5.0 serves v5
 /// as a stable (non-beta) version, and `cdrs-tokio` 8 speaks v3 to v5.
 pub(crate) const PROTOCOL_VERSION: Version = Version::V5;
+
+/// Rows per page of a [`CassandraSession::rows_paged`] read. Without a page
+/// size the node returns the whole result in one message (native protocol v5,
+/// section 7, "Result paging"); 5000 is the DataStax Java driver's default.
+///
+/// **`cdrs-tokio` 8.1.9 loses a response that spans protocol v5 frames**
+/// (over 128 KiB): `cassandra-protocol` 3.3.0 gates a multi-frame envelope on
+/// its body length without the 9-byte header and never resets that length
+/// (`frame/frame_decoder.rs:271` and `:277`), so the request runs into its
+/// deadline and the connection is left broken. A 5000-row page of
+/// `resources_by_type`'s partition keys is that large. Fixed upstream in
+/// 9.0.2 (krojew/cdrs-tokio `31d69ea89`); layer L8 moves to 10.0.0.
+pub(crate) const PAGE_SIZE: i32 = 5000;
+
+/// One page request: its size, and the node's paging state from the page
+/// before (`None` for the first page).
+struct Paging {
+    page_size: i32,
+    state: Option<CBytes>,
+}
 
 type LoadBalancing = TopologyAwareLoadBalancingStrategy<TransportTcp, TcpConnectionManager>;
 type CdrsSession = Session<TransportTcp, TcpConnectionManager, LoadBalancing>;
@@ -478,8 +499,23 @@ impl CassandraSession {
         values: Vec<Value>,
         kind: StatementKind,
     ) -> Result<Envelope, DriverError> {
+        self.execute_with(cql, values, kind, None).await
+    }
+
+    /// [`Self::execute`], for one page when `paging` is set.
+    async fn execute_with(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        kind: StatementKind,
+        paging: Option<Paging>,
+    ) -> Result<Envelope, DriverError> {
         let started = Instant::now();
-        let params = statement_params(kind, values, &self.no_retry);
+        let mut params = statement_params(kind, values, &self.no_retry);
+        if let Some(paging) = paging {
+            params.query_params.page_size = Some(paging.page_size);
+            params.query_params.paging_state = paging.state;
+        }
         let connected = self.current();
         let result = Self::execute_on(&connected, cql, &params, self.request_timeout).await;
         let Err(DriverError::Driver(error)) = &result else {
@@ -565,6 +601,58 @@ impl CassandraSession {
         let envelope = self.execute(cql, values, kind).await?;
         let body = envelope.response_body()?;
         Ok(body.into_rows().unwrap_or_default())
+    }
+
+    /// Executes `cql` page by page, [`PAGE_SIZE`] rows at a time, and returns
+    /// every row of every page.
+    ///
+    /// [`Self::rows`] sets no page size, so the node builds the whole result
+    /// in one message. That is right for a single partition of known size,
+    /// not for a range scan. `cdrs-tokio` 8.1.9's own pager
+    /// (`cluster/pager.rs:199-223`, `ExecPager::next`) builds its parameters
+    /// from `StatementParamsBuilder::new()`, which drops the consistency this
+    /// module sets, so each page goes through [`Self::execute`]'s path
+    /// instead, with the kind's consistency and deadline. A page whose
+    /// metadata carries a paging state has more after it
+    /// (`cassandra-protocol` 3.3.0, `frame/message_result.rs:355-359`: the
+    /// state is read only when `HAS_MORE_PAGES` is set).
+    pub(crate) async fn rows_paged(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        kind: StatementKind,
+    ) -> Result<Vec<Row>, DriverError> {
+        self.rows_paged_by(cql, values, kind, PAGE_SIZE).await
+    }
+
+    /// [`Self::rows_paged`] with `page_size` rows per page.
+    pub(crate) async fn rows_paged_by(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        kind: StatementKind,
+        page_size: i32,
+    ) -> Result<Vec<Row>, DriverError> {
+        let mut all = Vec::new();
+        let mut state = None;
+        loop {
+            let paging = Paging {
+                page_size,
+                state: state.take(),
+            };
+            let envelope = self
+                .execute_with(cql, values.clone(), kind, Some(paging))
+                .await?;
+            let body = envelope.response_body()?;
+            let next = body
+                .as_rows_metadata()
+                .and_then(|metadata| metadata.paging_state.clone());
+            all.extend(body.into_rows().unwrap_or_default());
+            match next {
+                Some(next) => state = Some(next),
+                None => return Ok(all),
+            }
+        }
     }
 }
 

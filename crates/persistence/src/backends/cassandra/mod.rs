@@ -56,7 +56,7 @@ mod storage;
 mod stubs;
 mod write;
 
-pub use backend::{CassandraBackend, CassandraConnection};
+pub use backend::{CassandraBackend, CassandraConnection, StoredSearchParameterReload};
 pub use config::{
     CassandraConfig, CassandraConfigError, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_CONTACT_POINT,
     DEFAULT_KEYSPACE, DEFAULT_LOCAL_DC, DEFAULT_POOL_SIZE, DEFAULT_REQUEST_TIMEOUT_MS,

@@ -4696,15 +4696,23 @@ async fn start_cassandra(
     // is one lightweight-transaction create, fanned out at
     // `bulk_write_concurrency`.
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
-    // The default tenant's stored SearchParameters, before the first request:
-    // one that changes the patient compartment must apply from the first
+    // Every tenant's stored SearchParameters, before the first request: one
+    // that changes the patient compartment must apply from a tenant's first
     // request after a restart, as PostgreSQL's and MongoDB's startup reloads
-    // make it. Other tenants load on the refresh after their first request.
-    let stored = backend
-        .load_stored_search_parameters(&config.default_tenant)
+    // make it, also with the refresh off (TTL 0). The tenants come from a
+    // scan of `resources_by_type`'s partition keys; Cassandra keeps no table
+    // of tenants. A failed load stops startup, as PostgreSQL's does.
+    let started = std::time::Instant::now();
+    let reload = backend
+        .load_all_stored_search_parameters()
         .await
         .map_err(|e| anyhow::anyhow!("Loading the stored SearchParameters failed: {e}"))?;
-    info!(stored, tenant = %config.default_tenant, "Stored SearchParameters loaded");
+    info!(
+        tenants = reload.tenants,
+        stored = reload.definitions,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Stored SearchParameters loaded"
+    );
     spawn_cassandra_search_param_refresh(backend.clone(), &config);
 
     let ui_tenants: Option<Arc<dyn ResourceStorage>> =

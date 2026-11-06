@@ -4696,6 +4696,15 @@ async fn start_cassandra(
     // is one lightweight-transaction create, fanned out at
     // `bulk_write_concurrency`.
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
+    // The default tenant's stored SearchParameters, before the first request:
+    // one that changes the patient compartment must apply from the first
+    // request after a restart, as PostgreSQL's and MongoDB's startup reloads
+    // make it. Other tenants load on the refresh after their first request.
+    let stored = backend
+        .load_stored_search_parameters(&config.default_tenant)
+        .await
+        .map_err(|e| anyhow::anyhow!("Loading the stored SearchParameters failed: {e}"))?;
+    info!(stored, tenant = %config.default_tenant, "Stored SearchParameters loaded");
     spawn_cassandra_search_param_refresh(backend.clone(), &config);
 
     let ui_tenants: Option<Arc<dyn ResourceStorage>> =

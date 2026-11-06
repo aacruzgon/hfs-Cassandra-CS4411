@@ -1,7 +1,7 @@
 //! [`CassandraBackend`]: construction, the search-parameter registries and
 //! the [`Backend`] implementation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::value::Value;
+use futures::stream::{self, StreamExt};
 use parking_lot::RwLock;
 
 use super::config::CassandraConfig;
@@ -16,7 +17,7 @@ use super::errors::{BACKEND_NAME, map_driver_error};
 use super::schema;
 use super::session::{CassandraSession, DriverError, StatementKind};
 use crate::core::{Backend, BackendCapability, BackendKind};
-use crate::error::{BackendError, StorageError, StorageResult};
+use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::{
     SearchParameterDefinition, SearchParameterLoader, SearchParameterRegistry,
     TenantSearchRegistries,
@@ -24,6 +25,14 @@ use crate::search::{
 
 /// The cheap health probe: one row of the coordinator's own `system.local`.
 const HEALTH_CHECK: &str = "SELECT release_version FROM system.local";
+
+/// Every SearchParameter id a tenant has stored, from its `resources_by_type`
+/// partition, which `create` writes in Step 2 (write.rs, X1).
+const SELECT_STORED_SEARCH_PARAMETER_IDS: &str =
+    "SELECT id FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?";
+
+/// How many SearchParameter reads a reload runs at once.
+const STORED_SEARCH_PARAMETER_READS: usize = 16;
 
 /// Each tenant's stored, `active` SearchParameters, read by the registry
 /// loader. A map lookup cannot fail, so the loader always reports success.
@@ -46,6 +55,10 @@ pub struct CassandraBackend {
     pub(super) registries: Arc<TenantSearchRegistries>,
     /// The overlay the registry loader reads.
     stored_by_tenant: StoredByTenant,
+    /// Every tenant this process has built a registry for, loaded the overlay
+    /// of, or stored a SearchParameter in: the tenants the TTL refresh
+    /// reloads. Cassandra cannot list tenants without a full scan.
+    known_tenants: Arc<RwLock<BTreeSet<String>>>,
 }
 
 impl fmt::Debug for CassandraBackend {
@@ -108,8 +121,13 @@ impl CassandraBackend {
 
         let stored_by_tenant: StoredByTenant = Arc::new(RwLock::new(HashMap::new()));
         let loader_cache = stored_by_tenant.clone();
+        let known_tenants: Arc<RwLock<BTreeSet<String>>> = Arc::default();
+        let loader_known = known_tenants.clone();
         let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
             move |tenant_id: &str| {
+                if !loader_known.read().contains(tenant_id) {
+                    loader_known.write().insert(tenant_id.to_string());
+                }
                 Some(
                     loader_cache
                         .read()
@@ -134,6 +152,7 @@ impl CassandraBackend {
             session: Arc::new(session),
             registries,
             stored_by_tenant,
+            known_tenants,
         })
     }
 
@@ -168,17 +187,120 @@ impl CassandraBackend {
 
     /// The TTL refresh for the stored SearchParameter overlay
     /// (`HFS_SEARCH_PARAM_CACHE_TTL`, as `spawn_mongodb_search_param_refresh`
-    /// drives MongoDB's): drops every cached per-tenant registry so the next
-    /// access rebuilds it from the overlay. Returns how many stored
-    /// definitions the overlay holds.
+    /// drives MongoDB's): reloads the overlay of every tenant this process
+    /// knows (see [`Self::load_stored_search_parameters`]) and returns how many
+    /// stored definitions they hold.
     ///
-    /// Step 2 has no way to list a tenant's stored SearchParameters yet: that
-    /// needs the `resources_by_type` rows Step 5 writes. Until then the
-    /// overlay holds only the SearchParameters this process has stored itself,
-    /// and this keeps them.
+    /// Cassandra has no table of tenants, so a tenant is reloaded once this
+    /// process has seen it: the server loads the default tenant before it
+    /// serves, and any other tenant's first request builds its registry, which
+    /// makes the next refresh load it. Until then that tenant's registry has
+    /// only the shared base.
+    ///
+    /// # Errors
+    ///
+    /// The first failed reload; the tenants already reloaded keep their new
+    /// overlay, the others their previous one.
     pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
-        self.registries.invalidate_all();
-        Ok(self.stored_by_tenant.read().values().map(Vec::len).sum())
+        let tenants: Vec<String> = self.known_tenants.read().iter().cloned().collect();
+        let mut total = 0;
+        for tenant_id in tenants {
+            total += self.load_stored_search_parameters(&tenant_id).await?;
+        }
+        Ok(total)
+    }
+
+    /// Reads `tenant_id`'s stored, `active` SearchParameters from Cassandra
+    /// into the overlay, replacing what it held, and drops that tenant's
+    /// cached registry so the next access rebuilds it. Returns how many the
+    /// overlay now holds for the tenant.
+    ///
+    /// The server calls this for the default tenant before it serves, so a
+    /// stored SearchParameter that changes the patient compartment applies
+    /// from the first request after a restart, as PostgreSQL's and MongoDB's
+    /// startup reloads do. A SearchParameter whose `url` the shared base
+    /// already holds is skipped, as [`Self::note_stored_search_parameter`]
+    /// skips it, so the spec definitions the conformance seed stores never
+    /// enter the overlay.
+    ///
+    /// # Errors
+    ///
+    /// The mapped driver error of the id scan or of any read. The overlay is
+    /// unchanged then.
+    pub async fn load_stored_search_parameters(&self, tenant_id: &str) -> StorageResult<usize> {
+        use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
+        use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+
+        self.known_tenants.write().insert(tenant_id.to_string());
+        let rows = self
+            .session
+            .rows(
+                SELECT_STORED_SEARCH_PARAMETER_IDS,
+                vec![Value::from(tenant_id), Value::from("SearchParameter")],
+                StatementKind::Read,
+            )
+            .await
+            .map_err(|error| {
+                StorageError::Backend(map_driver_error(&error, "stored SearchParameters"))
+            })?;
+        let mut ids = BTreeSet::new();
+        for row in &rows {
+            let id: String = row.get_r_by_name("id").map_err(|error| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: BACKEND_NAME.to_string(),
+                    message: format!("stored SearchParameters: id: {error}"),
+                    source: None,
+                })
+            })?;
+            ids.insert(id);
+        }
+
+        let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
+        let loader = SearchParameterLoader::new(self.config.fhir_version);
+        let tenant = &tenant;
+        let pending: Vec<_> = ids
+            .into_iter()
+            .map(|id| async move { self.read_resource(tenant, "SearchParameter", &id).await })
+            .collect();
+        let mut reads = stream::iter(pending).buffer_unordered(STORED_SEARCH_PARAMETER_READS);
+        let mut defs: Vec<SearchParameterDefinition> = Vec::new();
+        while let Some(read) = reads.next().await {
+            let stored = match read {
+                Ok(Some(stored)) => stored,
+                // Deleted since the scan, or never finished: not stored.
+                Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. })) => continue,
+                Err(error) => return Err(error),
+            };
+            if !self.registries.create_affects_overlay(stored.content()) {
+                continue;
+            }
+            let Ok(mut definition) = loader.parse_resource(stored.content()) else {
+                tracing::warn!(
+                    tenant_id,
+                    id = stored.id(),
+                    "stored SearchParameter does not parse; leaving it out of the registry"
+                );
+                continue;
+            };
+            if definition.status != SearchParameterStatus::Active {
+                continue;
+            }
+            definition.source = SearchParameterSource::Stored;
+            defs.retain(|existing| existing.url != definition.url);
+            defs.push(definition);
+        }
+
+        let count = defs.len();
+        {
+            let mut stored = self.stored_by_tenant.write();
+            if defs.is_empty() {
+                stored.remove(tenant_id);
+            } else {
+                stored.insert(tenant_id.to_string(), defs);
+            }
+        }
+        self.registries.invalidate(tenant_id);
+        Ok(count)
     }
 
     /// Records a SearchParameter `tenant_id` just stored in the overlay, if it
@@ -207,6 +329,7 @@ impl CassandraBackend {
             return;
         }
         definition.source = SearchParameterSource::Stored;
+        self.known_tenants.write().insert(tenant_id.to_string());
         {
             let mut stored = self.stored_by_tenant.write();
             let defs = stored.entry(tenant_id.to_string()).or_default();

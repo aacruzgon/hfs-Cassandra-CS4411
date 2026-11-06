@@ -56,6 +56,10 @@ mod backend_skeleton;
 #[path = "cassandra/create_read.rs"]
 mod create_read;
 
+/// Step 2: stored SearchParameters reloaded after a restart (item 2.2).
+#[path = "cassandra/stored_search_parameters.rs"]
+mod stored_search_parameters;
+
 /// The shared backend-test harness, `tests/common/{harness, fixtures,
 /// capabilities}.rs`, compiled here as `crate::common` because
 /// [`TestableBackend`](common::harness::TestableBackend) lives there and

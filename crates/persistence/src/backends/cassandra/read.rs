@@ -154,11 +154,16 @@ impl CassandraBackend {
                     .iter()
                     .map(|resource_type| self.count_type(tenant_id, resource_type))
                     .collect();
-                let counts: Vec<StorageResult<u64>> = stream::iter(scans)
-                    .buffer_unordered(COUNT_ALL_CONCURRENCY)
-                    .collect()
-                    .await;
-                counts.into_iter().sum()
+                // Sum as the scans finish and stop at the first error:
+                // dropping the stream cancels the scans still in flight,
+                // so a down node costs at most `COUNT_ALL_CONCURRENCY`
+                // timed-out requests, not one for every resource type.
+                let mut counts = stream::iter(scans).buffer_unordered(COUNT_ALL_CONCURRENCY);
+                let mut total = 0u64;
+                while let Some(count) = counts.next().await {
+                    total += count?;
+                }
+                Ok(total)
             }
         }
     }

@@ -248,7 +248,17 @@ struct RebuildState {
     not_before: Option<Instant>,
     /// The rebuild in progress: callers wait on it instead of starting
     /// another. Its task sends `true` when it has finished.
-    pending: Option<watch::Receiver<bool>>,
+    pending: Option<Pending>,
+}
+
+/// A rebuild in progress.
+#[derive(Debug)]
+struct Pending {
+    finished: watch::Receiver<bool>,
+    started: Instant,
+    /// Whether the warning for a rebuild that outlived the connect timeout
+    /// has been logged.
+    warned: bool,
 }
 
 /// What [`CassandraSession`] shares with its rebuild task.
@@ -305,7 +315,13 @@ impl Holder {
 /// would leave that task running for good; the rebuild task is never
 /// cancelled, and at most one is pending. Before building, it checks that a
 /// contact point accepts a TCP connection, so a node that is down fails the
-/// rebuild at once. After a failed rebuild, or one whose new session has no
+/// rebuild at once. A build whose contact point accepts TCP but whose session
+/// does not start (the keyspace dropped, credentials rotated, TLS required, a
+/// node still booting) stays pending until that clears, retried by the
+/// driver with a backoff of up to 60 s; once it has outlived the connect
+/// timeout, callers get their own error back at once instead of waiting, and
+/// one warning is logged. A panic in the task clears the pending rebuild
+/// through a drop guard. After a failed rebuild, or one whose new session has no
 /// usable node, no new one starts for a backoff of 250 ms, doubling per
 /// failure up to 5 s; callers in that window get their own error back at
 /// once, so a node that is down is not hammered. A caller waits for a pending
@@ -337,15 +353,24 @@ impl CassandraSession {
     /// `config.keyspace` as the session keyspace, all within
     /// `config.connect_timeout_ms`.
     ///
-    /// When the contact points accept TCP but the session does not come up
-    /// in time (a missing keyspace, a node still starting), the driver's
-    /// control-connection task outlives the failed call (see the type docs).
-    /// A failed startup ends the process, which ends the task.
+    /// A contact point that refuses TCP fails here before the driver starts
+    /// anything. When a contact point accepts TCP but the session does not
+    /// come up in time (a missing keyspace, rejected credentials, a node
+    /// still starting), the build is cut off by the deadline and the driver's
+    /// control-connection task outlives the failed call, retrying in the
+    /// background (see the type docs): one task per failed `connect`.
     pub(crate) async fn connect(config: &CassandraConfig) -> Result<Self, DriverError> {
         let deadline = Duration::from_millis(config.connect_timeout_ms);
         let started = Instant::now();
-        let builder = session_builder(config, deadline).await?;
+        probe_contact_points(config, deadline).await?;
+        let builder = session_builder(config, deadline.saturating_sub(started.elapsed())).await?;
         let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(DriverError::Deadline {
+                after: deadline,
+                sent: false,
+            });
+        }
         let session = within(remaining, false, builder.build())
             .await?
             .map_err(build_error)?;
@@ -365,21 +390,25 @@ impl CassandraSession {
         })
     }
 
-    /// The data centres of nodes the session would send to that are not
-    /// `local_dc`. The driver gives every contact point a `Local` distance
+    /// The data centres, each once, of nodes the session could send to that
+    /// are not `local_dc`. The driver gives every contact point a `Local` distance
     /// and keeps it after the first refresh (`cluster/session.rs:784-786`,
     /// `topology/node.rs:330`), without asking [`LocalDcOnly`], so a contact
     /// point in another DC would coordinate requests.
     pub(crate) fn usable_nodes_outside(&self, local_dc: &str) -> Vec<String> {
-        self.holder
+        let datacenters: std::collections::BTreeSet<String> = self
+            .holder
             .current()
             .session
             .cluster_metadata()
             .nodes()
             .values()
-            .filter(|node| !node.is_ignored() && node.datacenter() != local_dc)
+            // A distance, whatever the node's state now: a remote contact
+            // point that is down would coordinate requests once it is up.
+            .filter(|node| node.distance().is_some() && node.datacenter() != local_dc)
             .map(|node| node.datacenter().to_string())
-            .collect()
+            .collect();
+        datacenters.into_iter().collect()
     }
 
     /// The session in use now.
@@ -485,23 +514,45 @@ impl CassandraSession {
             if current.generation != broken.generation {
                 return Some(current);
             }
-            match &state.pending {
-                Some(pending) => pending.clone(),
+            let stuck_after = Duration::from_millis(self.holder.config.connect_timeout_ms);
+            match &mut state.pending {
+                // A build that outlives the connect timeout is waiting on
+                // something that may not clear soon (see the type docs):
+                // answer at once instead of holding every request for its
+                // whole deadline.
+                Some(pending) if pending.started.elapsed() > stuck_after => {
+                    if !pending.warned {
+                        pending.warned = true;
+                        tracing::warn!(
+                            pending_ms = pending.started.elapsed().as_millis() as u64,
+                            "cassandra: the new session is still not open; a contact point \
+                             accepts TCP, but the session does not start (keyspace, \
+                             credentials, TLS, or a node still starting)"
+                        );
+                    }
+                    return None;
+                }
+                Some(pending) => pending.finished.clone(),
                 None => {
                     if state.not_before.is_some_and(|at| Instant::now() < at) {
                         return None;
                     }
                     state.failures = state.failures.saturating_add(1);
                     let (done, pending) = watch::channel(false);
-                    state.pending = Some(pending.clone());
+                    state.pending = Some(Pending {
+                        finished: pending.clone(),
+                        started: Instant::now(),
+                        warned: false,
+                    });
                     self.holder.rebuild_attempts.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(rebuild(self.holder.clone(), broken.generation + 1, done));
                     pending
                 }
             }
         };
-        // An error here means the task ended without sending (a panic);
-        // either way, the current session decides.
+        // An error here means the task ended without sending (it panicked,
+        // and its guard cleared `pending`); either way, the current session
+        // decides.
         let _ = tokio::time::timeout(budget, finished.wait_for(|done| *done)).await;
         let current = self.holder.current();
         (current.generation > broken.generation).then_some(current)
@@ -542,6 +593,10 @@ fn describe_open_error(error: &DriverError) -> String {
 /// failure and its backoff; then wakes the callers waiting on `done`. Runs in
 /// its own task and is never cancelled (see [`CassandraSession`]).
 async fn rebuild(holder: Arc<Holder>, generation: u64, done: watch::Sender<bool>) {
+    let mut guard = PendingGuard {
+        holder: holder.clone(),
+        armed: true,
+    };
     tracing::warn!(
         generation,
         "cassandra: the session has no node to send to; opening a new session"
@@ -564,6 +619,7 @@ async fn rebuild(holder: Arc<Holder>, generation: u64, done: watch::Sender<bool>
     {
         let mut state = holder.state.lock();
         state.pending = None;
+        guard.armed = false;
         match outcome {
             Ok(fresh) => {
                 *holder.current.write() = Arc::new(fresh);
@@ -586,6 +642,24 @@ async fn rebuild(holder: Arc<Holder>, generation: u64, done: watch::Sender<bool>
     let _ = done.send(true);
 }
 
+/// Clears [`RebuildState::pending`] and sets the backoff if [`rebuild`] ends
+/// without doing so, which only a panic can cause; otherwise no rebuild could
+/// ever start again.
+struct PendingGuard {
+    holder: Arc<Holder>,
+    armed: bool,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = self.holder.state.lock();
+            state.pending = None;
+            state.not_before = Some(Instant::now() + rebuild_backoff(state.failures));
+        }
+    }
+}
+
 /// The replacement session for [`rebuild`]. First checks, within
 /// `config.connect_timeout_ms`, that some contact point accepts a TCP
 /// connection, so a node that is down fails here at once. The session build
@@ -594,6 +668,19 @@ async fn rebuild(holder: Arc<Holder>, generation: u64, done: watch::Sender<bool>
 async fn open_replacement(config: &CassandraConfig) -> Result<CdrsSession, DriverError> {
     let deadline = Duration::from_millis(config.connect_timeout_ms);
     let started = Instant::now();
+    probe_contact_points(config, deadline).await?;
+    let builder = session_builder(config, deadline.saturating_sub(started.elapsed())).await?;
+    builder.build().await.map_err(build_error)
+}
+
+/// Succeeds once some contact point accepts a TCP connection within
+/// `deadline`. Cheap, and spawns nothing, so it is safe to cancel; it runs
+/// before every session build so that a closed port fails without starting
+/// the driver's control-connection task.
+async fn probe_contact_points(
+    config: &CassandraConfig,
+    deadline: Duration,
+) -> Result<(), DriverError> {
     let attempts: Vec<_> = config
         .contact_points
         .iter()
@@ -601,9 +688,8 @@ async fn open_replacement(config: &CassandraConfig) -> Result<CdrsSession, Drive
         .collect();
     within(deadline, false, futures::future::select_ok(attempts))
         .await?
-        .map_err(|error| DriverError::from(cdrs_tokio::error::Error::Io(error)))?;
-    let builder = session_builder(config, deadline.saturating_sub(started.elapsed())).await?;
-    builder.build().await.map_err(build_error)
+        .map(drop)
+        .map_err(|error| DriverError::from(cdrs_tokio::error::Error::Io(error)))
 }
 
 /// The driver's session builder for `config`. Resolving the contact points

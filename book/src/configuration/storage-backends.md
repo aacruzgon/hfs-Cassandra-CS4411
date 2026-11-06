@@ -12,6 +12,7 @@ The Helios FHIR Server supports several storage backend configurations. Set `HFS
 | PostgreSQL + Elasticsearch | `postgres-elasticsearch` or `pg-es` | PostgreSQL for CRUD, Elasticsearch for search |
 | S3 | `s3` | Object storage for CRUD, versioning, history, and bulk ops. No search. |
 | S3 + Elasticsearch | `s3-elasticsearch` or `s3-es` | S3 for CRUD, Elasticsearch for search |
+| Cassandra | `cassandra` | Apache Cassandra for CRUD (in development: create and read). Search limited to token, date and URI parameters. |
 
 ## Running with Each Backend
 
@@ -107,6 +108,20 @@ AWS_PROFILE=your-aws-profile \
 AWS_REGION=us-east-1 \
   ./hfs
 ```
+
+### Cassandra
+
+The Cassandra backend is in development: create and read work, and the rest of the RESTful API answers `501 Not Implemented` until it lands. Build with the `cassandra` feature; without it, `HFS_STORAGE_BACKEND=cassandra` fails at startup.
+
+```bash
+cargo build -p helios-hfs --features cassandra
+HFS_STORAGE_BACKEND=cassandra ./target/debug/hfs
+```
+
+- **The schema is applied separately.** The server never creates the keyspace or the tables; at startup it only checks that the ten tables exist. Apply `docs/Cassandra/schema/keyspace-single-node.cql` and then `docs/Cassandra/schema/schema.cql` with `cqlsh` once, before the first start.
+- **No database audit sink.** The Cassandra backend does not store AuditEvents, so `HFS_AUDIT_BACKEND=database` fails at startup. Use `file` or `cloudwatch`.
+- **Standalone only.** There is no Cassandra + Elasticsearch mode.
+- **No per-user settings, login-session store, bulk export, bulk submit, `$purge` or `$reindex`.** Those endpoints answer `501`, and web login sessions are held in process.
 
 ## Choosing a Backend
 

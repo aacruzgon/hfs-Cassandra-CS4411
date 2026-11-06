@@ -96,6 +96,9 @@ pub enum StorageBackendMode {
     /// AWS S3 for CRUD/history + Elasticsearch for search.
     /// Requires AWS credentials and a running Elasticsearch instance.
     S3Elasticsearch,
+    /// Apache Cassandra only. Requires a running Cassandra node or cluster
+    /// with the `helios` schema already applied, and the `cassandra` feature.
+    Cassandra,
 }
 
 impl StorageBackendMode {
@@ -112,6 +115,7 @@ impl StorageBackendMode {
                 BackendKind::MongoDB
             }
             StorageBackendMode::S3 | StorageBackendMode::S3Elasticsearch => BackendKind::S3,
+            StorageBackendMode::Cassandra => BackendKind::Cassandra,
         }
     }
 }
@@ -129,6 +133,7 @@ impl fmt::Display for StorageBackendMode {
             StorageBackendMode::MongoDBElasticsearch => write!(f, "mongodb-elasticsearch"),
             StorageBackendMode::S3 => write!(f, "s3"),
             StorageBackendMode::S3Elasticsearch => write!(f, "s3-elasticsearch"),
+            StorageBackendMode::Cassandra => write!(f, "cassandra"),
         }
     }
 }
@@ -150,8 +155,9 @@ impl FromStr for StorageBackendMode {
             }
             "s3" | "objectstore" => Ok(StorageBackendMode::S3),
             "s3-elasticsearch" | "s3-es" => Ok(StorageBackendMode::S3Elasticsearch),
+            "cassandra" => Ok(StorageBackendMode::Cassandra),
             _ => Err(format!(
-                "Invalid storage backend '{}'. Valid values: sqlite, sqlite-elasticsearch, postgres, postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, s3-elasticsearch",
+                "Invalid storage backend '{}'. Valid values: sqlite, sqlite-elasticsearch, postgres, postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, s3-elasticsearch, cassandra",
                 s
             )),
         }
@@ -1338,7 +1344,8 @@ pub struct ServerConfig {
     pub everything_max_unpaged: usize,
 
     /// Storage backend mode: sqlite (default), sqlite-elasticsearch, postgres,
-    /// postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, or s3-elasticsearch.
+    /// postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, s3-elasticsearch,
+    /// or cassandra.
     #[arg(long, env = "HFS_STORAGE_BACKEND", default_value = "sqlite")]
     pub storage_backend: String,
 
@@ -2911,7 +2918,21 @@ mod tests {
             "S3-ES".parse::<StorageBackendMode>().unwrap(),
             StorageBackendMode::S3Elasticsearch
         );
+        assert_eq!(
+            "cassandra".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::Cassandra
+        );
+        assert_eq!(
+            "CASSANDRA".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::Cassandra
+        );
         assert!("invalid".parse::<StorageBackendMode>().is_err());
+        assert!(
+            "invalid"
+                .parse::<StorageBackendMode>()
+                .unwrap_err()
+                .contains("cassandra")
+        );
     }
 
     #[test]
@@ -2936,6 +2957,7 @@ mod tests {
             StorageBackendMode::S3Elasticsearch.to_string(),
             "s3-elasticsearch"
         );
+        assert_eq!(StorageBackendMode::Cassandra.to_string(), "cassandra");
     }
 
     #[test]
@@ -2971,6 +2993,10 @@ mod tests {
         assert_eq!(
             StorageBackendMode::S3Elasticsearch.primary_backend_kind(),
             BackendKind::S3
+        );
+        assert_eq!(
+            StorageBackendMode::Cassandra.primary_backend_kind(),
+            BackendKind::Cassandra
         );
     }
 
@@ -3987,6 +4013,7 @@ mod tests {
             ),
             (StorageBackendMode::S3, "s3"),
             (StorageBackendMode::S3Elasticsearch, "s3-elasticsearch"),
+            (StorageBackendMode::Cassandra, "cassandra"),
         ] {
             assert_eq!(variant.to_string(), expected);
             assert_eq!(expected.parse::<StorageBackendMode>().unwrap(), variant);

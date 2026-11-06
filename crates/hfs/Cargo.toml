@@ -42,6 +42,7 @@ xml = ["helios-rest/xml"]
 sqlite = ["helios-rest/sqlite"]
 postgres = ["helios-rest/postgres"]
 mongodb = ["helios-rest/mongodb"]
+cassandra = ["helios-rest/cassandra"]
 elasticsearch = ["helios-rest/elasticsearch"]
 s3 = ["helios-rest/s3"]
 

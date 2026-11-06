@@ -118,6 +118,9 @@ To list what is owed: `SELECT * FROM secondary_sync_failures ORDER BY last_faile
 | PostgreSQL plus Elasticsearch | `postgres-elasticsearch` or `pg-es` |
 | S3 | `s3` |
 | S3 plus Elasticsearch | `s3-elasticsearch` or `s3-es` |
+| Cassandra (in development: create and read) | `cassandra` |
+
+Cassandra requires `--features cassandra` and a node with `docs/Cassandra/schema/keyspace-single-node.cql` and `schema.cql` already applied (the server only checks that the ten tables exist). `HFS_AUDIT_BACKEND=database` is refused at startup on Cassandra, which stores no AuditEvents.
 
 S3 requires `--features s3`:
 

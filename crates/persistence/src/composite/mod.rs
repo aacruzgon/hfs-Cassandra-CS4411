@@ -17,10 +17,12 @@
 //! | Terminology expansion | Terminology Service | Dedicated code hierarchies |
 //! | Bulk analytics | S3 + Parquet | Cost-effective columnar storage |
 //!
-//! Note that [`BackendKind`](crate::core::BackendKind) also names `Cassandra`
-//! and `Neo4j`, and the builder accepts them, but no backend is implemented for
-//! either — see [`backends`](crate::backends). A graph role configured with
-//! `BackendKind::Neo4j` cannot be instantiated at runtime.
+//! Note that [`BackendKind`](crate::core::BackendKind) also names `Neo4j`, and
+//! the builder accepts it, but no backend is implemented for it — see
+//! [`backends`](crate::backends). A graph role configured with
+//! `BackendKind::Neo4j` cannot be instantiated at runtime. `Cassandra` is
+//! implemented as a standalone primary only; no composite configuration in
+//! the server pairs it with a secondary yet.
 //!
 //! # Design Principles
 //!

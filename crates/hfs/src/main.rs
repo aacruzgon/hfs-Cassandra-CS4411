@@ -14,9 +14,11 @@
 //! | MongoDB + Elasticsearch | `mongodb,elasticsearch` | MongoDB for CRUD, Elasticsearch for search |
 //! | S3 | `s3` | AWS S3 object storage for CRUD, versioning, history, and bulk ops (no search) |
 //! | S3 + Elasticsearch | `s3,elasticsearch` | S3 for CRUD/history, Elasticsearch for search |
+//! | Cassandra | `cassandra` | Apache Cassandra wide-column store (in development: create and read) |
 //!
 //! Set `HFS_STORAGE_BACKEND` to `sqlite`, `sqlite-elasticsearch`, `postgres`,
-//! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
+//! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, `s3-elasticsearch`,
+//! or `cassandra`.
 
 use std::sync::Arc;
 
@@ -1028,6 +1030,13 @@ async fn create_database_audit_storage(
             create_audit_mongodb_storage(server_config, audit_config, dedicated).await
         }
         BackendKind::S3 => create_audit_s3_storage(server_config, audit_config, dedicated).await,
+        // Cassandra never stores AuditEvents (cassandra-discussion.md, "What else
+        // the server expects from a primary backend"): refuse at startup, by name.
+        BackendKind::Cassandra => anyhow::bail!(
+            "HFS_AUDIT_BACKEND=database is not supported with HFS_STORAGE_BACKEND=cassandra: \
+             the Cassandra backend does not store AuditEvents. Use HFS_AUDIT_BACKEND=file \
+             or HFS_AUDIT_BACKEND=cloudwatch instead"
+        ),
         _ => anyhow::bail!(
             "Database audit sink is unsupported for primary backend kind '{}'",
             backend_kind
@@ -1836,7 +1845,11 @@ fn mount_ui(
 #[cfg(feature = "ui")]
 fn patient_name_search_support(mode: StorageBackendMode) -> helios_ui::PatientNameSearchSupport {
     match mode {
-        StorageBackendMode::S3 => helios_ui::PatientNameSearchSupport::IdOnly,
+        // Neither standalone S3 nor standalone Cassandra searches `name`
+        // (Cassandra serves token, date and URI parameters only).
+        StorageBackendMode::S3 | StorageBackendMode::Cassandra => {
+            helios_ui::PatientNameSearchSupport::IdOnly
+        }
         StorageBackendMode::Sqlite
         | StorageBackendMode::SqliteElasticsearch
         | StorageBackendMode::Postgres
@@ -2254,6 +2267,9 @@ async fn main() -> anyhow::Result<()> {
         }
         StorageBackendMode::S3Elasticsearch => {
             start_s3_elasticsearch(config, auth_config, auth_state, audit_state).await?;
+        }
+        StorageBackendMode::Cassandra => {
+            start_cassandra(config, auth_config, auth_state, audit_state).await?;
         }
     }
 
@@ -4607,6 +4623,38 @@ async fn start_s3(
     )
 }
 
+/// Starts the server with the Apache Cassandra backend.
+///
+/// Placeholder until the backend module lands (roadmap Step 2, layer L2):
+/// the `cassandra` feature is threaded through so the mode parses and the
+/// build is exercised, but there is no backend type to construct yet.
+#[cfg(feature = "cassandra")]
+async fn start_cassandra(
+    _config: ServerConfig,
+    _auth_config: AuthConfig,
+    _auth_state: Option<Arc<AuthMiddlewareState>>,
+    _audit_state: Option<Arc<AuditMiddlewareState>>,
+) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "The cassandra backend is not implemented in this build yet \
+         (development-roadmap.md, Step 2)"
+    )
+}
+
+/// Fallback when cassandra feature is not enabled.
+#[cfg(not(feature = "cassandra"))]
+async fn start_cassandra(
+    _config: ServerConfig,
+    _auth_config: AuthConfig,
+    _auth_state: Option<Arc<AuthMiddlewareState>>,
+    _audit_state: Option<Arc<AuditMiddlewareState>>,
+) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "The cassandra backend requires the 'cassandra' feature. \
+         Build with: cargo build -p helios-hfs --features cassandra"
+    )
+}
+
 /// Starts the server with S3 + Elasticsearch composite backend.
 #[cfg(all(feature = "s3", feature = "elasticsearch"))]
 async fn start_s3_elasticsearch(
@@ -6030,6 +6078,10 @@ mod tests {
             StorageBackendMode::S3Elasticsearch.primary_backend_kind(),
             BackendKind::S3
         );
+        assert_eq!(
+            StorageBackendMode::Cassandra.primary_backend_kind(),
+            BackendKind::Cassandra
+        );
     }
 
     #[test]
@@ -6043,6 +6095,7 @@ mod tests {
             Some(StorageBackendMode::MongoDBElasticsearch),
             Some(StorageBackendMode::S3),
             Some(StorageBackendMode::S3Elasticsearch),
+            Some(StorageBackendMode::Cassandra),
             None,
         ];
 
@@ -6197,9 +6250,34 @@ mod tests {
                 StorageBackendMode::S3Elasticsearch,
                 helios_ui::PatientNameSearchSupport::Enabled,
             ),
+            (
+                StorageBackendMode::Cassandra,
+                helios_ui::PatientNameSearchSupport::IdOnly,
+            ),
         ] {
             assert_eq!(patient_name_search_support(mode), expected, "{mode:?}");
         }
+    }
+
+    /// `HFS_AUDIT_BACKEND=database` on a Cassandra primary fails at startup
+    /// with a reason that names both settings, rather than the generic
+    /// "unsupported backend kind" message.
+    #[tokio::test]
+    async fn database_audit_sink_refuses_a_cassandra_primary() {
+        let error = create_database_audit_storage(
+            &ServerConfig::default(),
+            StorageBackendMode::Cassandra,
+            &AuditConfig::default(),
+        )
+        .await
+        .err()
+        .expect("a Cassandra primary has no database audit sink");
+        let message = error.to_string();
+        assert!(
+            message.contains("HFS_AUDIT_BACKEND=database")
+                && message.contains("HFS_STORAGE_BACKEND=cassandra"),
+            "{message}"
+        );
     }
 
     #[test]

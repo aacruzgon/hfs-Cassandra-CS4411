@@ -143,8 +143,8 @@ async fn cassandra_startup_load_covers_an_unseen_tenant_without_a_refresh() {
 }
 
 #[tokio::test]
-async fn cassandra_refresh_reloads_a_tenant_seen_since_start() {
-    let node = node_or_skip!("cassandra_refresh_reloads_a_tenant_seen_since_start");
+async fn cassandra_refresh_picks_up_another_process_write() {
+    let node = node_or_skip!("cassandra_refresh_picks_up_another_process_write");
     let restarted = backend(node).await;
     let writer = backend(node).await;
     // The tenant's first request builds its registry from the shared base,
@@ -232,11 +232,14 @@ async fn cassandra_a_stored_compartment_parameter_applies_after_a_restart() {
     assert!(member(&writer, "focus-b"), "the writer applies it at once");
     assert!(!member(&writer, "subject-a"));
 
+    // This tenant's load only, which the startup load runs for every listed
+    // tenant (see the test above), so other workers' tenants on a shared node
+    // cannot change the result.
     let restarted = backend(node).await;
     restarted
-        .load_all_stored_search_parameters()
+        .load_stored_search_parameters(tenant.tenant_id().as_str())
         .await
-        .expect("startup load");
+        .expect("load");
     assert!(
         member(&restarted, "focus-b"),
         "after a restart, the tenant's first use sees the stored parameter"

@@ -61,8 +61,8 @@ type StoredByTenant = Arc<RwLock<HashMap<String, Vec<StoredDefinition>>>>;
 /// What [`CassandraBackend::load_all_stored_search_parameters`] loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredSearchParameterReload {
-    /// Tenants reloaded: those with a stored SearchParameter, plus those this
-    /// process already knew.
+    /// Tenants reloaded: those with a stored SearchParameter, plus those
+    /// whose overlay held a definition.
     pub tenants: usize,
     /// Stored, `active`, non-spec definitions the overlay now holds across
     /// them.
@@ -86,11 +86,6 @@ pub struct CassandraBackend {
     pub(super) registries: Arc<TenantSearchRegistries>,
     /// The overlay the registry loader reads.
     stored_by_tenant: StoredByTenant,
-    /// Every tenant this process has built a registry for, loaded the overlay
-    /// of, or stored a SearchParameter in. A reload covers them as well as
-    /// the tenants the scan lists, so a tenant whose SearchParameters are all
-    /// gone has its overlay cleared.
-    known_tenants: Arc<RwLock<BTreeSet<String>>>,
     /// Counts the SearchParameters this process has noted in the overlay
     /// ([`StoredDefinition::noted_at`]).
     note_seq: AtomicU64,
@@ -156,13 +151,8 @@ impl CassandraBackend {
 
         let stored_by_tenant: StoredByTenant = Arc::new(RwLock::new(HashMap::new()));
         let loader_cache = stored_by_tenant.clone();
-        let known_tenants: Arc<RwLock<BTreeSet<String>>> = Arc::default();
-        let loader_known = known_tenants.clone();
         let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
             move |tenant_id: &str| {
-                if !loader_known.read().contains(tenant_id) {
-                    loader_known.write().insert(tenant_id.to_string());
-                }
                 Some(
                     loader_cache
                         .read()
@@ -187,7 +177,6 @@ impl CassandraBackend {
             session: Arc::new(session),
             registries,
             stored_by_tenant,
-            known_tenants,
             note_seq: AtomicU64::new(0),
         })
     }
@@ -234,7 +223,8 @@ impl CassandraBackend {
     }
 
     /// Reloads the overlay of every tenant that has stored a SearchParameter,
-    /// and of every tenant this process knows, with
+    /// and of every tenant whose overlay holds a definition (so one whose
+    /// SearchParameters are all gone is cleared), with
     /// [`Self::load_stored_search_parameters`]. The server runs it before it
     /// serves and on every TTL refresh, so a tenant's stored SearchParameters
     /// are in its registry from its first request after a restart, whatever
@@ -244,6 +234,8 @@ impl CassandraBackend {
     /// the tenants come from [`Self::stored_search_parameter_tenants`], a
     /// paged scan of `resources_by_type`'s partition keys.
     ///
+    /// Then it drops every cached per-tenant registry.
+    ///
     /// # Errors
     ///
     /// The first failed scan or reload. The tenants already reloaded keep
@@ -252,11 +244,16 @@ impl CassandraBackend {
         &self,
     ) -> StorageResult<StoredSearchParameterReload> {
         let mut tenants = self.stored_search_parameter_tenants().await?;
-        tenants.extend(self.known_tenants.read().iter().cloned());
+        tenants.extend(self.stored_by_tenant.read().keys().cloned());
         let mut definitions = 0;
         for tenant_id in &tenants {
             definitions += self.load_stored_search_parameters(tenant_id).await?;
         }
+        // Every cached registry is rebuilt from the new overlay on its next
+        // use, also a tenant's that has no stored definitions, and one cached
+        // from an older overlay while this ran (`TenantSearchRegistries::
+        // for_tenant` builds outside its lock).
+        self.registries.invalidate_all();
         Ok(StoredSearchParameterReload {
             tenants: tenants.len(),
             definitions,
@@ -313,9 +310,14 @@ impl CassandraBackend {
     /// **A concurrent create is kept.** A SearchParameter this process stores
     /// while the reload runs is noted after the reload took `since`, so the
     /// replacement keeps it, and it wins over the reloaded copy of its `url`.
-    /// One noted before `since` had committed its `resources_by_type` row
-    /// first (`create` notes it after the row), so the id scan, sent after
-    /// `since`, lists it.
+    /// One noted before `since` was noted after `create` wrote its
+    /// `resources_by_type` row, so the id scan, sent after `since`, lists it.
+    ///
+    /// **Except when that row was not written.** `create` also notes a
+    /// SearchParameter whose index row failed (it only warns, and the intent
+    /// row is left for the sweeper) or was skipped because a later version
+    /// exists. The scan cannot list it, so a reload drops it from the overlay
+    /// until the sweeper (Step 5) writes the row.
     ///
     /// # Errors
     ///
@@ -325,7 +327,6 @@ impl CassandraBackend {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
         use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
-        self.known_tenants.write().insert(tenant_id.to_string());
         let since = self.note_seq.load(Ordering::SeqCst);
         let rows = self
             .session
@@ -441,7 +442,6 @@ impl CassandraBackend {
             return;
         }
         definition.source = SearchParameterSource::Stored;
-        self.known_tenants.write().insert(tenant_id.to_string());
         {
             let mut stored = self.stored_by_tenant.write();
             let noted_at = self.note_seq.fetch_add(1, Ordering::SeqCst) + 1;

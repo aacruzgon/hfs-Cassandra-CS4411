@@ -1,0 +1,100 @@
+# ADR-aacruzgon-0046: More CI reports: latency, dependency freshness, advisories, sizes and step timings
+
+- **Date:** 2026-11-06
+- **Status:** accepted (written after Alan approved the other Step 2 records; he approved it on 2026-11-06)
+- **Context:**
+    - PR #46 adds a CI report mechanism, `.github/scripts/ci-report.py`, and its own first reports: boot and seed, build time and memory, tests and skips, readiness recovery, and node statistics (ADR-aacruzgon-0045).
+        - **How it works:** a section in the run's summary page, plus a JSON document in the job's report directory. The directory is uploaded as `ci-report-<job>`.
+        - **The rule:** reports never fail a job for a figure.
+    - Alan asked for every CI report that can be built so far, to measure the project properly. Two more figures matter now:
+        - **How fast the backend's two real operations are**, `create` and `read` (and `count`), roadmap Step 2.
+        - **How far behind the dependencies are.** Step 2 worked around a `cdrs-tokio` 8.1.9 bug that 9.1.0 and 10.0.0 had already fixed (ADR-aacruzgon-0044). Alan's rule since then is to check newer releases before working around a dependency.
+    - The persistent target directories are bounded by a reset step (ADR-sam-michaels-0002, ADR-aacruzgon-0023).
+        - **The gap:** that step only prints whether it reset, so a cold build is invisible unless someone reads the log.
+        - **Why it matters:** the light runner's 9 GiB service cap makes cold builds the risky ones.
+    - **Upstream's advisory job is disabled here:** `.github/disabled-workflows/ci.yml`, "Security Audit". `audit.toml`'s `ignore` list is not read by cargo-audit from the repository root; cargo-audit 0.22.2 reads `.cargo/audit.toml`, and `cargo audit --json` shows `settings.ignore: []`.
+    - **Constraints:**
+        - five required checks, whose job names stay unchanged;
+        - no `paths:` filter (`CLAUDE.md`, ADR-aacruzgon-0019, 0021);
+        - the fork guard (ADR-aacruzgon-0018);
+        - SHA-pinned actions (ADR-aacruzgon-0022);
+        - the Cassandra job stays light and its readiness test stays last (ADR-aacruzgon-0042).
+- **Decision:** add five reports on ADR-aacruzgon-0045's mechanism, each written with `ci-report.py add`. All are report only.
+    - **Per-operation latency.** It runs in the required Cassandra job, after the boot-time report and before the node statistics and the readiness test.
+        - **Two tests,** gated by one variable, `HFS_TEST_LATENCY_REPORT`, which names an output directory:
+            - in `cassandra_tests`: 200 `create`s, 200 `read`s of those ids and 20 `count`s through `CassandraBackend`;
+            - in `cassandra_milestone_a`: 50 `POST /Patient` + `GET` round trips through the real `hfs` binary.
+        - **Method:** each test runs on a fresh tenant, one operation at a time, after unmeasured warm-up operations, and reports p50, p95, p99 and max (nearest rank) with the sample size.
+        - **Labelling:** marked "single node, debug build, not the Step 8 benchmark".
+        - **Failure:** a failed operation fails the step, because the measurement is then broken; no figure fails it.
+        - **No threshold:** a trend has no stated limit, so the report warns about nothing.
+        - **Cost:** about 12 s locally (5.1 s for the backend test, 6.6 s for the REST test with its boot); 2 s in CI, on either runner.
+    - **Dependency freshness.** It runs in the fmt job, the cheapest job, which builds nothing.
+        - **Which crates:**
+            - `helios-hfs`'s registry dependencies;
+            - what `helios-persistence`'s `cassandra` feature enables;
+            - `cdrs-tokio`, `cassandra-protocol`, `tokio`, `uuid` and `testcontainers` always.
+        - **What it compares:** each crate's version from `cargo metadata --locked --all-features`, against `crates.io/api/v1/crates/<name>`.
+        - **Etiquette** (https://crates.io/data-access): one request a second, and a User-Agent naming the client and the repository.
+        - **What it reports:** both release dates, and whether the gap is within the semver range (`cargo update` reaches it) or major, by Cargo's caret rule (0.y minor bumps are major).
+        - **Warning:** one annotation listing every crate a major version behind, and a second one if a locked version was yanked.
+        - **Cost:** about 20 s, mostly the rate limit.
+    - **RustSec advisories.** It runs in the fmt job.
+        - **The tool:** cargo-audit 0.22.2, the newest release, downloaded once per runner into its tool cache and checked against the release asset's SHA-256, instead of `cargo install` (minutes of compiling).
+        - **What it reports:** every advisory, each marked with who acknowledged it.
+            - `audit.toml` acknowledges warning-class advisories.
+            - Upstream's CI acknowledges vulnerabilities: its now-disabled Security Audit job passes them to `cargo audit --ignore` (`.github/disabled-workflows/ci.yml`). `audit.toml`'s own comment points there, by the file's old path, `.github/workflows/ci.yml`.
+            - The third mark is "no one".
+        - **Warning:** one annotation listing every vulnerability no one has acknowledged, so the warning means a new advisory.
+        - **Cost:** about 2 s, plus the advisory-database fetch.
+    - **Artifact and cache size.** It runs in every job with a persistent target directory: both clippy jobs, the Cassandra job and the R4B check.
+        - **The reset step** keeps its condition, now from a single `du` in bytes, and records four things in `GITHUB_ENV`: the size before, whether it reset, why (no stamp, a changed stamp, or over the cap), and the cap (`TARGET_DIR_BEFORE_BYTES`, `TARGET_DIR_RESET`, `TARGET_DIR_RESET_REASON`, `TARGET_DIR_CAP_GB`).
+        - **A last step** reports the size after, and the job's growth (from zero after a reset), and warns if the directory ends the job over its cap, since the next run will then build cold.
+        - **In the Cassandra job,** it also lists the size of every binary the build made. It finds them by re-running the build's two `cargo test --no-run` commands with `--message-format=json`, a no-op on a built tree, and only when the build succeeded.
+    - **Where CI time goes.** Every job's last report, `if: always()`, reads the job's own step timings from the Actions API with the job's token. The API closes a step late, so a step before the report that has started but isn't closed is timed to the moment of reading and shown as an upper bound. Waiting for the API would add tens of seconds to every job.
+        - **Permission:** both workflows gain `actions: read`, which is read-only like `contents: read`. The fork guard and `persist-credentials: false` are unchanged, and the token reaches only that one step's environment.
+        - **The R4B check and the fmt job** gain the upload step, as `ci-report-r4b-check` and `ci-report-fmt`.
+    - **Failure policy for the report steps:** every one except the latency step is `continue-on-error: true`, so a crates.io, GitHub or advisory-database outage cannot fail a required check.
+- **Alternatives considered:**
+    - **Latency in a separate, non-required job:** lost. It would need its own node (about 60 s to boot) and its own build, while the Cassandra job already has both. Inside the job, it costs about 2 s (12 s locally).
+    - **Latency over hundreds of thousands of operations, or in a release build:** lost. That is the Step 8 benchmark, which needs its own harness, method and hardware notes (roadmap Step 8). A smoke trend on the binaries already built is what this step can measure without a new compile.
+    - **`cargo outdated` for freshness:** lost.
+        - It is not installed on the runners and would be built from source.
+        - It reports every transitive crate, not the chosen direct ones.
+        - It gives no release dates.
+    - **The crates.io sparse index instead of the API:** lost. It has no release dates, and the API is within its rate limit for about 20 crates.
+    - **`cargo install cargo-audit` on each runner:** lost. It takes minutes of compiling in a 10-minute job, and its version floats unless pinned. The pinned binary and its checksum are reproducible.
+    - **Warn on every vulnerability `audit.toml` does not name:** lost. All seven are already accepted upstream, so the warning would fire on every run and teach readers to ignore it (the audit subagent's finding).
+    - **Gate on advisories, as upstream's disabled job did:** lost. Reports never fail a job for a figure (ADR-aacruzgon-0045), and seven current vulnerabilities in transitive dependencies would block every pull request.
+    - **Point cargo-audit at `audit.toml`** (move it to `.cargo/audit.toml`, or pass `--ignore`): not done here. Moving it is a separate decision, because the file is upstream's. Marking the acknowledged ids in the report keeps them visible either way.
+    - **`gh api` for the step timings:** lost. Python's standard library needs no `gh` on the runner. `python3` is there for `cqlsh` (ADR-sam-michaels-0003).
+    - **Read the binaries' paths from the build step's own output:** lost. That step is wrapped by `ci-report.py build`, and changing its output format there would change its log. The no-op rerun costs about a second.
+- **Consequences:**
+    - **Every run now writes these reports:**
+        - the dependency-freshness and RustSec reports in the fmt job;
+        - the two latency reports in the Cassandra job;
+        - a step-timings report in every job, and the target-directory report in every job that has one.
+    - **One warning appears on every run until someone acts on it:** four dependencies a major version behind (`parking_lot`, `reqwest`, `sqlparser`, `testcontainers`).
+    - **The seven current vulnerabilities do not warn.** They are in `crypto-bigint`, `quick-xml` and `rkyv`, and all are on upstream's `--ignore` list. The report lists them all the same.
+    - **Upstream's acceptance is inherited.** Treating upstream's `--ignore` list as acknowledged means this fork inherits upstream's acceptance of those seven vulnerabilities. The report still lists each one, with its patched versions. To revoke one, remove it from that list; to fix one, upgrade the crate that pulls it in.
+    - **An unsound advisory:** the audit also lists `tokio` 1.52.1 under RUSTSEC-2026-0386 (patched in 1.53.3 or later), which the freshness report shows as "compatible: `cargo update` reaches it".
+    - **Time added to the required Cassandra job: about 3 s,** measured from the API's step times in runs 42258376856 (on `7cb2f96b8`, now `8cd30da94`) and 42263823196: latency 2 s, sizes 0 s, timings 1 s. **The fmt job gains about 21 s,** almost all of it the crates.io rate limit.
+    - **Later work:** the Step 8 benchmarks add their own sections with `ci-report.py add`. The latency report's figures are the debug-build baseline they can be compared against.
+- **AI involvement:**
+    - **Tool and model:** Claude Code (Opus 5.5), worker `s2-contract` under the Step 2 orchestrator.
+    - **What the AI proposed:**
+        - the five reports, and where each runs;
+        - the crate selection;
+        - the pinned cargo-audit binary;
+        - one annotation per report rather than one per crate;
+        - and the reset step's recording of its decision.
+    - **What Alan changed:** Alan asked for every CI report that can be built so far ("I want to build as many reports as possible during CI in everything that we can so we can measure things properly"; "if there are any other CI reports that can be built so far, let's send them to be built and add them to ADR"). That request is why PR #47 exists. The report-only rule and the dependency-upgrade rule are his. This entry was written after his approval of the other Step 2 records; he approved it later on 2026-11-06.
+    - **Verified:**
+        - **Latency tests:** both ran against the shared node (`HFS_TEST_CASSANDRA_URL=127.0.0.1:59042`). The backend test took 5.1 s in all (create p50 21.7 ms, read 3.0 ms, count 4.4 ms); the REST test took 6.6 s with its boot (POST p50 25.7 ms, GET 4.9 ms).
+        - **The four scripts:** each ran locally and was fed through `ci-report.py add`.
+        - **The step-timings script:** checked against run 42190397880.
+        - **The cargo-audit asset's SHA-256:** checked against a download and GitHub's asset digest.
+        - **Workflows:** actionlint 1.7.12 with shellcheck finds nothing new in either; the four `runner.workspace` findings are pre-existing.
+        - **Local builds:** the R4B check passed. Scoped clippy (`--no-deps`, with CI's `-A` list) found zero hits in the changed files.
+        - **CI:** runs 42263823196 (fmt, both clippy jobs, Cassandra) and 42263819461 (R4B) passed on `7c80154c9` (before the restack; now `0733f6e55`), with every report in its artifact and the summary page.
+- **Links:** PR #47 (branch `cassandra/step2-ci-reports`); roadmap Step 2 (items 2.6, 2.7) and Step 8; ADR-aacruzgon-0018, 0019, 0021, 0022, 0023, 0042, 0044, 0045; ADR-sam-michaels-0002, 0003; https://crates.io/data-access; https://docs.github.com/en/rest/actions/workflow-jobs.

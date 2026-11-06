@@ -73,3 +73,23 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0026](2026-11-05/0026-schema-audit-fixes.md) | 2026-11-05 | Schema audit fixes: compartment and FHIR-version residuals, a 2 KiB limit on indexed values, `write_id` on version rows, and intersected `_id` parameters | accepted |
 | [0027](2026-11-05/0027-step-1-open-items-decided.md) | 2026-11-05 | The open items are decided: `count`, date-only paging, stored index keys, the cap, the unread rows, `_sort`, the rejections, the sweeper and the schema's setup | accepted |
 | [0028](2026-11-06/0028-schema-sign-off.md) | 2026-11-06 | Sign-off on `schema.cql` as merged at `67f9e0532` | accepted |
+| [0029](2026-11-06/0029-cassandra-test-node.md) | 2026-11-06 | How the Cassandra test node is reached, started and shared | accepted |
+| [0030](2026-11-06/0030-ci-cassandra-tests.md) | 2026-11-06 | The Cassandra job builds its tests before starting the node, and stays on the light runners | accepted |
+| [0031](2026-11-06/0031-cassandra-config-names.md) | 2026-11-06 | `HFS_CASSANDRA_*` configuration names and defaults | accepted |
+| [0032](2026-11-06/0032-cassandra-driver-settings.md) | 2026-11-06 | `cdrs-tokio` session settings: protocol v5, local-DC routing, no driver re-send of a CAS, and a client deadline | accepted |
+| [0033](2026-11-06/0033-create-writes-resources-by-type.md) | 2026-11-06 | Step 2's `create` writes the `resources_by_type` row, and `count` is real at Milestone A | accepted |
+| [0034](2026-11-06/0034-create-details.md) | 2026-11-06 | The choices inside Step 2's `create`: post-CAS retries, every attempt's `write_id`, id and code checks | accepted |
+| [0035](2026-11-06/0035-write-timeout-simple.md) | 2026-11-06 | A CAS `WriteTimeout` with `write_type = SIMPLE` is confirmed by the serial read, not taken as applied | accepted |
+| [0036](2026-11-06/0036-capability-instance-tests-skip.md) | 2026-11-06 | The capability contract's Cassandra instance tests skip without `HFS_TEST_CASSANDRA_URL` instead of starting the fallback container | accepted |
+| [0037](2026-11-06/0037-declare-capabilities-as-they-land.md) | 2026-11-06 | Declare each Cassandra capability when its step lands, not at Step 2 | accepted |
+| [0038](2026-11-06/0038-testable-reset-rotates-tenant.md) | 2026-11-06 | The Cassandra `TestableBackend` resets by rotating to fresh tenants | accepted |
+| [0039](2026-11-06/0039-compile-shared-harness.md) | 2026-11-06 | `cassandra_tests` compiles the shared test harness as upstream wrote it, with one fix to `fixtures.rs` | accepted |
+| [0040](2026-11-06/0040-cassandra-server-wiring.md) | 2026-11-06 | How the server selects and starts the Cassandra backend | accepted |
+| [0041](2026-11-06/0041-stored-search-parameters-reload.md) | 2026-11-06 | Cassandra reloads every tenant's stored SearchParameters before it serves, listing the tenants from `resources_by_type`, and startup fails if the load fails | accepted |
+| [0042](2026-11-06/0042-milestone-a-in-ci.md) | 2026-11-06 | Milestone A runs in the required Cassandra job, which stays on the light runners, and stops that job's own node | accepted |
+| [0043](2026-11-06/0043-seeder-boot-time.md) | 2026-11-06 | The startup budget is 10 s of seeding per fresh tenant on the single node (provisional), and the conformance seed keeps the default `create_many` | accepted |
+| [0044](2026-11-06/0044-upgrade-cdrs-tokio.md) | 2026-11-06 | Upgrade `cdrs-tokio` to 10.0.0, and drop the workarounds it makes unnecessary | accepted |
+| [0045](2026-11-06/0045-ci-reports-and-boot-time.md) | 2026-11-06 | CI reports measured figures on every run, starting with the boot time; they never fail a job | accepted |
+| [0046](2026-11-06/0046-more-ci-reports.md) | 2026-11-06 | More CI reports: latency, dependency freshness, advisories, sizes and step timings | accepted |
+| [0047](2026-11-06/0047-coverage-report-in-ci.md) | 2026-11-06 | A Cassandra coverage report in CI, in its own workflow, not required and with no threshold | accepted |
+| [0048](2026-11-06/0048-more-ci-reports-node-and-build.md) | 2026-11-06 | More CI reports: the R4B build, cargo timings, the node's start, its JVM and container, hfs's memory, and the stored-SearchParameter load | accepted |

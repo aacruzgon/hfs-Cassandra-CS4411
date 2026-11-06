@@ -1,0 +1,31 @@
+# ADR-aacruzgon-0036: The capability contract's Cassandra instance tests skip without `HFS_TEST_CASSANDRA_URL` instead of starting the fallback container
+
+- **Date:** 2026-11-06
+- **Status:** accepted
+- **Context:**
+    - ADR-aacruzgon-0020 rule 1: a Cassandra test connects to the node `HFS_TEST_CASSANDRA_URL` names (`host:port`, ADR-aacruzgon-0029) and, when the variable is unset, starts a fallback container.
+    - `crates/persistence/tests/backend_capability_contract.rs` says in its module docs that "Nothing here needs a database, Docker ... or the network". Its assertions run on a constructor-free `declared_capabilities()`. SQLite, MongoDB and Elasticsearch also have an instance test (`*_instance_supports_matches_capabilities`); Postgres has none, because `PostgresBackend::new` connects eagerly.
+    - `CassandraBackend::connect` connects eagerly too, so a Cassandra instance test needs a node. The instance test is the only check that `supports_conditional`, which the CapabilityStatement and REST's 501 read, agrees with `supports()`.
+    - Roadmap Step 2, item 2.4 adds the Cassandra module to this file. The same item says to "remove or fix" the stale Cassandra row in `tests/common/capabilities.rs`. That row was fixed to match the design's scope: the seven declared capabilities and `ReverseChaining` are `Planned`, and every other variant is `NotPlanned`. The fix is routine test upkeep and needs no entry.
+- **Decision:**
+    - The Cassandra module has two instance tests, `cassandra_instance_supports_matches_capabilities` and `cassandra_instance_supports_conditional_matches_its_declaration`. They connect to the node `HFS_TEST_CASSANDRA_URL` names, as rule 1 says.
+    - **When the variable is unset, they start no container:** they print `skipping: HFS_TEST_CASSANDRA_URL is not set` and pass. This departs from rule 1's fallback. The file's module docs name it as the one opt-in exception to "nothing here needs a database".
+    - The tests write nothing, so rule 2 (each test writes under its own tenant) holds. The golden-list tests stay constructor-free and always run.
+- **Alternatives considered:**
+    - **Start the fallback container when `HFS_TEST_CASSANDRA_URL` is unset, as ADR-aacruzgon-0020 rule 1 says:** lost. The contract file promises "Nothing here needs a database" (its module docs), and a local run of it should not boot a JVM.
+    - **No Cassandra instance test, as for Postgres:** lost. Postgres has none only because its constructor connects. The Cassandra test can use the node `HFS_TEST_CASSANDRA_URL` names, and it is the only check of `supports_conditional` (which REST reads) against `supports()`.
+- **Consequences:**
+    - The instance tests run only where `HFS_TEST_CASSANDRA_URL` is set. CI's `Cassandra schema (single node)` job sets it and runs them against its own node: since PR #41 (commit `6db0ae52e`), that job runs `--test cassandra_tests --test backend_capability_contract` (`.github/workflows/fmt-clippy-cassandra.yml:332-336` at PR #41's head, `:578-585` at PR #49's). From PR #48 the coverage workflow also sets the variable and runs the contract test (`.github/workflows/cassandra-coverage.yml:180-187`, ADR-aacruzgon-0047).
+    - A local run without the variable, or with it set but empty, skips them; only the printed line shows it. To run them, set `HFS_TEST_CASSANDRA_URL` to the shared node. From PR #46 on, the CI test report flags any test that prints a skip line (ADR-aacruzgon-0045).
+- **AI involvement:**
+    - **Tool and model:** Claude Code (Opus 5.5), worker `s2-contract` under the Step 2 orchestrator.
+    - **What the AI proposed:** the instance tests and their skip. An earlier version of this entry also proposed a second decision: fix the `capabilities.rs` row rather than delete it.
+    - **What Alan changed:** Alan reviewed every Step 2 decision record on 2026-11-06, before it was committed. From his own review he found that several alternatives were stale, because `cdrs-tokio` 9.1.0 and 10.0.0 (released 2026-11-04) had already fixed driver behaviour the records relied on. He found that some alternatives were not real options or did not make sense: strawmen, restatements of the decision, and the workers' own debugging steps listed as alternatives. And he found that some records cited sources outside the repository. He had a review agent re-audit every alternative against the code, the design documents and `cdrs-tokio` 10.0.0, accepted its recommendations, and had each record rewritten from them. For this entry:
+        - **The review's counts:** of four alternatives, it kept three and rewrote one. The rewritten one, "No Cassandra instance test", had cited a source outside the repository. The review also added the missing alternative, "Start the fallback container".
+        - **Alan's decision:** fixing the `capabilities.rs` row is routine, so the entry covers only the deviation from ADR-aacruzgon-0020 rule 1, and it was retitled to say so.
+        - **What moved:** the row fix went to Context. Its three alternatives (delete the file, delete only the row, mark the seven `Implemented`) left the entry.
+        - **Stale Consequences corrected:** CI now runs the instance tests, and from PR #42 `cassandra_tests` compiles `capabilities.rs` (ADR-aacruzgon-0039).
+    - **Verified:**
+        - **Local runs:** the contract test passed in the default build and in a `--no-default-features --features cassandra,R4` build. With `HFS_TEST_CASSANDRA_URL=127.0.0.1:59042` set, the instance tests ran; without it, they printed "skipping".
+        - **CI:** in run 42190397880 (on the branch's pre-restack head `1b907ecad`), the `Cassandra schema (single node)` job ran the contract test: 10 passed, with no "skipping" line.
+- **Links:** PR #41 (branch `cassandra/step2-capability-contract`); roadmap Step 2, item 2.4; design "Structs and enums" (`docs/Cassandra/cassandra-discussion.md:135`); ADR-aacruzgon-0020, 0029, 0037, 0039, 0045; `crates/persistence/tests/backend_capability_contract.rs`.

@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 use super::config::CassandraConfig;
 use super::errors::{BACKEND_NAME, map_driver_error};
 use super::schema;
-use super::session::{CassandraSession, StatementKind};
+use super::session::{CassandraSession, DriverError, StatementKind};
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::search::{
@@ -89,7 +89,10 @@ impl CassandraBackend {
 
         let session = CassandraSession::connect(&config)
             .await
-            .map_err(|error| StorageError::Backend(map_driver_error(&error, "connect")))?;
+            .map_err(|error| StorageError::Backend(connect_error(&error, &config)))?;
+        verify_local_dc(&session, &config.local_dc)
+            .await
+            .map_err(StorageError::Backend)?;
 
         let stored_by_tenant: StoredByTenant = Arc::new(RwLock::new(HashMap::new()));
         let loader_cache = stored_by_tenant.clone();
@@ -159,17 +162,21 @@ impl CassandraBackend {
     ///
     /// Step 2 has no way to list a tenant's stored SearchParameters yet: that
     /// needs the `resources_by_type` rows Step 5 writes. Until then the
-    /// overlay holds only what [`note_stored_search_parameter`] puts there,
-    /// and this keeps it.
-    ///
-    /// [`note_stored_search_parameter`]: Self::note_stored_search_parameter
+    /// overlay holds only the SearchParameters this process has stored itself,
+    /// and this keeps them.
     pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
         self.registries.invalidate_all();
         Ok(self.stored_by_tenant.read().values().map(Vec::len).sum())
     }
 
     /// Records a SearchParameter `tenant_id` just stored in the overlay, if it
-    /// is `active`, and drops that tenant's cached registry.
+    /// can change that tenant's registry, and only then drops the tenant's
+    /// cached registry.
+    ///
+    /// `create_affects_overlay` skips anything that is not `active` and
+    /// anything whose `url` the shared base already holds, so seeding the spec
+    /// SearchParameters (R6 ships them `active`) does not rebuild the registry
+    /// once per resource (#667).
     #[allow(dead_code)] // Called by the write path from Step 2's create on.
     pub(super) fn note_stored_search_parameter(
         &self,
@@ -178,6 +185,9 @@ impl CassandraBackend {
     ) {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
+        if !self.registries.create_affects_overlay(resource) {
+            return;
+        }
         let loader = SearchParameterLoader::new(self.config.fhir_version);
         let Ok(mut definition) = loader.parse_resource(resource) else {
             return;
@@ -226,6 +236,87 @@ impl CassandraBackend {
                 message: schema::missing_tables_message(&self.config.keyspace, &missing),
             })
         }
+    }
+}
+
+/// The error for a session that could not be opened.
+///
+/// The driver sends `USE "<keyspace>"` on every new connection, and a keyspace
+/// that does not exist makes it keep retrying until the connect deadline
+/// (checked against the shared 5.0.9 node, 2026-11-06), so a deadline here is
+/// a startup failure, not a statement timeout, and the keyspace is one of
+/// its two likely causes.
+fn connect_error(error: &DriverError, config: &CassandraConfig) -> BackendError {
+    match error {
+        DriverError::Deadline { after, .. } => {
+            tracing::warn!(
+                contact_points = ?config.contact_points,
+                keyspace = %config.keyspace,
+                "Cassandra session not open after {} ms",
+                after.as_millis()
+            );
+            BackendError::ConnectionFailed {
+                backend_name: BACKEND_NAME.to_string(),
+                message: format!(
+                    "no Cassandra session within {} ms: no contact point answered, or keyspace \
+                     '{}' does not exist (apply docs/Cassandra/schema/keyspace-single-node.cql)",
+                    after.as_millis(),
+                    config.keyspace
+                ),
+            }
+        }
+        other => map_driver_error(other, "connect"),
+    }
+}
+
+/// Fails unless some node of the cluster is in `local_dc`.
+///
+/// Every node outside `local_dc` is ignored (`session.rs`, `LocalDcOnly`), so
+/// a misspelt `HFS_CASSANDRA_LOCAL_DC` would otherwise surface later as "no
+/// Cassandra node could be reached" from every request. `system.local` and
+/// `system.peers_v2` are node-local tables, so this reads what the
+/// coordinator knows of the whole cluster.
+async fn verify_local_dc(session: &CassandraSession, local_dc: &str) -> Result<(), BackendError> {
+    let mut datacenters = std::collections::BTreeSet::new();
+    for cql in [
+        "SELECT data_center FROM system.local",
+        "SELECT data_center FROM system.peers_v2",
+    ] {
+        let rows = match session.rows(cql, Vec::new(), StatementKind::Read).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                let mapped = map_driver_error(&error, "local data centre check");
+                return Err(match mapped {
+                    BackendError::ConnectionFailed { backend_name, .. } => {
+                        BackendError::ConnectionFailed {
+                            backend_name,
+                            message: format!(
+                                "no Cassandra node in data centre '{local_dc}' could be reached; \
+                                 check HFS_CASSANDRA_LOCAL_DC"
+                            ),
+                        }
+                    }
+                    other => other,
+                });
+            }
+        };
+        for row in &rows {
+            if let Ok(Some(dc)) = IntoRustByName::<String>::get_by_name(row, "data_center") {
+                datacenters.insert(dc);
+            }
+        }
+    }
+    if datacenters.contains(local_dc) {
+        Ok(())
+    } else {
+        Err(BackendError::Internal {
+            backend_name: BACKEND_NAME.to_string(),
+            message: format!(
+                "HFS_CASSANDRA_LOCAL_DC is '{local_dc}', but the cluster's data centres are {:?}",
+                datacenters
+            ),
+            source: None,
+        })
     }
 }
 

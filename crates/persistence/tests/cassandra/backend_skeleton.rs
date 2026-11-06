@@ -235,3 +235,75 @@ async fn cassandra_search_param_registry_is_per_tenant_and_populated() {
         &backend.search_param_registry(&a)
     ));
 }
+
+#[tokio::test]
+async fn cassandra_connect_refuses_a_local_dc_the_cluster_does_not_have() {
+    let Some(url) = test_node_url() else {
+        eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+        return;
+    };
+    let result = CassandraBackend::connect(CassandraConfig {
+        local_dc: "no-such-dc".to_string(),
+        ..config_for(&url)
+    })
+    .await;
+    match result {
+        Err(StorageError::Backend(
+            BackendError::Internal { message, .. } | BackendError::ConnectionFailed { message, .. },
+        )) => assert!(message.contains("no-such-dc"), "{message}"),
+        other => panic!("expected the local DC to be refused, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cassandra_connect_to_a_missing_keyspace_fails_naming_it() {
+    let Some(url) = test_node_url() else {
+        eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+        return;
+    };
+    let result = CassandraBackend::connect(CassandraConfig {
+        keyspace: "s2_skeleton_no_such_keyspace".to_string(),
+        connect_timeout_ms: 2_000,
+        ..config_for(&url)
+    })
+    .await;
+    match result {
+        Err(StorageError::Backend(BackendError::ConnectionFailed { message, .. })) => {
+            assert!(
+                message.contains("s2_skeleton_no_such_keyspace"),
+                "{message}"
+            )
+        }
+        other => panic!("expected ConnectionFailed naming the keyspace, got {other:?}"),
+    }
+}
+
+/// `helios_rest::create_app`'s bound (`crates/rest/src/lib.rs`), checked here
+/// so a missing trait fails this layer's build, not the wiring layer's.
+#[allow(dead_code)]
+fn assert_server_bound<S>()
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + helios_persistence::core::IncludeProvider
+        + helios_persistence::core::RevincludeProvider
+        + helios_persistence::core::InstanceHistoryProvider
+        + helios_persistence::core::TypeHistoryProvider
+        + helios_persistence::core::SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + helios_persistence::core::SearchCapabilityProvider
+        + Backend
+        + Send
+        + Sync
+        + 'static,
+{
+}
+
+#[test]
+fn cassandra_backend_meets_the_server_bound() {
+    assert_server_bound::<CassandraBackend>();
+}

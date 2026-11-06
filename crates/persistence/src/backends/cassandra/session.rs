@@ -41,17 +41,18 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cdrs_tokio::authenticators::StaticPasswordAuthenticatorProvider;
 use cdrs_tokio::cluster::connection_pool::ConnectionPoolConfigBuilder;
 use cdrs_tokio::cluster::session::{Session, SessionBuilder, TcpSessionBuilder};
-use cdrs_tokio::cluster::{NodeAddress, NodeTcpConfigBuilder, TcpConnectionManager};
+use cdrs_tokio::cluster::topology::NodeDistance;
+use cdrs_tokio::cluster::{NodeAddress, NodeInfo, NodeTcpConfigBuilder, TcpConnectionManager};
 use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::frame::Envelope;
 use cdrs_tokio::frame::Version;
 use cdrs_tokio::load_balancing::TopologyAwareLoadBalancingStrategy;
-use cdrs_tokio::load_balancing::node_distance_evaluator::TopologyAwareNodeDistanceEvaluator;
+use cdrs_tokio::load_balancing::node_distance_evaluator::NodeDistanceEvaluator;
 use cdrs_tokio::query::{PreparedQuery, QueryValues};
 use cdrs_tokio::retry::{DefaultRetryPolicy, FallthroughRetryPolicy, RetryPolicy};
 use cdrs_tokio::statement::{StatementParams, StatementParamsBuilder};
@@ -127,7 +128,45 @@ pub(crate) enum DriverError {
     /// driver's error is several hundred bytes.
     Driver(Box<cdrs_tokio::error::Error>),
     /// The backend's own request deadline elapsed first.
-    Deadline(Duration),
+    Deadline {
+        /// The deadline that elapsed.
+        after: Duration,
+        /// Whether the statement itself had been handed to the driver. `false`
+        /// when the deadline ran out while connecting or preparing, so a CAS
+        /// cut off there was never sent and its outcome is not unknown.
+        sent: bool,
+    },
+}
+
+/// Nodes in the local data centre are `Local`; every other node gets no
+/// distance, which the driver treats as ignored: it opens no pool to it and
+/// never puts it in a query plan (`cluster/topology/node.rs`, `is_ignored`).
+///
+/// The driver's own `TopologyAwareNodeDistanceEvaluator` marks other-DC nodes
+/// `Remote`, and `TopologyAwareLoadBalancingStrategy` keeps remote **replicas**
+/// in every plan, after the local ones, whatever its failover flag says
+/// (`load_balancing/topology_aware.rs:190-235`). A retry or a plan whose local
+/// replicas are down would then reach a coordinator in another DC, which
+/// would run `LOCAL_QUORUM` and `LOCAL_SERIAL` in its own DC and break the
+/// single-DC linearizability the design relies on (`cassandra-discussion.md`,
+/// data model: "`LOCAL_SERIAL` is linearizable only within one data centre").
+#[derive(Debug, Clone)]
+pub(crate) struct LocalDcOnly {
+    local_dc: String,
+}
+
+impl LocalDcOnly {
+    pub(crate) fn new(local_dc: impl Into<String>) -> Self {
+        Self {
+            local_dc: local_dc.into(),
+        }
+    }
+}
+
+impl NodeDistanceEvaluator for LocalDcOnly {
+    fn compute_distance(&self, node: &NodeInfo) -> Option<NodeDistance> {
+        (node.datacenter == self.local_dc).then_some(NodeDistance::Local)
+    }
 }
 
 impl From<cdrs_tokio::error::Error> for DriverError {
@@ -174,25 +213,24 @@ impl CassandraSession {
                 StaticPasswordAuthenticatorProvider::new(username, password),
             ));
         }
-        let node_config = within(connect_timeout, node_config.build()).await??;
+        let node_config = within(connect_timeout, false, node_config.build()).await??;
 
         let pool = ConnectionPoolConfigBuilder::new()
             .with_local_size(config.pool_size)
             .with_connect_timeout(Some(connect_timeout))
             .build();
 
-        // Replicas first, local DC only: no remote node is ever tried, and
-        // LOCAL_* consistency never fails over to another DC.
+        // Replicas first. Nodes outside the local DC are ignored by
+        // `LocalDcOnly`, so no remote node is ever tried; the strategy's
+        // remote-DC options are off as well.
         let load_balancing = TopologyAwareLoadBalancingStrategy::new(None, false);
         let builder = TcpSessionBuilder::new(load_balancing, node_config)
-            .with_node_distance_evaluator(Box::new(TopologyAwareNodeDistanceEvaluator::new(
-                config.local_dc.clone(),
-            )))
+            .with_node_distance_evaluator(Box::new(LocalDcOnly::new(config.local_dc.clone())))
             .with_retry_policy(Box::new(DefaultRetryPolicy))
             .with_connection_pool_config(pool)
             .with_keyspace(config.keyspace.clone());
 
-        let session = within(connect_timeout, builder.build())
+        let session = within(connect_timeout, false, builder.build())
             .await?
             .map_err(|error| {
                 DriverError::from(cdrs_tokio::error::Error::General(error.to_string()))
@@ -206,31 +244,41 @@ impl CassandraSession {
         })
     }
 
-    /// The prepared form of `cql`, preparing it on first use.
-    async fn prepared(&self, cql: &str) -> Result<Arc<PreparedQuery>, DriverError> {
+    /// The prepared form of `cql`, preparing it on first use within
+    /// `deadline`.
+    async fn prepared(
+        &self,
+        cql: &str,
+        deadline: Duration,
+    ) -> Result<Arc<PreparedQuery>, DriverError> {
         if let Some(prepared) = self.prepared.read().get(cql) {
             return Ok(prepared.clone());
         }
         // Two callers may prepare the same text at once; both get the same
         // statement id from the node, and the last insert wins.
-        let prepared = Arc::new(within(self.request_timeout, self.session.prepare(cql)).await??);
+        let prepared = Arc::new(within(deadline, false, self.session.prepare(cql)).await??);
         self.prepared
             .write()
             .insert(cql.to_string(), prepared.clone());
         Ok(prepared)
     }
 
-    /// Executes `cql` (prepared and cached) with positional `values`.
+    /// Executes `cql` (prepared and cached) with positional `values`. The
+    /// request deadline covers the prepare, on first use, and the execute
+    /// together.
     pub(crate) async fn execute(
         &self,
         cql: &str,
         values: Vec<Value>,
         kind: StatementKind,
     ) -> Result<Envelope, DriverError> {
-        let prepared = self.prepared(cql).await?;
+        let started = Instant::now();
+        let prepared = self.prepared(cql, self.request_timeout).await?;
         let params = statement_params(kind, values, &self.no_retry);
+        let remaining = self.request_timeout.saturating_sub(started.elapsed());
         Ok(within(
-            self.request_timeout,
+            remaining,
+            true,
             self.session.exec_with_params(&prepared, &params),
         )
         .await??)
@@ -271,14 +319,19 @@ fn statement_params(
     builder.build()
 }
 
-/// Runs `future` under `deadline`.
+/// Runs `future` under `deadline`; `sent` says whether `future` hands the
+/// statement itself to the driver (see [`DriverError::Deadline`]).
 async fn within<F: std::future::Future>(
     deadline: Duration,
+    sent: bool,
     future: F,
 ) -> Result<F::Output, DriverError> {
     tokio::time::timeout(deadline, future)
         .await
-        .map_err(|_| DriverError::Deadline(deadline))
+        .map_err(|_| DriverError::Deadline {
+            after: deadline,
+            sent,
+        })
 }
 
 #[cfg(test)]
@@ -339,6 +392,28 @@ mod tests {
                 "{kind:?}: only a CAS overrides the session retry policy"
             );
         }
+    }
+
+    fn node_in(datacenter: &str) -> NodeInfo {
+        NodeInfo {
+            host_id: Default::default(),
+            broadcast_rpc_address: "127.0.0.1:9042".parse().unwrap(),
+            broadcast_address: None,
+            datacenter: datacenter.to_string(),
+            tokens: Vec::new(),
+            rack: "helios-rack1".to_string(),
+        }
+    }
+
+    #[test]
+    fn nodes_outside_the_local_dc_get_no_distance_so_are_ignored() {
+        let evaluator = LocalDcOnly::new("helios-dc1");
+        assert_eq!(
+            evaluator.compute_distance(&node_in("helios-dc1")),
+            Some(NodeDistance::Local)
+        );
+        assert_eq!(evaluator.compute_distance(&node_in("helios-dc2")), None);
+        assert_eq!(evaluator.compute_distance(&node_in("")), None);
     }
 
     #[test]

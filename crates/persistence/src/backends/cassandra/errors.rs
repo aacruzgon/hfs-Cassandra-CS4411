@@ -16,14 +16,24 @@
 //! | the node refused the statement (`Syntax`, `Invalid`, `Unauthorized`, `Config`, `AlreadyExists`, `FunctionFailure`) | `QueryError` | 500 |
 //! | anything else (a node-side exception, a decoding error) | `Internal` | 500 |
 //!
-//! **Compare-and-swap outcomes are not decided here.** A `WriteTimeout` or
-//! `WriteFailure` with `write_type = CAS`, a closed connection or the deadline
-//! around a CAS leave its outcome unknown, and Step 3 resolves them with a
-//! `LOCAL_SERIAL` read before anything is mapped (ADR-aacruzgon-0024). When
-//! that read cannot decide, the design returns exactly what this table gives:
-//! 504 after a timeout or a dropped connection's deadline, 503 after a
-//! failure. A `WriteTimeout` with `write_type = SIMPLE` on a CAS means it
-//! applied; that too is the CAS path's call, not this table's.
+//! **Compare-and-swap outcomes must not go through this table.** It is for
+//! every other statement. A CAS's failure is classified first by the CAS path
+//! (ADR-aacruzgon-0024; `cassandra-discussion.md`, "When the LWT outcome is
+//! unknown" and "Which error, and why"), which differs from this table in
+//! three places:
+//!
+//! - an `Io` error, a closed connection (`General("Connection closed …")`) or
+//!   the deadline after the CAS was sent leave the outcome unknown; when the
+//!   `LOCAL_SERIAL` read cannot decide, the design answers **504**
+//!   (`BackendError::Timeout`), where this table gives `ConnectionFailed`
+//!   (503) for the first two;
+//! - `UnexpectedErrorCode` (`CAS_WRITE_UNKNOWN`, 0x1700, which cdrs-tokio
+//!   cannot decode) is an unknown outcome too, where this table gives
+//!   `Internal` (500);
+//! - a `WriteTimeout` with `write_type = SIMPLE` means the CAS applied.
+//!
+//! A `WriteTimeout` or `WriteFailure` with `write_type = CAS` that the serial
+//! read cannot decide gets what this table gives: 504 and 503.
 //!
 //! Messages: `Unavailable` and `ConnectionFailed` messages are sent to the
 //! client as the 503 text (`crate::error`, #2303), so they name no host; the
@@ -67,7 +77,7 @@ pub(crate) fn map_driver_error(error: &DriverError, operation: &str) -> BackendE
 
 fn classify(error: &DriverError, operation: &str) -> BackendError {
     let error = match error {
-        DriverError::Deadline(after) => {
+        DriverError::Deadline { after, .. } => {
             return timeout(format!(
                 "{operation} exceeded the backend's request deadline of {} ms",
                 after.as_millis()
@@ -109,11 +119,16 @@ fn classify(error: &DriverError, operation: &str) -> BackendError {
 /// `General` messages the driver raises when no connection could carry the
 /// request: `transport.rs` ("Connection closed when writing data!",
 /// "Connection closed while waiting for response!"), the session ("No nodes
-/// available in query plan!"), and session construction ("Session control
-/// connection died before completing initialization").
+/// available in query plan!"), the connection pool ("No active connections
+/// to: …", `cluster/connection_pool.rs:518-523`, while a node is still marked
+/// up), the write channel ("Write channel failure!", `transport.rs:528`), and
+/// session construction ("Session control connection died before completing
+/// initialization").
 fn is_connection_message(message: &str) -> bool {
     message.contains("Connection closed")
         || message.contains("No nodes available")
+        || message.contains("No active connections")
+        || message.contains("Write channel failure")
         || message.contains("control connection")
 }
 
@@ -121,7 +136,15 @@ fn is_connection_message(message: &str) -> bool {
 /// their `Display`.
 fn describe(error: &DriverError) -> String {
     match error {
-        DriverError::Deadline(after) => format!("request deadline of {} ms", after.as_millis()),
+        DriverError::Deadline { after, sent } => format!(
+            "request deadline of {} ms ({})",
+            after.as_millis(),
+            if *sent {
+                "after sending"
+            } else {
+                "before sending"
+            }
+        ),
         DriverError::Driver(error) => match error.as_ref() {
             CdrsError::Server { body, addr } => {
                 format!("{:?} from {addr}: {}", body.ty, body.message)
@@ -239,7 +262,14 @@ mod tests {
             server(write_timeout(WriteType::Simple)),
             server(write_timeout(WriteType::Cas)),
             server(write_timeout(WriteType::Batch)),
-            DriverError::Deadline(Duration::from_millis(10_000)),
+            DriverError::Deadline {
+                after: Duration::from_millis(10_000),
+                sent: true,
+            },
+            DriverError::Deadline {
+                after: Duration::from_millis(10_000),
+                sent: false,
+            },
         ] {
             let mapped = map_driver_error(&error, "test");
             assert_eq!(status_family(&mapped), "504", "{error:?} -> {mapped:?}");
@@ -257,6 +287,8 @@ mod tests {
             CdrsError::General("Connection closed when writing data!".to_string()),
             CdrsError::General("Connection closed while waiting for response!".to_string()),
             CdrsError::General("No nodes available in query plan!".to_string()),
+            CdrsError::General("No active connections to: 10.0.0.1:9042".to_string()),
+            CdrsError::General("Write channel failure!".to_string()),
         ] {
             let mapped = map_driver_error(&DriverError::from(error), "test");
             assert!(

@@ -220,31 +220,41 @@ jobs:
 
       # Built before Cassandra starts, so the build's memory peak and the
       # 3 GiB container never overlap. acruzdebian caps its runner service at
-      # 9 GiB (ADR-aacruzgon-0023), so the step prints the peak of the
-      # runner's cgroup during the build: memory.current, sampled every
-      # second, counts every process of the job, page cache included. The
-      # EXIT trap stops the sampler and prints the peak on a failed build too.
+      # 9 GiB (ADR-aacruzgon-0023), so the step samples the runner's cgroup
+      # every second and prints two peaks: memory.current, page cache
+      # included, which reaches the cap whenever the cache fills it; and
+      # memory.stat's anon, the memory the kernel cannot reclaim, which is
+      # the one that must stay under the cap. It also prints how many OOM
+      # kills the cgroup had during the build. The EXIT trap stops the
+      # sampler and prints all of it on a failed build too.
       # nice, as for clippy: sam-7900x is also Sam's desktop.
       - name: Build tests/cassandra_tests.rs and print its memory peak
         run: |
           cgroup="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
-          peak_file="$RUNNER_TEMP/build-memory-peak"
-          echo 0 > "$peak_file"
+          peaks="$RUNNER_TEMP/build-memory-peaks"
+          echo "0 0" > "$peaks"
+          oom_kills() { awk '$1 == "oom_kill" { print $2 }' "$cgroup/memory.events" 2>/dev/null || echo 0; }
+          oom_before=$(oom_kills)
           sampler=
           start=$(date +%s)
           report() {
             if [ -n "$sampler" ]; then kill "$sampler" 2>/dev/null || true; fi
-            echo "Build ran $(( $(date +%s) - start )) s on $RUNNER_NAME." \
-              "Peak of $cgroup: $(( $(cat "$peak_file") / 1048576 )) MiB;" \
-              "memory.max: $(cat "$cgroup/memory.max" 2>/dev/null || echo unknown)"
+            read -r current anon < "$peaks"
+            echo "Build ran $(( $(date +%s) - start )) s on $RUNNER_NAME ($cgroup)." \
+              "Peak memory.current: $(( current / 1048576 )) MiB; peak anon: $(( anon / 1048576 )) MiB;" \
+              "memory.max: $(cat "$cgroup/memory.max" 2>/dev/null || echo unknown);" \
+              "OOM kills during the build: $(( $(oom_kills) - oom_before ))"
           }
           trap report EXIT
-          if [ -r "$cgroup/memory.current" ]; then
+          if [ -r "$cgroup/memory.current" ] && [ -r "$cgroup/memory.stat" ]; then
             (
-              peak=0
+              current_peak=0; anon_peak=0
               while :; do
-                now=$(cat "$cgroup/memory.current")
-                if [ "$now" -gt "$peak" ]; then peak=$now; echo "$peak" > "$peak_file"; fi
+                current=$(cat "$cgroup/memory.current")
+                anon=$(awk '$1 == "anon" { print $2 }' "$cgroup/memory.stat")
+                if [ "$current" -gt "$current_peak" ]; then current_peak=$current; fi
+                if [ "$anon" -gt "$anon_peak" ]; then anon_peak=$anon; fi
+                echo "$current_peak $anon_peak" > "$peaks"
                 sleep 1
               done
             ) &

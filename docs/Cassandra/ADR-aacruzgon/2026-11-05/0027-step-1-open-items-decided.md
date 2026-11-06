@@ -1,0 +1,332 @@
+# ADR-aacruzgon-0027: The open items are decided: `count`, date-only paging, stored index keys, the cap, the unread rows, `_sort`, the rejections, the sweeper and the schema's setup
+
+- **Date:** 2026-11-05
+- **Status:** accepted
+- **Context:**
+    - **Why now.** PR #33 (ADR-aacruzgon-0026) fixed the schema audit's findings. It left open the items that the walk-through, the coverage table and the schema README had carried since the Step 1 design sessions, plus older ones. Alan wants none of them left open before the team's sign-off (roadmap row 1.4).
+    - **Why each is a decision.** Each item has workable alternatives:
+        - Q5 / G32: the intent row's unread `write_id`.
+        - G7: `count` without the tag check, `count(tenant, None)`, and how far a filtered count may differ.
+        - G8: the mass-update tombstone case.
+        - G12: several sweepers.
+        - G18 and P5: index rows nobody reads.
+        - G20: date-only paging, `ne`, and "date-only" with several dates.
+        - G22: old keys recomputed with a registry that may have changed.
+        - G23: what a write returns when its index writes fail after its compare-and-swap applied.
+        - G27: the candidate cap's error and what it counts.
+        - C1: the Resource-level parameters.
+        - C2: `_id` with a pipe.
+        - C4: the pipe form on ContactPoint and boolean elements.
+        - C5: the AND driver.
+        - C6: `MaxPageSize`.
+        - C7: the composite part count, a failing `_has` hop, and `_has` itself.
+        - C8: the terminology modifiers.
+        - C9: which `_sort` counts as the default.
+        - C10: `_text` and `_content`.
+        - C11: `_filter`.
+        - P6: who applies the schema.
+        - Roadmap section 6, "To consider": a node-kill test, and a clean restart.
+    - **Review of PR #33.** CodeRabbit raised five more points on this entry and the files it changes. Each was checked against the spec, the Cassandra 5.0 docs and `cassandra-5.0.9` source, the design and the code, and each was real:
+        - G7's operations rule overstated what it prevents, because hints are best effort;
+        - G22 left orphans when a writer paused after its compare-and-swap while the registry changed;
+        - the shared `_has` resolver misses versioned and absolute references;
+        - a failed terminology expansion widens the result silently (C8);
+        - a custom SearchParameter's `code` can push an index key past Cassandra's limit (G38).
+    - **Third review of PR #33.** CodeRabbit raised three more points, each checked against the Cassandra 5.0 docs, the `cassandra-5.0.9` source, the design and the code, and each real:
+        - resurrected and orphan rows count against the candidate cap (G7);
+        - a replica that missed a revive brings `resources.deleted_at` back once the revive's tombstone is purged (G39);
+        - the sweeper read a missing row V−1 as an empty key set, which a paused writer and a crashed successor turn into orphans (G40).
+    - **Fourth review of PR #33.** CodeRabbit raised three more points, each checked against the spec, SMART App Launch, the Cassandra 5.0 docs, the design and the code, and each real:
+        - five places promised `(last_updated DESC, id DESC)` for every search, against G20's date-table order;
+        - `schema.cql`'s outage comment said "any outage" and left out the replace-not-rejoin rule (G7);
+        - under a `patient/` scope, the shared resolver runs a `_has` source search with no compartment, so it can reveal another patient's data (C7).
+      Checking them found three more: the replacement node must be repaired after it bootstraps (G7); hop types are never checked against the token's scopes, for any scope (C7); and on Cassandra a forward chain answers 400 or 200 depending on whether any resource in the tenant matches its terminal (C7).
+    - **Checked against the code before it was written.** Every answer below was checked against `main` and the R4 spec. Where a recommendation did not fit, a proposal that does was put to Alan and accepted. For C5 and C7 the orchestrating session also checked the spec and #28 before Alan decided.
+- **Decision:**
+    - **Q5 / G32.** `pending_index_writes.write_id` is kept as a diagnostic, so an operator can match a stuck intent to a request's log. The sweeper still never reads it.
+    - **G7.**
+        - `gc_grace_seconds` stays at 3 h on `resources_by_type` (ADR-aacruzgon-0009).
+        - Operations rules on the cluster:
+            - a replica back from an outage shorter than `max_hint_window` (3 h), or after a spike of `Unavailable` errors, timeouts or dropped mutations, is repaired promptly, within 3 h of the outage's start;
+            - a replica down longer than `max_hint_window` is replaced (`replace_address_first_boot`), never rejoined, even after repair: "If a node remains down or disconnected for longer than `gc_grace_seconds`, its deleted data will be repaired back to the other nodes and reappear in the cluster" ([tombstones](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/compaction/tombstones.html#deletion)), and on these tables that is 3 h;
+            - the replacement node is repaired once it has bootstrapped. Every replacement under the previous rule is a case where Cassandra's replace procedure says "you **MUST** run repair to make the replaced node consistent again" when "The node is down for longer than `max_hint_window` before being replaced" ([replacing a dead node](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/topo_changes.html#replacing-a-dead-node)). The new node streams its data from live replicas, so it holds nothing the cluster purged, and repairing it cannot bring a deleted row back [inferred]; it only fills in the writes it missed while bootstrapping.
+        - **The rules narrow resurrection; they do not rule it out.**
+            - Hints are best effort: "Hints are best effort, however, and do not guarantee eventual consistency like anti-entropy repair does" ([hints](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/hints.html)).
+            - A hint expires at the smallest `gc_grace_seconds` of its mutation's tables (`Hint.java:56-57`, `131-158`, `Mutation.java:282-288` in `cassandra-5.0.9`). For `resources_by_type` and the index tables that is 3 h, the same as `max_hint_window`.
+            - Hints are not written at all when they are disabled, past the window, or over the per-host limit (`StorageProxy.java:2428-2462`). A coordinator that dies before its 10 s `hints_flush_period` loses the buffered ones [inferred].
+            - So a delete a replica missed, in an outage of any length, through a dropped mutation or a lost hint, comes back once its tombstone is purged before repair reaches that replica: "At a minimum, repair should be run often enough that the gc grace period never expires on unrepaired data. Otherwise, deleted data could reappear" ([repair](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/repair.html)).
+        - **The exposure, exactly.** Only the three-node cluster (RF 3); at RF 1 no replica can miss a write. Only `count`, `_count=0` without filters, `_total` on an unfiltered search and `/console` metrics: one too many per resurrected `resources_by_type` row, until an unfiltered type search pages over the row and repair on read deletes it. Search is never wrong: a resurrected row carries an old `version_id`, so the tag check hides it. A resurrected intent row is harmless (ADR-aacruzgon-0009).
+        - **Search can fail, not only count** (CodeRabbit's third review). Each resurrected index or `resources_by_type` row is a candidate that a search point-reads and the tag check hides, so it counts against the candidate cap (walkthrough 5.1, step 7). If enough of them lie ahead of the live matches in one partition, that page returns 422 `TooManyResults` before it fills. It never returns a wrong result. Repair on read deletes each stale row the search reads, at step 4, before the cap is checked at step 7, so a retry gets further. The same holds for the orphans of the design's stated limitations. Reaching the cap needs that many missed deletes in one partition, all purged before repair.
+        - We accept this exposure.
+        - A filtered `search_count` uses tag checks and the candidate cap. An unfiltered `count` scans `resources_by_type`.
+        - `count(tenant, None)` sums `count` over the resource type names of every enabled FHIR version: `FhirVersion::enabled_versions()` with `FhirResourceTypeProvider::get_resource_type_names`, as `ResourceTypeScope` does (`crates/persistence/src/search/type_qualifier.rs:98-118`), each name once. No new table.
+        - `count` and a filtered `search_count` may differ in three cases: while a write is in flight; while a crashed write waits for the sweeper; and in the design's stated limitations (an intent that expired during a sweeper outage over 24 h, a request stalled past the grace period, or one paused past `gc_grace_seconds`), where an orphan row stays counted until a search repairs it.
+    - **G8.** A named benchmark case in roadmap Step 8: update every resource of one type once, then, within 3 h, run `count` and page an unfiltered search to its last page, recording tombstones scanned per read against `tombstone_warn_threshold` (1,000) and `tombstone_failure_threshold` (100,000).
+    - **G12.** Duplicate sweepers are accepted, with no lease row. This project runs one process. Every sweeper write carries the version's fixed timestamp, so extra sweepers write the same cells and only add duplicate reads.
+    - **G18 and P5.** These rows are dropped before index keys are computed:
+        - the extractor's `_id` token and `_lastUpdated` date rows;
+        - display-only tokens. The converter emits an empty code only for `CodeableConcept.text` with no coding, with no system (`search/converters.rs:189-197`). It skips a Coding without a code and an Identifier without a value (`converters.rs:444-445`, `502`);
+        - `token_system_index` rows for the implicit-system marker, and for system `''`;
+        - URI rows whose URI is empty, which `convert_to_uri` writes for an empty string (`search/converters.rs:670-678`).
+    - **G20.**
+        - **Paging.** Date-only searches page natively in the table's own order: `(start, id)` ascending on `date_index`, `(end, id)` ascending on `date_index_by_end`.
+        - **Cursor.** `sort_values = [<start or end>, <reserved bucket slot>, "start" | "end"]`. The third element names the table, so a cursor from another order is `InvalidCursor`. The `(last_updated, id)` cursor keeps its two elements.
+        - **Several rows per resource.** A resource with several values is emitted once, at its first matching row in slice order.
+        - **`ge`** is the single slice `end > s`, with the full predicate as residual.
+        - **`ne`, and a comma list whose values slice both tables.** They read `date_index`'s slices first, then `date_index_by_end`'s, each in its own order. A resource is emitted at its first matching row in that concatenated order, and the cursor's third element names the table being read.
+        - **Several dates.** With two or more date parameters, a repeated date, or a date with `_lastUpdated`, one is sliced and the rest are residuals. The sliced one is `_lastUpdated` if present, which then pages in the default order. Otherwise it is the first date parameter in query order, and the first occurrence of a repeated one.
+        - **Stated as the one exception.** Every other search comes back in `(last_updated DESC, id DESC)` order, deduplicated on `(last_updated, id)`. A date-only search sliced on a date table comes back in that table's ascending order and keeps each resource once, at its first matching row. `coverage.md` (the "true of every row" paragraph and the next-page row), walkthrough 5.1 step 3, and the design's default-order and cursor bullets said one order for every search; they now state the exception (fourth review of PR #33).
+    - **G22.** Each version stores the index rows it wrote, and the current `resources` row holds the current version's.
+        - **The columns.**
+            - `resources.index_keys blob`, written by every compare-and-swap: C1, C2 and C4 write the new version's set, C3 the empty set.
+            - `resource_versions.index_keys blob`, written in the same row and statement as the version: V1 and V2 at step 4, the V3 rewrite, and the sweeper's replay.
+            - Neither adds a statement.
+        - **The encoding.** Format 1, documented in `schema.cql` and the walk-through: a format byte `0x01`, a varint row count, then per row a table tag and the key columns the version row does not imply (`tenant_id`, `resource_type`, `id` and `last_updated` are the row's own). Strings are varint-length-prefixed UTF-8; timestamps are 8-byte milliseconds. A delete marker's set is `0x01 0x00`.
+        - **Where each reader gets its keys. Nothing is re-extracted.**
+            - A writer's `K(N)` is the `index_keys` of the `resources` row it read, at the version its compare-and-swap is conditioned on.
+            - Repair on read uses the `index_keys` of the R1 row the tag check loaded.
+            - The sweeper takes `K(V)` from its R2 of `resources`, and `K(V−1)` from row `V−1`.
+        - **Why the read is exact.** Only the compare-and-swap that creates version N writes `index_keys` at N, in the same mutation as `version_id`, and nothing else writes `resources`. So a read that shows `version_id = N` shows N's set, and a compare-and-swap conditioned on `version_id = N` applies only while the row still holds it.
+        - **`update` reads `resources`, not row N** (one R1 at `LOCAL_QUORUM`). Its `StoredResource` has no blob, and row N may not be written yet, which is the race below. If R1 shows a version above N, it returns C2's mapped miss (404 if deleted, else 409) without the CAS. If R1 shows a version below N, N's compare-and-swap is still committing: it runs R2 at `LOCAL_SERIAL` and uses that row.
+        - **Why `resources` carries it: the paused writer** (CodeRabbit's review of PR #33).
+            - **The race, before this change.** Writer A's compare-and-swap applies N+1 with keys extracted under registry R1, then A pauses before step 4. The tenant's registry changes to R2. Writer B updates N+1 to N+2, finds row N+1 missing, and re-extracts `K(N+1)` under R2. A resumes and inserts its own `K(N+1)`. Keys of A's set that B's set lacks are never deleted: orphans. The sweeper's superseded case deletes `K(N)`, never `K(N+1)`, so the grace period does not help.
+            - **After it.** B reads `resources` at N+1, whose `index_keys` is A's set, because A's compare-and-swap wrote it. B's compare-and-swap is conditioned on N+1, so B deletes A's keys that N+2 drops at `write_ts(N+2)`, and inserts N+2's at the same timestamp. Each of A's late inserts at `write_ts(N+1)` is either under a newer tombstone or overwritten by a newer insert. A's late V1 for row N+1 writes the same blob as B's V3.
+            - **Checked on a 5.0.9 node.** A key only in A's set stayed deleted after A's late insert, a shared key kept tag N+2, and row N+1 held A's 289-byte blob.
+        - **The V3 rewrite of row N** carries the `index_keys` read from `resources` at N, so it is exact and never unset. It is written one microsecond below `write_ts(N)`, and every stored blob is written at `write_ts(N)`, so the rewrite never replaces one: the original wins every cell, as the existing V3 rule says.
+        - **Both copies are kept.** `resources` holds only the current version's set. The sweeper needs `K(V−1)` once V is current, and every version row keeps the set its version wrote.
+        - **Versions written before the column.** None exist: no Cassandra data predates this schema, so every `resources` and version row has `index_keys`.
+        - **Reads.** One extra point read, R1 of `resources`, for `update` only. None for `create`, `update_with_match`, `delete`, `delete_versioned` or `create_or_update`, whose R1 already returns the set; none for the sweeper, whose R2 returns `K(V)` and which already reads row `V−1`; none for repair on read or an unknown CAS outcome.
+        - **Cost.** The set travels in every compare-and-swap's Paxos proposal and commit, and makes the `resources` row larger by the same amount: 289 bytes for the worked example's `K(1)` and 2 bytes for a delete, computed from the encoding and checked on the node. The same compare-and-swap already carries `data`, the resource JSON; the worked example's Patient is about 140 bytes of it without `meta`, and fixture sizes are measured in Step 8. The compare-and-swap stays one statement on one partition.
+    - **G23.** When the compare-and-swap applied but the index writes failed after retries, the write returns success, and the sweeper finishes it. The design's claim is narrowed to "searchable within poll interval plus grace when the index writes fail".
+    - **G27.** The cap's error is 422 `SearchError::TooManyResults`, issue `processing` (`crates/rest/src/error.rs:1123-1125`, `591-595`).
+        - No new variant is added.
+        - No search produces `too-costly`; its one producer is the batch handler's 500 for a transaction too large for MongoDB's cache (`crates/rest/src/handlers/batch.rs:3745`).
+        - The cap counts distinct candidates point-read, per page or per `search_count`.
+        - The compartment cap (ADR-aacruzgon-0026) follows this rule.
+    - **C1.** `_profile`, `_source`, `_tag` and `_security` are in scope. `coverage.md` section 4 stands. `_tag` and `_security` are Codings, served by the three token tables (`meta_params_suite.rs` asserts both directions).
+    - **C2.** An `_id` value is compared whole with the id, pipe included, as SQLite and PostgreSQL do: both bind `value.value` into `id IN (…)` (`backends/sqlite/search/query_builder.rs:1159-1224`, `backends/postgres/search/query_builder.rs:1870-1929`). A FHIR id cannot contain `|`, so `_id=sys|abc` and `_id=|abc` return an empty searchset.
+    - **C4.** The pipe form on ContactPoint and boolean elements is accepted and matched by the general token rules. Neither SQLite nor PostgreSQL has a case for those types (`backends/sqlite/search/parameter_handlers/token.rs:12-19`, `86-120`; `backends/postgres/search/query_builder.rs:2344-2394`). So `phone|555-0100` matches a phone ContactPoint, and `|true` matches a boolean.
+    - **C5.** The AND driver is the first parameter in a fixed order, with no statistics, so that the most specific key drives:
+        1. `_id`;
+        2. `system|code` and `|code` tokens;
+        3. identity URIs;
+        4. code-only tokens, `_profile`, `_source` and every other URI parameter, whose values many resources share (every US Core Patient carries the same profile);
+        5. `system|` tokens;
+        6. `_lastUpdated`, only when nothing else can drive.
+
+      Ties go by query order. Dates beside another parameter never drive (they are residuals), and other types are refused before any read. The order is revisited only if the Step 8 benchmark shows it matters.
+        - **Identity URI:** a registered `uri` parameter whose expression is the resource's own canonical `url`. Checked against the R4 registry (`data/search-parameters-r4.json`): `url` on 28 types (ActivityDefinition, CapabilityStatement, ChargeItemDefinition, CodeSystem, CompartmentDefinition, ConceptMap, EffectEvidenceSynthesis, EventDefinition, Evidence, EvidenceVariable, ExampleScenario, GraphDefinition, ImplementationGuide, Library, Measure, MessageDefinition, OperationDefinition, PlanDefinition, Questionnaire, ResearchDefinition, ResearchElementDefinition, RiskEvidenceSynthesis, SearchParameter, StructureDefinition, StructureMap, TerminologyCapabilities, TestScript, ValueSet), and `system` on CodeSystem, whose expression is `CodeSystem.url`. Not `url` on Device (`Device.url`, a network address), Contract (`Contract.url`, the basal contract definition) or Subscription (`Subscription.channel.endpoint`).
+        - **Why fixed.** The spec defines only the result: every parameter must match, and the order without `_sort` is the server's choice ([R4 search.html](https://hl7.org/fhir/R4/search.html)). [Discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28) asks for "a (hopefully lightweight) query planner", warns against post-filtering "millions of rows only to discard most of them", and notes that "Cassandra's data model essentially forces you to pre-plan your queries". The cost hooks it sketches (`QueryCostEstimator`, `estimated_cost`) do not exist in the code.
+    - **C6.** `MaxPageSize` is REST's `HFS_MAX_PAGE_SIZE` (default 1000, `crates/rest/src/config.rs:1331-1332`), which clamps `_count` before the backend is called (`crates/rest/src/handlers/search.rs:606-612`). The backend has no limit of its own and declares `MaxPageSize(1000)`, as every other backend does (`backends/sqlite/backend.rs:936`).
+    - **C7.** The 400s are what the shared code returns today, pinned by Step 6 tests (roadmap section 5):
+        - a composite value with the wrong `$` part count is `SearchError::InvalidComposite` from the shared gate `validate_composite_values` (`crates/persistence/src/search/composite_value.rs:127-141`), which REST runs while building the query (`crates/rest/src/extractors/search_query_builder.rs:243`). REST maps it to `BadRequest`, 400, issue `invalid` (`crates/rest/src/error.rs:1109-1115`, `570-571`);
+        - a `_has` fails at its terminal hop when the terminal's parameter type is not served: the resolver's search through our `search()` returns `UnsupportedParameterType`, which REST maps the same way (`crates/rest/src/handlers/search.rs:678`).
+    - **C7, `_has`.** `_has` is served when its terminal parameter is token, date or URI. REST's shared resolver (`crates/persistence/src/search/chain_resolver.rs`) runs the terminal search through our base `search()` page by page and reads the references in Rust (`chain_resolver.rs:693-771`), so the backend never sees `_has`.
+        - **The spec allows answering it.** [R4 search.html](https://hl7.org/fhir/R4/search.html) says "Servers are not required to implement any of the standard search parameters", and gives no `_has`-specific rule. Unknown and unsupported parameters are already handled in REST: ignored by default, an error under `Prefer: handling=strict`.
+        - **#28 places it above the backend.** [Discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28): "Search is a base trait plus extension traits", with chaining an extension; the design implements base `SearchProvider` only. #28's work-in-progress matrix marks `_has` unsupported for Cassandra, and the design already says the persistence README matrix supersedes it. That matrix's Cassandra `_has` row becomes ◐, "through the shared resolver, when its terminal parameter is token, date or URI", at roadmap Step 8.
+        - **Its cost.** The resolver drains every page of the terminal search into memory (`search_all_pages`, `chain_resolver.rs:268`, called at line 758), so a broad terminal, such as a common Observation code, is expensive. Roadmap Step 8 names it as a benchmark case.
+        - The Step 6 test that pins it stays (roadmap section 5).
+        - **Known upstream defect: versioned and absolute references** (CodeRabbit's review of PR #33).
+            - The shared resolver turns each source reference into a target id with `reference.split_once('/')` (`chain_resolver.rs:739-745`, unchanged on upstream `main` at `be76ebead`). So `Patient/a/_history/1` becomes `_id=a/_history/1`, and an absolute reference splits into the type `http:` and is dropped. Neither finds Patient `a`.
+            - The spec expects both to match: "A relative reference resolving to the same value as a specified absolute URL, or vice versa, qualifies as a match" ([R4 search.html#reference](https://hl7.org/fhir/R4/search.html#reference)), and "Search is only defined to function against the current version of a resource" ([#versions](https://hl7.org/fhir/R4/search.html#versions)).
+            - It is shared code. Absolute references are missed on every backend. Versioned ones are missed everywhere the resolver sees them as written; on upstream `main`, MongoDB strips the version when it builds its reference rows (`backends/mongodb/search_index_builder.rs:743` at `be76ebead`; not yet in this fork), so only its fast path escapes that case.
+            - Filed upstream as [HeliosSoftware/hfs#2499](https://github.com/HeliosSoftware/hfs/issues/2499). `coverage.md` section 6 documents it. A Step 6 test row expects the corrected result and is `#[ignore]`d until the fix arrives (roadmap section 5).
+        - **Known upstream security defect: `_has` and chains under a scope** (CodeRabbit's fourth review of PR #33, widened by this audit).
+            - REST confines only the base query: `PatientCompartment::confine_query` (`crates/rest/src/patient_compartment.rs:168-202`, called at `handlers/search.rs:562`) adds `_id=<launch patient>` to a Patient search and `query.compartment` to any other. The resolver builds every hop with a fresh `SearchQuery` and no compartment (`chain_resolver.rs:570` and `603` for forward chains, `684` and `728` for `_has`), and `ChainResolveOptions` carries none. The middleware checks only the path's resource type against the scopes (`crates/rest/src/middleware/auth.rs:245-246`). All four sites are the same on upstream `main` at `be76ebead`.
+            - So the result is confined, but a hop selects over the whole tenant. `Patient?_has:Observation:focus:code=X` under p1's `patient/` scope returns p1 when only p2's Observation, with `focus` p1, has code X; `focus` is not an Observation compartment parameter (R4 Patient CompartmentDefinition: `subject`, `performer`). A token with only `user/Patient.rs` can run `_has:Observation:…` with no Observation scope. On Cassandra, which serves no reference parameter, a forward chain such as `Observation?subject:Patient.identifier=…` answers 400 when its terminal matches some Patient in the tenant (the hop back is a reference search) and 200 empty when it matches none (`chain_resolver.rs:583-585`), so the status alone reveals the match.
+            - [R4 security.html](https://hl7.org/fhir/R4/security.html), Access Control Considerations: "A security implementation must consider whether a client has the permission to access the resource being searched on, as well as the chained resource(s)". [SMART App Launch STU2.2](https://hl7.org/fhir/smart-app-launch/STU2.2/scopes-and-launch-context.html): "Patient-specific scopes allow access to specific data about a single patient"; requests "may be rejected"; chaining is listed as experimental. [R4 search.html#errors](https://hl7.org/fhir/R4/search.html#errors): 403 "signifies that the server refused to perform the search".
+            - Filed upstream as [HeliosSoftware/hfs#2501](https://github.com/HeliosSoftware/hfs/issues/2501), with the code linked at `be76ebead`. `coverage.md` section 6 documents it.
+            - **A gate, not ignored tests.** Four Step 6 rows (roadmap section 5): under p1's `patient/` token, `Patient?_has:Observation:focus:code=X` gives 403 or a searchset without p1, never p1; with no scope the same request returns p1; `Observation?subject:Patient.identifier=…` under p1's token gives the same answer whether or not the identifier exists, never 400 for one and 200 for the other; a token with only `user/Patient.rs` gets 403 for `Patient?_has:Observation:subject:code=X`. Cassandra search is not signed off while they fail.
+            - **The fork patch, if upstream has not fixed it by then.** Right after `confine_query`, refuse a query with chains or `_has` (`query_has_chains`) under a confined grant with `RestError::Forbidden` (403, issue `forbidden`, `crates/rest/src/error.rs:612-614`), as `patient_compartment_path_check` already does for what it cannot confine; and check each `_has` source type and chain target type with `SmartScopePolicy::check(…, FhirOperation::Search)` for every scope, refusing a denied type the same way. It is a REST change, so it is a separate code PR, not part of this documentation PR. The Cassandra backend cannot do it: it never sees the chain, only each hop's ordinary search, with no principal.
+    - **C8.** The design matches the REST code, which runs before the backend is called:
+        - 501 `TerminologyRequired` for token `:in`, `:above` and `:below` without a terminology server (`crates/rest/src/handlers/search.rs:430-466`);
+        - a plain comma OR with one (`expand_terminology_params`, line 429);
+        - 501 for `:not-in` always (lines 411-426);
+        - **when the expansion fails** (the terminology server is unreachable, or answers an error such as 404 for an unknown ValueSet), REST drops the parameter and runs the search without it. The result is wider than asked, with no warning or OperationOutcome, even under `Prefer: handling=strict`, which `expand_terminology_params` never sees (`search.rs:1302-1310` for `:in`, `1401-1407` for `:above` and `:below`; CodeRabbit's review of PR #33). The spec does not describe this. [R4 #modifiers](https://hl7.org/fhir/R4/search.html#modifiers) says a server "SHALL reject" a modifier it does not support, and [#errors](https://hl7.org/fhir/R4/search.html#errors) says servers "SHOULD honor" `handling=strict`. Upstream closed this exact report as not planned ([HeliosSoftware/hfs#2019](https://github.com/HeliosSoftware/hfs/issues/2019), 2026-10-16), so it is documented in `coverage.md` and the design, kept out of the Inferno kit's supported-search group, and not refiled. The backend cannot refuse it: the parameter is gone before the backend is called.
+    - **C9.** `_sort` counts as the default only when it equals the search's native order:
+        - absent, or `-_lastUpdated` where the order is `(last_updated DESC, id DESC)`;
+        - on a date-only search sliced on a date table, `-_lastUpdated` is not the native order.
+
+      Every other value follows the design's existing rule: `QueryParseError`, 400.
+    - **C10.** `_text` and `_content` are checked by name in the Cassandra backend's `search()` and `search_count()`, before the type check, so they get 501 `TextSearchNotAvailable`. REST passes both through: they are in `GLOBAL_SEARCH_PARAMS` (`crates/rest/src/extractors/search_query_builder.rs:297-298`), and SQLite serves them.
+    - **C11.** `_filter` is refused by name in the Cassandra backend's `search()` and `search_count()`, with `_text` and `_content` and before the type check, as `BackendError::UnsupportedCapability`. REST maps that to 501, issue `not-supported` (`crates/rest/src/error.rs:1209-1211`, `656-659`). REST is unchanged: it passes `_filter` through (`search_query_builder.rs:184`, `299`), and SQLite (`backends/sqlite/search/query_builder.rs:1237-1240`) and MongoDB serve it.
+    - **G38: a custom SearchParameter's `code`** (CodeRabbit's review of PR #33).
+        - **The bound.** The Cassandra backend refuses to store a SearchParameter whose `code` is longer than 128 bytes in UTF-8, in `create`, `update`, `update_with_match` and `create_or_update`, batch entries included. It is refused before the intent row with `StorageError::Validation(ValidationError::InvalidResource { message, details })`, one `ValidationDetail` on `SearchParameter.code`. REST answers 400, issue `invalid` (`crates/rest/src/error.rs:1048`, `570-571`), as for G35, and nothing is written.
+        - **The backstop.** The step 1 size check also measures each index row's `param`, with the same 400 over 128 bytes. That covers a registry holding a longer code stored before the bound.
+        - **Why it is needed.** `code` becomes the `param` component of every index key under that parameter, and nothing bounds it.
+            - [R4 `SearchParameter.code`](https://hl7.org/fhir/R4/searchparameter-definitions.html#SearchParameter.code) is a `code`, 1..1, with no invariant; R5 is the same.
+            - The [`code` datatype](https://hl7.org/fhir/R4/datatypes.html#code) has no length limit, and its [string](https://hl7.org/fhir/R4/datatypes.html#string) base "SHALL NOT exceed 1MB".
+            - The shared loader checks only the code's characters (`crates/fhir/src/search/loader.rs:31-36`, `512-520`).
+            - So this is a stated server restriction, not a spec rule.
+        - **Measured on a 5.0.9 node.** With a 64-byte tenant, resource type `MedicinalProductUndesirableEffect` and a 2,048-byte `system` and `code` in `token_system_code_index`, a 61,327-byte `param` was accepted and a 61,328-byte one failed: "Key length of 65536 is longer than maximum of 65535". Such a write would commit its compare-and-swap and then fail step 5 on every retry, the G35 failure caused by another client's SearchParameter. The 5 KiB batch argument already fails once `param` passes about 1 KB.
+        - **Why 128.** The longest code in the spec data is 46 bytes (R6; 33 in R4 and R4B, 35 in R5, from `data/search-parameters-*.json`). The largest key is then 4,337 bytes, which still fits one row in a 5 KiB batch. Conformance seeding goes through `create_many` (`crates/persistence/src/search/seeder.rs:110`), and every spec code passes.
+    - **G39: `resources.deleted_at` never needs a tombstone** (CodeRabbit's third review of PR #33).
+        - **The rule.** A live `resources` row has `deleted_at = 0` (1970-01-01T00:00:00Z), written by C1 (create) and C4 (revive). A delete (C3) writes its own `last_updated`, never 0. C2 and C3 are conditioned on `deleted_at = 0`, where they were conditioned on `deleted_at = null`. C4 keeps `IF version_id = N`. `resource_versions` is unchanged: a content row leaves `deleted_at` unset, and a marker sets it.
+        - **ADR-aacruzgon-0024's literal-null rule is superseded.** C4 no longer writes `SET deleted_at = null`, so "never bind null" has no exception, and neither `resources` nor `resource_versions` holds any tombstone.
+        - **Every reader that decides "deleted" tests `deleted_at > 0`** (walkthrough section 2, "`deleted_at` and its readers"):
+            - `read` (410, or 404 with `HFS_RETURN_GONE` false) and `exists`;
+            - `vread`: a marker, whose `deleted_at` is always `> 0`;
+            - the `_id` search, and the tag check behind every search, filtered `search_count` and the compartment residual;
+            - the CAS-miss mapping of C2 and C3 (404);
+            - `update`'s R1 and the pre-reads of `delete` and `update_with_match` (404);
+            - `create_or_update`'s branch choice (revive);
+            - the sweeper (a marker gets V2 and an empty key set);
+            - `StoredResource::from_storage`, which receives `None` for 0.
+          Unfiltered `count` reads `resources_by_type`, not `resources`, so it never tests `deleted_at`.
+        - **Why.** The revive's literal null was the one tombstone in `resources`, and `resources` keeps the 10-day default `gc_grace_seconds`.
+            - A replica that missed the revive and its hint kept the delete's value. Paxos v2 hints a commit like any write (`PaxosCommit.java:219-231`, `allowHints = true` at `Paxos.java:764`), and hints are best effort.
+            - A prepare refreshes stale promisers with the latest commit only (`PaxosPrepare.java:80-104`, `852-857`; `PaxosPrepareRefresh.java:177-184`), and a later C2 does not write `deleted_at`.
+            - Once the other replicas purged the tombstone, any read that included the stale replica reconciled to the delete's value, and read repair and repair then spread it, the zombie of the 5.0 [tombstones](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/compaction/tombstones.html) page.
+            - The revived resource read as deleted (410), vanished from search, and its next update missed its CAS (404). With the sentinel, the revive's cell is newer, so it wins on every replica whatever the repair schedule.
+        - **Repair** within the 10-day grace period stays routine practice on the cluster ("At a minimum, repair should be run often enough that the gc grace period never expires on unrepaired data", [repair](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/repair.html)). Correctness no longer depends on it.
+        - **No column or type changes.** `expected-schema.txt` is unchanged at 92 rows.
+    - **G40: the rewrite of row N (V3) runs before the compare-and-swap** (CodeRabbit's third review of PR #33).
+        - **The rule.** `update`, `update_with_match`, `delete`, `delete_versioned` and a `create_or_update` turn on a live row or a delete marker write V3 for row N at `write_ts(N) − 1` at step 2, before the intent row and the CAS, where step 4 wrote it before. It is built from R1, or from `current` with R1's `K(N)`, exactly as before. Step 4 now writes only row N+1. This revises ADR-aacruzgon-0012's placement of V3.
+        - **Why.** ADR-aacruzgon-0013's sweeper read a missing row V−1 as "its writer never reached step 5", so it took `K(V−1)` as empty. A paused writer breaks that assumption. The gap predates `resources.index_keys`.
+            1. Writer N's CAS applies, and N pauses before step 4.
+            2. Writer N+1's CAS applies and overwrites `resources.index_keys`; it crashes before step 4. `K(N)` is now only in the paused writer's memory.
+            3. The sweeper takes N+1's intent, deletes nothing for N, and deletes the intent.
+            4. N resumes and inserts `K(N)`, whose keys outside `K(N+1)` nothing deletes. They always include `resources_by_type (lu(N), id)`, so `count` was wrong even at RF 1.
+
+          With V3 before the CAS, row N exists with its exact `index_keys` whenever any CAS creating N+1 has applied. The sweeper deletes `K(N) \ K(N+1)` at `write_ts(N+1)`, and N's late inserts at `write_ts(N)` lose.
+        - **The sweeper's rules.** Row V−1 always exists for V > 1, and row V once V is superseded. The "row V missing" branch (delete `K(V−1)` at `write_ts(V−1) + 1`) is removed, and the "two crashes in a row lose a version" limitation goes away.
+        - **Cost.** One more sequential round trip on those operations, since V3 no longer shares a single-partition batch with V1. A CAS that misses wastes its V3, which changes nothing. No schema change.
+        - **Failure test.** A roadmap section 6 row: the paused writer, then a crashed successor, then both sweeps, then the resume. Expected: no index or `resources_by_type` row of N remains, and `count` is correct.
+    - **P6.** The schema is applied from one process, a setup command or the test harness. `initialize` only checks that the ten tables exist (roadmap Step 2).
+    - **Roadmap section 6.**
+        - A node-kill test: Cassandra killed with `kill -9` under write load on the single node. Expected: up to one `commitlog_sync_period` of acknowledged writes lost, no half-applied batch, and no index row for a resource whose CAS was lost.
+        - The Restart row is a clean restart: `nodetool drain`, then stop.
+- **Alternatives considered:**
+    - **Q5:** drop the column. This lost: it costs 16 bytes per intent row, and it is the only link from a stuck intent to the request that wrote it.
+    - **G7:**
+        - Tag-check `count`. This lost: one point read per row.
+        - Raise `gc_grace_seconds` on `resources_by_type` back to 10 days, or to a day with daily repair. This lost: tombstones there are the G8 cost, kept for days. The earlier wording here said the replace-not-rejoin rule "closes the resurrection case instead"; it does not (see the decision).
+        - Keep 3 h and require repair to complete on every node within each 3 h. This lost: near-continuous validation and anticompaction on the three-node cluster, which would also disturb the benchmarks, for an exposure confined to `count`.
+        - Set `only_purge_repaired_tombstones: true` in `resources_by_type`'s compaction, so a tombstone is purged only once its data is repaired (`CompactionController.java:164`, `297`; off by default, `CompactionStrategyManager.java:1239-1242`). This lost: without regular repair tombstones are never purged, which is worse than G8, and an explicit compaction map in `schema.cql` erases the four UCS sub-options inherited from `cassandra_latest.yaml`, which the schema README warns about (both checked on a 5.0.9 node). It and a higher `gc_grace_seconds` are the fix if the cluster ever becomes a deployment target.
+        - Paxos repair (5.0, `paxos_variant: v2`). Not an option: it covers the LWT state on `resources`, not the index tables [inferred; the repair and tombstone pages say nothing of it].
+        - `count(tenant, None)` over the registry's `resource_types()`, the first recommendation. This lost: it returns the bases of registered parameters (`crates/fhir/src/search/registry.rs:538-541`), which in R4 include the abstract `Resource` and `DomainResource` and miss `Binary`, `Parameters` and `OperationOutcome` (`data/search-parameters-r4.json`), so it would undercount.
+        - A per-tenant types table. This lost: another write on every create, for one internal caller.
+    - **G12:** a lease row taken with an LWT. This lost: an LWT per poll, and a lease outliving a crashed holder would stall every intent until it expired.
+    - **G20:**
+        - Keep reading the whole candidate set on every page and sorting in Rust. This lost: the cost on page k is that of all k pages, and every one-sided prefix reaches the cap on large tenants.
+        - Keep `ge` as a union. This lost: two tables with no shared order cannot page natively.
+        - Merge `ne`'s two slices by one key. This lost: the tables share no order, so a merge would need the whole candidate set.
+    - **G22:**
+        - Accept the orphans, the earlier proposal. This lost: the registry changes at runtime per tenant (a `SearchParameter` write invalidates it, `crates/persistence/src/backends/sqlite/storage.rs:520-529`), and the orphans waste point reads, count against the cap, and are never cleaned.
+        - Store the key set on `resource_versions` only, and re-extract `K(N)` when row N is missing, the first form of this decision. This lost after CodeRabbit's review of PR #33: a writer paused after its compare-and-swap while the registry changed leaves orphans (the decision), and it needed an extra read on five operations. Its reason for not storing the set on `resources`, that every compare-and-swap would carry the blob through Paxos, was overstated: the blob is about 300 bytes in a compare-and-swap that already carries the resource's `data`, and it adds no statement or round trip.
+        - Carry `K(N+1)` in the writer's intent row instead. This lost: it does not close the race. B cannot find A's intent, whose key holds A's `enqueued_at`, and A deletes its intent when it resumes, so the sweeper never sees it after a pause shorter than the grace period.
+    - **G23:** 5xx. This lost: a client's retried POST would create a second resource.
+    - **G27:** a new variant mapped to `too-costly`. This lost: it is an upstream change for the same status class, and 422 already tells the client the request was too broad.
+    - **C1:** say there are no URI rows. This lost: the extractor already indexes all four, `meta_params_suite.rs` expects them, and no table change is needed.
+    - **C2:** 400 for a pipe in `_id`. This lost: SQLite and PostgreSQL return an empty result, and the backends should agree.
+    - **C4:** 400 for the pipe form. This lost: SQLite and PostgreSQL accept it, and refusing it would make the backends disagree.
+    - **C5:**
+        - Choose the driver from statistics. This lost: no selectivity source exists, #28's cost hooks are not in the code, and the benchmarks may show the fixed order is enough.
+        - The first recommendation, `_id`, `system|code`, code-only tokens, string, date. This lost: string and date never drive here, and it did not place URI, `|code`, `system|` or `_lastUpdated`.
+        - All URIs in one rank. This lost: a canonical `url` names one resource, while `_profile` and `_source` are tags thousands share.
+    - **C7:** refuse `_has`. This lost: the backend never sees it, so it could not, and the spec does not require it.
+    - **C7, versioned and absolute references:** fix the shared resolver in this fork. This lost: it is upstream's shared code, outside this documentation PR, and the fix belongs with every backend's. Saying nothing lost too: this entry advertises `_has` as served.
+    - **C7, `_has` and chains under a scope:**
+        - Ignored Step 6 rows that expect the fix, as for #2499. This lost: it would let Cassandra search be signed off while a scoped token can read another patient's data through `_has`.
+        - Confine each hop instead of refusing (pass the confinement through `ChainResolveOptions` and set the compartment on each hop's query). Not chosen as the fork patch: it touches the shared resolver in several places. It is the longer-term fix the upstream issue suggests, and the gate rows accept it ("a searchset without p1").
+        - 200 with an empty searchset under a scope, which [R4 security.html#AccessDenied](https://hl7.org/fhir/R4/security.html#AccessDenied) allows. This lost: it silently answers the query wrongly, where a 403 tells the app the truth.
+        - A refusal in the Cassandra backend. Not possible: it sees each hop as an ordinary search, with no principal and no way to tell a hop from a direct search.
+    - **C8, a failed expansion:** refile upstream, or have the Cassandra backend refuse it. Neither: a maintainer declined #2019 three weeks earlier, and the parameter is removed before the backend is called.
+    - **G38:**
+        - The step 1 `param` check alone. This lost: a client's write would be refused because of another client's SearchParameter, and seeding would not see the problem.
+        - Skip index rows under an over-long `param` and log it. This lost: the resource would be silently unsearchable under that parameter, which ADR-aacruzgon-0026 rejected for values.
+        - A length check in the shared loader's `is_valid_search_parameter_code`. Not chosen here: it would protect every backend, but it is upstream's file; it can be proposed upstream separately.
+    - **C6:** a separate, lower backend limit. This lost: REST already clamps, and two limits could disagree.
+    - **C8:** the design's earlier 400. This lost: REST decides these before the backend is called, so the backend cannot change them.
+    - **C9:** accept `_sort=_lastUpdated` (ascending), or `_sort=date` on a date-only search. This lost: the rule stays "only the native order", stated once.
+    - **C11:** a REST-layer 501 checked by name, the first recommendation. This lost: REST passes `_filter` through and SQLite and MongoDB serve it, so a REST-layer refusal would break them.
+    - **P5:** keep writing every extracted row. This lost: one row in three for every `code`-typed element, and `_lastUpdated` rows that move on every update.
+    - **P6:** `initialize` applies the schema. This lost: several processes would change the schema at once, which the Apache docs do not cover.
+    - **G39:**
+        - Keep the literal null and require repair to complete within `resources`' 10-day grace period. This lost: it leaves a correctness property of reads and writes to an operations promise, which a missed repair window breaks.
+        - An always-written `is_deleted boolean`, conditioned on `is_deleted = false`. Not chosen: it is clearer than a sentinel, but it adds a column (93 rows) and two columns that must agree.
+        - Drop the `deleted_at` condition from C2 and C3 and rely on `version_id`. This lost: the revive must still mark the row live, and a missed CAS would no longer return `deleted_at` to tell 404 from 409.
+    - **G40:**
+        - Carry the previous key set in the intent row (`pending_index_writes.previous_index_keys`). Not chosen: a schema change (93 rows) and about 300 bytes more per intent; it keeps the two-crashes limitation.
+        - Keep the intent pending until row V−1 appears, or for up to its 24 h TTL. This lost: an intent from a real double crash would be re-read every poll for a day, and a writer paused longer still orphans.
+    - **Roadmap section 6:** kill the node on Restart. This lost: at RF 1 it would fail by design, so the loss gets its own row.
+- **Consequences:**
+    - **Easier:**
+        - date-only searches page at the cost of one page, not of every earlier page;
+        - fewer index rows and tombstones per write;
+        - deletes remove exactly what a version wrote, whatever the registry says now, so a `SearchParameter` change leaves no orphans;
+        - every error the cap produces is the same 422;
+        - `resources` writes no tombstone, so a missed revive cannot bring a delete back, whatever the repair schedule (G39);
+        - row N always exists once a later compare-and-swap applied, so two crashes in a row no longer lose a version (G40);
+        - the schema has one owner at setup.
+    - **Harder or costlier:**
+        - a date-only page comes in date order, not in the default order, so a client that pages a date-only search and then a token search sees two orders. The scope table says so;
+        - a `_has` with a broad terminal reads every page of it; a Step 8 benchmark case;
+        - one extra point read per `update`;
+        - one extra sequential round trip per `update`, `update_with_match`, `delete`, `delete_versioned` and a `create_or_update` turn on a live row or a marker, for V3 before the compare-and-swap (G40);
+        - `index_keys` costs about 289 bytes per version in the worked example (8 rows), and at most about 4 KB more per row with the 2 KiB rule, stored twice for the current version (`resources` and its version row) and carried in every compare-and-swap's Paxos proposal;
+        - a SearchParameter with a `code` over 128 bytes is refused, a restriction FHIR does not impose;
+        - if the fork patch is needed, a scoped token gets 403 for every `_has` and chain, and for a hop whose type its scopes do not grant (C7);
+        - **known limitations:** on the three-node cluster, `count` can be one too high per row resurrected after a missed delete, and enough such rows in one partition can make a search page return 422 (G7); `_has` misses versioned and absolute source references until upstream fixes #2499; `_has` and chains under a scope are not confined until upstream fixes #2501 or the fork patch lands, which gates Step 6 (C7); a failed terminology expansion widens a search silently (C8, upstream #2019);
+        - **known limitation:** adding a `SearchParameter` does not index existing resources. They are found by it only after their next write, and no reindex exists.
+    - **Schema:** `resources.index_keys blob` and `resource_versions.index_keys blob`. `expected-schema.txt` has 92 rows; the CI assertion checks both columns. G39 and G40 change statements and comments only.
+    - **Settled by earlier decisions, now marked as such in the walk-through:** G14 (ADR-aacruzgon-0011), G15 (ADR-aacruzgon-0025), G19 (the design's `_lastUpdated` rule), G21 (roadmap 6d), G24 and G28 (ADR-aacruzgon-0024), G29 (design step 4), G30 (the design's measure-first decision), C3 (the design's token rules).
+    - **To measure:** date-only page latency in the table's order; how often the cap's 422 fires; the mass-update case (G8); the broad `_has` case and the AND driver (C5, C7); `index_keys` sizes on the fixtures (roadmap sections 7 and Step 8).
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5). An orchestrating Claude Code session ran a Rex worker session in its own worktree.
+    - **What the AI proposed:**
+        - The audit worker identified the open items in its report and in the PR #33 description.
+        - The orchestrating Claude Code session recommended each answer, in two rounds.
+        - The worker checked each answer against the code and the spec, wrote the ones that fit, and reported the ones that did not, with evidence and a proposal. It also drafted this entry.
+    - **Where the code did not fit the recommendations, and what replaced them:**
+        - `count(tenant, None)` over the registry's `resource_types()`: replaced by every enabled version's resource type names.
+        - "`count` and `search_count` differ only while writes are in flight": replaced by the three cases above.
+        - G20's "the table's own order" for `ne` and cross-table comma lists: replaced by reading `date_index`, then `date_index_by_end`.
+        - C11's REST-layer 501: replaced by a backend-layer `BackendError::UnsupportedCapability`, REST unchanged.
+        - C5's order naming string and date, which never drive here, and not placing URI, `|code`, `system|` or `_lastUpdated`: the worker proposed a full order with URI as one rank.
+        - C7's "failing `_has` hop": the example the coverage table gave does not fail; `_has` with a served terminal is answered through the shared resolver.
+    - **C5 and C7, checked against the spec and #28.** At Alan's request, the orchestrating Claude Code session checked the R4 search page, Discussion #28 and the design's polyglot table for both. C5 changed as a result: URI is split into identity URIs (rank 3) and shared tags (`_profile`, `_source`, rank 4). The worker checked the identity URIs against the R4 registry and the `search_all_pages` line numbers.
+    - **Review of PR #33.** CodeRabbit's review raised the five points under "Context". The worker checked each against the spec, the Cassandra 5.0 docs and `cassandra-5.0.9` source, the design and the code, and ran the questions it could settle on a fresh 5.0.9 node; all five were real. The orchestrating Claude Code session recommended an answer to each, and Alan accepted them and the filing of the upstream issue. CodeRabbit's review prompted the G22 change: the worker had first raised the `resources` copy and recorded it as not chosen for its Paxos cost, which it had overstated. The worker filed HeliosSoftware/hfs#2499 after searching upstream for an existing report, and found #2019 already declined for C8.
+    - **Third review of PR #33.** CodeRabbit's third review found the three points under "Context". The worker checked each against the Cassandra 5.0 docs and `cassandra-5.0.9` source, the design and the code, and reproduced G39 on a three-node cluster. G40 predates the `index_keys` change: ADR-aacruzgon-0013's sweeper already read a missing row V−1 as an empty set. The orchestrating Claude Code session recommended the answers: the sentinel for G39, V3 before the CAS for G40, and the cap paragraph. Alan accepted them.
+    - **Fourth review of PR #33.** CodeRabbit's fourth review raised the paging-order, replacement and compartment cases under "Context". The worker's audit found the repair-after-replace gap, the type-scope case and the Cassandra 400/200 chain test, and showed the compartment leak on SQLite with a temporary test that was then reverted. The orchestrating Claude Code session recommended the answers, and recommended gating Step 6 on the four scope rows instead of ignoring them; Alan accepted.
+    - **Fifth review of PR #33.** CodeRabbit's fifth review found two stale statements in `schema/README.md` (the ADR-0024 row's "one allowed null" and the old V3-with-V1 batch); the worker swept `docs/Cassandra/` for other stale copies and fixed one more, in `spike-findings.md`.
+    - **What the human changed:**
+        - Alan accepted all the recommendations, then accepted the worker's four proposals for the first round's misfits, then the C5 and C7 conclusions.
+        - G22 was reversed after Alan asked "why would we leave orphan rows?". The earlier proposal had been to accept them; Alan decided to store each version's key set instead.
+    - **Verified:**
+        - Code read at the PR #33 head (`1a838beca`): the registry's `resource_types()` and the R4 parameter bases; `ResourceTypeScope` and `FhirResourceTypeProvider`; the token converter; the SQLite and PostgreSQL token and `_id` predicates; the SQLite registry invalidation; REST's `_count` clamp and `HFS_MAX_PAGE_SIZE`; the composite gate; the chain resolver; the REST terminology, `_text`, `_content` and `_filter` handling; the error mappings; `PageCursor`.
+        - Spec: [R4 search.html](https://hl7.org/fhir/R4/search.html) #token (the pipe rule), #prefix (`ge`, `ne`), #has, and "Servers are not required to implement any of the standard search parameters"; [R4 datatypes.html#id](https://hl7.org/fhir/R4/datatypes.html#id). Discussion #28's quotes, as cited above.
+        - The R4 registry's `uri` parameters (`data/search-parameters-r4.json`), for the identity URIs.
+        - The `index_keys` sizes were computed by encoding the worked example's key sets: `K(1)` 289 bytes, `K(2)` 293, the empty set 2.
+        - For the review of PR #33: the Cassandra 5.0 [hints](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/hints.html), [repair](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/repair.html) and [tombstones](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/compaction/tombstones.html) pages; `cassandra-5.0.9` `Hint.java`, `Mutation.java`, `StorageProxy.java`, `Config.java`, `CompactionController.java` and `CompactionStrategyManager.java`; `chain_resolver.rs`, the REST terminology expansion, the SearchParameter loader and the seeder at the PR head and on upstream `main` (`be76ebead`); the R4 `SearchParameter.code`, `code` and `string` definitions and search.html #reference, #versions, #modifiers and #errors.
+        - On fresh 5.0.9 nodes for the review: UCS with `only_purge_repaired_tombstones` accepted, which erased the inherited sub-options; the `param` key-length boundary at 61,327 and 61,328 bytes; `schema.cql` with `resources.index_keys` applied twice, silently, with ten tables; the CI assertion passed with 92 rows, and failed with a one-line diff when `resources.index_keys` was left out or typed `text`; C1 to C4 writing `index_keys`, a missed CAS returning only its `IF` columns, and the paused-writer sequence leaving no orphan. The nodes were removed afterwards.
+        - For the third review, on a three-node 5.0.9 cluster (RF 3, Paxos v2), on 2026-11-06:
+            - **Setup.** Two copies of the `resources` shape, both with `gc_grace_seconds = 0`, standing in for the 10 days; it also gives a hint a TTL of 0, standing in for a lost one.
+            - **Steps.** Create and delete, with every node up. Stop one node. Revive, then update to version 4. `listpendinghints` showed none on the two live nodes. Flush and compact the two live nodes. Restart the stopped one, with no repair.
+            - **Literal null.** `CONSISTENCY ALL` returned version 4 with the revived data, but `deleted_at` was the delete's time. Afterwards `ONE` on each node returned that time, because read repair had spread it. The next CAS, `IF version_id = 4 AND deleted_at = null`, missed (`[applied] False`), which maps to 404.
+            - **Sentinel.** `deleted_at` was `1970-01-01` at `ALL` and on every node. The next CAS, `IF version_id = 4 AND deleted_at = 0`, applied.
+            - The cluster was removed afterwards.
+        - On a fresh 5.0.9 node, also 2026-11-06:
+            - **Schema.** `schema.cql` with the G39 comments applied twice, silently, with ten tables. The CI assertion passed with 92 rows, `expected-schema.txt` unchanged. It failed with a one-line diff when `resources.deleted_at` was typed `bigint`.
+            - **The sentinel.** C1, C3 and C4 with `deleted_at = 0` applied on `resources`. A repeat delete missed, returning `deleted_at`, and a C2-style update of the revived row applied. After a flush, `sstabledump` showed no cell tombstone for that row, and one `deleted_at` cell tombstone for a row revived with the literal null.
+            - **G40.** The paused-writer sequence, with V3 after the CAS, left two orphans tagged 2 for version 2 (`resources_by_type` at `lu(2)` and `token_code_index` `gender=female` at `lu(2)`), so `count` was 2 for one resource. The sweeper's R3 of row 2 had returned no row. With V3 before the CAS, R3 returned row 2 with its `index_keys`, and no orphan remained.
+            - The node was removed afterwards.
+        - For the fourth review, on 2026-11-06:
+            - **The compartment leak, on SQLite.** A temporary test in `chain_resolver.rs`'s test module applied the filters `confine_query` sets for p1: an Observation search with the `subject`/`performer` compartment of `Patient/p1` and `code=LEAK-1` returned `[]`; `Patient?_id=p1&_has:Observation:focus:code=LEAK-1` returned `["p1"]`; the same with a code no Observation has returned `[]`. The file was then restored and `git diff` was empty.
+            - **Code.** The four resolver sites, `confine_query` and the middleware's scope check, read in this fork and on upstream `main` at `be76ebead` with `gh api …/contents?ref=…`; the same.
+            - **Docs.** The Cassandra 5.0 [replacing a dead node](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/topo_changes.html#replacing-a-dead-node), [tombstones](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/compaction/tombstones.html#deletion), [hints](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/hints.html) and [repair](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/repair.html) pages; [R4 security.html](https://hl7.org/fhir/R4/security.html); [SMART App Launch STU2.2](https://hl7.org/fhir/smart-app-launch/STU2.2/scopes-and-launch-context.html).
+            - **Upstream.** No existing issue matched on HeliosSoftware/hfs, searched with eleven queries before filing #2501 and eight again just before.
+            - **Schema.** On a fresh 5.0.9 node (the CI compose file): `keyspace-single-node.cql` and `schema.cql` with the new outage comment applied twice, the second time silently, with ten tables. The CI assertion passed with 92 rows, `expected-schema.txt` unchanged. With `resources.deleted_at` typed `bigint` it failed with a one-line diff, and passed again after the real schema was restored. The node was removed afterwards.
+        - On a fresh 5.0.9 node, before the review: `keyspace-single-node.cql` and the revised `schema.cql` applied twice, silently, with ten tables. The CI assertion passed with 91 rows. It failed with a one-line diff when `index_keys` was typed `text` or left out, and passed again after the real schema was restored. V1 with the 289-byte `K(1)`, then a V3 at `write_ts(1) − 1` with another blob: row 1 kept the original blob and data. A V3 for a missing row 2 restored it, and the original written afterwards at `write_ts(2)` replaced every cell. The node was removed afterwards.
+- **Links:**
+    - **Files:**
+        - `docs/Cassandra/schema/schema.cql` (`resources.index_keys`, `resource_versions.index_keys`, the encoding, the hint note, the statement rules) and `schema/expected-schema.txt`;
+        - `docs/Cassandra/schema/walkthrough.md`: section 1, section 2 ("Stored key sets"), 3.1 to 3.5, 5.1, 5.7, 5.9, 5.11, section 6, the worked example, section 8 (G2, G3, G7, G9, G13, G22, G31, G38, G39, G40), section 2's "`deleted_at` and its readers";
+        - `schema/coverage.md`: sections 1 to 7, including the `_has` reference, terminology fail-open, SearchParameter `code`, chain and scoped-search rows in section 6;
+        - `schema/README.md`: checklist, changes table, proposals and decisions;
+        - `cassandra-discussion.md`: scope table, `_id` note, paging capability, data model, token rules, write path steps 1 and 4, sweeper, repair, tombstones, capabilities and rejection, open questions, `count`;
+        - `development-roadmap.md`: rows 5.2 and 6a, Step 1 checklist, Steps 5, 6, 6a, 6b and 8, sections 5 and 6.
+    - **Builds on:** ADR-aacruzgon-0009, 0012, 0013, 0017, 0024, 0026.
+    - **Supersedes:** ADR-aacruzgon-0024's literal-null rule (the revive's `SET deleted_at = null`), replaced by `deleted_at = 0` (G39); ADR-0024 itself is unchanged. It also revises ADR-aacruzgon-0012's placement of V3 and ADR-aacruzgon-0013's missing-row rule (G40).
+    - **Sources:** [R4 search.html](https://hl7.org/fhir/R4/search.html); [R4 SearchParameter.code](https://hl7.org/fhir/R4/searchparameter-definitions.html#SearchParameter.code); [R4 datatypes.html#code](https://hl7.org/fhir/R4/datatypes.html#code); [Discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28); Cassandra 5.0 [hints](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/hints.html) and [repair](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/repair.html); [HeliosSoftware/hfs#2019](https://github.com/HeliosSoftware/hfs/issues/2019); [HeliosSoftware/hfs#2499](https://github.com/HeliosSoftware/hfs/issues/2499); [HeliosSoftware/hfs#2501](https://github.com/HeliosSoftware/hfs/issues/2501); Cassandra 5.0 [replacing a dead node](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/topo_changes.html#replacing-a-dead-node); [R4 security.html](https://hl7.org/fhir/R4/security.html); [SMART App Launch STU2.2](https://hl7.org/fhir/smart-app-launch/STU2.2/scopes-and-launch-context.html).
+    - **Pull request:** [PR #33](https://github.com/aacruzgon/hfs-Cassandra-CS4411/pull/33), from branch `docs/schema-audit-fixes`.

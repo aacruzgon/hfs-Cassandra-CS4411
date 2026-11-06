@@ -221,6 +221,33 @@ jobs:
           echo "$tables"
           [ "$(echo "$tables" | wc -l)" -eq 10 ]
 
+      # What the design relies on, read back from system_schema and compared
+      # with docs/Cassandra/schema/expected-schema.txt (ADR-aacruzgon-0026):
+      # every table and column, each key column's kind and position, each
+      # clustering column's order, and gc_grace_seconds, default_time_to_live
+      # and the compaction class and scaling parameters (ADR-aacruzgon-0009,
+      # 0010). Each query's rows are trimmed, joined by single spaces and
+      # sorted bytewise (LC_ALL=C), so the comparison depends on neither cqlsh's
+      # column padding nor the runner's locale.
+      # After a deliberate change to schema.cql, regenerate the file with this
+      # same function and review the diff with the change.
+      - name: Check tables, keys, clustering order and options against the design
+        run: |
+          q() {
+            cqlsh 127.0.0.1 "$CASSANDRA_HOST_PORT" -e "$1" 2>/dev/null \
+              | awk -F'|' 'NF > 1 && !/^-/ { out = ""; for (i = 1; i <= NF; i++) { gsub(/^ +| +$/, "", $i); out = out (i > 1 ? " " : "") $i }; print out }' \
+              | tail -n +2 | LC_ALL=C sort
+          }
+          actual="$RUNNER_TEMP/actual-schema.txt"
+          {
+            echo "# columns: table column kind position clustering_order type"
+            q "SELECT table_name, column_name, kind, position, clustering_order, type FROM system_schema.columns WHERE keyspace_name = 'helios'"
+            echo "# options: table gc_grace_seconds default_time_to_live compaction_class scaling_parameters"
+            q "SELECT table_name, gc_grace_seconds, default_time_to_live, compaction['class'], compaction['scaling_parameters'] FROM system_schema.tables WHERE keyspace_name = 'helios'"
+          } > "$actual"
+          diff -u docs/Cassandra/schema/expected-schema.txt "$actual"
+          echo "schema matches docs/Cassandra/schema/expected-schema.txt ($(grep -vc '^#' "$actual") rows)"
+
       - name: Cassandra logs
         if: failure()
         run: docker compose -p hfs-cassandra-ci logs --tail 200

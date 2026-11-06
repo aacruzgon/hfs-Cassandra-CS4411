@@ -9,6 +9,11 @@ its `name:` (the first argument) and this runner's name, among the attempt's
 in-progress jobs. Steps that have not finished, this one and any after it,
 have no duration yet and are listed as such.
 
+The API reports a step's completion a few seconds late, so a step that ended
+just before this one can still read "in_progress". The script re-reads the
+jobs, every 3 s for up to SETTLE_S, until this step is the only one in
+progress, and says so if it gives up.
+
 Usage: job-step-timings.py <job name> <out-dir>
 Writes <out-dir>/step-timings.json and .md and prints the Markdown. An API
 error is reported in the output, and the script still exits 0: a missing
@@ -19,9 +24,14 @@ import http.client
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+
+
+SETTLE_S = 30
+RETRY_S = 3
 
 
 def iso(ts):
@@ -62,22 +72,29 @@ def main():
         f"{api}/repos/{env['GITHUB_REPOSITORY']}/actions/runs/{env['GITHUB_RUN_ID']}"
         f"/attempts/{env.get('GITHUB_RUN_ATTEMPT', '1')}/jobs?per_page=100"
     )
-    try:
-        jobs = fetch(url, env["GITHUB_TOKEN"])["jobs"]
-    # OSError covers URLError, socket.timeout (not a TimeoutError before
-    # Python 3.10) and a reset connection; HTTPException an incomplete read.
-    except (OSError, KeyError, ValueError, http.client.HTTPException) as e:
-        write(out_dir, {"report": "step-timings", "job": job_name, "error": str(e)},
-              f"Step timings unavailable: {e}\n")
-        return
     runner = env.get("RUNNER_NAME")
-    candidates = [j for j in jobs if j["name"] == job_name and j["status"] == "in_progress"]
-    mine = [j for j in candidates if j.get("runner_name") == runner] or candidates
-    if not mine:
-        write(out_dir, {"report": "step-timings", "job": job_name, "error": "job not found"},
-              f"Step timings unavailable: no in-progress job named `{job_name}` in this run.\n")
-        return
-    job = mine[0]
+    deadline = time.monotonic() + SETTLE_S
+    while True:
+        try:
+            jobs = fetch(url, env["GITHUB_TOKEN"])["jobs"]
+        # OSError covers URLError, socket.timeout (not a TimeoutError before
+        # Python 3.10) and a reset connection; HTTPException an incomplete read.
+        except (OSError, KeyError, ValueError, http.client.HTTPException) as e:
+            write(out_dir, {"report": "step-timings", "job": job_name, "error": str(e)},
+                  f"Step timings unavailable: {e}\n")
+            return
+        candidates = [j for j in jobs if j["name"] == job_name and j["status"] == "in_progress"]
+        mine = [j for j in candidates if j.get("runner_name") == runner] or candidates
+        if not mine:
+            write(out_dir, {"report": "step-timings", "job": job_name, "error": "job not found"},
+                  f"Step timings unavailable: no in-progress job named `{job_name}` in this run.\n")
+            return
+        job = mine[0]
+        running = [st for st in job["steps"] if st["status"] == "in_progress"]
+        settled = len(running) <= 1
+        if settled or time.monotonic() >= deadline:
+            break
+        time.sleep(RETRY_S)
 
     started = iso(job.get("started_at"))
     rows = []
@@ -101,12 +118,14 @@ def main():
         "runner": job.get("runner_name"),
         "job_started_at": job.get("started_at"),
         "finished_steps_s": total,
+        "settled": settled,
         "steps": rows,
     }
 
     lines = [
         f"Job `{job_name}` on `{job.get('runner_name')}`, job id {job['id']}: "
-        f"{total} s across its finished steps. The API gives whole seconds, so short steps read 0 s.",
+        f"{total} s across its finished steps. The API gives whole seconds, so short steps read 0 s."
+        + ("" if settled else f" The API still showed an earlier step running after {SETTLE_S} s, so its time is missing."),
         "",
         "| # | Step | Result | Seconds | Share |",
         "| ---: | --- | --- | ---: | ---: |",

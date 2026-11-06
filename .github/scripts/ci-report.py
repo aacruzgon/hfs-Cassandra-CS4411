@@ -349,8 +349,8 @@ def report_build(args, command, status, wall, group, sampled, peaks, oom, timing
     # Cold or warm: L10's "Target directory size" section says whether the
     # reset step reset the directory.
     if timings and timings.get("html"):
-        md += (f"\n`cargo --timings`: {timings['units']} units, {timings.get('fresh_units') or '?'} fresh, total "
-               f"{timings.get('total_time') or '?'}; the full chart is `{timings['html']}` in the artifact.")
+        md += (f"\n`cargo --timings`: {timings['units']} units compiled, {timings.get('fresh_units') or '?'} already up to "
+               f"date, total {timings.get('total_time') or '?'}; the full chart is `{timings['html']}` in the artifact.")
         if timings["slowest"]:
             md += " Slowest units:\n\n" + table(["Unit", "Mode", "Time"], [[f"`{u['unit']}`", u["mode"], f"{u['seconds']:.1f} s"] for u in timings["slowest"]])
         else:

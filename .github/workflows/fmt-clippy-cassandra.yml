@@ -230,7 +230,10 @@ jobs:
       # kills the cgroup had during the build. The EXIT trap stops the
       # sampler and prints all of it on a failed build too.
       # nice, as for clippy: sam-7900x is also Sam's desktop.
-      - name: Build tests/cassandra_tests.rs and backend_capability_contract.rs and print the memory peak
+      # The Milestone A test (crates/hfs/tests/cassandra_milestone_a.rs) is
+      # built here too, so the sampler covers it: hfs with only the cassandra
+      # backend, and the test binary that starts it.
+      - name: Build tests/cassandra_tests.rs, backend_capability_contract.rs and the Milestone A test, and print the memory peak
         run: |
           cgroup="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
           peaks="$RUNNER_TEMP/build-memory-peaks"
@@ -264,6 +267,8 @@ jobs:
           fi
           nice -n 10 cargo test -p helios-persistence --features cassandra \
             --test cassandra_tests --test backend_capability_contract --no-run
+          nice -n 10 cargo test -p helios-hfs --no-default-features --features R4,cassandra \
+            --test cassandra_milestone_a --no-run
 
       # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
       - name: Remove leftovers of an earlier run
@@ -334,6 +339,27 @@ jobs:
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-persistence --features cassandra \
               --test cassandra_tests --test backend_capability_contract
+
+      # Milestone A (roadmap Step 2, item 2.7): the real hfs binary on this
+      # node, POST /Patient then GET /Patient/{id}. Built above.
+      - name: Milestone A round trip through hfs against this node
+        run: |
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+            cargo test -p helios-hfs --no-default-features --features R4,cassandra \
+              --test cassandra_milestone_a -- --exact milestone_a_create_then_read_through_rest
+
+      # Step 2's exit criterion: /_readiness reports down while Cassandra is
+      # stopped, and up once it is back. The test stops and starts this job's
+      # own node, named by HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER (the opt-in;
+      # the test checks the container publishes the URL's port), so it is the
+      # job's last test step. --nocapture prints the down and up times.
+      - name: Milestone A readiness, stopping and starting this job's node (last test step)
+        run: |
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+          HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER=hfs-cassandra-ci-cassandra-1 \
+            cargo test -p helios-hfs --no-default-features --features R4,cassandra \
+              --test cassandra_milestone_a -- --exact readiness_reports_down_while_cassandra_is_stopped \
+              --nocapture
 
       - name: Cassandra logs
         if: failure()

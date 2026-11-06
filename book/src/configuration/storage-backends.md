@@ -115,12 +115,27 @@ The Cassandra backend is in development: create and read work, and the rest of t
 
 ```bash
 cargo build -p helios-hfs --features cassandra
-HFS_STORAGE_BACKEND=cassandra ./target/debug/hfs
+HFS_STORAGE_BACKEND=cassandra \
+HFS_CASSANDRA_CONTACT_POINTS=127.0.0.1:9042 \
+  ./target/debug/hfs
 ```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_CASSANDRA_CONTACT_POINTS` | `127.0.0.1:9042` | Comma-separated `host:port` list |
+| `HFS_CASSANDRA_KEYSPACE` | `helios` | Keyspace holding the ten tables |
+| `HFS_CASSANDRA_LOCAL_DC` | `helios-dc1` | Data centre whose nodes serve every request |
+| `HFS_CASSANDRA_USERNAME`, `HFS_CASSANDRA_PASSWORD` | unset | `PasswordAuthenticator` credentials; set both or neither |
+| `HFS_CASSANDRA_POOL_SIZE` | `2` | Connections per local node |
+| `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection |
+| `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` | `10000` | The backend's own deadline for one statement |
+
+An invalid value fails startup.
 
 - **The schema is applied separately.** The server never creates the keyspace or the tables; at startup it only checks that the ten tables exist. Apply `docs/Cassandra/schema/keyspace-single-node.cql` and then `docs/Cassandra/schema/schema.cql` with `cqlsh` once, before the first start.
 - **No database audit sink.** The Cassandra backend does not store AuditEvents, so `HFS_AUDIT_BACKEND=database` fails at startup. Use `file` or `cloudwatch`.
 - **Standalone only.** There is no Cassandra + Elasticsearch mode.
+- **No SQL-on-FHIR.** The backend has no in-database SQL-on-FHIR runner, so the server turns SQL-on-FHIR off at startup with a warning, and `$viewdefinition-run` and `$sql-run` answer `501`. Setting `HFS_SOF_ENABLED=true` explicitly fails startup.
 - **No per-user settings, login-session store, bulk export, bulk submit, `$purge` or `$reindex`.** Those endpoints answer `501`, and web login sessions are held in process.
 
 ## Choosing a Backend

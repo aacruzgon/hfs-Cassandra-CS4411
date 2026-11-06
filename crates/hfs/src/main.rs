@@ -2032,8 +2032,9 @@ fn attach_login_sessions(
 /// node, but a cluster needs sticky sessions and a restart signs everyone
 /// out. Said once at startup so an operator knows which mode they are in.
 /// Reached from this binary's environment by `HFS_S3_TENANCY=bucket-per-tenant`
-/// with no `HFS_S3_SYSTEM_BUCKET` (#1598; before that, #1514).
-#[cfg(feature = "s3")]
+/// with no `HFS_S3_SYSTEM_BUCKET` (#1598; before that, #1514), and by every
+/// standalone Cassandra primary, which keeps no login sessions.
+#[cfg(any(feature = "s3", feature = "cassandra"))]
 fn warn_login_sessions_in_process(auth_state: Option<&Arc<AuthMiddlewareState>>) {
     if auth_state.is_some_and(|state| state.sessions.is_some()) {
         warn!(
@@ -2292,7 +2293,8 @@ async fn main() -> anyhow::Result<()> {
     feature = "postgres",
     feature = "mongodb",
     feature = "elasticsearch",
-    feature = "s3"
+    feature = "s3",
+    feature = "cassandra"
 ))]
 async fn seed_conformance_resources<S>(
     backend: &S,
@@ -2331,7 +2333,8 @@ async fn seed_conformance_resources<S>(
     feature = "postgres",
     feature = "mongodb",
     feature = "elasticsearch",
-    feature = "s3"
+    feature = "s3",
+    feature = "cassandra"
 ))]
 async fn provisioned_tenants<S>(backend: &S, config: &ServerConfig) -> Vec<String>
 where
@@ -4625,20 +4628,162 @@ async fn start_s3(
 
 /// Starts the server with the Apache Cassandra backend.
 ///
-/// Placeholder until the backend module lands (roadmap Step 2, layer L2):
-/// the `cassandra` feature is threaded through so the mode parses and the
-/// build is exercised, but there is no backend type to construct yet.
+/// Modelled on [`start_s3`], passing `None` for every store and bundle the
+/// backend does not implement (cassandra-discussion.md, "What else the server
+/// expects from a primary backend"): login sessions stay in process, there is
+/// no per-user settings store (`/_user/settings` is 501) and no bulk-provider
+/// store, `$purge` and `$reindex` are 501, and there is no bulk export or bulk
+/// submit (501).
+///
+/// The schema is never applied here (P6, ADR-aacruzgon-0027): `initialize`
+/// only checks that the ten tables exist, and startup stops, naming the
+/// schema files, if any is missing.
 #[cfg(feature = "cassandra")]
 async fn start_cassandra(
-    _config: ServerConfig,
-    _auth_config: AuthConfig,
-    _auth_state: Option<Arc<AuthMiddlewareState>>,
-    _audit_state: Option<Arc<AuditMiddlewareState>>,
+    mut config: ServerConfig,
+    auth_config: AuthConfig,
+    auth_state: Option<Arc<AuthMiddlewareState>>,
+    audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "The cassandra backend is not implemented in this build yet \
-         (development-roadmap.md, Step 2)"
+    use helios_persistence::backends::cassandra::CassandraBackend;
+    use helios_persistence::core::Backend;
+
+    config.sof_enabled = cassandra_sof_enabled(
+        config.sof_enabled,
+        std::env::var_os("HFS_SOF_ENABLED").is_some(),
+    )?;
+    let backend_config = build_cassandra_config(&config, |name| std::env::var(name).ok())?;
+    // Contact points are `host:port` and carry no credentials; the password
+    // never reaches this line.
+    info!(
+        contact_points = ?backend_config.contact_points,
+        keyspace = %backend_config.keyspace,
+        local_dc = %backend_config.local_dc,
+        "Initializing Cassandra backend"
+    );
+    let backend = CassandraBackend::connect(backend_config)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to initialize Cassandra backend: {e}"))?;
+    backend
+        .initialize()
+        .await
+        .map_err(|e| anyhow::anyhow!("Cassandra schema check failed: {e}"))?;
+    let backend = Arc::new(backend);
+
+    warn_login_sessions_in_process(auth_state.as_ref());
+    let serve_audit_state = audit_state.clone();
+    // REST writes and the conformance seed report to the one write observer
+    // (#1078).
+    let observability = helios_rest::WriteObservability::new();
+    // No tenant registry (`supports_tenant_registry` is false), so this seeds
+    // the default tenant only. Each SearchParameter and CompartmentDefinition
+    // is one lightweight-transaction create, fanned out at
+    // `bulk_write_concurrency`.
+    seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
+    spawn_cassandra_search_param_refresh(backend.clone(), &config);
+
+    let ui_tenants: Option<Arc<dyn ResourceStorage>> =
+        Some(backend.clone() as Arc<dyn ResourceStorage>);
+    let ops = OperationsBundle {
+        purge: None,
+        reindex: None,
+        observability: Some(observability.clone()),
+    };
+    let app = create_app_with_auth_bulk_settings_and_ops(
+        backend,
+        config.clone(),
+        auth_config,
+        auth_state,
+        audit_state,
+        None,
+        None,
+        None,
+        ops,
+    );
+    serve(
+        app,
+        &config,
+        serve_audit_state,
+        ui_tenants,
+        None,
+        None,
+        Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        None,
     )
+    .await
+}
+
+/// Whether SQL-on-FHIR stays on for a Cassandra primary: never. The backend
+/// has no in-DB SOF runner (SQL-on-FHIR is outside the Cassandra backend's
+/// scope), and `build_app` panics when SOF is on without one.
+///
+/// SOF is on by default, so the default is switched off with a warning, and
+/// `$viewdefinition-run`/`$sql-run` answer 501. An operator who set
+/// `HFS_SOF_ENABLED=true` explicitly asked for it, so startup fails instead of
+/// dropping the feature they asked for.
+#[cfg(feature = "cassandra")]
+fn cassandra_sof_enabled(sof_enabled: bool, set_explicitly: bool) -> anyhow::Result<bool> {
+    match (sof_enabled, set_explicitly) {
+        (false, _) => Ok(false),
+        (true, true) => anyhow::bail!(
+            "HFS_SOF_ENABLED=true is not supported with HFS_STORAGE_BACKEND=cassandra: the \
+             Cassandra backend has no in-DB SQL-on-FHIR runner. Unset it or set \
+             HFS_SOF_ENABLED=false"
+        ),
+        (true, false) => {
+            warn!(
+                "SQL-on-FHIR is not available on the Cassandra backend; turning it off \
+                 ($viewdefinition-run and $sql-run answer 501 Not Implemented)"
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// The Cassandra backend's configuration: the `HFS_CASSANDRA_*` settings
+/// read through `env` (`CassandraConfig::from_env_with`), plus the server's
+/// default FHIR version and data directory, as every other backend gets them.
+#[cfg(feature = "cassandra")]
+fn build_cassandra_config<F>(
+    config: &ServerConfig,
+    env: F,
+) -> anyhow::Result<helios_persistence::backends::cassandra::CassandraConfig>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut backend_config =
+        helios_persistence::backends::cassandra::CassandraConfig::from_env_with(env)?;
+    backend_config.fhir_version = config.default_fhir_version;
+    backend_config.data_dir = config.data_dir.clone();
+    Ok(backend_config)
+}
+
+/// Cassandra flavor of the periodic registry refresh (#235).
+/// `HFS_SEARCH_PARAM_CACHE_TTL=0` disables it. A failed pass keeps serving
+/// the stale cache; the next tick retries.
+#[cfg(feature = "cassandra")]
+fn spawn_cassandra_search_param_refresh(
+    backend: Arc<helios_persistence::backends::cassandra::CassandraBackend>,
+    config: &ServerConfig,
+) {
+    let ttl = config.search_param_cache_ttl;
+    if ttl == 0 {
+        return;
+    }
+    let interval = std::time::Duration::from_secs(ttl);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match backend.refresh_stored_search_parameters().await {
+                Ok(stored) => {
+                    tracing::debug!(stored, "SearchParameter registry refreshed from storage")
+                }
+                Err(e) => tracing::warn!(
+                    "SearchParameter registry refresh failed; serving the stale cache: {e}"
+                ),
+            }
+        }
+    });
 }
 
 /// Fallback when cassandra feature is not enabled.
@@ -6257,6 +6402,42 @@ mod tests {
         ] {
             assert_eq!(patient_name_search_support(mode), expected, "{mode:?}");
         }
+    }
+
+    /// The server's default FHIR version and data directory reach the
+    /// Cassandra backend's configuration, and a bad `HFS_CASSANDRA_*` value
+    /// fails startup instead of falling back.
+    #[cfg(feature = "cassandra")]
+    #[test]
+    fn cassandra_config_takes_the_servers_version_and_data_dir() {
+        let config = ServerConfig {
+            data_dir: Some(std::path::PathBuf::from("/srv/hfs-data")),
+            ..ServerConfig::default()
+        };
+        let backend_config = build_cassandra_config(&config, |name| {
+            (name == "HFS_CASSANDRA_CONTACT_POINTS").then(|| "127.0.0.1:59042".to_string())
+        })
+        .unwrap();
+        assert_eq!(backend_config.contact_points, vec!["127.0.0.1:59042"]);
+        assert_eq!(backend_config.fhir_version, config.default_fhir_version);
+        assert_eq!(backend_config.data_dir, config.data_dir);
+
+        let bad = build_cassandra_config(&config, |name| {
+            (name == "HFS_CASSANDRA_POOL_SIZE").then(|| "many".to_string())
+        });
+        assert!(bad.is_err());
+    }
+
+    /// SQL-on-FHIR is switched off by default on Cassandra, and an explicit
+    /// `HFS_SOF_ENABLED=true` fails startup.
+    #[cfg(feature = "cassandra")]
+    #[test]
+    fn cassandra_turns_sql_on_fhir_off_unless_asked_for() {
+        assert!(!cassandra_sof_enabled(true, false).unwrap());
+        assert!(!cassandra_sof_enabled(false, true).unwrap());
+        assert!(!cassandra_sof_enabled(false, false).unwrap());
+        let message = cassandra_sof_enabled(true, true).unwrap_err().to_string();
+        assert!(message.contains("HFS_SOF_ENABLED=false"), "{message}");
     }
 
     /// `HFS_AUDIT_BACKEND=database` on a Cassandra primary fails at startup

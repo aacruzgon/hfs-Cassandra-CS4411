@@ -120,7 +120,8 @@ To list what is owed: `SELECT * FROM secondary_sync_failures ORDER BY last_faile
 | S3 plus Elasticsearch | `s3-elasticsearch` or `s3-es` |
 | Cassandra (in development: create and read) | `cassandra` |
 
-Cassandra requires `--features cassandra` and a node with `docs/Cassandra/schema/keyspace-single-node.cql` and `schema.cql` already applied (the server only checks that the ten tables exist). `HFS_AUDIT_BACKEND=database` is refused at startup on Cassandra, which stores no AuditEvents.
+Cassandra requires `--features cassandra` and a node with `docs/Cassandra/schema/keyspace-single-node.cql` and `schema.cql` already applied (the server only checks that the ten tables exist). `HFS_AUDIT_BACKEND=database` is refused at startup on Cassandra, which stores no AuditEvents. SQL-on-FHIR is turned off with a warning (no in-DB runner); an explicit `HFS_SOF_ENABLED=true` fails startup.
+Connection settings are `HFS_CASSANDRA_CONTACT_POINTS` (default `127.0.0.1:9042`; the local Compose node is `127.0.0.1:59042`), `_KEYSPACE` (`helios`), `_LOCAL_DC` (`helios-dc1`), `_USERNAME`/`_PASSWORD`, `_POOL_SIZE` (`2`), `_CONNECT_TIMEOUT_MS` (`5000`) and `_REQUEST_TIMEOUT_MS` (`10000`); see `crates/persistence/README.md`, "Cassandra".
 
 S3 requires `--features s3`:
 

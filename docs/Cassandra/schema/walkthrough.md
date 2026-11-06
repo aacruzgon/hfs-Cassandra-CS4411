@@ -8,7 +8,7 @@ This walks every in-scope operation through the ten tables, statement by stateme
 
 Code facts were checked against the working tree on 2026-10-13 (`crates/persistence`, `crates/rest`). "Checked on a 5.0.9 node, 2026-10-13" marks live tests on a single Cassandra 5.0.9 node. Revised on 2026-10-14 for the design changes in ADR-aacruzgon-0012 to 0017, and on 2026-11-05 for ADR-aacruzgon-0024, 0026 and 0027. For ADR-0026 the code facts it relies on were re-checked on 2026-11-05 against `main` after the upstream sync (PR #28): `SearchQuery.fhir_version` and `SearchQuery.compartment`, the compartment membership rule of SQLite and MongoDB, the error variants, and every line reference in section 8. "Checked on a 5.0.9 node, 2026-11-05" marks the tests for ADR-0026.
 
-> **Read this first.** No gap is open. The seven most serious gaps of the first draft (G1, G2, G4, G5, G6, G10, G11) are resolved in the design. So are G3, G9, G13, G16, G25, G26 and G31, the schema audit's G33 to G37 (ADR-aacruzgon-0026), and G7, G8, G12, G17, G18, G20, G22, G23, G27 and G32 (ADR-aacruzgon-0027). G14, G15, G19, G21, G24, G28, G29 and G30 were already settled by an earlier decision. Section 8 says how. G22 changed the schema: every version row now stores the index rows it wrote, as `index_keys`, and every compare-and-swap writes the same set into `resources.index_keys` (section 2, "Stored key sets"). G38, a bound on a custom SearchParameter's `code`, came from review on PR #33 (ADR-aacruzgon-0027).
+> **Read this first.** No gap is open. The seven most serious gaps of the first draft (G1, G2, G4, G5, G6, G10, G11) are resolved in the design. So are G3, G9, G13, G16, G25, G26 and G31, the schema audit's G33 to G37 (ADR-aacruzgon-0026), and G7, G8, G12, G17, G18, G20, G22, G23, G27 and G32 (ADR-aacruzgon-0027). G14, G15, G19, G21, G24, G28, G29 and G30 were already settled by an earlier decision. Section 8 says how. G22 changed the schema: every version row now stores the index rows it wrote, as `index_keys`, and every compare-and-swap writes the same set into `resources.index_keys` (section 2, "Stored key sets"). G38 (a bound on a custom SearchParameter's `code`), G39 (`resources.deleted_at` without a tombstone) and G40 (V3 before the CAS) came from review on PR #33 (ADR-aacruzgon-0027).
 
 ## Contents
 
@@ -91,14 +91,14 @@ Partition: one `(bucket, shard)`. `bucket` is the UTC hour of `enqueued_at` (`'2
 
 ### Compare-and-swap on `resources`
 
-All four use `LOCAL_SERIAL` for Paxos and `LOCAL_QUORUM` for the commit, on partition `(T, P, id)`. Absent columns are left unset, never bound to null. The one exception is C4's literal `deleted_at = null` (G13). `fhir_version` is the request's only in C1. C2 and C4 bind the version the resource was created with, from `current` or R1, as every other backend keeps it (ADR-aacruzgon-0024).
+All four use `LOCAL_SERIAL` for Paxos and `LOCAL_QUORUM` for the commit, on partition `(T, P, id)`. Absent columns are left unset, never bound to null, with no exception. `resources.deleted_at` is always written: `0` (1970-01-01T00:00:00Z) means live, and a delete writes its own time, so `resources` never holds a tombstone (G39). `fhir_version` is the request's only in C1. C2 and C4 bind the version the resource was created with, from `current` or R1, as every other backend keeps it (ADR-aacruzgon-0024).
 
 ```sql
 -- C1: create (POST, or create_or_update on a missing id). Version 1.
 INSERT INTO resources
        (tenant_id, resource_type, id, version_id, data, last_updated,
-        created_at, fhir_version, write_ts, write_id, index_keys)
-VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)    -- index_keys = K(1)
+        created_at, fhir_version, write_ts, write_id, index_keys, deleted_at)
+VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 0)    -- index_keys = K(1); deleted_at 0 = live (G39)
 IF NOT EXISTS;
 
 -- C2: update of a live row, N -> N+1. fhir_version = current's (fixed at create).
@@ -106,22 +106,23 @@ UPDATE resources
    SET version_id = ?, data = ?, last_updated = ?, fhir_version = ?,
        write_ts = ?, write_id = ?, index_keys = ?     -- K(N+1)
  WHERE tenant_id = ? AND resource_type = ? AND id = ?
-    IF version_id = ? AND deleted_at = null;
+    IF version_id = ? AND deleted_at = 0;             -- 0 = live (G39)
 
 -- C3: delete (plain and versioned), N -> N+1. Soft delete; never a CQL DELETE.
 UPDATE resources
    SET version_id = ?, deleted_at = ?, last_updated = ?, write_ts = ?, write_id = ?,
-       index_keys = 0x0100                             -- the empty set
+       index_keys = 0x0100                             -- the empty set; deleted_at = lu(N+1)
  WHERE tenant_id = ? AND resource_type = ? AND id = ?
-    IF version_id = ? AND deleted_at = null;
+    IF version_id = ? AND deleted_at = 0;
 
 -- C4: revive (create_or_update on a deleted row), N -> N+1.
--- deleted_at = null is a literal in the statement, not a bound null.
--- It writes one cell tombstone, on purpose (G13).
+-- deleted_at = 0 marks the row live again. It is an ordinary cell, newer than the
+-- delete's, so the revive writes no tombstone (G39; replaces ADR-aacruzgon-0024's
+-- literal deleted_at = null).
 -- fhir_version = the original, from the row R1 read, never the request's (G13).
 UPDATE resources
    SET version_id = ?, data = ?, last_updated = ?, fhir_version = ?,
-       write_ts = ?, write_id = ?, index_keys = ?, deleted_at = null   -- K(N+1)
+       write_ts = ?, write_id = ?, index_keys = ?, deleted_at = 0   -- K(N+1); live
  WHERE tenant_id = ? AND resource_type = ? AND id = ?
     IF version_id = ?;
 ```
@@ -130,7 +131,7 @@ Every CAS writes `index_keys`, the key set of the version it creates (G22, below
 
 **What a CAS returns when not applied** (spike A1; checked on a 5.0.9 node, 2026-10-13, and again with `index_keys` on 2026-11-05): `[applied] False` plus exactly the `IF`-clause columns with their current values, never `index_keys`. On a missing row, `[applied] False` only. `IF NOT EXISTS` returns the whole existing row.
 
-**How it maps** (design step 3): no columns → `NotFound`, 404; `deleted_at` set → `NotFound`, 404; any other `version_id` → `VersionConflict`, 409. A write never returns 410; only `read` and `vread` do. After a definite miss the request runs I2.
+**How it maps** (design step 3): no columns → `NotFound`, 404; `deleted_at > 0` → `NotFound`, 404; any other `version_id` → `VersionConflict`, 409. A write never returns 410; only `read` and `vread` do. After a definite miss the request runs I2.
 
 ### Version rows (`resource_versions`)
 
@@ -148,16 +149,18 @@ INSERT INTO resource_versions
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 USING TIMESTAMP ?;                       -- ts(V)
 
--- V3: rewrite of row N on update, delete and revive (ADR-aacruzgon-0012).
--- V1, or V2 for a marker (deleted_at set, data unset), from what the writer holds,
+-- V3: rewrite of row N on update, delete and revive (ADR-aacruzgon-0012), written at
+-- step 2, before I1 and the CAS (G40).
+-- V1, or V2 for a marker (deleted_at > 0, data unset), from what the writer holds,
 -- USING TIMESTAMP ts(N) - 1.  One microsecond older than the original row.
+-- A content row leaves deleted_at unset: the live sentinel 0 is only for resources.
 -- Built from R1 (delete, create_or_update, update_with_match): write_id = R1's write_id.
 -- Built from update's StoredResource, which has no write_id: write_id left unset (G36).
 -- index_keys: K(N), the index_keys of the resources row the writer read at
 -- version N (R1; G22). Never left unset, and never re-extracted.
 ```
 
-Partition: `(T, P, id)` of `resource_versions`, a different table from `resources`. Every version row carries the resource's own `fhir_version`, the one it was created with (G13), and the `write_id` of the CAS that created it, except a V3 built from `update`'s `StoredResource` (G36), and the `index_keys` of the version (G22, below). V3 and the `N+1` row may share one single-partition batch, each with its own `USING TIMESTAMP`. If row `N` exists, the original wins every cell, even if the content re-serialises differently; if `N`'s request crashed before its step 4, V3 restores it.
+Partition: `(T, P, id)` of `resource_versions`, a different table from `resources`. Every version row carries the resource's own `fhir_version`, the one it was created with (G13), and the `write_id` of the CAS that created it, except a V3 built from `update`'s `StoredResource` (G36), and the `index_keys` of the version (G22, below). V3 is written at step 2, before the CAS (G40), so it no longer shares a batch with the `N+1` row. If row `N` exists, the original wins every cell, even if the content re-serialises differently; if `N`'s request crashed or paused before its step 4, V3 restores it. So whenever a CAS creating `N+1` has applied, row `N` exists, with the exact `K(N)`.
 
 ### Stored key sets (`index_keys`, G22)
 
@@ -167,12 +170,12 @@ Each version row stores `K(V)`, the index rows that version wrote, and the `reso
 - **Size.** The worked example's `K(1)`, 8 rows, is 289 bytes; `K(2)` is 293 (`female` for `male`); a marker's empty set is 2 bytes (computed from the encoding, section 7). The 2,048-byte rule bounds each value, so a blob grows by at most about 4 KB per row. The blob is in a single-partition write, which the batch thresholds do not check (`spike-findings.md`, B1).
 - **Written** with the version, in statements that already run, so no extra write:
     - in `resources`, by every CAS: C1, C2 and C4 write `K(N+1)`, and C3 the empty set;
-    - in `resource_versions`, in the same row and statement as the version: V1 and V2 at step 4, V3, and the sweeper's replay.
+    - in `resource_versions`, in the same row and statement as the version: V1 and V2 at step 4, V3 at step 2, and the sweeper's replay.
 - **Where `K(N)` comes from.** The `index_keys` of the `resources` row the writer read, R1 at `LOCAL_QUORUM`, before step 2. That read's `version_id` is the `N` the CAS is conditioned on. Deletes use it, and so does repair on read (5.1, step 4). The sweeper takes `K(V)` from its own R2 of `resources`, and `K(V-1)` from row `V-1`'s `index_keys`, since `resources` holds only the current version's (section 6).
 - **Why the read is exact.** Only the CAS that creates version `N` writes `index_keys` at version `N`, and it writes `version_id` in the same mutation. So any read that returns `version_id = N` returns that CAS's `K(N)`. A CAS conditioned on `version_id = N` applies only if the row is still at `N`, so the keys it deletes are the ones `N`'s writer inserts. Nothing else writes `resources`: repair and the sweeper never do.
 - **`update` reads `resources`, not row `N`** (R1, the one extra read). Its `StoredResource` has no blob, and row `N` of `resource_versions` may not exist yet: `N`'s writer may have crashed or paused between its CAS and step 4, which is exactly the race below. `resources` always holds `N`'s key set while `N` is current, because the CAS that made `N` current wrote it.
     - R1 shows `version_id = N`: use its `index_keys`.
-    - R1 shows a higher version: the CAS could not apply. Return what C2's miss would give, without running it: `NotFound` (404) if `deleted_at` is set, otherwise `VersionConflict` (409).
+    - R1 shows a higher version: the CAS could not apply. Return what C2's miss would give, without running it: `NotFound` (404) if `deleted_at > 0`, otherwise `VersionConflict` (409).
     - R1 shows a lower version: `N`'s CAS is still committing. Run R2 at `LOCAL_SERIAL`, which completes it, and use R2's row.
     - No row: `NotFound` (404).
 - **Why the CAS carries it (CodeRabbit's review of PR #33).** With the key set only on `resource_versions`, a writer that found row `N` missing re-extracted `K(N)` under today's registry, and this sequence left orphans:
@@ -185,21 +188,44 @@ Each version row stores `K(V)`, the index rows that version wrote, and the `reso
 - **Cost.** The blob travels in every CAS's Paxos proposal and commit, and makes the `resources` row larger by the same amount: 289 bytes for the worked example's `K(1)`, and 2 for a delete's empty set (section 7). That example's `data` is about 140 bytes of JSON, without `meta`, so on that Patient the blob doubles what the CAS carries. A fixture resource's `data` is usually larger; the fixture sizes are measured in Step 8 (roadmap section 7). The CAS is already one partition and one statement, so its round trips do not change.
 - **Why both copies are kept.** `resources` holds only the current version's set. The sweeper needs `K(V-1)` once `V` is current, from row `V-1`. Every version row keeps its own set, so a row V3 restores is complete and any version's keys can be checked against what it wrote (roadmap Step 5's exit criterion).
 - **Versions written before the column.** None exist: no Cassandra data predates this schema, so every `resources` and version row has `index_keys`.
-- **Extra reads per operation:**
+- **Extra reads and round trips per operation.** "Extra round trips" counts V3 at step 2 (G40). It used to share a single-partition batch with V1 at step 4; now it is its own sequential write before the CAS. The statement count is unchanged.
 
-| Operation | Extra reads | Why |
-| --- | --- | --- |
-| `create` | 0 | `K(0)` is empty |
-| `update` | 1 (R1 of `resources`) | its `StoredResource` has no blob; `resources`, not row `N`, as above |
-| `update_with_match` | 0 | its R1 already reads `resources` |
-| `delete`, `delete_versioned` | 0 | the same |
-| `create_or_update` | 0 | each turn's R1 already reads `resources`; a delete marker's set is empty |
-| sweeper, `V` current | 0 | its R2 of `resources` already returns `K(V)`; R3 for `V-1` as before |
-| sweeper, `V` superseded | 0 | it already reads rows `V` and `V-1` |
-| repair on read | 0 | the tag check's R1 already returns the current version's `index_keys` |
-| unknown CAS outcome | 0 | R2 already returns the row; R3 on row `V` runs only when `V` was superseded (3.1) |
+| Operation | Extra reads | Extra round trips | Why |
+| --- | --- | --- | --- |
+| `create` | 0 | 0 | `K(0)` is empty; no V3 |
+| `update` | 1 (R1 of `resources`) | 1 (V3) | its `StoredResource` has no blob; `resources`, not row `N`, as above |
+| `update_with_match` | 0 | 1 (V3) | its R1 already reads `resources` |
+| `delete`, `delete_versioned` | 0 | 1 (V3) | the same |
+| `create_or_update` | 0 | 1 (V3) per turn on a live row (b) or a delete marker (c); 0 on an absent id (a) | each turn's R1 already reads `resources`; a delete marker's set is empty |
+| sweeper, `V` current | 0 | 0 | its R2 of `resources` already returns `K(V)`; R3 for `V-1` as before |
+| sweeper, `V` superseded | 0 | 0 | it already reads rows `V` and `V-1` |
+| repair on read | 0 | 0 | the tag check's R1 already returns the current version's `index_keys` |
+| unknown CAS outcome | 0 | 0 | R2 already returns the row; R3 on row `V` runs only when `V` was superseded (3.1) |
+
+A CAS that misses wastes its V3, which rewrites row `N` at an older timestamp and changes nothing.
 
 - **Known limitation.** Adding a `SearchParameter` does not index existing resources. They are found by it only after their next write, and there is no reindex. Removing one leaves no orphans, since deletes use the stored rows.
+
+### `deleted_at` and its readers (G39)
+
+`resources.deleted_at` is always written. `0` (1970-01-01T00:00:00Z) means live, and C1 and C4 write it. A delete (C3) writes its `lu(N+1)`, which is never 0. A revive therefore overwrites the delete's cell with a newer one rather than deleting it, and `resources` holds no tombstone. A replica that missed any of these writes holds an older cell, and the newer one wins by timestamp, whatever the repair schedule. `resource_versions` is unchanged: a content row leaves `deleted_at` unset, and a marker sets it, which is never 0. A version row never changes state, so it never needs a tombstone either.
+
+Every reader that decides "deleted" tests `deleted_at > 0`:
+
+| Reader | Where | Deleted means |
+| --- | --- | --- |
+| `read` | 4.1, R1 | `ResourceError::Gone`, 410 (404 if `HFS_RETURN_GONE` is false) |
+| `exists` | 4.1, R1 | `false` |
+| `vread` | 4.2, R3 on `resource_versions` | a delete marker: `deleted_at` set, always `> 0`; 410 |
+| `_id` search | 5.4, R1 | not returned |
+| tag check, every search, filtered `search_count`, compartment residual | 5.1 step 4, R1 | candidate hidden |
+| CAS miss mapping (C2, C3) | 2, "How it maps"; 3.3, 3.4 | `NotFound`, 404 |
+| `update`'s R1, the pre-reads of `delete`, `update_with_match` | 2, "Stored key sets"; 3.3; 3.4 | `NotFound`, 404, nothing written |
+| `create_or_update` branch choice | 3.5, R1 | branch c (revive) |
+| sweeper, `V` current | 6, R2 | V is a marker: V2 for its row, and `K(V)` empty |
+| `StoredResource::from_storage` | every R1 | `deleted_at` 0 is passed as `None` |
+
+Unfiltered `count` reads `resources_by_type`, not `resources`, so it never tests `deleted_at`; a deleted resource has no `resources_by_type` row once its delete's index writes are done (5.9).
 
 ### Index rows
 
@@ -295,9 +321,9 @@ Every write first calls `tenant.check_permission(Operation::…, resource_type)`
 | Step | Statement | Partition | On failure |
 | --- | --- | --- | --- |
 | 1 | permission check; for a SearchParameter, the `code` bound (G38, below); extract `K(N+1)`; `K(N)` is the `index_keys` of the `resources` row read at version `N`: the pre-read R1 of `delete`, `update_with_match` and `create_or_update`, or `update`'s own R1 (G22, section 2); size check of `K(N+1)` (below) | `resources (T,P,id)` for `update`'s R1 | `TenantError`; a value over 2,048 bytes, a `param` over 128, or a SearchParameter `code` over 128 is `ValidationError::InvalidResource`, 400; `update`'s R1 timed out is 504, failed is 503; nothing written |
-| 2 | I1, with `version_id = N+1` | `(bucket, shard)` | `Unavailable`: 503, nothing changed. `WriteTimeout`: an unused intent is swept, so harmless; 504 (`BackendError::Timeout`, G26) |
+| 2 | on update, delete and revive (`update`, `update_with_match`, `delete`, `delete_versioned`, and `create_or_update` on a live row or a delete marker): V3 for `N` at `ts(N) − 1`, from R1 or `current`, with R1's `K(N)` (G40); then I1, with `version_id = N+1` | `resource_versions (T,P,id)` for V3, then `(bucket, shard)` | V3 timed out: 504; failed: 503; nothing changed, since V3 only rewrites row `N` at an older timestamp. I1 `Unavailable`: 503, nothing changed. I1 `WriteTimeout`: an unused intent is swept, so harmless; 504 (`BackendError::Timeout`, G26) |
 | 3 | C1 to C4 | `resources (T,P,id)` | not applied: I2, then the mapped error; unknown outcome below |
-| 4 | V1 or V2 for `N+1` at `ts(N+1)`; on update, delete and revive also V3 for `N` at `ts(N) − 1` | `resource_versions (T,P,id)` | retry with the same timestamps |
+| 4 | V1 or V2 for `N+1` at `ts(N+1)` (V3 for `N` already ran at step 2) | `resource_versions (T,P,id)` | retry with the same timestamps |
 | 5 | index batches, at `ts(N+1)` | index partitions | retry with the same timestamps; `WriteTimeout` type `BATCH` needs no retry (batchlog replays), `BATCH_LOG` does. Retries exhausted: return success, with I1 left for the sweeper, which makes the write searchable within one poll interval plus the grace period (G23, ADR-aacruzgon-0027) |
 | 6 | I2 | `(bucket, shard)` | ignored: return success; the sweeper replays the same writes, which changes nothing, and deletes the intent |
 
@@ -325,10 +351,10 @@ For an attempt that targeted version `V` (1 for C1):
 | `version_id > V` | ours may have applied and been superseded | R3 on row `V`, which now selects `write_id` (ADR-aacruzgon-0026, G36); see the next three rows |
 | `version_id > V`; row `V` has our `write_id` | applied, then superseded | success with version `V`, as for "applied" (201 for a create or revive, 200 for an update, 204 for a delete); steps 4 and 5 are skipped, since a late insert of `K(V)` could outlive a later version's tombstones; I1 is left for the sweeper, whose superseded case deletes `K(V-1)` |
 | `version_id > V`; row `V` has another `write_id` | another writer won `V` | a definite miss, as the third row |
-| `version_id > V`; row `V` missing, or its `write_id` unset | undecidable | after `WriteTimeout`, a client-side timeout or a dropped connection: `BackendError::Timeout`, 504; after `WriteFailure`: `BackendError::Unavailable`, 503. No retry, which could write the body twice; I1 left for the sweeper |
+| `version_id > V`; row `V`'s `write_id` unset | undecidable | after `WriteTimeout`, a client-side timeout or a dropped connection: `BackendError::Timeout`, 504; after `WriteFailure`: `BackendError::Unavailable`, 503. No retry, which could write the body twice; I1 left for the sweeper |
 | R2 times out, or fails | unknown | timed out: `BackendError::Timeout`, 504; failed (`ReadFailure`, `Unavailable`): `BackendError::Unavailable`, 503; I1 kept |
 
-Row `V`'s `write_id` is set by `V`'s own step 4 (V1 or V2), by the sweeper's replay of `V`, or by the next writer's V3 when that writer built it from R1: a `delete`, a `create_or_update` or an `update_with_match`. So the outcome is decided whenever the version that superseded ours came from one of those paths. It stays undecidable when it came from `update`, whose V3 is built from a `StoredResource` without a `write_id`, or when row `V` is not written yet.
+Row `V`'s `write_id` is set by `V`'s own step 4 (V1 or V2), by the sweeper's replay of `V`, or by the next writer's V3 when that writer built it from R1: a `delete`, a `create_or_update` or an `update_with_match`. So the outcome is decided whenever the version that superseded ours came from one of those paths. It stays undecidable when it came from `update`, whose V3 is built from a `StoredResource` without a `write_id`. Row `V` always exists once a later CAS has applied, because that writer's V3 ran before its CAS (G40).
 
 Every timeout is 504 and every unavailable node or replica failure 503, as `crates/rest/src/error.rs` maps them (G26). When the 2 re-runs are used up, the last attempt's error decides the same way: 504 after a `WriteTimeout`, 503 after a `WriteFailure`. `write_type = SIMPLE`: the CAS was decided and only the commit timed out, so treat it as applied.
 
@@ -344,16 +370,16 @@ Every timeout is 504 and every unavailable node or replica failure 503, as `crat
 
 ### 3.3 Update (`ResourceStorage::update(tenant, current, resource)`, `PUT /Patient/id`)
 
-REST has already read the row, checked `If-Match` (412 on a mismatch, before storage is called), and passes `current`, version `N`. `Operation::Update`. `K(N)` is the `index_keys` of one R1 of `resources` (G22; section 2 says what to do when R1 shows another version). Steps: R1; I1; C2 with `IF version_id = N AND deleted_at = null`, writing `K(N+1)`; V1 for `N+1` with `K(N+1)`, and V3 rewrites `N` from `current` with that `K(N)`; delete `K(N) \ K(N+1)` and insert `K(N+1)` at `ts(N+1)`; I2.
+REST has already read the row, checked `If-Match` (412 on a mismatch, before storage is called), and passes `current`, version `N`. `Operation::Update`. `K(N)` is the `index_keys` of one R1 of `resources` (G22; section 2 says what to do when R1 shows another version). Steps: R1; V3 rewrites `N` from `current` with that `K(N)` (G40); I1; C2 with `IF version_id = N AND deleted_at = 0`, writing `K(N+1)`; V1 for `N+1` with `K(N+1)`; delete `K(N) \ K(N+1)` and insert `K(N+1)` at `ts(N+1)`; I2.
 
 | CAS result | Meaning | Returned |
 | --- | --- | --- |
 | applied | | 200 OK, `ETag: W/"N+1"` |
 | `[applied] False` only | row never existed | `ResourceError::NotFound`, 404 |
-| `deleted_at` set | soft-deleted after REST's read | `NotFound`, 404 (design step 3; the race suite also accepts `Gone`, G9) |
-| `version_id ≠ N`, `deleted_at` null | lost the race | `ConcurrencyError::VersionConflict`, 409 |
+| `deleted_at > 0` | soft-deleted after REST's read | `NotFound`, 404 (design step 3; the race suite also accepts `Gone`, G9) |
+| `version_id ≠ N`, `deleted_at` 0 | lost the race | `ConcurrencyError::VersionConflict`, 409 |
 
-`update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `OptimisticLockFailure` (412) without a CAS; a CAS miss after that is 409. Its V3 is built from that R1, so it carries R1's `write_id`; plain `update`'s V3 leaves `write_id` unset (G36).
+`update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `OptimisticLockFailure` (412) without a CAS; a CAS miss after that is 409. Its V3, at step 2, is built from that R1, so it carries R1's `write_id`; plain `update`'s V3 leaves `write_id` unset (G36).
 
 ### 3.4 Delete (`delete` and `delete_versioned`, `DELETE /Patient/id`)
 
@@ -361,17 +387,18 @@ The REST handler reads the row, then calls `delete_versioned(current.version_id(
 
 | # | Statement | Notes |
 | --- | --- | --- |
-| 0 | R1 | R1 gives `N`, `data`, `lu(N)` and `K(N)`, its `index_keys` (G22). Absent or `deleted_at` set: `NotFound`, 404, nothing written. `delete_versioned` with `N ≠ expected`: `VersionConflict`, 409, nothing written. |
+| 0 | R1 | R1 gives `N`, `data`, `lu(N)` and `K(N)`, its `index_keys` (G22). Absent or `deleted_at > 0`: `NotFound`, 404, nothing written. `delete_versioned` with `N ≠ expected`: `VersionConflict`, 409, nothing written. |
 | 1 | — | `Operation::Delete`. `K(N)` from R1's `index_keys`; `K(N+1)` empty; `deleted_at = lu(N+1)`. |
-| 2–3 | I1; C3 with `IF version_id = N AND deleted_at = null` | C3 sets `index_keys` to the empty set |
-| 4 | V2 (delete marker) for `N+1`; V3 rewrites `N` from R1's `data` | marker `data` unset, `index_keys` empty; V3 carries `K(N)` |
+| 2 | V3 rewrites `N` from R1's `data`, with `K(N)` (G40); then I1 | V3 before the CAS, so row `N` exists if C3 applies |
+| 3 | C3 with `IF version_id = N AND deleted_at = 0` | C3 sets `deleted_at = lu(N+1)` and `index_keys` to the empty set |
+| 4 | V2 (delete marker) for `N+1` | marker `data` unset, `index_keys` empty |
 | 5 | delete every key of `K(N)` at `ts(N+1)`, including `resources_by_type (lu(N), id)` | no inserts |
 | 6 | I2 | |
 
 | CAS result | `delete` | `delete_versioned` |
 | --- | --- | --- |
 | applied | 204 No Content | 204 |
-| `[applied] False` only, or `deleted_at` set | `NotFound`, 404 | `NotFound`, 404 (a repeated `delete_versioned` must be `NotFound`, G9) |
+| `[applied] False` only, or `deleted_at > 0` | `NotFound`, 404 | `NotFound`, 404 (a repeated `delete_versioned` must be `NotFound`, G9) |
 | `version_id` moved, still live | retry once, at once, from step 0 with a new I1 (G25, ADR-aacruzgon-0024); a second miss: `VersionConflict`, 409; the new R1 finds it deleted: `NotFound`, 404 | `VersionConflict`, 409 (never retried) |
 
 Helios answers 404, not the spec's 200/204, for a delete of an unknown or already-deleted id (`delete.rs`; G25).
@@ -383,18 +410,18 @@ The REST update handler maps `Gone` to "no current resource" and calls `create_o
 | Branch | Row | CAS | Not applied |
 | --- | --- | --- | --- |
 | a | absent | C1 (version 1) | someone created it (`AlreadyExists`); I2, next turn |
-| b | live | C2 with `IF version_id = N AND deleted_at = null` | `VersionConflict`, or `NotFound` if deleted in the gap; I2, next turn |
-| c | deleted (revive) | C4 with `IF version_id = N`; `K(N)` is empty (delete marker) | `VersionConflict`; I2, next turn |
+| b | live (`deleted_at = 0`) | C2 with `IF version_id = N AND deleted_at = 0` | `VersionConflict`, or `NotFound` if deleted in the gap; I2, next turn |
+| c | deleted (`deleted_at > 0`; revive) | C4 with `IF version_id = N`, setting `deleted_at = 0`; `K(N)` is empty (delete marker) | `VersionConflict`; I2, next turn |
 
 A definite miss starts the next turn at once, with no pause, for at most 3 retries, so 4 turns in all. An unknown outcome is settled first by the table in 3.1, from its own budget of 2 re-runs.
 
-After the CAS applies, steps 4 to 6 run as for update: V1 for `N+1`; V3 for `N` (branch b a content row from R1; branch c a delete marker, `deleted_at` set and `data` unset, although `resources.data` still holds the old content); inserts of `K(N+1)` (branch b also deletes `K(N) \ K(N+1)`), I2. Returned: branch a 201 (`created = true`); branch b 200 (`created = false`); branch c 201 (`created = true`, PostgreSQL parity; R4 and R4B http.html#update require 201 for a resource "brought back to life"); a fourth definite miss is `VersionConflict`, 409 (that turn's I2 already ran). On revive, `fhir_version` is the original from R1 (G13, ADR-aacruzgon-0024) and `created_at` is kept (G14, ADR-aacruzgon-0011).
+Branches b and c write V3 for `N` at step 2, before the CAS (G40): branch b a content row from R1; branch c a delete marker, `deleted_at` set and `data` unset, although `resources.data` still holds the old content. After the CAS applies, steps 4 to 6 run as for update: V1 for `N+1`; inserts of `K(N+1)` (branch b also deletes `K(N) \ K(N+1)`), I2. Returned: branch a 201 (`created = true`); branch b 200 (`created = false`); branch c 201 (`created = true`, PostgreSQL parity; R4 and R4B http.html#update require 201 for a resource "brought back to life"); a fourth definite miss is `VersionConflict`, 409 (that turn's I2 already ran). On revive, `fhir_version` is the original from R1 (G13, ADR-aacruzgon-0024) and `created_at` is kept (G14, ADR-aacruzgon-0011).
 
 ## 4. Reads
 
 ### 4.1 read (`GET /Patient/id`)
 
-R1 at `LOCAL_QUORUM`, partition `resources (T,P,id)`. Absent: `Ok(None)`, 404. `deleted_at` set: `ResourceError::Gone`, 410 (404 if `HFS_RETURN_GONE` is false). Otherwise `StoredResource::from_storage(…)`, 200, `ETag: W/"version_id"`. `exists` is the same read and answers `false` for a deleted row (the trait doc requires MongoDB's behaviour).
+R1 at `LOCAL_QUORUM`, partition `resources (T,P,id)`. Absent: `Ok(None)`, 404. `deleted_at > 0`: `ResourceError::Gone`, 410 (404 if `HFS_RETURN_GONE` is false). Otherwise `StoredResource::from_storage(…)`, 200, `ETag: W/"version_id"`. `exists` is the same read and answers `false` for a deleted row (the trait doc requires MongoDB's behaviour).
 
 ### 4.2 vread (`GET /Patient/id/_history/vid`)
 
@@ -411,7 +438,7 @@ R3 at `LOCAL_QUORUM`, partition `resource_versions (T,P,id)`, one row. `vid` is 
 
 ### 4.3 list_versions
 
-R4 at `LOCAL_QUORUM`, one partition. `ORDER BY version_id ASC` reverses the clustering order, which a single-partition query may do (or read `DESC` and reverse in Rust). Returns `["1", "2", …]`, numerically ordered past 9 because `version_id` is an `int`; an unknown id gives an empty list. The race suite requires "no gap, no duplicate"; V3 keeps that through one crash (G2).
+R4 at `LOCAL_QUORUM`, one partition. `ORDER BY version_id ASC` reverses the clustering order, which a single-partition query may do (or read `DESC` and reverse in Rust). Returns `["1", "2", …]`, numerically ordered past 9 because `version_id` is an `int`; an unknown id gives an empty list. The race suite requires "no gap, no duplicate"; V3 before the CAS keeps that through any number of crashes (G2, G40).
 
 ## 5. Search
 
@@ -422,10 +449,10 @@ Expected results for every case are in [`coverage.md`](coverage.md). This sectio
 1. Validate (order and statuses in `coverage.md` section 6).
 2. Stream candidates from one or more index partitions, in the shared order `(last_updated DESC, id DESC)` where the table has it.
 3. Collapse rows with the same `(last_updated, id)`.
-4. **Tag check:** R1 for the candidate. Keep it only if the row exists, `deleted_at` is unset and `resources.version_id` equals the index row's `version_id`. A mismatch hides the candidate and triggers repair on read (ADR-aacruzgon-0017): maintenance for the current version at its `ts`, with its key set from the `index_keys` of the R1 row just loaded (G22), so repair reads nothing more. A stale key the current version does not produce is deleted; one it produces is upserted with the current tag. Repair is logged as a write made from a read.
+4. **Tag check:** R1 for the candidate. Keep it only if the row exists, `deleted_at` is 0 (live; G39) and `resources.version_id` equals the index row's `version_id`. A mismatch hides the candidate and triggers repair on read (ADR-aacruzgon-0017): maintenance for the current version at its `ts`, with its key set from the `index_keys` of the R1 row just loaded (G22), so repair reads nothing more. A stale key the current version does not produce is deleted; one it produces is upserted with the current tag. Repair is logged as a write made from a read.
 5. Apply residual filters: dates and `_lastUpdated` combined with another parameter (5.8); `query.fhir_version`, kept only if `resources.fhir_version` equals `as_mime_param()` of it (5.9, G34); `query.compartment` (5.11, G33).
 6. Stop at `_count + 1` kept resources; the extra one decides whether `next` exists. `LIMIT` is a batch size, not the page size.
-7. **Cap** (G27, ADR-aacruzgon-0027). The search counts the distinct candidates it point-reads (R1) for one page, or for one `search_count`. Past the configured cap it fails with `SearchError::TooManyResults`, which REST answers with 422, issue `processing` (`crates/rest/src/error.rs:1123-1125`, `591-595`). No search error produces `too-costly`; its only producer is the batch handler's 500 for a transaction too large for MongoDB's cache (`crates/rest/src/handlers/batch.rs:3745`).
+7. **Cap** (G27, ADR-aacruzgon-0027). The search counts the distinct candidates it point-reads (R1) for one page, or for one `search_count`. Past the configured cap it fails with `SearchError::TooManyResults`, which REST answers with 422, issue `processing` (`crates/rest/src/error.rs:1123-1125`, `591-595`). No search error produces `too-costly`; its only producer is the batch handler's 500 for a transaction too large for MongoDB's cache (`crates/rest/src/handlers/batch.rs:3745`). Stale rows count too: a candidate the tag check hides is still a candidate point-read, so enough resurrected or orphan rows ahead of the live matches can make a page fail before it fills (G7). Repair on read at step 4 deletes each one it reads, so a retry gets further.
 
 Index and R1 reads are `LOCAL_QUORUM`. A candidate whose index tag is `N` while `resources` is at `N+1` (a write between steps 3 and 5) is hidden: the design's in-flight window.
 
@@ -640,11 +667,10 @@ A background task in each Helios process (ADR-aacruzgon-0013 to 0015). It never 
 | Case | Reads | Writes |
 | --- | --- | --- |
 | no row, or `version_id < V`: the CAS never applied | — | none |
-| `V` current: a crashed or slow request | R3 for `V-1` (not for `V = 1`) | `K(V)` is the `index_keys` R2 returned (G22). Step 4 for `V`'s own row (never V3), at `ts(V)`: V1, or V2 if `deleted_at` is set, with `data`, `write_id` and `index_keys` from the `resources` row. It writes the same cells as `V`'s writer, so an existing row is unchanged. Then step 5 at `ts(V)`: delete `K(V-1) \ K(V)`, insert `K(V)` |
+| `V` current: a crashed or slow request | R3 for `V-1` (not for `V = 1`) | `K(V)` is the `index_keys` R2 returned (G22). Step 4 for `V`'s own row (never V3), at `ts(V)`: V1, or V2 if `deleted_at > 0`, with `data`, `write_id` and `index_keys` from the `resources` row. It writes the same cells as `V`'s writer, so an existing row is unchanged. Then step 5 at `ts(V)`: delete `K(V-1) \ K(V)`, insert `K(V)` |
 | `V` superseded | R3 for `V` (for `ts(V)`) and `V-1` | delete all of `K(V-1)` at `ts(V)`; no inserts, since a later version already deleted `K(V)` and a late insert would outlive those tombstones (3 h) |
-| `V` superseded, row `V` missing (two crashes in a row) | R3 for `V-1` | delete all of `K(V-1)` at `ts(V-1) + 1`, and log; `V` never reached step 5 |
 
-`K(V-1)` is row `V-1`'s `index_keys` (G22), since `resources` holds only the current version's. It is empty for version 1, a marker, or a missing row `V-1`, whose writer never reached step 5. Every write is older than any later version's, so it never removes a newer row, even after that row's tombstones are purged. A sweeper and a slow request may run the same writes. The grace period is the one clock comparison (G11).
+`K(V-1)` is row `V-1`'s `index_keys` (G22), since `resources` holds only the current version's. Row `V-1` always exists for `V > 1`, and row `V` once `V` is superseded: each writer wrote the previous row (V3) before its CAS (G40). A missing row `V-1` therefore never stands for an empty set. It is empty for version 1, a marker, or a missing row `V-1`, whose writer never reached step 5. Every write is older than any later version's, so it never removes a newer row, even after that row's tombstones are purged. A sweeper and a slow request may run the same writes. The grace period is the one clock comparison (G11).
 
 ## 7. Worked example: one Patient, four versions
 
@@ -687,7 +713,7 @@ Eight partitions, eight rows; at an estimated 150 to 250 bytes per row, one batc
 
 ### Version 2: update (gender `male` → `female`)
 
-`current` is version 1. R1 reads `resources` at version 1, whose `index_keys` is `K(1)`, the table above (G22). I1 `(tu(2), acme, Patient, p1)`, `w2`, `version_id 2`. C2 `IF version_id = 1 AND deleted_at = null` applies: `version_id 2`, `lu(2)`, `ts(2)`, `w2`, new `data`, `index_keys` `K(2)`, 293 bytes. V1 writes version 2 at `ts(2)`, with the same `K(2)`; V3 rewrites version 1 from `current` at `ts(1) − 1`, with the `K(1)` R1 returned, so the original wins and nothing changes. Index changes, all `USING TIMESTAMP 1791972300456000`:
+`current` is version 1. R1 reads `resources` at version 1, whose `index_keys` is `K(1)`, the table above (G22). V3 rewrites version 1 from `current` at `ts(1) − 1`, with the `K(1)` R1 returned, so the original wins and nothing changes. I1 `(tu(2), acme, Patient, p1)`, `w2`, `version_id 2`. C2 `IF version_id = 1 AND deleted_at = 0` applies: `version_id 2`, `lu(2)`, `ts(2)`, `w2`, new `data`, `index_keys` `K(2)`, 293 bytes. V1 writes version 2 at `ts(2)`, with the same `K(2)`. Index changes, all `USING TIMESTAMP 1791972300456000`:
 
 - **6 deletes:** every non-date row of `K(1)`.
 - **8 inserts, tag 2:** `K(2)`, which is `K(1)` with `lu(2)` for `lu(1)` and `female` for `male`. The two date keys are unchanged, so they are only re-inserted (tag 1 → 2).
@@ -698,13 +724,13 @@ Then I2. Six row tombstones, one in each of six partitions. The identifier did n
 
 ### Version 3: delete
 
-REST read version 2 and, with no `If-Match`, called `delete`. R1 gives version 2, `data`, `lu(2)` and `K(2)`. I1 `(tu(3), acme, Patient, p1)`, `w3`, `version_id 3`. C3 `IF version_id = 2 AND deleted_at = null` applies: `version_id 3`, `deleted_at` and `last_updated` `lu(3)`, `ts(3)`, `w3`, `index_keys` the empty set (`data` kept, G29). V2 writes the marker, version 3, no `data`, with the empty key set (2 bytes), at `ts(3)`; V3 rewrites version 2 from R1's `data` at `ts(2) − 1`. Then 8 deletes at `ts(3)` (`USING TIMESTAMP 1791972600789000`), every key of `K(2)`, including the two date rows; then I2.
+REST read version 2 and, with no `If-Match`, called `delete`. R1 gives version 2, `data`, `lu(2)` and `K(2)`. V3 rewrites version 2 from R1's `data` at `ts(2) − 1`. I1 `(tu(3), acme, Patient, p1)`, `w3`, `version_id 3`. C3 `IF version_id = 2 AND deleted_at = 0` applies: `version_id 3`, `deleted_at` and `last_updated` `lu(3)`, `ts(3)`, `w3`, `index_keys` the empty set (`data` kept, G29). V2 writes the marker, version 3, no `data`, with the empty key set (2 bytes), at `ts(3)`. Then 8 deletes at `ts(3)` (`USING TIMESTAMP 1791972600789000`), every key of `K(2)`, including the two date rows; then I2.
 
 Now `read` and vread 3 return 410; vread 2 returns version 2's content with 200; every search misses the patient.
 
 ### Version 4: revive
 
-`PUT /Patient/p1` with the version 2 content. REST's read returned `Gone`, so it called `create_or_update`. R1: version 3, `deleted_at` set, so branch c, and R1's `index_keys`, `K(3)`, is empty. I1 `(tu(4), acme, Patient, p1)`, `w4`, `version_id 4`. C4 `IF version_id = 3` applies: `version_id 4`, `lu(4)`, `ts(4)`, `w4`, `data`, `index_keys` `K(4)`, `deleted_at = null` (one cell tombstone). V1 writes version 4 at `ts(4)`, with the same `K(4)` (293 bytes: `last_updated` is implied by the row, so `K(4)` encodes as `K(2)` does); V3 rewrites the version 3 marker at `ts(3) − 1`, `deleted_at` set, `data` unset. `K(3)` is empty, so 8 inserts and no deletes, at `ts(4)` (`USING TIMESTAMP 1791972900012000`), tag 4: `K(2)` with `lu(4)` for `lu(2)`. Then I2. Returned: 201 (`created = true`), `ETag: W/"4"`.
+`PUT /Patient/p1` with the version 2 content. REST's read returned `Gone`, so it called `create_or_update`. R1: version 3, `deleted_at > 0`, so branch c, and R1's `index_keys`, `K(3)`, is empty. V3 rewrites the version 3 marker at `ts(3) − 1`, `deleted_at` set, `data` unset. I1 `(tu(4), acme, Patient, p1)`, `w4`, `version_id 4`. C4 `IF version_id = 3` applies: `version_id 4`, `lu(4)`, `ts(4)`, `w4`, `data`, `index_keys` `K(4)`, `deleted_at = 0` (an ordinary cell, newer than the delete's; no tombstone, G39). V1 writes version 4 at `ts(4)`, with the same `K(4)` (293 bytes: `last_updated` is implied by the row, so `K(4)` encodes as `K(2)` does). `K(3)` is empty, so 8 inserts and no deletes, at `ts(4)` (`USING TIMESTAMP 1791972900012000`), tag 4: `K(2)` with `lu(4)` for `lu(2)`. Then I2. Returned: 201 (`created = true`), `ETag: W/"4"`.
 
 The two date keys are the ones version 3 deleted. They come back because the insert at `ts(4)` is newer than the delete at `ts(3)`. With equal timestamps the delete would win, which is why `ts` must strictly increase per resource.
 
@@ -712,7 +738,7 @@ The two date keys are the ones version 3 deleted. They come back because the ins
 
 | Table | Live rows for `p1` | Row tombstones left by `p1` |
 | --- | --- | --- |
-| `resources` | 1 row, version 4, with the 293-byte `K(4)` as `index_keys` | 1 cell tombstone (`deleted_at`) |
+| `resources` | 1 row, version 4, with the 293-byte `K(4)` as `index_keys`, `deleted_at` 0 | 0 |
 | `resource_versions` | versions 1, 2, 3 (marker), 4, with 289 + 293 + 2 + 293 = 877 bytes of `index_keys` | 0 |
 | `pending_index_writes` `('2026-10-14T10', 7)` | 0 | 4 |
 | `resources_by_type` | `(lu(4), p1)` tag 4 | 2 (`lu(1)`, `lu(2)`) |
@@ -728,7 +754,7 @@ The two date keys are the ones version 3 deleted. They come back because the ins
 - **Killed after I1 of version 2** (no CAS): after 30 s the sweeper reads `resources` at `LOCAL_SERIAL`, sees version 1, below the intent's 2, and deletes the intent. Nothing else changes.
 - **Killed after C2 of version 2** (no version row, no index writes): `read` returns version 2 at once, but vread 2 is 404 until the sweep (G2). Search hides the patient. The sweeper finds version 2 current, and its R2 returns `K(2)`, which C2 wrote; `K(1)` is row 1's `index_keys`. It writes row 2 from the `resources` row, with that `K(2)` as `index_keys`, deletes `K(1) \ K(2)`, inserts `K(2)` at `ts(2)`, and deletes the intent.
 - **Same crash, but version 3 (the delete) lands before the sweeper runs.**
-    - The delete's R1 gives version 2's content and `K(2)`, which C2 wrote (G22). Its V3 restores row 2 at `ts(2) − 1`, with that `K(2)` as `index_keys`. It deletes `K(2)` at `ts(3)`; of those 8 keys only the two date keys exist (equal to `K(1)`'s, tag 1), so the date rows go.
+    - The delete's R1 gives version 2's content and `K(2)`, which C2 wrote (G22). Its V3, before C3, restores row 2 at `ts(2) − 1`, with that `K(2)` as `index_keys`. It deletes `K(2)` at `ts(3)`; of those 8 keys only the two date keys exist (equal to `K(1)`'s, tag 1), so the date rows go.
     - Left behind: the 6 non-date rows of `K(1)`, tag 1: `resources_by_type (lu(1), p1)`, three identifier rows and two gender `male` rows. The tag check hides them; `count` is 1 for a deleted patient (G7).
     - The sweeper finds `resources` at 3, above the intent's 2: version 2 is superseded. It reads `ts(2)` from row 2 and `K(1)` from row 1's `index_keys`, deletes all 8 keys of `K(1)` at `ts(2)` (the 6 orphans, and the two date keys version 3 already deleted), inserts nothing, then runs I2.
     - After the sweep: vread 2 is 200, `list_versions` is `["1", "2", "3"]`, `count` is 0. As in the crash-free run there are 14 index row tombstones (the two date keys carry both deletes, merged into one each); only the shadowed `K(2)` inserts are missing.
@@ -740,16 +766,16 @@ G numbers are stable references; the list is grouped by severity, not sorted.
 - **Resolved in the design:** G1, G2, G3, G4, G5, G6, G9, G10, G11, G13, G16, G25, G26, G31; from the schema audit G33 to G37 (ADR-aacruzgon-0026); and G17, G23, G27, G32 (ADR-aacruzgon-0027).
 - **Resolved by an earlier decision**, now marked as such: G14, G15, G19, G21, G24, G28, G29, G30.
 - **Resolved last** (ADR-aacruzgon-0027, the items still open after PR #33's first commit): G7, G8, G12, G18, G20, G22.
-- **Raised in review of PR #33, resolved (ADR-aacruzgon-0027):** G38.
+- **Raised in review of PR #33, resolved (ADR-aacruzgon-0027):** G38, G39, G40.
 - **Open:** none.
 
 ### Resolved in the design
 
 **G1. The sweeper left orphans when a later write superseded a crashed one.** *Resolved in the design (ADR-aacruzgon-0013).* The old sweeper dropped any intent whose `write_id` no longer matched, so the `K(N)` rows before the crash stayed. Now the intent carries `version_id` and the sweeper replays `V` whenever it exists (section 6). No `write_id` on `resource_versions` is needed: the replay is safe whoever made `V`.
 
-**G2. A crash could lose a version's content for good.** *Resolved in the design (ADR-aacruzgon-0012).* A crash before the version row, then another update, overwrote `N+1` in `resources` before it reached history. Now every update, delete and revive rewrites row `N` (V3). V3 is at `ts(N) − 1`, so an existing row always wins. Left over, and now stated in the design: vread `N+1` is 404 until the sweep or the next write; two crashes in a row still lose a version's content.
+**G2. A crash could lose a version's content for good.** *Resolved in the design (ADR-aacruzgon-0012).* A crash before the version row, then another update, overwrote `N+1` in `resources` before it reached history. Now every update, delete and revive rewrites row `N` (V3). V3 is at `ts(N) − 1`, so an existing row always wins. Left over, and stated in the design: vread `N+1` is 404 until the sweep or the next write. "Two crashes in a row still lose a version's content" was also left over, until G40 moved V3 before the CAS: the next writer now restores row `N+1` before it can overwrite `resources`.
 
-**G3. Where the sweeper gets `K(V-1)`.** *Resolved in the design (ADR-aacruzgon-0013).* From row `V-1`, empty for version 1 or a marker. The row is there unless two crashes came in a row: then the sweeper deletes `K(V-1)` at `ts(V-1) + 1` (section 6). Since G22 the keys are row `V-1`'s stored `index_keys`, so a registry change no longer alters them.
+**G3. Where the sweeper gets `K(V-1)`.** *Resolved in the design (ADR-aacruzgon-0013).* From row `V-1`, empty for version 1 or a marker. The row was thought to be missing only after two crashes in a row; G40 found that a paused writer breaks that assumption, and moved V3 before the CAS, so row `V-1` now always exists for `V > 1` (section 6). Since G22 the keys are row `V-1`'s stored `index_keys`, so a registry change no longer alters them.
 
 **G4. `ts(N)` was not available on the update path.** *Resolved in the design (ADR-aacruzgon-0016).* `StoredResource` carries no `write_ts`. Now `lu(N+1) = max(now_ms, lu(N) + 1 ms)` and `ts = lu · 1000`, so any version's `ts` is recomputable, as V3 needs. Side effect: a burst of updates, or a clock stepping back, keeps `lu` ahead of the wall clock.
 
@@ -757,7 +783,7 @@ G numbers are stable references; the list is grouped by severity, not sorted.
 
 **G6. The sweeper polled 2 buckets, but intents live 24 h.** *Resolved in the design (ADR-aacruzgon-0014).* After an outage over an hour, a crashed create stayed unsearchable for good. Now the sweeper walks the 25 most recent buckets at startup. Past the TTL a crashed create stays unsearchable (readable by id) until next written, a limitation the design now states.
 
-**G9. The CAS result mapping depends on the operation.** *Resolved in the design (step 3; a correction, no ADR).* `deleted_at` set is 410 for `read` and `vread` only; every write maps it to `NotFound`, 404, which the race suite allows (`versioned_write_race_suite.rs:94-95`, and the deleted-row arms at 262, 369 and 541). `spike-findings.md` point 3 is corrected.
+**G9. The CAS result mapping depends on the operation.** *Resolved in the design (step 3; a correction, no ADR).* `deleted_at` set (`> 0` since G39) is 410 for `read` and `vread` only; every write maps it to `NotFound`, 404, which the race suite allows (`versioned_write_race_suite.rs:94-95`, and the deleted-row arms at 262, 369 and 541). `spike-findings.md` point 3 is corrected.
 
 **G10. Repair on read could delete a key the in-flight writer needs.** *Resolved in the design (ADR-aacruzgon-0017).* A delete wins a timestamp tie, so deleting a stale date key at `ts(N+1)` beat the writer's insert. Now repair deletes only keys the current version does not produce and upserts the rest (5.1). Its read-latency cost is unmeasured.
 
@@ -765,11 +791,11 @@ G numbers are stable references; the list is grouped by severity, not sorted.
 
 **G16. Columns on `resource_versions` and the intent row.** *Resolved in the design (ADR-aacruzgon-0013); revised by G36.* The intent row gained `version_id int`. `resource_versions` needs no `created_at` (G14). It was first left without a `write_id`, since the sweeper no longer compares it; ADR-aacruzgon-0026 added one for the unknown-outcome rule (G36).
 
-**G31. Sweeper edge cases found in the revision.** *Resolved in the design (ADR-aacruzgon-0013, 0015).* A late replay could resurrect `K(V)`: a superseded `V` now gets deletes only. A double crash: intent `V` deletes `K(V-1)` at `ts(V-1) + 1`, and a missing previous row means empty previous keys. A stuck intent pinned its mark, and an empty slice never moved it: now a retry list, and the mark moves to each poll's upper bound. Marks are per `(bucket, shard)`, with `bucket` from `enqueued_at`.
+**G31. Sweeper edge cases found in the revision.** *Resolved in the design (ADR-aacruzgon-0013, 0015).* A late replay could resurrect `K(V)`: a superseded `V` now gets deletes only. A double crash: intent `V` deleted `K(V-1)` at `ts(V-1) + 1`, and a missing previous row meant empty previous keys; G40 replaces both rules, since neither row can be missing now. A stuck intent pinned its mark, and an empty slice never moved it: now a retry list, and the mark moves to each poll's upper bound. Marks are per `(bucket, shard)`, with `bucket` from `enqueued_at`.
 
 **G13. Revive details.** *Resolved in the design (ADR-aacruzgon-0024).*
-- C4 clears `deleted_at` with a literal `deleted_at = null` in the statement. That is not a bound null: it writes exactly one cell tombstone, on purpose.
-    - Checked on a 5.0.9 node, 2026-10-13: `UPDATE resources SET deleted_at = null, version_id = 4, … IF version_id = 3` applies, and `DELETE deleted_at FROM resources WHERE … IF version_id = 3` also works.
+- C4 cleared `deleted_at` with a literal `deleted_at = null` in the statement. That was not a bound null: it wrote exactly one cell tombstone, on purpose. G39 replaced it with `deleted_at = 0`, because that tombstone could be purged on replicas while one replica still held the delete's value.
+    - History, before G39. Checked on a 5.0.9 node, 2026-10-13: `UPDATE resources SET deleted_at = null, version_id = 4, … IF version_id = 3` applies, and `DELETE deleted_at FROM resources WHERE … IF version_id = 3` also works.
     - It is now the one stated exception to "never bind null" in `schema.cql`, in section 2 ("Compare-and-swap on `resources`") and in the roadmap's Step 1 checklist.
 - A revive returns `created = true` (201) and keeps the **original** `fhir_version`, bound in C4 from R1. This matches every other backend:
     - `create_or_update` uses the request's version only to create;
@@ -801,7 +827,7 @@ The CAS had already applied when step 5 failed, so no retry, sweep or repair cou
 **G36. A superseded unknown outcome was always undecidable.** *Resolved in the design (ADR-aacruzgon-0026, refining ADR-aacruzgon-0024).*
 - `resource_versions` gains `write_id`, written by V1 and V2 and by any V3 built from R1.
 - When the serial read finds a version past ours, R3 on row `V` decides it: our `write_id` is success with no index writes; another is a definite miss.
-- It stays undecidable (504 or 503) when row `V` is missing or has no `write_id`, which is the case when `update`, whose `StoredResource` has no `write_id`, superseded it (3.1).
+- It stays undecidable (504 or 503) when row `V` has no `write_id` (row `V` can no longer be missing once superseded, G40), which is the case when `update`, whose `StoredResource` has no `write_id`, superseded it (3.1).
 
 **G37. Two `_id` parameters must intersect.** *Resolved in the design (ADR-aacruzgon-0026).* A `patient/` scope appends `_id=<patient>` to every Patient search. If it had been checked against an index table, P5 would have made such searches empty; if only the first `_id` had been used, they would have leaked other patients. All `_id` parameters are now intersected before any read (5.4).
 
@@ -872,6 +898,7 @@ The CAS had already applied when step 5 failed, so no retry, sweep or repair cou
     - `gc_grace_seconds` stays at 3 h on `resources_by_type` (ADR-aacruzgon-0009), with two operations rules on the cluster: a replica down longer than `max_hint_window` (3 h) is replaced, not rejoined; and a replica returning from any shorter outage is repaired promptly, within 3 h of the outage's start. The rules narrow the lasting row of the table above; they do not remove it.
     - **Why it is only narrowed (CodeRabbit's review of PR #33).** Hints are best effort: "Hints are best effort, however, and do not guarantee eventual consistency like anti-entropy repair does" ([hints](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/hints.html)). A hint also expires at the smallest `gc_grace_seconds` of its mutation's tables (`Hint.java:56-57`, `131-158` in `cassandra-5.0.9`), so a hint for `resources_by_type` lives 3 h, the same as `max_hint_window`. A hint not delivered in time, one never written (disabled, past the window, or over the per-host limit, `StorageProxy.java:2428-2462`), or one lost with a coordinator before its 10 s flush can each leave a replica holding a row whose tombstone the others purge after 3 h. Cassandra's own rule is "repair should be run often enough that the gc grace period never expires on unrepaired data" ([repair](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/repair.html)), which a 3 h grace makes near-continuous.
     - **What is at risk.** Only `count`, `_count=0` without filters, and `/console` metrics, on the three-node cluster: one too many per resurrected `resources_by_type` row. Search is never wrong: a resurrected row has an old `version_id`, so the tag check hides it (5.1, step 4). The deliverable runs at RF 1, where no replica can miss a write.
+    - **Search can fail, not only count.** Each resurrected index or `resources_by_type` row is a candidate that a search point-reads and the tag check hides, so it counts against the candidate cap (5.1, step 7). If enough of them lie ahead of the live matches in one partition, that page returns 422 `TooManyResults` before it fills. It never returns a wrong result. Repair on read deletes each stale row the search reads, at step 4, before the cap is checked at step 7, so a retry gets further. The same holds for the orphans of the design's stated limitations. Reaching the cap needs that many missed deletes in one partition, all purged before repair, so we accept it with the `count` exposure.
     - **Rejected:** `only_purge_repaired_tombstones` on `resources_by_type`, which purges a tombstone only after repair (it defaults to false, `CompactionStrategyManager.java:1239-1242`): without regular repair, tombstones are never purged, which is worse than G8, and setting it in `schema.cql` erases the inherited UCS sub-options, as the README warns (checked on a 5.0.9 node, 2026-11-05). A higher `gc_grace_seconds`, back towards the 10-day default: tombstones would stay for days, the G8 cost. Either is the fix if the cluster ever becomes a deployment target.
     - A filtered `search_count` uses tag checks and the candidate cap; an unfiltered `count` scans `resources_by_type`.
     - `count(tenant, None)` loops over the resource type names of every enabled FHIR version (`FhirVersion::enabled_versions()` with `FhirResourceTypeProvider::get_resource_type_names`, as `ResourceTypeScope` does, `search/type_qualifier.rs:98-118`), each name once. Not over the registry's `resource_types()`, which the first recommendation named: it returns the bases of registered parameters (`crates/fhir/src/search/registry.rs:538-541`), which in R4 include the abstract `Resource` and `DomainResource` and miss every type with no parameter of its own (`Binary`, `Parameters`, `OperationOutcome`, from `data/search-parameters-r4.json`), so it would undercount.
@@ -915,3 +942,33 @@ The CAS had already applied when step 5 failed, so no retry, sweep or repair cou
 - **Measured on a 5.0.9 node.** On 2026-11-05, with a 64-byte tenant, resource type `MedicinalProductUndesirableEffect` (33 bytes) and a 2,048-byte `system` and `code` in `token_system_code_index`: a `param` of 61,327 bytes was accepted, and one of 61,328 failed with "Key length of 65536 is longer than maximum of 65535". Such a write would commit its CAS and then fail step 5 on every retry. The 5 KiB batch argument (3.1) already fails once `param` passes about 1 KB.
 - **Why 128.** The longest code in the spec data is 33 bytes in R4 and R4B, 35 in R5 and 46 in R6 (`data/search-parameters-*.json`). 128 leaves almost three times that, and keeps the largest key at 4,337 bytes.
 - **Decided:** the Cassandra backend refuses to store a SearchParameter whose `code` is over 128 UTF-8 bytes, with 400 (3.1, "SearchParameter `code` bound"), and the step 1 size check also measures `param`, as a backstop. This is a stated server restriction; FHIR sets no limit. Conformance seeding goes through `create_many` (`crates/persistence/src/search/seeder.rs:110`), and every spec code passes.
+
+**G39. A missed revive brought `resources.deleted_at` back.** *Resolved: `deleted_at = 0` means live, and `resources` writes no tombstone (ADR-aacruzgon-0027).* CodeRabbit's third review of PR #33 found it.
+- **The fault.** C4 cleared `deleted_at` with a literal null, the one cell tombstone in `resources`. `resources` keeps the 10-day default `gc_grace_seconds` (`expected-schema.txt`). A replica that missed the revive and its hint kept the delete's value. Once the other replicas had purged the tombstone, any read that included that replica reconciled to the old value: the zombie the 5.0 [tombstones](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/compaction/tombstones.html) page describes. Then:
+    - `read` answered 410;
+    - search hid the resource;
+    - `update` missed its CAS and answered 404;
+    - read repair copied the value to the other replicas.
+- **Why Paxos v2 does not prevent it.** In `cassandra-5.0.9`:
+    - a commit is hinted like any write (`PaxosCommit.java:219-231`, `allowHints = true` at `Paxos.java:764`), and hints are best effort;
+    - a prepare refreshes stale promisers with the latest commit only (`PaxosPrepare.java:80-104`, `852-857`; `PaxosPrepareRefresh.java:177-184`), and a later C2 does not touch `deleted_at`;
+    - once the tombstone is purged, read repair and repair both treat the stale value as the newest.
+- **Reproduced on a three-node 5.0.9 cluster** (2026-11-06; RF 3, Paxos v2; `gc_grace_seconds = 0` standing in for the 10 days, which also gives a hint a TTL of 0, standing in for a lost one). Steps: create and delete with all nodes up; stop one node; revive, then update to version 4; flush and compact the other two; restart the stopped node; no repair.
+
+    | Read after the restart | Literal-null revive | `deleted_at = 0` revive |
+    | --- | --- | --- |
+    | `CONSISTENCY ALL` | version 4, revived data, `deleted_at` = the delete's time | version 4, `deleted_at` 1970-01-01 |
+    | `ONE` on each node afterwards | the delete's time on all three | 1970-01-01 on all three |
+    | next CAS, `IF version_id = 4 AND deleted_at = null` / `= 0` | `[applied] False`, so 404 | `[applied] True` |
+
+- **Decided.** C1 and C4 write `deleted_at = 0`, a delete writes its own time, and C2 and C3 test `deleted_at = 0`. Every reader tests `deleted_at > 0` (section 2, "`deleted_at` and its readers"). `resources` and `resource_versions` now hold no tombstone, so their grace period no longer affects correctness. No column or type changes, and `expected-schema.txt` is unchanged. Repair within the 10-day grace period stays routine practice on the cluster ([repair](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/repair.html): "At a minimum, repair should be run often enough that the gc grace period never expires on unrepaired data"), but correctness no longer depends on it. It supersedes ADR-aacruzgon-0024's literal-null rule (G13).
+
+**G40. A missing row `V-1` was read as an empty key set.** *Resolved: V3 is written before the CAS (ADR-aacruzgon-0027).* CodeRabbit's third review of PR #33 found it. It predates `resources.index_keys`: ADR-aacruzgon-0013's sweeper took a missing row `V-1` to mean "its writer never reached step 5".
+- **The sequence, before the fix.**
+    1. Writer `N`'s CAS applies; `N` pauses before step 4.
+    2. Writer `N+1` reads `K(N)` from `resources`; its CAS applies and overwrites `index_keys`; it crashes before step 4. `K(N)` is now held only in the paused writer's memory.
+    3. The sweeper takes `N+1`'s intent: `N+1` is current, row `N` is missing, so `K(N)` was taken as empty. It inserts `K(N+1)`, deletes nothing, and deletes the intent.
+    4. Writer `N` resumes and inserts `K(N)`. Every key of `K(N) \ K(N+1)` is an orphan tagged `N`. That always includes `resources_by_type (lu(N), id)`, so `count` was one too high even on a single node.
+- **Decided.** V3, the rewrite of row `N`, moves from step 4 to step 2, before the intent row and the CAS (3.1). Once any CAS creating `N+1` has applied, row `N` exists with the exact `K(N)`. The sweeper's `K(V-1)` therefore always comes from a row that exists (section 6), and in step 3 above it deletes `K(N) \ K(N+1)` at `ts(N+1)`; writer `N`'s late inserts at `ts(N)` lose. It also removes the "two crashes in a row" limitation (G2) and the sweeper's missing-row branch (G3, G31).
+- **Cost.** One more sequential round trip on `update`, `update_with_match`, `delete`, `delete_versioned` and a `create_or_update` turn on a live row or a delete marker, since V3 no longer shares a batch with V1. A CAS that misses wastes its V3, which changes nothing. No schema change (section 2, "Extra reads and round trips").
+- **Checked on a fresh 5.0.9 node** (2026-11-06), with the statements in section 2: see ADR-aacruzgon-0027.

@@ -21,9 +21,17 @@
 --     current row always names the index rows its version writes
 --     (ADR-aacruzgon-0027);
 --   * never a CQL DELETE against resources (soft delete only: 410 needs the row);
+--   * resources.deleted_at is always written: 0 (1970-01-01T00:00:00Z) means
+--     live, written by the create and the revive CAS; a delete writes its own
+--     last_updated, never 0. Every CAS that requires a live row tests
+--     "deleted_at = 0", and every reader treats deleted_at > 0 as deleted. So
+--     resources never holds a tombstone, and a replica that missed a revive
+--     cannot bring the delete back (ADR-aacruzgon-0027, walkthrough G39);
 --   * every update, delete and revive also rewrites resource_versions row N
---     from current, USING TIMESTAMP write_ts(N) - 1, so a crash cannot lose
---     it and an existing row always wins; a rewrite built from a read of
+--     from current, USING TIMESTAMP write_ts(N) - 1, before its intent row and
+--     its CAS, so row N exists whenever a CAS creating N+1 has applied, a crash
+--     cannot lose it, and an existing row always wins (ADR-aacruzgon-0027,
+--     walkthrough G40); a rewrite built from a read of
 --     resources (delete, create_or_update, update_with_match) also carries
 --     that read's write_id, one built from update's StoredResource leaves it
 --     unset (ADR-aacruzgon-0026);
@@ -40,10 +48,10 @@
 --     re-extracted (ADR-aacruzgon-0027);
 --   * every write to resource_versions and the index tables carries USING
 --     TIMESTAMP derived from write_ts; a plain write would lose to them;
---   * never bind null; leave absent columns unset (null writes a cell tombstone).
---     The one deliberate null is the literal "SET deleted_at = null" in the
---     revive CAS, which clears the delete and writes exactly one cell
---     tombstone, on purpose (checked on 5.0.9, 2026-10-13; ADR-aacruzgon-0024);
+--   * never bind null and never write a null literal; leave absent columns
+--     unset (null writes a cell tombstone). There is no exception: the revive
+--     writes deleted_at = 0, which replaces ADR-aacruzgon-0024's literal
+--     "SET deleted_at = null" (ADR-aacruzgon-0027, walkthrough G39);
 --   * never ALLOW FILTERING;
 --   * never write an index row whose code, system or uri value is longer than
 --     2,048 bytes in UTF-8, or whose param is longer than 128 bytes: the write
@@ -95,7 +103,8 @@ CREATE TABLE IF NOT EXISTS resources (
     data          text,       -- resource JSON
     last_updated  timestamp,
     created_at    timestamp,
-    deleted_at    timestamp,  -- unset while live; set by a delete
+    deleted_at    timestamp,  -- 0 (1970-01-01) while live, always written; a
+                              -- delete sets its time; > 0 means deleted (G39)
     fhir_version  text,
     write_ts      bigint,     -- timestamp of this version's index writes
     write_id      uuid,       -- the CAS attempt that wrote this version; read back
@@ -136,7 +145,8 @@ CREATE TABLE IF NOT EXISTS resource_versions (
     version_id    int,
     data          text,       -- unset for a delete marker
     last_updated  timestamp,
-    deleted_at    timestamp,  -- set only on a delete marker
+    deleted_at    timestamp,  -- set only on a delete marker (never 0); unset on a
+                              -- content row
     fhir_version  text,
     write_ts      bigint,
     write_id      uuid,       -- the CAS attempt that wrote this version; unset when
@@ -190,7 +200,9 @@ CREATE TABLE IF NOT EXISTS pending_index_writes (
 -- resource's version_id; search compares it with resources.version_id (the
 -- tag check), so a stale or resurrected row never surfaces. That is why
 -- these seven tables lower gc_grace_seconds to 10800 s (3 h, the node's
--- max_hint_window). resources and resource_versions keep the 10-day default.
+-- max_hint_window). resources and resource_versions keep the 10-day default;
+-- neither holds a tombstone (G39), so their grace period does not affect
+-- correctness, and repair within it is routine practice on the cluster.
 -- A hint lives no longer than the smallest gc_grace_seconds of its tables
 -- (Hint.java in 5.0.9), so a hint for these tables expires at 3 h even after
 -- a short outage. On the cluster a replica returning from any outage is

@@ -14,7 +14,7 @@ This file holds expected results. The CQL for each case is in [`walkthrough.md`]
 - **Residual**: what is checked in Rust after the read.
 - **Expected**: the HTTP result.
 
-**True of every row that returns results.** Each candidate's `resources` row is loaded. It is dropped if its `version_id` differs from the index row's tag or if `deleted_at` is set. It is also dropped if the query names a FHIR version (`query.fhir_version`) that differs from `resources.fhir_version`, or carries a compartment filter (`query.compartment`) the resource is not a member of (section 5). Results come in `(last_updated DESC, id DESC)` order, deduplicated on `(last_updated, id)`. `_count` is the page size, and `next` is minted only when a `_count + 1`th match exists.
+**True of every row that returns results.** Each candidate's `resources` row is loaded. It is dropped if its `version_id` differs from the index row's tag or if `deleted_at > 0` (a live row carries `0`, walkthrough G39). It is also dropped if the query names a FHIR version (`query.fhir_version`) that differs from `resources.fhir_version`, or carries a compartment filter (`query.compartment`) the resource is not a member of (section 5). Results come in `(last_updated DESC, id DESC)` order, deduplicated on `(last_updated, id)`. `_count` is the page size, and `next` is minted only when a `_count + 1`th match exists.
 
 ## 1. The parameters
 
@@ -75,7 +75,7 @@ Forms that read two partitions run one query per partition and merge the sorted 
 | boolean | `Patient?active=true` | `token_code_index`, `(param, 'true')` | cursor | — | 200; matches `active: true` |
 | ContactPoint | `Patient?phone=555-0100` | `token_code_index`, `(param, '555-0100')` | cursor | — | 200; exact, case-sensitive value |
 | pipe on ContactPoint or boolean | `Patient?phone=phone\|555-0100`, `Patient?active=\|true` | as the form says | cursor | — | 200, matched by the general token rules, as SQLite and PostgreSQL do: neither has a case for ContactPoint or boolean (`backends/sqlite/search/parameter_handlers/token.rs:12-19`, `86-120`; `backends/postgres/search/query_builder.rs:2344-2394`). A ContactPoint is stored with its own `system` (`phone`), and a boolean with no system. So `phone\|555-0100` matches the phone `555-0100`, `\|true` matches `active: true`, and `email\|` matches any email. The spec says clients SHALL NOT send the pipe here; the server does not refuse it (C4, decided) |
-| `_id` | `Patient?_id=abc` | `resources`, point read `(id)` | — | `deleted_at` unset | 200; zero or one entry; case-sensitive |
+| `_id` | `Patient?_id=abc` | `resources`, point read `(id)` | — | `deleted_at` 0 (live) | 200; zero or one entry; case-sensitive |
 | `_id` with a pipe | `Patient?_id=sys\|abc`, `Patient?_id=\|abc` | `resources`, point read of the whole value as the id | — | — | 200, empty searchset. The value is compared whole with `Resource.id`, pipe included, as SQLite and PostgreSQL do (`backends/sqlite/search/query_builder.rs:1159-1224`, `backends/postgres/search/query_builder.rs:1870-1929`, both `id IN (…)` on `value.value`); an id never contains `\|` ([R4 datatypes.html#id](https://hl7.org/fhir/R4/datatypes.html#id)), so nothing matches (C2, decided) |
 | `_id` list | `Patient?_id=a,b,c` | `resources`, concurrent point reads (`read_batch`) | — | sort in Rust, cut at cursor | 200; existing, live ids |
 | two `_id` parameters (AND) | `Patient?_id=a,b&_id=b`; every Patient search under a `patient/` scope, to which REST appends `_id=<patient>` | intersect the id sets in Rust, then point-read only the intersection; never an index table | — | sort in Rust, cut at cursor | 200; only ids in every `_id` parameter (`b` here); disjoint sets give an empty searchset (walkthrough 5.4, G37) |
@@ -235,5 +235,7 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 | Compartment filter (`query.compartment`) | G33 | **resolved** (ADR-aacruzgon-0026): residual on each loaded row, under the cap |
 | `query.fhir_version` on searches and counts | G34 | **resolved** (ADR-aacruzgon-0026): residual, and `resources_by_type.fhir_version` for counts |
 | Index values over 2,048 bytes | G35 | **resolved** (ADR-aacruzgon-0026): the write is refused with 400 `InvalidResource` before step 2 (section 6) |
+| A revived resource read as deleted after a missed revive | G39 | **resolved** (ADR-aacruzgon-0027): `deleted_at = 0` means live; `resources` writes no tombstone |
+| A paused writer, then a crashed successor, left orphans | G40 | **resolved** (ADR-aacruzgon-0027): the rewrite of row N runs before the CAS |
 | A custom SearchParameter's `code` over 128 bytes | G38 | **resolved** (ADR-aacruzgon-0027): refused with 400 `InvalidResource` when stored; `param` measured in the step 1 check (section 6) |
 | Two `_id` parameters | G37 | **resolved** (ADR-aacruzgon-0026): intersected before any read |

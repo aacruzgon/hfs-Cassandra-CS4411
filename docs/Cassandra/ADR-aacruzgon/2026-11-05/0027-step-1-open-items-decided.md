@@ -32,6 +32,10 @@
         - the shared `_has` resolver misses versioned and absolute references;
         - a failed terminology expansion widens the result silently (C8);
         - a custom SearchParameter's `code` can push an index key past Cassandra's limit (G38).
+    - **Third review of PR #33.** CodeRabbit raised three more points, each checked against the Cassandra 5.0 docs, the `cassandra-5.0.9` source, the design and the code, and each real:
+        - resurrected and orphan rows count against the candidate cap (G7);
+        - a replica that missed a revive brings `resources.deleted_at` back once the revive's tombstone is purged (G39);
+        - the sweeper read a missing row V−1 as an empty key set, which a paused writer and a crashed successor turn into orphans (G40).
     - **Checked against the code before it was written.** Every answer below was checked against `main` and the R4 spec. Where a recommendation did not fit, a proposal that does was put to Alan and accepted. For C5 and C7 the orchestrating session also checked the spec and #28 before Alan decided.
 - **Decision:**
     - **Q5 / G32.** `pending_index_writes.write_id` is kept as a diagnostic, so an operator can match a stuck intent to a request's log. The sweeper still never reads it.
@@ -43,7 +47,9 @@
             - A hint expires at the smallest `gc_grace_seconds` of its mutation's tables (`Hint.java:56-57`, `131-158`, `Mutation.java:282-288` in `cassandra-5.0.9`). For `resources_by_type` and the index tables that is 3 h, the same as `max_hint_window`.
             - Hints are not written at all when they are disabled, past the window, or over the per-host limit (`StorageProxy.java:2428-2462`). A coordinator that dies before its 10 s `hints_flush_period` loses the buffered ones [inferred].
             - So a delete a replica missed, in an outage of any length, through a dropped mutation or a lost hint, comes back once its tombstone is purged before repair reaches that replica: "At a minimum, repair should be run often enough that the gc grace period never expires on unrepaired data. Otherwise, deleted data could reappear" ([repair](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/repair.html)).
-        - **The exposure, exactly.** Only the three-node cluster (RF 3); at RF 1 no replica can miss a write. Only `count`, `_count=0` without filters, `_total` on an unfiltered search and `/console` metrics: one too many per resurrected `resources_by_type` row, until an unfiltered type search pages over the row and repair on read deletes it. Search is never wrong: a resurrected row carries an old `version_id`, so the tag check hides it. A resurrected intent row is harmless (ADR-aacruzgon-0009). We accept this exposure.
+        - **The exposure, exactly.** Only the three-node cluster (RF 3); at RF 1 no replica can miss a write. Only `count`, `_count=0` without filters, `_total` on an unfiltered search and `/console` metrics: one too many per resurrected `resources_by_type` row, until an unfiltered type search pages over the row and repair on read deletes it. Search is never wrong: a resurrected row carries an old `version_id`, so the tag check hides it. A resurrected intent row is harmless (ADR-aacruzgon-0009).
+        - **Search can fail, not only count** (CodeRabbit's third review). Each resurrected index or `resources_by_type` row is a candidate that a search point-reads and the tag check hides, so it counts against the candidate cap (walkthrough 5.1, step 7). If enough of them lie ahead of the live matches in one partition, that page returns 422 `TooManyResults` before it fills. It never returns a wrong result. Repair on read deletes each stale row the search reads, at step 4, before the cap is checked at step 7, so a retry gets further. The same holds for the orphans of the design's stated limitations. Reaching the cap needs that many missed deletes in one partition, all purged before repair.
+        - We accept this exposure.
         - A filtered `search_count` uses tag checks and the candidate cap. An unfiltered `count` scans `resources_by_type`.
         - `count(tenant, None)` sums `count` over the resource type names of every enabled FHIR version: `FhirVersion::enabled_versions()` with `FhirResourceTypeProvider::get_resource_type_names`, as `ResourceTypeScope` does (`crates/persistence/src/search/type_qualifier.rs:98-118`), each name once. No new table.
         - `count` and a filtered `search_count` may differ in three cases: while a write is in flight; while a crashed write waits for the sweeper; and in the design's stated limitations (an intent that expired during a sweeper outage over 24 h, a request stalled past the grace period, or one paused past `gc_grace_seconds`), where an orphan row stays counted until a search repairs it.
@@ -138,6 +144,38 @@
             - So this is a stated server restriction, not a spec rule.
         - **Measured on a 5.0.9 node.** With a 64-byte tenant, resource type `MedicinalProductUndesirableEffect` and a 2,048-byte `system` and `code` in `token_system_code_index`, a 61,327-byte `param` was accepted and a 61,328-byte one failed: "Key length of 65536 is longer than maximum of 65535". Such a write would commit its compare-and-swap and then fail step 5 on every retry, the G35 failure caused by another client's SearchParameter. The 5 KiB batch argument already fails once `param` passes about 1 KB.
         - **Why 128.** The longest code in the spec data is 46 bytes (R6; 33 in R4 and R4B, 35 in R5, from `data/search-parameters-*.json`). The largest key is then 4,337 bytes, which still fits one row in a 5 KiB batch. Conformance seeding goes through `create_many` (`crates/persistence/src/search/seeder.rs:110`), and every spec code passes.
+    - **G39: `resources.deleted_at` never needs a tombstone** (CodeRabbit's third review of PR #33).
+        - **The rule.** A live `resources` row has `deleted_at = 0` (1970-01-01T00:00:00Z), written by C1 (create) and C4 (revive). A delete (C3) writes its own `last_updated`, never 0. C2 and C3 are conditioned on `deleted_at = 0`, where they were conditioned on `deleted_at = null`. C4 keeps `IF version_id = N`. `resource_versions` is unchanged: a content row leaves `deleted_at` unset, and a marker sets it.
+        - **ADR-aacruzgon-0024's literal-null rule is superseded.** C4 no longer writes `SET deleted_at = null`, so "never bind null" has no exception, and neither `resources` nor `resource_versions` holds any tombstone.
+        - **Every reader that decides "deleted" tests `deleted_at > 0`** (walkthrough section 2, "`deleted_at` and its readers"):
+            - `read` (410, or 404 with `HFS_RETURN_GONE` false) and `exists`;
+            - `vread`: a marker, whose `deleted_at` is always `> 0`;
+            - the `_id` search, and the tag check behind every search, filtered `search_count` and the compartment residual;
+            - the CAS-miss mapping of C2 and C3 (404);
+            - `update`'s R1 and the pre-reads of `delete` and `update_with_match` (404);
+            - `create_or_update`'s branch choice (revive);
+            - the sweeper (a marker gets V2 and an empty key set);
+            - `StoredResource::from_storage`, which receives `None` for 0.
+          Unfiltered `count` reads `resources_by_type`, not `resources`, so it never tests `deleted_at`.
+        - **Why.** The revive's literal null was the one tombstone in `resources`, and `resources` keeps the 10-day default `gc_grace_seconds`.
+            - A replica that missed the revive and its hint kept the delete's value. Paxos v2 hints a commit like any write (`PaxosCommit.java:219-231`, `allowHints = true` at `Paxos.java:764`), and hints are best effort.
+            - A prepare refreshes stale promisers with the latest commit only (`PaxosPrepare.java:80-104`, `852-857`; `PaxosPrepareRefresh.java:177-184`), and a later C2 does not write `deleted_at`.
+            - Once the other replicas purged the tombstone, any read that included the stale replica reconciled to the delete's value, and read repair and repair then spread it, the zombie of the 5.0 [tombstones](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/compaction/tombstones.html) page.
+            - The revived resource read as deleted (410), vanished from search, and its next update missed its CAS (404). With the sentinel, the revive's cell is newer, so it wins on every replica whatever the repair schedule.
+        - **Repair** within the 10-day grace period stays routine practice on the cluster ("At a minimum, repair should be run often enough that the gc grace period never expires on unrepaired data", [repair](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/repair.html)). Correctness no longer depends on it.
+        - **No column or type changes.** `expected-schema.txt` is unchanged at 92 rows.
+    - **G40: the rewrite of row N (V3) runs before the compare-and-swap** (CodeRabbit's third review of PR #33).
+        - **The rule.** `update`, `update_with_match`, `delete`, `delete_versioned` and a `create_or_update` turn on a live row or a delete marker write V3 for row N at `write_ts(N) − 1` at step 2, before the intent row and the CAS, where step 4 wrote it before. It is built from R1, or from `current` with R1's `K(N)`, exactly as before. Step 4 now writes only row N+1. This revises ADR-aacruzgon-0012's placement of V3.
+        - **Why.** ADR-aacruzgon-0013's sweeper read a missing row V−1 as "its writer never reached step 5", so it took `K(V−1)` as empty. A paused writer breaks that assumption. The gap predates `resources.index_keys`.
+            1. Writer N's CAS applies, and N pauses before step 4.
+            2. Writer N+1's CAS applies and overwrites `resources.index_keys`; it crashes before step 4. `K(N)` is now only in the paused writer's memory.
+            3. The sweeper takes N+1's intent, deletes nothing for N, and deletes the intent.
+            4. N resumes and inserts `K(N)`, whose keys outside `K(N+1)` nothing deletes. They always include `resources_by_type (lu(N), id)`, so `count` was wrong even at RF 1.
+
+          With V3 before the CAS, row N exists with its exact `index_keys` whenever any CAS creating N+1 has applied. The sweeper deletes `K(N) \ K(N+1)` at `write_ts(N+1)`, and N's late inserts at `write_ts(N)` lose.
+        - **The sweeper's rules.** Row V−1 always exists for V > 1, and row V once V is superseded. The "row V missing" branch (delete `K(V−1)` at `write_ts(V−1) + 1`) is removed, and the "two crashes in a row lose a version" limitation goes away.
+        - **Cost.** One more sequential round trip on those operations, since V3 no longer shares a single-partition batch with V1. A CAS that misses wastes its V3, which changes nothing. No schema change.
+        - **Failure test.** A roadmap section 6 row: the paused writer, then a crashed successor, then both sweeps, then the resume. Expected: no index or `resources_by_type` row of N remains, and `count` is correct.
     - **P6.** The schema is applied from one process, a setup command or the test harness. `initialize` only checks that the ten tables exist (roadmap Step 2).
     - **Roadmap section 6.**
         - A node-kill test: Cassandra killed with `kill -9` under write load on the single node. Expected: up to one `commitlog_sync_period` of acknowledged writes lost, no half-applied batch, and no index row for a resource whose CAS was lost.
@@ -183,6 +221,13 @@
     - **C11:** a REST-layer 501 checked by name, the first recommendation. This lost: REST passes `_filter` through and SQLite and MongoDB serve it, so a REST-layer refusal would break them.
     - **P5:** keep writing every extracted row. This lost: one row in three for every `code`-typed element, and `_lastUpdated` rows that move on every update.
     - **P6:** `initialize` applies the schema. This lost: several processes would change the schema at once, which the Apache docs do not cover.
+    - **G39:**
+        - Keep the literal null and require repair to complete within `resources`' 10-day grace period. This lost: it leaves a correctness property of reads and writes to an operations promise, which a missed repair window breaks.
+        - An always-written `is_deleted boolean`, conditioned on `is_deleted = false`. Not chosen: it is clearer than a sentinel, but it adds a column (93 rows) and two columns that must agree.
+        - Drop the `deleted_at` condition from C2 and C3 and rely on `version_id`. This lost: the revive must still mark the row live, and a missed CAS would no longer return `deleted_at` to tell 404 from 409.
+    - **G40:**
+        - Carry the previous key set in the intent row (`pending_index_writes.previous_index_keys`). Not chosen: a schema change (93 rows) and about 300 bytes more per intent; it keeps the two-crashes limitation.
+        - Keep the intent pending until row V−1 appears, or for up to its 24 h TTL. This lost: an intent from a real double crash would be re-read every poll for a day, and a writer paused longer still orphans.
     - **Roadmap section 6:** kill the node on Restart. This lost: at RF 1 it would fail by design, so the loss gets its own row.
 - **Consequences:**
     - **Easier:**
@@ -190,16 +235,19 @@
         - fewer index rows and tombstones per write;
         - deletes remove exactly what a version wrote, whatever the registry says now, so a `SearchParameter` change leaves no orphans;
         - every error the cap produces is the same 422;
+        - `resources` writes no tombstone, so a missed revive cannot bring a delete back, whatever the repair schedule (G39);
+        - row N always exists once a later compare-and-swap applied, so two crashes in a row no longer lose a version (G40);
         - the schema has one owner at setup.
     - **Harder or costlier:**
         - a date-only page comes in date order, not in the default order, so a client that pages a date-only search and then a token search sees two orders. The scope table says so;
         - a `_has` with a broad terminal reads every page of it; a Step 8 benchmark case;
         - one extra point read per `update`;
+        - one extra sequential round trip per `update`, `update_with_match`, `delete`, `delete_versioned` and a `create_or_update` turn on a live row or a marker, for V3 before the compare-and-swap (G40);
         - `index_keys` costs about 289 bytes per version in the worked example (8 rows), and at most about 4 KB more per row with the 2 KiB rule, stored twice for the current version (`resources` and its version row) and carried in every compare-and-swap's Paxos proposal;
         - a SearchParameter with a `code` over 128 bytes is refused, a restriction FHIR does not impose;
-        - **known limitations:** on the three-node cluster, `count` can be one too high per row resurrected after a missed delete (G7); `_has` misses versioned and absolute source references until upstream fixes #2499; a failed terminology expansion widens a search silently (C8, upstream #2019);
+        - **known limitations:** on the three-node cluster, `count` can be one too high per row resurrected after a missed delete, and enough such rows in one partition can make a search page return 422 (G7); `_has` misses versioned and absolute source references until upstream fixes #2499; a failed terminology expansion widens a search silently (C8, upstream #2019);
         - **known limitation:** adding a `SearchParameter` does not index existing resources. They are found by it only after their next write, and no reindex exists.
-    - **Schema:** `resources.index_keys blob` and `resource_versions.index_keys blob`. `expected-schema.txt` has 92 rows; the CI assertion checks both columns.
+    - **Schema:** `resources.index_keys blob` and `resource_versions.index_keys blob`. `expected-schema.txt` has 92 rows; the CI assertion checks both columns. G39 and G40 change statements and comments only.
     - **Settled by earlier decisions, now marked as such in the walk-through:** G14 (ADR-aacruzgon-0011), G15 (ADR-aacruzgon-0025), G19 (the design's `_lastUpdated` rule), G21 (roadmap 6d), G24 and G28 (ADR-aacruzgon-0024), G29 (design step 4), G30 (the design's measure-first decision), C3 (the design's token rules).
     - **To measure:** date-only page latency in the table's order; how often the cap's 422 fires; the mass-update case (G8); the broad `_has` case and the AND driver (C5, C7); `index_keys` sizes on the fixtures (roadmap sections 7 and Step 8).
 - **AI involvement:**
@@ -217,6 +265,7 @@
         - C7's "failing `_has` hop": the example the coverage table gave does not fail; `_has` with a served terminal is answered through the shared resolver.
     - **C5 and C7, checked against the spec and #28.** At Alan's request, the orchestrating Claude Code session checked the R4 search page, Discussion #28 and the design's polyglot table for both. C5 changed as a result: URI is split into identity URIs (rank 3) and shared tags (`_profile`, `_source`, rank 4). The worker checked the identity URIs against the R4 registry and the `search_all_pages` line numbers.
     - **Review of PR #33.** CodeRabbit's review raised the five points under "Context". The worker checked each against the spec, the Cassandra 5.0 docs and `cassandra-5.0.9` source, the design and the code, and ran the questions it could settle on a fresh 5.0.9 node; all five were real. The orchestrating Claude Code session recommended an answer to each, and Alan accepted them and the filing of the upstream issue. CodeRabbit's review prompted the G22 change: the worker had first raised the `resources` copy and recorded it as not chosen for its Paxos cost, which it had overstated. The worker filed HeliosSoftware/hfs#2499 after searching upstream for an existing report, and found #2019 already declined for C8.
+    - **Third review of PR #33.** CodeRabbit's third review found the three points under "Context". The worker checked each against the Cassandra 5.0 docs and `cassandra-5.0.9` source, the design and the code, and reproduced G39 on a three-node cluster. G40 predates the `index_keys` change: ADR-aacruzgon-0013's sweeper already read a missing row V−1 as an empty set. The orchestrating Claude Code session recommended the answers: the sentinel for G39, V3 before the CAS for G40, and the cap paragraph. Alan accepted them.
     - **What the human changed:**
         - Alan accepted all the recommendations, then accepted the worker's four proposals for the first round's misfits, then the C5 and C7 conclusions.
         - G22 was reversed after Alan asked "why would we leave orphan rows?". The earlier proposal had been to accept them; Alan decided to store each version's key set instead.
@@ -227,15 +276,27 @@
         - The `index_keys` sizes were computed by encoding the worked example's key sets: `K(1)` 289 bytes, `K(2)` 293, the empty set 2.
         - For the review of PR #33: the Cassandra 5.0 [hints](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/hints.html), [repair](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/repair.html) and [tombstones](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/compaction/tombstones.html) pages; `cassandra-5.0.9` `Hint.java`, `Mutation.java`, `StorageProxy.java`, `Config.java`, `CompactionController.java` and `CompactionStrategyManager.java`; `chain_resolver.rs`, the REST terminology expansion, the SearchParameter loader and the seeder at the PR head and on upstream `main` (`be76ebead`); the R4 `SearchParameter.code`, `code` and `string` definitions and search.html #reference, #versions, #modifiers and #errors.
         - On fresh 5.0.9 nodes for the review: UCS with `only_purge_repaired_tombstones` accepted, which erased the inherited sub-options; the `param` key-length boundary at 61,327 and 61,328 bytes; `schema.cql` with `resources.index_keys` applied twice, silently, with ten tables; the CI assertion passed with 92 rows, and failed with a one-line diff when `resources.index_keys` was left out or typed `text`; C1 to C4 writing `index_keys`, a missed CAS returning only its `IF` columns, and the paused-writer sequence leaving no orphan. The nodes were removed afterwards.
+        - For the third review, on a three-node 5.0.9 cluster (RF 3, Paxos v2), on 2026-11-06:
+            - **Setup.** Two copies of the `resources` shape, both with `gc_grace_seconds = 0`, standing in for the 10 days; it also gives a hint a TTL of 0, standing in for a lost one.
+            - **Steps.** Create and delete, with every node up. Stop one node. Revive, then update to version 4. `listpendinghints` showed none on the two live nodes. Flush and compact the two live nodes. Restart the stopped one, with no repair.
+            - **Literal null.** `CONSISTENCY ALL` returned version 4 with the revived data, but `deleted_at` was the delete's time. Afterwards `ONE` on each node returned that time, because read repair had spread it. The next CAS, `IF version_id = 4 AND deleted_at = null`, missed (`[applied] False`), which maps to 404.
+            - **Sentinel.** `deleted_at` was `1970-01-01` at `ALL` and on every node. The next CAS, `IF version_id = 4 AND deleted_at = 0`, applied.
+            - The cluster was removed afterwards.
+        - On a fresh 5.0.9 node, also 2026-11-06:
+            - **Schema.** `schema.cql` with the G39 comments applied twice, silently, with ten tables. The CI assertion passed with 92 rows, `expected-schema.txt` unchanged. It failed with a one-line diff when `resources.deleted_at` was typed `bigint`.
+            - **The sentinel.** C1, C3 and C4 with `deleted_at = 0` applied on `resources`. A repeat delete missed, returning `deleted_at`, and a C2-style update of the revived row applied. After a flush, `sstabledump` showed no cell tombstone for that row, and one `deleted_at` cell tombstone for a row revived with the literal null.
+            - **G40.** The paused-writer sequence, with V3 after the CAS, left two orphans tagged 2 for version 2 (`resources_by_type` at `lu(2)` and `token_code_index` `gender=female` at `lu(2)`), so `count` was 2 for one resource. The sweeper's R3 of row 2 had returned no row. With V3 before the CAS, R3 returned row 2 with its `index_keys`, and no orphan remained.
+            - The node was removed afterwards.
         - On a fresh 5.0.9 node, before the review: `keyspace-single-node.cql` and the revised `schema.cql` applied twice, silently, with ten tables. The CI assertion passed with 91 rows. It failed with a one-line diff when `index_keys` was typed `text` or left out, and passed again after the real schema was restored. V1 with the 289-byte `K(1)`, then a V3 at `write_ts(1) − 1` with another blob: row 1 kept the original blob and data. A V3 for a missing row 2 restored it, and the original written afterwards at `write_ts(2)` replaced every cell. The node was removed afterwards.
 - **Links:**
     - **Files:**
         - `docs/Cassandra/schema/schema.cql` (`resources.index_keys`, `resource_versions.index_keys`, the encoding, the hint note, the statement rules) and `schema/expected-schema.txt`;
-        - `docs/Cassandra/schema/walkthrough.md`: section 1, section 2 ("Stored key sets"), 3.1 to 3.5, 5.1, 5.7, 5.9, 5.11, section 6, the worked example, section 8 (G7, G22, G38);
+        - `docs/Cassandra/schema/walkthrough.md`: section 1, section 2 ("Stored key sets"), 3.1 to 3.5, 5.1, 5.7, 5.9, 5.11, section 6, the worked example, section 8 (G2, G3, G7, G9, G13, G22, G31, G38, G39, G40), section 2's "`deleted_at` and its readers";
         - `schema/coverage.md`: sections 1 to 7, including the `_has` reference, terminology fail-open and SearchParameter `code` rows in section 6;
         - `schema/README.md`: checklist, changes table, proposals and decisions;
         - `cassandra-discussion.md`: scope table, `_id` note, paging capability, data model, token rules, write path steps 1 and 4, sweeper, repair, tombstones, capabilities and rejection, open questions, `count`;
         - `development-roadmap.md`: rows 5.2 and 6a, Step 1 checklist, Steps 5, 6, 6a, 6b and 8, sections 5 and 6.
     - **Builds on:** ADR-aacruzgon-0009, 0012, 0013, 0017, 0024, 0026.
+    - **Supersedes:** ADR-aacruzgon-0024's literal-null rule (the revive's `SET deleted_at = null`), replaced by `deleted_at = 0` (G39); ADR-0024 itself is unchanged. It also revises ADR-aacruzgon-0012's placement of V3 and ADR-aacruzgon-0013's missing-row rule (G40).
     - **Sources:** [R4 search.html](https://hl7.org/fhir/R4/search.html); [R4 SearchParameter.code](https://hl7.org/fhir/R4/searchparameter-definitions.html#SearchParameter.code); [R4 datatypes.html#code](https://hl7.org/fhir/R4/datatypes.html#code); [Discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28); Cassandra 5.0 [hints](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/hints.html) and [repair](https://cassandra.apache.org/doc/5.0/cassandra/managing/operating/repair.html); [HeliosSoftware/hfs#2019](https://github.com/HeliosSoftware/hfs/issues/2019); [HeliosSoftware/hfs#2499](https://github.com/HeliosSoftware/hfs/issues/2499).
     - **Pull request:** [PR #33](https://github.com/aacruzgon/hfs-Cassandra-CS4411/pull/33), from branch `docs/schema-audit-fixes`.

@@ -29,9 +29,15 @@
 //! container and its volume are removed when the test ends. Only one container
 //! runs at a time. Without Docker, a test that needs a container skips.
 //!
-//! Each run writes under its own tenant (`HFS_DEFAULT_TENANT`), so a reused
-//! node's earlier rows change nothing. `HFS_SOF_ENABLED` is removed from
-//! `hfs`'s environment: the Cassandra backend refuses it when set.
+//! Each run writes under its own tenant (`HFS_DEFAULT_TENANT`, prefix `test-`),
+//! so a reused node's earlier rows change nothing. Every `HFS_*`, `OTEL_*` and
+//! `RUST_LOG` variable of the caller is removed from `hfs`'s environment, which
+//! also keeps `HFS_SOF_ENABLED` unset (the Cassandra backend refuses it).
+//!
+//! Without Docker the readiness test skips, unless `HFS_TEST_CASSANDRA_URL` is
+//! set: then it fails, so a run meant to check the exit criterion cannot pass
+//! without stopping a node. The evidence of a real run is its
+//! `/_readiness down …` and `/_readiness up …` lines on stderr.
 //!
 //! Run with:
 //! `HFS_TEST_CASSANDRA_URL=127.0.0.1:59042 cargo test -p helios-hfs --features cassandra --test cassandra_milestone_a`
@@ -50,7 +56,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::StatusCode;
-use reqwest::header::{CONTENT_TYPE, ETAG, LOCATION};
+use reqwest::header::{CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATION};
 use serde_json::{Value, json};
 use testcontainers::core::{CmdWaitFor, ExecCommand, IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -92,9 +98,9 @@ static CONTAINER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 async fn milestone_a_create_then_read_through_rest() {
     let _lock;
     let _container;
-    let contact_point = match std::env::var(URL_VAR) {
-        Ok(url) => url.trim().to_owned(),
-        Err(_) => {
+    let contact_point = match test_url() {
+        Some(url) => url,
+        None => {
             _lock = CONTAINER_LOCK.lock().await;
             let Some(node) = OwnNode::start().await else {
                 return;
@@ -108,7 +114,7 @@ async fn milestone_a_create_then_read_through_rest() {
     // No conformance seed: on a reused node every run would add about 1,400
     // rows under a new tenant. The readiness test, on its own node, boots with
     // the seed.
-    let hfs = Hfs::start(&contact_point, &unique_tenant("milestone-a"), false);
+    let mut hfs = Hfs::start(&contact_point, &unique_tenant("milestone-a"), false);
     hfs.wait_until_serving().await;
     round_trip(&hfs).await;
 }
@@ -117,9 +123,16 @@ async fn milestone_a_create_then_read_through_rest() {
 async fn readiness_reports_down_while_cassandra_is_stopped() {
     let _lock = CONTAINER_LOCK.lock().await;
     let Some(node) = OwnNode::start().await else {
+        // A skip must not pass for the exit criterion: a caller who named a
+        // node meant the Cassandra tests to run, and this one needs Docker.
+        assert!(
+            test_url().is_none(),
+            "{URL_VAR} is set, but Docker cannot be reached, and this test needs a node of its \
+             own to stop; it cannot run"
+        );
         return;
     };
-    let hfs = Hfs::start(&node.contact_point(), &unique_tenant("readiness"), true);
+    let mut hfs = Hfs::start(&node.contact_point(), &unique_tenant("readiness"), true);
     hfs.wait_until_serving().await;
     assert!(
         hfs.output()
@@ -161,7 +174,7 @@ async fn readiness_reports_down_while_cassandra_is_stopped() {
 
 /// `POST /Patient`, then `GET` of the id the response names.
 async fn round_trip(hfs: &Hfs) {
-    let client = reqwest::Client::new();
+    let client = http();
     let family = format!("Milestone-{}", unique_suffix());
     let created = client
         .post(format!("{}/Patient", hfs.base))
@@ -182,14 +195,16 @@ async fn round_trip(hfs: &Hfs) {
 
     let id = body["id"].as_str().expect("the created resource has an id");
     assert!(!id.is_empty());
-    // R4 http.html#create: the server assigns the id, and `Location` names it
-    // (as `[base]/Patient/[id]`, or with `/_history/[vid]` after it).
-    let named = location
-        .strip_prefix(&format!("{}/Patient/", hfs.base))
-        .unwrap_or_else(|| panic!("Location {location} is not under {}/Patient/", hfs.base));
-    assert!(
-        named == id || named == format!("{id}/_history/1"),
-        "Location {location} does not name id {id}"
+    // R4 http.html#create: the server "SHALL also return a Location header
+    // which contains the new Logical Id and Version Id", that is
+    // `[base]/Patient/[id]/_history/[vid]`. HFS's REST layer, shared by every
+    // backend, sends `[base]/Patient/[id]` (`crates/rest/src/handlers/create.rs`),
+    // a deviation upstream owns. This pins what it sends today: when the
+    // version is added, update the expected value here.
+    assert_eq!(
+        location,
+        format!("{}/Patient/{id}", hfs.base),
+        "Location of the create"
     );
     assert_eq!(etag, "W/\"1\"", "ETag of the create");
     assert_eq!(body["meta"]["versionId"], "1", "{body}");
@@ -207,6 +222,18 @@ async fn round_trip(hfs: &Hfs) {
         .expect("GET /Patient/{id}");
     assert_eq!(read.status(), StatusCode::OK, "GET /Patient/{id}");
     assert_eq!(header(&read, ETAG), "W/\"1\"", "ETag of the read");
+    // R4 http.html#read: the server SHOULD return `Last-Modified`; it is
+    // `meta.lastUpdated` at HTTP-date (second) precision.
+    let last_modified = header(&read, LAST_MODIFIED);
+    let last_modified = chrono::DateTime::parse_from_rfc2822(&last_modified)
+        .unwrap_or_else(|e| panic!("Last-Modified {last_modified} is not an HTTP date: {e}"));
+    assert_eq!(
+        last_modified.timestamp(),
+        chrono::DateTime::parse_from_rfc3339(last_updated)
+            .expect("checked above")
+            .timestamp(),
+        "Last-Modified of the read"
+    );
     let read: Value = read.json().await.expect("the read's body is JSON");
     assert_eq!(read["resourceType"], "Patient", "{read}");
     assert_eq!(read["id"], id, "{read}");
@@ -237,7 +264,18 @@ impl Hfs {
     fn start(contact_point: &str, tenant: &str, seed: bool) -> Self {
         let port = free_port();
         let base = format!("http://127.0.0.1:{port}");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_hfs"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hfs"));
+        // Nothing in the caller's environment decides how this `hfs` runs, as
+        // in `elasticsearch_startup.rs`. That also keeps HFS_SOF_ENABLED unset:
+        // the Cassandra backend refuses it when it is set.
+        for (key, _) in std::env::vars_os() {
+            if let Some(key) = key.to_str()
+                && (key.starts_with("HFS_") || key.starts_with("OTEL_") || key == "RUST_LOG")
+            {
+                command.env_remove(key);
+            }
+        }
+        let mut child = command
             .env("HFS_STORAGE_BACKEND", "cassandra")
             .env("HFS_CASSANDRA_CONTACT_POINTS", contact_point)
             .env("HFS_DEFAULT_TENANT", tenant)
@@ -246,9 +284,6 @@ impl Hfs {
             .env("HFS_SERVER_PORT", port.to_string())
             .env("HFS_BASE_URL", &base)
             .env("HFS_LOG_LEVEL", "info")
-            .env_remove("HFS_SOF_ENABLED")
-            .env_remove("HFS_DATABASE_URL")
-            .env_remove("HFS_AUDIT_BACKEND")
             .current_dir(repo_path(""))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -269,27 +304,24 @@ impl Hfs {
     }
 
     /// Waits until `/metadata` answers 200; fails if `hfs` exits first.
-    async fn wait_until_serving(&self) {
+    async fn wait_until_serving(&mut self) {
         let deadline = Instant::now() + HFS_STARTUP_TIMEOUT;
-        let client = reqwest::Client::new();
+        let client = http();
         loop {
             if let Ok(response) = client.get(format!("{}/metadata", self.base)).send().await
                 && response.status() == StatusCode::OK
             {
                 return;
             }
+            if let Some(status) = self.child.try_wait().expect("poll hfs") {
+                panic!(
+                    "hfs exited ({status}) before serving; output:\n{}",
+                    self.output()
+                );
+            }
             assert!(
                 Instant::now() < deadline,
                 "/metadata did not answer within {HFS_STARTUP_TIMEOUT:?}; hfs output:\n{}",
-                self.output()
-            );
-            assert!(
-                self.output
-                    .lock()
-                    .expect("output lock")
-                    .find("Error:")
-                    .is_none(),
-                "hfs failed to start; output:\n{}",
                 self.output()
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -297,7 +329,9 @@ impl Hfs {
     }
 
     async fn readiness(&self) -> (StatusCode, Value) {
-        let response = reqwest::get(format!("{}/_readiness", self.base))
+        let response = http()
+            .get(format!("{}/_readiness", self.base))
+            .send()
             .await
             .expect("GET /_readiness");
         let status = response.status();
@@ -351,7 +385,9 @@ struct OwnNode {
 impl OwnNode {
     /// `None` (the test skips) when Docker cannot be reached.
     async fn start() -> Option<Self> {
-        let host_port = free_port();
+        // `with_mapped_port` publishes on every interface, so the port must be
+        // free on all of them, not only on loopback.
+        let host_port = free_port_on("0.0.0.0");
         let request = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
             .with_exposed_port(CQL_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stdout(CQL_LISTENING))
@@ -449,9 +485,13 @@ async fn docker_answers() -> bool {
     }
 }
 
-/// A port nothing is listening on.
+/// A loopback port nothing is listening on.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
+    free_port_on("127.0.0.1")
+}
+
+fn free_port_on(address: &str) -> u16 {
+    TcpListener::bind(format!("{address}:0"))
         .and_then(|listener| listener.local_addr())
         .expect("reserve a local port")
         .port()
@@ -472,7 +512,28 @@ fn unique_suffix() -> String {
     format!("{nanos:x}-{}", std::process::id())
 }
 
-/// A tenant no earlier run used; tenant ids allow letters, digits and `-`.
+/// A tenant no earlier run used, with the L1 harness's `test-` prefix so test
+/// rows on a shared node can be told apart. Tenant ids allow letters, digits
+/// and `-`.
 fn unique_tenant(test: &str) -> String {
-    format!("s2-{test}-{}", unique_suffix())
+    format!("test-{test}-{}", unique_suffix())
+}
+
+/// `HFS_TEST_CASSANDRA_URL`, trimmed; empty counts as unset, as in the L1
+/// harness.
+fn test_url() -> Option<String> {
+    std::env::var(URL_VAR)
+        .ok()
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty())
+}
+
+/// The client every request goes through: no proxy (a developer's
+/// `HTTP_PROXY` must not route loopback requests), and a bound on each request.
+fn http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("HTTP client")
 }

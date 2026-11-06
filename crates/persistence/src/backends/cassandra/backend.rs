@@ -248,21 +248,21 @@ impl CassandraBackend {
     }
 
     /// The capabilities every Cassandra backend has, whatever its
-    /// configuration (design, "Structs and enums": `BackendCapability`).
+    /// configuration.
     ///
-    /// There is no `TokenSearch` or `UriSearch` variant; `BasicSearch` covers
-    /// token and URI search. `SharedSchema` is the one placement: one keyspace,
-    /// with the tenant in every partition key.
+    /// At Step 2 that is only `SharedSchema`, the one placement: one keyspace,
+    /// with the tenant in every partition key. A capability must never be
+    /// declared for behaviour that is planned or stubbed (`core/backend.rs`), so
+    /// each other one is added here, and to the golden list in
+    /// `tests/backend_capability_contract.rs`, in the commit of the step that
+    /// implements it: `Crud` and `OptimisticLocking` at Step 3, `Versioning` at
+    /// Step 4, `BasicSearch`, `DateSearch` and `CursorPagination` at Steps 6a to
+    /// 6d (ADR-aacruzgon-0037). `Crud` means create, read, update and delete,
+    /// so Step 2's `create` and `read` do not make it true. Those seven are the
+    /// end state (design, "Structs and enums": `BackendCapability`); there is no
+    /// `TokenSearch` or `UriSearch` variant, and `BasicSearch` covers both.
     pub fn declared_capabilities() -> Vec<BackendCapability> {
-        vec![
-            BackendCapability::Crud,
-            BackendCapability::Versioning,
-            BackendCapability::OptimisticLocking,
-            BackendCapability::BasicSearch,
-            BackendCapability::DateSearch,
-            BackendCapability::CursorPagination,
-            BackendCapability::SharedSchema,
-        ]
+        vec![BackendCapability::SharedSchema]
     }
 
     /// The TTL refresh for the stored SearchParameter overlay
@@ -799,20 +799,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn declared_capabilities_are_exactly_the_designs() {
+    fn declared_capabilities_are_exactly_those_implemented() {
         let declared = CassandraBackend::declared_capabilities();
-        assert_eq!(
-            declared,
-            vec![
-                BackendCapability::Crud,
-                BackendCapability::Versioning,
-                BackendCapability::OptimisticLocking,
-                BackendCapability::BasicSearch,
-                BackendCapability::DateSearch,
-                BackendCapability::CursorPagination,
-                BackendCapability::SharedSchema,
-            ]
-        );
+        // The other six of the design's list arrive with their steps
+        // (ADR-aacruzgon-0037).
+        assert_eq!(declared, vec![BackendCapability::SharedSchema]);
         for absent in [
             BackendCapability::Transactions,
             BackendCapability::InstanceHistory,

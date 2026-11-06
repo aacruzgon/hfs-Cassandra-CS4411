@@ -372,7 +372,9 @@ mod testable_backend {
             .into_iter()
             .collect();
         assert_eq!(a.supported_capabilities(), declared);
-        assert!(a.supports_all(&[BackendCapability::Crud, BackendCapability::SharedSchema]));
+        // Each other capability is declared by the step that implements it
+        // (ADR-aacruzgon-0037); the contract test pins the list.
+        assert!(a.supports(BackendCapability::SharedSchema));
         assert!(!a.supports(BackendCapability::Transactions));
 
         // Two instances, four tenants, all distinct and all test tenants.
@@ -456,7 +458,7 @@ mod testable_backend {
             ctx.secondary_tenant.tenant_id(),
             ctx.backend.secondary_tenant().tenant_id()
         );
-        assert!(ctx.supports(BackendCapability::Crud));
+        assert!(ctx.supports(BackendCapability::SharedSchema));
 
         ctx.backend.seed(&ctx.fixtures).await.expect("seed");
         assert_seeded(&ctx.backend, &ctx.tenant, &ctx.fixtures).await;

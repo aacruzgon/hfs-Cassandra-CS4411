@@ -91,8 +91,9 @@ jobs:
       # RustSec advisories for Cargo.lock, with cargo-audit 0.22.2 (the newest
       # release on 2026-11-06), downloaded once per runner into its tool cache
       # and checked against the release asset's SHA-256, rather than built.
-      # Report only: a vulnerability audit.toml does not acknowledge is a
-      # warning annotation.
+      # Report only: a vulnerability that neither audit.toml nor upstream's
+      # disabled Security Audit job (its cargo audit --ignore flags)
+      # acknowledges is a warning annotation.
       - name: Report RustSec advisories (cargo audit)
         if: always()
         continue-on-error: true

@@ -60,7 +60,7 @@ use super::backend::CassandraBackend;
 use super::errors::{BACKEND_NAME, map_driver_error};
 use super::index_keys::{self, IndexKey};
 use super::read::SELECT_RESOURCE;
-use super::session::{DriverError, StatementKind};
+use super::session::{DriverError, NO_NODE_IN_PLAN, StatementKind};
 use crate::error::{
     BackendError, ResourceError, StorageError, StorageResult, ValidationDetail, ValidationError,
     ValidationSeverity,
@@ -242,9 +242,11 @@ fn classify_cas_failure(error: DriverError) -> CasFailure {
             // Raised only while connecting (`connection_pool.rs`), so before
             // anything was sent.
             CdrsError::Timeout(_) => CasFailure::NotApplied(error),
+            // The plan held no node, or no connection to it: the driver sent
+            // the statement nowhere (`send_envelope.rs`). The session holder
+            // rebuilds the session after the first, but never re-sends a CAS.
             CdrsError::General(message)
-                if message.contains("No nodes available")
-                    || message.contains("No active connections") =>
+                if message == NO_NODE_IN_PLAN || message.contains("No active connections") =>
             {
                 CasFailure::NotApplied(error)
             }
@@ -920,9 +922,7 @@ mod tests {
                 sent: false,
             },
             DriverError::from(CdrsError::Timeout("connect".to_string())),
-            DriverError::from(CdrsError::General(
-                "No nodes available in query plan!".to_string(),
-            )),
+            DriverError::from(CdrsError::General(NO_NODE_IN_PLAN.to_string())),
             server(ErrorType::Unavailable(UnavailableError {
                 cl: Consistency::LocalSerial,
                 required: 1,

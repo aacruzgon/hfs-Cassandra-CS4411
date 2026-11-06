@@ -1,40 +1,40 @@
 //! Roadmap Step 2, item 2.1 (layer L4): `create`, `read` and `count`
 //! against a running node.
 //!
-//! The node is `HFS_TEST_CASSANDRA_URL` (`host:port`) with the schema applied
-//! (ADR-aacruzgon-0020). Every test writes under its own tenant, so tests in
-//! parallel and data left by earlier runs never meet (rule 2). Where a test
+//! Included by `tests/cassandra_tests.rs`. The node comes from
+//! [`cassandra_node::node`] (`HFS_TEST_CASSANDRA_URL`, or the harness's own
+//! container). Every test writes under its own tenant ([`unique_tenant`]), so
+//! tests in parallel and data left by earlier runs never meet
+//! (ADR-aacruzgon-0020, rule 2). Where a test
 //! must look at cells, it reads them with its own `cdrs-tokio` session, and
 //! the one setup write it makes (a delete marker, until Step 3 has `delete`)
 //! is itself a compare-and-swap, as every write to `resources` must be.
 
 use std::collections::BTreeSet;
 
-use cdrs_tokio::cluster::session::{Session, SessionBuilder, TcpSessionBuilder};
-use cdrs_tokio::cluster::{NodeTcpConfigBuilder, TcpConnectionManager};
+use cdrs_tokio::cluster::NodeTcpConfigBuilder;
+use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
 use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::frame::Version;
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::query::QueryValues;
 use cdrs_tokio::statement::StatementParamsBuilder;
-use cdrs_tokio::transport::TransportTcp;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::blob::Blob;
 use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
-use helios_persistence::backends::cassandra::{CassandraBackend, CassandraConfig};
+use helios_persistence::backends::cassandra::CassandraBackend;
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::error::{ResourceError, StorageError, TenantError, ValidationError};
-use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+use helios_persistence::tenant::{TenantContext, TenantPermissions};
 use serde_json::json;
 
-type CqlSession = Session<
-    TransportTcp,
-    TcpConnectionManager,
-    RoundRobinLoadBalancingStrategy<TransportTcp, TcpConnectionManager>,
->;
+use crate::backend_skeleton::backend;
+use crate::cassandra_node::{
+    self, CassandraNode, TestSession as CqlSession, URL_VAR, unique_tenant,
+};
 
 /// A non-null column, typed.
 fn col<T>(row: &Row, name: &str) -> T
@@ -52,42 +52,22 @@ where
     IntoRustByName::<T>::get_by_name(row, name).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
-fn test_node_url() -> Option<String> {
-    std::env::var("HFS_TEST_CASSANDRA_URL")
-        .ok()
-        .filter(|url| !url.trim().is_empty())
-}
-
-/// The backend and a raw CQL session on the same node, or `None` to skip.
-async fn setup() -> Option<(CassandraBackend, CqlSession)> {
-    let Some(url) = test_node_url() else {
-        eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
-        return None;
-    };
-    let backend = CassandraBackend::connect(CassandraConfig {
-        contact_points: vec![url.clone()],
-        data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
-        ..CassandraConfig::default()
-    })
-    .await
-    .unwrap_or_else(|e| panic!("connect to {url}: {e}"));
-    let node = NodeTcpConfigBuilder::new()
-        .with_contact_points(vec![url.as_str().into()])
+/// The backend and a raw CQL session on the same node, with the backend's
+/// keyspace selected and protocol v5, for reading cells back.
+async fn setup(node: &CassandraNode) -> (CassandraBackend, CqlSession) {
+    let backend = backend(node).await;
+    let config = NodeTcpConfigBuilder::new()
+        .with_contact_point(node.contact_point().into())
         .with_version(Version::V5)
         .build()
         .await
         .expect("node config");
-    let cql = TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), node)
+    let cql = TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), config)
         .with_keyspace(backend.config().keyspace.clone())
         .build()
         .await
         .expect("CQL session");
-    Some((backend, cql))
-}
-
-fn own_tenant(test: &str) -> TenantContext {
-    let id = format!("s2-create-{test}-{}", uuid::Uuid::new_v4().simple());
-    TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
+    (backend, cql)
 }
 
 /// Runs `cql` at `consistency` and returns its rows.
@@ -131,10 +111,9 @@ fn patient(id: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn cassandra_create_then_read_round_trips() {
-    let Some((backend, _cql)) = setup().await else {
-        return;
-    };
-    let tenant = own_tenant("round-trip");
+    let node = node_or_skip!("cassandra_create_then_read_round_trips");
+    let (backend, _cql) = setup(node).await;
+    let tenant = unique_tenant("round-trip");
     let version = FhirVersion::default_enabled();
 
     let created = backend
@@ -170,7 +149,7 @@ async fn cassandra_create_then_read_round_trips() {
     assert_eq!(served["meta"]["versionId"], "1");
 
     // Another tenant does not see it.
-    let other = own_tenant("round-trip-other");
+    let other = unique_tenant("round-trip-other");
     assert!(
         backend
             .read(&other, "Patient", "p1")
@@ -182,10 +161,9 @@ async fn cassandra_create_then_read_round_trips() {
 
 #[tokio::test]
 async fn cassandra_create_assigns_an_id_when_the_resource_has_none() {
-    let Some((backend, _cql)) = setup().await else {
-        return;
-    };
-    let tenant = own_tenant("assigned-id");
+    let node = node_or_skip!("cassandra_create_assigns_an_id_when_the_resource_has_none");
+    let (backend, _cql) = setup(node).await;
+    let tenant = unique_tenant("assigned-id");
     let created = backend
         .create(
             &tenant,
@@ -207,10 +185,9 @@ async fn cassandra_create_assigns_an_id_when_the_resource_has_none() {
 
 #[tokio::test]
 async fn cassandra_duplicate_create_is_already_exists() {
-    let Some((backend, _cql)) = setup().await else {
-        return;
-    };
-    let tenant = own_tenant("duplicate");
+    let node = node_or_skip!("cassandra_duplicate_create_is_already_exists");
+    let (backend, _cql) = setup(node).await;
+    let tenant = unique_tenant("duplicate");
     let version = FhirVersion::default_enabled();
     backend
         .create(&tenant, "Patient", patient("dup"), version)
@@ -236,10 +213,9 @@ async fn cassandra_duplicate_create_is_already_exists() {
 
 #[tokio::test]
 async fn cassandra_concurrent_creates_of_one_id_make_exactly_one_resource() {
-    let Some((backend, _cql)) = setup().await else {
-        return;
-    };
-    let tenant = own_tenant("race");
+    let node = node_or_skip!("cassandra_concurrent_creates_of_one_id_make_exactly_one_resource");
+    let (backend, _cql) = setup(node).await;
+    let tenant = unique_tenant("race");
     let version = FhirVersion::default_enabled();
     let attempts = (0..8).map(|i| {
         let mut body = patient("race");
@@ -263,10 +239,9 @@ async fn cassandra_concurrent_creates_of_one_id_make_exactly_one_resource() {
 
 #[tokio::test]
 async fn cassandra_read_of_a_missing_id_is_none() {
-    let Some((backend, _cql)) = setup().await else {
-        return;
-    };
-    let tenant = own_tenant("missing");
+    let node = node_or_skip!("cassandra_read_of_a_missing_id_is_none");
+    let (backend, _cql) = setup(node).await;
+    let tenant = unique_tenant("missing");
     assert!(
         backend
             .read(&tenant, "Patient", "never-created")
@@ -278,10 +253,9 @@ async fn cassandra_read_of_a_missing_id_is_none() {
 
 #[tokio::test]
 async fn cassandra_read_of_a_deleted_resource_is_gone() {
-    let Some((backend, cql)) = setup().await else {
-        return;
-    };
-    let tenant = own_tenant("gone");
+    let node = node_or_skip!("cassandra_read_of_a_deleted_resource_is_gone");
+    let (backend, cql) = setup(node).await;
+    let tenant = unique_tenant("gone");
     backend
         .create(
             &tenant,
@@ -336,10 +310,9 @@ async fn cassandra_read_of_a_deleted_resource_is_gone() {
 
 #[tokio::test]
 async fn cassandra_create_writes_every_cell_and_no_null() {
-    let Some((backend, cql)) = setup().await else {
-        return;
-    };
-    let tenant = own_tenant("cells");
+    let node = node_or_skip!("cassandra_create_writes_every_cell_and_no_null");
+    let (backend, cql) = setup(node).await;
+    let tenant = unique_tenant("cells");
     let version = FhirVersion::default_enabled();
     let started = Utc::now() - chrono::Duration::seconds(5);
     let created = backend
@@ -471,10 +444,9 @@ async fn cassandra_create_writes_every_cell_and_no_null() {
 
 #[tokio::test]
 async fn cassandra_count_scans_resources_by_type() {
-    let Some((backend, _cql)) = setup().await else {
-        return;
-    };
-    let tenant = own_tenant("count");
+    let node = node_or_skip!("cassandra_count_scans_resources_by_type");
+    let (backend, _cql) = setup(node).await;
+    let tenant = unique_tenant("count");
     let version = FhirVersion::default_enabled();
     assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
     assert_eq!(backend.count(&tenant, None).await.unwrap(), 0);
@@ -505,10 +477,9 @@ async fn cassandra_count_scans_resources_by_type() {
 
 #[tokio::test]
 async fn cassandra_create_many_seeds_through_create() {
-    let Some((backend, _cql)) = setup().await else {
-        return;
-    };
-    let tenant = own_tenant("many");
+    let node = node_or_skip!("cassandra_create_many_seeds_through_create");
+    let (backend, _cql) = setup(node).await;
+    let tenant = unique_tenant("many");
     let bodies: Vec<_> = (0..20).map(|i| patient(&format!("m{i}"))).collect();
     let results = backend
         .create_many(&tenant, "Patient", bodies, FhirVersion::default_enabled())
@@ -519,10 +490,9 @@ async fn cassandra_create_many_seeds_through_create() {
 
 #[tokio::test]
 async fn cassandra_create_checks_permission_before_writing() {
-    let Some((backend, _cql)) = setup().await else {
-        return;
-    };
-    let writer = own_tenant("permission");
+    let node = node_or_skip!("cassandra_create_checks_permission_before_writing");
+    let (backend, _cql) = setup(node).await;
+    let writer = unique_tenant("permission");
     let reader = TenantContext::new(writer.tenant_id().clone(), TenantPermissions::read_only());
     match backend
         .create(
@@ -548,10 +518,9 @@ async fn cassandra_create_checks_permission_before_writing() {
 
 #[tokio::test]
 async fn cassandra_search_parameter_code_is_bounded_at_128_bytes() {
-    let Some((backend, _cql)) = setup().await else {
-        return;
-    };
-    let tenant = own_tenant("sp-code");
+    let node = node_or_skip!("cassandra_search_parameter_code_is_bounded_at_128_bytes");
+    let (backend, _cql) = setup(node).await;
+    let tenant = unique_tenant("sp-code");
     let search_parameter = |id: &str, code: String| {
         json!({
             "resourceType": "SearchParameter",

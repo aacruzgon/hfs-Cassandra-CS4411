@@ -244,9 +244,10 @@ fn classify_cas_failure(error: DriverError) -> CasFailure {
                 // cannot name), and any variant a later driver adds.
                 _ => unknown(false, error),
             },
-            // Raised only while connecting (`connection_pool.rs`), so before
-            // anything was sent.
-            CdrsError::Timeout(_) => CasFailure::NotApplied(error),
+            // Raised only while connecting (`connection_pool.rs:49-56`), so
+            // before anything was sent. `InvalidProtocol` too: it comes from
+            // opening the node's pool (`cluster/topology/node.rs:294-300`).
+            CdrsError::Timeout(_) | CdrsError::InvalidProtocol(_) => CasFailure::NotApplied(error),
             // The plan held no node (`cluster/session.rs:892`, `:906`), or
             // the pool had no connection to the last node tried
             // (`cluster/connection_pool.rs:711-716`, returned by
@@ -945,6 +946,9 @@ mod tests {
                 sent: false,
             },
             DriverError::from(CdrsError::Timeout("connect".to_string())),
+            DriverError::from(CdrsError::InvalidProtocol(
+                "127.0.0.1:9042".parse().unwrap(),
+            )),
             DriverError::from(CdrsError::General(NO_NODE_IN_PLAN.to_string())),
             server(ErrorType::Unavailable(UnavailableError::new(
                 Consistency::LocalSerial,

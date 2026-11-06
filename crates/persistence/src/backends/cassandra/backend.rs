@@ -585,32 +585,34 @@ impl CassandraBackend {
 /// The error for a session that could not be opened.
 ///
 /// The driver sends `USE "<keyspace>"` on every new connection, so a keyspace
-/// that does not exist fails the connection like a closed port does: with
+/// that does not exist, or credentials the node refuses, fail the connection
+/// like a closed port does: with
 /// `cdrs-tokio` 10.0.0 the build ends at once with "Session control
 /// connection died before completing initialization" when no contact point
 /// connects (`cluster/control_connection.rs:170-176`; checked against the
 /// shared 5.0.9 node, 2026-11-06), and the driver does not say why. A
 /// deadline means a contact point connected but the session did not start
 /// in time. Either is a startup failure, not a statement failure, so the
-/// message names both likely causes.
+/// message names the likely causes.
 fn connect_error(error: &DriverError, config: &CassandraConfig) -> BackendError {
-    let opened_nothing = |why: String| {
-        tracing::warn!(
-            contact_points = ?config.contact_points,
-            keyspace = %config.keyspace,
-            "Cassandra session not open: {why}"
-        );
-        BackendError::ConnectionFailed {
-            backend_name: BACKEND_NAME.to_string(),
-            message: format!(
-                "no Cassandra session ({why}): no contact point answered, or keyspace '{}' \
-                 does not exist (apply docs/Cassandra/schema/keyspace-single-node.cql)",
-                config.keyspace
-            ),
-        }
+    let opened_nothing = |why: String| BackendError::ConnectionFailed {
+        backend_name: BACKEND_NAME.to_string(),
+        message: format!(
+            "no Cassandra session ({why}): no contact point answered, keyspace '{}' does not \
+             exist (apply docs/Cassandra/schema/keyspace-single-node.cql), or the node refused \
+             the credentials",
+            config.keyspace
+        ),
     };
     match error {
+        // The only arm `map_driver_error` does not log.
         DriverError::Deadline { after, .. } => {
+            tracing::warn!(
+                contact_points = ?config.contact_points,
+                keyspace = %config.keyspace,
+                "Cassandra session not open after {} ms",
+                after.as_millis()
+            );
             opened_nothing(format!("not open within {} ms", after.as_millis()))
         }
         other => match map_driver_error(other, "connect") {

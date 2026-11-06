@@ -31,8 +31,14 @@
 //! same key again.
 //!
 //! **Prepared statements** are prepared once per CQL text and kept for the
-//! life of the session. The driver re-prepares one transparently when a node
-//! answers `Unprepared`, which means that node did not execute it.
+//! life of the driver session. The driver re-prepares one transparently when
+//! a node answers `Unprepared`, which means that node did not execute it.
+//!
+//! **Rebuilt sessions.** `cdrs-tokio` 8.1.9 can lose a single-node cluster
+//! for good after a control-connection reconnect, a Cassandra restart
+//! included. [`CassandraSession`] then opens a new driver session, with an
+//! empty prepared cache, and sends an idempotent statement once more on it;
+//! a CAS is never sent again. See [`CassandraSession`] for the rules.
 //!
 //! **Deadlines.** `cdrs-tokio` 8 has no per-request timeout, so every
 //! statement runs under the configured request deadline. When it elapses the
@@ -175,18 +181,127 @@ impl From<cdrs_tokio::error::Error> for DriverError {
     }
 }
 
-/// An open session plus the prepared-statement cache.
-pub(crate) struct CassandraSession {
+/// The message `cdrs-tokio` 8.1.9 returns when a statement's query plan holds
+/// no node (`cluster/session.rs:723` and `:738`). The driver has no error
+/// variant of its own for it: it is an [`Error::General`] with this text, so
+/// [`is_no_node_in_plan`] matches both.
+///
+/// [`Error::General`]: cdrs_tokio::error::Error::General
+pub(crate) const NO_NODE_IN_PLAN: &str = "No nodes available in query plan!";
+
+/// The first wait after a failed rebuild; it doubles per failure, up to
+/// [`REBUILD_BACKOFF_MAX`].
+const REBUILD_BACKOFF_MIN: Duration = Duration::from_millis(250);
+
+/// The longest wait between two rebuild attempts while the cluster stays
+/// unreachable.
+const REBUILD_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Whether `error` is the driver's empty-query-plan error. Matches the
+/// variant and the exact text (see [`NO_NODE_IN_PLAN`]).
+pub(crate) fn is_no_node_in_plan(error: &cdrs_tokio::error::Error) -> bool {
+    matches!(error, cdrs_tokio::error::Error::General(message) if message == NO_NODE_IN_PLAN)
+}
+
+/// The wait after `failures` consecutive failed rebuilds.
+fn rebuild_backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    REBUILD_BACKOFF_MIN
+        .saturating_mul(1 << doublings)
+        .min(REBUILD_BACKOFF_MAX)
+}
+
+/// One open driver session and the statements prepared on it.
+///
+/// The prepared cache belongs to the session it was filled on, so a rebuilt
+/// session starts with an empty cache and prepares every statement again on
+/// first use.
+struct Connected {
     session: CdrsSession,
     prepared: RwLock<HashMap<String, Arc<PreparedQuery>>>,
+    /// 0 for the session [`CassandraSession::connect`] opened, then one more
+    /// per rebuild.
+    generation: u64,
+}
+
+impl Connected {
+    /// Whether the driver's metadata still holds a node it would put in a
+    /// query plan: one with a distance (`LocalDcOnly`: the local DC) whose
+    /// state is `Up` (`cluster/topology/node.rs`, `is_ignored`).
+    fn has_usable_node(&self) -> bool {
+        self.session
+            .cluster_metadata()
+            .nodes()
+            .values()
+            .any(|node| !node.is_ignored())
+    }
+}
+
+/// Rebuild bookkeeping, held under [`CassandraSession::rebuild`] so only one
+/// rebuild runs at a time.
+#[derive(Debug, Default)]
+struct RebuildState {
+    /// Consecutive failed or abandoned rebuilds.
+    failures: u32,
+    /// No new rebuild starts before this.
+    not_before: Option<Instant>,
+}
+
+/// The backend's session holder: the open driver session, its
+/// prepared-statement cache, and the rebuild that works around `cdrs-tokio`
+/// 8.1.9 losing a single-node cluster.
+///
+/// **Why it rebuilds.** After a control-connection reconnect whose query plan
+/// still holds the node, `cdrs-tokio` 8.1.9 refreshes each known node with
+/// `clone_with_node_info` (`cluster/topology/node.rs:279-290`, reached from
+/// `metadata_builder.rs:56`). That compares the node's stored
+/// `broadcast_address`, the gossip address (`<ip>:7000`), with the fresh
+/// `broadcast_rpc_address`, the CQL address (`<ip>:9042`). The two never
+/// match, so the node is set `Unknown` with no distance. Such a node is
+/// ignored, every statement fails with [`NO_NODE_IN_PLAN`], and with one node
+/// no peer event marks it up again. A Cassandra restart is enough to cause it
+/// (`docker/cassandra/README.md`).
+///
+/// **What it does.** When a statement fails with [`NO_NODE_IN_PLAN`] and the
+/// session's metadata holds no usable node, the holder opens a new session
+/// from the same configuration and swaps it in. The statement is then sent
+/// once more on the new session **only if it is idempotent**; a
+/// compare-and-swap returns its error, which says it was never sent (the
+/// driver returns this error only when it tried no node), and the caller's
+/// unknown-outcome rules decide what follows (ADR-aacruzgon-0024).
+/// `health_check` runs through the same path, so a probe both sees the broken
+/// session and repairs it.
+///
+/// **One rebuild at a time.** Callers that hit the error together queue on
+/// [`rebuild`](Self::rebuild); the first one rebuilds, the rest find the new
+/// session and use it. After a failed rebuild no new one starts for a backoff
+/// of 250 ms, doubling per failure up to 5 s, and callers in that window get
+/// their own error back at once, so a node that is down is not hammered.
+/// Waiting for the queue counts against the caller's request deadline.
+pub(crate) struct CassandraSession {
+    /// Kept to open the replacement session. The password stays here and is
+    /// never logged (`CassandraConfig`'s `Debug` redacts it).
+    config: CassandraConfig,
+    current: RwLock<Arc<Connected>>,
+    rebuild: tokio::sync::Mutex<RebuildState>,
+    /// Rebuilds started, successful or not.
+    rebuild_attempts: std::sync::atomic::AtomicU64,
     request_timeout: Duration,
     no_retry: Arc<dyn RetryPolicy + Send + Sync>,
 }
 
 impl std::fmt::Debug for CassandraSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let current = self.current();
         f.debug_struct("CassandraSession")
-            .field("prepared_statements", &self.prepared.read().len())
+            .field("generation", &current.generation)
+            .field(
+                "rebuild_attempts",
+                &self
+                    .rebuild_attempts
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field("prepared_statements", &current.prepared.read().len())
             .field("request_timeout", &self.request_timeout)
             .finish_non_exhaustive()
     }
@@ -197,75 +312,87 @@ impl CassandraSession {
     /// the replicas in `config.local_dc` (ADR-aacruzgon-0003), with
     /// `config.keyspace` as the session keyspace.
     pub(crate) async fn connect(config: &CassandraConfig) -> Result<Self, DriverError> {
-        let connect_timeout = Duration::from_millis(config.connect_timeout_ms);
-
-        let mut node_config = NodeTcpConfigBuilder::new()
-            .with_contact_points(
-                config
-                    .contact_points
-                    .iter()
-                    .map(|point| NodeAddress::from(point.as_str()))
-                    .collect(),
-            )
-            .with_version(PROTOCOL_VERSION);
-        if let (Some(username), Some(password)) = (&config.username, &config.password) {
-            node_config = node_config.with_authenticator_provider(Arc::new(
-                StaticPasswordAuthenticatorProvider::new(username, password),
-            ));
-        }
-        let node_config = within(connect_timeout, false, node_config.build()).await??;
-
-        let pool = ConnectionPoolConfigBuilder::new()
-            .with_local_size(config.pool_size)
-            .with_connect_timeout(Some(connect_timeout))
-            .build();
-
-        // Replicas first. Nodes outside the local DC are ignored by
-        // `LocalDcOnly`, so no remote node is ever tried; the strategy's
-        // remote-DC options are off as well.
-        let load_balancing = TopologyAwareLoadBalancingStrategy::new(None, false);
-        let builder = TcpSessionBuilder::new(load_balancing, node_config)
-            .with_node_distance_evaluator(Box::new(LocalDcOnly::new(config.local_dc.clone())))
-            .with_retry_policy(Box::new(DefaultRetryPolicy))
-            .with_connection_pool_config(pool)
-            .with_keyspace(config.keyspace.clone());
-
-        let session = within(connect_timeout, false, builder.build())
-            .await?
-            .map_err(|error| {
-                DriverError::from(cdrs_tokio::error::Error::General(error.to_string()))
-            })?;
-
+        let session = open_session(config).await?;
         Ok(Self {
-            session,
-            prepared: RwLock::new(HashMap::new()),
+            config: config.clone(),
+            current: RwLock::new(Arc::new(Connected {
+                session,
+                prepared: RwLock::new(HashMap::new()),
+                generation: 0,
+            })),
+            rebuild: tokio::sync::Mutex::new(RebuildState::default()),
+            rebuild_attempts: std::sync::atomic::AtomicU64::new(0),
             request_timeout: Duration::from_millis(config.request_timeout_ms),
             no_retry: Arc::new(FallthroughRetryPolicy),
         })
     }
 
-    /// The prepared form of `cql`, preparing it on first use within
-    /// `deadline`.
+    /// The session in use now.
+    fn current(&self) -> Arc<Connected> {
+        self.current.read().clone()
+    }
+
+    /// How many sessions have replaced the first one.
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.current().generation
+    }
+
+    /// How many rebuilds have started, successful or not.
+    #[cfg(test)]
+    pub(crate) fn rebuild_attempts(&self) -> u64 {
+        self.rebuild_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many statements are prepared on the session in use now.
+    #[cfg(test)]
+    pub(crate) fn prepared_count(&self) -> usize {
+        self.current().prepared.read().len()
+    }
+
+    /// The prepared form of `cql` on `connected`, preparing it on first use
+    /// within `deadline`.
     async fn prepared(
-        &self,
+        connected: &Connected,
         cql: &str,
         deadline: Duration,
     ) -> Result<Arc<PreparedQuery>, DriverError> {
-        if let Some(prepared) = self.prepared.read().get(cql) {
+        if let Some(prepared) = connected.prepared.read().get(cql) {
             return Ok(prepared.clone());
         }
         // Two callers may prepare the same text at once; both get the same
         // statement id from the node, and the last insert wins.
-        let prepared = Arc::new(within(deadline, false, self.session.prepare(cql)).await??);
-        self.prepared
+        let prepared = Arc::new(within(deadline, false, connected.session.prepare(cql)).await??);
+        connected
+            .prepared
             .write()
             .insert(cql.to_string(), prepared.clone());
         Ok(prepared)
     }
 
+    /// Prepares (or reuses) `cql` on `connected` and executes it, all within
+    /// `deadline`.
+    async fn execute_on(
+        connected: &Connected,
+        cql: &str,
+        params: &StatementParams,
+        deadline: Duration,
+    ) -> Result<Envelope, DriverError> {
+        let started = Instant::now();
+        let prepared = Self::prepared(connected, cql, deadline).await?;
+        let remaining = deadline.saturating_sub(started.elapsed());
+        Ok(within(
+            remaining,
+            true,
+            connected.session.exec_with_params(&prepared, params),
+        )
+        .await??)
+    }
+
     /// Executes `cql` (prepared and cached) with positional `values`. The
-    /// request deadline covers the prepare, on first use, and the execute
-    /// together.
+    /// request deadline covers the prepare, on first use, the execute, and a
+    /// rebuild and its one retry (see the type docs).
     pub(crate) async fn execute(
         &self,
         cql: &str,
@@ -273,15 +400,77 @@ impl CassandraSession {
         kind: StatementKind,
     ) -> Result<Envelope, DriverError> {
         let started = Instant::now();
-        let prepared = self.prepared(cql, self.request_timeout).await?;
         let params = statement_params(kind, values, &self.no_retry);
+        let connected = self.current();
+        let result = Self::execute_on(&connected, cql, &params, self.request_timeout).await;
+        let Err(DriverError::Driver(error)) = &result else {
+            return result;
+        };
+        if !is_no_node_in_plan(error) || connected.has_usable_node() {
+            return result;
+        }
         let remaining = self.request_timeout.saturating_sub(started.elapsed());
-        Ok(within(
-            remaining,
-            true,
-            self.session.exec_with_params(&prepared, &params),
-        )
-        .await??)
+        let Some(fresh) = self.recover(&connected, remaining).await else {
+            return result;
+        };
+        let remaining = self.request_timeout.saturating_sub(started.elapsed());
+        if !kind.is_idempotent() || remaining.is_zero() {
+            return result;
+        }
+        Self::execute_on(&fresh, cql, &params, remaining).await
+    }
+
+    /// Replaces `broken` with a new session, or returns the one another caller
+    /// already put in its place. `None` when no new session could be had:
+    /// the rebuild failed, a recent failure's backoff has not passed, or
+    /// `budget` ran out while waiting.
+    async fn recover(&self, broken: &Connected, budget: Duration) -> Option<Arc<Connected>> {
+        let attempt = async {
+            let mut state = self.rebuild.lock().await;
+            let current = self.current();
+            if current.generation != broken.generation {
+                return Some(current);
+            }
+            if state.not_before.is_some_and(|at| Instant::now() < at) {
+                return None;
+            }
+            // Counted before the attempt, so a caller dropped mid-rebuild
+            // still leaves a backoff behind; reset on success.
+            state.failures = state.failures.saturating_add(1);
+            state.not_before = Some(Instant::now() + rebuild_backoff(state.failures));
+            let generation = broken.generation + 1;
+            self.rebuild_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                generation,
+                "cassandra: the session has no node to send to; opening a new session"
+            );
+            match open_session(&self.config).await {
+                Ok(session) => {
+                    let fresh = Arc::new(Connected {
+                        session,
+                        prepared: RwLock::new(HashMap::new()),
+                        generation,
+                    });
+                    *self.current.write() = fresh.clone();
+                    *state = RebuildState::default();
+                    tracing::info!(generation, "cassandra: new session open");
+                    Some(fresh)
+                }
+                Err(error) => {
+                    let backoff = rebuild_backoff(state.failures);
+                    state.not_before = Some(Instant::now() + backoff);
+                    tracing::warn!(
+                        failures = state.failures,
+                        retry_in_ms = backoff.as_millis() as u64,
+                        error = %describe_open_error(&error),
+                        "cassandra: could not open a new session"
+                    );
+                    None
+                }
+            }
+        };
+        tokio::time::timeout(budget, attempt).await.ok().flatten()
     }
 
     /// Executes `cql` and returns its rows (empty for a statement without a
@@ -296,6 +485,63 @@ impl CassandraSession {
         let body = envelope.response_body()?;
         Ok(body.into_rows().unwrap_or_default())
     }
+}
+
+/// A failed session open, for a log line: the kind of failure, never an
+/// address or a credential.
+fn describe_open_error(error: &DriverError) -> String {
+    match error {
+        DriverError::Deadline { after, .. } => {
+            format!("no session within {} ms", after.as_millis())
+        }
+        DriverError::Driver(error) => match error.as_ref() {
+            cdrs_tokio::error::Error::Io(io) => format!("I/O error: {:?}", io.kind()),
+            cdrs_tokio::error::Error::Server { body, .. } => {
+                format!("server error {:?}", body.ty)
+            }
+            _ => "driver error".to_string(),
+        },
+    }
+}
+
+/// Opens a driver session for `config`, within `config.connect_timeout_ms`.
+async fn open_session(config: &CassandraConfig) -> Result<CdrsSession, DriverError> {
+    let connect_timeout = Duration::from_millis(config.connect_timeout_ms);
+
+    let mut node_config = NodeTcpConfigBuilder::new()
+        .with_contact_points(
+            config
+                .contact_points
+                .iter()
+                .map(|point| NodeAddress::from(point.as_str()))
+                .collect(),
+        )
+        .with_version(PROTOCOL_VERSION);
+    if let (Some(username), Some(password)) = (&config.username, &config.password) {
+        node_config = node_config.with_authenticator_provider(Arc::new(
+            StaticPasswordAuthenticatorProvider::new(username, password),
+        ));
+    }
+    let node_config = within(connect_timeout, false, node_config.build()).await??;
+
+    let pool = ConnectionPoolConfigBuilder::new()
+        .with_local_size(config.pool_size)
+        .with_connect_timeout(Some(connect_timeout))
+        .build();
+
+    // Replicas first. Nodes outside the local DC are ignored by
+    // `LocalDcOnly`, so no remote node is ever tried; the strategy's
+    // remote-DC options are off as well.
+    let load_balancing = TopologyAwareLoadBalancingStrategy::new(None, false);
+    let builder = TcpSessionBuilder::new(load_balancing, node_config)
+        .with_node_distance_evaluator(Box::new(LocalDcOnly::new(config.local_dc.clone())))
+        .with_retry_policy(Box::new(DefaultRetryPolicy))
+        .with_connection_pool_config(pool)
+        .with_keyspace(config.keyspace.clone());
+
+    within(connect_timeout, false, builder.build())
+        .await?
+        .map_err(|error| DriverError::from(cdrs_tokio::error::Error::General(error.to_string())))
 }
 
 /// The parameters `kind` requires; see the module docs.
@@ -337,6 +583,30 @@ async fn within<F: std::future::Future>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_empty_plan_error_counts_as_no_node_in_plan() {
+        use cdrs_tokio::error::Error;
+        assert!(is_no_node_in_plan(&Error::General(
+            NO_NODE_IN_PLAN.to_string()
+        )));
+        for other in [
+            Error::General("No active connections to: 10.0.0.1:9042".to_string()),
+            Error::General("Connection closed while waiting for response!".to_string()),
+            Error::General(format!("{NO_NODE_IN_PLAN} (and more)")),
+            Error::Timeout(NO_NODE_IN_PLAN.to_string()),
+        ] {
+            assert!(!is_no_node_in_plan(&other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn rebuild_backoff_doubles_from_250_ms_up_to_5_s() {
+        let waits: Vec<u128> = (1..=8).map(|n| rebuild_backoff(n).as_millis()).collect();
+        assert_eq!(waits, [250, 500, 1000, 2000, 4000, 5000, 5000, 5000]);
+        assert_eq!(rebuild_backoff(0), REBUILD_BACKOFF_MIN);
+        assert_eq!(rebuild_backoff(u32::MAX), REBUILD_BACKOFF_MAX);
+    }
 
     #[test]
     fn every_kind_sets_its_consistency_explicitly() {

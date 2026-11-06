@@ -488,3 +488,174 @@ mod tests {
         assert!(!reg.get_active_params("Observation").is_empty());
     }
 }
+
+/// The session rebuild (`session.rs`, [`CassandraSession`]) against a real
+/// restart. It stops and starts a Cassandra container, so it runs only on a
+/// node of its own, never the shared one; it is skipped unless both of these
+/// are set:
+///
+/// - `HFS_TEST_CASSANDRA_RESTART_URL`: the node's `host:port`, schema applied;
+/// - `HFS_TEST_CASSANDRA_RESTART_CONTAINER`: its container name, for
+///   `docker stop` and `docker start`.
+///
+/// ```text
+/// CASSANDRA_HOST_PORT=59342 docker compose -p s2be-restart -f docker/cassandra/docker-compose.yml up -d
+/// # apply keyspace-single-node.cql, then schema.cql
+/// HFS_TEST_CASSANDRA_RESTART_URL=127.0.0.1:59342 \
+/// HFS_TEST_CASSANDRA_RESTART_CONTAINER=s2be-restart-cassandra-1 \
+///     cargo test -p helios-persistence --features cassandra --lib \
+///     backends::cassandra::backend::restart_tests -- --nocapture
+/// docker compose -p s2be-restart -f docker/cassandra/docker-compose.yml down -v
+/// ```
+#[cfg(test)]
+mod restart_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use cdrs_tokio::types::value::Value;
+
+    const URL: &str = "HFS_TEST_CASSANDRA_RESTART_URL";
+    const CONTAINER: &str = "HFS_TEST_CASSANDRA_RESTART_CONTAINER";
+
+    /// How long the backend must stay healthy after the node returns. The
+    /// driver lost the node 40 s after a restart in layer L1's reproduction
+    /// (`~/.claude/rex-agent/runs/s2-testnode/report-L1.md`).
+    const STAY_HEALTHY: Duration = Duration::from_secs(120);
+
+    fn docker(args: &[&str]) {
+        let status = std::process::Command::new("docker")
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap_or_else(|e| panic!("docker {args:?}: {e}"));
+        assert!(status.success(), "docker {args:?}: {status}");
+    }
+
+    async fn read_one(backend: &CassandraBackend) -> Result<usize, String> {
+        backend
+            .session
+            .rows(
+                "SELECT id FROM resources WHERE tenant_id = ? AND resource_type = ? AND id = ?",
+                vec![
+                    Value::from("s2-restart"),
+                    Value::from("Patient"),
+                    Value::from("p1"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .map(|rows| rows.len())
+            .map_err(|e| map_driver_error(&e, "read").to_string())
+    }
+
+    /// Callers per poll in [`wait_for_health`]: a burst of probes and
+    /// requests reaching a broken session together.
+    const CALLERS: usize = 16;
+
+    /// Every 500 ms, runs [`CALLERS`] `health_check`s at once until all
+    /// return `want_ok`, or panics after `limit`. Returns how long that took
+    /// and how many polls it made.
+    async fn wait_for_health(
+        backend: &CassandraBackend,
+        want_ok: bool,
+        limit: Duration,
+    ) -> (Duration, usize) {
+        let started = Instant::now();
+        let mut polls = 0;
+        loop {
+            polls += 1;
+            let results =
+                futures::future::join_all((0..CALLERS).map(|_| backend.health_check())).await;
+            if results.iter().all(|result| result.is_ok() == want_ok) {
+                return (started.elapsed(), polls);
+            }
+            assert!(
+                started.elapsed() < limit,
+                "health_check still {:?} after {limit:?}",
+                results.last()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_backend_recovers_after_its_node_restarts() {
+        let (Ok(url), Ok(container)) = (std::env::var(URL), std::env::var(CONTAINER)) else {
+            eprintln!("skipping: set {URL} and {CONTAINER} to a node of the test's own");
+            return;
+        };
+        let backend = CassandraBackend::connect(CassandraConfig {
+            contact_points: vec![url.clone()],
+            connect_timeout_ms: 2_000,
+            request_timeout_ms: 3_000,
+            data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
+            ..CassandraConfig::default()
+        })
+        .await
+        .unwrap_or_else(|e| panic!("connect to {url}: {e}"));
+
+        backend.health_check().await.expect("health_check before");
+        assert_eq!(read_one(&backend).await, Ok(0), "read before");
+        // A third statement, so the cache is seen to be emptied by a rebuild.
+        backend.check_schema().await.expect("schema check before");
+        let prepared_before = backend.session.prepared_count();
+        assert!(prepared_before >= 3, "{prepared_before} prepared");
+        assert_eq!(backend.session.generation(), 0);
+
+        docker(&["stop", &container]);
+        let (down_after, _) = wait_for_health(&backend, false, Duration::from_secs(60)).await;
+        let failed = backend
+            .health_check()
+            .await
+            .expect_err("health_check while down");
+        eprintln!("down: health_check failed {down_after:?} after the stop: {failed}");
+        assert!(read_one(&backend).await.is_err(), "a read while down");
+
+        docker(&["start", &container]);
+        let (up_after, polls) = wait_for_health(&backend, true, Duration::from_secs(240)).await;
+        let attempts = backend.session.rebuild_attempts();
+        eprintln!(
+            "up: health_check passed {up_after:?} after the start (generation {}); \
+             {attempts} rebuild attempt(s) for {polls} polls of {CALLERS} concurrent callers",
+            backend.session.generation()
+        );
+        // One rebuild at a time, and none inside a failure's backoff: never
+        // one per caller.
+        assert!(
+            attempts as usize <= polls,
+            "{attempts} rebuild attempts for {polls} polls"
+        );
+
+        // The driver lost the node some seconds after recovering in L1's
+        // reproduction; the backend must stay healthy through that.
+        let started = Instant::now();
+        let mut checks = 0;
+        let mut generation = backend.session.generation();
+        while started.elapsed() < STAY_HEALTHY {
+            if backend.session.generation() != generation {
+                generation = backend.session.generation();
+                eprintln!(
+                    "rebuilt {:?} after recovery (generation {generation})",
+                    started.elapsed()
+                );
+            }
+            backend.health_check().await.unwrap_or_else(|e| {
+                panic!("health_check {:?} after recovery: {e}", started.elapsed())
+            });
+            assert_eq!(read_one(&backend).await, Ok(0), "read after recovery");
+            checks += 1;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let generation = backend.session.generation();
+        eprintln!(
+            "stayed healthy for {STAY_HEALTHY:?} ({checks} health checks and reads); \
+             {generation} rebuild(s); {} statements prepared now, {prepared_before} before",
+            backend.session.prepared_count()
+        );
+        if generation > 0 {
+            // Only the health check and the read ran on the new session: the
+            // cache started empty and both were prepared again on it.
+            assert_eq!(backend.session.prepared_count(), 2);
+        }
+    }
+}

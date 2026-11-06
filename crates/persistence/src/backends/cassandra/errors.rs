@@ -193,13 +193,15 @@ fn internal(message: String) -> BackendError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::frame::Version;
     use cdrs_tokio::frame::message_error::{
         CasWriteUnknownError, ErrorBody, FailureInfo, UnavailableError, WriteFailureError,
         WriteTimeoutError, WriteType,
     };
+    use std::io::Cursor;
     use std::net::SocketAddr;
     use std::time::Duration;
 
@@ -308,19 +310,42 @@ mod tests {
         }
     }
 
-    #[test]
-    fn refused_statements_are_500() {
-        for ty in [
-            ErrorType::Syntax,
-            ErrorType::Invalid,
-            ErrorType::Server,
+    /// An error code the driver does not recognize, decoded the way the driver
+    /// decodes an ERROR body: `0x2600` is not in the v5 table, so
+    /// `from_cursor_with_code` keeps it as `Unknown` with its trailing bytes.
+    pub(in crate::backends::cassandra) fn undecoded_error_type() -> ErrorType {
+        let trailing: &[u8] = &[1, 2, 3];
+        let ty = ErrorType::from_cursor_with_code(&mut Cursor::new(trailing), 0x2600, Version::V5)
+            .unwrap();
+        assert_eq!(
+            ty,
             ErrorType::Unknown {
-                code: 0x2000,
-                body: Vec::new(),
-            },
-        ] {
+                code: 0x2600,
+                body: vec![1, 2, 3],
+            }
+        );
+        ty
+    }
+
+    #[test]
+    fn refused_statements_are_query_errors() {
+        for ty in [ErrorType::Syntax, ErrorType::Invalid] {
             let mapped = map_driver_error(&server(ty.clone()), "test");
-            assert_eq!(status_family(&mapped), "500", "{ty:?} -> {mapped:?}");
+            assert!(
+                matches!(mapped, BackendError::QueryError { .. }),
+                "{ty:?} -> {mapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_and_unrecognized_errors_are_internal() {
+        for ty in [ErrorType::Server, undecoded_error_type()] {
+            let mapped = map_driver_error(&server(ty.clone()), "test");
+            assert!(
+                matches!(mapped, BackendError::Internal { .. }),
+                "{ty:?} -> {mapped:?}"
+            );
         }
     }
 

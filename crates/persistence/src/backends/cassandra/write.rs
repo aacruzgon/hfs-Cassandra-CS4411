@@ -915,10 +915,7 @@ mod tests {
             true,
         );
         unknown(
-            server(ErrorType::Unknown {
-                code: 0x2000,
-                body: Vec::new(),
-            }),
+            server(crate::backends::cassandra::errors::tests::undecoded_error_type()),
             false,
         );
         unknown(

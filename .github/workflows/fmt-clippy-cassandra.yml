@@ -560,9 +560,11 @@ jobs:
       # The start and apply times above, and the container's start to its CQL
       # line from its own log timestamps, which the 10 s healthcheck interval
       # does not round. Report only.
+      # Only after a build that passed: without one, no node was started.
       - name: Report the node's start and schema apply
-        if: always()
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         continue-on-error: true
+        timeout-minutes: 2
         run: python3 .github/scripts/ci-report.py node-start node-start "Cassandra start and schema apply" hfs-cassandra-ci-cassandra-1 node-start
 
       # ADR-aacruzgon-0020, Rule 1: the tests use this job's node, with the

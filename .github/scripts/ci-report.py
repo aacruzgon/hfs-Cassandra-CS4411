@@ -281,9 +281,9 @@ def keep_timings(report_id: str, since: float) -> dict:
         except ValueError:
             units = []
     rows = sorted(
-        # cargo names a compile unit's mode "todo" (its internal name for a build).
+        # cargo names every unit that is not a build script "todo".
         ({"unit": " ".join(f"{u.get('name')} {u.get('version', '')} {u.get('target', '')}".split()),
-          "mode": "build" if u.get("mode") == "todo" else u.get("mode"),
+          "mode": "compile" if u.get("mode") == "todo" else u.get("mode"),
           "seconds": round(float(u.get("duration") or 0), 2)} for u in units),
         key=lambda u: -u["seconds"],
     )
@@ -319,8 +319,6 @@ def report_build(args, command, status, wall, group, sampled, peaks, oom, timing
         "memory_max": memory_max,
         "oom_kills": oom,
         "cargo_build_jobs": os.environ.get("CARGO_BUILD_JOBS"),
-        "target_dir_reset": os.environ.get("TARGET_DIR_RESET"),
-        "target_dir_reset_reason": os.environ.get("TARGET_DIR_RESET_REASON") or None,
         "timings": timings,
         "warnings": [],
     }
@@ -348,10 +346,8 @@ def report_build(args, command, status, wall, group, sampled, peaks, oom, timing
         "cannot reclaim and must fit the cap; `memory.current` includes page cache, which fills "
         "the cgroup up to the cap (ADR-aacruzgon-0023).\n"
     )
-    reset = data["target_dir_reset"]
-    if reset:
-        md += f"\nTarget dir: {'reset before this job, so a cold build' if reset == 'yes' else 'kept, so a warm build'}"
-        md += f" ({data['target_dir_reset_reason']}).\n" if data["target_dir_reset_reason"] else ".\n"
+    # Cold or warm: L10's "Target directory size" section says whether the
+    # reset step reset the directory.
     if timings and timings.get("html"):
         md += (f"\n`cargo --timings`: {timings['units']} units, {timings.get('fresh_units') or '?'} fresh, total "
                f"{timings.get('total_time') or '?'}; the full chart is `{timings['html']}` in the artifact.")
@@ -415,9 +411,17 @@ def cmd_node_start(args) -> int:
     # From the container's own clock: its start to the native transport's
     # line, which is when CQL could first answer, without the healthcheck's
     # polling interval.
-    started = iso(run(["docker", "inspect", "-f", "{{.State.StartedAt}}", args.container]) or "")
-    logs = subprocess.run(["docker", "logs", "--timestamps", args.container], capture_output=True, text=True) \
-        if run(["docker", "inspect", args.container]) is not None else None
+    started_text = (run(["docker", "inspect", "-f", "{{.State.StartedAt}}", args.container]) or "").strip()
+    started = iso(started_text)
+    logs = None
+    if started_text:
+        # Only the log since the container's last start, so a restarted
+        # container's earlier boot is not read.
+        try:
+            logs = subprocess.run(["docker", "logs", "--timestamps", "--since", started_text, args.container],
+                                  capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            logs = None
     listening = None
     for line in ((logs.stdout + logs.stderr) if logs else "").splitlines():
         if CQL_LISTENING in line:
@@ -722,7 +726,7 @@ def compaction_stats(out: str) -> dict:
         cells = line.split()
         if cells[:1] == ["id"]:
             header = True
-        elif header and cells:
+        elif header and cells and not line.strip().startswith("active compaction remaining time"):
             rows += 1
     if match:
         stats["active"] = rows
@@ -743,6 +747,11 @@ def cmd_node_stats(args) -> int:
     started = time.monotonic()
     nodetool = lambda *a: run(["docker", "exec", container, "nodetool", *a], timeout=120)
     raw = {
+        # First: every nodetool call below is a JVM in the container's cgroup
+        # (with the compose file's MAX_HEAP_SIZE), and would raise its peak.
+        "container_memory": run(["docker", "exec", container, "sh", "-c",
+                                 "cd /sys/fs/cgroup && for f in memory.peak memory.current memory.max; do echo \"$f $(cat $f 2>/dev/null)\"; done; "
+                                 "grep -E '^(anon|file) ' memory.stat; grep -E '^(oom|oom_kill) ' memory.events; true"]),
         "tablestats": nodetool("tablestats", args.keyspace),
         "tpstats": nodetool("tpstats"),
         "proxyhistograms": nodetool("proxyhistograms"),
@@ -750,10 +759,6 @@ def cmd_node_stats(args) -> int:
         "info": nodetool("info"),
         "gcstats": nodetool("gcstats"),
         "compactionstats": nodetool("compactionstats"),
-        # cgroup v2 inside the container: its own memory files.
-        "container_memory": run(["docker", "exec", container, "sh", "-c",
-                                 "cd /sys/fs/cgroup && for f in memory.peak memory.current memory.max; do echo \"$f $(cat $f 2>/dev/null)\"; done; "
-                                 "grep -E '^(anon|file) ' memory.stat; grep -E '^(oom|oom_kill) ' memory.events"]),
         "system_views": run(["docker", "exec", container, "cqlsh", "-e", " ".join(
             f"SELECT JSON * FROM system_views.{t} WHERE keyspace_name = '{args.keyspace}';" for t in VIRTUAL_TABLES
         )], timeout=120),
@@ -822,7 +827,9 @@ def cmd_node_stats(args) -> int:
     ])
     if memory.get("memory.peak") is not None and memory.get("memory.max"):
         share = memory["memory.peak"] / memory["memory.max"]
-        md += f"\nThe peak is {share:.0%} of the limit (ADR-aacruzgon-0002), page cache included; it covers the node's life up to this snapshot.\n"
+        md += (f"\nThe peak is {share:.0%} of the limit (ADR-aacruzgon-0002), page cache included; it covers the node's life up to "
+               "this snapshot, read before this step's own `nodetool` calls. Anything run in the container counts against the "
+               "same limit: the healthcheck's `cqlsh` and every `docker exec`, `nodetool` included (a JVM each).\n")
         if share > 0.9:
             warnings.append(f"Node statistics: the container's memory peak is {share:.0%} of its limit")
     if memory.get("oom_kill"):

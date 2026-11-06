@@ -730,12 +730,16 @@ const SEED_BUDGET: Duration = Duration::from_secs(10);
 
 /// A warning, not a gate, when one boot's stored-SearchParameter load takes
 /// longer. The load runs on every boot, warm ones included, and on every TTL
-/// refresh, and it reads every seeded tenant's 1,372-row SearchParameter
-/// partition (an id scan, then one point read per row, all spec definitions
-/// it then skips). 5 s is half the 10 s seeding budget: the seed is paid once
-/// per tenant, the load on every start, so it gets the stricter line. At the
-/// 0.1 to 0.2 s per seeded tenant measured so far, that is 25 to 50 seeded
-/// tenants on one node.
+/// refresh. It scans `resources_by_type`'s partition keys (`SELECT DISTINCT`
+/// over the whole table) for the tenants with a SearchParameter partition,
+/// then reads each one: an id scan, then one point read per row. A seeded
+/// tenant's partition holds 1,372 spec definitions, all read and then
+/// skipped, so the seeded tenants are nearly all of the cost. 5 s is half the
+/// 10 s seeding budget: the seed is paid once per tenant, the load on every
+/// start, so it gets the stricter line. At the 0.2 s per seeded tenant
+/// measured so far, that is about 25 seeded tenants on one node. CI's fresh
+/// node only ever has three, so there the line catches a slowdown per tenant
+/// (about 8×), not growth in their number.
 const STORED_LOAD_WARN: Duration = Duration::from_secs(5);
 
 /// Fresh-tenant boots; one warm boot follows, on the last fresh tenant.
@@ -1115,8 +1119,8 @@ async fn boot_report(runs: &[Boot], contact_point: &str, node: &str) -> Value {
         "worst_fresh_tenant_seed_ms": round(worst),
         "stored_load_warning": {
             "above_ms": load_warn_ms,
-            "basis": "proposed in L12: half the seeding budget, because the load runs on every \
-                      boot and every TTL refresh",
+            "basis": "proposed: half the seeding budget, because the load runs on every boot \
+                      and every TTL refresh",
         },
         "worst_stored_load_ms": round(worst_load),
         "within_budget": worst <= budget_ms,
@@ -1214,10 +1218,10 @@ fn boot_markdown(report: &Value, runs: &[Boot]) -> String {
          and every TTL refresh, and reads every seeded tenant's 1,372-row SearchParameter \
          partition: an id scan, then a point read per row, all spec definitions it then skips. \
          Each fresh run adds one seeded tenant, so the change from the run before is the cost \
-         of one. Worst load: **{}**; a load over {} s (half the seeding budget, proposed in \
-         L12) is a warning.\n\n\
-         | Run | Tenants | Stored (non-spec) | Load | Change from the run before | Load per tenant |\n\
-         | --- | --- | --- | --- | --- | --- |\n",
+         of one; tenants without the seed hold a few rows and cost little. Worst load: **{}**; \
+         a load over {} s (half the seeding budget, a proposed line) is a warning.\n\n\
+         | Run | Tenants with a SearchParameter | Stored (non-spec) | Load | Change from the run before |\n\
+         | --- | --- | --- | --- | --- |\n",
         seconds(worst_load),
         STORED_LOAD_WARN.as_secs(),
     ));
@@ -1233,19 +1237,14 @@ fn boot_markdown(report: &Value, runs: &[Boot]) -> String {
                     ),
                     None => "–".to_owned(),
                 };
-                let per_tenant = if tenants > 0 {
-                    format!("{:.0} ms", ms / tenants as f64)
-                } else {
-                    "–".to_owned()
-                };
                 md.push_str(&format!(
-                    "| {} | {tenants} | {stored} | {} | {change} | {per_tenant} |\n",
+                    "| {} | {tenants} | {stored} | {} | {change} |\n",
                     run.label,
                     seconds(ms)
                 ));
                 previous = Some((ms, tenants));
             }
-            None => md.push_str(&format!("| {} | – | – | no line | – | – |\n", run.label)),
+            None => md.push_str(&format!("| {} | – | – | no line | – |\n", run.label)),
         }
     }
     let text = |value: &Value| match value {

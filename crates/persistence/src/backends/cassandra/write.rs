@@ -277,7 +277,7 @@ fn undecidable(timed_out: bool, operation: &str) -> StorageError {
 /// and its intent row. Every attempt is kept, because an attempt whose
 /// outcome was unknown can still apply after a later one started: after a
 /// dropped connection or the client deadline the coordinator may still be
-/// running it (audit of L4, S1).
+/// running it.
 #[derive(Debug, Clone)]
 struct Tried {
     write_id: Uuid,

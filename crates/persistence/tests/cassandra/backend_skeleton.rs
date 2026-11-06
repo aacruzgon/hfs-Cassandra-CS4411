@@ -1,7 +1,7 @@
 //! Roadmap Step 2 (items 2.1 and 2.3) against a running node: the
 //! connection, `health_check`, `initialize` on the ten tables, the stubs and
 //! the search-parameter registry. `create`, `read` and `count` are in
-//! `create_read.rs` (layer L4).
+//! `create_read.rs` (layer L3).
 //!
 //! Included by `tests/cassandra_tests.rs`. The node comes from
 //! [`cassandra_node::node`] (`HFS_TEST_CASSANDRA_URL`, or the harness's own
@@ -118,7 +118,7 @@ async fn cassandra_stubs_refuse_with_unsupported_capability() {
     let tenant = unique_tenant("stubs");
     let version = FhirVersion::default_enabled();
 
-    // `create`, `read` and `count` are real from L4 on (`create_read.rs`).
+    // `create`, `read` and `count` are real from L3 on (`create_read.rs`).
     let err = backend
         .update(
             &tenant,

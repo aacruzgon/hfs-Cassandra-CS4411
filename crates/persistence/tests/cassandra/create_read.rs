@@ -1,4 +1,4 @@
-//! Roadmap Step 2, item 2.1 (layer L4): `create`, `read` and `count`
+//! Roadmap Step 2, item 2.1 (layer L3): `create`, `read` and `count`
 //! against a running node.
 //!
 //! Included by `tests/cassandra_tests.rs`. The node comes from

@@ -93,6 +93,18 @@ impl CassandraBackend {
         verify_local_dc(&session, &config.local_dc)
             .await
             .map_err(StorageError::Backend)?;
+        let outside = session.usable_nodes_outside(&config.local_dc);
+        if !outside.is_empty() {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: BACKEND_NAME.to_string(),
+                message: format!(
+                    "a contact point is in data centre {outside:?}, not in HFS_CASSANDRA_LOCAL_DC \
+                     '{}'; list only contact points in the local data centre",
+                    config.local_dc
+                ),
+                source: None,
+            }));
+        }
 
         let stored_by_tenant: StoredByTenant = Arc::new(RwLock::new(HashMap::new()));
         let loader_cache = stored_by_tenant.clone();
@@ -518,8 +530,8 @@ mod restart_tests {
     const CONTAINER: &str = "HFS_TEST_CASSANDRA_RESTART_CONTAINER";
 
     /// How long the backend must stay healthy after the node returns. The
-    /// driver lost the node 40 s after a restart in layer L1's reproduction
-    /// (`~/.claude/rex-agent/runs/s2-testnode/report-L1.md`).
+    /// driver lost the node 40 s after a restart when roadmap Step 2's test
+    /// node layer reproduced the bug.
     const STAY_HEALTHY: Duration = Duration::from_secs(120);
 
     fn docker(args: &[&str]) {
@@ -612,8 +624,9 @@ mod restart_tests {
         assert!(read_one(&backend).await.is_err(), "a read while down");
 
         docker(&["start", &container]);
+        let attempts_before = backend.session.rebuild_attempts();
         let (up_after, polls) = wait_for_health(&backend, true, Duration::from_secs(240)).await;
-        let attempts = backend.session.rebuild_attempts();
+        let attempts = backend.session.rebuild_attempts() - attempts_before;
         eprintln!(
             "up: health_check passed {up_after:?} after the start (generation {}); \
              {attempts} rebuild attempt(s) for {polls} polls of {CALLERS} concurrent callers",
@@ -652,10 +665,11 @@ mod restart_tests {
              {generation} rebuild(s); {} statements prepared now, {prepared_before} before",
             backend.session.prepared_count()
         );
-        if generation > 0 {
-            // Only the health check and the read ran on the new session: the
-            // cache started empty and both were prepared again on it.
-            assert_eq!(backend.session.prepared_count(), 2);
-        }
+        // The node was down long enough to be marked down, so the session
+        // was rebuilt at least once.
+        assert!(generation > 0, "no rebuild happened");
+        // Only the health check and the read ran on the new session: the
+        // cache started empty and both were prepared again on it.
+        assert_eq!(backend.session.prepared_count(), 2);
     }
 }

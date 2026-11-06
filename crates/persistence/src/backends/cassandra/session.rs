@@ -65,7 +65,9 @@ use cdrs_tokio::statement::{StatementParams, StatementParamsBuilder};
 use cdrs_tokio::transport::TransportTcp;
 use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::watch;
 
 use super::config::CassandraConfig;
 
@@ -237,14 +239,34 @@ impl Connected {
     }
 }
 
-/// Rebuild bookkeeping, held under [`CassandraSession::rebuild`] so only one
-/// rebuild runs at a time.
+/// Rebuild bookkeeping, under [`Holder::state`].
 #[derive(Debug, Default)]
 struct RebuildState {
-    /// Consecutive failed or abandoned rebuilds.
+    /// Rebuilds started since the last one that succeeded.
     failures: u32,
     /// No new rebuild starts before this.
     not_before: Option<Instant>,
+    /// The rebuild in progress: callers wait on it instead of starting
+    /// another. Its task sends `true` when it has finished.
+    pending: Option<watch::Receiver<bool>>,
+}
+
+/// What [`CassandraSession`] shares with its rebuild task.
+struct Holder {
+    /// Kept to open the replacement session. The password stays here and is
+    /// never logged (`CassandraConfig`'s `Debug` redacts it).
+    config: CassandraConfig,
+    current: RwLock<Arc<Connected>>,
+    /// Taken before `current` when both are needed.
+    state: Mutex<RebuildState>,
+    /// Rebuilds started, successful or not.
+    rebuild_attempts: AtomicU64,
+}
+
+impl Holder {
+    fn current(&self) -> Arc<Connected> {
+        self.current.read().clone()
+    }
 }
 
 /// The backend's session holder: the open driver session, its
@@ -253,8 +275,8 @@ struct RebuildState {
 ///
 /// **Why it rebuilds.** After a control-connection reconnect whose query plan
 /// still holds the node, `cdrs-tokio` 8.1.9 refreshes each known node with
-/// `clone_with_node_info` (`cluster/topology/node.rs:279-290`, reached from
-/// `metadata_builder.rs:56`). That compares the node's stored
+/// `clone_with_node_info` (`cluster/topology/node.rs:279-290`, called from
+/// `metadata_builder.rs:81`). That compares the node's stored
 /// `broadcast_address`, the gossip address (`<ip>:7000`), with the fresh
 /// `broadcast_rpc_address`, the CQL address (`<ip>:9042`). The two never
 /// match, so the node is set `Unknown` with no distance. Such a node is
@@ -265,41 +287,43 @@ struct RebuildState {
 /// **What it does.** When a statement fails with [`NO_NODE_IN_PLAN`] and the
 /// session's metadata holds no usable node, the holder opens a new session
 /// from the same configuration and swaps it in. The statement is then sent
-/// once more on the new session **only if it is idempotent**; a
-/// compare-and-swap returns its error, which says it was never sent (the
-/// driver returns this error only when it tried no node), and the caller's
-/// unknown-outcome rules decide what follows (ADR-aacruzgon-0024).
-/// `health_check` runs through the same path, so a probe both sees the broken
-/// session and repairs it.
+/// once more on the new session **only if it is idempotent**. A
+/// compare-and-swap returns its error, and the caller's unknown-outcome rules
+/// decide what follows (ADR-aacruzgon-0024). For a CAS the error means it was
+/// sent to no node: it carries `FallthroughRetryPolicy`, so the driver never
+/// moves on after sending it (`send_envelope.rs`). For an idempotent statement
+/// under `DefaultRetryPolicy` the same text can also follow a retry that ran
+/// out of nodes after the statement was sent; the node is then still usable,
+/// so no rebuild starts, and a re-send would be safe anyway. `health_check`
+/// runs through the same path, so a probe both sees the broken session and
+/// repairs it.
 ///
-/// **One rebuild at a time.** Callers that hit the error together queue on
-/// [`rebuild`](Self::rebuild); the first one rebuilds, the rest find the new
-/// session and use it. After a failed rebuild no new one starts for a backoff
-/// of 250 ms, doubling per failure up to 5 s, and callers in that window get
-/// their own error back at once, so a node that is down is not hammered.
-/// Waiting for the queue counts against the caller's request deadline.
+/// **One rebuild at a time, in a task of its own.** The rebuild runs in a
+/// spawned task that callers wait on, never in a caller's future. The
+/// driver's session builder spawns its control-connection task before it
+/// waits for the cluster (`cluster/session.rs:826`), so a cancelled build
+/// would leave that task running for good; the rebuild task is never
+/// cancelled, and at most one is pending. Before building, it checks that a
+/// contact point accepts a TCP connection, so a node that is down fails the
+/// rebuild at once. After a failed rebuild, or one whose new session has no
+/// usable node, no new one starts for a backoff of 250 ms, doubling per
+/// failure up to 5 s; callers in that window get their own error back at
+/// once, so a node that is down is not hammered. A caller waits for a pending
+/// rebuild only as long as its request deadline allows.
 pub(crate) struct CassandraSession {
-    /// Kept to open the replacement session. The password stays here and is
-    /// never logged (`CassandraConfig`'s `Debug` redacts it).
-    config: CassandraConfig,
-    current: RwLock<Arc<Connected>>,
-    rebuild: tokio::sync::Mutex<RebuildState>,
-    /// Rebuilds started, successful or not.
-    rebuild_attempts: std::sync::atomic::AtomicU64,
+    holder: Arc<Holder>,
     request_timeout: Duration,
     no_retry: Arc<dyn RetryPolicy + Send + Sync>,
 }
 
 impl std::fmt::Debug for CassandraSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let current = self.current();
+        let current = self.holder.current();
         f.debug_struct("CassandraSession")
             .field("generation", &current.generation)
             .field(
                 "rebuild_attempts",
-                &self
-                    .rebuild_attempts
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                &self.holder.rebuild_attempts.load(Ordering::Relaxed),
             )
             .field("prepared_statements", &current.prepared.read().len())
             .field("request_timeout", &self.request_timeout)
@@ -310,26 +334,57 @@ impl std::fmt::Debug for CassandraSession {
 impl CassandraSession {
     /// Opens a session to `config.contact_points`, routing every request to
     /// the replicas in `config.local_dc` (ADR-aacruzgon-0003), with
-    /// `config.keyspace` as the session keyspace.
+    /// `config.keyspace` as the session keyspace, all within
+    /// `config.connect_timeout_ms`.
+    ///
+    /// When the contact points accept TCP but the session does not come up
+    /// in time (a missing keyspace, a node still starting), the driver's
+    /// control-connection task outlives the failed call (see the type docs).
+    /// A failed startup ends the process, which ends the task.
     pub(crate) async fn connect(config: &CassandraConfig) -> Result<Self, DriverError> {
-        let session = open_session(config).await?;
+        let deadline = Duration::from_millis(config.connect_timeout_ms);
+        let started = Instant::now();
+        let builder = session_builder(config, deadline).await?;
+        let remaining = deadline.saturating_sub(started.elapsed());
+        let session = within(remaining, false, builder.build())
+            .await?
+            .map_err(build_error)?;
         Ok(Self {
-            config: config.clone(),
-            current: RwLock::new(Arc::new(Connected {
-                session,
-                prepared: RwLock::new(HashMap::new()),
-                generation: 0,
-            })),
-            rebuild: tokio::sync::Mutex::new(RebuildState::default()),
-            rebuild_attempts: std::sync::atomic::AtomicU64::new(0),
+            holder: Arc::new(Holder {
+                config: config.clone(),
+                current: RwLock::new(Arc::new(Connected {
+                    session,
+                    prepared: RwLock::new(HashMap::new()),
+                    generation: 0,
+                })),
+                state: Mutex::new(RebuildState::default()),
+                rebuild_attempts: AtomicU64::new(0),
+            }),
             request_timeout: Duration::from_millis(config.request_timeout_ms),
             no_retry: Arc::new(FallthroughRetryPolicy),
         })
     }
 
+    /// The data centres of nodes the session would send to that are not
+    /// `local_dc`. The driver gives every contact point a `Local` distance
+    /// and keeps it after the first refresh (`cluster/session.rs:784-786`,
+    /// `topology/node.rs:330`), without asking [`LocalDcOnly`], so a contact
+    /// point in another DC would coordinate requests.
+    pub(crate) fn usable_nodes_outside(&self, local_dc: &str) -> Vec<String> {
+        self.holder
+            .current()
+            .session
+            .cluster_metadata()
+            .nodes()
+            .values()
+            .filter(|node| !node.is_ignored() && node.datacenter() != local_dc)
+            .map(|node| node.datacenter().to_string())
+            .collect()
+    }
+
     /// The session in use now.
     fn current(&self) -> Arc<Connected> {
-        self.current.read().clone()
+        self.holder.current()
     }
 
     /// How many sessions have replaced the first one.
@@ -341,8 +396,7 @@ impl CassandraSession {
     /// How many rebuilds have started, successful or not.
     #[cfg(test)]
     pub(crate) fn rebuild_attempts(&self) -> u64 {
-        self.rebuild_attempts
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.holder.rebuild_attempts.load(Ordering::Relaxed)
     }
 
     /// How many statements are prepared on the session in use now.
@@ -420,57 +474,37 @@ impl CassandraSession {
         Self::execute_on(&fresh, cql, &params, remaining).await
     }
 
-    /// Replaces `broken` with a new session, or returns the one another caller
-    /// already put in its place. `None` when no new session could be had:
-    /// the rebuild failed, a recent failure's backoff has not passed, or
-    /// `budget` ran out while waiting.
+    /// Replaces `broken` with a new session, or returns the one a rebuild
+    /// already put in its place. `None` when no new session could be had
+    /// within `budget`: the rebuild failed or is still running, or a recent
+    /// failure's backoff has not passed.
     async fn recover(&self, broken: &Connected, budget: Duration) -> Option<Arc<Connected>> {
-        let attempt = async {
-            let mut state = self.rebuild.lock().await;
-            let current = self.current();
+        let mut finished = {
+            let mut state = self.holder.state.lock();
+            let current = self.holder.current();
             if current.generation != broken.generation {
                 return Some(current);
             }
-            if state.not_before.is_some_and(|at| Instant::now() < at) {
-                return None;
-            }
-            // Counted before the attempt, so a caller dropped mid-rebuild
-            // still leaves a backoff behind; reset on success.
-            state.failures = state.failures.saturating_add(1);
-            state.not_before = Some(Instant::now() + rebuild_backoff(state.failures));
-            let generation = broken.generation + 1;
-            self.rebuild_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!(
-                generation,
-                "cassandra: the session has no node to send to; opening a new session"
-            );
-            match open_session(&self.config).await {
-                Ok(session) => {
-                    let fresh = Arc::new(Connected {
-                        session,
-                        prepared: RwLock::new(HashMap::new()),
-                        generation,
-                    });
-                    *self.current.write() = fresh.clone();
-                    *state = RebuildState::default();
-                    tracing::info!(generation, "cassandra: new session open");
-                    Some(fresh)
-                }
-                Err(error) => {
-                    let backoff = rebuild_backoff(state.failures);
-                    state.not_before = Some(Instant::now() + backoff);
-                    tracing::warn!(
-                        failures = state.failures,
-                        retry_in_ms = backoff.as_millis() as u64,
-                        error = %describe_open_error(&error),
-                        "cassandra: could not open a new session"
-                    );
-                    None
+            match &state.pending {
+                Some(pending) => pending.clone(),
+                None => {
+                    if state.not_before.is_some_and(|at| Instant::now() < at) {
+                        return None;
+                    }
+                    state.failures = state.failures.saturating_add(1);
+                    let (done, pending) = watch::channel(false);
+                    state.pending = Some(pending.clone());
+                    self.holder.rebuild_attempts.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(rebuild(self.holder.clone(), broken.generation + 1, done));
+                    pending
                 }
             }
         };
-        tokio::time::timeout(budget, attempt).await.ok().flatten()
+        // An error here means the task ended without sending (a panic);
+        // either way, the current session decides.
+        let _ = tokio::time::timeout(budget, finished.wait_for(|done| *done)).await;
+        let current = self.holder.current();
+        (current.generation > broken.generation).then_some(current)
     }
 
     /// Executes `cql` and returns its rows (empty for a statement without a
@@ -504,10 +538,80 @@ fn describe_open_error(error: &DriverError) -> String {
     }
 }
 
-/// Opens a driver session for `config`, within `config.connect_timeout_ms`.
-async fn open_session(config: &CassandraConfig) -> Result<CdrsSession, DriverError> {
-    let connect_timeout = Duration::from_millis(config.connect_timeout_ms);
+/// Opens the replacement session for `holder` and swaps it in, or records the
+/// failure and its backoff; then wakes the callers waiting on `done`. Runs in
+/// its own task and is never cancelled (see [`CassandraSession`]).
+async fn rebuild(holder: Arc<Holder>, generation: u64, done: watch::Sender<bool>) {
+    tracing::warn!(
+        generation,
+        "cassandra: the session has no node to send to; opening a new session"
+    );
+    let outcome = match open_replacement(&holder.config).await {
+        Ok(session) => {
+            let fresh = Connected {
+                session,
+                prepared: RwLock::new(HashMap::new()),
+                generation,
+            };
+            if fresh.has_usable_node() {
+                Ok(fresh)
+            } else {
+                Err("the new session has no usable node in the local data centre".to_string())
+            }
+        }
+        Err(error) => Err(describe_open_error(&error)),
+    };
+    {
+        let mut state = holder.state.lock();
+        state.pending = None;
+        match outcome {
+            Ok(fresh) => {
+                *holder.current.write() = Arc::new(fresh);
+                state.failures = 0;
+                state.not_before = None;
+                tracing::info!(generation, "cassandra: new session open");
+            }
+            Err(reason) => {
+                let backoff = rebuild_backoff(state.failures);
+                state.not_before = Some(Instant::now() + backoff);
+                tracing::warn!(
+                    failures = state.failures,
+                    retry_in_ms = backoff.as_millis() as u64,
+                    error = %reason,
+                    "cassandra: could not open a new session"
+                );
+            }
+        }
+    }
+    let _ = done.send(true);
+}
 
+/// The replacement session for [`rebuild`]. First checks, within
+/// `config.connect_timeout_ms`, that some contact point accepts a TCP
+/// connection, so a node that is down fails here at once. The session build
+/// itself has no deadline: cancelling it would orphan the driver's
+/// control-connection task, and it finishes once the node answers.
+async fn open_replacement(config: &CassandraConfig) -> Result<CdrsSession, DriverError> {
+    let deadline = Duration::from_millis(config.connect_timeout_ms);
+    let started = Instant::now();
+    let attempts: Vec<_> = config
+        .contact_points
+        .iter()
+        .map(|point| Box::pin(tokio::net::TcpStream::connect(point.as_str())))
+        .collect();
+    within(deadline, false, futures::future::select_ok(attempts))
+        .await?
+        .map_err(|error| DriverError::from(cdrs_tokio::error::Error::Io(error)))?;
+    let builder = session_builder(config, deadline.saturating_sub(started.elapsed())).await?;
+    builder.build().await.map_err(build_error)
+}
+
+/// The driver's session builder for `config`. Resolving the contact points
+/// runs within `deadline` and spawns nothing, so it is safe to cancel.
+async fn session_builder(
+    config: &CassandraConfig,
+    deadline: Duration,
+) -> Result<TcpSessionBuilder<LoadBalancing>, DriverError> {
     let mut node_config = NodeTcpConfigBuilder::new()
         .with_contact_points(
             config
@@ -522,26 +626,27 @@ async fn open_session(config: &CassandraConfig) -> Result<CdrsSession, DriverErr
             StaticPasswordAuthenticatorProvider::new(username, password),
         ));
     }
-    let node_config = within(connect_timeout, false, node_config.build()).await??;
+    let node_config = within(deadline, false, node_config.build()).await??;
 
     let pool = ConnectionPoolConfigBuilder::new()
         .with_local_size(config.pool_size)
-        .with_connect_timeout(Some(connect_timeout))
+        .with_connect_timeout(Some(Duration::from_millis(config.connect_timeout_ms)))
         .build();
 
     // Replicas first. Nodes outside the local DC are ignored by
     // `LocalDcOnly`, so no remote node is ever tried; the strategy's
     // remote-DC options are off as well.
     let load_balancing = TopologyAwareLoadBalancingStrategy::new(None, false);
-    let builder = TcpSessionBuilder::new(load_balancing, node_config)
+    Ok(TcpSessionBuilder::new(load_balancing, node_config)
         .with_node_distance_evaluator(Box::new(LocalDcOnly::new(config.local_dc.clone())))
         .with_retry_policy(Box::new(DefaultRetryPolicy))
         .with_connection_pool_config(pool)
-        .with_keyspace(config.keyspace.clone());
+        .with_keyspace(config.keyspace.clone()))
+}
 
-    within(connect_timeout, false, builder.build())
-        .await?
-        .map_err(|error| DriverError::from(cdrs_tokio::error::Error::General(error.to_string())))
+/// A failed session build, as a driver error.
+fn build_error(error: impl std::fmt::Display) -> DriverError {
+    DriverError::from(cdrs_tokio::error::Error::General(error.to_string()))
 }
 
 /// The parameters `kind` requires; see the module docs.

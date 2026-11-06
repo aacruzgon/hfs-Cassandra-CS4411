@@ -96,7 +96,10 @@ def context() -> dict:
     except AttributeError:
         affinity = None
     ctx = {
-        "commit": os.environ.get("GITHUB_SHA"),
+        # On a pull request GITHUB_SHA is the merge commit; CI_REPORT_COMMIT
+        # (the workflow sets it to the pull request's head) is what was pushed.
+        "commit": os.environ.get("CI_REPORT_COMMIT") or os.environ.get("GITHUB_SHA"),
+        "github_sha": os.environ.get("GITHUB_SHA"),
         "ref": os.environ.get("GITHUB_REF_NAME"),
         "workflow": os.environ.get("GITHUB_WORKFLOW"),
         "job": os.environ.get("GITHUB_JOB"),
@@ -129,7 +132,8 @@ def add(report_id: str, title: str, markdown: str, data: dict) -> None:
     directory = report_dir()
     (directory / f"{report_id}.md").write_text(f"## {title}\n\n{markdown.rstrip()}\n")
     document = {"id": report_id, "title": title, "context": context(), "data": data}
-    (directory / f"{report_id}.json").write_text(json.dumps(document, indent=2))
+    # allow_nan=False: NaN is not JSON, and strict parsers reject it.
+    (directory / f"{report_id}.json").write_text(json.dumps(document, indent=2, allow_nan=False))
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as out:
@@ -417,13 +421,21 @@ def cmd_readiness(args) -> int:
     elif None in figures.values():
         warnings.append("Readiness report: the readiness test printed no figures for " + ", ".join(k for k, v in figures.items() if v is None))
     seconds = lambda ms: None if ms is None else f"{ms / 1000:.2f} s"
+    total = lambda a, b: None if figures[a] is None or figures[b] is None else figures[a] + figures[b]
     md = table(
-        ["`docker stop` took", "Stop returned → `/_readiness` 503", "`docker start` took", "Start returned → `/_readiness` 200", "Test"],
-        [[seconds(figures["stop_ms"]), seconds(figures["stopped_to_503_ms"]), seconds(figures["start_ms"]),
-          seconds(figures["started_to_200_ms"]), result.group(1) if result else "no result line"]],
+        ["Stop issued → `/_readiness` 503 (upper bound)", "`docker stop` took", "Start issued → `/_readiness` 200", "`docker start` took", "Test"],
+        [[seconds(total("stop_ms", "stopped_to_503_ms")), seconds(figures["stop_ms"]),
+          seconds(total("start_ms", "started_to_200_ms")), seconds(figures["start_ms"]),
+          result.group(1) if result else "no result line"]],
     )
-    md += "\nFrom the readiness test's own `[key=ms]` line, on this job's node (`docker stop --time 30`, then `docker start`). `/_readiness` is polled every 0.5 s.\n"
-    add(args.id, args.title, md, {**figures, "test_result": result.group(1) if result else None, "warnings": warnings})
+    md += (
+        "\nFrom the readiness test's own `[key=ms]` lines, on this job's node (`docker stop --time 30`, then "
+        "`docker start`). `/_readiness` is polled every 0.5 s, from the moment each command returns. The node stops "
+        "serving during `docker stop`, so the 503 often comes before the stop returns: the stop's figure is an upper "
+        "bound, and the time from the command's return alone is usually 0.\n"
+    )
+    add(args.id, args.title, md, {**figures, "stop_issued_to_503_upper_bound_ms": total("stop_ms", "stopped_to_503_ms"),
+                                  "start_issued_to_200_ms": total("start_ms", "started_to_200_ms"), "test_result": result.group(1) if result else None, "warnings": warnings})
     return 0
 
 
@@ -441,14 +453,23 @@ TABLESTATS_KEYS = {
     "Droppable tombstone ratio": "droppable_tombstone_ratio",
 }
 
+# The design's trigger for time-bucketing a partition: tombstones scanned per
+# read above the warn threshold (cassandra-discussion.md, "Decision: measure
+# partition growth first, bucket on a trigger").
+TOMBSTONE_TRIGGER = 1000
+
 VIRTUAL_TABLES = ["local_read_latency", "local_write_latency", "tombstones_per_read", "rows_per_read", "max_partition_size"]
 
 
 def number(text: str):
+    """A number, or None for nodetool's NaN (no samples yet), which JSON has no
+    value for."""
     try:
         value = float(text)
     except ValueError:
         return text
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
     return int(value) if value.is_integer() else value
 
 
@@ -555,11 +576,20 @@ def cmd_node_stats(args) -> int:
         ])
     md = f"Snapshot of `{container}`, keyspace `{args.keyspace}`, after the tests and before the readiness test restarts the node (a restart resets these metrics). Read in {took:.1f} s.\n\n"
     md += table(["Table", "Partitions (est.)", "SSTables", "Memtable cells", "Local reads", "Read p99 (ms)",
-                 "Local writes", "Write p99 (ms)", "Reads with tombstone counts", "Tombstones per read (max)",
+                 "Local writes", "Write p99 (ms)", "Reads (tombstone histogram)", "Tombstones per read (max)",
                  "Tombstones per read (p99)", "Droppable tombstone ratio"], rows)
-    md += "\n**Lightweight transactions** (`ClientRequest` CASWrite/CASRead counts):\n\n"
-    cas_rows = [[key, value] for key, value in sorted(cas.items()) if value or key.endswith(".Latency")]
-    md += table(["Metric", "Count"], cas_rows) if cas_rows else "Not read.\n"
+    md += "\n**Lightweight transactions** (`ClientRequest` CASWrite/CASRead, since the node started):\n\n"
+    cas_rows = []
+    for scope in ("CASWrite", "CASRead"):
+        requests = cas.get(f"{scope}.Latency")
+        total_us = cas.get(f"{scope}.TotalLatency")
+        if requests is None:
+            continue
+        mean = f"{total_us / requests / 1000:.2f} ms" if requests and total_us is not None else None
+        others = ", ".join(f"{name.split('.', 1)[1]} {value}" for name, value in sorted(cas.items())
+                           if name.startswith(scope + ".") and value and not name.endswith(("Latency", "TotalLatency")))
+        cas_rows.append([scope, requests, mean, others or "none"])
+    md += table(["Scope", "Requests", "Mean latency", "Other non-zero counts"], cas_rows) if cas_rows else "Not read.\n"
     if histogram:
         md += "\nCAS latency (`nodetool proxyhistograms`, µs):\n\n"
         md += table(["Percentile", "CAS read", "CAS write"], [[r["percentile"], r["cas_read_us"], r["cas_write_us"]] for r in histogram])
@@ -569,7 +599,14 @@ def cmd_node_stats(args) -> int:
                 [[p["pool"], p["active"], p["pending"], p["completed"], p["blocked"], p["all_time_blocked"]] for p in busy])
     dropped_any = [d for d in dropped if d["dropped"]]
     md += "\nDropped messages: " + (", ".join(f"{d['message_type']} {d['dropped']}" for d in dropped_any) or "none") + ".\n"
-    md += "\nRaw outputs are in the artifact, next to this report.\n"
+    md += (
+        "\nLatency and tombstone columns are `system_views` histograms (recent, decaying); "
+        f"a table over {TOMBSTONE_TRIGGER} tombstones per read, the design's bucketing trigger, is a warning. "
+        "Raw outputs are in the artifact, next to this report.\n"
+    )
+    for name, row in views.get("tombstones_per_read", {}).items():
+        if (row.get("max") or 0) > TOMBSTONE_TRIGGER:
+            warnings.append(f"Node statistics: a read of {name} scanned {row['max']:.0f} tombstones, over the design's bucketing trigger of {TOMBSTONE_TRIGGER}")
     if dropped_any:
         warnings.append("Node statistics: the node dropped messages: " + ", ".join(d["message_type"] for d in dropped_any))
     data = {"container": container, "keyspace": args.keyspace, "seconds": round(took, 1), "tables": tables,

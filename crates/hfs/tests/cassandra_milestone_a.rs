@@ -397,6 +397,8 @@ struct Hfs {
     child: Child,
     base: String,
     output: Arc<Mutex<String>>,
+    /// The threads copying stdout and stderr into `output`.
+    readers: Vec<thread::JoinHandle<()>>,
 }
 
 impl Hfs {
@@ -429,17 +431,31 @@ impl Hfs {
             .spawn()
             .expect("start hfs");
         let output = Arc::new(Mutex::new(String::new()));
-        collect(child.stdout.take().expect("stdout"), output.clone());
-        collect(child.stderr.take().expect("stderr"), output.clone());
+        let readers = vec![
+            collect(child.stdout.take().expect("stdout"), output.clone()),
+            collect(child.stderr.take().expect("stderr"), output.clone()),
+        ];
         Self {
             child,
             base,
             output,
+            readers,
         }
     }
 
     fn output(&self) -> String {
         self.output.lock().expect("output lock").clone()
+    }
+
+    /// Kills `hfs` and returns its whole output, once both pipes are read to
+    /// the end, so no line it wrote is still in a pipe.
+    fn stop_and_output(mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for reader in std::mem::take(&mut self.readers) {
+            let _ = reader.join();
+        }
+        self.output()
     }
 
     /// Waits until `/metadata` answers 200; fails if `hfs` exits first.
@@ -506,14 +522,17 @@ impl Drop for Hfs {
     }
 }
 
-fn collect(stream: impl Read + Send + 'static, output: Arc<Mutex<String>>) {
+fn collect(
+    stream: impl Read + Send + 'static,
+    output: Arc<Mutex<String>>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
             let mut output = output.lock().expect("output lock");
             output.push_str(&line);
             output.push('\n');
         }
-    });
+    })
 }
 
 /// A Cassandra container of this test's, with the schema applied. Dropping it
@@ -784,7 +803,10 @@ struct Boot {
     to_metadata_ms: f64,
     /// Launch to `BACKEND_INIT`: process start, configuration, logging.
     to_backend_init_ms: f64,
-    /// `BACKEND_INIT` to `CONNECTED`: the driver session opening.
+    /// `BACKEND_INIT` to `CONNECTED`: the driver session opening, the
+    /// local-DC check, and the base search registry's load from the spec
+    /// file (`CassandraBackend::connect` logs `CONNECTED` after all three).
+    /// No line separates them; the parse is most of it.
     connect_ms: f64,
     /// `CONNECTED` to the start of the stored-SearchParameter load: the
     /// ten-table check (`initialize`, which logs no line of its own) and the
@@ -817,9 +839,9 @@ impl Boot {
         let mut hfs = Hfs::start(contact_point, tenant, true);
         hfs.wait_until_serving().await;
         let to_metadata = launched.elapsed();
-        // Killed before the next boot, so two never share the node.
-        let output = hfs.output();
-        drop(hfs);
+        // Killed before the next boot, so two never share the node; the
+        // output is read once both pipes are drained.
+        let output = hfs.stop_and_output();
 
         let lines = log_lines(&output);
         let need = |marker: &str| -> &LogLine<'_> {
@@ -1055,7 +1077,9 @@ async fn boot_report(runs: &[Boot], contact_point: &str, node: &str) -> Value {
             "launch_to_metadata_200_ms": "hfs launched to the first GET /metadata 200, polled \
                                           every 50 ms",
             "launch_to_backend_init_ms": "launch to \"Initializing Cassandra backend\"",
-            "connect_ms": "\"Initializing Cassandra backend\" to \"Connected to Cassandra\"",
+            "connect_ms": "\"Initializing Cassandra backend\" to \"Connected to Cassandra\": the \
+                           driver session, the local-DC check and the base search registry's \
+                           load from the spec file, which no line separates",
             "initialize_and_seed_ms": "\"Connected to Cassandra\" to the start of the stored \
                                        SearchParameter load; includes initialize (the \
                                        ten-table check), which logs no line of its own",
@@ -1087,7 +1111,7 @@ fn boot_markdown(report: &Value, runs: &[Boot]) -> String {
         seconds(worst),
     );
     md.push_str(
-        "| Run | Launch → `/metadata` 200 | Launch → backend init | Connect | `initialize` + seed \
+        "| Run | Launch → `/metadata` 200 | Launch → backend init | Connect + base registry | `initialize` + seed \
          | Stored SearchParameter load | Launch → listening | Created |\n\
          | --- | --- | --- | --- | --- | --- | --- | --- |\n",
     );
@@ -1130,8 +1154,11 @@ fn boot_markdown(report: &Value, runs: &[Boot]) -> String {
     md.push_str(&format!(
         "\nEach run is a new `hfs` process with the conformance seed on; `warm` boots again on \
          the last fresh tenant. `initialize` + seed ends at {}; it includes the ten-table check, \
-         which logs no line of its own. The stored-SearchParameter load reads every tenant on \
-         the node, so it grows with each fresh run. Each boot's `hfs` log is in the artifact (`hfs-<run>.log`). Commit `{}`, runner `{}`, `{}` build, {} \
+         which logs no line of its own. Connect + base registry is the driver session, the \
+         local-DC check and the spec file's SearchParameter parse, which no line separates. \
+         The first run's launch includes the first start of a newly built binary. The \
+         stored-SearchParameter load reads every tenant on the node, so it grows with each \
+         fresh run. Each boot's `hfs` log is in the artifact (`hfs-<run>.log`). Commit `{}`, runner `{}`, `{}` build, {} \
          CPUs, Cassandra {} ({}), node {} at `{}`.\n",
         runs.first().map_or("?", |run| run.seed_end),
         text(&context["commit"]),
@@ -1146,17 +1173,22 @@ fn boot_markdown(report: &Value, runs: &[Boot]) -> String {
     md
 }
 
-/// `GITHUB_SHA` in CI, otherwise `git rev-parse HEAD`.
+/// `CI_REPORT_COMMIT` in CI (the pull request's head, not the merge commit
+/// `GITHUB_SHA` names on a pull request), otherwise `git rev-parse HEAD`.
 fn commit() -> Option<String> {
-    std::env::var("GITHUB_SHA").ok().or_else(|| {
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(repo_path(""))
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-    })
+    std::env::var("CI_REPORT_COMMIT")
+        .or_else(|_| std::env::var("GITHUB_SHA"))
+        .ok()
+        .filter(|sha| !sha.is_empty())
+        .or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo_path(""))
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        })
 }
 
 /// `RUNNER_NAME` in CI, otherwise `local (<hostname>)`.

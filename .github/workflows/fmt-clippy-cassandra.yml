@@ -110,6 +110,9 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 1
           CI_REPORT_PROFILE: clippy (dev profile, check only)
+          # The commit the CI reports name: on a pull request, its head, not
+          # the merge commit GITHUB_SHA names.
+          CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           python3 .github/scripts/ci-report.py build build-clippy-fhir "Build: cargo clippy (helios-fhir)" -- \
           nice -n 10 cargo clippy -p helios-fhir --all-targets --all-features -- -D warnings \
@@ -184,6 +187,9 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 8
           CI_REPORT_PROFILE: clippy (dev profile, check only)
+          # The commit the CI reports name: on a pull request, its head, not
+          # the merge commit GITHUB_SHA names.
+          CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           python3 .github/scripts/ci-report.py build build-clippy-workspace "Build: cargo clippy (workspace)" -- \
           nice -n 10 cargo clippy --workspace --exclude helios-fhir --all-targets --all-features \
@@ -231,8 +237,11 @@ jobs:
       # No incremental cache in the persistent target dir below: it would grow
       # with every commit until the size cap wipes the whole directory.
       CARGO_INCREMENTAL: 0
-      # The build profile the CI reports name (ci-report.py context).
+      # The build profile and the commit the CI reports name (ci-report.py
+      # context): on a pull request, its head, not the merge commit
+      # GITHUB_SHA names.
       CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
+      CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -369,6 +378,7 @@ jobs:
       # Milestone A (roadmap Step 2, item 2.7): the real hfs binary on this
       # node, POST /Patient then GET /Patient/{id}. Built above.
       - name: Milestone A round trip through hfs against this node
+        id: round-trip
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
@@ -382,8 +392,12 @@ jobs:
       # a fresh tenant, then a warm boot, against this node. Report only: a
       # seed over the provisional 10 s budget (roadmap section 7) is a
       # warning annotation; the step fails only if hfs does not boot or a log
-      # line the measurement needs is missing. Already built.
+      # line the measurement needs is missing. Already built. A failure here
+      # does not skip the readiness test: that one runs when the round trip
+      # passed. Four boots take well under a minute; the timeout bounds a hung
+      # node.
       - name: Boot-time report against this node (report only)
+        timeout-minutes: 10
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
@@ -401,15 +415,21 @@ jobs:
       # histograms of system_views, and the lightweight-transaction counts,
       # after everything the tests and the boot report wrote. Report only.
       - name: Report the node's statistics
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
         continue-on-error: true
+        timeout-minutes: 5
         run: python3 .github/scripts/ci-report.py node-stats node-stats "Cassandra node statistics" hfs-cassandra-ci-cassandra-1
 
       # Step 2's exit criterion: /_readiness reports down while Cassandra is
       # stopped, and up once it is back. The test stops and starts this job's
       # own node, named by HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER (the opt-in;
       # the test checks the container publishes the URL's port), so it is the
-      # job's last test step. --nocapture prints the down and up times.
+      # job's last test step. --nocapture prints the down and up times. It
+      # runs whenever the round trip passed, so a failed boot-time report or
+      # node snapshot (both report steps) does not hide the exit criterion;
+      # that failure still fails the job.
       - name: Milestone A readiness, stopping and starting this job's node (last test step)
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/ci-report/logs"

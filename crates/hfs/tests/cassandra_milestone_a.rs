@@ -4,9 +4,12 @@
 //! REST, and `/_readiness` reports down while Cassandra is stopped.
 //!
 //! - **The round trip** ([R4 http.html#create], [#read]): `POST /Patient` is
-//!   `201 Created` with a `Location` naming the new id, `ETag: W/"1"`,
-//!   `meta.versionId` "1" and a `meta.lastUpdated` instant; `GET` of that
-//!   `Location`'s id is `200 OK` with the same resource, version and ETag.
+//!   `201 Created` with the versioned `Location`
+//!   `[base]/Patient/[id]/_history/1`, `ETag: W/"1"`, `meta.versionId` "1"
+//!   and a `meta.lastUpdated` instant; `GET /Patient/[id]` is `200 OK` with
+//!   the same resource, version and ETag. A `GET` of the `Location` itself
+//!   reaches [#vread], which the backend does not serve before roadmap
+//!   Step 4.
 //! - **Readiness**: `/_readiness` is `200` with the node up, `503` once it is
 //!   stopped, and `200` again once it is back, after which the round trip
 //!   works again (the `cdrs-tokio` session recovers by itself once the node
@@ -69,6 +72,7 @@
 //!
 //! [R4 http.html#create]: https://hl7.org/fhir/R4/http.html#create
 //! [#read]: https://hl7.org/fhir/R4/http.html#read
+//! [#vread]: https://hl7.org/fhir/R4/http.html#vread
 
 #![cfg(feature = "cassandra")]
 
@@ -315,7 +319,8 @@ fn stoppable_container() -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-/// `POST /Patient`, then `GET` of the id the response names.
+/// `POST /Patient`, then `GET` of the id the response names, then `GET` of
+/// its `Location`.
 async fn round_trip(hfs: &Hfs) {
     let client = http();
     let family = format!("Milestone-{}", unique_suffix());
@@ -340,16 +345,13 @@ async fn round_trip(hfs: &Hfs) {
     assert!(!id.is_empty());
     // R4 http.html#create: the server "SHALL also return a Location header
     // which contains the new Logical Id and Version Id", that is
-    // `[base]/Patient/[id]/_history/[vid]`. HFS's REST layer, shared by every
-    // backend, sends `[base]/Patient/[id]` (`crates/rest/src/handlers/create.rs`),
-    // a deviation upstream owns; the same server already versions a batch
-    // entry's `response.location`. An upstream issue is drafted, not yet filed
-    // ("rest: `Location` from create (`POST [type]`) omits the version",
-    // roadmap Step 2 report L7). This pins what it sends today: when the
-    // version is added, update the expected value here and link the issue.
+    // `[base]/Patient/[id]/_history/[vid]`. Upstream HFS sends
+    // `[base]/Patient/[id]` (HeliosSoftware/hfs#2517). Its fix,
+    // HeliosSoftware/hfs#2518, is backported here ahead of its upstream merge;
+    // the next upstream sync brings the same change.
     assert_eq!(
         location,
-        format!("{}/Patient/{id}", hfs.base),
+        format!("{}/Patient/{id}/_history/1", hfs.base),
         "Location of the create"
     );
     assert_eq!(etag, "W/\"1\"", "ETag of the create");
@@ -386,6 +388,32 @@ async fn round_trip(hfs: &Hfs) {
     assert_eq!(read["meta"]["versionId"], "1", "{read}");
     assert_eq!(read["meta"]["lastUpdated"], last_updated, "{read}");
     assert_eq!(read["name"], body["name"], "{read}");
+
+    // The `Location` is a vread (R4 http.html#vread). The backend leaves
+    // `vread` to roadmap Step 4, so today it routes to the vread handler and
+    // answers 501 `not-supported`, not a 404. Step 4 makes this `200 OK` with
+    // version 1: assert that then, as `read` is asserted above.
+    let vread = client
+        .get(&location)
+        .send()
+        .await
+        .expect("GET of the create's Location");
+    assert_eq!(
+        vread.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "GET {location} (vread)"
+    );
+    let outcome: Value = vread.json().await.expect("the vread's body is JSON");
+    assert_eq!(outcome["resourceType"], "OperationOutcome", "{outcome}");
+    assert_eq!(outcome["issue"][0]["code"], "not-supported", "{outcome}");
+    // The backend's stub names the capability (`unsupported("vread")`), so a
+    // 501 from anywhere else fails here.
+    assert!(
+        outcome["issue"][0]["details"]["text"]
+            .as_str()
+            .is_some_and(|d| d.contains("'vread'")),
+        "{outcome}"
+    );
 }
 
 fn header(response: &reqwest::Response, name: reqwest::header::HeaderName) -> String {

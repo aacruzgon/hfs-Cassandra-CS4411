@@ -5,6 +5,7 @@
 
 use serde_json::{json, Value};
 
+use helios_fhir::FhirVersion;
 use helios_persistence::tenant::TenantId;
 use helios_persistence::types::StoredResource;
 
@@ -122,7 +123,7 @@ impl PatientFixture {
 
     /// Converts to a StoredResource.
     pub fn to_stored_resource(&self, tenant_id: &TenantId) -> StoredResource {
-        StoredResource::new("Patient", &self.id, tenant_id.clone(), self.to_json())
+        StoredResource::new("Patient", &self.id, tenant_id.clone(), self.to_json(), FhirVersion::default_enabled())
     }
 }
 
@@ -222,7 +223,7 @@ impl ObservationFixture {
 
     /// Converts to a StoredResource.
     pub fn to_stored_resource(&self, tenant_id: &TenantId) -> StoredResource {
-        StoredResource::new("Observation", &self.id, tenant_id.clone(), self.to_json())
+        StoredResource::new("Observation", &self.id, tenant_id.clone(), self.to_json(), FhirVersion::default_enabled())
     }
 }
 
@@ -305,7 +306,7 @@ impl OrganizationFixture {
 
     /// Converts to a StoredResource.
     pub fn to_stored_resource(&self, tenant_id: &TenantId) -> StoredResource {
-        StoredResource::new("Organization", &self.id, tenant_id.clone(), self.to_json())
+        StoredResource::new("Organization", &self.id, tenant_id.clone(), self.to_json(), FhirVersion::default_enabled())
     }
 }
 
@@ -378,7 +379,7 @@ impl PractitionerFixture {
 
     /// Converts to a StoredResource.
     pub fn to_stored_resource(&self, tenant_id: &TenantId) -> StoredResource {
-        StoredResource::new("Practitioner", &self.id, tenant_id.clone(), self.to_json())
+        StoredResource::new("Practitioner", &self.id, tenant_id.clone(), self.to_json(), FhirVersion::default_enabled())
     }
 }
 
@@ -485,7 +486,7 @@ impl EncounterFixture {
 
     /// Converts to a StoredResource.
     pub fn to_stored_resource(&self, tenant_id: &TenantId) -> StoredResource {
-        StoredResource::new("Encounter", &self.id, tenant_id.clone(), self.to_json())
+        StoredResource::new("Encounter", &self.id, tenant_id.clone(), self.to_json(), FhirVersion::default_enabled())
     }
 }
 

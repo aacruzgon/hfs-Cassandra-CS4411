@@ -56,6 +56,35 @@ mod backend_skeleton;
 #[path = "cassandra/create_read.rs"]
 mod create_read;
 
+/// The shared backend-test harness, `tests/common/{harness, fixtures,
+/// capabilities}.rs`, compiled here as `crate::common` because
+/// [`TestableBackend`](common::harness::TestableBackend) lives there and
+/// `harness.rs` names its two siblings. No other test target declares
+/// `mod common;`, so this binary is the first to compile them. They stay as
+/// upstream wrote them: what Cassandra does not use may stay unused, `rustfmt`
+/// skips them, and the two Clippy lints `capabilities.rs` trips (its hand-written
+/// `Default` for `SupportLevel`, and an `or_insert_with(HashMap::new)` in
+/// `set_backend_capabilities`) are allowed here rather than fixed in a file the
+/// capability-contract layer owns.
+#[allow(
+    dead_code,
+    unused_imports,
+    clippy::derivable_impls,
+    clippy::unwrap_or_default
+)]
+mod common {
+    #[rustfmt::skip]
+    pub mod capabilities;
+    #[rustfmt::skip]
+    pub mod fixtures;
+    #[rustfmt::skip]
+    pub mod harness;
+}
+
+/// Step 2: `TestableBackend` for Cassandra (item 2.5).
+#[path = "common/cassandra_testable.rs"]
+mod cassandra_testable;
+
 /// The node holds the signed-off schema: the ten tables, and every column,
 /// key position, clustering order and table option recorded in
 /// `docs/Cassandra/schema/expected-schema.txt`. The CI job makes the same
@@ -248,4 +277,263 @@ fn cql_comments_and_strings_do_not_split_statements() {
             "SELECT \"we;ird\" FROM t",
         ]
     );
+}
+
+/// Item 2.5: the Cassandra [`TestableBackend`](common::harness::TestableBackend)
+/// on the test node.
+mod testable_backend {
+    use std::collections::HashSet;
+
+    use helios_fhir::FhirVersion;
+    use helios_persistence::backends::cassandra::CassandraBackend;
+    use helios_persistence::core::{BackendCapability, BackendKind, ResourceStorage};
+    use helios_persistence::error::{BackendError, ResourceError, StorageError};
+    use helios_persistence::tenant::TenantContext;
+    use serde_json::json;
+
+    use crate::cassandra_node::{self, URL_VAR, unique_id};
+    use crate::cassandra_testable::{CassandraTestBackend, reset_and_seed};
+    use crate::common::fixtures::TestFixtures;
+    use crate::common::harness::TestableBackend;
+
+    /// Asserts every fixture reads back under `tenant` as version 1 of
+    /// itself, and that `tenant` holds nothing else.
+    async fn assert_seeded(
+        backend: &CassandraTestBackend,
+        tenant: &TenantContext,
+        fixtures: &TestFixtures,
+    ) {
+        for (resource_type, id, expected) in fixtures.all_resources() {
+            let stored = backend
+                .read(tenant, resource_type, &id)
+                .await
+                .unwrap_or_else(|e| panic!("read {resource_type}/{id}: {e}"))
+                .unwrap_or_else(|| panic!("{resource_type}/{id} not under {}", tenant.tenant_id()));
+            assert_eq!(stored.id(), id);
+            assert_eq!(stored.version_id(), "1", "{resource_type}/{id}");
+            assert_eq!(stored.tenant_id(), tenant.tenant_id());
+            for (key, value) in expected.as_object().unwrap() {
+                assert_eq!(&stored.content()[key], value, "{resource_type}/{id} .{key}");
+            }
+        }
+        assert_eq!(
+            backend.count(tenant, None).await.unwrap(),
+            fixtures.total_count() as u64,
+            "resources under {}",
+            tenant.tenant_id()
+        );
+    }
+
+    /// Asserts no fixture is visible under `tenant`, and that it is empty.
+    async fn assert_empty(
+        backend: &CassandraTestBackend,
+        tenant: &TenantContext,
+        fixtures: &TestFixtures,
+    ) {
+        for (resource_type, id, _) in fixtures.all_resources() {
+            let found = backend.read(tenant, resource_type, &id).await.unwrap();
+            assert!(
+                found.is_none(),
+                "{resource_type}/{id} is visible under {}",
+                tenant.tenant_id()
+            );
+        }
+        assert_eq!(backend.count(tenant, None).await.unwrap(), 0);
+    }
+
+    /// The brief's sequence: build, seed, read back, reset, nothing visible
+    /// under the new tenant, and two instances never see each other's data.
+    #[tokio::test]
+    async fn testable_backend_seeds_resets_and_isolates() {
+        let node = node_or_skip!("testable_backend_seeds_resets_and_isolates");
+        let a = CassandraTestBackend::connect(node, "testable-a").await;
+        let b = CassandraTestBackend::connect(node, "testable-b").await;
+        let fixtures = TestFixtures::rich();
+        // Every fixture kind is present, so seeding covers them all.
+        let kinds: HashSet<&str> = fixtures
+            .all_resources()
+            .iter()
+            .map(|(t, _, _)| *t)
+            .collect();
+        assert_eq!(kinds.len(), 5, "{kinds:?}");
+
+        // What the backend declares, and nothing hard-coded here.
+        assert_eq!(a.backend_kind(), BackendKind::Cassandra);
+        let declared: HashSet<BackendCapability> = CassandraBackend::declared_capabilities()
+            .into_iter()
+            .collect();
+        assert_eq!(a.supported_capabilities(), declared);
+        assert!(a.supports_all(&[BackendCapability::Crud, BackendCapability::SharedSchema]));
+        assert!(!a.supports(BackendCapability::Transactions));
+
+        // Two instances, four tenants, all distinct and all test tenants.
+        let tenants: HashSet<String> = [&a, &b]
+            .iter()
+            .flat_map(|x| [x.tenant(), x.secondary_tenant()])
+            .map(|t| t.tenant_id().as_str().to_owned())
+            .collect();
+        assert_eq!(tenants.len(), 4, "{tenants:?}");
+        assert!(
+            tenants
+                .iter()
+                .all(|t| t.starts_with(cassandra_node::TEST_TENANT_PREFIX))
+        );
+
+        // Seed `a`; read every fixture back.
+        a.seed(&fixtures).await.expect("seed a");
+        assert_seeded(&a, &a.tenant(), &fixtures).await;
+        assert_empty(&a, &a.secondary_tenant(), &fixtures).await;
+
+        // `b` sees none of it, through its own tenants or its own connection,
+        // and seeds the same fixed ids without meeting `a`'s.
+        assert_empty(&b, &b.tenant(), &fixtures).await;
+        assert_empty(&b, &b.secondary_tenant(), &fixtures).await;
+        b.seed(&fixtures).await.expect("seed b, same ids as a");
+        assert_seeded(&b, &b.tenant(), &fixtures).await;
+        let extra = unique_id("testable-extra");
+        b.create(
+            &b.tenant(),
+            "Patient",
+            json!({"resourceType": "Patient", "id": extra}),
+            FhirVersion::default_enabled(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            a.read(&a.tenant(), "Patient", &extra)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_seeded(&a, &a.tenant(), &fixtures).await;
+
+        // Seeding a tenant twice is refused by the backend's real create.
+        match a.seed(&fixtures).await {
+            Err(StorageError::Resource(ResourceError::AlreadyExists { .. })) => {}
+            other => panic!("second seed without reset: {other:?}"),
+        }
+
+        // Reset: both tenants replaced; nothing visible under the new ones.
+        let (old, old_secondary) = (a.tenant(), a.secondary_tenant());
+        a.reset().await.expect("reset");
+        assert_ne!(a.tenant().tenant_id(), old.tenant_id());
+        assert_ne!(a.secondary_tenant().tenant_id(), old_secondary.tenant_id());
+        assert_ne!(a.tenant().tenant_id(), a.secondary_tenant().tenant_id());
+        assert_empty(&a, &a.tenant(), &fixtures).await;
+        assert_empty(&a, &a.secondary_tenant(), &fixtures).await;
+        // Reset deleted nothing: the old tenant still holds its rows, which
+        // nobody names again (ADR-aacruzgon-0020).
+        assert_seeded(&a, &old, &fixtures).await;
+        // `b` is untouched by `a`'s reset.
+        assert_eq!(
+            b.count(&b.tenant(), None).await.unwrap(),
+            fixtures.total_count() as u64 + 1
+        );
+
+        // The fresh tenant seeds again.
+        a.seed(&fixtures).await.expect("seed after reset");
+        assert_seeded(&a, &a.tenant(), &fixtures).await;
+    }
+
+    /// A `TestContext` built from the backend follows its resets.
+    #[tokio::test]
+    async fn testable_backend_context_follows_reset() {
+        let node = node_or_skip!("testable_backend_context_follows_reset");
+        let mut ctx = CassandraTestBackend::connect(node, "testable-ctx")
+            .await
+            .into_context(TestFixtures::minimal());
+        assert_eq!(ctx.tenant.tenant_id(), ctx.backend.tenant().tenant_id());
+        assert_eq!(
+            ctx.secondary_tenant.tenant_id(),
+            ctx.backend.secondary_tenant().tenant_id()
+        );
+        assert!(ctx.supports(BackendCapability::Crud));
+
+        ctx.backend.seed(&ctx.fixtures).await.expect("seed");
+        assert_seeded(&ctx.backend, &ctx.tenant, &ctx.fixtures).await;
+        let before = ctx.tenant.clone();
+
+        reset_and_seed(&mut ctx).await.expect("reset_and_seed");
+        assert_ne!(ctx.tenant.tenant_id(), before.tenant_id());
+        assert_eq!(ctx.tenant.tenant_id(), ctx.backend.tenant().tenant_id());
+        assert_eq!(
+            ctx.secondary_tenant.tenant_id(),
+            ctx.backend.secondary_tenant().tenant_id()
+        );
+        assert_seeded(&ctx.backend, &ctx.tenant, &ctx.fixtures).await;
+        assert_empty(&ctx.backend, &ctx.secondary_tenant, &ctx.fixtures).await;
+        // A read-only copy of the current tenant reads the fixtures too.
+        let read_only = ctx.read_only_tenant();
+        assert!(
+            ctx.backend
+                .read(&read_only, "Patient", "patient-1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The wrapper forwards to the backend's overrides, not the trait's
+    /// defaults.
+    #[tokio::test]
+    async fn testable_backend_forwards_the_backend_overrides() {
+        let node = node_or_skip!("testable_backend_forwards_the_backend_overrides");
+        let backend = CassandraTestBackend::connect(node, "testable-fwd").await;
+        let inner = backend.inner();
+        assert_eq!(backend.backend_name(), "cassandra");
+        // The default answers false; the backend overrides it to true.
+        assert!(backend.is_cluster_shared());
+        assert_eq!(backend.is_cluster_shared(), inner.is_cluster_shared());
+        assert_eq!(
+            backend.bulk_write_concurrency(),
+            inner.bulk_write_concurrency()
+        );
+        assert_ne!(
+            backend.bulk_write_concurrency(),
+            1,
+            "the trait default; the backend overrides it"
+        );
+        // A smoke check only: the default also answers Ok, and telling the two
+        // apart needs a node that is down (L7's `/_readiness` check).
+        backend.readiness_check().await.expect("readiness_check");
+
+        // The default `delete_versioned` reads first and answers NotFound for a
+        // missing id; the backend's stub refuses before reading.
+        let tenant = backend.tenant();
+        match backend
+            .delete_versioned(&tenant, "Patient", &unique_id("missing"), "1")
+            .await
+        {
+            Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name,
+                ..
+            })) => assert_eq!(backend_name, "cassandra"),
+            other => panic!("delete_versioned went to the default: {other:?}"),
+        }
+
+        // `create_many` reaches the backend's `create`.
+        let ids: Vec<String> = (0..3).map(|_| unique_id("testable-many")).collect();
+        let results = backend
+            .create_many(
+                &tenant,
+                "Patient",
+                ids.iter()
+                    .map(|id| json!({"resourceType": "Patient", "id": id}))
+                    .collect(),
+                FhirVersion::default_enabled(),
+            )
+            .await;
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 3);
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        assert_eq!(
+            backend
+                .read_batch(&tenant, "Patient", &id_refs)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(backend.exists(&tenant, "Patient", &ids[0]).await.unwrap());
+    }
 }

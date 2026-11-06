@@ -45,6 +45,13 @@ const MAX_KEYSPACE_LEN: usize = 48;
 /// Configuration for [`CassandraBackend`](super::CassandraBackend).
 ///
 /// `Debug` is written by hand so that the password never reaches a log line.
+///
+/// **Safe to log:** `contact_points`, `keyspace`, `local_dc`, `username`,
+/// `pool_size` and the timeouts. Credentials live only in `username` and
+/// `password`: [`validate`](Self::validate) refuses a contact point that
+/// carries a user or password (`user:pass@host:9042`), and the keyspace and
+/// data-centre names cannot hold one. Never log `password`; it is also skipped
+/// when the config is serialized.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CassandraConfig {
@@ -174,6 +181,15 @@ impl CassandraConfig {
             ));
         }
         for point in &self.contact_points {
+            // A `user:password@host` form would put a secret in a field the
+            // server logs; refuse it without echoing the value.
+            if point.contains('@') || point.contains('/') {
+                return Err(CassandraConfigError(
+                    "a contact point must be host:port, with no user, password, scheme or path; \
+                     set HFS_CASSANDRA_USERNAME and HFS_CASSANDRA_PASSWORD for credentials"
+                        .to_string(),
+                ));
+            }
             let has_port = point
                 .rsplit_once(':')
                 .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
@@ -289,6 +305,11 @@ mod tests {
             ("HFS_CASSANDRA_CONTACT_POINTS", "localhost"),
             ("HFS_CASSANDRA_CONTACT_POINTS", ":9042"),
             ("HFS_CASSANDRA_CONTACT_POINTS", ","),
+            (
+                "HFS_CASSANDRA_CONTACT_POINTS",
+                "helios:secret@127.0.0.1:9042",
+            ),
+            ("HFS_CASSANDRA_CONTACT_POINTS", "cassandra://127.0.0.1:9042"),
             ("HFS_CASSANDRA_KEYSPACE", "helios; DROP KEYSPACE helios"),
             ("HFS_CASSANDRA_KEYSPACE", "a-b"),
             ("HFS_CASSANDRA_POOL_SIZE", "0"),
@@ -301,6 +322,16 @@ mod tests {
                 "{name}={value} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn a_contact_point_with_credentials_is_refused_without_echoing_them() {
+        let error = CassandraConfig::from_env_with(env_of(&[(
+            "HFS_CASSANDRA_CONTACT_POINTS",
+            "helios:hunter2@127.0.0.1:9042",
+        )]))
+        .unwrap_err();
+        assert!(!error.to_string().contains("hunter2"), "{error}");
     }
 
     #[test]

@@ -28,6 +28,14 @@
 //! depends on the configured `S3TenancyMode`, so it is asserted per mode here and
 //! its *instance* composition is covered in `src/backends/s3/tests.rs` with a
 //! mock client.
+//!
+//! Cassandra's two instance tests are the one opt-in exception to "nothing here
+//! needs a database". `CassandraBackend::connect` is async and connects eagerly,
+//! as `PostgresBackend::new` does, so they connect to the node
+//! `HFS_TEST_CASSANDRA_URL` names (ADR-aacruzgon-0020, rule 1). Unlike the
+//! Cassandra test harness, they start no container when it is unset: they skip
+//! with a message, so this file still needs no Docker. Its golden-list tests
+//! need nothing.
 
 // Each backend's assertions are gated on its own feature; the shared helpers
 // below would be dead code if none were enabled, so the whole file compiles
@@ -37,7 +45,8 @@
     feature = "postgres",
     feature = "mongodb",
     feature = "elasticsearch",
-    feature = "s3"
+    feature = "s3",
+    feature = "cassandra"
 ))]
 
 use helios_persistence::core::BackendCapability;
@@ -155,12 +164,18 @@ fn assert_exactly_one_tenancy_claim(backend: &str, declared: &[BackendCapability
 /// a hand-rolled `matches!` ladder inside `supports()`. Both methods currently
 /// delegate to one declaration, so they agree — but that delegation is exactly
 /// what a regression would undo, silently, with every golden test still green.
-/// It needs no database: the SQLite/MongoDB/Elasticsearch constructors that
-/// call it open no connection.
+/// It needs no database for SQLite, MongoDB and Elasticsearch, whose
+/// constructors open no connection. Cassandra's caller connects to the node
+/// `HFS_TEST_CASSANDRA_URL` names, and skips without one.
 ///
 /// Only valid for the shared-schema backends; S3's tenancy is mode-dependent and
 /// has its own coverage in `src/backends/s3/tests.rs`.
-#[cfg(any(feature = "sqlite", feature = "mongodb", feature = "elasticsearch"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mongodb",
+    feature = "elasticsearch",
+    feature = "cassandra"
+))]
 fn assert_shared_schema_instance_is_consistent<B: helios_persistence::core::Backend>(
     name: &str,
     backend: &B,
@@ -722,6 +737,131 @@ mod s3 {
                 "s3",
                 &S3Backend::declared_capabilities_for(&mode),
                 &[BackendCapability::ConditionalCreate],
+            );
+        }
+    }
+}
+
+#[cfg(feature = "cassandra")]
+mod cassandra {
+    use super::*;
+    use helios_persistence::backends::cassandra::{CassandraBackend, CassandraConfig};
+
+    /// The design's golden list ("Structs and enums", the `BackendKind::Cassandra`
+    /// and `BackendCapability` row; roadmap item 2.4).
+    ///
+    /// There is no `TokenSearch` or `UriSearch` variant: `BasicSearch` covers
+    /// token search, and URI search has no variant of its own. Nothing else is
+    /// declared. String, reference, number, quantity and composite search,
+    /// history, transactions, conditional operations, `_include`/`_revinclude`,
+    /// text search, offset paging, sorting and the bulk-submit REST worker are ✗
+    /// in the design's scope (not implemented); bulk export and bulk-submit
+    /// ingest are out of scope for this project.
+    const GOLDEN: [BackendCapability; 7] = [
+        BackendCapability::Crud,
+        BackendCapability::Versioning,
+        BackendCapability::OptimisticLocking,
+        BackendCapability::BasicSearch,
+        BackendCapability::DateSearch,
+        BackendCapability::CursorPagination,
+        BackendCapability::SharedSchema,
+    ];
+
+    /// One keyspace for every tenant, with `tenant_id` leading every partition
+    /// key (`docs/Cassandra/schema/schema.cql`). There is no keyspace or cluster
+    /// per tenant, so neither of the per-tenant placements may be claimed.
+    #[test]
+    fn cassandra_declares_shared_schema_only() {
+        let declared = CassandraBackend::declared_capabilities();
+
+        assert!(declared.contains(&BackendCapability::SharedSchema));
+        assert!(
+            !declared.contains(&BackendCapability::SchemaPerTenant),
+            "Cassandra keeps every tenant in one keyspace; it creates no keyspace per tenant."
+        );
+        assert!(
+            !declared.contains(&BackendCapability::DatabasePerTenant),
+            "Cassandra keeps every tenant in one cluster and keyspace, reached by one session; \
+             claiming DatabasePerTenant would overstate isolation. See #369."
+        );
+        assert_exactly_one_tenancy_claim("cassandra", &declared);
+    }
+
+    #[test]
+    fn cassandra_declares_exactly_its_golden_capabilities() {
+        assert_declares_exactly(
+            "cassandra",
+            &CassandraBackend::declared_capabilities(),
+            &GOLDEN,
+        );
+    }
+
+    /// None: conditional create, update, delete and patch are ✗ in the design's
+    /// scope, and `supports_conditional` is overridden to `false` ("Defaults we
+    /// must override").
+    #[test]
+    fn cassandra_declares_no_conditional_interaction() {
+        assert_declares_exactly_these_conditionals(
+            "cassandra",
+            &CassandraBackend::declared_capabilities(),
+            &[],
+        );
+    }
+
+    /// The node to test against, or `None` to skip. `HFS_TEST_CASSANDRA_URL` is
+    /// `host:port`, with the schema already applied (ADR-aacruzgon-0020, rule 1).
+    async fn backend() -> Option<CassandraBackend> {
+        let Some(url) = std::env::var("HFS_TEST_CASSANDRA_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+        else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return None;
+        };
+        let config = CassandraConfig {
+            contact_points: vec![url.clone()],
+            data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
+            ..CassandraConfig::default()
+        };
+        Some(
+            CassandraBackend::connect(config)
+                .await
+                .unwrap_or_else(|e| panic!("connect to {url}: {e}")),
+        )
+    }
+
+    /// Instance-level counterpart to the golden-list test. Unlike the other
+    /// backends' it needs a node, because `connect` opens the session; it reads
+    /// nothing and writes nothing there.
+    #[tokio::test]
+    async fn cassandra_instance_supports_matches_capabilities() {
+        use helios_persistence::core::{Backend, BackendKind};
+
+        let Some(backend) = backend().await else {
+            return;
+        };
+        assert_eq!(backend.kind(), BackendKind::Cassandra);
+        assert_shared_schema_instance_is_consistent("cassandra", &backend);
+        assert_declares_exactly("cassandra (instance)", &backend.capabilities(), &GOLDEN);
+    }
+
+    /// The REST layer reads `ConditionalStorage::supports_conditional`, not the
+    /// capability list, for the CapabilityStatement's `conditional*` elements and
+    /// for its 501: on a real instance the two must give the same answer, which
+    /// for Cassandra is "no" for every interaction.
+    #[tokio::test]
+    async fn cassandra_instance_supports_conditional_matches_its_declaration() {
+        use helios_persistence::core::{Backend, ConditionalInteraction, ConditionalStorage};
+
+        let Some(backend) = backend().await else {
+            return;
+        };
+        for interaction in ConditionalInteraction::ALL {
+            assert!(!backend.supports_conditional(interaction), "{interaction}");
+            assert_eq!(
+                backend.supports_conditional(interaction),
+                backend.supports(interaction.capability()),
+                "{interaction}"
             );
         }
     }

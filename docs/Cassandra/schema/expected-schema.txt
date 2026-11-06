@@ -37,6 +37,7 @@ resources data regular -1 none text
 resources deleted_at regular -1 none timestamp
 resources fhir_version regular -1 none text
 resources id partition_key 2 none text
+resources index_keys regular -1 none blob
 resources last_updated regular -1 none timestamp
 resources resource_type partition_key 1 none text
 resources tenant_id partition_key 0 none text

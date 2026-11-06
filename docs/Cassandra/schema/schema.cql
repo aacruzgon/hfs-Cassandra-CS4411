@@ -16,6 +16,10 @@
 --   * every write to resources is a lightweight transaction at serial
 --     consistency LOCAL_SERIAL, never a plain write and never SERIAL (a plain
 --     write bypasses Paxos and breaks the compare-and-swap);
+--   * every CAS on resources sets index_keys to K(N+1), the key set of the
+--     version it creates (a delete sets the empty set, 0x01 0x00), so the
+--     current row always names the index rows its version writes
+--     (ADR-aacruzgon-0027);
 --   * never a CQL DELETE against resources (soft delete only: 410 needs the row);
 --   * every update, delete and revive also rewrites resource_versions row N
 --     from current, USING TIMESTAMP write_ts(N) - 1, so a crash cannot lose
@@ -25,13 +29,15 @@
 --     unset (ADR-aacruzgon-0026);
 --   * every resource_versions row carries index_keys, the key set its version
 --     wrote, never unset: V1 and V2 write the writer's own K(V), the sweeper's
---     replay of a missing row writes the K(V) it extracts, and a rewrite of
---     row N writes the blob read from row N, or, when row N is missing, the
---     K(N) re-extracted from the content the writer holds. The rewrite is one
---     microsecond older, so it never replaces a stored blob (ADR-aacruzgon-0027);
---   * the old keys of a write, the sweeper's K(V-1) and repair's keys come
---     from that version's stored index_keys, never from re-extraction, except
---     when its row is missing (ADR-aacruzgon-0027);
+--     replay writes the index_keys of the resources row it read, and a
+--     rewrite of row N writes the index_keys the writer read from resources
+--     at version N. The rewrite is one microsecond older, so it never
+--     replaces a stored blob (ADR-aacruzgon-0027);
+--   * the old keys of a write, K(N), are the index_keys of the resources row
+--     the writer read, and that read's version_id is the one its CAS is
+--     conditioned on. Repair's keys are the tag check's resources.index_keys,
+--     and the sweeper's K(V-1) is row V-1's index_keys. None is ever
+--     re-extracted (ADR-aacruzgon-0027);
 --   * every write to resource_versions and the index tables carries USING
 --     TIMESTAMP derived from write_ts; a plain write would lose to them;
 --   * never bind null; leave absent columns unset (null writes a cell tombstone).
@@ -40,8 +46,12 @@
 --     tombstone, on purpose (checked on 5.0.9, 2026-10-13; ADR-aacruzgon-0024);
 --   * never ALLOW FILTERING;
 --   * never write an index row whose code, system or uri value is longer than
---     2,048 bytes in UTF-8: the write is refused with 400 before its intent
---     row, so nothing is written (ADR-aacruzgon-0026).
+--     2,048 bytes in UTF-8, or whose param is longer than 128 bytes: the write
+--     is refused with 400 before its intent row, so nothing is written
+--     (ADR-aacruzgon-0026, 0027);
+--   * never store a SearchParameter whose code is longer than 128 bytes in
+--     UTF-8: it is refused with 400, so no param over 128 bytes reaches the
+--     registry (ADR-aacruzgon-0027).
 --
 -- Common types:
 --   tenant_id, resource_type, id   text (id is never uuid: FHIR ids are
@@ -70,6 +80,13 @@
 
 -- Current version of every resource, and the compare-and-swap target for
 -- every write. Point reads only: read, exists, _id, and the tag check.
+--
+-- index_keys (ADR-aacruzgon-0027, walkthrough G22) is K(V) of the current
+-- version V, written by the CAS that created V. It is the same blob as
+-- resource_versions row V's index_keys, encoded as described below that
+-- table. Because the CAS writes it, a writer that reads version N here and
+-- whose CAS is conditioned on version_id = N deletes exactly the rows N
+-- wrote, even when row N of resource_versions is not written yet.
 CREATE TABLE IF NOT EXISTS resources (
     tenant_id     text,
     resource_type text,
@@ -83,6 +100,8 @@ CREATE TABLE IF NOT EXISTS resources (
     write_ts      bigint,     -- timestamp of this version's index writes
     write_id      uuid,       -- the CAS attempt that wrote this version; read back
                               -- after an LWT timeout to learn the outcome
+    index_keys    blob,       -- K(V) of this version, set by every CAS; the empty
+                              -- set after a delete (ADR-aacruzgon-0027)
     PRIMARY KEY ((tenant_id, resource_type, id))
 ) WITH comment = 'Current version per resource; LWT target for every write';
 
@@ -92,8 +111,9 @@ CREATE TABLE IF NOT EXISTS resources (
 --
 -- index_keys (ADR-aacruzgon-0027, walkthrough G22) is K(V), the exact index
 -- rows version V wrote, so that a later write, the sweeper and repair delete
--- what was written, not what today's registry would extract. Encoding,
--- format 1:
+-- what was written, not what today's registry would extract. The sweeper
+-- reads K(V-1) from here, since resources holds only the current version's.
+-- Encoding, format 1, for this column and resources.index_keys:
 --   byte    format version, 0x01
 --   varint  row count (unsigned LEB128)
 --   rows, each a table tag byte followed by the key columns that are not
@@ -171,6 +191,11 @@ CREATE TABLE IF NOT EXISTS pending_index_writes (
 -- tag check), so a stale or resurrected row never surfaces. That is why
 -- these seven tables lower gc_grace_seconds to 10800 s (3 h, the node's
 -- max_hint_window). resources and resource_versions keep the 10-day default.
+-- A hint lives no longer than the smallest gc_grace_seconds of its tables
+-- (Hint.java in 5.0.9), so a hint for these tables expires at 3 h even after
+-- a short outage. On the cluster a replica returning from any outage is
+-- repaired promptly; resurrection is narrowed, not ruled out
+-- (ADR-aacruzgon-0027).
 -- resources_by_type also carries fhir_version, so count can apply the
 -- request's FHIR version (SearchQuery.fhir_version, upstream #2254) without a
 -- point read per row (ADR-aacruzgon-0026).

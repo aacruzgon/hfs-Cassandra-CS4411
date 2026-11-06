@@ -217,33 +217,90 @@ impl CapabilityMatrix {
             ],
         );
 
-        // Cassandra capabilities
+        // Cassandra capabilities: the design's scope, `docs/Cassandra/cassandra-discussion.md`
+        // ("Scope: the Cassandra column of the capability matrix"; "Structs and enums",
+        // the `BackendCapability` row). `Planned` is what the design scopes in: the
+        // golden list in `tests/backend_capability_contract.rs` (roadmap item 2.4), plus
+        // `ReverseChaining` (◐, below). Each becomes `Implemented` when the roadmap step
+        // that serves it lands (Steps 3 to 6d), as the README's ○ becomes ✓ at Step 8.
+        // URI search has no variant; `BasicSearch` covers token. Everything else is
+        // out of scope or ✗, so `NotPlanned`, including every variant listed here
+        // explicitly, since `support_level` answers `Planned` for a missing one.
         matrix.set_backend_capabilities(
             BackendKind::Cassandra,
             vec![
                 (BackendCapability::Crud, SupportLevel::Planned),
                 (BackendCapability::Versioning, SupportLevel::Planned),
-                (BackendCapability::InstanceHistory, SupportLevel::Planned),
+                (BackendCapability::InstanceHistory, SupportLevel::NotPlanned),
                 (BackendCapability::TypeHistory, SupportLevel::NotPlanned),
                 (BackendCapability::SystemHistory, SupportLevel::NotPlanned),
-                (BackendCapability::BasicSearch, SupportLevel::Partial),
+                (BackendCapability::BasicSearch, SupportLevel::Planned),
                 (BackendCapability::DateSearch, SupportLevel::Planned),
+                (BackendCapability::QuantitySearch, SupportLevel::NotPlanned),
                 (BackendCapability::ReferenceSearch, SupportLevel::NotPlanned),
                 (BackendCapability::ChainedSearch, SupportLevel::NotPlanned),
-                (BackendCapability::ReverseChaining, SupportLevel::NotPlanned),
+                // `_has` is ◐ in the design: REST's shared resolver answers it through
+                // `search()` when its terminal parameter is token, date or URI. The
+                // backend does not declare it; the README cell becomes ◐ at Step 8,
+                // and this `Partial` once those searches land.
+                (BackendCapability::ReverseChaining, SupportLevel::Planned),
                 (BackendCapability::Include, SupportLevel::NotPlanned),
                 (BackendCapability::Revinclude, SupportLevel::NotPlanned),
                 (BackendCapability::FullTextSearch, SupportLevel::NotPlanned),
+                // ✗ in the design. With `HFS_TERMINOLOGY_SERVER` set, the REST layer
+                // expands `:in`, `:above` and `:below` on a token into a plain token
+                // list before the backend is called; `:not-in` is always 501.
                 (BackendCapability::TerminologySearch, SupportLevel::NotPlanned),
                 (BackendCapability::Transactions, SupportLevel::NotPlanned),
                 (BackendCapability::OptimisticLocking, SupportLevel::Planned),
+                (
+                    BackendCapability::PessimisticLocking,
+                    SupportLevel::NotPlanned,
+                ),
                 (BackendCapability::CursorPagination, SupportLevel::Planned),
-                (BackendCapability::OffsetPagination, SupportLevel::NotPlanned),
+                (
+                    BackendCapability::OffsetPagination,
+                    SupportLevel::NotPlanned,
+                ),
                 (BackendCapability::Sorting, SupportLevel::NotPlanned),
-                (BackendCapability::BulkExport, SupportLevel::Planned),
+                // Bulk export and bulk-submit ingest are ○ in the README but out of
+                // scope for this project.
+                (BackendCapability::BulkExport, SupportLevel::NotPlanned),
+                (
+                    BackendCapability::BulkSubmitIngest,
+                    SupportLevel::NotPlanned,
+                ),
+                (
+                    BackendCapability::BulkSubmitRestWorker,
+                    SupportLevel::NotPlanned,
+                ),
+                (
+                    BackendCapability::ConditionalCreate,
+                    SupportLevel::NotPlanned,
+                ),
+                (
+                    BackendCapability::ConditionalUpdate,
+                    SupportLevel::NotPlanned,
+                ),
+                (
+                    BackendCapability::ConditionalDelete,
+                    SupportLevel::NotPlanned,
+                ),
+                (
+                    BackendCapability::ConditionalPatch,
+                    SupportLevel::NotPlanned,
+                ),
+                (BackendCapability::InDbSofRunner, SupportLevel::NotPlanned),
+                (BackendCapability::RawSqlQuery, SupportLevel::NotPlanned),
+                // One keyspace, `tenant_id` leading every partition key. The per-tenant
+                // placements are `NotPlanned`, not `Planned`: the roadmap's Step 8 README
+                // column is ✓ ✗ ✗ ✗, as for SQLite.
                 (BackendCapability::SharedSchema, SupportLevel::Planned),
                 (BackendCapability::SchemaPerTenant, SupportLevel::NotPlanned),
-                (BackendCapability::DatabasePerTenant, SupportLevel::Planned),
+                (
+                    BackendCapability::DatabasePerTenant,
+                    SupportLevel::NotPlanned,
+                ),
             ],
         );
 

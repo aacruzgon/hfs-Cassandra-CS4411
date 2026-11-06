@@ -222,7 +222,11 @@ fn classify_cas_failure(error: DriverError) -> CasFailure {
         DriverError::Deadline { sent: false, .. } => CasFailure::NotApplied(error),
         DriverError::Driver(inner) => match inner.as_ref() {
             CdrsError::Server { body, .. } => match &body.ty {
-                ErrorType::WriteTimeout(_) | ErrorType::ReadTimeout(_) => unknown(true, error),
+                // `CasWriteUnknown` (0x1700) is the protocol's own unknown
+                // outcome; only the legacy Paxos v1 path sends it.
+                ErrorType::WriteTimeout(_)
+                | ErrorType::ReadTimeout(_)
+                | ErrorType::CasWriteUnknown(_) => unknown(true, error),
                 // Refused before execution: too few replicas alive, a
                 // bootstrapping node, a statement the node rejected, or one
                 // it no longer had prepared (the driver re-prepared once).
@@ -235,24 +239,29 @@ fn classify_cas_failure(error: DriverError) -> CasFailure {
                 | ErrorType::Authentication
                 | ErrorType::Protocol
                 | ErrorType::Unprepared(_) => CasFailure::NotApplied(error),
-                // `WriteFailure`, `ReadFailure`, `Server`, `Overloaded`,
-                // `Truncate`, and any code a later protocol adds.
+                // `WriteFailure`, `ReadFailure`, `CdcWriteFailure`, `Server`,
+                // `Overloaded`, `Truncate`, `Unknown` (a code the driver
+                // cannot name), and any variant a later driver adds.
                 _ => unknown(false, error),
             },
-            // Raised only while connecting (`connection_pool.rs`), so before
-            // anything was sent.
-            CdrsError::Timeout(_) => CasFailure::NotApplied(error),
-            // The plan held no node, or no connection to it: the driver sent
-            // the statement nowhere (`send_envelope.rs`). The session holder
-            // rebuilds the session after the first, but never re-sends a CAS.
+            // Raised only while connecting (`connection_pool.rs:49-56`), so
+            // before anything was sent. `InvalidProtocol` too: it comes from
+            // opening the node's pool (`cluster/topology/node.rs:294-300`).
+            CdrsError::Timeout(_) | CdrsError::InvalidProtocol(_) => CasFailure::NotApplied(error),
+            // The plan held no node (`cluster/session.rs:892`, `:906`), or
+            // the pool had no connection to the last node tried
+            // (`cluster/connection_pool.rs:711-716`, returned by
+            // `send_envelope.rs:66-69` before writing): the driver sent the
+            // statement nowhere.
             CdrsError::General(message)
                 if message == NO_NODE_IN_PLAN || message.contains("No active connections") =>
             {
                 CasFailure::NotApplied(error)
             }
-            // A closed connection, `Io`, `CAS_WRITE_UNKNOWN` (0x1700, which
-            // cassandra-protocol 3.3.0 cannot decode), and anything else after
-            // the request may have left: unknown.
+            // A closed connection (including one marked broken after a
+            // missed heartbeat, `transport.rs:444-450`), `Io`, and anything
+            // else after the request may have left, including any variant a
+            // later driver adds: unknown.
             _ => unknown(true, error),
         },
     }
@@ -849,27 +858,25 @@ mod tests {
     use super::*;
     use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::frame::message_error::{
-        ErrorBody, FailureInfo, UnavailableError, WriteFailureError, WriteTimeoutError, WriteType,
+        CasWriteUnknownError, ErrorBody, FailureInfo, UnavailableError, WriteFailureError,
+        WriteTimeoutError, WriteType,
     };
 
     fn server(ty: ErrorType) -> DriverError {
         DriverError::from(CdrsError::Server {
-            body: ErrorBody {
-                message: "x".to_string(),
-                ty,
-            },
+            body: ErrorBody::new("x", ty),
             addr: "127.0.0.1:9042".parse().unwrap(),
         })
     }
 
     fn write_timeout(write_type: WriteType) -> ErrorType {
-        ErrorType::WriteTimeout(WriteTimeoutError {
-            cl: Consistency::LocalQuorum,
-            received: 0,
-            block_for: 1,
+        ErrorType::WriteTimeout(WriteTimeoutError::new(
+            Consistency::LocalQuorum,
+            0,
+            1,
             write_type,
-            contentions: None,
-        })
+            None,
+        ))
     }
 
     #[test]
@@ -880,13 +887,13 @@ mod tests {
         };
         unknown(server(write_timeout(WriteType::Cas)), true);
         unknown(
-            server(ErrorType::WriteFailure(WriteFailureError {
-                cl: Consistency::LocalQuorum,
-                received: 0,
-                block_for: 1,
-                failure_info: FailureInfo::NumFailures(1),
-                write_type: WriteType::Cas,
-            })),
+            server(ErrorType::WriteFailure(WriteFailureError::new(
+                Consistency::LocalQuorum,
+                0,
+                1,
+                FailureInfo::NumFailures(1),
+                WriteType::Cas,
+            ))),
             false,
         );
         unknown(
@@ -900,7 +907,21 @@ mod tests {
             true,
         );
         unknown(
-            DriverError::from(CdrsError::UnexpectedErrorCode(0x1700)),
+            server(ErrorType::CasWriteUnknown(CasWriteUnknownError::new(
+                Consistency::LocalSerial,
+                0,
+                1,
+            ))),
+            true,
+        );
+        unknown(
+            server(crate::backends::cassandra::errors::tests::undecoded_error_type()),
+            false,
+        );
+        unknown(
+            DriverError::from(CdrsError::General(
+                "Transport processing task panicked!".to_string(),
+            )),
             true,
         );
         unknown(
@@ -922,12 +943,18 @@ mod tests {
                 sent: false,
             },
             DriverError::from(CdrsError::Timeout("connect".to_string())),
+            DriverError::from(CdrsError::InvalidProtocol(
+                "127.0.0.1:9042".parse().unwrap(),
+            )),
             DriverError::from(CdrsError::General(NO_NODE_IN_PLAN.to_string())),
-            server(ErrorType::Unavailable(UnavailableError {
-                cl: Consistency::LocalSerial,
-                required: 1,
-                alive: 0,
-            })),
+            server(ErrorType::Unavailable(UnavailableError::new(
+                Consistency::LocalSerial,
+                1,
+                0,
+            ))),
+            DriverError::from(CdrsError::General(
+                "No active connections to: 127.0.0.1:9042".to_string(),
+            )),
             server(ErrorType::IsBootstrapping),
             server(ErrorType::Invalid),
         ] {

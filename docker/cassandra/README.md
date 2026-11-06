@@ -33,39 +33,26 @@ host cannot silently answer instead; set `CASSANDRA_HOST_PORT` to change it.
 Inside the container, and for other containers, the port is still 9042.
 
 The node advertises its container IP as `rpc_address` in `system.local`.
-`cdrs-tokio` 8.1.9, the backend's driver, never uses that address for the node
+`cdrs-tokio` 10.0.0, the backend's driver, never uses that address for the node
 it connected through: it keeps the contact point (`build_node_broadcast_rpc_address`
-in its `cluster_metadata_manager.rs`), and one node has no peers to learn. So
-`127.0.0.1:59042` works as is, and `CASSANDRA_BROADCAST_RPC_ADDRESS` is not
-needed. `tests/cassandra_tests.rs` checks that the driver addresses the node by
-its contact point.
+in its `cluster/cluster_metadata_manager.rs`), and one node has no peers to
+learn. So `127.0.0.1:59042` works as is, and `CASSANDRA_BROADCAST_RPC_ADDRESS`
+is not needed. `tests/cassandra_tests.rs` checks that the driver addresses the
+node by its contact point.
 
-**A restart of the node can leave an open `cdrs-tokio` 8.1.9 session failing
-for as long as its control connection stays up.** Queries then fail with "No
-nodes available in query plan!". Setting `CASSANDRA_BROADCAST_RPC_ADDRESS:
-127.0.0.1` does not change this.
+**A restart of the node needs no restart of Helios.** An open session fails
+while the node is down and recovers by itself once it is back. Since
+`cdrs-tokio` 9.1.0, a control-connection reconnect keeps the known node and
+marks it up (`Node::clone_with_node_info`, `cluster/topology/node.rs:376-413`
+in 10.0.0), and its pool reconnects. `cdrs-tokio` 8.1.9, used before
+2026-11-06, compared the node's gossip address with its contact point
+there, marked it `Unknown`, and left the session failing with "No nodes
+available in query plan!" until something reopened it.
 
-The driver's control connection does one of two things when it reconnects:
-
-- **Its query plan is empty** (the node is down or ignored): it rebuilds the
-  metadata from its contact points, which start `Up`, and the session works
-  again (`control_connection.rs`, `full_refresh`).
-- **The plan still holds the node:** it updates the node in place.
-  `Node::clone_with_node_info` (`topology/node.rs`) compares the node's gossip
-  address (`<listen address>:7000`) with its contact point, finds them
-  different, and marks the node `Unknown`, which drops it from every plan.
-
-With one node no peer event sets it back. So the session stays broken until
-something drops the control connection again, which takes the first path, or
-until the client opens a new session.
-
-Checked on 2026-11-06 with the Compose file on host port 59242. A `docker
-compose restart` at 8 s gave failures until the session recovered at 36 s (the
-first path). Failures came back at 40 s (the second path) and lasted to the end
-of a 180 s run, with and without the variable; the control connection stayed up
-throughout. That a later drop restores the session comes from the driver
-source, not from this run. After restarting Cassandra, restart anything that
-holds a session to it, Helios included, rather than wait for that.
+Checked on 2026-11-06 against a node of this Compose file on host port 59442
+(`crates/persistence` `backend.rs`, `restart_tests`). In 10 `docker stop` /
+`docker start` runs, health checks passed again 11 to 30 s after the start,
+then stayed healthy for 120 s each.
 
 ## Recorded configuration
 

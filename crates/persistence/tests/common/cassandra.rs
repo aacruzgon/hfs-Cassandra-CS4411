@@ -125,7 +125,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// hang the suite.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One statement through [`select`] or the schema apply. `cdrs-tokio` 8 has
+/// One statement through [`select`] or the schema apply. `cdrs-tokio` 10 has
 /// only a connect timeout, so a node that stops answering would hang a test.
 const STATEMENT_TIMEOUT: Duration = Duration::from_secs(60);
 

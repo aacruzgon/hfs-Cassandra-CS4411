@@ -10,7 +10,8 @@
 //! | --- | --- | --- |
 //! | `Unavailable`, `Overloaded`, `IsBootstrapping` | `Unavailable` | 503 |
 //! | `ReadFailure`, `WriteFailure` (replicas answered with failures) | `Unavailable` | 503 |
-//! | `ReadTimeout`, `WriteTimeout` | `Timeout` | 504 |
+//! | `CdcWriteFailure` (a CDC table's log space is full; no table here uses CDC) | `Unavailable` | 503 |
+//! | `ReadTimeout`, `WriteTimeout`, `CasWriteUnknown` | `Timeout` | 504 |
 //! | the backend's own request deadline | `Timeout` | 504 |
 //! | `Io`, `Timeout` (raised only while connecting), a closed connection, no node to send to, `Authentication`, protocol negotiation | `ConnectionFailed` | 503 |
 //! | the node refused the statement (`Syntax`, `Invalid`, `Unauthorized`, `Config`, `AlreadyExists`, `FunctionFailure`) | `QueryError` | 500 |
@@ -27,9 +28,8 @@
 //!   `LOCAL_SERIAL` read cannot decide, the design answers **504**
 //!   (`BackendError::Timeout`), where this table gives `ConnectionFailed`
 //!   (503) for the first two;
-//! - `UnexpectedErrorCode` (`CAS_WRITE_UNKNOWN`, 0x1700, which cdrs-tokio
-//!   cannot decode) is an unknown outcome too, where this table gives
-//!   `Internal` (500);
+//! - an error code the driver does not know (`ErrorType::Unknown`) is an
+//!   unknown outcome, where this table gives `Internal` (500);
 //! - a `WriteTimeout` with `write_type = SIMPLE` means the CAS applied.
 //!
 //! A `WriteTimeout` or `WriteFailure` with `write_type = CAS` that the serial
@@ -91,10 +91,14 @@ fn classify(error: &DriverError, operation: &str) -> BackendError {
             ErrorType::Unavailable(_) | ErrorType::Overloaded | ErrorType::IsBootstrapping => {
                 unavailable()
             }
-            ErrorType::ReadFailure(_) | ErrorType::WriteFailure(_) => unavailable(),
-            ErrorType::ReadTimeout(_) | ErrorType::WriteTimeout(_) => {
-                timeout(format!("{operation}: {}", body.message))
+            ErrorType::ReadFailure(_) | ErrorType::WriteFailure(_) | ErrorType::CdcWriteFailure => {
+                unavailable()
             }
+            // `CasWriteUnknown` reaches this table only for a statement that
+            // is not a CAS, which no node sends; it is a timeout like the rest.
+            ErrorType::ReadTimeout(_)
+            | ErrorType::WriteTimeout(_)
+            | ErrorType::CasWriteUnknown(_) => timeout(format!("{operation}: {}", body.message)),
             ErrorType::Authentication => connection_failed(),
             ErrorType::Syntax
             | ErrorType::Invalid
@@ -105,25 +109,30 @@ fn classify(error: &DriverError, operation: &str) -> BackendError {
                 message: format!("{operation}: {}", body.message),
             },
             // `Server`, `Protocol`, `Truncate`, `Unprepared` (the driver
-            // already re-prepared once), and any code a later protocol adds.
+            // already re-prepared once), `Unknown` (a code the driver cannot
+            // name), and any variant a later driver adds (`ErrorType` is
+            // `#[non_exhaustive]`).
             _ => internal(format!("{operation}: {}", body.message)),
         },
         CdrsError::Io(_) | CdrsError::Timeout(_) | CdrsError::InvalidProtocol(_) => {
             connection_failed()
         }
         CdrsError::General(message) if is_connection_message(message) => connection_failed(),
+        // Decoding errors, and any variant a later driver adds (`Error` is
+        // `#[non_exhaustive]`).
         other => internal(format!("{operation}: {other}")),
     }
 }
 
-/// `General` messages the driver raises when no connection could carry the
-/// request: `transport.rs` ("Connection closed when writing data!",
-/// "Connection closed while waiting for response!"), the session ("No nodes
-/// available in query plan!"), the connection pool ("No active connections
-/// to: …", `cluster/connection_pool.rs:518-523`, while a node is still marked
-/// up), the write channel ("Write channel failure!", `transport.rs:528`), and
-/// session construction ("Session control connection died before completing
-/// initialization").
+/// `General` messages `cdrs-tokio` 10.0.0 raises when no connection could
+/// carry the request: `transport.rs` ("Connection closed when writing data!",
+/// "Connection closed while waiting for response!", `:487`, `:491`), the
+/// session ("No nodes available in query plan!", `cluster/session.rs:892`,
+/// `:906`, only for an empty plan), the connection pool ("No active
+/// connections to: …", `cluster/connection_pool.rs:711-716`, while a node is
+/// still marked up), the write channel ("Write channel failure!",
+/// `transport.rs:684`, `:769`), and session construction ("Session control
+/// connection died before completing initialization", `cluster/session.rs:1167`).
 fn is_connection_message(message: &str) -> bool {
     message.contains("Connection closed")
         || message.contains("No nodes available")
@@ -184,43 +193,43 @@ fn internal(message: String) -> BackendError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::frame::Version;
     use cdrs_tokio::frame::message_error::{
-        ErrorBody, FailureInfo, UnavailableError, WriteFailureError, WriteTimeoutError, WriteType,
+        CasWriteUnknownError, ErrorBody, FailureInfo, UnavailableError, WriteFailureError,
+        WriteTimeoutError, WriteType,
     };
+    use std::io::Cursor;
     use std::net::SocketAddr;
     use std::time::Duration;
 
     fn server(ty: ErrorType) -> DriverError {
         DriverError::from(CdrsError::Server {
-            body: ErrorBody {
-                message: "node said no".to_string(),
-                ty,
-            },
+            body: ErrorBody::new("node said no", ty),
             addr: "192.168.147.2:9042".parse::<SocketAddr>().unwrap(),
         })
     }
 
     fn write_timeout(write_type: WriteType) -> ErrorType {
-        ErrorType::WriteTimeout(WriteTimeoutError {
-            cl: Consistency::LocalQuorum,
-            received: 0,
-            block_for: 1,
-            contentions: None,
+        ErrorType::WriteTimeout(WriteTimeoutError::new(
+            Consistency::LocalQuorum,
+            0,
+            1,
             write_type,
-        })
+            None,
+        ))
     }
 
     fn write_failure(write_type: WriteType) -> ErrorType {
-        ErrorType::WriteFailure(WriteFailureError {
-            cl: Consistency::LocalQuorum,
-            received: 0,
-            block_for: 1,
-            failure_info: FailureInfo::NumFailures(1),
+        ErrorType::WriteFailure(WriteFailureError::new(
+            Consistency::LocalQuorum,
+            0,
+            1,
+            FailureInfo::NumFailures(1),
             write_type,
-        })
+        ))
     }
 
     fn status_family(error: &BackendError) -> &'static str {
@@ -236,15 +245,13 @@ mod tests {
 
     #[test]
     fn unavailable_and_replica_failures_are_503() {
-        let unavailable = ErrorType::Unavailable(UnavailableError {
-            cl: Consistency::LocalQuorum,
-            required: 2,
-            alive: 1,
-        });
+        let unavailable =
+            ErrorType::Unavailable(UnavailableError::new(Consistency::LocalQuorum, 2, 1));
         for ty in [
             unavailable,
             ErrorType::Overloaded,
             ErrorType::IsBootstrapping,
+            ErrorType::CdcWriteFailure,
             write_failure(WriteType::Simple),
             write_failure(WriteType::Cas),
         ] {
@@ -262,6 +269,11 @@ mod tests {
             server(write_timeout(WriteType::Simple)),
             server(write_timeout(WriteType::Cas)),
             server(write_timeout(WriteType::Batch)),
+            server(ErrorType::CasWriteUnknown(CasWriteUnknownError::new(
+                Consistency::LocalSerial,
+                0,
+                1,
+            ))),
             DriverError::Deadline {
                 after: Duration::from_millis(10_000),
                 sent: true,
@@ -298,11 +310,42 @@ mod tests {
         }
     }
 
+    /// An error code the driver does not recognize, decoded the way the driver
+    /// decodes an ERROR body: `0x2600` is not in the v5 table, so
+    /// `from_cursor_with_code` keeps it as `Unknown` with its trailing bytes.
+    pub(in crate::backends::cassandra) fn undecoded_error_type() -> ErrorType {
+        let trailing: &[u8] = &[1, 2, 3];
+        let ty = ErrorType::from_cursor_with_code(&mut Cursor::new(trailing), 0x2600, Version::V5)
+            .unwrap();
+        assert_eq!(
+            ty,
+            ErrorType::Unknown {
+                code: 0x2600,
+                body: vec![1, 2, 3],
+            }
+        );
+        ty
+    }
+
     #[test]
-    fn refused_statements_are_500() {
-        for ty in [ErrorType::Syntax, ErrorType::Invalid, ErrorType::Server] {
+    fn refused_statements_are_query_errors() {
+        for ty in [ErrorType::Syntax, ErrorType::Invalid] {
             let mapped = map_driver_error(&server(ty.clone()), "test");
-            assert_eq!(status_family(&mapped), "500", "{ty:?} -> {mapped:?}");
+            assert!(
+                matches!(mapped, BackendError::QueryError { .. }),
+                "{ty:?} -> {mapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_and_unrecognized_errors_are_internal() {
+        for ty in [ErrorType::Server, undecoded_error_type()] {
+            let mapped = map_driver_error(&server(ty.clone()), "test");
+            assert!(
+                matches!(mapped, BackendError::Internal { .. }),
+                "{ty:?} -> {mapped:?}"
+            );
         }
     }
 

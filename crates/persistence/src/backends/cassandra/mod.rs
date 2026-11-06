@@ -1,7 +1,7 @@
 //! Apache Cassandra backend (`cassandra` feature).
 //!
 //! A standalone primary over the ten tables of
-//! `docs/Cassandra/schema/schema.cql`, through the `cdrs-tokio` 8 driver. The
+//! `docs/Cassandra/schema/schema.cql`, through the `cdrs-tokio` 10 driver. The
 //! design is `docs/Cassandra/cassandra-discussion.md`; the order the work
 //! lands in is `docs/Cassandra/development-roadmap.md`.
 //!

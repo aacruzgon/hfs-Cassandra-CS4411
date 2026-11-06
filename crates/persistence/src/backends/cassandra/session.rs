@@ -11,16 +11,20 @@
 //! | [`Write`](StatementKind::Write) | `LOCAL_QUORUM` | unset | yes | default |
 //! | [`Cas`](StatementKind::Cas) | `LOCAL_QUORUM` (commit) | `LOCAL_SERIAL` (Paxos) | **no** | **none** |
 //!
-//! `cdrs-tokio` 8 defaults to `ONE` and leaves serial consistency unset, so
+//! `cdrs-tokio` 10 defaults to `ONE` and leaves serial consistency unset, so
 //! nothing here relies on a driver default.
 //!
 //! **A compare-and-swap is never re-sent by the driver** (ADR-aacruzgon-0024).
 //! It is marked non-idempotent, which keeps it out of speculative execution
-//! (`cluster/session.rs:666-668`) and out of the default retry session's
-//! re-sends after `Io`, `General`, `Overloaded`, `Server` and `Truncate`
-//! (`retry/retry_policy.rs:72-104`). That session still re-sends any
-//! statement once after `Unavailable` (`retry_policy.rs:104-118`), so a CAS
-//! also carries [`FallthroughRetryPolicy`], which never retries. Whether a CAS
+//! (`cdrs-tokio` 10.0.0, `cluster/session.rs:832-833`) and out of the default
+//! retry session's re-sends after `Io`, `General`, `Overloaded`, `Server` and
+//! `Truncate` (`retry/retry_policy.rs:92-123`). That session still re-sends
+//! any statement once after `Unavailable` (`:124-138`), once more on the same
+//! node after a `ReadTimeout` that retrieved no data (`:139-156`), and after
+//! `IsBootstrapping` (`:175-182`), whatever its idempotence, so a CAS also
+//! carries [`FallthroughRetryPolicy`], which never retries (`:52-69`). The
+//! other three kinds keep the default session: each of those re-sends is safe
+//! for a read, and for a write with a fixed `USING TIMESTAMP`. Whether a CAS
 //! whose outcome is unknown ran is decided by the caller, from a
 //! [`SerialRead`](StatementKind::SerialRead), never by the driver.
 //!
@@ -34,13 +38,15 @@
 //! life of the driver session. The driver re-prepares one transparently when
 //! a node answers `Unprepared`, which means that node did not execute it.
 //!
-//! **Rebuilt sessions.** `cdrs-tokio` 8.1.9 can lose a single-node cluster
-//! for good after a control-connection reconnect, a Cassandra restart
-//! included. [`CassandraSession`] then opens a new driver session, with an
-//! empty prepared cache, and sends an idempotent statement once more on it;
-//! a CAS is never sent again. See [`CassandraSession`] for the rules.
+//! **After a restart** the driver recovers the session by itself: since
+//! `cdrs-tokio` 9.1.0 a control-connection reconnect keeps a known node, and
+//! promotes it to up if it was down (10.0.0, `cluster/topology/node.rs:376-413`),
+//! and its pool reconnects as soon as it is marked up. 8.1.9 lost a single node
+//! for good there, which an earlier version of this module worked around by
+//! rebuilding the session. `backend.rs`, `restart_tests`, checks the recovery
+//! against a node of its own.
 //!
-//! **Deadlines.** `cdrs-tokio` 8 has no per-request timeout, so every
+//! **Deadlines.** `cdrs-tokio` 10 has no per-request timeout, so every
 //! statement runs under the configured request deadline. When it elapses the
 //! caller gets [`DriverError::Deadline`]; for a CAS that is an unknown outcome
 //! (design, "When the LWT outcome is unknown").
@@ -66,27 +72,23 @@ use cdrs_tokio::transport::TransportTcp;
 use cdrs_tokio::types::CBytes;
 use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
-use parking_lot::{Mutex, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::watch;
+use parking_lot::RwLock;
 
 use super::config::CassandraConfig;
 
 /// The native protocol version the session speaks. Cassandra 5.0 serves v5
-/// as a stable (non-beta) version, and `cdrs-tokio` 8 speaks v3 to v5.
+/// as a stable (non-beta) version, and `cdrs-tokio` 10 speaks v3 to v5.
 pub(crate) const PROTOCOL_VERSION: Version = Version::V5;
 
 /// Rows per page of a [`CassandraSession::rows_paged`] read. Without a page
 /// size the node returns the whole result in one message (native protocol v5,
 /// section 7, "Result paging"); 5000 is the DataStax Java driver's default.
 ///
-/// **`cdrs-tokio` 8.1.9 loses a response that spans protocol v5 frames**
-/// (over 128 KiB): `cassandra-protocol` 3.3.0 gates a multi-frame envelope on
-/// its body length without the 9-byte header and never resets that length
-/// (`frame/frame_decoder.rs:271` and `:277`), so the request runs into its
-/// deadline and the connection is left broken. A 5000-row page of
-/// `resources_by_type`'s partition keys is that large. Fixed upstream in
-/// 9.0.2 (krojew/cdrs-tokio `31d69ea89`); layer L8 moves to 10.0.0.
+/// A 5000-row page of `resources_by_type`'s partition keys spans several
+/// protocol v5 frames (over 128 KiB). `cdrs-tokio` 8.1.9 lost such a
+/// response (`cassandra-protocol` 3.3.0, `frame/frame_decoder.rs:271` and
+/// `:277`); 9.0.2 fixed it (krojew/cdrs-tokio `31d69ea89`), and this module
+/// is on 10.0.0.
 pub(crate) const PAGE_SIZE: i32 = 5000;
 
 /// One page request: its size, and the node's paging state from the page
@@ -168,12 +170,14 @@ pub(crate) enum DriverError {
 /// never puts it in a query plan (`cluster/topology/node.rs`, `is_ignored`).
 ///
 /// The driver's own `TopologyAwareNodeDistanceEvaluator` marks other-DC nodes
-/// `Remote`, and `TopologyAwareLoadBalancingStrategy` keeps remote **replicas**
-/// in every plan, after the local ones, whatever its failover flag says
-/// (`load_balancing/topology_aware.rs:190-235`). A retry or a plan whose local
-/// replicas are down would then reach a coordinator in another DC, which
-/// would run `LOCAL_QUORUM` and `LOCAL_SERIAL` in its own DC and break the
-/// single-DC linearizability the design relies on (`cassandra-discussion.md`,
+/// `Remote`. Since `cdrs-tokio` 9.1.0, `TopologyAwareLoadBalancingStrategy`
+/// leaves remote nodes out of a plan for a dc-local consistency on a
+/// `NetworkTopologyStrategy` keyspace (10.0.0,
+/// `load_balancing/topology_aware.rs:264-272`), but not for a
+/// `SimpleStrategy` keyspace, whose plan ends with every unignored node, local
+/// or remote (`:292-330`). A plan whose local nodes are down would then reach
+/// a coordinator in another DC, which would run `LOCAL_QUORUM` and
+/// `LOCAL_SERIAL` in its own DC and break the single-DC linearizability the design relies on (`cassandra-discussion.md`,
 /// data model: "`LOCAL_SERIAL` is linearizable only within one data centre").
 #[derive(Debug, Clone)]
 pub(crate) struct LocalDcOnly {
@@ -200,165 +204,28 @@ impl From<cdrs_tokio::error::Error> for DriverError {
     }
 }
 
-/// The message `cdrs-tokio` 8.1.9 returns when a statement's query plan holds
-/// no node (`cluster/session.rs:723` and `:738`). The driver has no error
-/// variant of its own for it: it is an [`Error::General`] with this text, so
-/// [`is_no_node_in_plan`] matches both.
+/// The message `cdrs-tokio` 10.0.0 returns when a statement's query plan
+/// holds no node (`cluster/session.rs:892`, `:906`); when every node in the
+/// plan failed, it returns the last node's error instead (since 9.1.0). The
+/// driver has no error variant of its own for it: it is an
+/// [`Error::General`] with this text.
 ///
 /// [`Error::General`]: cdrs_tokio::error::Error::General
 pub(crate) const NO_NODE_IN_PLAN: &str = "No nodes available in query plan!";
 
-/// The first wait after a failed rebuild; it doubles per failure, up to
-/// [`REBUILD_BACKOFF_MAX`].
-const REBUILD_BACKOFF_MIN: Duration = Duration::from_millis(250);
-
-/// The longest wait between two rebuild attempts while the cluster stays
-/// unreachable.
-const REBUILD_BACKOFF_MAX: Duration = Duration::from_secs(5);
-
-/// Whether `error` is the driver's empty-query-plan error. Matches the
-/// variant and the exact text (see [`NO_NODE_IN_PLAN`]).
-pub(crate) fn is_no_node_in_plan(error: &cdrs_tokio::error::Error) -> bool {
-    matches!(error, cdrs_tokio::error::Error::General(message) if message == NO_NODE_IN_PLAN)
-}
-
-/// The wait after `failures` consecutive failed rebuilds.
-fn rebuild_backoff(failures: u32) -> Duration {
-    let doublings = failures.saturating_sub(1).min(16);
-    REBUILD_BACKOFF_MIN
-        .saturating_mul(1 << doublings)
-        .min(REBUILD_BACKOFF_MAX)
-}
-
-/// One open driver session and the statements prepared on it.
-///
-/// The prepared cache belongs to the session it was filled on, so a rebuilt
-/// session starts with an empty cache and prepares every statement again on
-/// first use.
-struct Connected {
-    session: CdrsSession,
-    prepared: RwLock<HashMap<String, Arc<PreparedQuery>>>,
-    /// 0 for the session [`CassandraSession::connect`] opened, then one more
-    /// per rebuild.
-    generation: u64,
-}
-
-impl Connected {
-    /// Whether the driver's metadata still holds a node it would put in a
-    /// query plan: one with a distance (`LocalDcOnly`: the local DC) whose
-    /// state is `Up` (`cluster/topology/node.rs`, `is_ignored`).
-    fn has_usable_node(&self) -> bool {
-        self.session
-            .cluster_metadata()
-            .nodes()
-            .values()
-            .any(|node| !node.is_ignored())
-    }
-}
-
-/// Rebuild bookkeeping, under [`Holder::state`].
-#[derive(Debug, Default)]
-struct RebuildState {
-    /// Rebuilds started since the last one that succeeded.
-    failures: u32,
-    /// No new rebuild starts before this.
-    not_before: Option<Instant>,
-    /// The rebuild in progress: callers wait on it instead of starting
-    /// another. Its task sends `true` when it has finished.
-    pending: Option<Pending>,
-}
-
-/// A rebuild in progress.
-#[derive(Debug)]
-struct Pending {
-    finished: watch::Receiver<bool>,
-    started: Instant,
-    /// Whether the warning for a rebuild that outlived the connect timeout
-    /// has been logged.
-    warned: bool,
-}
-
-/// What [`CassandraSession`] shares with its rebuild task.
-struct Holder {
-    /// Kept to open the replacement session. The password stays here and is
-    /// never logged (`CassandraConfig`'s `Debug` redacts it).
-    config: CassandraConfig,
-    current: RwLock<Arc<Connected>>,
-    /// Taken before `current` when both are needed.
-    state: Mutex<RebuildState>,
-    /// Rebuilds started, successful or not.
-    rebuild_attempts: AtomicU64,
-}
-
-impl Holder {
-    fn current(&self) -> Arc<Connected> {
-        self.current.read().clone()
-    }
-}
-
-/// The backend's session holder: the open driver session, its
-/// prepared-statement cache, and the rebuild that works around `cdrs-tokio`
-/// 8.1.9 losing a single-node cluster.
-///
-/// **Why it rebuilds.** After a control-connection reconnect whose query plan
-/// still holds the node, `cdrs-tokio` 8.1.9 refreshes each known node with
-/// `clone_with_node_info` (`cluster/topology/node.rs:279-290`, called from
-/// `metadata_builder.rs:81`). That compares the node's stored
-/// `broadcast_address`, the gossip address (`<ip>:7000`), with the fresh
-/// `broadcast_rpc_address`, the CQL address (`<ip>:9042`). The two never
-/// match, so the node is set `Unknown` with no distance. Such a node is
-/// ignored, every statement fails with [`NO_NODE_IN_PLAN`], and with one node
-/// no peer event marks it up again. A Cassandra restart is enough to cause it
-/// (`docker/cassandra/README.md`).
-///
-/// **What it does.** When a statement fails with [`NO_NODE_IN_PLAN`] and the
-/// session's metadata holds no usable node, the holder opens a new session
-/// from the same configuration and swaps it in. The statement is then sent
-/// once more on the new session **only if it is idempotent**. A
-/// compare-and-swap returns its error, and the caller's unknown-outcome rules
-/// decide what follows (ADR-aacruzgon-0024). For a CAS the error means it was
-/// sent to no node: it carries `FallthroughRetryPolicy`, so the driver never
-/// moves on after sending it (`send_envelope.rs`). For an idempotent statement
-/// under `DefaultRetryPolicy` the same text can also follow a retry that ran
-/// out of nodes after the statement was sent; the node is then still usable,
-/// so no rebuild starts, and a re-send would be safe anyway. `health_check`
-/// runs through the same path, so a probe both sees the broken session and
-/// repairs it.
-///
-/// **One rebuild at a time, in a task of its own.** The rebuild runs in a
-/// spawned task that callers wait on, never in a caller's future. The
-/// driver's session builder spawns its control-connection task before it
-/// waits for the cluster (`cluster/session.rs:826`), so a cancelled build
-/// would leave that task running for good; the rebuild task is never
-/// cancelled, and at most one is pending. Before building, it checks that a
-/// contact point accepts a TCP connection, so a node that is down fails the
-/// rebuild at once. A build whose contact point accepts TCP but whose session
-/// does not start (the keyspace dropped, credentials rotated, TLS required, a
-/// node still booting) stays pending until that clears, retried by the
-/// driver with a backoff of up to 60 s; once it has outlived the connect
-/// timeout, callers get their own error back at once instead of waiting, and
-/// one warning is logged. A panic in the task clears the pending rebuild
-/// through a drop guard. After a failed rebuild, or one whose new session has no
-/// usable node, no new one starts for a backoff of 250 ms, doubling per
-/// failure up to 5 s; callers in that window get their own error back at
-/// once, so a node that is down is not hammered. A caller waits for a pending
-/// rebuild only as long as its request deadline allows.
+/// The backend's driver session and the statements prepared on it.
 pub(crate) struct CassandraSession {
-    holder: Arc<Holder>,
+    session: CdrsSession,
+    /// Prepared statements by CQL text, for the life of the session.
+    prepared: RwLock<HashMap<String, Arc<PreparedQuery>>>,
     request_timeout: Duration,
     no_retry: Arc<dyn RetryPolicy + Send + Sync>,
 }
 
 impl std::fmt::Debug for CassandraSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let current = self.holder.current();
         f.debug_struct("CassandraSession")
-            .field("generation", &current.generation)
-            .field(
-                "rebuild_attempts",
-                &self.holder.rebuild_attempts.load(Ordering::Relaxed),
-            )
-            .field("prepared_statements", &current.prepared.read().len())
+            .field("prepared_statements", &self.prepared.read().len())
             .field("request_timeout", &self.request_timeout)
             .finish_non_exhaustive()
     }
@@ -370,129 +237,57 @@ impl CassandraSession {
     /// `config.keyspace` as the session keyspace, all within
     /// `config.connect_timeout_ms`.
     ///
-    /// A contact point that refuses TCP fails here before the driver starts
-    /// anything. When a contact point accepts TCP but the session does not
-    /// come up in time (a missing keyspace, rejected credentials, a node
-    /// still starting), the build is cut off by the deadline and the driver's
-    /// control-connection task outlives the failed call, retrying in the
-    /// background (see the type docs): one task per failed `connect`.
+    /// The driver fails the build by itself when no contact point connects
+    /// (`cdrs-tokio` 10.0.0, `cluster/control_connection.rs:170-176`), but when
+    /// one connects and the metadata refresh fails (a node still starting) it
+    /// retries for good (`:166-169`); the deadline bounds that. Cutting the
+    /// build off is safe: the driver aborts its control-connection task when
+    /// the build future is dropped (`cluster/session.rs:996-1006`).
     pub(crate) async fn connect(config: &CassandraConfig) -> Result<Self, DriverError> {
         let deadline = Duration::from_millis(config.connect_timeout_ms);
-        let started = Instant::now();
-        probe_contact_points(config, deadline).await?;
-        let builder = session_builder(config, deadline.saturating_sub(started.elapsed())).await?;
-        let remaining = deadline.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err(DriverError::Deadline {
-                after: deadline,
-                sent: false,
-            });
-        }
-        let session = within(remaining, false, builder.build())
-            .await?
-            .map_err(build_error)?;
+        let session = within(deadline, false, async {
+            session_builder(config)
+                .await?
+                .build()
+                .await
+                .map_err(build_error)
+        })
+        .await??;
         Ok(Self {
-            holder: Arc::new(Holder {
-                config: config.clone(),
-                current: RwLock::new(Arc::new(Connected {
-                    session,
-                    prepared: RwLock::new(HashMap::new()),
-                    generation: 0,
-                })),
-                state: Mutex::new(RebuildState::default()),
-                rebuild_attempts: AtomicU64::new(0),
-            }),
+            session,
+            prepared: RwLock::new(HashMap::new()),
             request_timeout: Duration::from_millis(config.request_timeout_ms),
             no_retry: Arc::new(FallthroughRetryPolicy),
         })
     }
 
-    /// The data centres, each once, of nodes the session could send to that
-    /// are not `local_dc`. The driver gives every contact point a `Local` distance
-    /// and keeps it after the first refresh (`cluster/session.rs:784-786`,
-    /// `topology/node.rs:330`), without asking [`LocalDcOnly`], so a contact
-    /// point in another DC would coordinate requests.
-    pub(crate) fn usable_nodes_outside(&self, local_dc: &str) -> Vec<String> {
-        let datacenters: std::collections::BTreeSet<String> = self
-            .holder
-            .current()
-            .session
-            .cluster_metadata()
-            .nodes()
-            .values()
-            // A distance, whatever the node's state now: a remote contact
-            // point that is down would coordinate requests once it is up.
-            .filter(|node| node.distance().is_some() && node.datacenter() != local_dc)
-            .map(|node| node.datacenter().to_string())
-            .collect();
-        datacenters.into_iter().collect()
-    }
-
-    /// The session in use now.
-    fn current(&self) -> Arc<Connected> {
-        self.holder.current()
-    }
-
-    /// How many sessions have replaced the first one.
-    #[cfg(test)]
-    pub(crate) fn generation(&self) -> u64 {
-        self.current().generation
-    }
-
-    /// How many rebuilds have started, successful or not.
-    #[cfg(test)]
-    pub(crate) fn rebuild_attempts(&self) -> u64 {
-        self.holder.rebuild_attempts.load(Ordering::Relaxed)
-    }
-
-    /// How many statements are prepared on the session in use now.
+    /// How many statements are prepared on the session.
     #[cfg(test)]
     pub(crate) fn prepared_count(&self) -> usize {
-        self.current().prepared.read().len()
+        self.prepared.read().len()
     }
 
-    /// The prepared form of `cql` on `connected`, preparing it on first use
-    /// within `deadline`.
+    /// The prepared form of `cql`, preparing it on first use within
+    /// `deadline`.
     async fn prepared(
-        connected: &Connected,
+        &self,
         cql: &str,
         deadline: Duration,
     ) -> Result<Arc<PreparedQuery>, DriverError> {
-        if let Some(prepared) = connected.prepared.read().get(cql) {
+        if let Some(prepared) = self.prepared.read().get(cql) {
             return Ok(prepared.clone());
         }
         // Two callers may prepare the same text at once; both get the same
         // statement id from the node, and the last insert wins.
-        let prepared = Arc::new(within(deadline, false, connected.session.prepare(cql)).await??);
-        connected
-            .prepared
+        let prepared = Arc::new(within(deadline, false, self.session.prepare(cql)).await??);
+        self.prepared
             .write()
             .insert(cql.to_string(), prepared.clone());
         Ok(prepared)
     }
 
-    /// Prepares (or reuses) `cql` on `connected` and executes it, all within
-    /// `deadline`.
-    async fn execute_on(
-        connected: &Connected,
-        cql: &str,
-        params: &StatementParams,
-        deadline: Duration,
-    ) -> Result<Envelope, DriverError> {
-        let started = Instant::now();
-        let prepared = Self::prepared(connected, cql, deadline).await?;
-        let remaining = deadline.saturating_sub(started.elapsed());
-        Ok(within(
-            remaining,
-            true,
-            connected.session.exec_with_params(&prepared, params),
-        )
-        .await??)
-    }
-
     /// Executes `cql` (prepared and cached) with positional `values`. The
-    /// request deadline covers the prepare, on first use, the execute, and a
-    /// rebuild and its one retry (see the type docs).
+    /// request deadline covers the prepare, on first use, and the execute.
     pub(crate) async fn execute(
         &self,
         cql: &str,
@@ -511,83 +306,19 @@ impl CassandraSession {
         paging: Option<Paging>,
     ) -> Result<Envelope, DriverError> {
         let started = Instant::now();
+        let prepared = self.prepared(cql, self.request_timeout).await?;
         let mut params = statement_params(kind, values, &self.no_retry);
         if let Some(paging) = paging {
             params.query_params.page_size = Some(paging.page_size);
             params.query_params.paging_state = paging.state;
         }
-        let connected = self.current();
-        let result = Self::execute_on(&connected, cql, &params, self.request_timeout).await;
-        let Err(DriverError::Driver(error)) = &result else {
-            return result;
-        };
-        if !is_no_node_in_plan(error) || connected.has_usable_node() {
-            return result;
-        }
         let remaining = self.request_timeout.saturating_sub(started.elapsed());
-        let Some(fresh) = self.recover(&connected, remaining).await else {
-            return result;
-        };
-        let remaining = self.request_timeout.saturating_sub(started.elapsed());
-        if !kind.is_idempotent() || remaining.is_zero() {
-            return result;
-        }
-        Self::execute_on(&fresh, cql, &params, remaining).await
-    }
-
-    /// Replaces `broken` with a new session, or returns the one a rebuild
-    /// already put in its place. `None` when no new session could be had
-    /// within `budget`: the rebuild failed or is still running, or a recent
-    /// failure's backoff has not passed.
-    async fn recover(&self, broken: &Connected, budget: Duration) -> Option<Arc<Connected>> {
-        let mut finished = {
-            let mut state = self.holder.state.lock();
-            let current = self.holder.current();
-            if current.generation != broken.generation {
-                return Some(current);
-            }
-            let stuck_after = Duration::from_millis(self.holder.config.connect_timeout_ms);
-            match &mut state.pending {
-                // A build that outlives the connect timeout is waiting on
-                // something that may not clear soon (see the type docs):
-                // answer at once instead of holding every request for its
-                // whole deadline.
-                Some(pending) if pending.started.elapsed() > stuck_after => {
-                    if !pending.warned {
-                        pending.warned = true;
-                        tracing::warn!(
-                            pending_ms = pending.started.elapsed().as_millis() as u64,
-                            "cassandra: the new session is still not open; a contact point \
-                             accepts TCP, but the session does not start (keyspace, \
-                             credentials, TLS, or a node still starting)"
-                        );
-                    }
-                    return None;
-                }
-                Some(pending) => pending.finished.clone(),
-                None => {
-                    if state.not_before.is_some_and(|at| Instant::now() < at) {
-                        return None;
-                    }
-                    state.failures = state.failures.saturating_add(1);
-                    let (done, pending) = watch::channel(false);
-                    state.pending = Some(Pending {
-                        finished: pending.clone(),
-                        started: Instant::now(),
-                        warned: false,
-                    });
-                    self.holder.rebuild_attempts.fetch_add(1, Ordering::Relaxed);
-                    tokio::spawn(rebuild(self.holder.clone(), broken.generation + 1, done));
-                    pending
-                }
-            }
-        };
-        // An error here means the task ended without sending (it panicked,
-        // and its guard cleared `pending`); either way, the current session
-        // decides.
-        let _ = tokio::time::timeout(budget, finished.wait_for(|done| *done)).await;
-        let current = self.holder.current();
-        (current.generation > broken.generation).then_some(current)
+        Ok(within(
+            remaining,
+            true,
+            self.session.exec_with_params(&prepared, &params),
+        )
+        .await??)
     }
 
     /// Executes `cql` and returns its rows (empty for a statement without a
@@ -608,14 +339,14 @@ impl CassandraSession {
     ///
     /// [`Self::rows`] sets no page size, so the node builds the whole result
     /// in one message. That is right for a single partition of known size,
-    /// not for a range scan. `cdrs-tokio` 8.1.9's own pager
-    /// (`cluster/pager.rs:199-223`, `ExecPager::next`) builds its parameters
-    /// from `StatementParamsBuilder::new()`, which drops the consistency this
-    /// module sets, so each page goes through [`Self::execute`]'s path
-    /// instead, with the kind's consistency and deadline. A page whose
-    /// metadata carries a paging state has more after it
-    /// (`cassandra-protocol` 3.3.0, `frame/message_result.rs:355-359`: the
-    /// state is read only when `HAS_MORE_PAGES` is set).
+    /// not for a range scan. Each page goes through [`Self::execute`]'s path,
+    /// with the kind's consistency and its own deadline, rather than the
+    /// driver's pager: `cdrs-tokio` 8.1.9's pager dropped the consistency
+    /// (`cluster/pager.rs:199-223`); 9.1.0's carries the statement parameters
+    /// across pages, but it would put the whole scan under no deadline of
+    /// ours. A page whose metadata carries a paging state has more after it
+    /// (`cassandra-protocol` 5.0.0, `frame/message_result.rs:404`: the state
+    /// is read only when `HAS_MORE_PAGES` is set).
     pub(crate) async fn rows_paged(
         &self,
         cql: &str,
@@ -656,131 +387,10 @@ impl CassandraSession {
     }
 }
 
-/// A failed session open, for a log line: the kind of failure, never an
-/// address or a credential.
-fn describe_open_error(error: &DriverError) -> String {
-    match error {
-        DriverError::Deadline { after, .. } => {
-            format!("no session within {} ms", after.as_millis())
-        }
-        DriverError::Driver(error) => match error.as_ref() {
-            cdrs_tokio::error::Error::Io(io) => format!("I/O error: {:?}", io.kind()),
-            cdrs_tokio::error::Error::Server { body, .. } => {
-                format!("server error {:?}", body.ty)
-            }
-            _ => "driver error".to_string(),
-        },
-    }
-}
-
-/// Opens the replacement session for `holder` and swaps it in, or records the
-/// failure and its backoff; then wakes the callers waiting on `done`. Runs in
-/// its own task and is never cancelled (see [`CassandraSession`]).
-async fn rebuild(holder: Arc<Holder>, generation: u64, done: watch::Sender<bool>) {
-    let mut guard = PendingGuard {
-        holder: holder.clone(),
-        armed: true,
-    };
-    tracing::warn!(
-        generation,
-        "cassandra: the session has no node to send to; opening a new session"
-    );
-    let outcome = match open_replacement(&holder.config).await {
-        Ok(session) => {
-            let fresh = Connected {
-                session,
-                prepared: RwLock::new(HashMap::new()),
-                generation,
-            };
-            if fresh.has_usable_node() {
-                Ok(fresh)
-            } else {
-                Err("the new session has no usable node in the local data centre".to_string())
-            }
-        }
-        Err(error) => Err(describe_open_error(&error)),
-    };
-    {
-        let mut state = holder.state.lock();
-        state.pending = None;
-        guard.armed = false;
-        match outcome {
-            Ok(fresh) => {
-                *holder.current.write() = Arc::new(fresh);
-                state.failures = 0;
-                state.not_before = None;
-                tracing::info!(generation, "cassandra: new session open");
-            }
-            Err(reason) => {
-                let backoff = rebuild_backoff(state.failures);
-                state.not_before = Some(Instant::now() + backoff);
-                tracing::warn!(
-                    failures = state.failures,
-                    retry_in_ms = backoff.as_millis() as u64,
-                    error = %reason,
-                    "cassandra: could not open a new session"
-                );
-            }
-        }
-    }
-    let _ = done.send(true);
-}
-
-/// Clears [`RebuildState::pending`] and sets the backoff if [`rebuild`] ends
-/// without doing so, which only a panic can cause; otherwise no rebuild could
-/// ever start again.
-struct PendingGuard {
-    holder: Arc<Holder>,
-    armed: bool,
-}
-
-impl Drop for PendingGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let mut state = self.holder.state.lock();
-            state.pending = None;
-            state.not_before = Some(Instant::now() + rebuild_backoff(state.failures));
-        }
-    }
-}
-
-/// The replacement session for [`rebuild`]. First checks, within
-/// `config.connect_timeout_ms`, that some contact point accepts a TCP
-/// connection, so a node that is down fails here at once. The session build
-/// itself has no deadline: cancelling it would orphan the driver's
-/// control-connection task, and it finishes once the node answers.
-async fn open_replacement(config: &CassandraConfig) -> Result<CdrsSession, DriverError> {
-    let deadline = Duration::from_millis(config.connect_timeout_ms);
-    let started = Instant::now();
-    probe_contact_points(config, deadline).await?;
-    let builder = session_builder(config, deadline.saturating_sub(started.elapsed())).await?;
-    builder.build().await.map_err(build_error)
-}
-
-/// Succeeds once some contact point accepts a TCP connection within
-/// `deadline`. Cheap, and spawns nothing, so it is safe to cancel; it runs
-/// before every session build so that a closed port fails without starting
-/// the driver's control-connection task.
-async fn probe_contact_points(
-    config: &CassandraConfig,
-    deadline: Duration,
-) -> Result<(), DriverError> {
-    let attempts: Vec<_> = config
-        .contact_points
-        .iter()
-        .map(|point| Box::pin(tokio::net::TcpStream::connect(point.as_str())))
-        .collect();
-    within(deadline, false, futures::future::select_ok(attempts))
-        .await?
-        .map(drop)
-        .map_err(|error| DriverError::from(cdrs_tokio::error::Error::Io(error)))
-}
-
 /// The driver's session builder for `config`. Resolving the contact points
-/// runs within `deadline` and spawns nothing, so it is safe to cancel.
+/// spawns nothing, so it is safe to cancel.
 async fn session_builder(
     config: &CassandraConfig,
-    deadline: Duration,
 ) -> Result<TcpSessionBuilder<LoadBalancing>, DriverError> {
     let mut node_config = NodeTcpConfigBuilder::new()
         .with_contact_points(
@@ -796,7 +406,7 @@ async fn session_builder(
             StaticPasswordAuthenticatorProvider::new(username, password),
         ));
     }
-    let node_config = within(deadline, false, node_config.build()).await??;
+    let node_config = node_config.build().await?;
 
     let pool = ConnectionPoolConfigBuilder::new()
         .with_local_size(config.pool_size)
@@ -860,30 +470,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_empty_plan_error_counts_as_no_node_in_plan() {
-        use cdrs_tokio::error::Error;
-        assert!(is_no_node_in_plan(&Error::General(
-            NO_NODE_IN_PLAN.to_string()
-        )));
-        for other in [
-            Error::General("No active connections to: 10.0.0.1:9042".to_string()),
-            Error::General("Connection closed while waiting for response!".to_string()),
-            Error::General(format!("{NO_NODE_IN_PLAN} (and more)")),
-            Error::Timeout(NO_NODE_IN_PLAN.to_string()),
-        ] {
-            assert!(!is_no_node_in_plan(&other), "{other:?}");
-        }
-    }
-
-    #[test]
-    fn rebuild_backoff_doubles_from_250_ms_up_to_5_s() {
-        let waits: Vec<u128> = (1..=8).map(|n| rebuild_backoff(n).as_millis()).collect();
-        assert_eq!(waits, [250, 500, 1000, 2000, 4000, 5000, 5000, 5000]);
-        assert_eq!(rebuild_backoff(0), REBUILD_BACKOFF_MIN);
-        assert_eq!(rebuild_backoff(u32::MAX), REBUILD_BACKOFF_MAX);
-    }
-
-    #[test]
     fn every_kind_sets_its_consistency_explicitly() {
         assert_eq!(StatementKind::Read.consistency(), Consistency::LocalQuorum);
         assert_eq!(StatementKind::Write.consistency(), Consistency::LocalQuorum);
@@ -940,14 +526,14 @@ mod tests {
     }
 
     fn node_in(datacenter: &str) -> NodeInfo {
-        NodeInfo {
-            host_id: Default::default(),
-            broadcast_rpc_address: "127.0.0.1:9042".parse().unwrap(),
-            broadcast_address: None,
-            datacenter: datacenter.to_string(),
-            tokens: Vec::new(),
-            rack: "helios-rack1".to_string(),
-        }
+        NodeInfo::new(
+            Default::default(),
+            "127.0.0.1:9042".parse().unwrap(),
+            None,
+            datacenter.to_string(),
+            Vec::new(),
+            "helios-rack1".to_string(),
+        )
     }
 
     #[test]

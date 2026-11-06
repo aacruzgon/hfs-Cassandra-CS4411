@@ -9,8 +9,8 @@
 //!   `Location`'s id is `200 OK` with the same resource, version and ETag.
 //! - **Readiness**: `/_readiness` is `200` with the node up, `503` once it is
 //!   stopped, and `200` again once it is back, after which the round trip
-//!   works again (the backend rebuilds its session when the driver loses its
-//!   only node).
+//!   works again (the `cdrs-tokio` session recovers by itself once the node
+//!   is back).
 //!
 //! # Where the node comes from
 //!

@@ -22,7 +22,7 @@ default = ["R4", "sqlite"]
 # Database backends
 sqlite = ["dep:rusqlite", "dep:r2d2", "dep:r2d2_sqlite"]
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types"]
-cassandra = ["dep:cdrs-tokio", "dep:cdrs-tokio-helpers-derive"]
+cassandra = ["dep:cdrs-tokio"]
 mongodb = ["dep:mongodb"]
 neo4j = ["dep:neo4rs"]
 elasticsearch = ["dep:elasticsearch"]
@@ -87,8 +87,7 @@ deadpool-postgres = { version = "0.14", optional = true }
 postgres-types = { version = "0.2", features = ["derive", "with-serde_json-1"], optional = true }
 
 # Cassandra backend (using cdrs-tokio - pure Rust driver)
-cdrs-tokio = { version = "8", optional = true }
-cdrs-tokio-helpers-derive = { version = "5", optional = true }
+cdrs-tokio = { version = "10.0.0", optional = true }
 
 # MongoDB backend
 mongodb = { version = "3", optional = true }

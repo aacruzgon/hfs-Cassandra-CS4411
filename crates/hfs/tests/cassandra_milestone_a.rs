@@ -17,8 +17,12 @@
 //! - The round trip uses `HFS_TEST_CASSANDRA_URL` (one `host:port`, the schema
 //!   already applied; ADR-aacruzgon-0020) when it is set, and otherwise a
 //!   container of its own.
-//! - The readiness test always uses a container of its own, because it stops
-//!   the node; it never touches the `HFS_TEST_CASSANDRA_URL` node.
+//! - The readiness test stops the node, so it uses a container of its own,
+//!   never the `HFS_TEST_CASSANDRA_URL` node, unless
+//!   `HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER` opts in: that names the container
+//!   serving the URL node, which the test checks with `docker port` and then
+//!   stops and starts. CI sets it to its Cassandra job's own node. The shared
+//!   `docker/cassandra` node (`hfs-cassandra-cassandra-1`) is refused.
 //!
 //! A container of this file's runs the image `docker/cassandra` pins, through
 //! that directory's `entrypoint.sh`, with a 512M heap and a 2 GiB limit. The
@@ -64,6 +68,16 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt, TestcontainersError
 
 /// The variable that names a running node (ADR-aacruzgon-0020, Rule 1).
 const URL_VAR: &str = "HFS_TEST_CASSANDRA_URL";
+
+/// The opt-in that lets the readiness test stop and start an existing
+/// container instead of one of its own: the name of the container that
+/// serves `URL_VAR`'s node. CI sets it to its job's own node, which no other
+/// job uses.
+const STOPPABLE_VAR: &str = "HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER";
+
+/// `docker/cassandra`'s default Compose project's container, the shared node
+/// developers and other workers use; the readiness test refuses to stop it.
+const SHARED_NODE_CONTAINER: &str = "hfs-cassandra-cassandra-1";
 
 /// `docker/cassandra/docker-compose.yml`'s image, pinned by the same digest.
 /// Change both together.
@@ -122,15 +136,22 @@ async fn milestone_a_create_then_read_through_rest() {
 #[tokio::test]
 async fn readiness_reports_down_while_cassandra_is_stopped() {
     let _lock = CONTAINER_LOCK.lock().await;
-    let Some(node) = OwnNode::start().await else {
-        // A skip must not pass for the exit criterion: a caller who named a
-        // node meant the Cassandra tests to run, and this one needs Docker.
-        assert!(
-            test_url().is_none(),
-            "{URL_VAR} is set, but Docker cannot be reached, and this test needs a node of its \
-             own to stop; it cannot run"
-        );
-        return;
+    let node = match stoppable_container() {
+        Some(name) => StoppableNode::named(name).await,
+        None => match OwnNode::start().await {
+            Some(node) => StoppableNode::Own(Box::new(node)),
+            None => {
+                // A skip must not pass for the exit criterion: a caller who
+                // named a node meant the Cassandra tests to run, and this one
+                // needs Docker (or STOPPABLE_VAR).
+                assert!(
+                    test_url().is_none(),
+                    "{URL_VAR} is set, but Docker cannot be reached, and this test needs a node \
+                     it may stop (a container of its own, or {STOPPABLE_VAR}); it cannot run"
+                );
+                return;
+            }
+        },
     };
     let mut hfs = Hfs::start(&node.contact_point(), &unique_tenant("readiness"), true);
     hfs.wait_until_serving().await;
@@ -144,12 +165,7 @@ async fn readiness_reports_down_while_cassandra_is_stopped() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["checks"]["storage"], "ok", "{body}");
 
-    // SIGTERM, then SIGKILL after 30 s: a node going away, as an operator's
-    // stop or a crash looks to the server.
-    node.container
-        .stop_with_timeout(Some(30))
-        .await
-        .expect("stop the test's Cassandra container");
+    node.stop().await;
     let stopped = Instant::now();
     let body = hfs
         .wait_for_readiness(StatusCode::SERVICE_UNAVAILABLE, DOWN_TIMEOUT)
@@ -158,10 +174,7 @@ async fn readiness_reports_down_while_cassandra_is_stopped() {
     assert_eq!(body["checks"]["storage"], "unavailable", "{body}");
     eprintln!("/_readiness down {:?} after the stop", stopped.elapsed());
 
-    node.container
-        .start()
-        .await
-        .expect("start the test's Cassandra container again");
+    node.start().await;
     let started = Instant::now();
     let body = hfs.wait_for_readiness(StatusCode::OK, UP_TIMEOUT).await;
     assert_eq!(body["checks"]["storage"], "ok", "{body}");
@@ -170,6 +183,97 @@ async fn readiness_reports_down_while_cassandra_is_stopped() {
     // The backend's session survived the outage for writes too, not only for
     // the readiness probe.
     round_trip(&hfs).await;
+}
+
+/// The node the readiness test stops and starts.
+enum StoppableNode {
+    /// A container of this test's.
+    Own(Box<OwnNode>),
+    /// The container `STOPPABLE_VAR` names, which serves `URL_VAR`'s node.
+    Named { name: String, contact_point: String },
+}
+
+impl StoppableNode {
+    /// Checks that `name` is the container publishing `URL_VAR`'s port, and
+    /// that it is not the developer's shared node, before anything stops it.
+    async fn named(name: String) -> Self {
+        assert_ne!(
+            name, SHARED_NODE_CONTAINER,
+            "{STOPPABLE_VAR} names the shared docker/cassandra node, which no test may stop"
+        );
+        let contact_point = test_url()
+            .unwrap_or_else(|| panic!("{STOPPABLE_VAR} is set, so {URL_VAR} must name its node"));
+        let published = docker(&["port", &name, &format!("{CQL_PORT}/tcp")]).await;
+        let url_port = contact_point.rsplit_once(':').map(|(_, port)| port);
+        assert!(
+            published
+                .lines()
+                .any(|line| line.rsplit_once(':').map(|(_, port)| port) == url_port),
+            "{STOPPABLE_VAR}={name} publishes {published:?}, which is not {URL_VAR}={contact_point}"
+        );
+        Self::Named {
+            name,
+            contact_point,
+        }
+    }
+
+    fn contact_point(&self) -> String {
+        match self {
+            Self::Own(node) => node.contact_point(),
+            Self::Named { contact_point, .. } => contact_point.clone(),
+        }
+    }
+
+    /// SIGTERM, then SIGKILL after 30 s: a node going away, as an operator's
+    /// stop or a crash looks to the server.
+    async fn stop(&self) {
+        match self {
+            Self::Own(node) => node
+                .container
+                .stop_with_timeout(Some(30))
+                .await
+                .expect("stop the test's Cassandra container"),
+            Self::Named { name, .. } => {
+                docker(&["stop", "--time", "30", name]).await;
+            }
+        }
+    }
+
+    async fn start(&self) {
+        match self {
+            Self::Own(node) => node
+                .container
+                .start()
+                .await
+                .expect("start the test's Cassandra container again"),
+            Self::Named { name, .. } => {
+                docker(&["start", name]).await;
+            }
+        }
+    }
+}
+
+/// Runs the `docker` CLI and returns its stdout; panics if it fails.
+async fn docker(args: &[&str]) -> String {
+    let output = tokio::process::Command::new("docker")
+        .args(args)
+        .output()
+        .await
+        .unwrap_or_else(|e| panic!("docker {args:?}: {e}"));
+    assert!(
+        output.status.success(),
+        "docker {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// `HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER`, trimmed; empty counts as unset.
+fn stoppable_container() -> Option<String> {
+    std::env::var(STOPPABLE_VAR)
+        .ok()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
 }
 
 /// `POST /Patient`, then `GET` of the id the response names.
@@ -199,8 +303,11 @@ async fn round_trip(hfs: &Hfs) {
     // which contains the new Logical Id and Version Id", that is
     // `[base]/Patient/[id]/_history/[vid]`. HFS's REST layer, shared by every
     // backend, sends `[base]/Patient/[id]` (`crates/rest/src/handlers/create.rs`),
-    // a deviation upstream owns. This pins what it sends today: when the
-    // version is added, update the expected value here.
+    // a deviation upstream owns; the same server already versions a batch
+    // entry's `response.location`. An upstream issue is drafted, not yet filed
+    // ("rest: `Location` from create (`POST [type]`) omits the version",
+    // roadmap Step 2 report L7). This pins what it sends today: when the
+    // version is added, update the expected value here and link the issue.
     assert_eq!(
         location,
         format!("{}/Patient/{id}", hfs.base),

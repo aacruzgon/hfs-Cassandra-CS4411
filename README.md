@@ -230,7 +230,7 @@ AWS_REGION=us-east-1 \
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch` |
+| `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, `s3-elasticsearch`, or `cassandra` (in development) |
 | `HFS_SERVER_PORT` | `8080` | Server port |
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
 | `HFS_BASE_URL` | `http://localhost:8080` | Public HTTP(S) base used in `Location` headers and Bundle links |

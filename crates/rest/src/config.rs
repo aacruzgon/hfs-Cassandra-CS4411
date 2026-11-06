@@ -96,6 +96,9 @@ pub enum StorageBackendMode {
     /// AWS S3 for CRUD/history + Elasticsearch for search.
     /// Requires AWS credentials and a running Elasticsearch instance.
     S3Elasticsearch,
+    /// Apache Cassandra only. Requires a running Cassandra node or cluster
+    /// with the `helios` schema already applied, and the `cassandra` feature.
+    Cassandra,
 }
 
 impl StorageBackendMode {
@@ -112,6 +115,7 @@ impl StorageBackendMode {
                 BackendKind::MongoDB
             }
             StorageBackendMode::S3 | StorageBackendMode::S3Elasticsearch => BackendKind::S3,
+            StorageBackendMode::Cassandra => BackendKind::Cassandra,
         }
     }
 }
@@ -129,6 +133,7 @@ impl fmt::Display for StorageBackendMode {
             StorageBackendMode::MongoDBElasticsearch => write!(f, "mongodb-elasticsearch"),
             StorageBackendMode::S3 => write!(f, "s3"),
             StorageBackendMode::S3Elasticsearch => write!(f, "s3-elasticsearch"),
+            StorageBackendMode::Cassandra => write!(f, "cassandra"),
         }
     }
 }
@@ -150,8 +155,9 @@ impl FromStr for StorageBackendMode {
             }
             "s3" | "objectstore" => Ok(StorageBackendMode::S3),
             "s3-elasticsearch" | "s3-es" => Ok(StorageBackendMode::S3Elasticsearch),
+            "cassandra" => Ok(StorageBackendMode::Cassandra),
             _ => Err(format!(
-                "Invalid storage backend '{}'. Valid values: sqlite, sqlite-elasticsearch, postgres, postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, s3-elasticsearch",
+                "Invalid storage backend '{}'. Valid values: sqlite, sqlite-elasticsearch, postgres, postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, s3-elasticsearch, cassandra",
                 s
             )),
         }
@@ -1338,7 +1344,8 @@ pub struct ServerConfig {
     pub everything_max_unpaged: usize,
 
     /// Storage backend mode: sqlite (default), sqlite-elasticsearch, postgres,
-    /// postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, or s3-elasticsearch.
+    /// postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, s3-elasticsearch,
+    /// or cassandra.
     #[arg(long, env = "HFS_STORAGE_BACKEND", default_value = "sqlite")]
     pub storage_backend: String,
 
@@ -2022,6 +2029,35 @@ impl ServerConfig {
         let parsed = Self::from_arg_matches_mut(&mut matches)
             .map_err(|error| error.format(&mut Self::command()))?;
         Ok((Self::finish_parsed(parsed)?, version_is_implicit))
+    }
+
+    /// Whether `sof_enabled` was set through `--sof-enabled` or
+    /// `HFS_SOF_ENABLED` rather than taken from its default, for the process's
+    /// own arguments and environment. A backend with no SQL-on-FHIR runner
+    /// turns the default off but refuses an explicit request.
+    pub fn sof_enabled_is_explicit() -> bool {
+        Self::sof_enabled_is_explicit_in(std::env::args_os())
+    }
+
+    /// [`ServerConfig::sof_enabled_is_explicit`] over an explicit argument
+    /// list, whose first item is the program name. Arguments that do not parse
+    /// count as not explicit: startup has already rejected them.
+    pub fn sof_enabled_is_explicit_in<I, T>(args: I) -> bool
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        Self::command()
+            .try_get_matches_from(args)
+            .is_ok_and(|matches| {
+                matches!(
+                    matches.value_source("sof_enabled"),
+                    Some(
+                        clap::parser::ValueSource::CommandLine
+                            | clap::parser::ValueSource::EnvVariable
+                    )
+                )
+            })
     }
 
     fn finish_parsed(mut config: Self) -> Result<Self, clap::Error> {
@@ -2911,7 +2947,34 @@ mod tests {
             "S3-ES".parse::<StorageBackendMode>().unwrap(),
             StorageBackendMode::S3Elasticsearch
         );
+        assert_eq!(
+            "cassandra".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::Cassandra
+        );
+        assert_eq!(
+            "CASSANDRA".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::Cassandra
+        );
         assert!("invalid".parse::<StorageBackendMode>().is_err());
+        assert!(
+            "invalid"
+                .parse::<StorageBackendMode>()
+                .unwrap_err()
+                .contains("cassandra")
+        );
+    }
+
+    #[test]
+    fn sof_enabled_explicit_only_when_given() {
+        assert!(ServerConfig::sof_enabled_is_explicit_in([
+            "hfs",
+            "--sof-enabled"
+        ]));
+        // The environment can set it too; only assert the default case when
+        // the test process does not.
+        if std::env::var_os("HFS_SOF_ENABLED").is_none() {
+            assert!(!ServerConfig::sof_enabled_is_explicit_in(["hfs"]));
+        }
     }
 
     #[test]
@@ -2936,6 +2999,7 @@ mod tests {
             StorageBackendMode::S3Elasticsearch.to_string(),
             "s3-elasticsearch"
         );
+        assert_eq!(StorageBackendMode::Cassandra.to_string(), "cassandra");
     }
 
     #[test]
@@ -2971,6 +3035,10 @@ mod tests {
         assert_eq!(
             StorageBackendMode::S3Elasticsearch.primary_backend_kind(),
             BackendKind::S3
+        );
+        assert_eq!(
+            StorageBackendMode::Cassandra.primary_backend_kind(),
+            BackendKind::Cassandra
         );
     }
 
@@ -3987,6 +4055,7 @@ mod tests {
             ),
             (StorageBackendMode::S3, "s3"),
             (StorageBackendMode::S3Elasticsearch, "s3-elasticsearch"),
+            (StorageBackendMode::Cassandra, "cassandra"),
         ] {
             assert_eq!(variant.to_string(), expected);
             assert_eq!(expected.parse::<StorageBackendMode>().unwrap(), variant);

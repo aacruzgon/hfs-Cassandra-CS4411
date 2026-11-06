@@ -250,6 +250,7 @@ backend applies the discriminator in its own idiom:
 | **MongoDB**       | `tenant_id` field on every document                                       |
 | **Elasticsearch** | Per-tenant index (`{prefix}_{tenant}_{type}`) **and** a `tenant_id` filter |
 | **S3**            | Tenant-scoped key prefix (`prefix-per-tenant`, the default) or a dedicated bucket per tenant (`bucket-per-tenant`, see below) |
+| **Cassandra**     | `tenant_id` leads every partition key, so a tenant's rows never share a partition with another tenant's |
 
 The S3 backend is the one place HFS offers a genuine per-tenant *physical*
 boundary: `S3TenancyMode::BucketPerTenant` gives each mapped tenant its own
@@ -350,7 +351,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | Feature                                                                     | SQLite | PostgreSQL | MongoDB | Cassandra | Neo4j | Elasticsearch | S3  |
 | --------------------------------------------------------------------------- | ------ | ---------- | ------- | --------- | ----- | ------------- | --- |
 | **Core Operations**                                                         |
-| [CRUD](https://build.fhir.org/http.html#crud)                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ✓   |
+| [CRUD](https://build.fhir.org/http.html#crud)                               | ✓      | ✓          | ✓       | ◐         | ○     | ✓             | ✓   |
 | [Versioning (vread)](https://build.fhir.org/http.html#vread)                | ✓      | ✓          | ✓       | ○         | ○     | ○             | ✓   |
 | [Optimistic Locking](https://build.fhir.org/http.html#concurrency)          | ✓      | ✓          | ✓       | ○         | ○     | ✗             | ✓   |
 | [Instance History](https://build.fhir.org/http.html#history)                | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✓   |
@@ -363,10 +364,10 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Delete History](https://build.fhir.org/http.html#delete)                   | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✗   |
 | Per-User Settings (`/_user/settings`)                                       | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ✓   |
 | **Multitenancy**                                                            |
-| Shared Schema                                                               | ✓      | ✓          | ✓       | —         | —     | ✓             | ‡✓  |
-| Schema-per-Tenant                                                           | ✗      | ✗          | ✗       | —         | —     | ✗             | ✗   |
-| Database-per-Tenant                                                         | ✗      | ✗          | ○       | —         | —     | ○             | ‡✓  |
-| Row-Level Security                                                          | ✗      | ○          | ✗       | —         | —     | ✗             | ✗   |
+| Shared Schema                                                               | ✓      | ✓          | ✓       | ✓         | —     | ✓             | ‡✓  |
+| Schema-per-Tenant                                                           | ✗      | ✗          | ✗       | ✗         | —     | ✗             | ✗   |
+| Database-per-Tenant                                                         | ✗      | ✗          | ○       | ✗         | —     | ○             | ‡✓  |
+| Row-Level Security                                                          | ✗      | ○          | ✗       | ✗         | —     | ✗             | ✗   |
 | **[Search Parameters](https://build.fhir.org/search.html#ptypes)**          |
 | [String](https://build.fhir.org/search.html#string)                         | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | [Token](https://build.fhir.org/search.html#token)                           | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ✗   |
@@ -521,7 +522,8 @@ The S3 backend is intentionally storage-focused (CRUD/version/history and the fu
 - **‡ S3 tenancy is a property of the deployment, not the backend type.** A `PrefixPerTenant` instance (one shared bucket, tenant-scoped key prefixes) is *Shared Schema*; a `BucketPerTenant` instance (a dedicated bucket per tenant) is *Database-per-Tenant*. An instance declares exactly one — see `S3Backend::declared_capabilities_for`.
 - **○ means no backend implements it today.** Unwired SQL generators for these topologies (shared-schema + RLS, schema-per-tenant `search_path`, database-per-tenant pools) once lived in `src/strategy/`; they were removed in issue #370. Do not read a `○` cell as a deployable isolation guarantee.
 - **✗ for PostgreSQL is a decision, not a gap.** Design discussion #28 chose shared-schema for PostgreSQL and declined the per-schema and per-database topologies; advertising them anyway was the defect issue #369 corrected.
-- **— Cassandra and Neo4j have no backend in this tree** (`src/backends/mod.rs`), so they have no tenant placement to report.
+- **— Neo4j has no backend in this tree** (`src/backends/mod.rs`), so it has no tenant placement to report. **Cassandra** declares exactly one placement, *Shared Schema*: every table's partition key starts with `tenant_id` (`docs/Cassandra/schema/schema.cql`), and the keyspace is shared by all tenants.
+- **◐ CRUD on Cassandra** means create and read only, while the backend is in development (`docs/Cassandra/development-roadmap.md`); every other interaction answers `501`.
 - **Row-Level Security has no `BackendCapability` counterpart**, so the contract test cannot police it. PostgreSQL is `○` because no backend issues `ALTER TABLE … ENABLE ROW LEVEL SECURITY`; a database-enforced layer is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
 
 ### Polling `_history` with `_since`
@@ -610,7 +612,7 @@ Backends can serve as primary (CRUD, versioning, and — where the backend suppo
 | PostgreSQL alone           | PostgreSQL | —                      | ✓ Implemented                   | Production OLTP                         |
 | PostgreSQL + Elasticsearch | PostgreSQL | Elasticsearch (search) | ✓ Implemented                   | OLTP + advanced search                  |
 | PostgreSQL + Neo4j         | PostgreSQL | Neo4j (graph)          | Planned                         | Graph-heavy queries                     |
-| Cassandra alone            | Cassandra  | —                      | Planned                         | High write throughput                   |
+| Cassandra alone            | Cassandra  | —                      | In development (create, read)   | High write throughput                   |
 | Cassandra + Elasticsearch  | Cassandra  | Elasticsearch (search) | Planned                         | Write-heavy + search                    |
 | MongoDB alone              | MongoDB    | —                      | ✓ Implemented                   | Document-centric                        |
 | MongoDB + Elasticsearch    | MongoDB    | Elasticsearch (search) | ✓ Implemented                   | Document-centric + offloaded search     |
@@ -627,7 +629,7 @@ Backends can serve as primary (CRUD, versioning, and — where the backend suppo
 | Graph queries         | Neo4j               | Efficient relationship traversal           |
 | Full-text search      | Elasticsearch       | Optimized inverted indexes, analyzers      |
 | Bulk analytics        | S3 + Parquet        | Cost-effective, columnar, ML-ready         |
-| High write throughput | Cassandra           | Distributed writes, eventual consistency   |
+| High write throughput | Cassandra           | Distributed writes, `LOCAL_QUORUM` and lightweight transactions |
 
 ### Feature Flags
 
@@ -1829,6 +1831,39 @@ let composite = CompositeStorage::new(composite_config, backends)?
     .with_full_primary(s3);
 ```
 
+### Cassandra
+
+In development: create and read work, and every other interaction answers `501` (`docs/Cassandra/development-roadmap.md`). Standalone only; there is no Cassandra + Elasticsearch mode.
+
+```bash
+# Build with Cassandra support
+cargo build --bin hfs --features cassandra --release
+
+# Apply the schema once, from one process (the server never applies it;
+# at startup it only checks that the ten tables exist)
+cqlsh -f docs/Cassandra/schema/keyspace-single-node.cql
+cqlsh -k helios -f docs/Cassandra/schema/schema.cql
+
+# Start the server
+HFS_STORAGE_BACKEND=cassandra \
+HFS_CASSANDRA_CONTACT_POINTS=127.0.0.1:9042 \
+  ./target/release/hfs
+```
+
+The connection settings are read by `CassandraConfig::from_env` (`src/backends/cassandra/config.rs`), and an invalid value fails startup:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `HFS_CASSANDRA_CONTACT_POINTS` | `127.0.0.1:9042` | Comma-separated `host:port` list |
+| `HFS_CASSANDRA_KEYSPACE` | `helios` | Keyspace holding the ten tables |
+| `HFS_CASSANDRA_LOCAL_DC` | `helios-dc1` | Data centre whose nodes serve every request (`LOCAL_QUORUM`, `LOCAL_SERIAL`) |
+| `HFS_CASSANDRA_USERNAME`, `HFS_CASSANDRA_PASSWORD` | unset | `PasswordAuthenticator` credentials; set both or neither |
+| `HFS_CASSANDRA_POOL_SIZE` | `2` | Connections per local node |
+| `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection |
+| `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` | `10000` | The backend's own deadline for one statement |
+
+The Cassandra backend stores no AuditEvents, so `HFS_AUDIT_BACKEND=database` fails at startup; use `file` or `cloudwatch`. It has no per-user settings or login-session store, and no bulk export, bulk submit, `$purge` or `$reindex`; those answer `501`, and web login sessions are held in process. It has no SQL-on-FHIR runner either: the server turns SQL-on-FHIR off at startup with a warning (`$viewdefinition-run` and `$sql-run` answer `501`), and an explicit `HFS_SOF_ENABLED=true` fails startup.
+
 ### How Search Offloading Works
 
 When `HFS_STORAGE_BACKEND` is set to `sqlite-elasticsearch`, `postgres-elasticsearch`, `mongodb-elasticsearch`, or `s3-elasticsearch`, the server:
@@ -2822,7 +2857,7 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 
 ### Phase 5+: Additional Backends (Planned)
 
-- [ ] Cassandra backend (wide-column, partition keys)
+- [ ] Cassandra backend (wide-column, partition keys): in development; skeleton, server wiring, create and read first (`docs/Cassandra/development-roadmap.md`)
 - [x] MongoDB Phase 1 scaffold (module wiring, config, Backend trait baseline)
 - [x] MongoDB Phase 2 core storage parity (CRUD/count/read_batch/create_or_update, tenant isolation, soft-delete, schema bootstrap)
 - [x] MongoDB Phase 3 versioning/history plus best-effort session-backed consistency

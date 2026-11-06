@@ -35,6 +35,7 @@ xml = ["helios-fhir/xml", "dep:helios-serde", "helios-serde?/xml"]
 sqlite = ["helios-persistence/sqlite"]
 postgres = ["helios-persistence/postgres"]
 mongodb = ["helios-persistence/mongodb"]
+cassandra = ["helios-persistence/cassandra"]
 elasticsearch = ["helios-persistence/elasticsearch"]
 s3 = ["helios-persistence/s3", "dep:aws-sdk-s3", "dep:aws-config"]
 

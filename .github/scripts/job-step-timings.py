@@ -9,10 +9,12 @@ its `name:` (the first argument) and this runner's name, among the attempt's
 in-progress jobs. Steps that have not finished, this one and any after it,
 have no duration yet and are listed as such.
 
-The API reports a step's completion a few seconds late, so a step that ended
-just before this one can still read "in_progress". The script re-reads the
-jobs, every 3 s for up to SETTLE_S, until this step is the only one in
-progress, and says so if it gives up.
+The API reports a step's progress late: in run 42261862863 the build step that
+had just ended still read "in_progress", and this step itself still read
+"pending". So a step before this one (THIS_STEP, by name) that has a start but
+no completion is timed from its start to now, the moment this step reads the
+API, and marked as an estimate; it ended at most that long ago. Waiting for
+the API instead would add tens of seconds to every job.
 
 Usage: job-step-timings.py <job name> <out-dir>
 Writes <out-dir>/step-timings.json and .md and prints the Markdown. An API
@@ -24,14 +26,12 @@ import http.client
 import json
 import os
 import sys
-import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 
-SETTLE_S = 30
-RETRY_S = 3
+THIS_STEP = os.environ.get("STEP_TIMINGS_STEP", "Report where this job's time went")
 
 
 def iso(ts):
@@ -73,40 +73,44 @@ def main():
         f"/attempts/{env.get('GITHUB_RUN_ATTEMPT', '1')}/jobs?per_page=100"
     )
     runner = env.get("RUNNER_NAME")
-    deadline = time.monotonic() + SETTLE_S
-    while True:
-        try:
-            jobs = fetch(url, env["GITHUB_TOKEN"])["jobs"]
-        # OSError covers URLError, socket.timeout (not a TimeoutError before
-        # Python 3.10) and a reset connection; HTTPException an incomplete read.
-        except (OSError, KeyError, ValueError, http.client.HTTPException) as e:
-            write(out_dir, {"report": "step-timings", "job": job_name, "error": str(e)},
-                  f"Step timings unavailable: {e}\n")
-            return
-        candidates = [j for j in jobs if j["name"] == job_name and j["status"] == "in_progress"]
-        mine = [j for j in candidates if j.get("runner_name") == runner] or candidates
-        if not mine:
-            write(out_dir, {"report": "step-timings", "job": job_name, "error": "job not found"},
-                  f"Step timings unavailable: no in-progress job named `{job_name}` in this run.\n")
-            return
-        job = mine[0]
-        running = [st for st in job["steps"] if st["status"] == "in_progress"]
-        settled = len(running) <= 1
-        if settled or time.monotonic() >= deadline:
-            break
-        time.sleep(RETRY_S)
+    try:
+        jobs = fetch(url, env["GITHUB_TOKEN"])["jobs"]
+    # OSError covers URLError, socket.timeout (not a TimeoutError before
+    # Python 3.10) and a reset connection; HTTPException an incomplete read.
+    except (OSError, KeyError, ValueError, http.client.HTTPException) as e:
+        write(out_dir, {"report": "step-timings", "job": job_name, "error": str(e)},
+              f"Step timings unavailable: {e}\n")
+        return
+    now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    candidates = [j for j in jobs if j["name"] == job_name and j["status"] == "in_progress"]
+    mine = [j for j in candidates if j.get("runner_name") == runner] or candidates
+    if not mine:
+        write(out_dir, {"report": "step-timings", "job": job_name, "error": "job not found"},
+              f"Step timings unavailable: no in-progress job named `{job_name}` in this run.\n")
+        return
+    job = mine[0]
+    names = [st["name"] for st in job["steps"]]
+    this_index = names.index(THIS_STEP) if THIS_STEP in names else len(names)
 
     started = iso(job.get("started_at"))
     rows = []
-    for step in job["steps"]:
+    for index, step in enumerate(job["steps"]):
         begin, end = iso(step.get("started_at")), iso(step.get("completed_at"))
-        seconds = int((end - begin).total_seconds()) if begin and end else None
+        estimated = False
+        if begin and end:
+            seconds = int((end - begin).total_seconds())
+        elif begin and index < this_index:
+            # Finished before this step began; the API has not caught up.
+            seconds, estimated = max(0, int((now - begin).total_seconds())), True
+        else:
+            seconds = None
         rows.append(
             {
                 "number": step["number"],
                 "name": step["name"],
-                "conclusion": step.get("conclusion") or step["status"],
+                "conclusion": step.get("conclusion") or ("success (API not caught up)" if estimated else step["status"]),
                 "seconds": seconds,
+                "estimated": estimated,
             }
         )
     finished = [r for r in rows if r["seconds"] is not None]
@@ -118,14 +122,15 @@ def main():
         "runner": job.get("runner_name"),
         "job_started_at": job.get("started_at"),
         "finished_steps_s": total,
-        "settled": settled,
+
         "steps": rows,
     }
 
     lines = [
         f"Job `{job_name}` on `{job.get('runner_name')}`, job id {job['id']}: "
         f"{total} s across its finished steps. The API gives whole seconds, so short steps read 0 s."
-        + ("" if settled else f" The API still showed an earlier step running after {SETTLE_S} s, so its time is missing."),
+        + (" A time marked ≤ is an estimate: the API had not yet marked that step finished, so it is "
+           "measured to the moment this report read the API." if any(r["estimated"] for r in rows) else ""),
         "",
         "| # | Step | Result | Seconds | Share |",
         "| ---: | --- | --- | ---: | ---: |",
@@ -135,7 +140,8 @@ def main():
             lines.append(f"| {r['number']} | {r['name']} | {r['conclusion']} | not finished | |")
         else:
             share = f"{100 * r['seconds'] / total:.0f}%" if total else ""
-            lines.append(f"| {r['number']} | {r['name']} | {r['conclusion']} | {r['seconds']} | {share} |")
+            shown = f"≤ {r['seconds']}" if r["estimated"] else str(r["seconds"])
+            lines.append(f"| {r['number']} | {r['name']} | {r['conclusion']} | {shown} | {share} |")
     write(out_dir, report, "\n".join(lines) + "\n")
 
 

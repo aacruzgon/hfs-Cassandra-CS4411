@@ -245,7 +245,7 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 
 **Cassandra docs.** [SELECT](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/dml.html#select-statement) with [ORDER BY](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/dml.html#ordering-clause) and [LIMIT](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/dml.html#limit-clause) on one partition, and [clustering order](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/ddl.html#clustering-order) (`version_id DESC`).
 
-**Exit criterion.** `versioning_suite.rs` and `search/conditional_if_match_suite.rs` pass; vread of a deleted version returns 410; `list_versions` returns 12 versions in numeric order.
+**Exit criterion.** `versioning_suite.rs` and `search/conditional_if_match_suite.rs` pass; vread of a deleted version returns 410; `list_versions` returns 12 versions in numeric order; Milestone A's `GET` of the create's `Location` answers `200 OK` with version 1, replacing its 501 assertion (ADR-aacruzgon-0049).
 
 **Who.** **A**.
 

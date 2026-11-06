@@ -1,0 +1,62 @@
+# ADR-aacruzgon-0049: Carry upstream's versioned-`Location` fix (HeliosSoftware/hfs#2518) in the fork ahead of upstream, as `-x` cherry-picks
+
+- **Date:** 2026-11-06
+- **Status:** accepted (Alan approved it on 2026-11-06, with the Milestone A vread assertion as below)
+- **Context:**
+    - **The deviation.** R4 http.html#create says the server "SHALL also return a Location header which contains the new Logical Id and Version Id", that is `[base]/[type]/[id]/_history/[vid]`; R4B and R5 say the same.
+        - HFS's REST layer, shared by every backend, answered `[base]/[type]/[id]` for `POST [type]`, an update that creates, and a conditional create or update that creates.
+        - Batch entries were already versioned.
+        - Alan filed it upstream as HeliosSoftware/hfs#2517.
+    - **Where the fork met it.** The Milestone A test (`crates/hfs/tests/cassandra_milestone_a.rs`, roadmap Step 2 item 2.7, ADR-aacruzgon-0042) pinned the unversioned form as a known upstream deviation.
+    - **The upstream fix.** Alan opened HeliosSoftware/hfs#2518: branch `fix/2517-versioned-location`, two signed commits on upstream `main` `22c3c5779`, `717df7af5` and `e105943da`. On 2026-11-06 it is open, with review required.
+    - **Why it is a decision.**
+        - The fork takes upstream changes only through syncs, which merge upstream `main`. The last sync was on 2026-11-04 (`efab948ed`), and the fork is 85 commits behind.
+        - Carrying a change before upstream merges it means the fork and upstream differ until a sync, and that sync has to reconcile them.
+- **Decision:**
+    - **Backport now.** Cherry-pick both commits with `git cherry-pick -x`, so each records the upstream sha it came from, unchanged. Both applied cleanly, and each has the same `git patch-id --stable` as its upstream commit.
+    - **No reshaping.** The fix stays byte-for-byte upstream's, so the next sync sees the same change.
+    - **Where.** It was built on top of the Step 2 stack, on PR #51. The whole stack merged while it was being built, so it opened as PR #52 against `main`. That is the same place: `main` then held exactly the stack.
+    - **Milestone A,** in a separate commit after the picks:
+        - it asserts `[base]/Patient/[id]/_history/1`;
+        - it does one `GET` of that `Location`, which reaches vread. The Cassandra backend leaves vread to roadmap Step 4, so the test asserts `501 not-supported` with an error naming `vread`. This shows the new URL reaches the vread handler, and that the 501 comes from the backend stub.
+- **Alternatives considered:**
+    - **Wait for #2518 to merge upstream and come in with a sync:** lost.
+        - Its merge date is in upstream's hands, and syncs are manual.
+        - Until then, the fork's Milestone A would keep asserting a SHALL violation, and every fork client would keep getting the unversioned `Location`.
+    - **Make the Milestone A test accept both forms:** lost. A test that passes with or without the fix guards nothing, and it would not catch the version being dropped again.
+    - **Cherry-pick onto `main` while the stack was open:** lost. Main would have had the fix before #44's Milestone A test, which pinned the old form, so #44 would have failed on its new base. Every open stack PR would also have been rebased again. The stack then merged in full, which removed this concern.
+    - **Drop the Milestone A `GET` until Step 4:** lost. The 501 assertion already checks that the versioned URL routes to vread; dropping it would leave Step 4 nothing to change.
+- **Consequences:**
+    - **What the next upstream sync sees,** if #2518 merges unchanged (as a merge commit or a squash): no change in the fix's files.
+        - This was checked with throwaway merges in a scratch worktree: merging upstream's fix base `22c3c5779` and then `fix/2517-versioned-location` added no diff, and so did a simulated squash.
+        - Merging the fix branch straight in also brings the 85 commits the fork is behind. Their one conflict, in `.github/disabled-workflows/ci.yml`, comes from that drift: merging `22c3c5779` alone hits it as well. The fix's eight files merged to exactly upstream's content.
+    - **If #2518 changes in review:**
+        - each later upstream commit arrives in the sync as an ordinary change on top of the backport;
+        - a hunk that rewrites lines the backport changed conflicts. Resolve it by taking upstream's side in the fix's files, then re-run `location_header`, `public_url_contract`, `batch_conformance` and Milestone A.
+    - **If #2518 is closed without merging, or merged and later reverted before a sync:** the three-way merge sees no upstream change to those lines and keeps the backport silently. The fork then diverges from upstream with no conflict to say so.
+    - **What it obliges.** Each sync after this checks the backport against what merged:
+        - `git log --grep 'cherry picked from commit 717df7af5' --grep 'cherry picked from commit e105943da'` finds the picks;
+        - `git diff upstream/main HEAD -- <the eight files>` after the merge is empty, or every difference is explained;
+        - if upstream dropped the fix, the sync reverts the backport explicitly, or a new entry records keeping it.
+    - **Milestone A at Step 4.** The `GET` of the `Location` becomes `200 OK` with version 1, and the test's 501 assertion changes then. The roadmap's Step 4 exit criterion now says so.
+    - **Precedent.** Any later upstream fix carried ahead of upstream follows the same form:
+        - `-x` picks, with no reshaping;
+        - its own PR;
+        - the same check at the next sync.
+- **AI involvement:**
+    - **Who.** The Claude Code worker s2-wiring (Opus 5.5) made the branch, the picks and the test change, ran the checks and the sync merges, and drafted this entry. The orchestrating session placed the work, opened PR #52, and updated this entry for the stack having merged first.
+    - **What it verified, and how:**
+        - the patch-ids of both picks against upstream (`git patch-id --stable`);
+        - the throwaway merges above, in a scratch worktree removed afterwards;
+        - that the Cassandra `vread` is a stub returning `UnsupportedCapability` (`crates/persistence/src/backends/cassandra/storage.rs:128-136`), which REST maps to 501 `not-supported` (`crates/rest/src/error.rs:1209`);
+        - the fix's tests (`location_header` 10/10, `public_url_contract` 6/6, `batch_conformance` 109/109), Milestone A against the shared node, and the readiness test on a node of its own;
+        - CI, green on both workflows.
+    - **What Alan changed:**
+        - Alan asked to bring the fix into the fork now rather than wait for upstream to merge #2518.
+        - He accepted asserting the 501 on the `Location`'s vread until Step 4, rather than dropping the `GET`.
+- **Links:**
+    - PR #52, branch `cassandra/step2-backport-2518`;
+    - HeliosSoftware/hfs#2517 (issue) and HeliosSoftware/hfs#2518 (PR, commits `717df7af5` and `e105943da`);
+    - [R4 http.html#create](https://hl7.org/fhir/R4/http.html#create) and [#vread](https://hl7.org/fhir/R4/http.html#vread);
+    - [development-roadmap.md](../../development-roadmap.md): Step 2 item 2.7 (Milestone A) and Step 4 (vread);
+    - ADR-aacruzgon-0042 (Milestone A in CI).

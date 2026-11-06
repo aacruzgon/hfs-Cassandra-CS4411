@@ -3,7 +3,10 @@ name: R4B compile check
 # Roadmap item 0.4: proves the Cassandra backend assumes nothing R4-specific
 # by compiling helios-persistence with R4B as the only FHIR version. Runs on
 # the team's self-hosted runners (ADR-aacruzgon-0018, ADR-sam-michaels-0001);
-# a light job, so on either one (ADR-aacruzgon-0023).
+# a light job, so on either one (ADR-aacruzgon-0023). It reports the size of
+# its target directory and where its time went (.github/scripts/ci-report.py),
+# in the run's summary page and in the artifact ci-report-r4b-check; reports
+# never fail the job.
 
 on:
   push:
@@ -14,6 +17,9 @@ on:
 
 permissions:
   contents: read
+  # The job's last report reads its own step timings from the Actions API
+  # (.github/scripts/job-step-timings.py). Read-only, like contents.
+  actions: read
 
 # One run per ref; a newer push supersedes the run in flight.
 concurrency:
@@ -35,6 +41,12 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, hfs-cassandra-light]
     timeout-minutes: 30
+    env:
+      # The commit and build profile the CI reports name (ci-report.py
+      # context): on a pull request, its head, not the merge commit
+      # GITHUB_SHA names.
+      CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      CI_REPORT_PROFILE: dev (cargo check only)
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,13 +74,68 @@ jobs:
           CAP_GB: 10
         run: |
           stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
-          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
-          if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
-            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
+          # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
+          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
+          reset=no reason=
+          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+            if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
+            reset=yes
+            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
             rm -rf "$TARGET_DIR"
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+          # For the build-size report (.github/scripts/build-size-report.py).
+          {
+            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_RESET=$reset"
+            echo "TARGET_DIR_RESET_REASON=$reason"
+            echo "TARGET_DIR_CAP_GB=$CAP_GB"
+          } >> "$GITHUB_ENV"
 
       - name: cargo check -p helios-persistence --no-default-features --features cassandra,R4B
         run: cargo check -p helios-persistence --no-default-features --features cassandra,R4B
+
+      # The persistent target directory before and after this job, and
+      # whether the reset step reset it and why
+      # (.github/scripts/build-size-report.py). Report only.
+      - name: Report the target directory's size
+        if: always()
+        continue-on-error: true
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/build-size"
+          python3 .github/scripts/build-size-report.py "$out"
+          python3 .github/scripts/ci-report.py add build-size "Target directory size" \
+            --markdown "$out/build-size.md" --json "$out/build-size.json"
+
+      # Where this job's time went (.github/scripts/job-step-timings.py): each
+      # finished step's duration, read from the Actions API with this job's
+      # token, which the workflow's `actions: read` allows. Steps after this
+      # one are not finished, so they are listed untimed. Report only.
+      - name: Report where this job's time went
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
+          python3 .github/scripts/job-step-timings.py "cargo check (cassandra, R4B)" "$out"
+          python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
+            --markdown "$out/step-timings.md" --json "$out/step-timings.json"
+
+      # Every report section of this job (.github/scripts/ci-report.py), as
+      # JSON and Markdown, plus the raw outputs they were read from. Report
+      # only: an upload failure does not fail the job.
+      - name: Upload the CI report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-r4b-check
+          path: ${{ runner.temp }}/ci-report
+          if-no-files-found: warn
+          overwrite: true

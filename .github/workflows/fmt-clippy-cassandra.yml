@@ -10,7 +10,10 @@ name: fmt, clippy and Cassandra schema
 # has one executor, so the jobs on one machine run one after another.
 # Every job that compiles also writes CI reports (.github/scripts/ci-report.py):
 # measured figures in the run's summary page and in an artifact,
-# ci-report-<job>. Reports never fail a job for a figure.
+# ci-report-<job>. Reports never fail a job for a figure. Every job reports
+# where its time went and, where it has a persistent target directory, that
+# directory's size; fmt adds dependency freshness and RustSec advisories, and
+# the Cassandra job per-operation latency and binary sizes.
 
 on:
   push:
@@ -21,6 +24,9 @@ on:
 
 permissions:
   contents: read
+  # Each job's last report reads its own step timings from the Actions API
+  # (.github/scripts/job-step-timings.py). Read-only, like contents.
+  actions: read
 
 # One run per ref; a newer push supersedes the run in flight.
 concurrency:
@@ -42,6 +48,12 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, hfs-cassandra-light]
     timeout-minutes: 10
+    env:
+      # The commit and build profile the CI reports name (ci-report.py
+      # context): on a pull request, its head, not the merge commit
+      # GITHUB_SHA names. fmt builds nothing.
+      CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      CI_REPORT_PROFILE: none (rustfmt and reports only)
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,6 +70,87 @@ jobs:
 
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check
+
+      # The CI half of the dependency rule (check a dependency's newer
+      # releases before working around its bug): each chosen crate's locked
+      # version against crates.io's newest, one request a second with a
+      # descriptive User-Agent (https://crates.io/data-access). Here because
+      # fmt is the cheapest job and builds nothing. Report only: a major
+      # version behind is a warning annotation.
+      - name: Report dependency freshness
+        if: always()
+        continue-on-error: true
+        # The job has 10 minutes; its two report steps get at most 4.
+        timeout-minutes: 2
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/dependency-freshness"
+          python3 .github/scripts/dependency-freshness.py "$out"
+          python3 .github/scripts/ci-report.py add dependency-freshness "Dependency freshness" \
+            --markdown "$out/dependency-freshness.md" --json "$out/dependency-freshness.json"
+
+      # RustSec advisories for Cargo.lock, with cargo-audit 0.22.2 (the newest
+      # release on 2026-11-06), downloaded once per runner into its tool cache
+      # and checked against the release asset's SHA-256, rather than built.
+      # Report only: a vulnerability that neither audit.toml nor upstream's
+      # disabled Security Audit job (its cargo audit --ignore flags)
+      # acknowledges is a warning annotation.
+      - name: Report RustSec advisories (cargo audit)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          CARGO_AUDIT_VERSION: 0.22.2
+          CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+        run: |
+          [ "$(uname -m)" = x86_64 ] || { echo "cargo audit report: no pinned binary for $(uname -m)"; exit 0; }
+          dir="${RUNNER_TOOL_CACHE:?}/cargo-audit/$CARGO_AUDIT_VERSION"
+          # Unpacked next to its final place and renamed into it, so a job
+          # killed mid-install never leaves a partial binary that later runs
+          # would trust.
+          if [ ! -x "$dir/cargo-audit" ]; then
+            name="cargo-audit-x86_64-unknown-linux-musl-v$CARGO_AUDIT_VERSION"
+            tmp="$dir.partial.$$"
+            rm -rf "$tmp" && mkdir -p "$tmp"
+            curl -sSfL --retry 3 -o "$tmp/$name.tgz" \
+              "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v$CARGO_AUDIT_VERSION/$name.tgz"
+            echo "$CARGO_AUDIT_SHA256  $tmp/$name.tgz" | sha256sum -c -
+            tar -xzf "$tmp/$name.tgz" -C "$tmp"
+            mv "$tmp/$name" "$tmp/bin"
+            rm -rf "$dir" && mv "$tmp/bin" "$dir"
+            rm -rf "$tmp"
+          fi
+          out="$RUNNER_TEMP/ci-report/inputs/cargo-audit"
+          CARGO_AUDIT="$dir/cargo-audit" python3 .github/scripts/cargo-audit-report.py "$out"
+          python3 .github/scripts/ci-report.py add cargo-audit "RustSec advisories (cargo audit)" \
+            --markdown "$out/cargo-audit.md" --json "$out/cargo-audit.json"
+
+      # Where this job's time went (.github/scripts/job-step-timings.py): each
+      # finished step's duration, read from the Actions API with this job's
+      # token, which the workflow's `actions: read` allows. Steps after this
+      # one are not finished, so they are listed untimed. Report only.
+      - name: Report where this job's time went
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
+          python3 .github/scripts/job-step-timings.py "cargo fmt --check" "$out"
+          python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
+            --markdown "$out/step-timings.md" --json "$out/step-timings.json"
+
+      # Every report section of this job (.github/scripts/ci-report.py), as
+      # JSON and Markdown, plus the raw outputs they were read from. Report
+      # only: an upload failure does not fail the job.
+      - name: Upload the CI report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-fmt
+          path: ${{ runner.temp }}/ci-report
+          if-no-files-found: warn
+          overwrite: true
 
   # Clippy is the CONTRIBUTING.md command split in two (ADR-sam-michaels-0003).
   # With --all-features, helios-fhir holds all four FHIR versions, and its lib
@@ -94,13 +187,28 @@ jobs:
           CAP_GB: 30
         run: |
           stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
-          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
-          if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
-            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
+          # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
+          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
+          reset=no reason=
+          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+            if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
+            reset=yes
+            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
             rm -rf "$TARGET_DIR"
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+          # For the build-size report (.github/scripts/build-size-report.py).
+          {
+            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_RESET=$reset"
+            echo "TARGET_DIR_RESET_REASON=$reason"
+            echo "TARGET_DIR_CAP_GB=$CAP_GB"
+          } >> "$GITHUB_ENV"
 
       # Wrapped in ci-report.py build, which samples the runner's cgroup every
       # second and reports the wall time and the memory peaks
@@ -124,6 +232,33 @@ jobs:
               -A clippy::field_reassign_with_default \
               -A clippy::doc-overindented-list-items \
               -A clippy::doc-lazy-continuation
+
+      # The persistent target directory before and after this job, and
+      # whether the reset step reset it and why
+      # (.github/scripts/build-size-report.py). Report only.
+      - name: Report the target directory's size
+        if: always()
+        continue-on-error: true
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/build-size"
+          python3 .github/scripts/build-size-report.py "$out"
+          python3 .github/scripts/ci-report.py add build-size "Target directory size" \
+            --markdown "$out/build-size.md" --json "$out/build-size.json"
+
+      # Where this job's time went (.github/scripts/job-step-timings.py): each
+      # finished step's duration, read from the Actions API with this job's
+      # token, which the workflow's `actions: read` allows. Steps after this
+      # one are not finished, so they are listed untimed. Report only.
+      - name: Report where this job's time went
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
+          python3 .github/scripts/job-step-timings.py "cargo clippy (helios-fhir)" "$out"
+          python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
+            --markdown "$out/step-timings.md" --json "$out/step-timings.json"
 
       # Every report section of this job (.github/scripts/ci-report.py), as
       # JSON and Markdown, plus the raw outputs they were read from. Report
@@ -169,13 +304,28 @@ jobs:
           CAP_GB: 30
         run: |
           stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
-          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
-          if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
-            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
+          # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
+          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
+          reset=no reason=
+          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+            if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
+            reset=yes
+            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
             rm -rf "$TARGET_DIR"
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+          # For the build-size report (.github/scripts/build-size-report.py).
+          {
+            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_RESET=$reset"
+            echo "TARGET_DIR_RESET_REASON=$reason"
+            echo "TARGET_DIR_CAP_GB=$CAP_GB"
+          } >> "$GITHUB_ENV"
 
       # helios-fhir is built here once, as a dependency, never its test target.
       # helios-fhir/skip-r6-download gives it the same features as the
@@ -202,6 +352,33 @@ jobs:
               -A clippy::field_reassign_with_default \
               -A clippy::doc-overindented-list-items \
               -A clippy::doc-lazy-continuation
+
+      # The persistent target directory before and after this job, and
+      # whether the reset step reset it and why
+      # (.github/scripts/build-size-report.py). Report only.
+      - name: Report the target directory's size
+        if: always()
+        continue-on-error: true
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/build-size"
+          python3 .github/scripts/build-size-report.py "$out"
+          python3 .github/scripts/ci-report.py add build-size "Target directory size" \
+            --markdown "$out/build-size.md" --json "$out/build-size.json"
+
+      # Where this job's time went (.github/scripts/job-step-timings.py): each
+      # finished step's duration, read from the Actions API with this job's
+      # token, which the workflow's `actions: read` allows. Steps after this
+      # one are not finished, so they are listed untimed. Report only.
+      - name: Report where this job's time went
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
+          python3 .github/scripts/job-step-timings.py "cargo clippy (workspace)" "$out"
+          python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
+            --markdown "$out/step-timings.md" --json "$out/step-timings.json"
 
       # Every report section of this job (.github/scripts/ci-report.py), as
       # JSON and Markdown, plus the raw outputs they were read from. Report
@@ -261,13 +438,28 @@ jobs:
           CAP_GB: 15
         run: |
           stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
-          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
-          if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
-            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
+          # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
+          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
+          reset=no reason=
+          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+            if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
+            reset=yes
+            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
             rm -rf "$TARGET_DIR"
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+          # For the build-size report (.github/scripts/build-size-report.py).
+          {
+            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_RESET=$reset"
+            echo "TARGET_DIR_RESET_REASON=$reason"
+            echo "TARGET_DIR_CAP_GB=$CAP_GB"
+          } >> "$GITHUB_ENV"
 
       # Built before Cassandra starts, so the build's memory peak and the
       # 3 GiB container never overlap. acruzdebian caps its runner service at
@@ -283,6 +475,7 @@ jobs:
       # built here too: hfs with only the cassandra backend, and the test
       # binary that starts it.
       - name: Build tests/cassandra_tests.rs, backend_capability_contract.rs and the Milestone A test, and report the memory peak
+        id: build
         run: |
           python3 .github/scripts/ci-report.py build build-persistence-tests \
             "Build: helios-persistence Cassandra tests" -- \
@@ -410,6 +603,37 @@ jobs:
             "Boot time and conformance seed (roadmap item 2.6)" \
             --markdown "$dir/boot-time.md" --json "$dir/boot-time.json"
 
+      # Per-operation latency, a smoke trend: single node, debug build, not the
+      # Step 8 benchmark. 200 creates, 200 reads and 20 counts through
+      # CassandraBackend, then 50 POST + GET round trips through hfs, each on
+      # a fresh tenant (ADR-aacruzgon-0020). Already built; about 12 s. Report
+      # only: no figure fails it; it fails only if an operation fails. Before
+      # the node statistics, so they include its writes, and before the
+      # readiness test, which stays last.
+      - name: Latency report against this node (report only)
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/ci-report/logs"
+          logs="$RUNNER_TEMP/ci-report/logs"
+          dir="$RUNNER_TEMP/ci-report/inputs/latency"
+          export HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" HFS_TEST_LATENCY_REPORT="$dir"
+          status=0
+          cargo test -p helios-persistence --features cassandra --test cassandra_tests \
+            -- --exact latency_report::cassandra_latency_report --nocapture 2>&1 \
+            | tee "$logs/latency-backend.log" || status=1
+          cargo test -p helios-hfs --no-default-features --features R4,cassandra \
+            --test cassandra_milestone_a -- --exact rest_latency_report --nocapture 2>&1 \
+            | tee "$logs/latency-rest.log" || status=1
+          python3 .github/scripts/ci-report.py add latency-backend \
+            "Latency: CassandraBackend create, read and count (smoke trend)" \
+            --markdown "$dir/cassandra-latency.md" --json "$dir/cassandra-latency.json"
+          python3 .github/scripts/ci-report.py add latency-rest \
+            "Latency: POST and GET through hfs (smoke trend)" \
+            --markdown "$dir/hfs-rest-latency.md" --json "$dir/hfs-rest-latency.json"
+          exit "$status"
+
       # Before the readiness test, which restarts the node and so resets these
       # metrics: tablestats, tpstats, the per-table latency and tombstone
       # histograms of system_views, and the lightweight-transaction counts,
@@ -450,7 +674,8 @@ jobs:
           logs="$RUNNER_TEMP/ci-report/logs"
           python3 .github/scripts/ci-report.py tests tests "Tests" \
             "$logs/persistence-tests.log" "$logs/milestone-a-round-trip.log" \
-            "$logs/boot-time.log" "$logs/readiness.log"
+            "$logs/boot-time.log" "$logs/latency-backend.log" "$logs/latency-rest.log" \
+            "$logs/readiness.log"
           python3 .github/scripts/ci-report.py readiness readiness \
             "Readiness recovery (Step 2 exit criterion)" "$logs/readiness.log"
 
@@ -462,6 +687,48 @@ jobs:
       - name: Stop Cassandra and remove CI's volume
         if: always()
         run: docker compose -p hfs-cassandra-ci down -v --remove-orphans
+
+      # The target directory before and after, whether the reset step reset
+      # it, and the size of every binary the build step made: its two cargo
+      # commands again with --message-format=json, a no-op that lists the
+      # executables it already built (.github/scripts/build-size-report.py).
+      # Report only.
+      - name: Report the target directory's and the binaries' sizes
+        if: always()
+        continue-on-error: true
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/build-size"
+          mkdir -p "$out"
+          set --
+          if [ "$BUILD_OUTCOME" = success ]; then
+            # A failure here only loses the binary sizes, not the section.
+            cargo test -p helios-persistence --features cassandra \
+              --test cassandra_tests --test backend_capability_contract --no-run \
+              --message-format=json > "$out/persistence-artifacts.json" || true
+            cargo test -p helios-hfs --no-default-features --features R4,cassandra \
+              --test cassandra_milestone_a --no-run --message-format=json > "$out/hfs-artifacts.json" || true
+            set -- "@$out/persistence-artifacts.json" "@$out/hfs-artifacts.json"
+          fi
+          python3 .github/scripts/build-size-report.py "$out" "$@"
+          python3 .github/scripts/ci-report.py add build-size "Target directory and binary sizes" \
+            --markdown "$out/build-size.md" --json "$out/build-size.json"
+
+      # Where this job's time went (.github/scripts/job-step-timings.py): each
+      # finished step's duration, read from the Actions API with this job's
+      # token, which the workflow's `actions: read` allows. Steps after this
+      # one are not finished, so they are listed untimed. Report only.
+      - name: Report where this job's time went
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
+          python3 .github/scripts/job-step-timings.py "Cassandra schema (single node)" "$out"
+          python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
+            --markdown "$out/step-timings.md" --json "$out/step-timings.json"
 
       # Every report section of this job (.github/scripts/ci-report.py), as
       # JSON and Markdown, plus the raw outputs they were read from. Report

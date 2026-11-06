@@ -97,8 +97,13 @@ jobs:
             echo "TARGET_DIR_CAP_GB=$CAP_GB"
           } >> "$GITHUB_ENV"
 
+      # Wrapped in ci-report.py build: the wall time, the runner cgroup's
+      # memory peaks and OOM kills, and cargo's --timings chart, which does
+      # not change what is checked. It exits with cargo's status.
       - name: cargo check -p helios-persistence --no-default-features --features cassandra,R4B
-        run: cargo check -p helios-persistence --no-default-features --features cassandra,R4B
+        run: |
+          python3 .github/scripts/ci-report.py build build-r4b-check "Build: cargo check (cassandra, R4B)" -- \
+            cargo check -p helios-persistence --no-default-features --features cassandra,R4B --timings
 
       # The persistent target directory before and after this job, and
       # whether the reset step reset it and why

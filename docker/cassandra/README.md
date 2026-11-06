@@ -40,21 +40,32 @@ in its `cluster_metadata_manager.rs`), and one node has no peers to learn. So
 needed. `tests/cassandra_tests.rs` checks that the driver addresses the node by
 its contact point.
 
-**A restart of the node breaks an open `cdrs-tokio` 8.1.9 session to it.** The
-session reconnects, then marks the node `Unknown` and drops it from every query
-plan: queries fail with "No nodes available in query plan!" until the client
-opens a new session. Setting `CASSANDRA_BROADCAST_RPC_ADDRESS: 127.0.0.1` does
-not change this. Checked on 2026-11-06 with the Compose file on host port 59242.
-A `docker compose restart` at 8 s gave failures until the session recovered at
-36 s, then failures again from 40 s to the end of a 180 s run, with and without
-the variable. The cause is in the driver, and is not specific to Docker:
-whenever the session's control connection reconnects, `Node::clone_with_node_info`
-(`topology/node.rs`) compares the node's gossip address (`<listen address>:7000`)
-with its contact point, finds them different, and resets the node's state. With
-one node no event from a peer ever sets it back. So anything that drops the
-control connection, a restart or a network blip, has the same effect. After
-restarting Cassandra, restart anything that holds a session to it, Helios
-included.
+**A restart of the node can leave an open `cdrs-tokio` 8.1.9 session failing
+for as long as its control connection stays up.** Queries then fail with "No
+nodes available in query plan!". Setting `CASSANDRA_BROADCAST_RPC_ADDRESS:
+127.0.0.1` does not change this.
+
+The driver's control connection does one of two things when it reconnects:
+
+- **Its query plan is empty** (the node is down or ignored): it rebuilds the
+  metadata from its contact points, which start `Up`, and the session works
+  again (`control_connection.rs`, `full_refresh`).
+- **The plan still holds the node:** it updates the node in place.
+  `Node::clone_with_node_info` (`topology/node.rs`) compares the node's gossip
+  address (`<listen address>:7000`) with its contact point, finds them
+  different, and marks the node `Unknown`, which drops it from every plan.
+
+With one node no peer event sets it back. So the session stays broken until
+something drops the control connection again, which takes the first path, or
+until the client opens a new session.
+
+Checked on 2026-11-06 with the Compose file on host port 59242. A `docker
+compose restart` at 8 s gave failures until the session recovered at 36 s (the
+first path). Failures came back at 40 s (the second path) and lasted to the end
+of a 180 s run, with and without the variable; the control connection stayed up
+throughout. That a later drop restores the session comes from the driver
+source, not from this run. After restarting Cassandra, restart anything that
+holds a session to it, Helios included, rather than wait for that.
 
 ## Recorded configuration
 

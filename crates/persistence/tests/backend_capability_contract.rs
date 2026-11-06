@@ -747,24 +747,34 @@ mod cassandra {
     use super::*;
     use helios_persistence::backends::cassandra::{CassandraBackend, CassandraConfig};
 
-    /// The design's golden list ("Structs and enums", the `BackendKind::Cassandra`
-    /// and `BackendCapability` row; roadmap item 2.4).
+    /// The golden list at Step 2: `SharedSchema` alone (roadmap item 2.4,
+    /// ADR-aacruzgon-0037).
     ///
-    /// There is no `TokenSearch` or `UriSearch` variant: `BasicSearch` covers
-    /// token search, and URI search has no variant of its own. Nothing else is
-    /// declared. String, reference, number, quantity and composite search,
-    /// history, transactions, conditional operations, `_include`/`_revinclude`,
-    /// text search, offset paging, sorting and the bulk-submit REST worker are ✗
-    /// in the design's scope (not implemented); bulk export and bulk-submit
-    /// ingest are out of scope for this project.
-    const GOLDEN: [BackendCapability; 7] = [
+    /// Each step moves its capability from [`LATER`] to here, and adds it to
+    /// `declared_capabilities()`, in the same commit, once it is implemented:
+    /// `Crud` and `OptimisticLocking` at Step 3, `Versioning` at Step 4,
+    /// `BasicSearch`, `DateSearch` and `CursorPagination` at Steps 6a to 6d.
+    /// Those seven are the design's end state ("Structs and enums", the
+    /// `BackendKind::Cassandra` and `BackendCapability` row). There is no
+    /// `TokenSearch` or `UriSearch` variant: `BasicSearch` covers token search,
+    /// and URI search has no variant of its own. String, reference, number,
+    /// quantity and composite search, history, transactions, conditional
+    /// operations, `_include`/`_revinclude`, text search, offset paging, sorting
+    /// and the bulk-submit REST worker are ✗ in the design's scope (not
+    /// implemented); bulk export and bulk-submit ingest are out of scope for
+    /// this project.
+    const GOLDEN: [BackendCapability; 1] = [BackendCapability::SharedSchema];
+
+    /// The design's other six, which later steps declare as they land
+    /// (ADR-aacruzgon-0037). Until then the instance must not report them.
+    /// Delete this list, and its loop below, when Step 6d empties it.
+    const LATER: [BackendCapability; 6] = [
         BackendCapability::Crud,
-        BackendCapability::Versioning,
         BackendCapability::OptimisticLocking,
+        BackendCapability::Versioning,
         BackendCapability::BasicSearch,
         BackendCapability::DateSearch,
         BackendCapability::CursorPagination,
-        BackendCapability::SharedSchema,
     ];
 
     /// One keyspace for every tenant, with `tenant_id` leading every partition
@@ -843,6 +853,15 @@ mod cassandra {
         assert_eq!(backend.kind(), BackendKind::Cassandra);
         assert_shared_schema_instance_is_consistent("cassandra", &backend);
         assert_declares_exactly("cassandra (instance)", &backend.capabilities(), &GOLDEN);
+        // `supports()` must not claim what `capabilities()` leaves for a later
+        // step: #369's false claim lived in a hand-rolled `supports()`.
+        for capability in LATER {
+            assert!(
+                !backend.supports(capability),
+                "cassandra: supports({capability:?}) before its step declares it \
+                 (ADR-aacruzgon-0037)."
+            );
+        }
     }
 
     /// The REST layer reads `ConditionalStorage::supports_conditional`, not the

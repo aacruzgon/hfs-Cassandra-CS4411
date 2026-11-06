@@ -60,6 +60,11 @@ mod create_read;
 #[path = "cassandra/stored_search_parameters.rs"]
 mod stored_search_parameters;
 
+/// CI's per-operation latency report; runs only when
+/// `HFS_TEST_LATENCY_REPORT` names a directory.
+#[path = "cassandra/latency_report.rs"]
+mod latency_report;
+
 /// The shared backend-test harness, `tests/common/{harness, fixtures,
 /// capabilities}.rs`, compiled here as `crate::common` because
 /// [`TestableBackend`](common::harness::TestableBackend) lives there and

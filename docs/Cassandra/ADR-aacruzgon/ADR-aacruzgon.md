@@ -72,3 +72,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0025](2026-11-05/0025-readhistory-stays-true.md) | 2026-11-05 | `readHistory` stays `true` on Cassandra; only the history interactions are omitted | accepted |
 | [0026](2026-11-05/0026-schema-audit-fixes.md) | 2026-11-05 | Schema audit fixes: compartment and FHIR-version residuals, a 2 KiB limit on indexed values, `write_id` on version rows, and intersected `_id` parameters | accepted |
 | [0027](2026-11-05/0027-step-1-open-items-decided.md) | 2026-11-05 | The open items are decided: `count`, date-only paging, stored index keys, the cap, the unread rows, `_sort`, the rejections, the sweeper and the schema's setup | accepted |
+| [0028](2026-11-06/0028-schema-sign-off.md) | 2026-11-06 | Sign-off on `schema.cql` as merged at `67f9e0532` | accepted |

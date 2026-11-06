@@ -93,3 +93,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0046](2026-11-06/0046-more-ci-reports.md) | 2026-11-06 | More CI reports: latency, dependency freshness, advisories, sizes and step timings | accepted |
 | [0047](2026-11-06/0047-coverage-report-in-ci.md) | 2026-11-06 | A Cassandra coverage report in CI, in its own workflow, not required and with no threshold | accepted |
 | [0048](2026-11-06/0048-more-ci-reports-node-and-build.md) | 2026-11-06 | More CI reports: the R4B build, cargo timings, the node's start, its JVM and container, hfs's memory, and the stored-SearchParameter load | accepted |
+| [0049](2026-11-06/0049-backport-upstream-2518.md) | 2026-11-06 | Carry upstream's versioned-`Location` fix (HeliosSoftware/hfs#2518) in the fork ahead of upstream, as `-x` cherry-picks | accepted |

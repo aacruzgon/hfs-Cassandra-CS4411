@@ -205,9 +205,13 @@ CREATE TABLE IF NOT EXISTS pending_index_writes (
 -- correctness, and repair within it is routine practice on the cluster.
 -- A hint lives no longer than the smallest gc_grace_seconds of its tables
 -- (Hint.java in 5.0.9), so a hint for these tables expires at 3 h even after
--- a short outage. On the cluster a replica returning from any outage is
--- repaired promptly; resurrection is narrowed, not ruled out
--- (ADR-aacruzgon-0027).
+-- a short outage. On the cluster: a replica back from an outage shorter
+-- than max_hint_window (3 h) is repaired promptly, within 3 h of the
+-- outage's start; a replica down longer is replaced, never rejoined, even
+-- after repair; and the replacement node is repaired once it has
+-- bootstrapped, as Cassandra's replace-node procedure requires when the old
+-- node was down longer than max_hint_window. Resurrection is narrowed, not
+-- ruled out (ADR-aacruzgon-0027).
 -- resources_by_type also carries fhir_version, so count can apply the
 -- request's FHIR version (SearchQuery.fhir_version, upstream #2254) without a
 -- point read per row (ADR-aacruzgon-0026).

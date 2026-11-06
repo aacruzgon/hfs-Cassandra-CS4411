@@ -11,8 +11,9 @@
 //! of `helios_rest::create_app`), plus [`Backend`](crate::core::Backend) and
 //! [`SearchCapabilityProvider`](crate::core::SearchCapabilityProvider). In
 //! this step the connection, the health and schema checks, the capability
-//! declaration and the per-tenant search-parameter registries are real; every
-//! storage, search and history method refuses with
+//! declaration, the per-tenant search-parameter registries, `create`, `read`
+//! and `count` are real; every other storage, search and history method
+//! refuses with
 //! [`BackendError::UnsupportedCapability`](crate::error::BackendError), which
 //! the REST layer answers with 501. Later steps replace the stubs in their own
 //! files.
@@ -46,11 +47,14 @@
 mod backend;
 mod config;
 mod errors;
+mod index_keys;
+mod read;
 mod schema;
 mod search;
 mod session;
 mod storage;
 mod stubs;
+mod write;
 
 pub use backend::{CassandraBackend, CassandraConnection};
 pub use config::{

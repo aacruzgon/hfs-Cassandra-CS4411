@@ -1,9 +1,11 @@
 //! [`ResourceStorage`] and [`VersionedStorage`] for [`CassandraBackend`].
 //!
-//! Step 2 (roadmap) stubs every method here; `create` and `read` become real
-//! in the next layer, and Step 3 and Step 4 fill in the rest. A stub returns
+//! Roadmap Step 2 serves `create` (`write.rs`), `read` and `count`
+//! (`read.rs`); Step 3 and Step 4 fill in the rest. A stub returns
 //! [`BackendError::UnsupportedCapability`](crate::error::BackendError), which
-//! the REST layer answers with 501.
+//! the REST layer answers with 501. `count` is pulled forward from Step 3
+//! with the `resources_by_type` row every create writes, so the conformance
+//! seeder, which counts before it creates, works at boot.
 //!
 //! The provided defaults the design lists as wrong for a networked store are
 //! overridden here (`cassandra-discussion.md`, "Defaults we must override"):
@@ -47,12 +49,13 @@ impl ResourceStorage for CassandraBackend {
 
     async fn create(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _resource: Value,
-        _fhir_version: FhirVersion,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
-        Err(unsupported("create"))
+        self.create_resource(tenant, resource_type, resource, fhir_version)
+            .await
     }
 
     async fn create_or_update(
@@ -68,11 +71,11 @@ impl ResourceStorage for CassandraBackend {
 
     async fn read(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _id: &str,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
     ) -> StorageResult<Option<StoredResource>> {
-        Err(unsupported("read"))
+        self.read_resource(tenant, resource_type, id).await
     }
 
     async fn update(
@@ -109,10 +112,10 @@ impl ResourceStorage for CassandraBackend {
 
     async fn count(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: Option<&str>,
+        tenant: &TenantContext,
+        resource_type: Option<&str>,
     ) -> StorageResult<u64> {
-        Err(unsupported("count"))
+        self.count_resources(tenant, resource_type).await
     }
 
     fn bulk_write_concurrency(&self) -> usize {

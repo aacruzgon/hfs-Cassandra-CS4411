@@ -189,7 +189,6 @@ impl CassandraBackend {
     /// anything whose `url` the shared base already holds, so seeding the spec
     /// SearchParameters (R6 ships them `active`) does not rebuild the registry
     /// once per resource (#667).
-    #[allow(dead_code)] // Called by the write path from Step 2's create on.
     pub(super) fn note_stored_search_parameter(
         &self,
         tenant_id: &str,

@@ -454,6 +454,19 @@ impl Hfs {
         self.output.lock().expect("output lock").clone()
     }
 
+    /// `VmHWM` from `/proc/<pid>/status`, in KiB: the peak resident set so
+    /// far. Linux only.
+    fn peak_rss_kib(&self) -> Option<u64> {
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
+    }
+
     /// Kills `hfs` and returns its whole output, once both pipes are read to
     /// the end, so no line it wrote is still in a pipe.
     fn stop_and_output(mut self) -> String {
@@ -715,6 +728,20 @@ const BOOT_REPORT_VAR: &str = "HFS_TEST_BOOT_REPORT";
 /// is a warning in the report, never a test failure.
 const SEED_BUDGET: Duration = Duration::from_secs(10);
 
+/// A warning, not a gate, when one boot's stored-SearchParameter load takes
+/// longer. The load runs on every boot, warm ones included, and on every TTL
+/// refresh. It scans `resources_by_type`'s partition keys (`SELECT DISTINCT`
+/// over the whole table) for the tenants with a SearchParameter partition,
+/// then reads each one: an id scan, then one point read per row. A seeded
+/// tenant's partition holds 1,372 spec definitions, all read and then
+/// skipped, so the seeded tenants are nearly all of the cost. 5 s is half the
+/// 10 s seeding budget: the seed is paid once per tenant, the load on every
+/// start, so it gets the stricter line. At the 0.2 s per seeded tenant
+/// measured so far, that is about 25 seeded tenants on one node. CI's fresh
+/// node only ever has three, so there the line catches a slowdown per tenant
+/// (about 8×), not growth in their number.
+const STORED_LOAD_WARN: Duration = Duration::from_secs(5);
+
 /// Fresh-tenant boots; one warm boot follows, on the last fresh tenant.
 const FRESH_BOOTS: usize = 3;
 
@@ -834,6 +861,9 @@ struct Boot {
     seed_warnings: Vec<String>,
     /// `hfs`'s whole output, kept next to the report as the figures' source.
     log: String,
+    /// The process's peak resident set (`VmHWM`) once it serves, in KiB, on
+    /// Linux; `None` elsewhere.
+    peak_rss_kib: Option<u64>,
 }
 
 impl Boot {
@@ -846,6 +876,9 @@ impl Boot {
         let mut hfs = Hfs::start(contact_point, tenant, true);
         hfs.wait_until_serving().await;
         let to_metadata = launched.elapsed();
+        // Read while the process is alive: the seed and the load are done by
+        // the time it serves, so this is the boot's peak.
+        let peak_rss_kib = hfs.peak_rss_kib();
         // Killed before the next boot, so two never share the node; the
         // output is read once both pipes are drained.
         let output = hfs.stop_and_output();
@@ -937,6 +970,7 @@ impl Boot {
             seeded,
             seed_warnings,
             log: output,
+            peak_rss_kib,
         }
     }
 
@@ -972,6 +1006,7 @@ impl Boot {
             "created": self.created(),
             "seeded": seeded,
             "seed_warnings": self.seed_warnings,
+            "peak_rss_mib": self.peak_rss_kib.map(|kib| round(kib as f64 / 1024.0)),
         })
     }
 }
@@ -1059,6 +1094,19 @@ async fn boot_report(runs: &[Boot], contact_point: &str, node: &str) -> Value {
             ));
         }
     }
+    let worst_load = runs
+        .iter()
+        .filter_map(|run| run.stored_load.map(|(ms, ..)| ms))
+        .fold(0.0_f64, f64::max);
+    let load_warn_ms = STORED_LOAD_WARN.as_secs_f64() * 1000.0;
+    if worst_load > load_warn_ms {
+        warnings.push(format!(
+            "Boot-time report: a boot's stored-SearchParameter load took {:.2} s, over the {} s \
+             line proposed for it; it reads every seeded tenant's SearchParameter partition",
+            worst_load / 1000.0,
+            STORED_LOAD_WARN.as_secs()
+        ));
+    }
     let (cassandra_version, cassandra_version_source) = cassandra_version(contact_point).await;
     json!({
         "report": "boot-time",
@@ -1069,6 +1117,12 @@ async fn boot_report(runs: &[Boot], contact_point: &str, node: &str) -> Value {
                       threshold, not a gate",
         },
         "worst_fresh_tenant_seed_ms": round(worst),
+        "stored_load_warning": {
+            "above_ms": load_warn_ms,
+            "basis": "proposed: half the seeding budget, because the load runs on every boot \
+                      and every TTL refresh",
+        },
+        "worst_stored_load_ms": round(worst_load),
         "within_budget": worst <= budget_ms,
         "context": {
             "commit": commit(),
@@ -1119,8 +1173,8 @@ fn boot_markdown(report: &Value, runs: &[Boot]) -> String {
     );
     md.push_str(
         "| Run | Launch → `/metadata` 200 | Launch → backend init | Connect + base registry | `initialize` + seed \
-         | Stored SearchParameter load | Launch → listening | Created |\n\
-         | --- | --- | --- | --- | --- | --- | --- | --- |\n",
+         | Stored SearchParameter load | Launch → listening | Created | Peak RSS |\n\
+         | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n",
     );
     for run in runs {
         let load = run.stored_load.map_or_else(
@@ -1143,8 +1197,12 @@ fn boot_markdown(report: &Value, runs: &[Boot]) -> String {
                 .collect::<Vec<_>>()
                 .join(" + ")
         };
+        let rss = run.peak_rss_kib.map_or_else(
+            || "n/a".to_owned(),
+            |kib| format!("{:.0} MiB", kib as f64 / 1024.0),
+        );
         md.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {load} | {} | {created} |\n",
+            "| {} | {} | {} | {} | {} | {load} | {} | {created} | {rss} |\n",
             run.label,
             seconds(run.to_metadata_ms),
             seconds(run.to_backend_init_ms),
@@ -1152,6 +1210,42 @@ fn boot_markdown(report: &Value, runs: &[Boot]) -> String {
             seconds(run.seed_ms),
             seconds(run.to_listening_ms),
         ));
+    }
+
+    let worst_load = report["worst_stored_load_ms"].as_f64().unwrap_or(0.0);
+    md.push_str(&format!(
+        "\n**The stored-SearchParameter load against the node's tenants.** It runs on every boot \
+         and every TTL refresh, and reads every seeded tenant's 1,372-row SearchParameter \
+         partition: an id scan, then a point read per row, all spec definitions it then skips. \
+         Each fresh run adds one seeded tenant, so the change from the run before is the cost \
+         of one; tenants without the seed hold a few rows and cost little. Worst load: **{}**; \
+         a load over {} s (half the seeding budget, a proposed line) is a warning.\n\n\
+         | Run | Tenants with a SearchParameter | Stored (non-spec) | Load | Change from the run before |\n\
+         | --- | --- | --- | --- | --- |\n",
+        seconds(worst_load),
+        STORED_LOAD_WARN.as_secs(),
+    ));
+    let mut previous: Option<(f64, u64)> = None;
+    for run in runs {
+        match run.stored_load {
+            Some((ms, tenants, stored)) => {
+                let change = match previous {
+                    Some((before, before_tenants)) => format!(
+                        "{:+.2} s for {:+} tenant(s)",
+                        (ms - before) / 1000.0,
+                        tenants as i64 - before_tenants as i64
+                    ),
+                    None => "–".to_owned(),
+                };
+                md.push_str(&format!(
+                    "| {} | {tenants} | {stored} | {} | {change} |\n",
+                    run.label,
+                    seconds(ms)
+                ));
+                previous = Some((ms, tenants));
+            }
+            None => md.push_str(&format!("| {} | – | – | no line | – |\n", run.label)),
+        }
     }
     let text = |value: &Value| match value {
         Value::String(s) => s.clone(),
@@ -1165,7 +1259,7 @@ fn boot_markdown(report: &Value, runs: &[Boot]) -> String {
          local-DC check and the spec file's SearchParameter parse, which no line separates. \
          The first run's launch includes the first start of a newly built binary. The \
          stored-SearchParameter load reads every tenant on the node, so it grows with each \
-         fresh run. Each boot's `hfs` log is in the artifact (`hfs-<run>.log`). Commit `{}`, runner `{}`, `{}` build, {} \
+         fresh run. Peak RSS is `VmHWM` once `hfs` serves (Linux only). Each boot's `hfs` log is in the artifact (`hfs-<run>.log`). Commit `{}`, runner `{}`, `{}` build, {} \
          CPUs, Cassandra {} ({}), node {} at `{}`.\n",
         runs.first().map_or("?", |run| run.seed_end),
         text(&context["commit"]),

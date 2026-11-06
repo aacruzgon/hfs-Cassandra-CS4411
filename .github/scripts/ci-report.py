@@ -23,7 +23,10 @@ Commands:
 
   context [--cassandra-container NAME]
   add ID TITLE --markdown FILE [--json FILE]
-  build ID TITLE -- COMMAND...      run COMMAND, sampling the job's cgroup
+  build ID TITLE -- COMMAND...      run COMMAND, sampling the job's cgroup; with
+                                    cargo's --timings, keep its HTML and top units
+  timed GROUP LABEL -- COMMAND...   run COMMAND and record its wall time in GROUP
+  node-start ID TITLE CONTAINER GROUP  the node's boot to CQL, and GROUP's times
   tests ID TITLE LOG...             parse libtest output (`-- --show-output`)
   readiness ID TITLE LOG            the readiness test's `[key=ms]` pairs
   node-stats ID TITLE CONTAINER     nodetool and system_views on a node
@@ -230,6 +233,7 @@ def cmd_build(args) -> int:
     if sampler:
         sampler.start()
     started = time.monotonic()
+    started_wall = time.time()
     try:
         status = subprocess.call(command)
     except OSError as error:
@@ -240,13 +244,61 @@ def cmd_build(args) -> int:
     if sampler:
         sampler.join()
     try:
-        report_build(args, command, status, wall, group, sampled, peaks, oom_kills(group) - oom_before if sampled else None)
+        timings = keep_timings(args.id, started_wall) if "--timings" in command else None
+        report_build(args, command, status, wall, group, sampled, peaks, oom_kills(group) - oom_before if sampled else None, timings)
     except Exception as error:  # noqa: BLE001
         warn(f"{args.title}: the build report failed: {error!r}")
     return status
 
 
-def report_build(args, command, status, wall, group, sampled, peaks, oom) -> None:
+def keep_timings(report_id: str, since: float) -> dict:
+    """cargo --timings writes target/cargo-timings/cargo-timing-<time>.html and
+    a copy, cargo-timing.html. Keep this build's copy in the report, read its
+    unit data, and delete the older timestamped files: the target dir is
+    persistent, so they would otherwise pile up run after run."""
+    target = Path(os.environ.get("CARGO_TARGET_DIR") or "target")
+    directory = target / "cargo-timings"
+    html = directory / "cargo-timing.html"
+    try:
+        fresh = html.stat().st_mtime >= since - 1
+    except OSError:
+        return {"html": None, "note": f"{html} was not written"}
+    for old in directory.glob("cargo-timing-*.html"):
+        try:
+            if old.stat().st_mtime < since - 1:
+                old.unlink()
+        except OSError:
+            pass
+    if not fresh:
+        return {"html": None, "note": f"{html} is older than this build"}
+    text = html.read_text(errors="replace")
+    (report_dir() / f"{report_id}-timings.html").write_text(text)
+    match = re.search(r"const UNIT_DATA = (\[.*?\]);\s*$", text, re.MULTILINE | re.DOTALL)
+    units = []
+    if match:
+        try:
+            units = json.loads(match.group(1))
+        except ValueError:
+            units = []
+    rows = sorted(
+        # cargo names every unit that is not a build script "todo".
+        ({"unit": " ".join(f"{u.get('name')} {u.get('version', '')} {u.get('target', '')}".split()),
+          "mode": "compile" if u.get("mode") == "todo" else u.get("mode"),
+          "seconds": round(float(u.get("duration") or 0), 2)} for u in units),
+        key=lambda u: -u["seconds"],
+    )
+    total = re.search(r"<td>Total time:</td><td>([^<]+)</td>", text)
+    fresh_units = re.search(r"<td>Fresh units:</td><td>([^<]+)</td>", text)
+    return {
+        "html": f"{report_id}-timings.html",
+        "units": len(units),
+        "total_time": total.group(1) if total else None,
+        "fresh_units": fresh_units.group(1) if fresh_units else None,
+        "slowest": rows[:10],
+    }
+
+
+def report_build(args, command, status, wall, group, sampled, peaks, oom, timings=None) -> None:
     memory_max = read(group / "memory.max") if group else None
     runner = context()["runner"]
     print(
@@ -267,6 +319,7 @@ def report_build(args, command, status, wall, group, sampled, peaks, oom) -> Non
         "memory_max": memory_max,
         "oom_kills": oom,
         "cargo_build_jobs": os.environ.get("CARGO_BUILD_JOBS"),
+        "timings": timings,
         "warnings": [],
     }
     if oom:
@@ -293,7 +346,99 @@ def report_build(args, command, status, wall, group, sampled, peaks, oom) -> Non
         "cannot reclaim and must fit the cap; `memory.current` includes page cache, which fills "
         "the cgroup up to the cap (ADR-aacruzgon-0023).\n"
     )
+    # Cold or warm: L10's "Target directory size" section says whether the
+    # reset step reset the directory.
+    if timings and timings.get("html"):
+        md += (f"\n`cargo --timings`: {timings['units']} units compiled, {timings.get('fresh_units') or '?'} already up to "
+               f"date, total {timings.get('total_time') or '?'}; the full chart is `{timings['html']}` in the artifact.")
+        if timings["slowest"]:
+            md += " Slowest units:\n\n" + table(["Unit", "Mode", "Time"], [[f"`{u['unit']}`", u["mode"], f"{u['seconds']:.1f} s"] for u in timings["slowest"]])
+        else:
+            md += "\n"
+    elif timings:
+        md += f"\n`cargo --timings`: {timings['note']}.\n"
     add(args.id, args.title, md, data)
+
+
+# --- timed commands and the node's start ---------------------------------
+
+
+def cmd_timed(args) -> int:
+    """Runs COMMAND, appends {"label", "seconds", "exit_status"} to
+    inputs/<group>.jsonl, and exits with COMMAND's status."""
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    started = time.monotonic()
+    try:
+        status = subprocess.call(command)
+    except OSError as error:
+        print(f"{command[0]}: {error}", file=sys.stderr)
+        status = 127
+    seconds = time.monotonic() - started
+    try:
+        inputs = report_dir() / "inputs"
+        inputs.mkdir(exist_ok=True)
+        with open(inputs / f"{args.group}.jsonl", "a", encoding="utf-8") as out:
+            out.write(json.dumps({"label": args.label, "seconds": round(seconds, 2), "exit_status": status}) + "\n")
+        print(f"{args.label}: {seconds:.1f} s", flush=True)
+    except Exception as error:  # noqa: BLE001
+        warn(f"timed {args.label}: could not record the time: {error!r}")
+    return status
+
+
+CQL_LISTENING = "Starting listening for CQL clients"
+
+
+def iso(text: str):
+    """A docker timestamp (RFC 3339, nanoseconds) as seconds since the epoch."""
+    from datetime import datetime
+
+    match = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)", text.strip())
+    if not match:
+        return None
+    zone = "+00:00" if match.group(3) == "Z" else match.group(3)
+    base = datetime.fromisoformat(match.group(1) + zone).timestamp()
+    return base + float("0." + match.group(2)) if match.group(2) else base
+
+
+def cmd_node_start(args) -> int:
+    rows = []
+    path = report_dir() / "inputs" / f"{args.group}.jsonl"
+    for line in (read(path) or "").splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+    # From the container's own clock: its start to the native transport's
+    # line, which is when CQL could first answer, without the healthcheck's
+    # polling interval.
+    started_text = (run(["docker", "inspect", "-f", "{{.State.StartedAt}}", args.container]) or "").strip()
+    started = iso(started_text)
+    logs = None
+    if started_text:
+        # Only the log since the container's last start, so a restarted
+        # container's earlier boot is not read.
+        try:
+            logs = subprocess.run(["docker", "logs", "--timestamps", "--since", started_text, args.container],
+                                  capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            logs = None
+    listening = None
+    for line in ((logs.stdout + logs.stderr) if logs else "").splitlines():
+        if CQL_LISTENING in line:
+            listening = iso(line.split(" ", 1)[0])
+            break
+    to_cql = round(listening - started, 2) if started and listening else None
+    warnings = []
+    if to_cql is None:
+        warnings.append(f"Node start: no {CQL_LISTENING!r} line, or no start time, for {args.container}")
+    if not rows:
+        warnings.append(f"Node start: no timed steps in {path.name}")
+    md = table(["Step", "Wall time", "Result"], [[r["label"], f"{r['seconds']:.1f} s", "ok" if r["exit_status"] == 0 else f"exit {r['exit_status']}"] for r in rows])
+    md += (f"\nContainer start → \"{CQL_LISTENING}\" (from the container's own log timestamps): "
+           f"{'%.1f s' % to_cql if to_cql is not None else 'not read'}. The healthcheck then needs `cqlsh` to answer, "
+           "polled every 10 s, so the start step's wall time is longer.\n")
+    add(args.id, args.title, md, {"container": args.container, "container_start_to_cql_s": to_cql, "steps": rows, "warnings": warnings})
+    return 0
 
 
 # --- tests: libtest output -------------------------------------------------
@@ -538,15 +683,82 @@ def cas_counts(out: str) -> dict:
     return counts
 
 
+def node_info(out: str) -> dict:
+    info = {}
+    for line in out.splitlines():
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if key == "Heap Memory (MB)":
+            used, _, total = value.partition("/")
+            info["heap_used_mb"], info["heap_total_mb"] = number(used.strip()), number(total.strip())
+        elif key == "Off Heap Memory (MB)":
+            info["off_heap_mb"] = number(value)
+        elif key == "Uptime (seconds)":
+            info["uptime_s"] = number(value)
+        elif key == "Load":
+            info["load"] = value
+    return info
+
+
+def gc_stats(out: str) -> dict:
+    """`nodetool gcstats`: a header line, then one line of values."""
+    lines = [line for line in out.splitlines() if line.strip()]
+    for index, line in enumerate(lines[:-1]):
+        if "Interval" in line and "GC" in line:
+            values = lines[index + 1].split()
+            names = ["interval_ms", "max_gc_elapsed_ms", "total_gc_elapsed_ms", "stdev_gc_elapsed_ms",
+                     "gc_reclaimed_mb", "collections", "direct_memory_bytes"]
+            return {name: number(value) for name, value in zip(names, values)}
+    return {}
+
+
+def compaction_stats(out: str) -> dict:
+    # 5.0 prints "pending tasks  0" (4.x: "pending tasks: 0").
+    stats = {}
+    for key, name in [("pending tasks", "pending"), ("compactions completed", "completed"), ("compactions aborted", "aborted")]:
+        found = re.search(rf"^{key}:?\s+(\d+)\s*$", out, re.MULTILINE)
+        if found:
+            stats[name] = int(found.group(1))
+    match = "pending" in stats
+    # Each active compaction is a row under the header that starts with "id".
+    rows, header = 0, False
+    for line in out.splitlines():
+        cells = line.split()
+        if cells[:1] == ["id"]:
+            header = True
+        elif header and cells and not line.strip().startswith("active compaction remaining time"):
+            rows += 1
+    if match:
+        stats["active"] = rows
+    return stats
+
+
+def container_memory(out: str) -> dict:
+    memory = {}
+    for line in out.splitlines():
+        key, _, value = line.strip().partition(" ")
+        value = value.strip()
+        memory[key] = int(value) if value.isdigit() else (None if value in ("", "max") else value)
+    return memory
+
+
 def cmd_node_stats(args) -> int:
     container = args.container
     started = time.monotonic()
     nodetool = lambda *a: run(["docker", "exec", container, "nodetool", *a], timeout=120)
     raw = {
+        # First: every nodetool call below is a JVM in the container's cgroup
+        # (with the compose file's MAX_HEAP_SIZE), and would raise its peak.
+        "container_memory": run(["docker", "exec", container, "sh", "-c",
+                                 "cd /sys/fs/cgroup && for f in memory.peak memory.current memory.max; do echo \"$f $(cat $f 2>/dev/null)\"; done; "
+                                 "grep -E '^(anon|file) ' memory.stat; grep -E '^(oom|oom_kill) ' memory.events; true"]),
         "tablestats": nodetool("tablestats", args.keyspace),
         "tpstats": nodetool("tpstats"),
         "proxyhistograms": nodetool("proxyhistograms"),
         "cas": nodetool("sjk", "mx", "-mg", "-all", "-f", "Count", "-b", "org.apache.cassandra.metrics:type=ClientRequest,scope=CAS*,name=*"),
+        "info": nodetool("info"),
+        "gcstats": nodetool("gcstats"),
+        "compactionstats": nodetool("compactionstats"),
         "system_views": run(["docker", "exec", container, "cqlsh", "-e", " ".join(
             f"SELECT JSON * FROM system_views.{t} WHERE keyspace_name = '{args.keyspace}';" for t in VIRTUAL_TABLES
         )], timeout=120),
@@ -559,6 +771,10 @@ def cmd_node_stats(args) -> int:
     pools, dropped = tpstats(raw["tpstats"] or "")
     cas = cas_counts(raw["cas"] or "")
     histogram = proxy_cas(raw["proxyhistograms"] or "")
+    jvm = node_info(raw["info"] or "")
+    gc = gc_stats(raw["gcstats"] or "")
+    compaction = compaction_stats(raw["compactionstats"] or "")
+    memory = container_memory(raw["container_memory"] or "")
     took = time.monotonic() - started
 
     def view(name: str, table_name: str, key: str):
@@ -597,6 +813,27 @@ def cmd_node_stats(args) -> int:
     md += "\n**Thread pools** (`nodetool tpstats`, pools with any work):\n\n"
     md += table(["Pool", "Active", "Pending", "Completed", "Blocked", "All-time blocked"],
                 [[p["pool"], p["active"], p["pending"], p["completed"], p["blocked"], p["all_time_blocked"]] for p in busy])
+    md += "\n**JVM and container** (`nodetool info`, `gcstats` since the last call, `compactionstats`; the container's cgroup):\n\n"
+    mib = lambda b: None if b is None else f"{b / MIB:,.0f} MiB"
+    md += table(["Figure", "Value"], [
+        ["Heap used / total", f"{jvm.get('heap_used_mb')} / {jvm.get('heap_total_mb')} MB" if jvm.get("heap_used_mb") is not None else None],
+        ["Off heap", f"{jvm.get('off_heap_mb')} MB" if jvm.get("off_heap_mb") is not None else None],
+        ["Uptime", f"{jvm.get('uptime_s')} s" if jvm.get("uptime_s") is not None else None],
+        ["GC collections / total pause / max pause", f"{gc.get('collections')} / {gc.get('total_gc_elapsed_ms')} ms / {gc.get('max_gc_elapsed_ms')} ms" if gc else None],
+        ["Compactions pending / active / completed / aborted", f"{compaction.get('pending')} / {compaction.get('active')} / {compaction.get('completed')} / {compaction.get('aborted')}" if compaction else None],
+        ["Container memory peak / limit", f"{mib(memory.get('memory.peak'))} / {mib(memory.get('memory.max'))}" if memory.get("memory.peak") is not None else None],
+        ["Container memory now (anon, page cache)", f"{mib(memory.get('memory.current'))} ({mib(memory.get('anon'))}, {mib(memory.get('file'))})" if memory.get("memory.current") is not None else None],
+        ["Container OOM kills", memory.get("oom_kill")],
+    ])
+    if memory.get("memory.peak") is not None and memory.get("memory.max"):
+        share = memory["memory.peak"] / memory["memory.max"]
+        md += (f"\nThe peak is {share:.0%} of the limit (ADR-aacruzgon-0002), page cache included; it covers the node's life up to "
+               "this snapshot, read before this step's own `nodetool` calls. Anything run in the container counts against the "
+               "same limit: the healthcheck's `cqlsh` and every `docker exec`, `nodetool` included (a JVM each).\n")
+        if share > 0.9:
+            warnings.append(f"Node statistics: the container's memory peak is {share:.0%} of its limit")
+    if memory.get("oom_kill"):
+        warnings.append(f"Node statistics: {memory['oom_kill']} OOM kill(s) in the Cassandra container")
     dropped_any = [d for d in dropped if d["dropped"]]
     md += "\nDropped messages: " + (", ".join(f"{d['message_type']} {d['dropped']}" for d in dropped_any) or "none") + ".\n"
     md += (
@@ -611,6 +848,7 @@ def cmd_node_stats(args) -> int:
         warnings.append("Node statistics: the node dropped messages: " + ", ".join(d["message_type"] for d in dropped_any))
     data = {"container": container, "keyspace": args.keyspace, "seconds": round(took, 1), "tables": tables,
             "system_views": views, "cas_counts": cas, "cas_latency_us": histogram, "thread_pools": pools,
+            "jvm": jvm, "gc": gc, "compaction": compaction, "container_memory": memory,
             "dropped_messages": dropped, "warnings": warnings}
     add(args.id, args.title, md, data)
     return 0
@@ -622,7 +860,12 @@ def main() -> int:
     c = commands.add_parser("context")
     c.add_argument("--cassandra-container")
     c.set_defaults(func=cmd_context)
-    for name, func in [("add", cmd_add), ("build", cmd_build), ("tests", cmd_tests), ("readiness", cmd_readiness), ("node-stats", cmd_node_stats)]:
+    c = commands.add_parser("timed")
+    c.add_argument("group")
+    c.add_argument("label")
+    c.add_argument("command", nargs=argparse.REMAINDER)
+    c.set_defaults(func=cmd_timed)
+    for name, func in [("add", cmd_add), ("build", cmd_build), ("tests", cmd_tests), ("readiness", cmd_readiness), ("node-stats", cmd_node_stats), ("node-start", cmd_node_start)]:
         c = commands.add_parser(name)
         c.add_argument("id")
         c.add_argument("title")
@@ -639,8 +882,11 @@ def main() -> int:
         elif name == "node-stats":
             c.add_argument("container")
             c.add_argument("--keyspace", default="helios")
+        elif name == "node-start":
+            c.add_argument("container")
+            c.add_argument("group")
     args = parser.parse_args()
-    if args.cmd != "build":
+    if args.cmd not in ("build", "timed"):
         # A report must never fail the job: an unexpected error is a warning.
         try:
             return args.func(args)

@@ -213,7 +213,8 @@ jobs:
       # Wrapped in ci-report.py build, which samples the runner's cgroup every
       # second and reports the wall time and the memory peaks
       # (ADR-aacruzgon-0023, ADR-sam-michaels-0003). It exits with clippy's
-      # status.
+      # status. --timings writes cargo's per-unit chart, which the report
+      # keeps in the artifact; it does not change what is built.
       - name: cargo clippy -p helios-fhir --all-targets --all-features, one job at a time
         env:
           CARGO_BUILD_JOBS: 1
@@ -223,7 +224,7 @@ jobs:
           CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           python3 .github/scripts/ci-report.py build build-clippy-fhir "Build: cargo clippy (helios-fhir)" -- \
-          nice -n 10 cargo clippy -p helios-fhir --all-targets --all-features -- -D warnings \
+          nice -n 10 cargo clippy -p helios-fhir --all-targets --all-features --timings -- -D warnings \
               -A clippy::items_after_test_module \
               -A clippy::large_enum_variant \
               -A clippy::question_mark \
@@ -342,7 +343,7 @@ jobs:
           CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           python3 .github/scripts/ci-report.py build build-clippy-workspace "Build: cargo clippy (workspace)" -- \
-          nice -n 10 cargo clippy --workspace --exclude helios-fhir --all-targets --all-features \
+          nice -n 10 cargo clippy --workspace --exclude helios-fhir --all-targets --all-features --timings \
             --features helios-fhir/skip-r6-download -- -D warnings \
               -A clippy::items_after_test_module \
               -A clippy::large_enum_variant \
@@ -469,7 +470,9 @@ jobs:
       # whenever the cache fills it; and memory.stat's anon, the memory the
       # kernel cannot reclaim, which is the one that must stay under the cap.
       # It also reports the OOM kills during the build and the wall time, on
-      # a failed build too, and exits with cargo's status.
+      # a failed build too, and exits with cargo's status. --timings writes
+      # cargo's per-unit chart, which the report keeps in the artifact; it
+      # does not change the build, so the test steps below rebuild nothing.
       # nice, as for clippy: sam-7900x is also Sam's desktop.
       # The Milestone A test (crates/hfs/tests/cassandra_milestone_a.rs) is
       # built here too: hfs with only the cassandra backend, and the test
@@ -480,11 +483,11 @@ jobs:
           python3 .github/scripts/ci-report.py build build-persistence-tests \
             "Build: helios-persistence Cassandra tests" -- \
             nice -n 10 cargo test -p helios-persistence --features cassandra \
-              --test cassandra_tests --test backend_capability_contract --no-run
+              --test cassandra_tests --test backend_capability_contract --no-run --timings
           python3 .github/scripts/ci-report.py build build-hfs-milestone-a \
             "Build: hfs (R4, cassandra) and the Milestone A test" -- \
             nice -n 10 cargo test -p helios-hfs --no-default-features --features R4,cassandra \
-              --test cassandra_milestone_a --no-run
+              --test cassandra_milestone_a --no-run --timings
 
       # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
       - name: Remove leftovers of an earlier run
@@ -492,11 +495,12 @@ jobs:
 
       # First boot takes about 60 s; the healthcheck allows a 90 s start
       # period and then 12 retries 10 s apart.
+      # Timed with ci-report.py timed, which exits with the command's status;
+      # the node-start report below reads the times.
       - name: Start Cassandra and wait for its healthcheck
         run: |
-          start=$(date +%s)
-          docker compose -p hfs-cassandra-ci up -d --wait --wait-timeout 240
-          echo "Healthy after $(( $(date +%s) - start )) s"
+          python3 .github/scripts/ci-report.py timed node-start "Start and healthcheck (compose up --wait)" -- \
+            docker compose -p hfs-cassandra-ci up -d --wait --wait-timeout 240
 
       # The context every later report section carries, now with the node's
       # Cassandra version. Report only.
@@ -506,10 +510,12 @@ jobs:
 
       - name: Apply keyspace-single-node.cql, then schema.cql
         run: |
-          cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
-            -f docs/Cassandra/schema/keyspace-single-node.cql
-          cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
-            -k helios -f docs/Cassandra/schema/schema.cql
+          python3 .github/scripts/ci-report.py timed node-start "Apply keyspace-single-node.cql" -- \
+            cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
+              -f docs/Cassandra/schema/keyspace-single-node.cql
+          python3 .github/scripts/ci-report.py timed node-start "Apply schema.cql (ten tables)" -- \
+            cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
+              -k helios -f docs/Cassandra/schema/schema.cql
 
       # docs/Cassandra/schema/README.md: every statement is IF NOT EXISTS, so a
       # second apply is silent, and the keyspace holds the design's ten tables.
@@ -550,6 +556,16 @@ jobs:
           } > "$actual"
           diff -u docs/Cassandra/schema/expected-schema.txt "$actual"
           echo "schema matches docs/Cassandra/schema/expected-schema.txt ($(grep -vc '^#' "$actual") rows)"
+
+      # The start and apply times above, and the container's start to its CQL
+      # line from its own log timestamps, which the 10 s healthcheck interval
+      # does not round. Report only.
+      # Only after a build that passed: without one, no node was started.
+      - name: Report the node's start and schema apply
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: python3 .github/scripts/ci-report.py node-start node-start "Cassandra start and schema apply" hfs-cassandra-ci-cassandra-1 node-start
 
       # ADR-aacruzgon-0020, Rule 1: the tests use this job's node, with the
       # schema just applied, through its published port, as cqlsh does above.

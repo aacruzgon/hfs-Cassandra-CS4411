@@ -10,6 +10,7 @@
 //! | SQLite | `sqlite` | Lightweight embedded database, great for development |
 //! | PostgreSQL | `postgres` | Full-featured RDBMS with JSONB support |
 //! | MongoDB | `mongodb` | Document store with native JSON support |
+//! | Cassandra | `cassandra` | Wide-column store; standalone primary, in progress (roadmap Step 2: the connection and every trait in place, storage methods refuse with 501) |
 //! | Elasticsearch | `elasticsearch` | Full-text search optimized |
 //! | S3 | `s3` | Object storage for bulk data |
 //!
@@ -18,12 +19,11 @@
 //!
 //! # Not Implemented
 //!
-//! The `cassandra` and `neo4j` cargo features exist and pull in driver
-//! dependencies, but no backend is implemented behind them — enabling them adds
-//! no storage capability. [`BackendKind::Cassandra`](crate::core::BackendKind)
-//! and [`BackendKind::Neo4j`](crate::core::BackendKind) are likewise accepted by
-//! the composite router configuration and the configuration advisor, but cannot
-//! be instantiated.
+//! The `neo4j` cargo feature exists and pulls in its driver dependency, but no
+//! backend is implemented behind it — enabling it adds no storage capability.
+//! [`BackendKind::Neo4j`](crate::core::BackendKind) is likewise accepted by the
+//! composite router configuration and the configuration advisor, but cannot be
+//! instantiated.
 //!
 //! # Example
 //!
@@ -53,10 +53,10 @@ pub mod postgres;
 
 /// Local filesystem [`ExportOutputStore`](crate::core::bulk_export_output::ExportOutputStore).
 pub mod local_fs;
-//
-// #[cfg(feature = "cassandra")]
-// pub mod cassandra;
-//
+
+#[cfg(feature = "cassandra")]
+pub mod cassandra;
+
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 //

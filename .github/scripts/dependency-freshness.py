@@ -18,9 +18,9 @@ and how to reach its owner.
 
 Usage: dependency-freshness.py <out-dir>
 Writes <out-dir>/dependency-freshness.json and .md and prints the Markdown.
-The JSON's top-level "warnings" list has one entry per crate a major
-(semver-incompatible) version behind, or whose locked version is yanked;
-`ci-report.py add` turns each into a ::warning:: annotation.
+The JSON's top-level "warnings" list holds at most two entries, one naming
+every crate a major (semver-incompatible) version behind and one naming every
+yanked locked version; `ci-report.py add` turns each into a ::warning::.
 Exits non-zero only when the measurement itself cannot run (no cargo
 metadata); an unreachable crates.io is reported, not failed.
 """
@@ -152,7 +152,8 @@ def main():
 
     crates = chosen_crates(metadata())
     rows = []
-    warnings = []
+    warnings = []  # one entry per crate a major version behind
+    yanked_locks = []
     last_request = 0.0
     for name, (locked, why) in crates.items():
         wait = REQUEST_INTERVAL_S - (time.monotonic() - last_request)
@@ -176,11 +177,7 @@ def main():
             gap = "compatible"
         else:
             gap = "major"
-            warnings.append(
-                f"{name} {locked} is a major version behind crates.io's {latest} "
-                f"(released {dates.get(latest, '?')}): read its changelog before "
-                "working around a bug in it"
-            )
+            warnings.append(f"{name} {locked} → {latest} ({dates.get(latest, '?')})")
         row.update(
             {
                 "latest": latest,
@@ -191,10 +188,20 @@ def main():
             }
         )
         if locked in yanked:
-            warnings.append(f"{name} {locked} is locked, and crates.io has yanked it")
+            yanked_locks.append(f"{name} {locked}")
         rows.append(row)
 
     elapsed = round(time.monotonic() - started, 1)
+    # One annotation per kind, not one per crate, so a run page stays readable.
+    summary_warnings = []
+    if warnings:
+        summary_warnings.append(
+            f"{len(warnings)} dependencies a major (semver-incompatible) version behind "
+            f"crates.io: {'; '.join(warnings)}. Check their changelogs before working "
+            "around a bug in one."
+        )
+    if yanked_locks:
+        summary_warnings.append(f"Cargo.lock holds versions crates.io has yanked: {'; '.join(yanked_locks)}")
     counts = {g: sum(1 for r in rows if r.get("gap") == g) for g in ("current", "compatible", "major")}
     counts["unreachable"] = sum(1 for r in rows if "error" in r)
     report = {
@@ -203,7 +210,7 @@ def main():
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "elapsed_s": elapsed,
         "counts": counts,
-        "warnings": warnings,
+        "warnings": summary_warnings,
         "crates": rows,
     }
 

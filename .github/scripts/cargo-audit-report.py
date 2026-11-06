@@ -7,9 +7,9 @@ PATH) and lists every advisory it reports: vulnerabilities, and the
 unmaintained, unsound and notice warnings. cargo-audit reads its config from
 `.cargo/audit.toml`, not from the repository root's `audit.toml`, so that
 file's `ignore` list does not apply here; instead each advisory it names is
-marked "acknowledged". The JSON's top-level "warnings" list names every
-vulnerability `audit.toml` does not acknowledge; `ci-report.py add` turns each
-into a ::warning:: annotation.
+marked "acknowledged". The JSON's top-level "warnings" list has one entry
+naming every vulnerability `audit.toml` does not acknowledge; `ci-report.py
+add` turns it into a ::warning:: annotation.
 
 Usage: cargo-audit-report.py <out-dir>
 Writes <out-dir>/cargo-audit.json and .md and prints the Markdown. Exits
@@ -95,11 +95,13 @@ def main():
         "elapsed_s": elapsed,
         "counts": counts,
         "unacknowledged_vulnerabilities": len(new_vulns),
+        # One annotation for all of them, so a run page stays readable.
         "warnings": [
-            f"cargo audit: {r['id']} in {r['package']} {r['version']}: {r['title']} "
-            f"(patched: {', '.join(r['patched']) or 'none'}); not acknowledged in audit.toml"
-            for r in new_vulns
-        ],
+            f"cargo audit: {len(new_vulns)} vulnerabilities not acknowledged in audit.toml: "
+            + "; ".join(f"{r['id']} in {r['package']} {r['version']}" for r in new_vulns)
+        ]
+        if new_vulns
+        else [],
         "advisories": rows,
     }
 

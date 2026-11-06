@@ -85,16 +85,12 @@ pub(crate) enum StatementKind {
     Read,
     /// A read at `LOCAL_SERIAL`, which completes or cancels an in-flight Paxos
     /// proposal before it answers.
-    // Used from Step 3 on (unknown CAS outcomes, the sweeper).
-    #[allow(dead_code)]
     SerialRead,
     /// A plain write at `LOCAL_QUORUM`: intent rows, version rows, index
     /// batches.
-    #[allow(dead_code)]
     Write,
     /// A compare-and-swap on `resources`: Paxos at `LOCAL_SERIAL`, commit at
     /// `LOCAL_QUORUM`, never re-sent by the driver.
-    #[allow(dead_code)]
     Cas,
 }
 

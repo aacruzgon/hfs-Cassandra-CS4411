@@ -28,13 +28,15 @@
 //!
 //! - I1 fails: its error (503 or 504); nothing changed.
 //! - C1 not applied: the row exists, so `AlreadyExists` (409); this attempt's
-//!   intent row is deleted.
-//! - C1's outcome unknown (`WriteTimeout`/`WriteFailure` with `write_type =
-//!   CAS`, a dropped connection, the client deadline after sending,
-//!   `CAS_WRITE_UNKNOWN`): R2 at `LOCAL_SERIAL` decides, per the
-//!   walkthrough's table. "No row" re-runs the create, same id, after a 5 to
-//!   25 ms pause, at most twice. A `WriteTimeout` with `write_type = SIMPLE`
-//!   means the CAS was decided and only its commit timed out: applied.
+//!   intent row is deleted. On a re-run the returned row is checked first: it
+//!   may be an earlier attempt of this same request that applied after its
+//!   outcome was reported unknown, which is a success, not a 409.
+//! - C1's outcome unknown (every error except those that prove it was not
+//!   executed; see [`classify_cas_failure`]): R2 at `LOCAL_SERIAL` decides,
+//!   per the walkthrough's table, against every `write_id` this request has
+//!   used. "No row" re-runs the create, same id, after a 5 to 25 ms pause, at
+//!   most twice. A `WriteTimeout` with `write_type = SIMPLE` is confirmed by
+//!   R2 too, rather than taken as applied (ADR draft "create details").
 //! - Steps 4 and 5 fail: retried with the same timestamps; when the retries
 //!   run out the create still succeeds and its intent row is left for the
 //!   sweeper (G23), because a 5xx after an applied CAS would make a client's
@@ -44,7 +46,7 @@
 use std::time::Duration;
 
 use cdrs_tokio::error::Error as CdrsError;
-use cdrs_tokio::frame::message_error::{ErrorType, WriteType};
+use cdrs_tokio::frame::message_error::ErrorType;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::blob::Blob;
 use cdrs_tokio::types::rows::Row;
@@ -57,6 +59,7 @@ use uuid::Uuid;
 use super::backend::CassandraBackend;
 use super::errors::{BACKEND_NAME, map_driver_error};
 use super::index_keys::{self, IndexKey};
+use super::read::SELECT_RESOURCE;
 use super::session::{DriverError, StatementKind};
 use crate::error::{
     BackendError, ResourceError, StorageError, StorageResult, ValidationDetail, ValidationError,
@@ -80,11 +83,6 @@ const INSERT_RESOURCE_IF_NOT_EXISTS: &str = "INSERT INTO resources \
      (tenant_id, resource_type, id, version_id, data, last_updated, created_at, \
       fhir_version, write_ts, write_id, index_keys, deleted_at) \
      VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 0) IF NOT EXISTS";
-
-/// R2: the current row at `LOCAL_SERIAL`, which completes or cancels an
-/// in-flight proposal before answering. Only what an unknown outcome needs.
-const SELECT_RESOURCE_SERIAL: &str = "SELECT version_id, write_id FROM resources \
-     WHERE tenant_id = ? AND resource_type = ? AND id = ?";
 
 /// R3, reduced to what a superseded unknown outcome needs (G36).
 const SELECT_VERSION_WRITE_ID: &str = "SELECT write_id FROM resource_versions \
@@ -199,38 +197,47 @@ pub(super) fn write_ts_of(last_updated: DateTime<Utc>) -> i64 {
 enum CasFailure {
     /// It may or may not have applied. `timed_out` decides the status of an
     /// undecidable outcome: 504 after a timeout, a dropped connection or the
-    /// deadline; 503 after replicas failed.
+    /// deadline; 503 after replicas or the node failed.
     Unknown { timed_out: bool, error: DriverError },
-    /// `WriteTimeout` with `write_type = SIMPLE`: decided, only the commit
-    /// timed out.
-    Applied,
-    /// It was never sent, or the node refused it before acting.
+    /// It was never sent, or the coordinator refused it before acting.
     NotApplied(DriverError),
 }
 
 /// Classifies a CAS failure before anything maps it (`errors.rs`: a CAS must
 /// not go through the generic table).
+///
+/// Only errors that prove the CAS was not executed are `NotApplied`; every
+/// other error goes to the `LOCAL_SERIAL` read, which costs one read in a
+/// rare case and can never be wrong. In particular a `WriteTimeout` with
+/// `write_type = SIMPLE`, which the design takes as applied (the commit
+/// timed out after consensus), is confirmed by that read too: if it is ours,
+/// the read says so; if it was another coordinator's proposal that our
+/// prepare completed, the read shows its `write_id`, not ours. And a
+/// `Server` error or `Overloaded` can be raised after the proposal was
+/// accepted, so they are unknown, not refusals.
 fn classify_cas_failure(error: DriverError) -> CasFailure {
-    let unknown_timeout = |error| CasFailure::Unknown {
-        timed_out: true,
-        error,
-    };
+    let unknown = |timed_out, error| CasFailure::Unknown { timed_out, error };
     match &error {
-        DriverError::Deadline { sent: true, .. } => unknown_timeout(error),
+        DriverError::Deadline { sent: true, .. } => unknown(true, error),
         DriverError::Deadline { sent: false, .. } => CasFailure::NotApplied(error),
         DriverError::Driver(inner) => match inner.as_ref() {
             CdrsError::Server { body, .. } => match &body.ty {
-                ErrorType::WriteTimeout(timeout) if timeout.write_type == WriteType::Simple => {
-                    CasFailure::Applied
-                }
-                ErrorType::WriteTimeout(_) | ErrorType::ReadTimeout(_) => unknown_timeout(error),
-                ErrorType::WriteFailure(_) | ErrorType::ReadFailure(_) => CasFailure::Unknown {
-                    timed_out: false,
-                    error,
-                },
-                // Unavailable, Overloaded, IsBootstrapping, Syntax, …: the
-                // coordinator refused before it acted.
-                _ => CasFailure::NotApplied(error),
+                ErrorType::WriteTimeout(_) | ErrorType::ReadTimeout(_) => unknown(true, error),
+                // Refused before execution: too few replicas alive, a
+                // bootstrapping node, a statement the node rejected, or one
+                // it no longer had prepared (the driver re-prepared once).
+                ErrorType::Unavailable(_)
+                | ErrorType::IsBootstrapping
+                | ErrorType::Syntax
+                | ErrorType::Invalid
+                | ErrorType::Unauthorized
+                | ErrorType::Config
+                | ErrorType::Authentication
+                | ErrorType::Protocol
+                | ErrorType::Unprepared(_) => CasFailure::NotApplied(error),
+                // `WriteFailure`, `ReadFailure`, `Server`, `Overloaded`,
+                // `Truncate`, and any code a later protocol adds.
+                _ => unknown(false, error),
             },
             // Raised only while connecting (`connection_pool.rs`), so before
             // anything was sent.
@@ -244,7 +251,7 @@ fn classify_cas_failure(error: DriverError) -> CasFailure {
             // A closed connection, `Io`, `CAS_WRITE_UNKNOWN` (0x1700, which
             // cassandra-protocol 3.3.0 cannot decode), and anything else after
             // the request may have left: unknown.
-            _ => unknown_timeout(error),
+            _ => unknown(true, error),
         },
     }
 }
@@ -264,37 +271,67 @@ fn undecidable(timed_out: bool, operation: &str) -> StorageError {
     })
 }
 
-/// What R2 (and, when needed, R3) says about a create attempt.
+/// One create attempt of this request: its `write_id`, its `last_updated`
+/// and its intent row. Every attempt is kept, because an attempt whose
+/// outcome was unknown can still apply after a later one started: after a
+/// dropped connection or the client deadline the coordinator may still be
+/// running it (audit of L4, S1).
+#[derive(Debug, Clone)]
+struct Tried {
+    write_id: Uuid,
+    last_updated: DateTime<Utc>,
+    intent: IntentKey,
+}
+
+/// What the current row (and, when needed, row 1) says about this
+/// request's attempts.
 #[derive(Debug, PartialEq, Eq)]
 enum CreateOutcome {
-    /// Our write_id is version 1.
-    Applied,
-    /// Ours was version 1 and a later version superseded it.
-    AppliedSuperseded,
-    /// No row: ours did not apply and never will.
+    /// Attempt `n` of this request is version 1.
+    Applied(usize),
+    /// Attempt `n` was version 1, and a later version superseded it.
+    AppliedSuperseded(usize),
+    /// No row: no attempt applied, and after a serial read none will.
     NotApplied,
-    /// Another writer created it.
+    /// Another request created it.
     AnotherWriter,
     /// Nothing tells the two apart.
     Undecidable,
 }
 
-/// Reads the `[applied]` column of a CAS result.
-fn applied(rows: &[Row]) -> Result<bool, StorageError> {
-    let row = rows.first().ok_or_else(|| {
-        StorageError::Backend(BackendError::Internal {
-            backend_name: BACKEND_NAME.to_string(),
-            message: "compare-and-swap returned no [applied] row".to_string(),
-            source: None,
-        })
-    })?;
-    IntoRustByName::<bool>::get_r_by_name(row, "[applied]").map_err(|error| {
-        StorageError::Backend(BackendError::Internal {
-            backend_name: BACKEND_NAME.to_string(),
-            message: format!("unreadable [applied]: {error}"),
-            source: None,
-        })
-    })
+/// The row a decision reads: `version_id` and `write_id`, `None` when the
+/// cell is missing or cannot be decoded (which then decides nothing).
+struct CurrentRow {
+    version_id: Option<i32>,
+    write_id: Option<Uuid>,
+}
+
+impl CurrentRow {
+    fn of(row: &Row) -> Self {
+        Self {
+            version_id: IntoRustByName::<i32>::get_by_name(row, "version_id")
+                .ok()
+                .flatten(),
+            write_id: IntoRustByName::<Uuid>::get_by_name(row, "write_id")
+                .ok()
+                .flatten(),
+        }
+    }
+}
+
+fn attempt_with(tried: &[Tried], write_id: Option<Uuid>) -> Option<usize> {
+    let write_id = write_id?;
+    tried
+        .iter()
+        .position(|attempt| attempt.write_id == write_id)
+}
+
+/// Reads the `[applied]` column of a CAS result; `None` when the answer has
+/// none, which the caller treats as an unknown outcome.
+fn applied(rows: &[Row]) -> Option<bool> {
+    IntoRustByName::<bool>::get_by_name(rows.first()?, "[applied]")
+        .ok()
+        .flatten()
 }
 
 fn internal(message: String) -> StorageError {
@@ -406,117 +443,154 @@ impl CassandraBackend {
         let keys = vec![IndexKey::ResourcesByType];
         let keys_blob = index_keys::encode(&keys);
         let tenant_id = tenant.tenant_id().as_str();
+        let attempt_for = |last_updated| CreateAttempt {
+            tenant_id,
+            resource_type,
+            id: &id,
+            data: &data,
+            fhir_version: fhir_version.as_mime_param(),
+            last_updated,
+            keys_blob: &keys_blob,
+        };
 
-        let mut reruns = 0;
-        loop {
-            let last_updated = now_millis();
-            let attempt = CreateAttempt {
-                tenant_id,
-                resource_type,
-                id: &id,
-                data: &data,
-                fhir_version: fhir_version.as_mime_param(),
-                last_updated,
-                keys_blob: &keys_blob,
+        let mut tried: Vec<Tried> = Vec::new();
+        let outcome = loop {
+            let current = Tried {
+                write_id: Uuid::new_v4(),
+                last_updated: now_millis(),
+                intent: IntentKey::new(tenant_id, &id, Utc::now()),
             };
-            let write_id = Uuid::new_v4();
-            let intent = IntentKey::new(tenant_id, &id, Utc::now());
+            tried.push(current.clone());
+            let attempt = attempt_for(current.last_updated);
 
             // Step 2.
-            self.write_intent(&intent, tenant_id, resource_type, &id, write_id, 1)
-                .await?;
+            self.write_intent(
+                &current.intent,
+                tenant_id,
+                resource_type,
+                &id,
+                current.write_id,
+                1,
+            )
+            .await?;
 
             // Step 3.
-            let outcome = match self
+            let failure = match self
                 .session
                 .rows(
                     INSERT_RESOURCE_IF_NOT_EXISTS,
-                    attempt.c1_values(write_id),
+                    attempt.c1_values(current.write_id),
                     StatementKind::Cas,
                 )
                 .await
             {
-                Ok(rows) => {
-                    if applied(&rows)? {
-                        CreateOutcome::Applied
-                    } else {
-                        // `IF NOT EXISTS` returned the existing row: a
-                        // definite miss. This attempt's intent can go.
-                        self.delete_intent(&intent, tenant_id, resource_type, &id)
+                Ok(rows) => match applied(&rows) {
+                    Some(true) => break CreateOutcome::Applied(tried.len() - 1),
+                    Some(false) => {
+                        // `IF NOT EXISTS` returned the existing row: this
+                        // attempt missed, and its intent can go. The row may
+                        // still be an earlier attempt of this request that
+                        // applied after its outcome was reported unknown.
+                        self.delete_intent(&current.intent, tenant_id, resource_type, &id)
                             .await;
-                        return Err(already_exists(resource_type, &id));
-                    }
-                }
-                Err(error) => match classify_cas_failure(error) {
-                    CasFailure::Applied => CreateOutcome::Applied,
-                    CasFailure::NotApplied(error) => {
-                        // Nothing was decided; the intent is harmless and the
-                        // sweeper deletes it.
-                        return Err(StorageError::Backend(map_driver_error(&error, "create")));
-                    }
-                    CasFailure::Unknown { timed_out, error } => {
-                        tracing::warn!(
-                            resource_type,
-                            id = %id,
-                            error = ?error,
-                            "create: compare-and-swap outcome unknown; reading it back at LOCAL_SERIAL"
-                        );
-                        match self
-                            .resolve_unknown_create(tenant_id, resource_type, &id, write_id)
-                            .await?
-                        {
-                            CreateOutcome::NotApplied if reruns < UNKNOWN_OUTCOME_RERUNS => {
-                                reruns += 1;
-                                tokio::time::sleep(rerun_pause()).await;
-                                continue;
+                        let existing = rows.first().map(CurrentRow::of);
+                        let previous = &tried[..tried.len() - 1];
+                        if previous.is_empty() {
+                            return Err(already_exists(resource_type, &id));
+                        }
+                        match existing {
+                            Some(row) => {
+                                break self
+                                    .decide_create(tenant_id, resource_type, &id, previous, row)
+                                    .await?;
                             }
-                            CreateOutcome::NotApplied | CreateOutcome::Undecidable => {
-                                return Err(undecidable(timed_out, "create"));
-                            }
-                            CreateOutcome::AnotherWriter => {
-                                return Err(already_exists(resource_type, &id));
-                            }
-                            other => other,
+                            None => return Err(already_exists(resource_type, &id)),
                         }
                     }
+                    // An answer without a readable `[applied]`: as unknown.
+                    None => CasFailure::Unknown {
+                        timed_out: true,
+                        error: DriverError::from(cdrs_tokio::error::Error::General(
+                            "compare-and-swap answer without [applied]".to_string(),
+                        )),
+                    },
                 },
+                Err(error) => classify_cas_failure(error),
             };
 
-            if outcome == CreateOutcome::Applied {
-                // Steps 4 to 6.
-                let version_written = self.write_version_row(&attempt, write_id).await;
-                let indexed = self.write_index_rows(&attempt, &keys).await;
-                if version_written && indexed {
-                    self.delete_intent(&intent, tenant_id, resource_type, &id)
-                        .await;
-                } else {
+            match failure {
+                CasFailure::NotApplied(error) => {
+                    // Nothing was decided; the intent is harmless and the
+                    // sweeper deletes it.
+                    return Err(StorageError::Backend(map_driver_error(&error, "create")));
+                }
+                CasFailure::Unknown { timed_out, error } => {
                     tracing::warn!(
                         resource_type,
                         id = %id,
-                        "create applied, but its version or index rows could not be written; \
-                         the sweeper finishes it from the intent row"
+                        error = ?error,
+                        "create: compare-and-swap outcome unknown; reading it back at LOCAL_SERIAL"
                     );
+                    match self
+                        .resolve_unknown_create(tenant_id, resource_type, &id, &tried)
+                        .await?
+                    {
+                        CreateOutcome::NotApplied if tried.len() <= UNKNOWN_OUTCOME_RERUNS => {
+                            tokio::time::sleep(rerun_pause()).await;
+                        }
+                        CreateOutcome::NotApplied | CreateOutcome::Undecidable => {
+                            return Err(undecidable(timed_out, "create"));
+                        }
+                        decided => break decided,
+                    }
                 }
             }
-            // `AppliedSuperseded`: a later version exists, so V1 and X1 are
-            // skipped (a late insert of K(1) could outlive the later version's
-            // tombstones) and the intent is left for the sweeper.
+        };
 
-            if resource_type == "SearchParameter" {
-                self.note_stored_search_parameter(tenant_id, &resource);
+        let (attempt_index, write_rows) = match outcome {
+            CreateOutcome::Applied(n) => (n, true),
+            // A later version exists, so V1 and X1 are skipped (a late insert
+            // of K(1) could outlive the later version's tombstones) and the
+            // intent is left for the sweeper.
+            CreateOutcome::AppliedSuperseded(n) => (n, false),
+            CreateOutcome::AnotherWriter => return Err(already_exists(resource_type, &id)),
+            CreateOutcome::NotApplied | CreateOutcome::Undecidable => {
+                return Err(undecidable(true, "create"));
             }
-            return Ok(StoredResource::from_storage(
-                resource_type,
-                &id,
-                "1",
-                tenant.tenant_id().clone(),
-                resource,
-                last_updated,
-                last_updated,
-                None,
-                fhir_version,
-            ));
+        };
+        let winner = &tried[attempt_index];
+        if write_rows {
+            // Steps 4 to 6, with the values of the attempt that applied.
+            let attempt = attempt_for(winner.last_updated);
+            let version_written = self.write_version_row(&attempt, winner.write_id).await;
+            let indexed = self.write_index_rows(&attempt, &keys).await;
+            if version_written && indexed {
+                self.delete_intent(&winner.intent, tenant_id, resource_type, &id)
+                    .await;
+            } else {
+                tracing::warn!(
+                    resource_type,
+                    id = %id,
+                    "create applied, but its version or index rows could not be written; \
+                     the sweeper finishes it from the intent row"
+                );
+            }
         }
+
+        if resource_type == "SearchParameter" {
+            self.note_stored_search_parameter(tenant_id, &resource);
+        }
+        Ok(StoredResource::from_storage(
+            resource_type,
+            &id,
+            "1",
+            tenant.tenant_id().clone(),
+            resource,
+            winner.last_updated,
+            winner.last_updated,
+            None,
+            fhir_version,
+        ))
     }
 
     /// I1.
@@ -582,57 +656,85 @@ impl CassandraBackend {
         }
     }
 
-    /// R2 then, for a superseded version, R3 (walkthrough 3.1's table).
+    /// R2 at `LOCAL_SERIAL`, then [`decide_create`](Self::decide_create)
+    /// (walkthrough 3.1's table).
     async fn resolve_unknown_create(
         &self,
         tenant_id: &str,
         resource_type: &str,
         id: &str,
-        write_id: Uuid,
+        tried: &[Tried],
     ) -> StorageResult<CreateOutcome> {
-        let key = vec![
-            Value::from(tenant_id),
-            Value::from(resource_type),
-            Value::from(id),
-        ];
         let rows = self
             .session
             .rows(
-                SELECT_RESOURCE_SERIAL,
-                key.clone(),
+                SELECT_RESOURCE,
+                vec![
+                    Value::from(tenant_id),
+                    Value::from(resource_type),
+                    Value::from(id),
+                ],
                 StatementKind::SerialRead,
             )
             .await
             .map_err(|error| StorageError::Backend(map_driver_error(&error, "serial read")))?;
-        let Some(row) = rows.first() else {
-            return Ok(CreateOutcome::NotApplied);
+        match rows.first() {
+            None => Ok(CreateOutcome::NotApplied),
+            Some(row) => {
+                self.decide_create(tenant_id, resource_type, id, tried, CurrentRow::of(row))
+                    .await
+            }
+        }
+    }
+
+    /// Decides from the current row whether one of this request's attempts
+    /// created the resource. At version 1 the row's `write_id` decides; past
+    /// version 1, row 1 of `resource_versions` does (R3; G36). A cell that is
+    /// missing or cannot be decoded decides nothing (`Undecidable`), never
+    /// "another writer", which would be a false 409.
+    async fn decide_create(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+        tried: &[Tried],
+        current: CurrentRow,
+    ) -> StorageResult<CreateOutcome> {
+        let Some(version) = current.version_id else {
+            return Ok(CreateOutcome::Undecidable);
         };
-        let version: i32 = row
-            .get_r_by_name("version_id")
-            .map_err(|error| internal(format!("serial read: version_id: {error}")))?;
-        let current_writer: Option<Uuid> = row.get_by_name("write_id").ok().flatten();
         if version == 1 {
-            return Ok(if current_writer == Some(write_id) {
-                CreateOutcome::Applied
-            } else {
-                CreateOutcome::AnotherWriter
-            });
+            return Ok(
+                match (attempt_with(tried, current.write_id), current.write_id) {
+                    (Some(n), _) => CreateOutcome::Applied(n),
+                    (None, Some(_)) => CreateOutcome::AnotherWriter,
+                    (None, None) => CreateOutcome::Undecidable,
+                },
+            );
         }
 
-        let mut values = key;
-        values.push(Value::from(1_i32));
         let rows = self
             .session
-            .rows(SELECT_VERSION_WRITE_ID, values, StatementKind::Read)
+            .rows(
+                SELECT_VERSION_WRITE_ID,
+                vec![
+                    Value::from(tenant_id),
+                    Value::from(resource_type),
+                    Value::from(id),
+                    Value::from(1_i32),
+                ],
+                StatementKind::Read,
+            )
             .await
             .map_err(|error| StorageError::Backend(map_driver_error(&error, "version read")))?;
-        let version_one_writer: Option<Uuid> = rows
+        let version_one = rows
             .first()
-            .and_then(|row| row.get_by_name("write_id").ok().flatten());
-        Ok(match version_one_writer {
-            Some(writer) if writer == write_id => CreateOutcome::AppliedSuperseded,
-            Some(_) => CreateOutcome::AnotherWriter,
-            None => CreateOutcome::Undecidable,
+            .map(CurrentRow::of)
+            .and_then(|row| row.write_id);
+        Ok(match (attempt_with(tried, version_one), version_one) {
+            (Some(n), _) => CreateOutcome::AppliedSuperseded(n),
+            (None, Some(_)) => CreateOutcome::AnotherWriter,
+            (None, None) => CreateOutcome::Undecidable,
         })
     }
 
@@ -745,7 +847,7 @@ mod tests {
     use super::*;
     use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::frame::message_error::{
-        ErrorBody, FailureInfo, UnavailableError, WriteFailureError, WriteTimeoutError,
+        ErrorBody, FailureInfo, UnavailableError, WriteFailureError, WriteTimeoutError, WriteType,
     };
 
     fn server(ty: ErrorType) -> DriverError {
@@ -807,10 +909,11 @@ mod tests {
             true,
         );
 
-        assert!(matches!(
-            classify_cas_failure(server(write_timeout(WriteType::Simple))),
-            CasFailure::Applied
-        ));
+        // Confirmed by the serial read, never taken on trust.
+        unknown(server(write_timeout(WriteType::Simple)), true);
+        // Can be raised after the proposal was accepted.
+        unknown(server(ErrorType::Server), false);
+        unknown(server(ErrorType::Overloaded), false);
         for not_sent in [
             DriverError::Deadline {
                 after: Duration::from_secs(10),
@@ -825,6 +928,8 @@ mod tests {
                 required: 1,
                 alive: 0,
             })),
+            server(ErrorType::IsBootstrapping),
+            server(ErrorType::Invalid),
         ] {
             assert!(
                 matches!(classify_cas_failure(not_sent), CasFailure::NotApplied(_)),
@@ -930,5 +1035,175 @@ mod tests {
             let pause = rerun_pause();
             assert!((5..=25).contains(&pause.as_millis()), "{pause:?}");
         }
+    }
+}
+
+/// The decision table of an unknown create outcome, against the node at
+/// `HFS_TEST_CASSANDRA_URL` (skipped when unset). Each case sets up its own
+/// rows under its own tenant, every write to `resources` as a CAS.
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+    use crate::backends::cassandra::CassandraConfig;
+
+    async fn backend() -> Option<CassandraBackend> {
+        let url = std::env::var("HFS_TEST_CASSANDRA_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())?;
+        Some(
+            CassandraBackend::connect(CassandraConfig {
+                contact_points: vec![url],
+                data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
+                ..CassandraConfig::default()
+            })
+            .await
+            .expect("connect"),
+        )
+    }
+
+    fn tried(write_id: Uuid) -> Tried {
+        Tried {
+            write_id,
+            last_updated: now_millis(),
+            intent: IntentKey::new("t", "p", Utc::now()),
+        }
+    }
+
+    /// A version-1 row whose `write_id` is `writer`, through C1.
+    async fn create_row(backend: &CassandraBackend, tenant: &str, writer: Uuid) {
+        let keys = index_keys::encode(&[IndexKey::ResourcesByType]);
+        let attempt = CreateAttempt {
+            tenant_id: tenant,
+            resource_type: "Patient",
+            id: "p",
+            data: r#"{"resourceType":"Patient","id":"p"}"#,
+            fhir_version: FhirVersion::default_enabled().as_mime_param(),
+            last_updated: now_millis(),
+            keys_blob: &keys,
+        };
+        let rows = backend
+            .session
+            .rows(
+                INSERT_RESOURCE_IF_NOT_EXISTS,
+                attempt.c1_values(writer),
+                StatementKind::Cas,
+            )
+            .await
+            .expect("C1");
+        assert_eq!(applied(&rows), Some(true));
+    }
+
+    /// Moves the row to version 2 (a CAS), as a later writer would.
+    async fn supersede(backend: &CassandraBackend, tenant: &str) {
+        let rows = backend
+            .session
+            .rows(
+                "UPDATE resources SET version_id = 2, write_id = ? \
+                 WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = 1",
+                vec![
+                    Value::from(Uuid::new_v4()),
+                    Value::from(tenant),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                ],
+                StatementKind::Cas,
+            )
+            .await
+            .expect("supersede");
+        assert_eq!(applied(&rows), Some(true));
+    }
+
+    /// Row 1 of `resource_versions` with `writer` as its `write_id`.
+    async fn version_one(backend: &CassandraBackend, tenant: &str, writer: Uuid) {
+        let lu = now_millis();
+        backend
+            .session
+            .execute(
+                INSERT_VERSION,
+                vec![
+                    Value::from(tenant),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                    Value::from(1_i32),
+                    Value::from("{}"),
+                    Value::from(lu),
+                    Value::from(FhirVersion::default_enabled().as_mime_param()),
+                    Value::from(write_ts_of(lu)),
+                    Value::from(writer),
+                    Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+                    Value::from(write_ts_of(lu)),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect("V1");
+    }
+
+    async fn resolve(backend: &CassandraBackend, tenant: &str, attempts: &[Uuid]) -> CreateOutcome {
+        let attempts: Vec<Tried> = attempts.iter().copied().map(tried).collect();
+        backend
+            .resolve_unknown_create(tenant, "Patient", "p", &attempts)
+            .await
+            .expect("resolve")
+    }
+
+    fn tenant(case: &str) -> String {
+        format!("s2-resolve-{case}-{}", Uuid::new_v4().simple())
+    }
+
+    #[tokio::test]
+    async fn unknown_create_outcomes_follow_the_walkthrough_table() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (ours, earlier, theirs) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+
+        // No row: not applied, and after the serial read never will be.
+        let t = tenant("none");
+        assert_eq!(
+            resolve(&backend, &t, &[ours]).await,
+            CreateOutcome::NotApplied
+        );
+
+        // Version 1 with one of our write_ids: applied, by that attempt.
+        let t = tenant("v1-ours");
+        create_row(&backend, &t, ours).await;
+        assert_eq!(
+            resolve(&backend, &t, &[ours]).await,
+            CreateOutcome::Applied(0)
+        );
+        assert_eq!(
+            resolve(&backend, &t, &[earlier, ours]).await,
+            CreateOutcome::Applied(1),
+            "an earlier attempt that applied late is still ours"
+        );
+        assert_eq!(
+            resolve(&backend, &t, &[theirs]).await,
+            CreateOutcome::AnotherWriter
+        );
+
+        // Past version 1: row 1's write_id decides.
+        let t = tenant("superseded-ours");
+        create_row(&backend, &t, ours).await;
+        version_one(&backend, &t, ours).await;
+        supersede(&backend, &t).await;
+        assert_eq!(
+            resolve(&backend, &t, &[ours]).await,
+            CreateOutcome::AppliedSuperseded(0)
+        );
+        assert_eq!(
+            resolve(&backend, &t, &[theirs]).await,
+            CreateOutcome::AnotherWriter
+        );
+
+        // Past version 1 with no row 1: nothing tells them apart.
+        let t = tenant("superseded-unknown");
+        create_row(&backend, &t, ours).await;
+        supersede(&backend, &t).await;
+        assert_eq!(
+            resolve(&backend, &t, &[ours]).await,
+            CreateOutcome::Undecidable
+        );
     }
 }

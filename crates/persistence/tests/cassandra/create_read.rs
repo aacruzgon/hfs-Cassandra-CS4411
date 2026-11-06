@@ -292,8 +292,10 @@ async fn cassandra_read_of_a_deleted_resource_is_gone() {
         .await
         .expect("create");
 
-    // Until Step 3 has `delete`: a delete marker set through CQL, as C3 would
-    // set it, and as a compare-and-swap, since every write to `resources` is.
+    // Until Step 3 has `delete`: `deleted_at > 0` set through CQL, as a
+    // compare-and-swap, since every write to `resources` is one. Only
+    // `deleted_at` and `version_id` change, which is all `read` looks at; C3
+    // would also set `last_updated`, `write_ts` and `index_keys`.
     let deleted_at = Utc::now();
     let mut values = vec![Value::from(deleted_at), Value::from(2_i32)];
     values.extend(key(&tenant, "Patient", "gone"));
@@ -339,6 +341,7 @@ async fn cassandra_create_writes_every_cell_and_no_null() {
     };
     let tenant = own_tenant("cells");
     let version = FhirVersion::default_enabled();
+    let started = Utc::now() - chrono::Duration::seconds(5);
     let created = backend
         .create(&tenant, "Patient", patient("cells"), version)
         .await
@@ -434,19 +437,26 @@ async fn cassandra_create_writes_every_cell_and_no_null() {
     assert_eq!(col::<String>(row, "fhir_version"), version.as_mime_param());
     assert_eq!(col::<i64>(row, "row_ts"), ts);
 
-    // The intent row is gone: no row of this tenant in any shard of this hour
-    // or the previous one.
+    // The intent row is gone: no row of this tenant in any shard of the
+    // create's hour bucket (or the previous one, across an hour boundary),
+    // reading only the time slice since the test started, as the sweeper
+    // reads, so the scan skips older intents' tombstones.
     let now = Utc::now();
     let mut buckets = BTreeSet::new();
-    for at in [now, now - chrono::Duration::hours(1)] {
+    for at in [now, started] {
         buckets.insert(at.format("%Y-%m-%dT%H").to_string());
     }
     for bucket in &buckets {
         for shard in 0..16_i16 {
             let rows = query(
                 &cql,
-                "SELECT tenant_id FROM pending_index_writes WHERE bucket = ? AND shard = ?",
-                vec![Value::from(bucket.as_str()), Value::from(shard)],
+                "SELECT tenant_id FROM pending_index_writes \
+                 WHERE bucket = ? AND shard = ? AND enqueued_at > minTimeuuid(?)",
+                vec![
+                    Value::from(bucket.as_str()),
+                    Value::from(shard),
+                    Value::from(started),
+                ],
                 Consistency::LocalQuorum,
             )
             .await;

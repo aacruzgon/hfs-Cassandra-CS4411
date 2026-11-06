@@ -15,6 +15,7 @@ error is reported in the output, and the script still exits 0: a missing
 timing table must not fail a job whose real work passed.
 """
 
+import http.client
 import json
 import os
 import sys
@@ -63,7 +64,9 @@ def main():
     )
     try:
         jobs = fetch(url, env["GITHUB_TOKEN"])["jobs"]
-    except (urllib.error.URLError, KeyError, ValueError, TimeoutError) as e:
+    # OSError covers URLError, socket.timeout (not a TimeoutError before
+    # Python 3.10) and a reset connection; HTTPException an incomplete read.
+    except (OSError, KeyError, ValueError, http.client.HTTPException) as e:
         write(out_dir, {"report": "step-timings", "job": job_name, "error": str(e)},
               f"Step timings unavailable: {e}\n")
         return

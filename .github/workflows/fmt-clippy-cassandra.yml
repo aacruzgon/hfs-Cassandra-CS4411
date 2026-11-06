@@ -80,9 +80,10 @@ jobs:
       - name: Report dependency freshness
         if: always()
         continue-on-error: true
-        timeout-minutes: 3
+        # The job has 10 minutes; its two report steps get at most 4.
+        timeout-minutes: 2
         run: |
-          out="$RUNNER_TEMP/ci-report-inputs/dependency-freshness"
+          out="$RUNNER_TEMP/ci-report/inputs/dependency-freshness"
           python3 .github/scripts/dependency-freshness.py "$out"
           python3 .github/scripts/ci-report.py add dependency-freshness "Dependency freshness" \
             --markdown "$out/dependency-freshness.md" --json "$out/dependency-freshness.json"
@@ -95,24 +96,29 @@ jobs:
       - name: Report RustSec advisories (cargo audit)
         if: always()
         continue-on-error: true
-        timeout-minutes: 5
+        timeout-minutes: 2
         env:
           CARGO_AUDIT_VERSION: 0.22.2
           CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
         run: |
           [ "$(uname -m)" = x86_64 ] || { echo "cargo audit report: no pinned binary for $(uname -m)"; exit 0; }
           dir="${RUNNER_TOOL_CACHE:?}/cargo-audit/$CARGO_AUDIT_VERSION"
+          # Unpacked next to its final place and renamed into it, so a job
+          # killed mid-install never leaves a partial binary that later runs
+          # would trust.
           if [ ! -x "$dir/cargo-audit" ]; then
             name="cargo-audit-x86_64-unknown-linux-musl-v$CARGO_AUDIT_VERSION"
-            tmp=$(mktemp -d)
+            tmp="$dir.partial.$$"
+            rm -rf "$tmp" && mkdir -p "$tmp"
             curl -sSfL --retry 3 -o "$tmp/$name.tgz" \
               "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v$CARGO_AUDIT_VERSION/$name.tgz"
             echo "$CARGO_AUDIT_SHA256  $tmp/$name.tgz" | sha256sum -c -
             tar -xzf "$tmp/$name.tgz" -C "$tmp"
-            mkdir -p "$dir" && mv "$tmp/$name/cargo-audit" "$dir/cargo-audit"
+            mv "$tmp/$name" "$tmp/bin"
+            rm -rf "$dir" && mv "$tmp/bin" "$dir"
             rm -rf "$tmp"
           fi
-          out="$RUNNER_TEMP/ci-report-inputs/cargo-audit"
+          out="$RUNNER_TEMP/ci-report/inputs/cargo-audit"
           CARGO_AUDIT="$dir/cargo-audit" python3 .github/scripts/cargo-audit-report.py "$out"
           python3 .github/scripts/ci-report.py add cargo-audit "RustSec advisories (cargo audit)" \
             --markdown "$out/cargo-audit.md" --json "$out/cargo-audit.json"
@@ -127,7 +133,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          out="$RUNNER_TEMP/ci-report-inputs/step-timings"
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
           python3 .github/scripts/job-step-timings.py "cargo fmt --check" "$out"
           python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
             --markdown "$out/step-timings.md" --json "$out/step-timings.json"
@@ -233,7 +239,7 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          out="$RUNNER_TEMP/ci-report-inputs/build-size"
+          out="$RUNNER_TEMP/ci-report/inputs/build-size"
           python3 .github/scripts/build-size-report.py "$out"
           python3 .github/scripts/ci-report.py add build-size "Target directory size" \
             --markdown "$out/build-size.md" --json "$out/build-size.json"
@@ -248,7 +254,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          out="$RUNNER_TEMP/ci-report-inputs/step-timings"
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
           python3 .github/scripts/job-step-timings.py "cargo clippy (helios-fhir)" "$out"
           python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
             --markdown "$out/step-timings.md" --json "$out/step-timings.json"
@@ -353,7 +359,7 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          out="$RUNNER_TEMP/ci-report-inputs/build-size"
+          out="$RUNNER_TEMP/ci-report/inputs/build-size"
           python3 .github/scripts/build-size-report.py "$out"
           python3 .github/scripts/ci-report.py add build-size "Target directory size" \
             --markdown "$out/build-size.md" --json "$out/build-size.json"
@@ -368,7 +374,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          out="$RUNNER_TEMP/ci-report-inputs/step-timings"
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
           python3 .github/scripts/job-step-timings.py "cargo clippy (workspace)" "$out"
           python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
             --markdown "$out/step-timings.md" --json "$out/step-timings.json"
@@ -610,7 +616,7 @@ jobs:
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
           logs="$RUNNER_TEMP/ci-report/logs"
-          dir="$RUNNER_TEMP/ci-report-inputs/latency"
+          dir="$RUNNER_TEMP/ci-report/inputs/latency"
           export HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" HFS_TEST_LATENCY_REPORT="$dir"
           status=0
           cargo test -p helios-persistence --features cassandra --test cassandra_tests \
@@ -692,15 +698,16 @@ jobs:
         env:
           BUILD_OUTCOME: ${{ steps.build.outcome }}
         run: |
-          out="$RUNNER_TEMP/ci-report-inputs/build-size"
+          out="$RUNNER_TEMP/ci-report/inputs/build-size"
           mkdir -p "$out"
           set --
           if [ "$BUILD_OUTCOME" = success ]; then
+            # A failure here only loses the binary sizes, not the section.
             cargo test -p helios-persistence --features cassandra \
               --test cassandra_tests --test backend_capability_contract --no-run \
-              --message-format=json > "$out/persistence-artifacts.json"
+              --message-format=json > "$out/persistence-artifacts.json" || true
             cargo test -p helios-hfs --no-default-features --features R4,cassandra \
-              --test cassandra_milestone_a --no-run --message-format=json > "$out/hfs-artifacts.json"
+              --test cassandra_milestone_a --no-run --message-format=json > "$out/hfs-artifacts.json" || true
             set -- "@$out/persistence-artifacts.json" "@$out/hfs-artifacts.json"
           fi
           python3 .github/scripts/build-size-report.py "$out" "$@"
@@ -717,7 +724,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          out="$RUNNER_TEMP/ci-report-inputs/step-timings"
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
           python3 .github/scripts/job-step-timings.py "Cassandra schema (single node)" "$out"
           python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
             --markdown "$out/step-timings.md" --json "$out/step-timings.json"

@@ -83,7 +83,10 @@ fn patient(i: usize) -> serde_json::Value {
 
 #[tokio::test]
 async fn cassandra_latency_report() {
-    let Some(dir) = std::env::var_os(REPORT_VAR).map(PathBuf::from) else {
+    let Some(dir) = std::env::var_os(REPORT_VAR)
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty())
+    else {
         // Not requested; deliberately no "Skipping" line, because this is a
         // report, not a live test that a node should have run.
         return;

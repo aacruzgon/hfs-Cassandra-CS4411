@@ -25,6 +25,7 @@ Exits non-zero only when the measurement itself cannot run (no cargo
 metadata); an unreachable crates.io is reported, not failed.
 """
 
+import http.client
 import json
 import os
 import subprocess
@@ -161,16 +162,19 @@ def main():
             time.sleep(wait)
         last_request = time.monotonic()
         row = {"crate": name, "locked": locked, "listed_because": why}
+        # OSError covers URLError, socket.timeout (not a TimeoutError before
+        # Python 3.10) and a reset connection; HTTPException an incomplete
+        # read; KeyError and TypeError a response without the fields read.
         try:
             data = crates_io(name)
-        except (urllib.error.URLError, TimeoutError, ValueError) as e:
-            row["error"] = f"crates.io: {e}"
+            crate = data["crate"]
+            latest = crate.get("max_stable_version") or crate["max_version"]
+            dates = {v["num"]: v["created_at"][:10] for v in data["versions"]}
+            yanked = {v["num"] for v in data["versions"] if v.get("yanked")}
+        except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException) as e:
+            row["error"] = f"crates.io: {type(e).__name__}: {e}"
             rows.append(row)
             continue
-        crate = data["crate"]
-        latest = crate.get("max_stable_version") or crate["max_version"]
-        dates = {v["num"]: v["created_at"][:10] for v in data["versions"]}
-        yanked = {v["num"] for v in data["versions"] if v.get("yanked")}
         if parse(latest)[:3] <= parse(locked)[:3]:
             gap = "current"
         elif compat_key(latest) == compat_key(locked):

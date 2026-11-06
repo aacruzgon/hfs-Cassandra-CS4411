@@ -107,7 +107,7 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          out="$RUNNER_TEMP/ci-report-inputs/build-size"
+          out="$RUNNER_TEMP/ci-report/inputs/build-size"
           python3 .github/scripts/build-size-report.py "$out"
           python3 .github/scripts/ci-report.py add build-size "Target directory size" \
             --markdown "$out/build-size.md" --json "$out/build-size.json"
@@ -122,7 +122,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          out="$RUNNER_TEMP/ci-report-inputs/step-timings"
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
           python3 .github/scripts/job-step-timings.py "cargo check (cassandra, R4B)" "$out"
           python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
             --markdown "$out/step-timings.md" --json "$out/step-timings.json"

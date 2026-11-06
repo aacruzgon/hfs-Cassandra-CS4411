@@ -94,6 +94,11 @@ def main():
         "target_dir_after_bytes": after,
         "target_dir_reset": env.get("TARGET_DIR_RESET"),
         "target_dir_reset_reason": env.get("TARGET_DIR_RESET_REASON") or None,
+        "target_dir_added_bytes": (
+            after - (0 if env.get("TARGET_DIR_RESET") == "yes" else before)
+            if after is not None and (before is not None or env.get("TARGET_DIR_RESET") == "yes")
+            else None
+        ),
         "target_dir_cap_gb": env.get("TARGET_DIR_CAP_GB"),
         "binaries": bins,
         "warnings": warnings,
@@ -101,12 +106,18 @@ def main():
 
     reset = env.get("TARGET_DIR_RESET", "unknown")
     reason = env.get("TARGET_DIR_RESET_REASON")
+    # After a reset the job built into an empty directory, so the job's own
+    # growth is measured from zero, not from the size the reset removed.
+    baseline = 0 if reset == "yes" else before
+    if baseline is not None and after is not None:
+        grew = after - baseline
+        delta = f"; this job {'added' if grew >= 0 else 'removed'} {human(abs(grew))}"
+    else:
+        delta = ""
     lines = [
         f"Target directory `{target}` (cap {env.get('TARGET_DIR_CAP_GB', '?')} GB): "
-        f"{human(before)} at the start, {human(after)} now"
-        + (f", {'+' if after >= before else ''}{human(after - before) if after >= before else '-' + human(before - after)}"
-           if before is not None and after is not None else "")
-        + f". Reset this run: **{reset}**" + (f" ({reason})" if reason else "") + ".",
+        f"{human(before)} when the job began, {human(after)} now{delta}. "
+        f"Reset this run: **{reset}**" + (f" ({reason}; the job built from empty)" if reset == "yes" else "") + ".",
     ]
     if bins:
         lines += ["", "| Binary | Size | Path |", "| --- | ---: | --- |"]

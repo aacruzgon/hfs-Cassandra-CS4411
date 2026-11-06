@@ -48,6 +48,9 @@ def main():
     # "found vulnerabilities", which is a figure here, not a failure.
     result = subprocess.run([binary, "audit", "--json"], capture_output=True, text=True)
     elapsed = round(time.monotonic() - started, 1)
+    # The raw output, kept with the report so it can be re-read later.
+    with open(os.path.join(out_dir, "cargo-audit-raw.json"), "w") as f:
+        f.write(result.stdout)
     try:
         data = json.loads(result.stdout)
     except ValueError:

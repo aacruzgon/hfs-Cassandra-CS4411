@@ -8,6 +8,9 @@ name: fmt, clippy and Cassandra schema
 # fmt and the Cassandra job are light and run on either runner; the clippy
 # pair is heavy and runs only on sam-7900x (ADR-aacruzgon-0023). Each runner
 # has one executor, so the jobs on one machine run one after another.
+# Every job that compiles also writes CI reports (.github/scripts/ci-report.py):
+# measured figures in the run's summary page and in an artifact,
+# ci-report-<job>. Reports never fail a job for a figure.
 
 on:
   push:
@@ -99,10 +102,16 @@ jobs:
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
 
+      # Wrapped in ci-report.py build, which samples the runner's cgroup every
+      # second and reports the wall time and the memory peaks
+      # (ADR-aacruzgon-0023, ADR-sam-michaels-0003). It exits with clippy's
+      # status.
       - name: cargo clippy -p helios-fhir --all-targets --all-features, one job at a time
         env:
           CARGO_BUILD_JOBS: 1
+          CI_REPORT_PROFILE: clippy (dev profile, check only)
         run: |
+          python3 .github/scripts/ci-report.py build build-clippy-fhir "Build: cargo clippy (helios-fhir)" -- \
           nice -n 10 cargo clippy -p helios-fhir --all-targets --all-features -- -D warnings \
               -A clippy::items_after_test_module \
               -A clippy::large_enum_variant \
@@ -112,6 +121,19 @@ jobs:
               -A clippy::field_reassign_with_default \
               -A clippy::doc-overindented-list-items \
               -A clippy::doc-lazy-continuation
+
+      # Every report section of this job (.github/scripts/ci-report.py), as
+      # JSON and Markdown, plus the raw outputs they were read from. Report
+      # only: an upload failure does not fail the job.
+      - name: Upload the CI report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-clippy-fhir
+          path: ${{ runner.temp }}/ci-report
+          if-no-files-found: warn
+          overwrite: true
 
   clippy-workspace:
     name: cargo clippy (workspace)
@@ -157,10 +179,13 @@ jobs:
       # CONTRIBUTING.md command (R4, R4B, R5, R6, xml, skip-r6-download);
       # without it, helios-fhir's build script downloads R6 examples from
       # build.fhir.org, because an excluded package gets no --all-features.
+      # Wrapped in ci-report.py build, as in clippy-fhir.
       - name: cargo clippy --workspace --exclude helios-fhir --all-targets --all-features
         env:
           CARGO_BUILD_JOBS: 8
+          CI_REPORT_PROFILE: clippy (dev profile, check only)
         run: |
+          python3 .github/scripts/ci-report.py build build-clippy-workspace "Build: cargo clippy (workspace)" -- \
           nice -n 10 cargo clippy --workspace --exclude helios-fhir --all-targets --all-features \
             --features helios-fhir/skip-r6-download -- -D warnings \
               -A clippy::items_after_test_module \
@@ -171,6 +196,19 @@ jobs:
               -A clippy::field_reassign_with_default \
               -A clippy::doc-overindented-list-items \
               -A clippy::doc-lazy-continuation
+
+      # Every report section of this job (.github/scripts/ci-report.py), as
+      # JSON and Markdown, plus the raw outputs they were read from. Report
+      # only: an upload failure does not fail the job.
+      - name: Upload the CI report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-clippy-workspace
+          path: ${{ runner.temp }}/ci-report
+          if-no-files-found: warn
+          overwrite: true
 
   # The job name is a required check (ADR-aacruzgon-0021): it stays
   # "Cassandra schema (single node)" although the job also runs
@@ -193,6 +231,8 @@ jobs:
       # No incremental cache in the persistent target dir below: it would grow
       # with every commit until the size cap wipes the whole directory.
       CARGO_INCREMENTAL: 0
+      # The build profile the CI reports name (ci-report.py context).
+      CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -222,53 +262,27 @@ jobs:
 
       # Built before Cassandra starts, so the build's memory peak and the
       # 3 GiB container never overlap. acruzdebian caps its runner service at
-      # 9 GiB (ADR-aacruzgon-0023), so the step samples the runner's cgroup
-      # every second and prints two peaks: memory.current, page cache
-      # included, which reaches the cap whenever the cache fills it; and
-      # memory.stat's anon, the memory the kernel cannot reclaim, which is
-      # the one that must stay under the cap. It also prints how many OOM
-      # kills the cgroup had during the build. The EXIT trap stops the
-      # sampler and prints all of it on a failed build too.
+      # 9 GiB (ADR-aacruzgon-0023), so each build runs under ci-report.py
+      # build, which samples the runner's cgroup every second and reports two
+      # peaks: memory.current, page cache included, which reaches the cap
+      # whenever the cache fills it; and memory.stat's anon, the memory the
+      # kernel cannot reclaim, which is the one that must stay under the cap.
+      # It also reports the OOM kills during the build and the wall time, on
+      # a failed build too, and exits with cargo's status.
       # nice, as for clippy: sam-7900x is also Sam's desktop.
       # The Milestone A test (crates/hfs/tests/cassandra_milestone_a.rs) is
-      # built here too, so the sampler covers it: hfs with only the cassandra
-      # backend, and the test binary that starts it.
-      - name: Build tests/cassandra_tests.rs, backend_capability_contract.rs and the Milestone A test, and print the memory peak
+      # built here too: hfs with only the cassandra backend, and the test
+      # binary that starts it.
+      - name: Build tests/cassandra_tests.rs, backend_capability_contract.rs and the Milestone A test, and report the memory peak
         run: |
-          cgroup="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
-          peaks="$RUNNER_TEMP/build-memory-peaks"
-          echo "0 0" > "$peaks"
-          oom_kills() { awk '$1 == "oom_kill" { print $2 }' "$cgroup/memory.events" 2>/dev/null || echo 0; }
-          oom_before=$(oom_kills)
-          sampler=
-          start=$(date +%s)
-          report() {
-            if [ -n "$sampler" ]; then kill "$sampler" 2>/dev/null || true; fi
-            read -r current anon < "$peaks"
-            echo "Build ran $(( $(date +%s) - start )) s on $RUNNER_NAME ($cgroup)." \
-              "Peak memory.current: $(( current / 1048576 )) MiB; peak anon: $(( anon / 1048576 )) MiB;" \
-              "memory.max: $(cat "$cgroup/memory.max" 2>/dev/null || echo unknown);" \
-              "OOM kills during the build: $(( $(oom_kills) - oom_before ))"
-          }
-          trap report EXIT
-          if [ -r "$cgroup/memory.current" ] && [ -r "$cgroup/memory.stat" ]; then
-            (
-              current_peak=0; anon_peak=0
-              while :; do
-                current=$(cat "$cgroup/memory.current")
-                anon=$(awk '$1 == "anon" { print $2 }' "$cgroup/memory.stat")
-                if [ "$current" -gt "$current_peak" ]; then current_peak=$current; fi
-                if [ "$anon" -gt "$anon_peak" ]; then anon_peak=$anon; fi
-                echo "$current_peak $anon_peak" > "$peaks"
-                sleep 1
-              done
-            ) &
-            sampler=$!
-          fi
-          nice -n 10 cargo test -p helios-persistence --features cassandra \
-            --test cassandra_tests --test backend_capability_contract --no-run
-          nice -n 10 cargo test -p helios-hfs --no-default-features --features R4,cassandra \
-            --test cassandra_milestone_a --no-run
+          python3 .github/scripts/ci-report.py build build-persistence-tests \
+            "Build: helios-persistence Cassandra tests" -- \
+            nice -n 10 cargo test -p helios-persistence --features cassandra \
+              --test cassandra_tests --test backend_capability_contract --no-run
+          python3 .github/scripts/ci-report.py build build-hfs-milestone-a \
+            "Build: hfs (R4, cassandra) and the Milestone A test" -- \
+            nice -n 10 cargo test -p helios-hfs --no-default-features --features R4,cassandra \
+              --test cassandra_milestone_a --no-run
 
       # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
       - name: Remove leftovers of an earlier run
@@ -281,6 +295,12 @@ jobs:
           start=$(date +%s)
           docker compose -p hfs-cassandra-ci up -d --wait --wait-timeout 240
           echo "Healthy after $(( $(date +%s) - start )) s"
+
+      # The context every later report section carries, now with the node's
+      # Cassandra version. Report only.
+      - name: Report the context
+        continue-on-error: true
+        run: python3 .github/scripts/ci-report.py context --cassandra-container hfs-cassandra-ci-cassandra-1
 
       - name: Apply keyspace-single-node.cql, then schema.cql
         run: |
@@ -334,19 +354,55 @@ jobs:
       # Already built, so this step only runs the two binaries. The capability
       # contract's Cassandra instance tests skip without the variable, so they
       # run only here.
+      # Each test step keeps its output in the report directory, and
+      # --show-output prints each passing test's captured output, so the test
+      # report can name every live test that printed a skip.
       - name: cargo test --test cassandra_tests --test backend_capability_contract against this node
         run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/ci-report/logs"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-persistence --features cassandra \
-              --test cassandra_tests --test backend_capability_contract
+              --test cassandra_tests --test backend_capability_contract -- --show-output 2>&1 \
+            | tee "$RUNNER_TEMP/ci-report/logs/persistence-tests.log"
 
       # Milestone A (roadmap Step 2, item 2.7): the real hfs binary on this
       # node, POST /Patient then GET /Patient/{id}. Built above.
       - name: Milestone A round trip through hfs against this node
         run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/ci-report/logs"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-hfs --no-default-features --features R4,cassandra \
-              --test cassandra_milestone_a -- --exact milestone_a_create_then_read_through_rest
+              --test cassandra_milestone_a -- --exact milestone_a_create_then_read_through_rest \
+              --show-output 2>&1 \
+            | tee "$RUNNER_TEMP/ci-report/logs/milestone-a-round-trip.log"
+
+      # Roadmap item 2.6: three boots of hfs with the conformance seed, each on
+      # a fresh tenant, then a warm boot, against this node. Report only: a
+      # seed over the provisional 10 s budget (roadmap section 7) is a
+      # warning annotation; the step fails only if hfs does not boot or a log
+      # line the measurement needs is missing. Already built.
+      - name: Boot-time report against this node (report only)
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/ci-report/logs"
+          dir="$RUNNER_TEMP/ci-report/boot-time"
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" HFS_TEST_BOOT_REPORT="$dir" \
+            cargo test -p helios-hfs --no-default-features --features R4,cassandra \
+              --test cassandra_milestone_a -- --exact boot_time_report --nocapture 2>&1 \
+            | tee "$RUNNER_TEMP/ci-report/logs/boot-time.log"
+          python3 .github/scripts/ci-report.py add boot-time \
+            "Boot time and conformance seed (roadmap item 2.6)" \
+            --markdown "$dir/boot-time.md" --json "$dir/boot-time.json"
+
+      # Before the readiness test, which restarts the node and so resets these
+      # metrics: tablestats, tpstats, the per-table latency and tombstone
+      # histograms of system_views, and the lightweight-transaction counts,
+      # after everything the tests and the boot report wrote. Report only.
+      - name: Report the node's statistics
+        continue-on-error: true
+        run: python3 .github/scripts/ci-report.py node-stats node-stats "Cassandra node statistics" hfs-cassandra-ci-cassandra-1
 
       # Step 2's exit criterion: /_readiness reports down while Cassandra is
       # stopped, and up once it is back. The test stops and starts this job's
@@ -355,11 +411,28 @@ jobs:
       # job's last test step. --nocapture prints the down and up times.
       - name: Milestone A readiness, stopping and starting this job's node (last test step)
         run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/ci-report/logs"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
           HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER=hfs-cassandra-ci-cassandra-1 \
             cargo test -p helios-hfs --no-default-features --features R4,cassandra \
               --test cassandra_milestone_a -- --exact readiness_reports_down_while_cassandra_is_stopped \
-              --nocapture
+              --nocapture 2>&1 \
+            | tee "$RUNNER_TEMP/ci-report/logs/readiness.log"
+
+      # Written after the last test step, whatever its result: the test counts
+      # and skips of every test step, and the readiness test's recovery times.
+      # Report only.
+      - name: Report the tests and the readiness recovery
+        if: always()
+        continue-on-error: true
+        run: |
+          logs="$RUNNER_TEMP/ci-report/logs"
+          python3 .github/scripts/ci-report.py tests tests "Tests" \
+            "$logs/persistence-tests.log" "$logs/milestone-a-round-trip.log" \
+            "$logs/boot-time.log" "$logs/readiness.log"
+          python3 .github/scripts/ci-report.py readiness readiness \
+            "Readiness recovery (Step 2 exit criterion)" "$logs/readiness.log"
 
       - name: Cassandra logs
         if: failure()
@@ -369,3 +442,16 @@ jobs:
       - name: Stop Cassandra and remove CI's volume
         if: always()
         run: docker compose -p hfs-cassandra-ci down -v --remove-orphans
+
+      # Every report section of this job (.github/scripts/ci-report.py), as
+      # JSON and Markdown, plus the raw outputs they were read from. Report
+      # only: an upload failure does not fail the job.
+      - name: Upload the CI report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-cassandra
+          path: ${{ runner.temp }}/ci-report
+          if-no-files-found: warn
+          overwrite: true

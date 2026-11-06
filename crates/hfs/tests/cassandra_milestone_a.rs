@@ -43,8 +43,22 @@
 //! without stopping a node. The evidence of a real run is its
 //! `/_readiness down …` and `/_readiness up …` lines on stderr.
 //!
+//! # The boot-time report
+//!
+//! `boot_time_report` (roadmap item 2.6) runs only when `HFS_TEST_BOOT_REPORT`
+//! names a directory, and skips otherwise. It boots `hfs` with the conformance
+//! seed three times, each on a fresh tenant, then once more on the third
+//! tenant (the warm start), and writes `boot-time.json` and `boot-time.md`
+//! there: each boot's spans, read from `hfs`'s own log lines, and the worst
+//! fresh-tenant seed against the provisional budget of 10 s (roadmap section
+//! 7). Over the budget is a warning in the report, never a failure; the test
+//! fails only if `hfs` does not boot or a log line it needs is missing.
+//!
 //! Run with:
 //! `HFS_TEST_CASSANDRA_URL=127.0.0.1:59042 cargo test -p helios-hfs --features cassandra --test cassandra_milestone_a`
+//!
+//! and the boot-time report with:
+//! `HFS_TEST_CASSANDRA_URL=127.0.0.1:59042 HFS_TEST_BOOT_REPORT=target/boot-report cargo test -p helios-hfs --features cassandra --test cassandra_milestone_a -- --exact boot_time_report`
 //!
 //! [R4 http.html#create]: https://hl7.org/fhir/R4/http.html#create
 //! [#read]: https://hl7.org/fhir/R4/http.html#read
@@ -165,20 +179,38 @@ async fn readiness_reports_down_while_cassandra_is_stopped() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["checks"]["storage"], "ok", "{body}");
 
+    // The bracketed `key=ms` pairs are read by `.github/scripts/ci-report.py
+    // readiness`; keep their names.
+    let stopping = Instant::now();
     node.stop().await;
+    let stop_took = stopping.elapsed();
     let stopped = Instant::now();
     let body = hfs
         .wait_for_readiness(StatusCode::SERVICE_UNAVAILABLE, DOWN_TIMEOUT)
         .await;
     assert_eq!(body["status"], "not_ready", "{body}");
     assert_eq!(body["checks"]["storage"], "unavailable", "{body}");
-    eprintln!("/_readiness down {:?} after the stop", stopped.elapsed());
+    let down_after = stopped.elapsed();
+    eprintln!(
+        "/_readiness down {down_after:?} after the stop returned; the stop took {stop_took:?} \
+         [stop_ms={} stopped_to_503_ms={}]",
+        stop_took.as_millis(),
+        down_after.as_millis()
+    );
 
+    let starting = Instant::now();
     node.start().await;
+    let start_took = starting.elapsed();
     let started = Instant::now();
     let body = hfs.wait_for_readiness(StatusCode::OK, UP_TIMEOUT).await;
     assert_eq!(body["checks"]["storage"], "ok", "{body}");
-    eprintln!("/_readiness up {:?} after the start", started.elapsed());
+    let up_after = started.elapsed();
+    eprintln!(
+        "/_readiness up {up_after:?} after the start returned; the start took {start_took:?} \
+         [start_ms={} started_to_200_ms={}]",
+        start_took.as_millis(),
+        up_after.as_millis()
+    );
 
     // The backend's session survived the outage for writes too, not only for
     // the readiness probe.
@@ -431,7 +463,9 @@ impl Hfs {
                 "/metadata did not answer within {HFS_STARTUP_TIMEOUT:?}; hfs output:\n{}",
                 self.output()
             );
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Short, so the boot-time report's launch-to-`/metadata` span is
+            // within 50 ms of the first answer.
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -643,4 +677,538 @@ fn http() -> reqwest::Client {
         .timeout(Duration::from_secs(30))
         .build()
         .expect("HTTP client")
+}
+
+// The boot-time report (roadmap Step 2, item 2.6).
+
+/// The directory `boot_time_report` writes to; unset, the test skips.
+const BOOT_REPORT_VAR: &str = "HFS_TEST_BOOT_REPORT";
+
+/// Seeding per fresh tenant on the single node: the startup budget of roadmap
+/// section 7, adopted provisionally on 2026-11-06. A review threshold: over it
+/// is a warning in the report, never a test failure.
+const SEED_BUDGET: Duration = Duration::from_secs(10);
+
+/// Fresh-tenant boots; one warm boot follows, on the last fresh tenant.
+const FRESH_BOOTS: usize = 3;
+
+/// The log lines the report reads, all logged by `hfs` before it serves.
+/// They are matched here only, so a reworded line is changed in one place.
+mod startup_line {
+    /// `start_cassandra` (`crates/hfs/src/main.rs`), before the session opens.
+    pub const BACKEND_INIT: &str = "Initializing Cassandra backend";
+    /// `CassandraBackend::connect`, once the session is open.
+    pub const CONNECTED: &str = "Connected to Cassandra";
+    /// `crates/persistence/src/search/seeder.rs`, after each set's creates.
+    /// Neither is logged when the set's `count` finds it already stored.
+    pub const SEEDED: [(&str, &str); 2] = [
+        (
+            "SearchParameter",
+            "Seeded spec SearchParameters into storage",
+        ),
+        (
+            "CompartmentDefinition",
+            "Seeded spec CompartmentDefinitions into storage",
+        ),
+    ];
+    /// `start_cassandra`, after the seed. Its `elapsed_ms` is the load's own
+    /// time, so its start is the line's time minus `elapsed_ms`.
+    pub const STORED_LOADED: &str = "Stored SearchParameters loaded";
+    /// `serve`, once the listener is bound.
+    pub const LISTENING: &str = "Server listening";
+    /// In a `WARN` line: the seeder's failed create or failed set, or a
+    /// failed tenant listing for the seed.
+    pub const SEED_WARNING: &str = "seeding";
+}
+
+#[tokio::test]
+async fn boot_time_report() {
+    let Some(dir) = std::env::var_os(BOOT_REPORT_VAR)
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty())
+    else {
+        eprintln!("Skipping boot_time_report: {BOOT_REPORT_VAR} is unset");
+        return;
+    };
+    let _lock;
+    let _container;
+    let (contact_point, node) = match test_url() {
+        Some(url) => (url, "HFS_TEST_CASSANDRA_URL"),
+        None => {
+            _lock = CONTAINER_LOCK.lock().await;
+            let Some(node) = OwnNode::start().await else {
+                return;
+            };
+            let contact_point = node.contact_point();
+            _container = node;
+            (contact_point, "a container of this test's")
+        }
+    };
+
+    let base = unique_tenant("boot");
+    let mut runs = Vec::new();
+    for run in 1..=FRESH_BOOTS {
+        let tenant = format!("{base}-{run}");
+        runs.push(Boot::measure(&contact_point, &tenant, format!("fresh {run}"), true).await);
+    }
+    let last = runs.last().expect("FRESH_BOOTS > 0").tenant.clone();
+    runs.push(Boot::measure(&contact_point, &last, "warm".to_owned(), false).await);
+
+    let report = boot_report(&runs, &contact_point, node).await;
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    let json_path = dir.join("boot-time.json");
+    let md_path = dir.join("boot-time.md");
+    std::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&report).expect("the report serialises"),
+    )
+    .unwrap_or_else(|e| panic!("write {}: {e}", json_path.display()));
+    for run in &runs {
+        let path = dir.join(format!("hfs-{}.log", run.label.replace(' ', "-")));
+        std::fs::write(&path, &run.log).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
+    let markdown = boot_markdown(&report, &runs);
+    std::fs::write(&md_path, &markdown)
+        .unwrap_or_else(|e| panic!("write {}: {e}", md_path.display()));
+    eprintln!("{markdown}");
+    eprintln!("Wrote {} and {}", json_path.display(), md_path.display());
+}
+
+/// What one boot measured. Times are in milliseconds from `hfs`'s launch, or
+/// between two of its log lines.
+struct Boot {
+    label: String,
+    tenant: String,
+    fresh: bool,
+    /// Launch to the first `/metadata` 200, as the client saw it.
+    to_metadata_ms: f64,
+    /// Launch to `BACKEND_INIT`: process start, configuration, logging.
+    to_backend_init_ms: f64,
+    /// `BACKEND_INIT` to `CONNECTED`: the driver session opening.
+    connect_ms: f64,
+    /// `CONNECTED` to the start of the stored-SearchParameter load: the
+    /// ten-table check (`initialize`, which logs no line of its own) and the
+    /// seed. On a warm boot, the seed is one `count` per set.
+    seed_ms: f64,
+    /// How `seed_ms` ends, for the reader.
+    seed_end: &'static str,
+    /// `CONNECTED` to the last `SEEDED` line, the span of the earlier hand
+    /// measurement (s2-wiring, roadmap item 2.6); `None` on a warm boot.
+    connected_to_last_seeded_ms: Option<f64>,
+    /// The stored-SearchParameter load: `elapsed_ms`, tenants, definitions.
+    stored_load: Option<(f64, u64, u64)>,
+    /// Launch to `LISTENING`.
+    to_listening_ms: f64,
+    /// Per seeded type: created, existing, failed.
+    seeded: Vec<(&'static str, u64, u64, u64)>,
+    /// The seed's `WARN` lines.
+    seed_warnings: Vec<String>,
+    /// `hfs`'s whole output, kept next to the report as the figures' source.
+    log: String,
+}
+
+impl Boot {
+    /// Boots `hfs` with the seed on `tenant`, waits for `/metadata`, stops it,
+    /// and reads the spans from its log. Panics if it does not boot, or if a
+    /// line a span needs is missing.
+    async fn measure(contact_point: &str, tenant: &str, label: String, fresh: bool) -> Self {
+        let launched_at = chrono::Utc::now();
+        let launched = Instant::now();
+        let mut hfs = Hfs::start(contact_point, tenant, true);
+        hfs.wait_until_serving().await;
+        let to_metadata = launched.elapsed();
+        // Killed before the next boot, so two never share the node.
+        let output = hfs.output();
+        drop(hfs);
+
+        let lines = log_lines(&output);
+        let need = |marker: &str| -> &LogLine<'_> {
+            lines
+                .iter()
+                .find(|line| line.text.contains(marker))
+                .unwrap_or_else(|| {
+                    panic!("{label}: no {marker:?} line in hfs's log; output:\n{output}")
+                })
+        };
+        let backend_init = need(startup_line::BACKEND_INIT).at;
+        let connected = need(startup_line::CONNECTED).at;
+        let listening = need(startup_line::LISTENING).at;
+
+        let mut seeded = Vec::new();
+        let mut last_seeded = None;
+        for (kind, marker) in startup_line::SEEDED {
+            if let Some(line) = lines.iter().find(|line| line.text.contains(marker)) {
+                seeded.push((
+                    kind,
+                    line.number("created"),
+                    line.number("existing"),
+                    line.number("failed"),
+                ));
+                last_seeded = last_seeded.max(Some(line.at));
+            }
+        }
+        if fresh {
+            let created: u64 = seeded.iter().map(|(_, created, ..)| created).sum();
+            assert!(
+                created > 0,
+                "{label}: a fresh tenant's boot created nothing, so the seed did not run; \
+                 output:\n{output}"
+            );
+        }
+
+        let stored = lines
+            .iter()
+            .find(|line| line.text.contains(startup_line::STORED_LOADED));
+        let (seed_end_at, seed_end, stored_load) = match stored {
+            Some(line) => {
+                let elapsed = line.number("elapsed_ms");
+                let start = line.at
+                    - chrono::Duration::milliseconds(
+                        i64::try_from(elapsed).expect("elapsed_ms fits an i64"),
+                    );
+                (
+                    start,
+                    "the start of the stored-SearchParameter load",
+                    Some((
+                        elapsed as f64,
+                        line.number("tenants"),
+                        line.number("stored"),
+                    )),
+                )
+            }
+            // A base whose load logs no such line: a fresh boot's seed still
+            // ends at its last `SEEDED` line; a warm boot's cannot be read.
+            None => match last_seeded {
+                Some(at) => (at, "the last \"Seeded spec …\" line", None),
+                None => panic!(
+                    "{label}: no {:?} line and no \"Seeded\" line, so the seed's end cannot be \
+                     read from hfs's log; output:\n{output}",
+                    startup_line::STORED_LOADED
+                ),
+            },
+        };
+        let seed_warnings = lines
+            .iter()
+            .filter(|line| line.level == "WARN" && line.text.contains(startup_line::SEED_WARNING))
+            .map(|line| line.text.to_owned())
+            .collect();
+
+        Self {
+            label,
+            tenant: tenant.to_owned(),
+            fresh,
+            to_metadata_ms: to_metadata.as_secs_f64() * 1000.0,
+            to_backend_init_ms: millis_between(launched_at, backend_init),
+            connect_ms: millis_between(backend_init, connected),
+            seed_ms: millis_between(connected, seed_end_at),
+            seed_end,
+            connected_to_last_seeded_ms: last_seeded.map(|at| millis_between(connected, at)),
+            stored_load,
+            to_listening_ms: millis_between(launched_at, listening),
+            seeded,
+            seed_warnings,
+            log: output,
+        }
+    }
+
+    fn created(&self) -> u64 {
+        self.seeded.iter().map(|(_, created, ..)| created).sum()
+    }
+
+    fn to_json(&self) -> Value {
+        let seeded: serde_json::Map<String, Value> = self
+            .seeded
+            .iter()
+            .map(|(kind, created, existing, failed)| {
+                (
+                    (*kind).to_owned(),
+                    json!({"created": created, "existing": existing, "failed": failed}),
+                )
+            })
+            .collect();
+        json!({
+            "run": self.label,
+            "tenant": self.tenant,
+            "fresh_tenant": self.fresh,
+            "launch_to_metadata_200_ms": round(self.to_metadata_ms),
+            "launch_to_backend_init_ms": round(self.to_backend_init_ms),
+            "connect_ms": round(self.connect_ms),
+            "initialize_and_seed_ms": round(self.seed_ms),
+            "initialize_and_seed_ends_at": self.seed_end,
+            "connected_to_last_seeded_line_ms": self.connected_to_last_seeded_ms.map(round),
+            "stored_search_parameter_load": self.stored_load.map(|(ms, tenants, stored)| json!({
+                "elapsed_ms": ms, "tenants": tenants, "stored": stored,
+            })),
+            "launch_to_listening_ms": round(self.to_listening_ms),
+            "created": self.created(),
+            "seeded": seeded,
+            "seed_warnings": self.seed_warnings,
+        })
+    }
+}
+
+/// One line of `hfs`'s log in tracing's default format:
+/// `<RFC 3339 time> <LEVEL> <target>: <message> <key>=<value> …`.
+struct LogLine<'a> {
+    at: chrono::DateTime<chrono::Utc>,
+    level: &'a str,
+    text: &'a str,
+}
+
+impl LogLine<'_> {
+    /// The unsigned field `key=<n>`; panics if it is missing, since a span
+    /// would otherwise be guessed.
+    fn number(&self, key: &str) -> u64 {
+        let prefix = format!("{key}=");
+        self.text
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix(&prefix))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no numeric {key}= in the log line {:?}", self.text))
+    }
+}
+
+/// The lines of `output` that start with a timestamp; the rest (a panic,
+/// a line split by the writer) are left out.
+fn log_lines(output: &str) -> Vec<LogLine<'_>> {
+    output
+        .lines()
+        .filter_map(|text| {
+            let mut tokens = text.split_whitespace();
+            let at = chrono::DateTime::parse_from_rfc3339(tokens.next()?).ok()?;
+            Some(LogLine {
+                at: at.with_timezone(&chrono::Utc),
+                level: tokens.next()?,
+                text,
+            })
+        })
+        .collect()
+}
+
+fn millis_between(from: chrono::DateTime<chrono::Utc>, to: chrono::DateTime<chrono::Utc>) -> f64 {
+    (to - from)
+        .num_microseconds()
+        .expect("a span under 292,000 years") as f64
+        / 1000.0
+}
+
+/// To 0.1 ms, which is finer than any of the spans can be trusted to.
+fn round(ms: f64) -> f64 {
+    (ms * 10.0).round() / 10.0
+}
+
+/// The report: the runs, the budget, and where they were measured.
+async fn boot_report(runs: &[Boot], contact_point: &str, node: &str) -> Value {
+    let worst = runs
+        .iter()
+        .filter(|run| run.fresh)
+        .map(|run| run.seed_ms)
+        .fold(0.0_f64, f64::max);
+    let budget_ms = SEED_BUDGET.as_secs_f64() * 1000.0;
+    let mut warnings = Vec::new();
+    if worst > budget_ms {
+        warnings.push(format!(
+            "Boot-time report: the worst fresh-tenant seed took {:.2} s, over the provisional \
+             {} s budget (roadmap section 7)",
+            worst / 1000.0,
+            SEED_BUDGET.as_secs()
+        ));
+    }
+    for run in runs {
+        if !run.seed_warnings.is_empty() {
+            warnings.push(format!(
+                "Boot-time report: {} logged {} seed warning(s)",
+                run.label,
+                run.seed_warnings.len()
+            ));
+        }
+        if !run.fresh && run.created() > 0 {
+            warnings.push(format!(
+                "Boot-time report: the warm boot created {} resources; the fresh boot before it \
+                 did not seed the whole set",
+                run.created()
+            ));
+        }
+    }
+    let (cassandra_version, cassandra_version_source) = cassandra_version(contact_point).await;
+    json!({
+        "report": "boot-time",
+        "roadmap_item": "2.6",
+        "budget": {
+            "seed_per_fresh_tenant_ms": budget_ms,
+            "basis": "roadmap section 7, adopted provisionally on 2026-11-06; a review \
+                      threshold, not a gate",
+        },
+        "worst_fresh_tenant_seed_ms": round(worst),
+        "within_budget": worst <= budget_ms,
+        "context": {
+            "commit": commit(),
+            "runner": runner(),
+            "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "cpus": std::thread::available_parallelism().map(usize::from).ok(),
+            "cassandra_version": cassandra_version,
+            "cassandra_version_source": cassandra_version_source,
+            "contact_point": contact_point,
+            "node": node,
+        },
+        "spans": {
+            "launch_to_metadata_200_ms": "hfs launched to the first GET /metadata 200, polled \
+                                          every 50 ms",
+            "launch_to_backend_init_ms": "launch to \"Initializing Cassandra backend\"",
+            "connect_ms": "\"Initializing Cassandra backend\" to \"Connected to Cassandra\"",
+            "initialize_and_seed_ms": "\"Connected to Cassandra\" to the start of the stored \
+                                       SearchParameter load; includes initialize (the \
+                                       ten-table check), which logs no line of its own",
+            "connected_to_last_seeded_line_ms": "\"Connected to Cassandra\" to the last \
+                                                 \"Seeded spec …\" line, the span of the \
+                                                 earlier hand measurement; null on a warm boot",
+            "stored_search_parameter_load": "the \"Stored SearchParameters loaded\" line's \
+                                             elapsed_ms, tenants and stored",
+            "launch_to_listening_ms": "launch to \"Server listening\"",
+        },
+        "runs": runs.iter().map(Boot::to_json).collect::<Vec<_>>(),
+        "warnings": warnings,
+    })
+}
+
+fn boot_markdown(report: &Value, runs: &[Boot]) -> String {
+    let seconds = |ms: f64| format!("{:.2} s", ms / 1000.0);
+    let context = &report["context"];
+    let worst = report["worst_fresh_tenant_seed_ms"].as_f64().unwrap_or(0.0);
+    let verdict = if report["within_budget"] == true {
+        "within the budget"
+    } else {
+        "**over the budget**"
+    };
+    let mut md = format!(
+        "Provisional budget (roadmap section 7): {} s of seeding per fresh tenant on the single \
+         node. Worst fresh-tenant seed: **{}**, {verdict}. Report only: this never fails the job.\n\n",
+        SEED_BUDGET.as_secs(),
+        seconds(worst),
+    );
+    md.push_str(
+        "| Run | Launch → `/metadata` 200 | Launch → backend init | Connect | `initialize` + seed \
+         | Stored SearchParameter load | Launch → listening | Created |\n\
+         | --- | --- | --- | --- | --- | --- | --- | --- |\n",
+    );
+    for run in runs {
+        let load = run.stored_load.map_or_else(
+            || "no line".to_owned(),
+            |(ms, tenants, stored)| format!("{} ({tenants} tenants, {stored} stored)", seconds(ms)),
+        );
+        let created = if run.seeded.is_empty() {
+            "0 (the seeder's count found the sets)".to_owned()
+        } else {
+            run.seeded
+                .iter()
+                .map(|(kind, created, _, failed)| {
+                    let failed = if *failed > 0 {
+                        format!(", {failed} failed")
+                    } else {
+                        String::new()
+                    };
+                    format!("{created} {kind}{failed}")
+                })
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
+        md.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {load} | {} | {created} |\n",
+            run.label,
+            seconds(run.to_metadata_ms),
+            seconds(run.to_backend_init_ms),
+            seconds(run.connect_ms),
+            seconds(run.seed_ms),
+            seconds(run.to_listening_ms),
+        ));
+    }
+    let text = |value: &Value| match value {
+        Value::String(s) => s.clone(),
+        Value::Null => "unknown".to_owned(),
+        other => other.to_string(),
+    };
+    md.push_str(&format!(
+        "\nEach run is a new `hfs` process with the conformance seed on; `warm` boots again on \
+         the last fresh tenant. `initialize` + seed ends at {}; it includes the ten-table check, \
+         which logs no line of its own. The stored-SearchParameter load reads every tenant on \
+         the node, so it grows with each fresh run. Each boot's `hfs` log is in the artifact (`hfs-<run>.log`). Commit `{}`, runner `{}`, `{}` build, {} \
+         CPUs, Cassandra {} ({}), node {} at `{}`.\n",
+        runs.first().map_or("?", |run| run.seed_end),
+        text(&context["commit"]),
+        text(&context["runner"]),
+        text(&context["build_profile"]),
+        text(&context["cpus"]),
+        text(&context["cassandra_version"]),
+        text(&context["cassandra_version_source"]),
+        text(&context["node"]),
+        text(&context["contact_point"]),
+    ));
+    md
+}
+
+/// `GITHUB_SHA` in CI, otherwise `git rev-parse HEAD`.
+fn commit() -> Option<String> {
+    std::env::var("GITHUB_SHA").ok().or_else(|| {
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_path(""))
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    })
+}
+
+/// `RUNNER_NAME` in CI, otherwise `local (<hostname>)`.
+fn runner() -> String {
+    std::env::var("RUNNER_NAME").unwrap_or_else(|_| {
+        let host = Command::new("hostname")
+            .output()
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .unwrap_or_default();
+        format!("local ({host})")
+    })
+}
+
+/// The node's `ReleaseVersion`, from `nodetool version` in the container that
+/// publishes the contact point's port, and how it was found. `None` when no
+/// such container is visible to `docker`.
+async fn cassandra_version(contact_point: &str) -> (Option<String>, String) {
+    let Some((_, port)) = contact_point.rsplit_once(':') else {
+        return (None, format!("{contact_point} has no port"));
+    };
+    let published = format!(":{port}->{CQL_PORT}/tcp");
+    let Some(containers) = docker_output(&["ps", "--format", "{{.Names}}\t{{.Ports}}"]).await
+    else {
+        return (None, "docker ps failed".to_owned());
+    };
+    let Some(name) = containers
+        .lines()
+        .find(|line| line.contains(&published))
+        .and_then(|line| line.split('\t').next())
+    else {
+        return (None, format!("no container publishes {published}"));
+    };
+    let version = docker_output(&["exec", name, "nodetool", "version"])
+        .await
+        .and_then(|out| {
+            out.lines()
+                .find_map(|line| line.strip_prefix("ReleaseVersion:"))
+                .map(|version| version.trim().to_owned())
+        });
+    (version, format!("nodetool version in {name}"))
+}
+
+/// The `docker` CLI's stdout, or `None` if it cannot run or fails.
+async fn docker_output(args: &[&str]) -> Option<String> {
+    let output = tokio::process::Command::new("docker")
+        .args(args)
+        .output()
+        .await
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }

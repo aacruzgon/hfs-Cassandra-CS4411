@@ -136,7 +136,7 @@ where
     Ok(reload)
 }
 
-/// The Cassandra backend: a `cdrs-tokio` 8 session over the ten tables of
+/// The Cassandra backend: a `cdrs-tokio` 10 session over the ten tables of
 /// `docs/Cassandra/schema/schema.cql`.
 ///
 /// Built with [`CassandraBackend::connect`]. It implements the twelve traits
@@ -203,18 +203,6 @@ impl CassandraBackend {
         verify_local_dc(&session, &config.local_dc)
             .await
             .map_err(StorageError::Backend)?;
-        let outside = session.usable_nodes_outside(&config.local_dc);
-        if !outside.is_empty() {
-            return Err(StorageError::Backend(BackendError::Internal {
-                backend_name: BACKEND_NAME.to_string(),
-                message: format!(
-                    "a contact point is in data centre {outside:?}, not in HFS_CASSANDRA_LOCAL_DC \
-                     '{}'; list only contact points in the local data centre",
-                    config.local_dc
-                ),
-                source: None,
-            }));
-        }
 
         let stored_by_tenant: StoredByTenant = Arc::new(RwLock::new(HashMap::new()));
         let loader_cache = stored_by_tenant.clone();
@@ -596,31 +584,41 @@ impl CassandraBackend {
 
 /// The error for a session that could not be opened.
 ///
-/// The driver sends `USE "<keyspace>"` on every new connection, and a keyspace
-/// that does not exist makes it keep retrying until the connect deadline
-/// (checked against the shared 5.0.9 node, 2026-11-06), so a deadline here is
-/// a startup failure, not a statement timeout, and the keyspace is one of
-/// its two likely causes.
+/// The driver sends `USE "<keyspace>"` on every new connection, so a keyspace
+/// that does not exist fails the connection like a closed port does: with
+/// `cdrs-tokio` 10.0.0 the build ends at once with "Session control
+/// connection died before completing initialization" when no contact point
+/// connects (`cluster/control_connection.rs:170-176`; checked against the
+/// shared 5.0.9 node, 2026-11-06), and the driver does not say why. A
+/// deadline means a contact point connected but the session did not start
+/// in time. Either is a startup failure, not a statement failure, so the
+/// message names both likely causes.
 fn connect_error(error: &DriverError, config: &CassandraConfig) -> BackendError {
+    let opened_nothing = |why: String| {
+        tracing::warn!(
+            contact_points = ?config.contact_points,
+            keyspace = %config.keyspace,
+            "Cassandra session not open: {why}"
+        );
+        BackendError::ConnectionFailed {
+            backend_name: BACKEND_NAME.to_string(),
+            message: format!(
+                "no Cassandra session ({why}): no contact point answered, or keyspace '{}' \
+                 does not exist (apply docs/Cassandra/schema/keyspace-single-node.cql)",
+                config.keyspace
+            ),
+        }
+    };
     match error {
         DriverError::Deadline { after, .. } => {
-            tracing::warn!(
-                contact_points = ?config.contact_points,
-                keyspace = %config.keyspace,
-                "Cassandra session not open after {} ms",
-                after.as_millis()
-            );
-            BackendError::ConnectionFailed {
-                backend_name: BACKEND_NAME.to_string(),
-                message: format!(
-                    "no Cassandra session within {} ms: no contact point answered, or keyspace \
-                     '{}' does not exist (apply docs/Cassandra/schema/keyspace-single-node.cql)",
-                    after.as_millis(),
-                    config.keyspace
-                ),
-            }
+            opened_nothing(format!("not open within {} ms", after.as_millis()))
         }
-        other => map_driver_error(other, "connect"),
+        other => match map_driver_error(other, "connect") {
+            BackendError::ConnectionFailed { .. } => {
+                opened_nothing("no contact point accepted a session".to_string())
+            }
+            mapped => mapped,
+        },
     }
 }
 
@@ -844,8 +842,9 @@ mod tests {
     }
 }
 
-/// The session rebuild (`session.rs`, [`CassandraSession`]) against a real
-/// restart. It stops and starts a Cassandra container, so it runs only on a
+/// The driver's own recovery after a real restart (`session.rs`, "After a
+/// restart"): `cdrs-tokio` 8.1.9 lost a single node for good there, 9.1.0 and
+/// later must not. It stops and starts a Cassandra container, so it runs only on a
 /// node of its own, never the shared one; it is skipped unless both of these
 /// are set:
 ///
@@ -872,9 +871,9 @@ mod restart_tests {
     const URL: &str = "HFS_TEST_CASSANDRA_RESTART_URL";
     const CONTAINER: &str = "HFS_TEST_CASSANDRA_RESTART_CONTAINER";
 
-    /// How long the backend must stay healthy after the node returns. The
-    /// driver lost the node 40 s after a restart when roadmap Step 2's test
-    /// node layer reproduced the bug.
+    /// How long the backend must stay healthy after the node returns.
+    /// `cdrs-tokio` 8.1.9 lost the node 40 s after a restart when roadmap
+    /// Step 2's test node layer reproduced its bug.
     const STAY_HEALTHY: Duration = Duration::from_secs(120);
 
     fn docker(args: &[&str]) {
@@ -904,7 +903,7 @@ mod restart_tests {
     }
 
     /// Callers per poll in [`wait_for_health`]: a burst of probes and
-    /// requests reaching a broken session together.
+    /// requests reaching the session together while the node comes back.
     const CALLERS: usize = 16;
 
     /// Every 500 ms, runs [`CALLERS`] `health_check`s at once until all
@@ -951,11 +950,9 @@ mod restart_tests {
 
         backend.health_check().await.expect("health_check before");
         assert_eq!(read_one(&backend).await, Ok(0), "read before");
-        // A third statement, so the cache is seen to be emptied by a rebuild.
         backend.check_schema().await.expect("schema check before");
         let prepared_before = backend.session.prepared_count();
         assert!(prepared_before >= 3, "{prepared_before} prepared");
-        assert_eq!(backend.session.generation(), 0);
 
         docker(&["stop", &container]);
         let (down_after, _) = wait_for_health(&backend, false, Duration::from_secs(60)).await;
@@ -967,34 +964,18 @@ mod restart_tests {
         assert!(read_one(&backend).await.is_err(), "a read while down");
 
         docker(&["start", &container]);
-        let attempts_before = backend.session.rebuild_attempts();
+        // The readiness budget of the Milestone A test (`UP_TIMEOUT`).
         let (up_after, polls) = wait_for_health(&backend, true, Duration::from_secs(240)).await;
-        let attempts = backend.session.rebuild_attempts() - attempts_before;
         eprintln!(
-            "up: health_check passed {up_after:?} after the start (generation {}); \
-             {attempts} rebuild attempt(s) for {polls} polls of {CALLERS} concurrent callers",
-            backend.session.generation()
-        );
-        // One rebuild at a time, and none inside a failure's backoff: never
-        // one per caller.
-        assert!(
-            attempts as usize <= polls,
-            "{attempts} rebuild attempts for {polls} polls"
+            "up: health_check passed {up_after:?} after the start, after {polls} polls of \
+             {CALLERS} concurrent callers"
         );
 
-        // The driver lost the node some seconds after recovering in L1's
+        // 8.1.9 lost the node some seconds after recovering in L1's
         // reproduction; the backend must stay healthy through that.
         let started = Instant::now();
         let mut checks = 0;
-        let mut generation = backend.session.generation();
         while started.elapsed() < STAY_HEALTHY {
-            if backend.session.generation() != generation {
-                generation = backend.session.generation();
-                eprintln!(
-                    "rebuilt {:?} after recovery (generation {generation})",
-                    started.elapsed()
-                );
-            }
             backend.health_check().await.unwrap_or_else(|e| {
                 panic!("health_check {:?} after recovery: {e}", started.elapsed())
             });
@@ -1002,18 +983,14 @@ mod restart_tests {
             checks += 1;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        let generation = backend.session.generation();
         eprintln!(
             "stayed healthy for {STAY_HEALTHY:?} ({checks} health checks and reads); \
-             {generation} rebuild(s); {} statements prepared now, {prepared_before} before",
+             {} statements prepared now, {prepared_before} before",
             backend.session.prepared_count()
         );
-        // The node was down long enough to be marked down, so the session
-        // was rebuilt at least once.
-        assert!(generation > 0, "no rebuild happened");
-        // Only the health check and the read ran on the new session: the
-        // cache started empty and both were prepared again on it.
-        assert_eq!(backend.session.prepared_count(), 2);
+        // The same driver session served throughout: nothing replaced it, so
+        // its prepared statements survived.
+        assert_eq!(backend.session.prepared_count(), prepared_before);
     }
 }
 

@@ -22,6 +22,17 @@
 
 use std::sync::Arc;
 
+// The bulk export and submit workers are its only users, and a Cassandra-only
+// build wires neither.
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgres",
+        feature = "mongodb",
+        feature = "s3"
+    )),
+    allow(dead_code)
+)]
 mod worker_shutdown;
 
 use helios_audit::{
@@ -76,6 +87,13 @@ use helios_rest::bulk_export_auth::BearerScopeAuth;
 use helios_rest::OperationsBundle;
 use helios_rest::create_app_with_auth_bulk_settings_and_ops;
 
+// Every backend but Cassandra wires `$purge`; a Cassandra-only build has none.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 use helios_persistence::core::PurgableStorage;
 // Only the reindex-capable ops bundles use this; the S3-only build has no
 // reindex path.
@@ -4648,10 +4666,8 @@ async fn start_cassandra(
     use helios_persistence::backends::cassandra::CassandraBackend;
     use helios_persistence::core::Backend;
 
-    config.sof_enabled = cassandra_sof_enabled(
-        config.sof_enabled,
-        std::env::var_os("HFS_SOF_ENABLED").is_some(),
-    )?;
+    config.sof_enabled =
+        cassandra_sof_enabled(config.sof_enabled, ServerConfig::sof_enabled_is_explicit())?;
     let backend_config = build_cassandra_config(&config, |name| std::env::var(name).ok())?;
     // Contact points are `host:port` and carry no credentials; the password
     // never reaches this line.
@@ -4718,17 +4734,17 @@ async fn start_cassandra(
 /// scope), and `build_app` panics when SOF is on without one.
 ///
 /// SOF is on by default, so the default is switched off with a warning, and
-/// `$viewdefinition-run`/`$sql-run` answer 501. An operator who set
-/// `HFS_SOF_ENABLED=true` explicitly asked for it, so startup fails instead of
-/// dropping the feature they asked for.
+/// `$viewdefinition-run`/`$sql-run` answer 501. An operator who turned it on
+/// explicitly (`HFS_SOF_ENABLED=true` or `--sof-enabled`) asked for it, so
+/// startup fails instead of dropping the feature they asked for.
 #[cfg(feature = "cassandra")]
 fn cassandra_sof_enabled(sof_enabled: bool, set_explicitly: bool) -> anyhow::Result<bool> {
     match (sof_enabled, set_explicitly) {
         (false, _) => Ok(false),
         (true, true) => anyhow::bail!(
-            "HFS_SOF_ENABLED=true is not supported with HFS_STORAGE_BACKEND=cassandra: the \
-             Cassandra backend has no in-DB SQL-on-FHIR runner. Unset it or set \
-             HFS_SOF_ENABLED=false"
+            "HFS_SOF_ENABLED=true (or --sof-enabled) is not supported with \
+             HFS_STORAGE_BACKEND=cassandra: the Cassandra backend has no in-DB SQL-on-FHIR \
+             runner. Unset it or set HFS_SOF_ENABLED=false"
         ),
         (true, false) => {
             warn!(
@@ -5122,7 +5138,8 @@ async fn start_s3_elasticsearch(
     feature = "sqlite",
     feature = "postgres",
     feature = "mongodb",
-    feature = "s3"
+    feature = "s3",
+    feature = "cassandra"
 )))]
 compile_error!("At least one database backend feature must be enabled");
 
@@ -6229,6 +6246,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "postgres",
+        feature = "mongodb",
+        feature = "s3"
+    ))]
     #[test]
     fn bulk_submit_file_scheduling_selection() {
         let modes = [

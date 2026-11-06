@@ -629,7 +629,7 @@ Backends can serve as primary (CRUD, versioning, and — where the backend suppo
 | Graph queries         | Neo4j               | Efficient relationship traversal           |
 | Full-text search      | Elasticsearch       | Optimized inverted indexes, analyzers      |
 | Bulk analytics        | S3 + Parquet        | Cost-effective, columnar, ML-ready         |
-| High write throughput | Cassandra           | Distributed writes, eventual consistency   |
+| High write throughput | Cassandra           | Distributed writes, `LOCAL_QUORUM` and lightweight transactions |
 
 ### Feature Flags
 
@@ -2857,7 +2857,7 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 
 ### Phase 5+: Additional Backends (Planned)
 
-- [ ] Cassandra backend (wide-column, partition keys)
+- [ ] Cassandra backend (wide-column, partition keys): in development; skeleton, server wiring, create and read first (`docs/Cassandra/development-roadmap.md`)
 - [x] MongoDB Phase 1 scaffold (module wiring, config, Backend trait baseline)
 - [x] MongoDB Phase 2 core storage parity (CRUD/count/read_batch/create_or_update, tenant isolation, soft-delete, schema bootstrap)
 - [x] MongoDB Phase 3 versioning/history plus best-effort session-backed consistency

@@ -2031,6 +2031,35 @@ impl ServerConfig {
         Ok((Self::finish_parsed(parsed)?, version_is_implicit))
     }
 
+    /// Whether `sof_enabled` was set through `--sof-enabled` or
+    /// `HFS_SOF_ENABLED` rather than taken from its default, for the process's
+    /// own arguments and environment. A backend with no SQL-on-FHIR runner
+    /// turns the default off but refuses an explicit request.
+    pub fn sof_enabled_is_explicit() -> bool {
+        Self::sof_enabled_is_explicit_in(std::env::args_os())
+    }
+
+    /// [`ServerConfig::sof_enabled_is_explicit`] over an explicit argument
+    /// list, whose first item is the program name. Arguments that do not parse
+    /// count as not explicit: startup has already rejected them.
+    pub fn sof_enabled_is_explicit_in<I, T>(args: I) -> bool
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        Self::command()
+            .try_get_matches_from(args)
+            .is_ok_and(|matches| {
+                matches!(
+                    matches.value_source("sof_enabled"),
+                    Some(
+                        clap::parser::ValueSource::CommandLine
+                            | clap::parser::ValueSource::EnvVariable
+                    )
+                )
+            })
+    }
+
     fn finish_parsed(mut config: Self) -> Result<Self, clap::Error> {
         config.multitenancy = MultitenancyConfig::from_env();
         config.bulk_export = BulkExportConfig::from_env();
@@ -2933,6 +2962,19 @@ mod tests {
                 .unwrap_err()
                 .contains("cassandra")
         );
+    }
+
+    #[test]
+    fn sof_enabled_explicit_only_when_given() {
+        assert!(ServerConfig::sof_enabled_is_explicit_in([
+            "hfs",
+            "--sof-enabled"
+        ]));
+        // The environment can set it too; only assert the default case when
+        // the test process does not.
+        if std::env::var_os("HFS_SOF_ENABLED").is_none() {
+            assert!(!ServerConfig::sof_enabled_is_explicit_in(["hfs"]));
+        }
     }
 
     #[test]

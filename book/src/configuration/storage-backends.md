@@ -12,7 +12,7 @@ The Helios FHIR Server supports several storage backend configurations. Set `HFS
 | PostgreSQL + Elasticsearch | `postgres-elasticsearch` or `pg-es` | PostgreSQL for CRUD, Elasticsearch for search |
 | S3 | `s3` | Object storage for CRUD, versioning, history, and bulk ops. No search. |
 | S3 + Elasticsearch | `s3-elasticsearch` or `s3-es` | S3 for CRUD, Elasticsearch for search |
-| Cassandra | `cassandra` | Apache Cassandra for CRUD (in development: create and read). Search limited to token, date and URI parameters. |
+| Cassandra | `cassandra` | Apache Cassandra for CRUD (in development: create and read). Search on token, date and URI parameters is planned. |
 
 ## Running with Each Backend
 

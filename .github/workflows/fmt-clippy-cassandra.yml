@@ -2,7 +2,8 @@ name: fmt, clippy and Cassandra schema
 
 # Roadmap item 0.5 on the team's self-hosted runner (ADR-aacruzgon-0018,
 # ADR-sam-michaels-0001): rustfmt, the CONTRIBUTING.md clippy command split
-# into two jobs, and a single-node Cassandra that the schema is applied to.
+# into two jobs, and a single-node Cassandra that the schema is applied to and
+# tests/cassandra_tests.rs runs against (ADR-aacruzgon-0020).
 # fmt and the Cassandra job are light and run on either runner; the clippy
 # pair is heavy and runs only on sam-7900x (ADR-aacruzgon-0023). Each runner
 # has one executor, so the jobs on one machine run one after another.
@@ -170,12 +171,16 @@ jobs:
               -A clippy::doc-overindented-list-items \
               -A clippy::doc-lazy-continuation
 
+  # The job name is a required check (ADR-aacruzgon-0021): it stays
+  # "Cassandra schema (single node)" although the job also runs
+  # tests/cassandra_tests.rs against its node (ADR-aacruzgon-0020).
   cassandra:
     name: Cassandra schema (single node)
     # Fork guard (ADR-aacruzgon-0018).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, hfs-cassandra-light]
-    timeout-minutes: 15
+    # A cold build of the test binary takes a few minutes; warm, seconds.
+    timeout-minutes: 40
     env:
       COMPOSE_FILE: docker/cassandra/docker-compose.yml
       # CI's own host port, never the default 59042 that a developer's
@@ -183,11 +188,69 @@ jobs:
       # also names CI's own project, hfs-cassandra-ci, so down -v can only
       # ever remove CI's containers and volume.
       CASSANDRA_HOST_PORT: 59142
+      # No incremental cache in the persistent target dir below: it would grow
+      # with every commit until the size cap wipes the whole directory.
+      CARGO_INCREMENTAL: 0
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+
+      # Same bounded, persistent target directory as r4b-compile-check.yml
+      # (ADR-sam-michaels-0002), one per runner.
+      - name: Reset the target dir if it is stale or over its cap
+        env:
+          TARGET_DIR: ${{ runner.workspace }}/target/cassandra-tests
+          CAP_GB: 15
+        run: |
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
+          if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
+            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+
+      # Built before Cassandra starts, so the build's memory peak and the
+      # 3 GiB container never overlap. acruzdebian caps its runner service at
+      # 9 GiB (ADR-aacruzgon-0023), so the step prints the peak of the
+      # runner's cgroup during the build: memory.current, sampled every
+      # second, counts every process of the job, page cache included. The
+      # EXIT trap stops the sampler and prints the peak on a failed build too.
+      # nice, as for clippy: sam-7900x is also Sam's desktop.
+      - name: Build tests/cassandra_tests.rs and print its memory peak
+        run: |
+          cgroup="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          peak_file="$RUNNER_TEMP/build-memory-peak"
+          echo 0 > "$peak_file"
+          sampler=
+          start=$(date +%s)
+          report() {
+            if [ -n "$sampler" ]; then kill "$sampler" 2>/dev/null || true; fi
+            echo "Build ran $(( $(date +%s) - start )) s on $RUNNER_NAME." \
+              "Peak of $cgroup: $(( $(cat "$peak_file") / 1048576 )) MiB;" \
+              "memory.max: $(cat "$cgroup/memory.max" 2>/dev/null || echo unknown)"
+          }
+          trap report EXIT
+          if [ -r "$cgroup/memory.current" ]; then
+            (
+              peak=0
+              while :; do
+                now=$(cat "$cgroup/memory.current")
+                if [ "$now" -gt "$peak" ]; then peak=$now; echo "$peak" > "$peak_file"; fi
+                sleep 1
+              done
+            ) &
+            sampler=$!
+          fi
+          nice -n 10 cargo test -p helios-persistence --features cassandra --test cassandra_tests --no-run
 
       # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
       - name: Remove leftovers of an earlier run
@@ -247,6 +310,14 @@ jobs:
           } > "$actual"
           diff -u docs/Cassandra/schema/expected-schema.txt "$actual"
           echo "schema matches docs/Cassandra/schema/expected-schema.txt ($(grep -vc '^#' "$actual") rows)"
+
+      # ADR-aacruzgon-0020, Rule 1: the tests use this job's node, with the
+      # schema just applied, through its published port, as cqlsh does above.
+      # Already built, so this step only runs the binary.
+      - name: cargo test --test cassandra_tests against this node
+        run: |
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+            cargo test -p helios-persistence --features cassandra --test cassandra_tests
 
       - name: Cassandra logs
         if: failure()

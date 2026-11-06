@@ -30,10 +30,31 @@ Point clients at `127.0.0.1:59042`, not `localhost`: the port is published on
 IPv4 loopback only, and `localhost` can resolve to `::1` first. The host port
 is 59042, not Cassandra's usual 9042, so a Cassandra already running on the
 host cannot silently answer instead; set `CASSANDRA_HOST_PORT` to change it.
-Inside the container, and for other containers, the port is still 9042. The node
-advertises its container IP as `rpc_address`; with one node a driver learns no
-peers and stays on the contact point, but if a driver ever tries to reconnect
-to the advertised address, set `CASSANDRA_BROADCAST_RPC_ADDRESS: 127.0.0.1`.
+Inside the container, and for other containers, the port is still 9042.
+
+The node advertises its container IP as `rpc_address` in `system.local`.
+`cdrs-tokio` 8.1.9, the backend's driver, never uses that address for the node
+it connected through: it keeps the contact point (`build_node_broadcast_rpc_address`
+in its `cluster_metadata_manager.rs`), and one node has no peers to learn. So
+`127.0.0.1:59042` works as is, and `CASSANDRA_BROADCAST_RPC_ADDRESS` is not
+needed. `tests/cassandra_tests.rs` checks that the driver addresses the node by
+its contact point.
+
+**A restart of the node breaks an open `cdrs-tokio` 8.1.9 session to it.** The
+session reconnects, then marks the node `Unknown` and drops it from every query
+plan: queries fail with "No nodes available in query plan!" until the client
+opens a new session. Setting `CASSANDRA_BROADCAST_RPC_ADDRESS: 127.0.0.1` does
+not change this. Checked on 2026-11-06 with the Compose file on host port 59242.
+A `docker compose restart` at 8 s gave failures until the session recovered at
+36 s, then failures again from 40 s to the end of a 180 s run, with and without
+the variable. The cause is in the driver, and is not specific to Docker:
+whenever the session's control connection reconnects, `Node::clone_with_node_info`
+(`topology/node.rs`) compares the node's gossip address (`<listen address>:7000`)
+with its contact point, finds them different, and resets the node's state. With
+one node no event from a peer ever sets it back. So anything that drops the
+control connection, a restart or a network blip, has the same effect. After
+restarting Cassandra, restart anything that holds a session to it, Helios
+included.
 
 ## Recorded configuration
 

@@ -1588,9 +1588,9 @@ dependencies = [
 
 [[package]]
 name = "cassandra-protocol"
-version = "3.3.0"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f792501116fe2f54392f0449d653f4d2ad31c659ae9a095681fae507ceef373"
+checksum = "14f7267a3c776b7bdbad66994dc42578f4c9347a01347b005267de0d1b7527a5"
 dependencies = [
  "arc-swap",
  "bitflags",
@@ -1598,14 +1598,12 @@ dependencies = [
  "chrono",
  "crc32fast",
  "derivative",
- "derive_more 1.0.0",
- "float_eq",
- "integer-encoding",
- "itertools 0.13.0",
- "lz4_flex 0.11.6",
- "num-bigint 0.4.6",
+ "derive_more",
+ "itertools 0.15.0",
+ "lz4_flex",
+ "num-bigint 0.5.1",
  "snap",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "time",
  "uuid",
 ]
@@ -1639,37 +1637,25 @@ dependencies = [
 
 [[package]]
 name = "cdrs-tokio"
-version = "8.1.9"
+version = "10.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d6aab6c612cc4340d3ebb275c246fc350c5492974a935eee748ea5e487aa6d8"
+checksum = "51fdba06d7d27eb679668518669287bfaece4dd853b02087aa9c058a98d07d60"
 dependencies = [
  "arc-swap",
  "atomic",
  "bytemuck",
  "cassandra-protocol",
  "derivative",
- "derive_more 2.1.1",
+ "derive_more",
  "futures",
  "fxhash",
- "itertools 0.14.0",
- "rand 0.9.4",
+ "itertools 0.15.0",
+ "rand 0.10.1",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "cdrs-tokio-helpers-derive"
-version = "5.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61cefbb7648a59bd7de42b0d8bdb5a39e029f429305190dec4e5ed56f98859cf"
-dependencies = [
- "itertools 0.11.0",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -2422,32 +2408,11 @@ dependencies = [
 
 [[package]]
 name = "derive_more"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a9b99b9cbbe49445b21764dc0625032a89b145a2642e67603e1c936f5458d05"
-dependencies = [
- "derive_more-impl 1.0.0",
-]
-
-[[package]]
-name = "derive_more"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
 dependencies = [
- "derive_more-impl 2.1.1",
-]
-
-[[package]]
-name = "derive_more-impl"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb7330aeadfbe296029522e6c40f315320aba36fc43a5b3632f3795348f3bd22"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
- "unicode-xid",
+ "derive_more-impl",
 ]
 
 [[package]]
@@ -2836,12 +2801,6 @@ dependencies = [
  "miniz_oxide",
  "zlib-rs",
 ]
-
-[[package]]
-name = "float_eq"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28a80e3145d8ad11ba0995949bbcf48b9df2be62772b3d351ef017dff6ecb853"
 
 [[package]]
 name = "fluent-bundle"
@@ -3604,7 +3563,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "cdrs-tokio",
- "cdrs-tokio-helpers-derive",
  "chrono",
  "criterion",
  "ctor",
@@ -4419,12 +4377,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "integer-encoding"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14c00403deb17c3221a1fe4fb571b9ed0370b3dcd116553c77fa294a3d918699"
-
-[[package]]
 name = "intl-memoizer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4512,15 +4464,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1c173a5686ce8bfa551b3563d0c2170bf24ca44da99c7ca4bfdab5418c3fe57"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
@@ -4533,6 +4476,15 @@ name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
 dependencies = [
  "either",
 ]
@@ -4855,15 +4807,6 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lz4_flex"
-version = "0.11.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
-name = "lz4_flex"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
@@ -5111,7 +5054,7 @@ dependencies = [
  "bitflags",
  "bson",
  "derive-where",
- "derive_more 2.1.1",
+ "derive_more",
  "futures-core",
  "futures-io",
  "futures-util",
@@ -5695,7 +5638,7 @@ dependencies = [
  "flate2",
  "half",
  "hashbrown 0.17.0",
- "lz4_flex 0.14.0",
+ "lz4_flex",
  "num-bigint 0.5.1",
  "num-integer",
  "num-traits",
@@ -7242,7 +7185,7 @@ checksum = "8adfa1c298912827b8a28b223b3b874357397ae706e6190acd9bf28cee99114d"
 dependencies = [
  "bitflags",
  "cssparser",
- "derive_more 2.1.1",
+ "derive_more",
  "log",
  "new_debug_unreachable",
  "phf 0.13.1",
@@ -7887,7 +7830,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -8723,14 +8666,14 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.18.1"
+version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
+checksum = "e2e054861b4bd027cd373e18e8d8d8e6548085000e41290d95ce0c373a654b4a"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
  "rand 0.9.4",
- "serde",
+ "serde_core",
  "wasm-bindgen",
 ]
 

@@ -940,14 +940,14 @@ mod tests {
     }
 
     fn node_in(datacenter: &str) -> NodeInfo {
-        NodeInfo {
-            host_id: Default::default(),
-            broadcast_rpc_address: "127.0.0.1:9042".parse().unwrap(),
-            broadcast_address: None,
-            datacenter: datacenter.to_string(),
-            tokens: Vec::new(),
-            rack: "helios-rack1".to_string(),
-        }
+        NodeInfo::new(
+            Default::default(),
+            "127.0.0.1:9042".parse().unwrap(),
+            None,
+            datacenter.to_string(),
+            Vec::new(),
+            "helios-rack1".to_string(),
+        )
     }
 
     #[test]

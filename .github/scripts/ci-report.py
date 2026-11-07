@@ -917,9 +917,7 @@ PROTECTED_TABLES = ("resources", "resource_versions")
 # type becomes REQUEST_FAILURE and whose scope is dropped when it was not
 # prepared. It is not tied to the start of a statement, so a string literal or
 # comment naming such a DELETE would also match: a false failure, never a
-# missed one. A failed native-protocol batch logs no child text at all
-# ("BATCH of N statements"), so a DELETE inside one is not seen; the backend
-# sends no batch to resources or resource_versions.
+# missed one.
 DELETE_TEXT = re.compile(
     r'\bDELETE\b[^;]*?\bFROM\s+(?:"?\w+"?\s*\.\s*)?"?(resources|resource_versions)"?(?![\w"])',
     re.IGNORECASE | re.DOTALL,
@@ -931,6 +929,15 @@ NOT_LWT = re.compile(r"\bIF\b", re.IGNORECASE)
 # Statements that remove a whole table's data: a violation too, by scope.
 TABLE_WIPES = ("TRUNCATE", "DROP_TABLE")
 ALLOW_FILTERING = re.compile(r"\bALLOW\s+FILTERING\b", re.IGNORECASE)
+# A failed native-protocol batch logs one REQUEST_FAILURE entry, "BATCH of N
+# statements at consistency X; <error>", with no keyspace from its statements,
+# no scope and no child text (AuditLogManager.batchFailure, 5.0.9). So a DELETE
+# inside it cannot be ruled out, and it may have applied: a logged batch that
+# timed out is still replayed from the batchlog (verified on 5.0.9: 400
+# DELETEs on resources, applied about a minute after the WriteTimeout). Under
+# --check it fails the check as unverifiable. The backend sends no native
+# batch, so the backend never trips it.
+FAILED_BATCH = re.compile(r"^BATCH of \d+ statements\b")
 
 
 def open_text(path: Path) -> str:
@@ -983,9 +990,23 @@ def audit_entry(message: str) -> dict:
     }
 
 
+def in_keyspace(entry: dict, keyspace: str) -> bool:
+    """An entry from `keyspace`, or one with no keyspace: a failed batch, or a
+    scope-less entry from a session with no current keyspace, may be ours."""
+    return entry["ks"] in (None, "", keyspace)
+
+
+def audit_unverifiable(entry: dict, keyspace: str) -> str | None:
+    """Why an entry hides statements the check cannot see, or None."""
+    if (in_keyspace(entry, keyspace) and entry["type"] == "REQUEST_FAILURE"
+            and FAILED_BATCH.match(entry["operation"] or "")):
+        return "a failed native-protocol batch, whose statements the audit log does not record"
+    return None
+
+
 def audit_violation(entry: dict, keyspace: str) -> str | None:
     """Why an entry is a CQL DELETE against a protected table, or None."""
-    if entry["ks"] not in (None, "", keyspace):
+    if not in_keyspace(entry, keyspace):
         return None
     if entry["type"] == "DELETE" and entry["scope"] in PROTECTED_TABLES:
         return f"type:DELETE with scope:{entry['scope']}"
@@ -1005,12 +1026,13 @@ def cmd_cql_audit(args) -> int:
     took = time.monotonic() - started
     ours = [e for e in entries if e["ks"] == args.keyspace]
     dml = [e for e in ours if e["category"] == "DML"]
-    violations = []
+    violations, unverifiable = [], []
     for entry in entries:
-        reason = audit_violation(entry, args.keyspace)
-        if reason:
-            violations.append({"reason": reason, "type": entry["type"], "scope": entry["scope"],
-                               "operation": " ".join((entry["operation"] or "").split())[:500]})
+        for found, reason in ((violations, audit_violation(entry, args.keyspace)),
+                              (unverifiable, audit_unverifiable(entry, args.keyspace))):
+            if reason:
+                found.append({"reason": reason, "type": entry["type"], "scope": entry["scope"],
+                              "operation": " ".join((entry["operation"] or "").split())[:500]})
     counts = {}
     for entry in ours:
         key = (entry["scope"] or "(none)", entry["type"] or "?")
@@ -1019,7 +1041,7 @@ def cmd_cql_audit(args) -> int:
                     and not NOT_LWT.search(e["operation"] or "")]
     filtering = [e for e in ours if ALLOW_FILTERING.search(e["operation"] or "")]
     prepares = sum(1 for e in ours if e["type"] == "PREPARE_STATEMENT")
-    failures = [e for e in ours if e["category"] == "ERROR"]
+    failures = [e for e in entries if in_keyspace(e, args.keyspace) and e["category"] == "ERROR"]
 
     problems, warnings = [], []
     if text is None:
@@ -1029,12 +1051,14 @@ def cmd_cql_audit(args) -> int:
                         "(was `nodetool enableauditlog` run before the tests?)")
     for v in violations:
         problems.append(f"CQL DELETE against a soft-delete table: {v['reason']}: {v['operation'][:200]}")
+    for u in unverifiable:
+        problems.append(f"cannot rule out a CQL DELETE: {u['reason']}: {u['operation'][:200]}")
     if plain_writes:
         warnings.append(f"CQL audit: {len(plain_writes)} plain (non-IF) write(s) to resources; every write there must be a CAS (schema/README.md)")
     if filtering:
         warnings.append(f"CQL audit: {len(filtering)} prepared or DML statement(s) with ALLOW FILTERING (schema/README.md: never)")
     if failures:
-        warnings.append(f"CQL audit: {len(failures)} failed statement(s) (REQUEST_FAILURE) in keyspace {args.keyspace}")
+        warnings.append(f"CQL audit: {len(failures)} failed statement(s) (REQUEST_FAILURE) in keyspace {args.keyspace} or with none")
     if not args.check:
         warnings += problems
 
@@ -1043,25 +1067,32 @@ def cmd_cql_audit(args) -> int:
         f"in {len(entries):,} entries ({len(dml):,} DML in `{args.keyspace}`).")
     md = verdict + "\n\n"
     md += (f"From the node's audit log (`nodetool enableauditlog`, BinAuditLogger, categories DML, ERROR, PREPARE and DDL, "
-           f"keyspace `{args.keyspace}`), read with `auditlogviewer` after the tests. A violation is an entry with "
+           "every keyspace but the system ones, so an entry with no keyspace is kept), read with `auditlogviewer` after "
+           "the tests. A violation is an entry with "
            "`type:DELETE` and a scope of exactly `resources` or `resource_versions`, or any entry whose CQL text holds "
            "a `DELETE … FROM` either table: a CQL-text batch logs one scope-less `BATCH` entry, and a failed statement "
-           "a `REQUEST_FAILURE`. A `TRUNCATE` or `DROP TABLE` of either table is one too. `resources_by_type` (X1) and "
+           "a `REQUEST_FAILURE`. A `TRUNCATE` or `DROP TABLE` of either table is one too. A failed native-protocol batch "
+           "fails the check as well: its entry holds no statement text, and a logged batch that timed out may still "
+           "apply. `resources_by_type` (X1) and "
            f"`pending_index_writes` (I2) are deleted from legitimately. Parsed in {took:.1f} s.\n\n")
     md += "**DML by table and type** (R7; `UPDATE` is an INSERT or an UPDATE; the driver may re-send an idempotent statement, so a count can exceed one per operation):\n\n"
     tables = sorted({scope for scope, _ in counts})
     types = sorted({kind for _, kind in counts})
     md += table(["Table"] + [f"`{t}`" for t in types] + ["Total"],
                 [[f"`{s}`"] + [counts.get((s, t)) for t in types] + [sum(counts.get((s, t), 0) for t in types)] for s in tables])
-    md += (f"\nPrepared statements: {prepares}. Failed statements: {len(failures)}. Plain writes to `resources`: "
+    md += (f"\nPrepared statements: {prepares}. Failed statements: {len(failures)}, of which failed native batches: "
+           f"{len(unverifiable)}. Plain writes to `resources`: "
            f"{len(plain_writes)}. `ALLOW FILTERING` (prepared or DML statements; plain queries are not logged): {len(filtering)}.\n")
     if violations:
         md += "\n**Violations:**\n\n" + table(["Reason", "CQL"], [[v["reason"], f"`{v['operation'][:300]}`"] for v in violations[:20]])
+    if unverifiable:
+        md += "\n**Unverifiable:**\n\n" + table(["Reason", "Entry"], [[u["reason"], f"`{u['operation'][:300]}`"] for u in unverifiable[:20]])
     data = {
         "file": str(path), "entries": len(entries), "keyspace_entries": len(ours), "dml_entries": len(dml),
         "by_table_and_type": [{"table": s, "type": t, "count": n} for (s, t), n in sorted(counts.items())],
         "prepares": prepares, "failures": len(failures), "plain_writes_to_resources": len(plain_writes),
-        "allow_filtering": len(filtering), "violations": violations, "check": bool(args.check),
+        "allow_filtering": len(filtering), "violations": violations, "unverifiable": unverifiable,
+        "check": bool(args.check),
         "check_passed": not problems, "parse_seconds": round(took, 2), "warnings": warnings,
     }
     add(args.id, args.title, md, data)

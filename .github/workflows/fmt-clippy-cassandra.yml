@@ -585,11 +585,16 @@ jobs:
       # restarts the node. Each docker exec runs a JVM in the node's 3 GiB
       # container, which would inherit its MAX_HEAP_SIZE=1G; each gets its
       # own script's default instead (nodetool 128m, auditlogviewer 256M).
+      # Every keyspace but the system ones, not --included-keyspaces helios:
+      # a failed native batch, or a failed statement from a session with no
+      # current keyspace, logs an entry with no keyspace, which an include
+      # list drops (AuditLogFilter, 5.0.9).
       - name: Turn on the CQL audit log (Step 3 exit criterion)
         id: cql-audit-on
         run: |
           docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool enableauditlog \
-            --included-keyspaces helios --included-categories DML,ERROR,PREPARE,DDL --blocking true
+            --excluded-keyspaces system,system_schema,system_auth,system_distributed,system_traces,system_views,system_virtual_schema \
+            --included-categories DML,ERROR,PREPARE,DDL --blocking true
           docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool getauditlog
 
       # The start and apply times above, and the container's start to its CQL
@@ -690,9 +695,11 @@ jobs:
       # warning annotation; the step fails only if hfs does not boot or a log
       # line the measurement needs is missing. Already built. A failure here
       # does not skip the readiness test: that one runs when the round trip
-      # passed. Four boots take well under a minute; the timeout bounds a hung
-      # node.
+      # passed. Like it, this one runs when the round trip passed, so a failed
+      # Step 3 REST step above does not skip it. Four boots take well under a
+      # minute; the timeout bounds a hung node.
       - name: Boot-time report against this node (report only)
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
         timeout-minutes: 10
         run: |
           set -o pipefail
@@ -751,7 +758,9 @@ jobs:
       # failed statement, which carry no scope. resources_by_type (the X1
       # row) and pending_index_writes (I2) are deleted from legitimately, and
       # are never matched by prefix. It also fails on an empty log, which
-      # would prove nothing. A check, not a report (ADR-aacruzgon-0045): no
+      # would prove nothing, and on a failed native batch, whose entry holds
+      # no statement text although a logged one that timed out may still
+      # apply. A check, not a report (ADR-aacruzgon-0045): no
       # continue-on-error. Its section also counts DML per table and type
       # (R7). The dump is kept, gzipped, in the artifact.
       - name: Check the CQL audit log for a DELETE on resources or resource_versions

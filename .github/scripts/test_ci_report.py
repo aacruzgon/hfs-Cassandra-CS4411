@@ -9,7 +9,8 @@ The audit fixtures are real `auditlogviewer` output, from a Cassandra 5.0.9
 node (`cassandra:5.0.9-trixie`, `docker/cassandra`) with
 `nodetool enableauditlog --included-keyspaces helios --included-categories
 DML,ERROR,PREPARE`, after the statements each fixture names were sent with
-cqlsh.
+cqlsh; FAILED_BATCHES with `--excluded-keyspaces system,…` (as CI runs it)
+and the cqlsh's own Python driver sending native-protocol batches.
 """
 
 from __future__ import annotations
@@ -50,6 +51,19 @@ Type: audit
 LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:60620|timestamp:1794020100916|type:REQUEST_FAILURE|category:ERROR|ks:helios|operation:DELETE FROM resources WHERE tenant_id='t';; Some partition key parts are missing: resource_type, id
 Type: audit
 LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:60620|timestamp:1794020100917|type:DELETE|category:DML|ks:helios|scope:resource_versions|operation:DELETE FROM "resource_versions" WHERE tenant_id='t' AND resource_type='Patient' AND id='q' AND version_id = 1;
+"""
+
+# Recorded: failed native-protocol batches. A LOGGED batch of 400 DELETEs on
+# resources under a 1 ms write timeout (WriteTimeout; the batchlog applied all
+# 400 about a minute later), from a session on keyspace helios; a batch with
+# conditions across partitions, from a session with no keyspace, so the entry
+# has none; and a failed single statement for comparison.
+FAILED_BATCHES = """Type: audit
+LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:44912|timestamp:1794025976515|type:REQUEST_FAILURE|category:ERROR|ks:helios|operation:BATCH of 400 statements at consistency ONE; Operation timed out - received only 0 responses.
+Type: audit
+LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:51436|timestamp:1794026122987|type:REQUEST_FAILURE|category:ERROR|operation:BATCH of 2 statements at consistency ONE; Batch with conditions cannot span multiple partitions
+Type: audit
+LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:51494|timestamp:1794026123525|type:REQUEST_FAILURE|category:ERROR|operation:INSERT INTO system_auth.nope (a) VALUES (1);; table nope does not exist
 """
 
 
@@ -150,6 +164,17 @@ class AuditEntries(unittest.TestCase):
         [e] = ci_report.audit_records(entry("DELETE", "resources", "DELETE FROM other.resources WHERE a = 1", ks="other"))
         self.assertIsNone(ci_report.audit_violation(e, "helios"))
 
+    def test_a_failed_native_batch_is_unverifiable(self):
+        timed_out, no_keyspace, single = ci_report.audit_records(FAILED_BATCHES)
+        self.assertEqual(timed_out["ks"], "helios")
+        self.assertIsNone(no_keyspace["ks"])
+        for e in (timed_out, no_keyspace):
+            self.assertIsNone(ci_report.audit_violation(e, "helios"))
+            self.assertIn("failed native-protocol batch", ci_report.audit_unverifiable(e, "helios"))
+        self.assertIsNone(ci_report.audit_unverifiable(single, "helios"))
+        other = ci_report.audit_records(entry("REQUEST_FAILURE", None, "BATCH of 2 statements at consistency ONE; x", ks="other", category="ERROR"))[0]
+        self.assertIsNone(ci_report.audit_unverifiable(other, "helios"))
+
 
 class Scratch(unittest.TestCase):
     """Each test writes its report into its own directory."""
@@ -202,6 +227,13 @@ class CqlAuditCommand(Scratch):
         self.assertEqual(status, 1)
         self.assertIn("::error title=CQL audit", out)
         self.assertEqual(len(self.report("cql-audit")["violations"]), 3)
+
+    def test_a_failed_native_batch_fails_the_check(self):
+        status, out = self.audit(CLEAN + FAILED_BATCHES)
+        self.assertEqual(status, 1)
+        self.assertIn("cannot rule out a CQL DELETE", out)
+        data = self.report("cql-audit")
+        self.assertEqual((len(data["violations"]), len(data["unverifiable"]), data["failures"]), (0, 2, 3))
 
     def test_empty_or_missing_log_fails_the_check(self):
         self.assertEqual(self.audit("")[0], 1)

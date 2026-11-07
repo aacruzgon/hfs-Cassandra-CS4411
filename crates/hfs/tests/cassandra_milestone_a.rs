@@ -1154,7 +1154,7 @@ async fn metadata_through_rest(rest: &Rest<'_>) {
         system.contains(&"transaction"),
         hfs,
     );
-    spec("B-4:batch", true, system.contains(&"batch"), hfs);
+    spec("B-1:batch", true, system.contains(&"batch"), hfs);
 }
 
 fn header(response: &reqwest::Response, name: reqwest::header::HeaderName) -> String {

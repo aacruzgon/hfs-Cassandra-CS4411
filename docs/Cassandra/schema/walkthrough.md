@@ -394,7 +394,7 @@ The REST handler reads the row, then calls `delete_versioned(current.version_id(
 
 | # | Statement | Notes |
 | --- | --- | --- |
-| 0 | R1 | R1 gives `N`, `data`, `lu(N)` and `K(N)`, its `index_keys` (G22). Absent or `deleted_at > 0`: `NotFound`, 404, nothing written. `delete_versioned` with `N ≠ expected`: `VersionConflict`, 409, nothing written. |
+| 0 | R1 | R1 gives `N`, `data`, `lu(N)` and `K(N)`, its `index_keys` (G22). Absent or `deleted_at > 0`: `NotFound`, nothing written (REST answers 204 for `delete`, below). `delete_versioned` with `N ≠ expected`: `VersionConflict`, 409, nothing written. |
 | 1 | — | `Operation::Delete`. `K(N)` from R1's `index_keys`; `K(N+1)` empty; `deleted_at = lu(N+1)`. |
 | 2 | V3 rewrites `N` from R1's `data`, with `K(N)` (G40); then I1 | V3 before the CAS, so row `N` exists if C3 applies |
 | 3 | C3 with `IF version_id = N AND deleted_at = 0` | C3 sets `deleted_at = lu(N+1)` and `index_keys` to the empty set |
@@ -405,10 +405,10 @@ The REST handler reads the row, then calls `delete_versioned(current.version_id(
 | CAS result | `delete` | `delete_versioned` |
 | --- | --- | --- |
 | applied | 204 No Content | 204 |
-| `[applied] False` only, or `deleted_at > 0` | `NotFound`, 404 | `NotFound`, 404 (a repeated `delete_versioned` must be `NotFound`, G9) |
-| `version_id` moved, still live | retry once, at once, from step 0 with a new I1 (G25, ADR-aacruzgon-0024); a second miss: `VersionConflict`, 409; the new R1 finds it deleted: `NotFound`, 404 | `VersionConflict`, 409 (never retried) |
+| `[applied] False` only, or `deleted_at > 0` | `NotFound`; REST answers 204 | `NotFound`, 404 (a repeated `delete_versioned` must be `NotFound`, G9) |
+| `version_id` moved, still live | retry once, at once, from step 0 with a new I1 (G25, ADR-aacruzgon-0024); a second miss: `VersionConflict`, 409; the new R1 finds it deleted: `NotFound`, which REST answers 204 | `VersionConflict`, 409 (never retried) |
 
-Helios answers 404, not the spec's 200/204, for a delete of an unknown or already-deleted id (`delete.rs`; G25).
+A delete of an unknown or already-deleted id is `NotFound` from the backend, as on SQLite, PostgreSQL and MongoDB. With no `If-Match`, the REST layer answers it with the spec's 204, or 200 with an informational OperationOutcome under `Prefer: return=OperationOutcome`, and writes nothing. That is HeliosSoftware/hfs#2529 (open upstream), which the fork carries (ADR-aacruzgon-0052); without it, Helios answers 404 (G25). Step 0's `NotFound` on a plain `delete` is answered the same way. With `If-Match`, REST answers 412 from its own read before storage is called, so `delete_versioned` meets `NotFound` only when another delete wins the race, and that stays 404.
 
 ### 3.5 Revive and `create_or_update` (`PUT` onto a deleted or unknown id; batch PUT)
 
@@ -792,7 +792,7 @@ G numbers are stable references; the list is grouped by severity, not sorted.
 
 **G6. The sweeper polled 2 buckets, but intents live 24 h.** *Resolved in the design (ADR-aacruzgon-0014).* After an outage over an hour, a crashed create stayed unsearchable for good. Now the sweeper walks the 25 most recent buckets at startup. Past the TTL a crashed create stays unsearchable (readable by id) until next written, a limitation the design now states.
 
-**G9. The CAS result mapping depends on the operation.** *Resolved in the design (step 3; a correction, no ADR).* `deleted_at` set (`> 0` since G39) is 410 for `read` and `vread` only; every write maps it to `NotFound`, 404, which the race suite allows (`versioned_write_race_suite.rs:94-95`, and the deleted-row arms at 262, 369 and 541). `spike-findings.md` point 3 is corrected.
+**G9. The CAS result mapping depends on the operation.** *Resolved in the design (step 3; a correction, no ADR).* `deleted_at` set (`> 0` since G39) is 410 for `read` and `vread` only; every write maps it to `NotFound`, 404, which the race suite allows (`versioned_write_race_suite.rs:94-95`, and the deleted-row arms at 262, 369 and 541). For a plain `delete`, REST answers that `NotFound` with 204, the spec's no-op (3.4, ADR-aacruzgon-0052). `spike-findings.md` point 3 is corrected.
 
 **G10. Repair on read could delete a key the in-flight writer needs.** *Resolved in the design (ADR-aacruzgon-0017).* A delete wins a timestamp tie, so deleting a stale date key at `ts(N+1)` beat the writer's insert. Now repair deletes only keys the current version does not produce and upserts the rest (5.1). Its read-latency cost is unmeasured.
 
@@ -814,7 +814,7 @@ G numbers are stable references; the list is grouped by severity, not sorted.
 - A `delete` without `If-Match` whose CAS misses because an update landed now retries once, at once, from the pre-read with a new I1, as MongoDB does (#1405).
 - A second miss is `VersionConflict`, 409. The race suite still holds: "a resource is deleted once".
 - `delete_versioned` never retries.
-- A delete of an unknown or already-deleted id stays 404, matching Helios (`delete.rs`), not the spec's 200/204 (3.4).
+- A delete of an unknown or already-deleted id is `NotFound` from the backend, and REST answers it with the spec's 204 (3.4). It was 404, matching Helios; it is 204 with HeliosSoftware/hfs#2529 (open upstream), which the fork carries (ADR-aacruzgon-0052).
 
 **G26. 503 or 504.** *Resolved in the design (ADR-aacruzgon-0024).* The rule is the one `crates/rest/src/error.rs` already applies:
 - a timeout (`WriteTimeout`, `ReadTimeout`, a timed-out serial read, or an outcome a timeout left undecidable) is `BackendError::Timeout`, 504;

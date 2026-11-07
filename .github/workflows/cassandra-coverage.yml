@@ -187,14 +187,9 @@ jobs:
             | tee "$RUNNER_TEMP/ci-report/logs/persistence-tests.log"
 
       # With the node's URL, so the node_tests modules in write.rs and
-      # backend.rs run instead of skipping; the required job runs no --lib
-      # tests, so this is the only CI run of them. After the integration
-      # tests for now: until the stack carries the wiring layer's fix
-      # (51199208b, 16 partitions), backend.rs's
-      # the_partition_key_scan_follows_every_page creates four partitions but
-      # asserts more than 14 rows, so it passes only on a node that already
-      # holds others (it failed first in run 42254248131). Once the fix is
-      # below this layer, this step can run first.
+      # backend.rs run instead of skipping. The required job runs the same
+      # --lib tests (fmt-clippy-cassandra.yml, Step 3); this run measures
+      # their coverage.
       - name: Backend unit tests (--lib, backends::cassandra) against this node
         run: |
           set -o pipefail

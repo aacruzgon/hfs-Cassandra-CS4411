@@ -477,13 +477,20 @@ jobs:
       # The Milestone A test (crates/hfs/tests/cassandra_milestone_a.rs) is
       # built here too: hfs with only the cassandra backend, and the test
       # binary that starts it.
-      - name: Build tests/cassandra_tests.rs, backend_capability_contract.rs and the Milestone A test, and report the memory peak
+      - name: Build tests/cassandra_tests.rs, backend_capability_contract.rs, the --lib tests and the Milestone A test, and report the memory peak
         id: build
         run: |
           python3 .github/scripts/ci-report.py build build-persistence-tests \
             "Build: helios-persistence Cassandra tests" -- \
             nice -n 10 cargo test -p helios-persistence --features cassandra \
               --test cassandra_tests --test backend_capability_contract --no-run --timings
+          # The backend's unit tests (--lib), their own binary: built and
+          # reported separately, so the report shows what the --lib step adds
+          # to the build (Step 3 plan, section 6).
+          python3 .github/scripts/ci-report.py build build-persistence-lib \
+            "Build: helios-persistence --lib tests (cassandra)" -- \
+            nice -n 10 cargo test -p helios-persistence --features cassandra \
+              --lib --no-run --timings
           python3 .github/scripts/ci-report.py build build-hfs-milestone-a \
             "Build: hfs (R4, cassandra) and the Milestone A test" -- \
             nice -n 10 cargo test -p helios-hfs --no-default-features --features R4,cassandra \
@@ -583,6 +590,21 @@ jobs:
             cargo test -p helios-persistence --features cassandra \
               --test cassandra_tests --test backend_capability_contract -- --show-output 2>&1 \
             | tee "$RUNNER_TEMP/ci-report/logs/persistence-tests.log"
+
+      # The backend's unit tests, so every engine test gates the pull request:
+      # the pure ones (CAS classification, the miss mapping, decide(V), the
+      # key delta, the binds, the no-DELETE source scan) and the live ones in
+      # write.rs and backend.rs, against this node. backend.rs's restart_tests
+      # skip: they need a node of their own (HFS_TEST_CASSANDRA_RESTART_*),
+      # and must never stop this one. Already built above.
+      - name: cargo test --lib backends::cassandra against this node
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/ci-report/logs"
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+            cargo test -p helios-persistence --features cassandra \
+              --lib -- backends::cassandra --show-output 2>&1 \
+            | tee "$RUNNER_TEMP/ci-report/logs/persistence-lib-tests.log"
 
       # Milestone A (roadmap Step 2, item 2.7): the real hfs binary on this
       # node, POST /Patient then GET /Patient/{id}. Built above.
@@ -689,7 +711,8 @@ jobs:
         run: |
           logs="$RUNNER_TEMP/ci-report/logs"
           python3 .github/scripts/ci-report.py tests tests "Tests" \
-            "$logs/persistence-tests.log" "$logs/milestone-a-round-trip.log" \
+            "$logs/persistence-tests.log" "$logs/persistence-lib-tests.log" \
+            "$logs/milestone-a-round-trip.log" \
             "$logs/boot-time.log" "$logs/latency-backend.log" "$logs/latency-rest.log" \
             "$logs/readiness.log"
           python3 .github/scripts/ci-report.py readiness readiness \

@@ -17,7 +17,11 @@
 //! `delete_versioned` and `create_or_update`; `read`, `count`, `exists`,
 //! `read_batch`, `vread`, `list_versions` and `delete_with_match`; and the
 //! stored-SearchParameter overlay. `create_many` works through the trait
-//! default's logic, on `create`.
+//! default's logic, on `create`. Three more `ResourceStorage` defaults are
+//! overridden because they are wrong for a networked store
+//! (`cassandra-discussion.md`, "Defaults we must override"; `storage.rs`):
+//! `is_cluster_shared` answers `true`, `readiness_check` goes through
+//! `health_check`, and `bulk_write_concurrency` is 8.
 //!
 //! What refuses, with
 //! [`BackendError::UnsupportedCapability`](crate::error::BackendError), which

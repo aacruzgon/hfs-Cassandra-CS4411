@@ -33,11 +33,10 @@
 //! renames or removes a CRUD test, or a whole file, fails it until this copy
 //! follows.
 //!
-//! Every test here runs against the real Step 3 backend: `update`, `delete`
-//! and `delete_versioned` (roadmap Step 3's write path), `vread`,
-//! `list_versions`, `delete_with_match`, `exists` and `read_batch` (Step 3,
-//! L2c), and `create_or_update`, as well as Step 2's `create`, `read` and
-//! `count`.
+//! Every test here runs against the real Step 3 backend. The methods they
+//! call are `update`, `delete` and `delete_versioned` (roadmap Step 3's write
+//! path), `exists` and `read_batch` (Step 3, L2c), and `create_or_update`, as
+//! well as Step 2's `create`, `read` and `count`.
 
 /// The Cassandra backend on the test node, or a skip (`return`) when there is
 /// no node. Stands in for upstream's `create_sqlite_backend()`.

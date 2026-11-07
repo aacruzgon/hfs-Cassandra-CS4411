@@ -28,13 +28,12 @@
 --     resources never holds a tombstone, and a replica that missed a revive
 --     cannot bring the delete back (ADR-aacruzgon-0027, walkthrough G39);
 --   * every update, delete and revive also rewrites resource_versions row N
---     from current, USING TIMESTAMP write_ts(N) - 1, before its intent row and
+--     from the writer's read of resources at N (R1), USING TIMESTAMP
+--     write_ts(N) - 1, before its intent row and
 --     its CAS, so row N exists whenever a CAS creating N+1 has applied, a crash
 --     cannot lose it, and an existing row always wins (ADR-aacruzgon-0027,
---     walkthrough G40); a rewrite built from a read of
---     resources (delete, create_or_update, update_with_match) also carries
---     that read's write_id, one built from update's StoredResource leaves it
---     unset (ADR-aacruzgon-0026);
+--     walkthrough G40); every rewrite carries that read's write_id, update's
+--     included (ADR-aacruzgon-0026, 0061);
 --   * every resource_versions row carries index_keys, the key set its version
 --     wrote, never unset: V1 and V2 write the writer's own K(V), the sweeper's
 --     replay writes the index_keys of the resources row it read, and a

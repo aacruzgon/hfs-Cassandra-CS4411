@@ -56,7 +56,7 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0009](2026-10-13/0009-gc-grace-seconds.md) | 2026-10-13 | `gc_grace_seconds` per table | accepted |
 | [0010](2026-10-13/0010-compaction-default.md) | 2026-10-13 | Compaction stays at the node default for every table | accepted |
 | [0011](2026-10-13/0011-created-at.md) | 2026-10-13 | Where `created_at` lives and what revive does to it | accepted |
-| [0012](2026-10-14/0012-rewrite-previous-version-row.md) | 2026-10-14 | Every write also rewrites the previous version's history row | accepted; partly superseded by [0027](2026-11-05/0027-step-1-open-items-decided.md) (G40: the rewrite runs before the CAS; [0060](2026-11-06/0060-step3-scope.md)) |
+| [0012](2026-10-14/0012-rewrite-previous-version-row.md) | 2026-10-14 | Every write also rewrites the previous version's history row | accepted; partly superseded by [0027](2026-11-05/0027-step-1-open-items-decided.md) (G40: the rewrite runs before the CAS; [0060](2026-11-06/0060-step3-scope.md)); its source is R1, not `current` ([0061](2026-11-06/0061-update-v3-from-r1.md)) |
 | [0013](2026-10-14/0013-sweeper-replays-versions.md) | 2026-10-14 | The sweeper replays the intent's version, even if superseded | accepted |
 | [0014](2026-10-14/0014-sweeper-startup-scan.md) | 2026-10-14 | The sweeper scans every live bucket when it starts | accepted |
 | [0015](2026-10-14/0015-outbox-clustered-by-time.md) | 2026-10-14 | `pending_index_writes` is clustered by `enqueued_at` first | accepted |
@@ -105,3 +105,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0058](2026-11-06/0058-cql-audit-check.md) | 2026-11-06 | The node's CQL audit log proves that no CQL `DELETE` reaches `resources` or `resource_versions`, as a check in the required Cassandra job | accepted |
 | [0059](2026-11-06/0059-step3-ci-reports.md) | 2026-11-06 | Step 3's CI reports: latency per operation, CAS outcomes, statements, intent rows, tombstones, DML and the HL7 rows | accepted |
 | [0060](2026-11-06/0060-step3-scope.md) | 2026-11-06 | Step 3's scope: vread, list_versions and delete_with_match come forward from Step 4, PATCH is in, the multitenancy suites split, and four contradictions are realigned; Steps 4 to 8 left to the group (**X**) | accepted |
+| [0061](2026-11-06/0061-update-v3-from-r1.md) | 2026-11-06 | Plain `update` builds its rewrite of row N from its own pre-read, so every rewrite carries a `write_id` | accepted |

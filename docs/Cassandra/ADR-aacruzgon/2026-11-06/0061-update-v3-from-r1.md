@@ -1,0 +1,29 @@
+# ADR-aacruzgon-0061: Plain `update` builds its rewrite of row N from its own pre-read, so every rewrite carries a `write_id`
+
+- **Date:** 2026-11-06
+- **Status:** accepted
+- **Context:**
+    - **What the walkthrough said.** Plain `update` built V3, its rewrite of row `N` at `ts(N) − 1`, from the `StoredResource` REST passes in as `current`, which carries no `write_id`, so V3 left `write_id` unset (walkthrough G36). G36 recorded the cost: when the write that superseded an unknown outcome was a plain `update`, R3 on row `V` finds no `write_id`, and the outcome stays undecidable (504 or 503) even when ours applied.
+    - **Why that no longer has to hold.** G36 predates ADR-aacruzgon-0027's G22, which gave `update` its own R1 of `resources` to read `K(N)`. R1 selects `write_id` (`read.rs`, `SELECT_RESOURCE`). When R1 shows `version_id = N`, its `write_id` is exactly `w(N)`, since the compare-and-swap that made `N` current wrote both in one mutation. CodeRabbit made the same point on PR #33 ("Copy `write_id` from R1 into `update`'s V3"), never applied (Step 3 plan D5).
+    - **The rule appeared in nine places:** design `:271` and `:316-317`; roadmap `:162`; `schema.cql:36-37`; walkthrough `:158`, `:163`, `:369`, `:404` and `:856` (G36).
+    - **A sub-case the walkthrough left open.** Section 2's R1 cases say that when R1 is below `N` (N's CAS still committing), `update` runs R2 at `LOCAL_SERIAL` and uses R2's row. It does not say what to do if R2 is still below `N`.
+- **Decision:**
+    - **V3 comes from R1.** `update_attempt` (`crates/persistence/src/backends/cassandra/update.rs:191`) builds its plan with `CasPlan::update(PreviousVersion::from_row(row), …)`, where `row` is R1, or R2 when R1 was below `current`'s version. V3 therefore carries R1's `data`, `lu(N)`, `w(N)`, `K(N)` and `fhir_version`. `current` supplies only the expected version `N` and the answer's `created_at`. When R1 shows `N`, its `data` and `lu(N)` are `current`'s, so nothing else changes.
+    - **The R1 cases, as built** (pure functions `r1_case` and `r2_case`, `update.rs:69`, `:90`):
+        - at `N` and live: the attempt;
+        - at `N` and deleted, past `N` and deleted, or no row: `NotFound`, nothing written;
+        - past `N` and live: `VersionConflict { expected N, actual }`, no CAS;
+        - below `N`: R2, then judged again.
+    - **R2 still below `N` is 409.** If R2 still shows a version below `current`'s, `current` is ahead of anything the partition has committed. The answer is `VersionConflict` (409) if the row is live, `NotFound` if it is deleted, and nothing is written. It is not read a third time.
+    - **V3 is a repair, not an edit of a past version** (matrix V-5, "there is no way to update or delete past versions"). At `ts(N) − 1` it never wins over a cell already there; it only restores a row `N` whose own writer had not written it yet (G40).
+    - **The nine places are corrected** in this entry's commit. No table, key or column type changes, so no new schema sign-off is needed (ADR-aacruzgon-0028 `:20`).
+- **Alternatives considered:**
+    - **Keep the walkthrough: V3 from `current`, `write_id` unset** (D5 b): lost. It leaves the one case in the 3.1 table where a write that may have applied answers 504, and it costs nothing to close, since the read already happens.
+    - **For R2 still below `N`: read again until it moves:** lost. A row that R2 at `LOCAL_SERIAL` shows below `current` has no proposal left in flight, so a third read would show the same; a 409 tells the client to re-read.
+- **Consequences:**
+    - **Every V3 carries a `write_id`,** so the "row `V`'s `write_id` unset" row of walkthrough 3.1 is unreachable for rows written by this code. It stays in the table, for a row whose `write_id` cannot be decoded.
+    - **ADR-aacruzgon-0051's undecidable case** becomes unreachable in practice, as that entry expected.
+    - **Tests** (layer L2, PR #58): `v3_restores_a_missing_row_n_with_its_write_id` (`update.rs:715`) checks that a row 1 never written by its own writer is restored by `update`'s V3 with that writer's `write_id`; `r1_version_cases_on_the_node` (`:764`) checks that R2 completes a held-back C2, that V3 then rewrites row 2 with the other writer's `write_id`, and the still-below-`N` answer.
+- **AI involvement:** The rule was proposed in the Step 3 plan (D5) by the `s3-plan` worker. The `s3-update` worker (W2, Claude Code, Opus 5.5) built it in layer L2a and drafted its notes, including the still-below-`N` sub-case, which the walkthrough did not cover. This entry was drafted by the `s3-docs` worker (Claude Code, Opus 5.5) for layer L5. Verified against the merged code (`main` `b8cf2d4f4`): `update.rs:102-135` (R1, then R2 below `N`), `:191-202` (`update_attempt` builds from the row), `write.rs:589-603` (`CasPlan::update` takes R1's `fhir_version`); and every one of the nine cited lines at `b7a7f7be8`, the same on `main` `9c8c8f4f3`.
+    - **What Alan changed:** nothing in the rule: he accepted D5 as recommended on 2026-11-06 (decisions `:83`). On 2026-11-07 he accepted the sub-case as W2 recommended it: "R2 still below the client's version answers 409 (D5 entry in L5 adds the sub-case)" (decisions `:129`), and later that day this entry as drafted (decisions `:151`).
+- **Links:** Step 3 plan D5; PR #58 (L2, merge `b8cf2d4f4`); PR #33's outside-diff comment; ADR-aacruzgon-0012, 0026 (G36), 0027 (G22, G40), 0028, 0051; `cassandra-discussion.md` write path step 4 and "A version past V"; `schema/walkthrough.md` section 2 ("Version rows", "Stored key sets"), 3.1, 3.3 and G36; `schema/schema.cql`'s `resource_versions` comment; `development-roadmap.md` Step 1 checklist.

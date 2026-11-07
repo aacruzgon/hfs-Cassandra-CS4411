@@ -591,6 +591,8 @@ mod testable_backend {
 mod step3_suites {
     use std::sync::Arc;
 
+    use helios_persistence::backends::cassandra::CasStats;
+
     use crate::cassandra_node::{self, CassandraNode, TEST_TENANT_PREFIX, URL_VAR};
     use crate::cassandra_testable::CassandraTestBackend;
     use crate::{tenant_existence_suite, tenant_id_fidelity_suite, versioned_write_race_suite};
@@ -645,28 +647,53 @@ mod step3_suites {
         Arc::new(CassandraTestBackend::connect(node, label).await)
     }
 
+    /// Prints the race's `[cas case=race:<test> …]` line: the write engine's
+    /// counters over the race (`CasStats`'s `Display`), for CI's CAS outcome
+    /// report (Step 3 plan R3, `ci-report.py cas`). Each wrapper connects its
+    /// own backend, so the counters are the race's alone.
+    fn print_cas(test: &str, backend: &CassandraTestBackend, before: &CasStats) {
+        eprintln!(
+            "[cas case=race:{test} {}]",
+            backend.inner().cas_stats().since(before)
+        );
+    }
+
     /// #1404: of eight writers holding the same version, one `update` writes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn cassandra_concurrent_updates_from_the_same_version_admit_one() {
         let node = node_or_skip!("cassandra_concurrent_updates_from_the_same_version_admit_one");
+        let backend = race_backend(node, "race-update").await;
+        let before = backend.inner().cas_stats();
         versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one(
-            race_backend(node, "race-update").await,
+            Arc::clone(&backend),
             &unique_base("upd"),
             RACE_ROUNDS,
         )
         .await;
+        print_cas(
+            "cassandra_concurrent_updates_from_the_same_version_admit_one",
+            &backend,
+            &before,
+        );
     }
 
     /// #1404: an update and a versioned delete of the same version: one wins.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn cassandra_concurrent_update_and_versioned_delete_admit_one() {
         let node = node_or_skip!("cassandra_concurrent_update_and_versioned_delete_admit_one");
+        let backend = race_backend(node, "race-vdelete").await;
+        let before = backend.inner().cas_stats();
         versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
-            race_backend(node, "race-vdelete").await,
+            Arc::clone(&backend),
             &unique_base("vdel"),
             RACE_ROUNDS,
         )
         .await;
+        print_cas(
+            "cassandra_concurrent_update_and_versioned_delete_admit_one",
+            &backend,
+            &before,
+        );
     }
 
     /// #1404, #1405: an update racing an unconditional delete leaves a
@@ -674,12 +701,19 @@ mod step3_suites {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn cassandra_concurrent_update_and_plain_delete_stay_consistent() {
         let node = node_or_skip!("cassandra_concurrent_update_and_plain_delete_stay_consistent");
+        let backend = race_backend(node, "race-pdelete").await;
+        let before = backend.inner().cas_stats();
         versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
-            race_backend(node, "race-pdelete").await,
+            Arc::clone(&backend),
             &unique_base("pdel"),
             RACE_ROUNDS,
         )
         .await;
+        print_cas(
+            "cassandra_concurrent_update_and_plain_delete_stay_consistent",
+            &backend,
+            &before,
+        );
     }
 
     /// #2111: four unconditional PUTs racing onto one delete marker all
@@ -688,12 +722,19 @@ mod step3_suites {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn cassandra_concurrent_puts_onto_a_tombstone_all_succeed() {
         let node = node_or_skip!("cassandra_concurrent_puts_onto_a_tombstone_all_succeed");
+        let backend = race_backend(node, "race-restore").await;
+        let before = backend.inner().cas_stats();
         versioned_write_race_suite::concurrent_puts_onto_a_tombstone_all_succeed(
-            race_backend(node, "race-restore").await,
+            Arc::clone(&backend),
             &unique_base("rest"),
             RACE_ROUNDS,
         )
         .await;
+        print_cas(
+            "cassandra_concurrent_puts_onto_a_tombstone_all_succeed",
+            &backend,
+            &before,
+        );
     }
 
     /// #1404: `delete_versioned` compares and deletes in one step. No race,
@@ -702,11 +743,17 @@ mod step3_suites {
     async fn cassandra_versioned_delete_is_a_compare_and_swap() {
         let node = node_or_skip!("cassandra_versioned_delete_is_a_compare_and_swap");
         let backend = CassandraTestBackend::connect(node, "race-cas").await;
+        let before = backend.inner().cas_stats();
         versioned_write_race_suite::versioned_delete_is_a_compare_and_swap(
             &backend,
             &unique_base("cas"),
         )
         .await;
+        print_cas(
+            "cassandra_versioned_delete_is_a_compare_and_swap",
+            &backend,
+            &before,
+        );
     }
 
     /// On a current-thread runtime the race tests pass without racing

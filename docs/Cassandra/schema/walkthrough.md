@@ -1,6 +1,6 @@
 # Paper walk-through of the schema
 
-**DRAFT for the schema session (roadmap item 1.2).** Not reviewed by the team. Nothing here is decided. Where the walk-through had to pick something the design leaves open, it points to the gap list at the end (G1, G2, …).
+**Status: agreed by the team with the schema; sign-offs being recorded against `67f9e0532` (roadmap item 1.4): Alan's is in (ADR-aacruzgon-0028), the other four members' are pending, and item 1.2 is done when they are.** Since then it has been kept in step with the code, each change through the ADR it names (the schema README lists them). Where it had to pick something the design leaves open, it points to the gap list at the end (G1, G2, …).
 
 This walks every in-scope operation through the ten tables, statement by statement. It follows the design in [`cassandra-discussion.md`](../cassandra-discussion.md) ("Proposed Cassandra data model" and "Consistency, failure handling and rejection"), the Step 1 checklist of [`development-roadmap.md`](../development-roadmap.md), and [`spike-findings.md`](../spike-findings.md). The tables are in [`schema.cql`](schema.cql); the directory overview is [`README.md`](README.md).
 
@@ -444,7 +444,7 @@ Branches b and c write V3 for `N` at step 2, before the CAS (G40): branch b a co
 
 ### 4.1 read (`GET /Patient/id`)
 
-R1 at `LOCAL_QUORUM`, partition `resources (T,P,id)`. Absent: `Ok(None)`, 404. `deleted_at > 0`: `ResourceError::Gone`, 410, whatever `HFS_RETURN_GONE` says: only the vread handler reads that flag (`crates/rest/src/handlers/vread.rs:81`; HeliosSoftware/hfs#2526; ADR-aacruzgon-0064). Otherwise `StoredResource::from_storage(…)`, 200, `ETag: W/"version_id"`. `exists` is the same read and answers `false` for a deleted row (the trait doc requires MongoDB's behaviour).
+R1 at `LOCAL_QUORUM`, partition `resources (T,P,id)`. Absent: `Ok(None)`, 404. `deleted_at > 0`: `ResourceError::Gone`, 410, whatever `HFS_RETURN_GONE` says: only the vread handler reads that flag (`crates/rest/src/handlers/vread.rs:81`; HeliosSoftware/hfs#2526; ADR-aacruzgon-0064). Otherwise `StoredResource::from_storage(…)`, 200, `ETag: W/"version_id"`. `exists` is R1 reduced to `deleted_at`, so a yes/no answer does not ship the resource, and answers `false` for no row or a deleted one (the trait doc requires MongoDB's behaviour; `versions.rs`, Step 3 plan D10).
 
 ### 4.2 vread (`GET /Patient/id/_history/vid`)
 
@@ -452,7 +452,7 @@ R3 at `LOCAL_QUORUM`, partition `resource_versions (T,P,id)`, one row. `vid` is 
 
 | Case | Backend returns | REST returns |
 | --- | --- | --- |
-| `vid` not a valid `int` (`"abc"`, `"1.0"`) | `Ok(None)` without a query | 404 |
+| `vid` not the canonical decimal of a positive `int` (`"abc"`, `"1.0"`, `"01"`, `"+1"`, `"0"`) | `Ok(None)` without a query | 404 |
 | no such row | `Ok(None)` | 404 |
 | content row | `StoredResource` with content | 200 |
 | delete marker (`deleted_at` set, `data` unset) | `StoredResource` with `deleted_at` set and content `Value::Null`, as PostgreSQL | 410 when `HFS_RETURN_GONE` is true (the default), else 404 (`vread.rs`) |
@@ -479,7 +479,7 @@ Expected results for every case are in [`coverage.md`](coverage.md). This sectio
 4. **Tag check:** R1 for the candidate. Keep it only if the row exists, `deleted_at` is 0 (live; G39) and `resources.version_id` equals the index row's `version_id`. A mismatch hides the candidate and triggers repair on read (ADR-aacruzgon-0017): maintenance for the current version at its `ts`, with its key set from the `index_keys` of the R1 row just loaded (G22), so repair reads nothing more. A stale key the current version does not produce is deleted; one it produces is upserted with the current tag. Repair is logged as a write made from a read.
 5. Apply residual filters: dates and `_lastUpdated` combined with another parameter (5.8); `query.fhir_version`, kept only if `resources.fhir_version` equals `as_mime_param()` of it (5.9, G34); `query.compartment` (5.11, G33).
 6. Stop at `_count + 1` kept resources; the extra one decides whether `next` exists. `LIMIT` is a batch size, not the page size.
-7. **Cap** (G27, ADR-aacruzgon-0027). The search counts the distinct candidates it point-reads (R1) for one page, or for one `search_count`. Past the configured cap it fails with `SearchError::TooManyResults`, which REST answers with 422, issue `processing` (`crates/rest/src/error.rs:1123-1125`, `591-595`). No search error produces `too-costly`; its only producer is the batch handler's 500 for a transaction too large for MongoDB's cache (`crates/rest/src/handlers/batch.rs:3745`). Stale rows count too: a candidate the tag check hides is still a candidate point-read, so enough resurrected or orphan rows ahead of the live matches can make a page fail before it fills (G7). Repair on read at step 4 deletes each one it reads, so a retry gets further.
+7. **Cap** (G27, ADR-aacruzgon-0027). The search counts the distinct candidates it point-reads (R1) for one page, or for one `search_count`. Past the configured cap it fails with `SearchError::TooManyResults`, which REST answers with 422, issue `processing` (`crates/rest/src/error.rs:1123-1125`, `591-595`). No search error produces `too-costly`; its only producer is the batch handler's 500 for a transaction too large for MongoDB's cache (`crates/rest/src/handlers/batch.rs:3807`). Stale rows count too: a candidate the tag check hides is still a candidate point-read, so enough resurrected or orphan rows ahead of the live matches can make a page fail before it fills (G7). Repair on read at step 4 deletes each one it reads, so a retry gets further.
 
 Index and R1 reads are `LOCAL_QUORUM`. A candidate whose index tag is `N` while `resources` is at `N+1` (a write between steps 3 and 5) is hidden: the design's in-flight window.
 
@@ -899,7 +899,7 @@ The CAS had already applied when step 5 failed, so no retry, sweep or repair cou
 - `bucket` is the UTC hour of `enqueued_at` itself, never a second clock reading (now in the design).
 - The sweeper reads `shard` back from the row, so any function works, even random. If it is a hash, name one stable across processes and Rust releases (not `DefaultHasher`).
 - `create_or_update` writes a new intent row for each turn, with its own `enqueued_at` and that turn's version, and a turn whose CAS misses deletes its own row (ADR-aacruzgon-0024). Rewriting one key with a new version, or deleting it and writing it again, would depend on coordinator timestamps.
-- HTTP retries: a `POST` after a timeout creates a duplicate; a `PUT` with `If-Match: W/"N"` after success gets 412; a `DELETE` after success gets 404. The other backends do the same; the demo script and the benchmark harness must not count these as Cassandra errors.
+- HTTP retries: a `POST` after a timeout creates a duplicate; a `PUT` with `If-Match: W/"N"` after success gets 412; a `DELETE` after success gets 204 again, writing nothing (ADR-aacruzgon-0052). The other backends do the same; the demo script and the benchmark harness must not count these as Cassandra errors.
 
 **G28. Batch `ifMatch` plus the `create_or_update` retry is last-writer-wins.** *Resolved (ADR-aacruzgon-0024 recorded it as an upstream limitation; ADR-aacruzgon-0056 closes it with the backport of upstream #2530).* REST used to check a batch entry's `ifMatch` with a read, then call `create_or_update`, so our loop, which retries on a newer version, let an entry conditioned on `W/"1"` overwrite a version 2 it never saw. Since the backport, the gate keeps the row it checked: a batch `PUT` with `ifMatch` calls `update` against that row (`VersionConflict` → 409, a delete since → 404), and a batch `DELETE` with `ifMatch` calls `delete_under_precondition`, as the single requests do. The `create_or_update` loop, with its bound of 3 retries or 4 attempts (ADR-aacruzgon-0024), now serves only entries without `ifMatch`, where last-writer-wins is the upstream contract (#2111).
 

@@ -1631,6 +1631,18 @@ impl CassandraBackend {
 
     /// Step 5: the delta from `K(N)` to `K(N+1)` at `ts(N+1)`. `true` once
     /// every row is written.
+    ///
+    /// The inserts go first, so a concurrent `count` never sees the resource
+    /// missing while its `resources_by_type` row moves. The deletes of
+    /// `K(N) \ K(N+1)` are sent only once every insert is acknowledged. If an
+    /// insert still fails after its tries, the old rows are kept and this
+    /// returns `false`: the write succeeds with I1 left (G23), and the
+    /// sweeper, which reads `K(N)` from row `N` and `K(N+1)` from the
+    /// `resources` row, writes the missing rows and deletes the old ones.
+    /// The walkthrough's batch template (section 2, "Index rows") sends a
+    /// version's deletes and inserts in one logged batch, all or nothing, so
+    /// this keeps what it guarantees: no old row is deleted without its
+    /// replacement written.
     async fn write_index_delta(
         &self,
         key: &RowKey<'_>,
@@ -1643,47 +1655,72 @@ impl CassandraBackend {
             .as_ref()
             .map(|p| (p.keys.as_slice(), p.last_updated));
         let (deletes, inserts) = index_delta(previous, (&plan.keys, last_updated));
-        let mut all = true;
-        // Inserts first, so a concurrent `count` never sees the resource
-        // missing while its `resources_by_type` row moves.
-        for (index_key, at, insert) in inserts
-            .into_iter()
-            .map(|(k, at)| (k, at, true))
-            .chain(deletes.into_iter().map(|(k, at)| (k, at, false)))
-        {
-            let (cql, values) = match (index_key, insert) {
-                (IndexKey::ResourcesByType, true) => (
-                    INSERT_RESOURCES_BY_TYPE,
-                    vec![
-                        Value::from(key.tenant_id),
-                        Value::from(key.resource_type),
-                        Value::from(at),
-                        Value::from(key.id),
-                        Value::from(plan.target_version()),
-                        Value::from(plan.fhir_version.as_mime_param()),
-                        Value::from(write_ts),
-                    ],
-                ),
-                (IndexKey::ResourcesByType, false) => (
-                    DELETE_RESOURCES_BY_TYPE,
-                    vec![
-                        Value::from(write_ts),
-                        Value::from(key.tenant_id),
-                        Value::from(key.resource_type),
-                        Value::from(at),
-                        Value::from(key.id),
-                    ],
-                ),
-                (other, _) => {
-                    // Step 5 adds these rows; Steps 2 to 4 never have them.
-                    tracing::error!(key = ?other, "index row kind not written before Step 5");
-                    all = false;
-                    continue;
-                }
-            };
-            all &= self.write_with_retries(cql, values, "index row").await;
+        let mut inserted = true;
+        for (index_key, at) in inserts {
+            inserted &= self
+                .write_index_row(key, plan, write_ts, index_key, at, true)
+                .await;
         }
-        all
+        if !inserted {
+            tracing::warn!(
+                resource_type = key.resource_type,
+                id = key.id,
+                version_id = plan.target_version(),
+                "an index insert failed after its tries; the old index rows are kept \
+                 for the sweeper"
+            );
+            return false;
+        }
+        let mut deleted = true;
+        for (index_key, at) in deletes {
+            deleted &= self
+                .write_index_row(key, plan, write_ts, index_key, at, false)
+                .await;
+        }
+        deleted
+    }
+
+    /// One row of step 5's delta, an insert or a delete at `write_ts`, with
+    /// its retries. `false` if it was not written.
+    async fn write_index_row(
+        &self,
+        key: &RowKey<'_>,
+        plan: &CasPlan,
+        write_ts: i64,
+        index_key: &IndexKey,
+        at: DateTime<Utc>,
+        insert: bool,
+    ) -> bool {
+        let (cql, values) = match (index_key, insert) {
+            (IndexKey::ResourcesByType, true) => (
+                INSERT_RESOURCES_BY_TYPE,
+                vec![
+                    Value::from(key.tenant_id),
+                    Value::from(key.resource_type),
+                    Value::from(at),
+                    Value::from(key.id),
+                    Value::from(plan.target_version()),
+                    Value::from(plan.fhir_version.as_mime_param()),
+                    Value::from(write_ts),
+                ],
+            ),
+            (IndexKey::ResourcesByType, false) => (
+                DELETE_RESOURCES_BY_TYPE,
+                vec![
+                    Value::from(write_ts),
+                    Value::from(key.tenant_id),
+                    Value::from(key.resource_type),
+                    Value::from(at),
+                    Value::from(key.id),
+                ],
+            ),
+            (other, _) => {
+                // Step 5 adds these rows; Steps 2 to 4 never have them.
+                tracing::error!(key = ?other, "index row kind not written before Step 5");
+                return false;
+            }
+        };
+        self.write_with_retries(cql, values, "index row").await
     }
 
     /// A plain, idempotent write with a fixed timestamp, tried up to
@@ -3378,6 +3415,107 @@ mod node_tests {
         // I1, three tries of V1, X1; no I2.
         assert_eq!((spent.write, spent.cas), (5, 1), "{spent}");
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    }
+
+    /// An update whose new `resources_by_type` row fails all three tries
+    /// keeps the old row: its delete is never sent, so the live resource
+    /// stays counted, and the write succeeds with I1 left for the sweeper
+    /// (G23). Reproduced first by W3 (L2b): before this, the delete still ran
+    /// and the id vanished from `resources_by_type` at version 2.
+    #[tokio::test]
+    async fn a_failed_index_insert_keeps_the_old_row_and_the_intent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("index-insert");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .unwrap();
+        let row1 = current(&backend, &tenant).await;
+        let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let plan = CasPlan::update(
+            PreviousVersion::from_row(&row1).unwrap(),
+            json,
+            data,
+            vec![IndexKey::ResourcesByType],
+        );
+        for _ in 0..POST_CAS_WRITE_TRIES {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resources_by_type",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        let (before, counted) = (backend.cas_stats(), backend.statement_counts());
+        let mut request = backend.cas_request("update", key_of(&tenant));
+        let applied = applied_of(backend.run_cas(&mut request, plan).await.unwrap());
+        assert_eq!(applied.version_id, 2);
+        assert!(!applied.post_cas_complete && !applied.superseded);
+        let stats = backend.cas_stats().since(&before);
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
+        // V3, I1, V1 and three tries of X1's insert; no X1 delete, no I2.
+        assert_eq!((spent.write, spent.cas), (6, 1), "{spent}");
+
+        // The old row is still there, at version 1's `last_updated`.
+        let by_type = backend
+            .session
+            .rows(
+                "SELECT last_updated, id, version_id FROM resources_by_type \
+                 WHERE tenant_id = ? AND resource_type = ?",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("resources_by_type");
+        let by_type: Vec<(DateTime<Utc>, String, i32)> = by_type
+            .iter()
+            .map(|row| {
+                (
+                    row.get_r_by_name("last_updated").unwrap(),
+                    row.get_r_by_name("id").unwrap(),
+                    row.get_r_by_name("version_id").unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(by_type, vec![(row1.last_updated, "p".to_string(), 1)]);
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+
+        // I1 is left for the sweeper.
+        let intent = &request.attempts[0].intent;
+        let intents = backend
+            .session
+            .rows(
+                "SELECT version_id FROM pending_index_writes \
+                 WHERE bucket = ? AND shard = ? AND enqueued_at = ? \
+                 AND tenant_id = ? AND resource_type = ? AND id = ?",
+                vec![
+                    Value::from(intent.bucket.as_str()),
+                    Value::from(intent.shard),
+                    Value::from(intent.enqueued_at),
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("pending_index_writes");
+        let versions: Vec<i32> = intents
+            .iter()
+            .map(|row| row.get_r_by_name("version_id").unwrap())
+            .collect();
+        assert_eq!(versions, vec![2]);
     }
 
     /// A superseded attempt, found by the pre-read check: the row is past

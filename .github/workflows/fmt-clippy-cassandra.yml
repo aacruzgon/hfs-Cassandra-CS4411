@@ -71,6 +71,13 @@ jobs:
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check
 
+      # The CI report script's own tests (standard library unittest, about a
+      # second): above all the CQL audit check, which is the one ci-report.py
+      # command that fails the Cassandra job. Here because fmt is the cheapest
+      # job and needs no node.
+      - name: Test the CI report script
+        run: python3 -m unittest discover -s .github/scripts -p 'test_ci_report.py' -v
+
       # The CI half of the dependency rule (check a dependency's newer
       # releases before working around its bug): each chosen crate's locked
       # version against crates.io's newest, one request a second with a
@@ -564,6 +571,32 @@ jobs:
           diff -u docs/Cassandra/schema/expected-schema.txt "$actual"
           echo "schema matches docs/Cassandra/schema/expected-schema.txt ($(grep -vc '^#' "$actual") rows)"
 
+      # Roadmap Step 3's exit criterion, "no CQL DELETE was ever issued
+      # against resources" (Step 3 plan D6): the node's own audit log records
+      # every statement the tests send to keyspace helios, from here until the
+      # check below. Turned on at runtime with nodetool, not in cassandra.yaml:
+      # docker/cassandra/entrypoint.sh rewrites the yaml on every boot, and the
+      # developers' shared node runs the same file. BinAuditLogger (the
+      # default) writes /opt/cassandra/logs/audit inside the container; DML is
+      # the statements, ERROR the failed ones, PREPARE what was prepared, DDL
+      # a TRUNCATE or DROP. Blocking, so a full queue slows writers rather
+      # than drops entries. A restart turns it off again (AuditLogManager
+      # reads only the yaml), so the check reads it before the readiness test
+      # restarts the node. Each docker exec runs a JVM in the node's 3 GiB
+      # container, which would inherit its MAX_HEAP_SIZE=1G; each gets its
+      # own script's default instead (nodetool 128m, auditlogviewer 256M).
+      # Every keyspace but the system ones, not --included-keyspaces helios:
+      # a failed native batch, or a failed statement from a session with no
+      # current keyspace, logs an entry with no keyspace, which an include
+      # list drops (AuditLogFilter, 5.0.9).
+      - name: Turn on the CQL audit log (Step 3 exit criterion)
+        id: cql-audit-on
+        run: |
+          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool enableauditlog \
+            --excluded-keyspaces system,system_schema,system_auth,system_distributed,system_traces,system_views,system_virtual_schema \
+            --included-categories DML,ERROR,PREPARE,DDL --blocking true
+          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool getauditlog
+
       # The start and apply times above, and the container's start to its CQL
       # line from its own log timestamps, which the 10 s healthcheck interval
       # does not round. Report only.
@@ -619,15 +652,49 @@ jobs:
               --show-output 2>&1 \
             | tee "$RUNNER_TEMP/ci-report/logs/milestone-a-round-trip.log"
 
+      # Roadmap Step 3 through REST (Step 3 plan D24): PUT, PATCH, DELETE,
+      # HEAD, revive, a batch and /metadata through the real hfs binary on this
+      # node, in the Milestone A binary built above, so no new build. Before
+      # the readiness test, which stays last (ADR-aacruzgon-0042). The test
+      # prints one [spec row=… expected=… got=…] line per check, which the
+      # HL7 report below tabulates. It must run exactly once: --exact on a
+      # name that matches nothing would pass with 0 tests, so a missing test
+      # fails the step, whatever the event. The test result is grepped from
+      # a process substitution, so grep -q stopping early cannot fail the
+      # step through a SIGPIPE'd sed under pipefail. Like the later report
+      # steps, it runs when the round trip passed, so its failure does not
+      # hide them.
+      - name: Step 3 CRUD through hfs against this node
+        id: step3-rest
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/ci-report/logs"
+          log="$RUNNER_TEMP/ci-report/logs/step3-rest.log"
+          if ! grep -q 'fn step3_crud_through_rest' crates/hfs/tests/cassandra_milestone_a.rs; then
+            echo "::error title=Step 3 REST test::step3_crud_through_rest is not in crates/hfs/tests/cassandra_milestone_a.rs"
+            exit 1
+          fi
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+            cargo test -p helios-hfs --no-default-features --features R4,cassandra \
+              --test cassandra_milestone_a -- --exact step3_crud_through_rest \
+              --show-output 2>&1 \
+            | tee "$log"
+          grep -Eq '^test result: ok\. 1 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$log") \
+            || { echo "::error title=Step 3 REST test::step3_crud_through_rest did not run exactly once"; exit 1; }
+
       # Roadmap item 2.6: three boots of hfs with the conformance seed, each on
       # a fresh tenant, then a warm boot, against this node. Report only: a
       # seed over the provisional 10 s budget (roadmap section 7) is a
       # warning annotation; the step fails only if hfs does not boot or a log
       # line the measurement needs is missing. Already built. A failure here
       # does not skip the readiness test: that one runs when the round trip
-      # passed. Four boots take well under a minute; the timeout bounds a hung
-      # node.
+      # passed. Like it, this one runs when the round trip passed, so a failed
+      # Step 3 REST step above does not skip it. Four boots take well under a
+      # minute; the timeout bounds a hung node.
       - name: Boot-time report against this node (report only)
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
         timeout-minutes: 10
         run: |
           set -o pipefail
@@ -642,12 +709,17 @@ jobs:
             --markdown "$dir/boot-time.md" --json "$dir/boot-time.json"
 
       # Per-operation latency, a smoke trend: single node, debug build, not the
-      # Step 8 benchmark. 200 creates, 200 reads and 20 counts through
-      # CassandraBackend, then 50 POST + GET round trips through hfs, each on
-      # a fresh tenant (ADR-aacruzgon-0020). Already built; about 12 s. Report
-      # only: no figure fails it; it fails only if an operation fails. Before
-      # the node statistics, so they include its writes, and before the
-      # readiness test, which stays last.
+      # Step 8 benchmark. Through CassandraBackend, 200 creates, reads and
+      # exists, 20 counts and read_batch calls, then 100 of each Step 3
+      # operation (update, vread, list_versions, the three create_or_update
+      # branches, delete, delete_versioned), with the statements and CAS
+      # outcomes per call from the backend's own counters (Step 3 plan R1,
+      # R2, R5). Then 50 POST + GET round trips through hfs. Each on a fresh
+      # tenant (ADR-aacruzgon-0020). Already built. Report only: no figure
+      # fails it; it fails if an operation fails, a 501 included, since every
+      # one is real from Step 3 on (ADR-aacruzgon-0059). Before the audit
+      # check and the node statistics, so they include its writes, and before
+      # the readiness test, which stays last.
       - name: Latency report against this node (report only)
         if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
         timeout-minutes: 5
@@ -665,12 +737,59 @@ jobs:
             --test cassandra_milestone_a -- --exact rest_latency_report --nocapture 2>&1 \
             | tee "$logs/latency-rest.log" || status=1
           python3 .github/scripts/ci-report.py add latency-backend \
-            "Latency: CassandraBackend create, read and count (smoke trend)" \
+            "Latency: CassandraBackend per operation (smoke trend)" \
             --markdown "$dir/cassandra-latency.md" --json "$dir/cassandra-latency.json"
           python3 .github/scripts/ci-report.py add latency-rest \
             "Latency: POST and GET through hfs (smoke trend)" \
             --markdown "$dir/hfs-rest-latency.md" --json "$dir/hfs-rest-latency.json"
           exit "$status"
+
+      # The exit criterion's check (Step 3 plan D6), after every step that
+      # writes and before the readiness test restarts the node. It stops the
+      # audit log, which flushes it, dumps it with auditlogviewer (in the
+      # image, not on its PATH), and fails if any entry is a CQL DELETE
+      # against resources or resource_versions: type DELETE with exactly that
+      # scope, or a DELETE … FROM either table in the CQL text of a batch or a
+      # failed statement, which carry no scope. resources_by_type (the X1
+      # row) and pending_index_writes (I2) are deleted from legitimately, and
+      # are never matched by prefix. It also fails on an empty log, which
+      # would prove nothing, and on a failed native batch, whose entry holds
+      # no statement text although a logged one that timed out may still
+      # apply. A check, not a report (ADR-aacruzgon-0045): no
+      # continue-on-error. Its section also counts DML per table and type
+      # (R7). The dump is kept, gzipped, in the artifact.
+      - name: Check the CQL audit log for a DELETE on resources or resource_versions
+        if: ${{ !cancelled() && steps.cql-audit-on.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/ci-report/inputs/cql-audit"
+          mkdir -p "$dir"
+          # Still on: a log that stopped early would leave writes unchecked.
+          # Written to the file first, then grepped: grep -q exits at its
+          # first match, so behind a tee under pipefail the tee could die of
+          # SIGPIPE (141) and fail the check although the log was enabled.
+          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool getauditlog \
+            > "$dir/getauditlog.txt"
+          cat "$dir/getauditlog.txt"
+          grep -Eq '^enabled[[:space:]]+true' "$dir/getauditlog.txt" \
+            || { echo "::error title=CQL audit (Step 3 exit criterion)::the audit log was not enabled at the end of the tests"; exit 1; }
+          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool disableauditlog
+          docker exec -e MAX_HEAP_SIZE=256M hfs-cassandra-ci-cassandra-1 /opt/cassandra/tools/bin/auditlogviewer /opt/cassandra/logs/audit \
+            | gzip > "$dir/auditlogviewer.txt.gz"
+          python3 .github/scripts/ci-report.py cql-audit cql-audit \
+            "CQL audit log: no DELETE on resources or resource_versions (Step 3 exit criterion)" \
+            "$dir/auditlogviewer.txt.gz" --check
+
+      # Intent rows the run's tests left in pending_index_writes (R4): every
+      # shard of this hour's bucket and the two before it, for test- tenants,
+      # each set against its resource's current version. Expected near 0: a
+      # finished write or a definite miss deletes its intent. Report only.
+      - name: Report the intent rows left behind
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 3
+        run: python3 .github/scripts/ci-report.py intents intents "Intent rows left in pending_index_writes" hfs-cassandra-ci-cassandra-1
 
       # Before the readiness test, which restarts the node and so resets these
       # metrics: tablestats, tpstats, the per-table latency and tombstone
@@ -717,6 +836,23 @@ jobs:
             "$logs/readiness.log"
           python3 .github/scripts/ci-report.py readiness readiness \
             "Readiness recovery (Step 2 exit criterion)" "$logs/readiness.log"
+
+      # Step 3's parsed reports, from the test logs, whatever the test steps'
+      # results (Step 3 plan section 7): the Step 3 REST test's suite counts
+      # (R9); its [spec row=… expected=… got=…] lines as the HL7 rows observed
+      # (R10); and every [cas case=… …] line, the backend's CAS outcome
+      # counters per scope (R2, R3, R8). Report only.
+      - name: Report the Step 3 REST test, its HL7 rows and the CAS counters
+        if: always()
+        continue-on-error: true
+        run: |
+          logs="$RUNNER_TEMP/ci-report/logs"
+          python3 .github/scripts/ci-report.py tests tests-step3 "Tests: Step 3 CRUD through hfs" "$logs/step3-rest.log"
+          python3 .github/scripts/ci-report.py spec spec \
+            "HL7 rows observed through hfs on Cassandra (Step 3)" "$logs/step3-rest.log"
+          python3 .github/scripts/ci-report.py cas cas "CAS outcome counters" \
+            "$logs/persistence-tests.log" "$logs/persistence-lib-tests.log" "$logs/latency-backend.log" \
+            "$logs/step3-rest.log"
 
       - name: Cassandra logs
         if: failure()

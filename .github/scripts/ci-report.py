@@ -954,33 +954,90 @@ FAILED_BATCH = re.compile(r"^BATCH of \d+ statements\b")
 
 
 def open_text(path: Path) -> str:
+    """The file's text with its line ends as written (newline=""): a bare CR
+    inside an entry's CQL text stays a CR, as the CQL lexer saw it, instead of
+    becoming a line break that audit_records would read as one."""
     if path.suffix == ".gz":
         import gzip
 
-        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as source:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace", newline="") as source:
             return source.read()
-    return path.read_text(errors="replace")
+    with open(path, encoding="utf-8", errors="replace", newline="") as source:
+        return source.read()
+
+
+# The record header auditlogviewer prints (tools/AuditLogViewer.java,
+# DisplayRecord.readMarshallable, 5.0.9): a line "Type: audit" (any other type
+# makes it throw), then "LogMessage: " and AuditLogEntry.getLogString(), whose
+# fields up to category are always there (AuditLogEntry.java:74-106). Each line
+# ends with System.lineSeparator(), "\n" in the Linux container.
+RECORD_TYPE_LINE = "Type: audit"
+RECORD_MESSAGE = re.compile(
+    r"LogMessage: user:[^|]*\|host:[^|]*\|source:[^|]*(?:\|port:\d+)?\|timestamp:\d+"
+    r"\|type:[A-Z_]+\|category:[A-Z]+(?:\||$)")
+HEADER_LOOKALIKE = ("Type: ", "LogMessage: ")
 
 
 def audit_records(text: str) -> list[dict]:
-    """`auditlogviewer` output: each record is a `Type: <type>` line, then
-    `LogMessage: <entry>` (tools/AuditLogViewer.java). An entry's CQL text may
-    span lines, so a record runs to the next `Type: ` line."""
-    messages, current = [], None
-    for line in text.splitlines():
-        if line.startswith("Type: "):
-            if current is not None:
-                messages.append(current)
-            current = None
-        elif line.startswith("LogMessage: "):
-            if current is not None:
-                messages.append(current)
-            current = line[len("LogMessage: "):]
-        elif current is not None:
-            current += "\n" + line
-    if current is not None:
-        messages.append(current)
-    return [audit_entry(message) for message in messages]
+    """`auditlogviewer` output: each record is a `Type: audit` line, then
+    `LogMessage: <entry>`, and an entry's CQL text may span lines. The CQL text
+    is free text, so a line in it may look like a header: the framing fails
+    closed instead of trusting one. A record starts only at a `Type: audit`
+    line followed by a well-formed `LogMessage:` line, and a record is marked
+    unverifiable (its `framing` field, see audit_unverifiable) when:
+
+    - its CQL text holds a line starting `Type: ` or `LogMessage: ` that is
+      not such a pair (the old parser split the record there and dropped the
+      rest, a DELETE after it included);
+    - its CQL text ends inside a string literal, quoted name or block comment
+      while another record follows, so that next header may be part of its
+      text. A well-formed header line holds `|`, which is no CQL token
+      (Lexer.g, Parser.g, 5.0.9), and any lexer error rejects the statement
+      (CQLFragmentParser.parseAnyUnhandled); a `--` or `//` comment ends at
+      the line break before it. So in a statement that ran, a header line can
+      only sit inside a literal, quoted name or block comment, and the text
+      before it then ends inside one;
+    - or it is text before the first record.
+
+    What stays possible is a header line in the code of a statement that
+    failed to parse, which never ran.
+
+    Lines are split on "\n" only, with a trailing "\r" dropped (a CRLF dump);
+    a bare "\r" stays in the text."""
+    lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()
+    records, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        if line == RECORD_TYPE_LINE and i + 1 < len(lines) and RECORD_MESSAGE.match(lines[i + 1]):
+            records.append({"lines": [lines[i + 1][len("LogMessage: "):]], "framing": None})
+            i += 2
+            continue
+        if not records:
+            records.append({"lines": [line], "framing": "text before the first record", "loose": True})
+        else:
+            records[-1]["lines"].append(line)
+            if line.startswith(HEADER_LOOKALIKE) and records[-1]["framing"] is None:
+                records[-1]["framing"] = ("a line in its CQL text starts like a record header "
+                                          f"({line[:40]!r}), so where the record ends is ambiguous")
+        i += 1
+    entries = []
+    for k, record in enumerate(records):
+        message = "\n".join(record["lines"])
+        if record.get("loose"):
+            entry = {"type": None, "category": None, "ks": None, "scope": None, "batch": None, "operation": message}
+        else:
+            entry = audit_entry(message)
+        framing = record["framing"]
+        if framing is None and k + 1 < len(records):
+            unclosed = cql_scan(entry["operation"] or "")[1]
+            if unclosed:
+                framing = (f"its CQL text ends inside {unclosed}, so the record header after it "
+                           "may be part of that text")
+        entry["framing"] = framing
+        entries.append(entry)
+    return entries
 
 
 def audit_entry(message: str) -> dict:
@@ -1018,37 +1075,54 @@ def audit_unverifiable(entry: dict, keyspace: str) -> str | None:
     if (entry["type"] == "REQUEST_FAILURE"
             and FAILED_BATCH.match(entry["operation"] or "")):
         return "a failed native-protocol batch, whose statements the audit log does not record"
+    if entry.get("framing"):
+        return f"a record that cannot be framed unambiguously: {entry['framing']}"
     return None
 
 
-def cql_code(text: str) -> str:
-    """`text` with its comments (`/* */`, `--`, `//`) blanked to a space and
-    its string literals (`'…'` with `''` escapes, `$$…$$`) emptied, so the text
-    rules see only statements. Quoted identifiers are kept as they are."""
+def cql_scan(text: str) -> tuple[str, str | None]:
+    """`text` with its comments (`/* */`, and `--` or `//` to the end of the
+    line, which a CR or an LF ends) blanked to a space and its string literals
+    (`'…'` with `''` escapes, `$$…$$`) emptied, keeping quoted identifiers, as
+    the 5.0.9 lexer reads them (Lexer.g STRING_LITERAL, QUOTED_NAME, COMMENT,
+    MULTILINE_COMMENT); and what the text ends inside, if anything: a string
+    literal, a quoted name or a block comment left open."""
     out, i, n = [], 0, len(text)
     while i < n:
         if text[i] in "'\"":
             quote, j = text[i], i + 1
             while j < n and not (text[j] == quote and text[j + 1:j + 2] != quote):
                 j += 2 if text[j] == quote else 1
+            if j >= n:
+                return "".join(out), "a string literal" if quote == "'" else "a quoted name"
             out.append(quote * 2 if quote == "'" else text[i:j + 1])
             i = j + 1
         elif text.startswith("$$", i):
             j = text.find("$$", i + 2)
+            if j < 0:
+                return "".join(out), "a $$ string literal"
             out.append("$$$$")
-            i = n if j < 0 else j + 2
+            i = j + 2
         elif text.startswith("/*", i):
             j = text.find("*/", i + 2)
+            if j < 0:
+                return "".join(out), "a /* comment"
             out.append(" ")
-            i = n if j < 0 else j + 2
+            i = j + 2
         elif text.startswith(("--", "//"), i):
-            j = text.find("\n", i)
+            ends = [k for k in (text.find("\n", i), text.find("\r", i)) if k >= 0]
             out.append(" ")
-            i = n if j < 0 else j
+            i = min(ends) if ends else n
         else:
             out.append(text[i])
             i += 1
-    return "".join(out)
+    return "".join(out), None
+
+
+def cql_code(text: str) -> str:
+    """`text` as the text rules see it: cql_scan's blanked text, with an
+    unterminated literal or comment blanked to the end."""
+    return cql_scan(text)[0]
 
 
 def protected_statements(text: str):

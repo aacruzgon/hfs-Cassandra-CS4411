@@ -67,6 +67,41 @@ Type: audit
 LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:51494|timestamp:1794026123525|type:REQUEST_FAILURE|category:ERROR|operation:INSERT INTO system_auth.nope (a) VALUES (1);; table nope does not exist
 """
 
+# Recorded with CI's enableauditlog flags (--excluded-keyspaces system,…),
+# CQL-text batches sent with the cqlsh's own Python driver; each one applied.
+# A and C hold a line "Type: x" in a literal and in a comment, and E a line
+# "LogMessage: …" in a literal, all before a DELETE on helios.resources; B ends
+# a -- comment with a bare CR (the 5.0.9 lexer's COMMENT ends at CR or LF), so
+# the DELETE after it is code. The old parser split A, C and E at the
+# look-alike line and dropped the DELETE after it.
+LOOKALIKES = (
+    "Type: audit\n"
+    "LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:37814|timestamp:1794088187349|type:BATCH|category:DML|ks:helios|operation:BEGIN BATCH INSERT INTO other.t (a, b) VALUES ('A', '\n"
+    "Type: x\n"
+    "'); DELETE FROM helios.resources WHERE tenant_id='test-review-live' AND resource_type='Patient' AND id='p1'; APPLY BATCH\n"
+    "Type: audit\n"
+    "LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:37814|timestamp:1794088187372|type:BATCH|category:DML|ks:other|operation:BEGIN BATCH INSERT INTO t (a, b) VALUES ('B', 'b'); DELETE FROM -- c\rhelios.resources WHERE tenant_id='test-review-live' AND resource_type='Patient' AND id='p1'; APPLY BATCH\n"
+    "Type: audit\n"
+    "LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:37814|timestamp:1794088187381|type:BATCH|category:DML|ks:other|operation:BEGIN BATCH /*\n"
+    "Type: x\n"
+    "*/ DELETE FROM helios.resources WHERE tenant_id='test-review-live' AND resource_type='Patient' AND id='p1'; INSERT INTO t (a, b) VALUES ('C', 'c'); APPLY BATCH\n"
+    "Type: audit\n"
+    "LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:57292|timestamp:1794088644067|type:BATCH|category:DML|ks:helios|operation:BEGIN BATCH\n"
+    "INSERT INTO other.t (a, b) VALUES ('E', '\n"
+    "LogMessage: |ks:other|operation:x\n"
+    "');\n"
+    "DELETE FROM helios.resources WHERE tenant_id='test-review-live' AND resource_type='Patient' AND id='p1';\n"
+    "APPLY BATCH\n"
+)
+# Case F: a whole, well-formed header pair inside a literal, before a DELETE.
+SPOOFED_HEADER = (
+    "Type: audit\n"
+    f"{HEAD}|type:BATCH|category:DML|ks:helios|operation:BEGIN BATCH INSERT INTO t (a, b) VALUES ('F', '\n"
+    "Type: audit\n"
+    "LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:1|timestamp:1|type:SELECT|category:QUERY|ks:other|operation:x\n"
+    "'); DELETE FROM resources WHERE a = 1; APPLY BATCH\n"
+)
+
 
 def entry(type_, scope, operation, ks="helios", category="DML"):
     scope_part = f"|scope:{scope}" if scope else ""
@@ -244,6 +279,46 @@ class AuditEntries(unittest.TestCase):
         self.assertEqual(ci_report.cql_code('DELETE "a--b" FROM "x/*y"'), 'DELETE "a--b" FROM "x/*y"')
         self.assertEqual(ci_report.cql_code("DELETE FROM resources WHERE a = ?"), "DELETE FROM resources WHERE a = ?")
 
+    def test_a_header_lookalike_in_cql_text_is_kept_and_unverifiable(self):
+        a, b, c, e = ci_report.audit_records(LOOKALIKES)
+        for record in (a, c, e):
+            self.assertIn("starts like a record header", ci_report.audit_unverifiable(record, "helios"), record)
+            # The text after the look-alike line stays in the record, so its
+            # DELETE is seen too.
+            self.assertIsNotNone(ci_report.audit_violation(record, "helios"), record)
+        self.assertIsNone(b["framing"])
+        self.assertIsNotNone(ci_report.audit_violation(b, "helios"), "the DELETE after a CR-ended comment")
+
+    def test_a_whole_header_inside_a_literal_is_unverifiable(self):
+        batch, spoof = ci_report.audit_records(SPOOFED_HEADER)
+        self.assertIn("ends inside a string literal", ci_report.audit_unverifiable(batch, "helios"))
+        self.assertEqual(spoof["ks"], "other")
+        self.assertIsNone(ci_report.audit_violation(spoof, "helios"), "the false record's DELETE is unqualified")
+
+    def test_framing_of_clean_and_crlf_dumps(self):
+        lf = ci_report.audit_records(CLEAN + RECORDED + FAILED_BATCHES)
+        crlf = ci_report.audit_records((CLEAN + RECORDED + FAILED_BATCHES).replace("\n", "\r\n"))
+        self.assertEqual(lf, crlf)
+        self.assertEqual(len(lf), 15)
+        self.assertTrue(all(e["framing"] is None for e in lf))
+        # A record ending inside a literal is a problem only when another follows.
+        [last] = ci_report.audit_records(entry("REQUEST_FAILURE", None, "SELECT 'a; line 1:9 mismatched character '<EOF>'", category="ERROR"))
+        self.assertIsNone(last["framing"])
+
+    def test_text_before_the_first_record_is_unverifiable(self):
+        first, *_ = ci_report.audit_records("DELETE FROM resources WHERE a = 1\n" + CLEAN)
+        self.assertIn("before the first record", ci_report.audit_unverifiable(first, "helios"))
+        self.assertIsNotNone(ci_report.audit_violation(first, "helios"))
+
+    def test_cql_code_ends_a_line_comment_at_cr_or_lf(self):
+        self.assertEqual(ci_report.cql_code("DELETE FROM -- c\rhelios.resources"), "DELETE FROM  \rhelios.resources")
+        self.assertEqual(ci_report.cql_code("DELETE FROM // c\r\nhelios.resources"), "DELETE FROM  \r\nhelios.resources")
+        self.assertEqual(ci_report.cql_scan("SELECT 'a"), ("SELECT ", "a string literal"))
+        self.assertEqual(ci_report.cql_scan('SELECT "a'), ("SELECT ", "a quoted name"))
+        self.assertEqual(ci_report.cql_scan("SELECT $$a")[1], "a $$ string literal")
+        self.assertEqual(ci_report.cql_scan("SELECT /* a")[1], "a /* comment")
+        self.assertEqual(ci_report.cql_scan("SELECT 1 -- a")[1], None)
+
     def test_a_failed_native_batch_is_unverifiable(self):
         timed_out, no_keyspace, single = ci_report.audit_records(FAILED_BATCHES)
         self.assertEqual(timed_out["ks"], "helios")
@@ -336,6 +411,27 @@ class CqlAuditCommand(Scratch):
         status, out = self.audit(CLEAN + wipe)
         self.assertEqual(status, 1)
         self.assertEqual(len(self.report("cql-audit")["violations"]), 1)
+
+    def test_header_lookalikes_fail_the_check(self):
+        status, out = self.audit(CLEAN + LOOKALIKES + SPOOFED_HEADER)
+        self.assertEqual(status, 1)
+        data = self.report("cql-audit")
+        self.assertEqual(len(data["unverifiable"]), 4, data["unverifiable"])
+        self.assertIn("cannot be framed unambiguously", out)
+
+    def test_a_bare_cr_in_a_file_stays_in_the_cql_text(self):
+        # Read with newline="": a CR inside an entry is the CQL text's, not a
+        # line break, so the -- comment ends there and the DELETE is code.
+        case_b = "Type: audit\n" + LOOKALIKES.split("Type: audit\n")[2]
+        self.assertIn("-- c\rhelios.resources", case_b)
+        path = self.dir / "cr.txt"
+        path.write_bytes((CLEAN + case_b).encode())
+        args = SimpleNamespace(id="cql-audit", title="CQL audit", file=str(path), keyspace="helios", check=True)
+        status, _ = self.quiet(ci_report.cmd_cql_audit, args)
+        self.assertEqual(status, 1)
+        data = self.report("cql-audit")
+        self.assertEqual((len(data["violations"]), len(data["unverifiable"])), (1, 0))
+        self.assertIn("-- c\rhelios.resources", ci_report.audit_records(ci_report.open_text(path))[-1]["operation"])
 
     def test_a_failed_native_batch_fails_the_check(self):
         status, out = self.audit(CLEAN + FAILED_BATCHES)

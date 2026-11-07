@@ -406,19 +406,26 @@ impl CassandraBackend {
     /// The capabilities every Cassandra backend has, whatever its
     /// configuration.
     ///
-    /// At Step 2 that is only `SharedSchema`, the one placement: one keyspace,
-    /// with the tenant in every partition key. A capability must never be
-    /// declared for behaviour that is planned or stubbed (`core/backend.rs`), so
-    /// each other one is added here, and to the golden list in
+    /// From Step 3 that is `SharedSchema`, the one placement (one keyspace,
+    /// with the tenant in every partition key), plus `Crud` (create, read,
+    /// update and delete; every write a compare-and-swap, the delete soft) and
+    /// `OptimisticLocking` (`If-Match` through `update`'s and
+    /// `delete_versioned`'s compare-and-swap). A capability must never be
+    /// declared for behaviour that is planned or stubbed (`core/backend.rs`),
+    /// so each other one is added here, and to the golden list in
     /// `tests/backend_capability_contract.rs`, in the commit of the step that
-    /// implements it: `Crud` and `OptimisticLocking` at Step 3, `Versioning` at
-    /// Step 4, `BasicSearch`, `DateSearch` and `CursorPagination` at Steps 6a to
-    /// 6d (ADR-aacruzgon-0037). `Crud` means create, read, update and delete,
-    /// so Step 2's `create` and `read` do not make it true. Those seven are the
-    /// end state (design, "Structs and enums": `BackendCapability`); there is no
-    /// `TokenSearch` or `UriSearch` variant, and `BasicSearch` covers both.
+    /// implements it: `Versioning` at Step 4, `BasicSearch`, `DateSearch` and
+    /// `CursorPagination` at Steps 6a to 6d (ADR-aacruzgon-0037). Those seven
+    /// are the end state (design, "Structs and enums": `BackendCapability`);
+    /// there is no `TokenSearch` or `UriSearch` variant, and `BasicSearch`
+    /// covers both. The CapabilityStatement does not read this list, so
+    /// `/metadata` does not change with it.
     pub fn declared_capabilities() -> Vec<BackendCapability> {
-        vec![BackendCapability::SharedSchema]
+        vec![
+            BackendCapability::Crud,
+            BackendCapability::OptimisticLocking,
+            BackendCapability::SharedSchema,
+        ]
     }
 
     /// The TTL refresh for the stored SearchParameter overlay
@@ -1086,10 +1093,21 @@ mod tests {
     #[test]
     fn declared_capabilities_are_exactly_those_implemented() {
         let declared = CassandraBackend::declared_capabilities();
-        // The other six of the design's list arrive with their steps
-        // (ADR-aacruzgon-0037).
-        assert_eq!(declared, vec![BackendCapability::SharedSchema]);
+        // Step 3's two and the placement; the other four of the design's list
+        // arrive with their steps (ADR-aacruzgon-0037).
+        assert_eq!(
+            declared,
+            vec![
+                BackendCapability::Crud,
+                BackendCapability::OptimisticLocking,
+                BackendCapability::SharedSchema,
+            ]
+        );
         for absent in [
+            BackendCapability::Versioning,
+            BackendCapability::BasicSearch,
+            BackendCapability::DateSearch,
+            BackendCapability::CursorPagination,
             BackendCapability::Transactions,
             BackendCapability::InstanceHistory,
             BackendCapability::ConditionalCreate,

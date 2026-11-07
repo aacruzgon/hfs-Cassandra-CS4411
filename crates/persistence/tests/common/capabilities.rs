@@ -221,16 +221,17 @@ impl CapabilityMatrix {
         // ("Scope: the Cassandra column of the capability matrix"; "Structs and enums",
         // the `BackendCapability` row). `Planned` is what the design scopes in: the
         // seven of that row, which the golden list in `tests/backend_capability_contract.rs`
-        // gains as each step lands (only `SharedSchema` at Step 2, ADR-aacruzgon-0037), plus
+        // gains as each step lands (`SharedSchema` at Step 2, ADR-aacruzgon-0037), plus
         // `ReverseChaining` (◐, below). Each becomes `Implemented` when the roadmap step
-        // that serves it lands (Steps 3 to 6d), as the README's ○ becomes ✓ at Step 8.
+        // that serves it lands (Steps 3 to 6d), as the README's ○ becomes ✓ at Step 8:
+        // `Crud` and `OptimisticLocking` at Step 3.
         // URI search has no variant; `BasicSearch` covers token. Everything else is
         // out of scope or ✗, so `NotPlanned`, including every variant listed here
         // explicitly, since `support_level` answers `Planned` for a missing one.
         matrix.set_backend_capabilities(
             BackendKind::Cassandra,
             vec![
-                (BackendCapability::Crud, SupportLevel::Planned),
+                (BackendCapability::Crud, SupportLevel::Implemented),
                 (BackendCapability::Versioning, SupportLevel::Planned),
                 (BackendCapability::InstanceHistory, SupportLevel::NotPlanned),
                 (BackendCapability::TypeHistory, SupportLevel::NotPlanned),
@@ -253,7 +254,7 @@ impl CapabilityMatrix {
                 // list before the backend is called; `:not-in` is always 501.
                 (BackendCapability::TerminologySearch, SupportLevel::NotPlanned),
                 (BackendCapability::Transactions, SupportLevel::NotPlanned),
-                (BackendCapability::OptimisticLocking, SupportLevel::Planned),
+                (BackendCapability::OptimisticLocking, SupportLevel::Implemented),
                 (
                     BackendCapability::PessimisticLocking,
                     SupportLevel::NotPlanned,

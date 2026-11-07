@@ -10,7 +10,7 @@
 //! | SQLite | `sqlite` | Lightweight embedded database, great for development |
 //! | PostgreSQL | `postgres` | Full-featured RDBMS with JSONB support |
 //! | MongoDB | `mongodb` | Document store with native JSON support |
-//! | Cassandra | `cassandra` | Wide-column store; standalone primary, in progress (roadmap Step 3): `create`, `read` and `count` are real, `exists`, `read_batch` and `create_many` work through the trait defaults' logic, and the other storage methods refuse with 501 until their step |
+//! | Cassandra | `cassandra` | Wide-column store; standalone primary, roadmap Steps 1 to 3 done: `create`, `read`, `update`, `delete` (soft), `delete_versioned`, `create_or_update` (with revive), `vread`, `list_versions`, `delete_with_match`, `count`, `exists` and `read_batch` are real, every write a compare-and-swap, and `create_many` works through the trait default's logic; `update_with_match` (Step 4) and every search and history method refuse with 501 |
 //! | Elasticsearch | `elasticsearch` | Full-text search optimized |
 //! | S3 | `s3` | Object storage for bulk data |
 //!

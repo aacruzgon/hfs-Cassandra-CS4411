@@ -468,7 +468,7 @@ mod node_tests {
         }
     }
 
-    /// Deletes `Patient/p` through the engine's C3, as L2b's `delete` will.
+    /// Deletes `Patient/p` through the engine's C3, as `delete` does.
     async fn delete(backend: &CassandraBackend, tenant: &TenantContext) {
         let row = current_row(backend, tenant).await;
         let mut request = backend.cas_request("delete", key(tenant));
@@ -1371,7 +1371,7 @@ mod node_tests {
             .unwrap();
         assert_eq!(expression_of(&backend, &tenant, url), None);
 
-        // Delete it (as L2b will, with its overlay removal), then revive it
+        // Delete it (as `delete` does, with its overlay removal), then revive it
         // active.
         let row = backend
             .read_resource_row(tenant.tenant_id().as_str(), "SearchParameter", "sp")

@@ -5,7 +5,7 @@
 //! design is `docs/Cassandra/cassandra-discussion.md`; the order the work
 //! lands in is `docs/Cassandra/development-roadmap.md`.
 //!
-//! # Status: roadmap Step 3 in progress
+//! # Status: roadmap Steps 1 to 3 done
 //!
 //! The backend implements every trait the server's bound requires (the twelve
 //! of `helios_rest::create_app`), plus [`Backend`](crate::core::Backend) and
@@ -22,6 +22,12 @@
 //! [`BackendError::UnsupportedCapability`](crate::error::BackendError), which
 //! the REST layer answers with 501. Each is replaced in its own file
 //! (`storage.rs` lists them).
+//!
+//! What comes next, by roadmap step: Step 4 makes `VersionedStorage` whole
+//! (`update_with_match`, `versioning_suite.rs`); Step 5 writes the six index
+//! tables on every write and adds the sweeper, which finishes the intent rows
+//! a write leaves behind; Step 6 adds search; Step 7 the CapabilityStatement
+//! hooks; Step 8 the benchmarks and failure tests.
 //!
 //! [`CassandraBackend::cas_stats`] and [`CassandraBackend::statement_counts`]
 //! count the engine's outcomes and the statements sent, for the CI reports.

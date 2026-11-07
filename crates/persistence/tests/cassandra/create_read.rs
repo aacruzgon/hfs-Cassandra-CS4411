@@ -7,8 +7,8 @@
 //! tests in parallel and data left by earlier runs never meet
 //! (ADR-aacruzgon-0020, rule 2). Where a test
 //! must look at cells, it reads them with its own `cdrs-tokio` session, and
-//! the one setup write it makes (a delete marker, until Step 3 has `delete`)
-//! is itself a compare-and-swap, as every write to `resources` must be.
+//! its one delete goes through the backend's own `delete`, a
+//! compare-and-swap, as every write to `resources` must be.
 
 use std::collections::BTreeSet;
 

@@ -179,6 +179,62 @@ class AuditEntries(unittest.TestCase):
             self.assertIsNotNone(ci_report.audit_violation(e, "helios"), e)
         self.assertIsNone(ci_report.audit_violation(unqualified, "helios"), "other.resources, not ours")
 
+    def test_an_unprepared_table_wipe_is_caught_by_its_text(self):
+        # A failed, unprepared statement has no scope (queryFailure, 5.0.9), so
+        # rule (b')'s scope test cannot see a TRUNCATE or DROP TABLE that timed
+        # out, and a timed-out TRUNCATE may still have applied on a replica.
+        def failed(text, ks="helios"):
+            return entry("REQUEST_FAILURE", None, f"{text}; Truncate timed out", ks=ks, category="ERROR")
+        hits = ci_report.audit_records(
+            failed("TRUNCATE resources")
+            + failed("TRUNCATE TABLE resource_versions")
+            + failed('truncate "helios"."resources"', ks="other")
+            + failed("DROP TABLE IF EXISTS helios.resource_versions", ks="other")
+            + failed("DROP TABLE resources"))
+        for e in hits:
+            self.assertIsNotNone(ci_report.audit_violation(e, "helios"), e)
+        passes = ci_report.audit_records(
+            failed("TRUNCATE resources_by_type")
+            + failed("TRUNCATE pending_index_writes")
+            + failed("TRUNCATE resources", ks="other")
+            + failed("TRUNCATE other.resources", ks="other")
+            + failed("DROP TABLE helios.resources_by_type", ks="other")
+            + entry("UPDATE", "resources_by_type", "INSERT INTO resources_by_type (a) VALUES ('TRUNCATE resources')"))
+        for e in passes:
+            self.assertIsNone(ci_report.audit_violation(e, "helios"), e)
+
+    def test_delete_text_sees_through_comments_and_odd_spacing(self):
+        # Spellings the 5.0.9 parser accepts (each reached semantic validation
+        # in cqlsh) that the text rule used to miss.
+        def failed(text, ks="other"):
+            return entry("REQUEST_FAILURE", None, f"{text}; Operation timed out", ks=ks, category="ERROR")
+        hits = ci_report.audit_records(
+            failed("DELETE FROM /* c */ helios.resources WHERE a = 1")
+            + failed("DELETE FROM -- c\nhelios.resources WHERE a = 1")
+            + failed("DELETE FROM // c\nhelios.resource_versions WHERE a = 1")
+            + failed('DELETE FROM"helios"."resources" WHERE a = 1')
+            + failed("DELETE m[';'] FROM helios.resources WHERE a = 1")
+            + failed('DELETE "a;b" FROM helios.resources WHERE a = 1')
+            + failed("DELETE FROM /* c */ resources WHERE a = 1", ks="helios")
+            + failed("BEGIN BATCH INSERT INTO t (a) VALUES ('--'); DELETE FROM helios.resources WHERE a = 1; APPLY BATCH"))
+        for e in hits:
+            self.assertIsNotNone(ci_report.audit_violation(e, "helios"), e)
+        # A literal or a comment naming such a DELETE is not one.
+        passes = ci_report.audit_records(
+            failed("INSERT INTO t (a) VALUES ('DELETE FROM helios.resources')")
+            + failed("SELECT a FROM t /* DELETE FROM helios.resources */")
+            + failed("SELECT a FROM t -- DELETE FROM helios.resources")
+            + failed("INSERT INTO t (a) VALUES ($$DELETE FROM helios.resources$$)")
+            + entry("UPDATE", "resources_by_type", "INSERT INTO resources_by_type (a) VALUES ('DELETE FROM resources; x')"))
+        for e in passes:
+            self.assertIsNone(ci_report.audit_violation(e, "helios"), e)
+
+    def test_cql_code_blanks_literals_and_comments_only(self):
+        self.assertEqual(ci_report.cql_code("SELECT 'it''s' FROM t -- x\nWHERE a = $$b$$ /* y */"),
+                         "SELECT '' FROM t  \nWHERE a = $$$$  ")
+        self.assertEqual(ci_report.cql_code('DELETE "a--b" FROM "x/*y"'), 'DELETE "a--b" FROM "x/*y"')
+        self.assertEqual(ci_report.cql_code("DELETE FROM resources WHERE a = ?"), "DELETE FROM resources WHERE a = ?")
+
     def test_a_failed_native_batch_is_unverifiable(self):
         timed_out, no_keyspace, single = ci_report.audit_records(FAILED_BATCHES)
         self.assertEqual(timed_out["ks"], "helios")
@@ -248,6 +304,12 @@ class CqlAuditCommand(Scratch):
         status, out = self.audit(CLEAN + other)
         self.assertEqual(status, 1)
         self.assertIn("::error title=CQL audit", out)
+        self.assertEqual(len(self.report("cql-audit")["violations"]), 1)
+
+    def test_an_unprepared_truncate_fails_the_check(self):
+        wipe = entry("REQUEST_FAILURE", None, "TRUNCATE helios.resources; Truncate timed out", ks="other", category="ERROR")
+        status, out = self.audit(CLEAN + wipe)
+        self.assertEqual(status, 1)
         self.assertEqual(len(self.report("cql-audit")["violations"]), 1)
 
     def test_a_failed_native_batch_fails_the_check(self):

@@ -915,11 +915,22 @@ PROTECTED_TABLES = ("resources", "resource_versions")
 # miss (AuditLogManager.java, 5.0.9): a CQL-text batch, logged as one
 # scope-less BATCH entry holding every child; and a failed statement, whose
 # type becomes REQUEST_FAILURE and whose scope is dropped when it was not
-# prepared. It is not tied to the start of a statement, so a string literal or
-# comment naming such a DELETE would also match: a false failure, never a
-# missed one.
+# prepared. It runs on cql_code(text), so comments and string literals are
+# neither a hiding place nor a match. A quoted identifier may hold a `;`, and
+# a quoted name may follow FROM with no space; both parse on 5.0.9. It is not
+# tied to the start of a statement, and folds case even in quoted names (a
+# quoted "Resources" is another table): a false failure, never a missed one.
 DELETE_TEXT = re.compile(
-    r'\bDELETE\b[^;]*?\bFROM\s+(?:"?(?P<ks>\w+)"?\s*\.\s*)?"?(?P<table>resources|resource_versions)"?(?![\w"])',
+    r'\bDELETE\b(?:"(?:[^"]|"")*"|[^;"])*?\bFROM(?:\s+|(?="))'
+    r'(?:"?(?P<ks>\w+)"?\s*\.\s*)?"?(?P<table>resources|resource_versions)"?(?![\w"])',
+    re.IGNORECASE | re.DOTALL,
+)
+# A TRUNCATE or DROP TABLE of a protected table in the CQL text, for rule (b'):
+# a failed, unprepared one has no scope (queryFailure, 5.0.9), and a TRUNCATE
+# that timed out may still have applied on a replica.
+WIPE_TEXT = re.compile(
+    r'\b(?P<verb>TRUNCATE(?:\s+TABLE)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?)(?:\s+|(?="))'
+    r'(?:"?(?P<ks>\w+)"?\s*\.\s*)?"?(?P<table>resources|resource_versions)"?(?![\w"])',
     re.IGNORECASE | re.DOTALL,
 )
 # Things the schema says must never exist (schema/README.md), that the audit
@@ -1004,12 +1015,45 @@ def audit_unverifiable(entry: dict, keyspace: str) -> str | None:
     return None
 
 
-def delete_naming(text: str, keyspace: str):
-    """A DELETE in `text` whose table is qualified with `keyspace`, or None."""
-    for match in DELETE_TEXT.finditer(text):
-        if (match.group("ks") or "").lower() == keyspace.lower():
-            return match
-    return None
+def cql_code(text: str) -> str:
+    """`text` with its comments (`/* */`, `--`, `//`) blanked to a space and
+    its string literals (`'…'` with `''` escapes, `$$…$$`) emptied, so the text
+    rules see only statements. Quoted identifiers are kept as they are."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] in "'\"":
+            quote, j = text[i], i + 1
+            while j < n and not (text[j] == quote and text[j + 1:j + 2] != quote):
+                j += 2 if text[j] == quote else 1
+            out.append(quote * 2 if quote == "'" else text[i:j + 1])
+            i = j + 1
+        elif text.startswith("$$", i):
+            j = text.find("$$", i + 2)
+            out.append("$$$$")
+            i = n if j < 0 else j + 2
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            out.append(" ")
+            i = n if j < 0 else j + 2
+        elif text.startswith(("--", "//"), i):
+            j = text.find("\n", i)
+            out.append(" ")
+            i = n if j < 0 else j
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def protected_statements(text: str):
+    """Each (statement, keyspace or None, table) in `text` that deletes from or
+    wipes a protected table: rule (b)'s DELETE, and rule (b')'s TRUNCATE or
+    DROP TABLE by its text."""
+    code = cql_code(text)
+    for match in DELETE_TEXT.finditer(code):
+        yield "DELETE FROM", match.group("ks"), match.group("table")
+    for match in WIPE_TEXT.finditer(code):
+        yield " ".join(match.group("verb").upper().split()), match.group("ks"), match.group("table")
 
 
 def audit_violation(entry: dict, keyspace: str) -> str | None:
@@ -1018,19 +1062,18 @@ def audit_violation(entry: dict, keyspace: str) -> str | None:
         # A failed unprepared statement logs its session's keyspace, not the
         # one its text names (AuditLogManager.queryFailure, 5.0.9). So from a
         # session using another keyspace, rule (b) still applies when the text
-        # names ours (ADR-aacruzgon-0058's known limit, closed).
-        match = delete_naming(entry["operation"] or "", keyspace)
-        if match:
-            return (f"a DELETE FROM {keyspace}.{match.group('table')} in the CQL text of a {entry['type']} "
-                    f"entry logged under ks:{entry['ks']}")
+        # names ours, qualified (ADR-aacruzgon-0058's known limit, closed).
+        for statement, ks, table in protected_statements(entry["operation"] or ""):
+            if (ks or "").lower() == keyspace.lower():
+                return (f"a {statement} {keyspace}.{table} in the CQL text of a {entry['type']} "
+                        f"entry logged under ks:{entry['ks']}")
         return None
     if entry["type"] == "DELETE" and entry["scope"] in PROTECTED_TABLES:
         return f"type:DELETE with scope:{entry['scope']}"
     if entry["type"] in TABLE_WIPES and entry["scope"] in PROTECTED_TABLES:
         return f"type:{entry['type']} with scope:{entry['scope']}"
-    match = DELETE_TEXT.search(entry["operation"] or "")
-    if match:
-        return f"a DELETE FROM {match.group('table')} in the CQL text of a {entry['type']} entry"
+    for statement, _, table in protected_statements(entry["operation"] or ""):
+        return f"a {statement} {table} in the CQL text of a {entry['type']} entry"
     return None
 
 

@@ -119,6 +119,8 @@ async fn cassandra_stubs_refuse_with_unsupported_capability() {
     let version = FhirVersion::default_enabled();
 
     // `create`, `read` and `count` are real from L3 on (`create_read.rs`).
+    // `update` is real from Step 3's L2a: on an id that was never created it
+    // is `NotFound` (walkthrough `:180`), no longer 501.
     let err = backend
         .update(
             &tenant,
@@ -133,19 +135,38 @@ async fn cassandra_stubs_refuse_with_unsupported_capability() {
         )
         .await
         .unwrap_err();
-    assert!(is_unsupported(&err), "update: {err:?}");
+    assert!(
+        matches!(
+            err,
+            StorageError::Resource(helios_persistence::error::ResourceError::NotFound { .. })
+        ),
+        "update: {err:?}"
+    );
+    // `delete` and `delete_versioned` are real from Step 3's L2b: an id that
+    // was never created is `NotFound` (REST answers the plain one with 204,
+    // ADR-aacruzgon-0052).
     let err = backend.delete(&tenant, "Patient", "p1").await.unwrap_err();
-    assert!(is_unsupported(&err), "delete: {err:?}");
+    assert!(
+        matches!(
+            err,
+            StorageError::Resource(helios_persistence::error::ResourceError::NotFound { .. })
+        ),
+        "delete: {err:?}"
+    );
     let err = backend
         .delete_versioned(&tenant, "Patient", "p1", "1")
         .await
         .unwrap_err();
-    assert!(is_unsupported(&err), "delete_versioned: {err:?}");
-    let err = backend
-        .vread(&tenant, "Patient", "p1", "1")
-        .await
-        .unwrap_err();
-    assert!(is_unsupported(&err), "vread: {err:?}");
+    assert!(
+        matches!(
+            err,
+            StorageError::Resource(helios_persistence::error::ResourceError::NotFound { .. })
+        ),
+        "delete_versioned: {err:?}"
+    );
+    // `vread` is real from Step 3 (L2c): a version of an unknown id is none.
+    let found = backend.vread(&tenant, "Patient", "p1", "1").await.unwrap();
+    assert!(found.is_none(), "vread: {found:?}");
     let err = backend
         .search(&tenant, &SearchQuery::new("Patient"))
         .await

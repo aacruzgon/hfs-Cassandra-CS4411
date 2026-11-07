@@ -7,11 +7,11 @@
 //! | --- | --- | --- |
 //! | `create` | `write.rs`, on the shared write engine | real |
 //! | `read`, `count` | `read.rs` | real |
-//! | `update` | `update.rs` | stub (Step 3, L2a) |
-//! | `delete`, `delete_versioned` | `delete.rs` | stubs (Step 3, L2b) |
+//! | `update` | `update.rs`, on the write engine | real (Step 3, L2a) |
+//! | `delete`, `delete_versioned` | `delete.rs`, on the write engine | real (Step 3, L2b) |
 //! | `create_or_update` | `upsert.rs` | stub (Step 3, L3) |
-//! | `vread`, `list_versions`, `delete_with_match` | `versions.rs` | stubs (Step 3, L2c) |
-//! | `exists`, `read_batch` | `versions.rs` | the trait defaults' logic, on `read` |
+//! | `vread`, `list_versions`, `delete_with_match` | `versions.rs` | real (Step 3, L2c; pulled forward from Step 4, D1) |
+//! | `exists`, `read_batch` | `versions.rs` | real (Step 3, L2c): `exists` reads only `deleted_at`, `read_batch` reads concurrently (D10) |
 //! | `update_with_match` | here | stub (Step 4) |
 //!
 //! A stub returns
@@ -24,7 +24,7 @@
 //! overridden here (`cassandra-discussion.md`, "Defaults we must override"):
 //! `readiness_check`, `is_cluster_shared`, `bulk_write_concurrency` and
 //! `delete_versioned`. `create_many` keeps its default, which calls
-//! `create`; Step 3 makes `read_batch` concurrent.
+//! `create`; `exists` and `read_batch` are overridden too (D10).
 
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;

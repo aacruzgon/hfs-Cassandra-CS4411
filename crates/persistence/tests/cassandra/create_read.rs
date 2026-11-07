@@ -266,33 +266,22 @@ async fn cassandra_read_of_a_deleted_resource_is_gone() {
         .await
         .expect("create");
 
-    // Until Step 3 has `delete`: `deleted_at > 0` set through CQL, as a
-    // compare-and-swap, since every write to `resources` is one. Only
-    // `deleted_at` and `version_id` change, which is all `read` looks at; C3
-    // would also set `last_updated`, `write_ts` and `index_keys`.
-    let deleted_at = Utc::now();
-    let mut values = vec![Value::from(deleted_at), Value::from(2_i32)];
-    values.extend(key(&tenant, "Patient", "gone"));
-    values.push(Value::from(1_i32));
-    let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
-        .with_serial_consistency(Consistency::LocalSerial)
-        .with_values(QueryValues::SimpleValues(values))
-        .build();
-    let applied = cql
-        .query_with_params(
-            "UPDATE resources SET deleted_at = ?, version_id = ? \
-             WHERE tenant_id = ? AND resource_type = ? AND id = ? \
-             IF version_id = ? AND deleted_at = 0",
-            params,
-        )
+    // The real soft delete (C3, Step 3's L2b): `deleted_at` is the delete's
+    // `last_updated`, `lu(2)`.
+    backend
+        .delete(&tenant, "Patient", "gone")
         .await
-        .expect("mark deleted")
-        .response_body()
-        .unwrap()
-        .into_rows()
-        .unwrap();
-    assert!(col::<bool>(&applied[0], "[applied]"));
+        .expect("delete");
+    let rows = query(
+        &cql,
+        "SELECT version_id, last_updated FROM resources \
+         WHERE tenant_id = ? AND resource_type = ? AND id = ?",
+        key(&tenant, "Patient", "gone"),
+        Consistency::LocalQuorum,
+    )
+    .await;
+    assert_eq!(col::<i32>(&rows[0], "version_id"), 2);
+    let deleted_at: DateTime<Utc> = col(&rows[0], "last_updated");
 
     match backend.read(&tenant, "Patient", "gone").await {
         Err(StorageError::Resource(ResourceError::Gone {

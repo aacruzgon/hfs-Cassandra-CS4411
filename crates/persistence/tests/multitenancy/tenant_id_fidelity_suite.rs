@@ -84,7 +84,7 @@ where
                 &ctx(id),
                 "Patient",
                 json!({"resourceType": "Patient", "id": format!("p{i}")}),
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap_or_else(|e| panic!("create in tenant {id:?} failed: {e}"));
@@ -141,7 +141,7 @@ where
                 &ctx(id),
                 "Patient",
                 json!({"resourceType": "Patient", "id": format!("p{i}")}),
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap_or_else(|e| panic!("create in tenant {id:?} failed: {e}"));

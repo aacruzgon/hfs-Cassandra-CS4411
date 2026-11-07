@@ -63,7 +63,7 @@ async fn seed<S: ResourceStorage>(backend: &S, tenant: &TenantContext, id: &str)
             tenant,
             "Patient",
             patient(id, "Seed"),
-            FhirVersion::default(),
+            FhirVersion::default_enabled(),
         )
         .await
         .expect("seed patient");
@@ -430,7 +430,7 @@ pub async fn concurrent_puts_onto_a_tombstone_all_succeed<S>(
                         "Patient",
                         &id,
                         patient(&id, &format!("Writer{n}")),
-                        FhirVersion::default(),
+                        FhirVersion::default_enabled(),
                     )
                     .await
             }));

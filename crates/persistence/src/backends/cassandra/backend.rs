@@ -1181,13 +1181,15 @@ mod restart_tests {
         assert!(status.success(), "docker {args:?}: {status}");
     }
 
-    async fn read_one(backend: &CassandraBackend) -> Result<usize, String> {
+    /// Reads one absent row under `tenant`, a `test-restart-<uuid>` tenant of
+    /// the run's own (ADR-aacruzgon-0029); it writes nothing.
+    async fn read_one(backend: &CassandraBackend, tenant: &str) -> Result<usize, String> {
         backend
             .session
             .rows(
                 "SELECT id FROM resources WHERE tenant_id = ? AND resource_type = ? AND id = ?",
                 vec![
-                    Value::from("s2-restart"),
+                    Value::from(tenant),
                     Value::from("Patient"),
                     Value::from("p1"),
                 ],
@@ -1247,8 +1249,9 @@ mod restart_tests {
         .await
         .unwrap_or_else(|e| panic!("connect to {url}: {e}"));
 
+        let tenant = format!("test-restart-{}", uuid::Uuid::new_v4().simple());
         backend.health_check().await.expect("health_check before");
-        assert_eq!(read_one(&backend).await, Ok(0), "read before");
+        assert_eq!(read_one(&backend, &tenant).await, Ok(0), "read before");
         backend.check_schema().await.expect("schema check before");
         let prepared_before = backend.session.prepared_count();
         assert!(prepared_before >= 3, "{prepared_before} prepared");
@@ -1260,7 +1263,10 @@ mod restart_tests {
             .await
             .expect_err("health_check while down");
         eprintln!("down: health_check failed {down_after:?} after the stop: {failed}");
-        assert!(read_one(&backend).await.is_err(), "a read while down");
+        assert!(
+            read_one(&backend, &tenant).await.is_err(),
+            "a read while down"
+        );
 
         docker(&["start", &container]);
         // The readiness budget of the Milestone A test (`UP_TIMEOUT`).
@@ -1278,7 +1284,11 @@ mod restart_tests {
             backend.health_check().await.unwrap_or_else(|e| {
                 panic!("health_check {:?} after recovery: {e}", started.elapsed())
             });
-            assert_eq!(read_one(&backend).await, Ok(0), "read after recovery");
+            assert_eq!(
+                read_one(&backend, &tenant).await,
+                Ok(0),
+                "read after recovery"
+            );
             checks += 1;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }

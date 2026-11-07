@@ -330,7 +330,7 @@ Every write first calls `tenant.check_permission(Operation::…, resource_type)`
 | 1 | permission check; for a SearchParameter, the `code` bound (G38, below); extract `K(N+1)`; `K(N)` is the `index_keys` of the `resources` row read at version `N`: the pre-read R1 of `delete`, `update_with_match` and `create_or_update`, or `update`'s own R1 (G22, section 2); size check of `K(N+1)` (below) | `resources (T,P,id)` for `update`'s R1 | `TenantError`; a value over 2,048 bytes, a `param` over 128, or a SearchParameter `code` over 128 is `ValidationError::InvalidResource`, 400; `update`'s R1 timed out is 504, failed is 503; nothing written |
 | 2 | on update, delete and revive (`update`, `update_with_match`, `delete`, `delete_versioned`, and `create_or_update` on a live row or a delete marker): V3 for `N` at `ts(N) − 1`, from R1 or `current`, with R1's `K(N)` (G40); then I1, with `version_id = N+1` | `resource_versions (T,P,id)` for V3, then `(bucket, shard)` | V3 timed out: 504; failed: 503; nothing changed, since V3 only rewrites row `N` at an older timestamp. I1 `Unavailable`: 503, nothing changed. I1 `WriteTimeout`: an unused intent is swept, so harmless; 504 (`BackendError::Timeout`, G26) |
 | 3 | C1 to C4 | `resources (T,P,id)` | not applied: I2, then the mapped error; unknown outcome below |
-| 4 | V1 or V2 for `N+1` at `ts(N+1)` (V3 for `N` already ran at step 2) | `resource_versions (T,P,id)` | retry with the same timestamps |
+| 4 | V1 or V2 for `N+1` at `ts(N+1)` (V3 for `N` already ran at step 2) | `resource_versions (T,P,id)` | retry with the same timestamps. Retries exhausted: return success, with I1 left for the sweeper (G23, ADR-aacruzgon-0034), on every operation (ADR-aacruzgon-0050) |
 | 5 | index batches, at `ts(N+1)` | index partitions | retry with the same timestamps; `WriteTimeout` type `BATCH` needs no retry (batchlog replays), `BATCH_LOG` does. Retries exhausted: return success, with I1 left for the sweeper, which makes the write searchable within one poll interval plus the grace period (G23, ADR-aacruzgon-0027) |
 | 6 | I2 | `(bucket, shard)` | ignored: return success; the sweeper replays the same writes, which changes nothing, and deletes the intent |
 
@@ -341,10 +341,13 @@ Every write first calls `tenant.check_permission(Operation::…, resource_type)`
 **Timestamps** (ADR-aacruzgon-0016). `lu(1) = now_ms`; `lu(N+1) = max(now_ms, lu(N) + 1 ms)`; `ts(V) = lu(V) · 1000`. `lu(N)` comes from `current.last_modified()` on update and from R1 on delete and revive, so V3's timestamp is exact with no extra read. `K(N)` comes from R1's `index_keys`; only `update` runs an R1 for it (G22). `w(N+1)` is a fresh uuid per CAS attempt (ADR-aacruzgon-0024), and `lu` and `ts` are computed from that attempt's R1.
 
 **Unknown CAS outcome** (ADR-aacruzgon-0024, amended 2026-11-05).
-- **Triggers:** `WriteTimeout` with `write_type = CAS` or `SIMPLE`, or `WriteFailure` with `write_type = CAS`, on any of C1 to C4, so for `create`, `create_or_update`, `update`, `delete` and `delete_versioned`.
-    - With `paxos_variant: v2`, 5.0.9 throws `WriteFailure`/CAS when replicas fail, even in the commit phase after consensus (`Paxos.java:794-799`).
-    - `CAS_WRITE_UNKNOWN` comes only from the legacy v1 path; cdrs-tokio 10 decodes it as `ErrorType::CasWriteUnknown` (8.1.9 could not, ADR-aacruzgon-0044), and if it ever arrives, it is treated the same way.
-    - A client-side timeout or a dropped connection after the CAS was sent is treated exactly like `WriteTimeout`/CAS. In cdrs-tokio that is `Error::General("Connection closed …")`, `Error::Io`, or the backend's own request deadline once the CAS was sent. `Error::Timeout` (raised only while connecting) and a deadline that elapsed while preparing prove nothing was sent, and are mapped directly (ADR-aacruzgon-0034).
+- **Triggers:** on any of C1 to C4, so for `create`, `create_or_update`, `update`, `delete` and `delete_versioned`, every error that does not prove the CAS was not executed (ADR-aacruzgon-0034; one engine for all four, ADR-aacruzgon-0050):
+    - `WriteTimeout` with `write_type = CAS` or `SIMPLE`, `ReadTimeout`, `WriteFailure` with `write_type = CAS`, and `ReadFailure`. With `paxos_variant: v2`, 5.0.9 throws `WriteFailure`/CAS when replicas fail, even in the commit phase after consensus (`Paxos.java:794-799`).
+    - `CAS_WRITE_UNKNOWN`, which comes only from the legacy v1 path; cdrs-tokio 10 decodes it as `ErrorType::CasWriteUnknown` (8.1.9 could not, ADR-aacruzgon-0044), and if it ever arrives, it is treated the same way.
+    - `Server` and `Overloaded`, which can be raised after the proposal was accepted, and every other server error not listed below as mapped directly, including a code the driver cannot name and any a later driver adds.
+    - An answer with no readable `[applied]` column.
+    - A client-side timeout or a dropped connection after the CAS was sent, treated exactly like `WriteTimeout`/CAS. In cdrs-tokio that is `Error::General("Connection closed …")`, `Error::General("Write channel failure!")`, `Error::General("Unmatched stream id: …")`, `Error::Io`, the backend's own request deadline once the CAS was sent, and any other driver error, such as an undecodable frame or a variant a later driver adds.
+- **Mapped directly, never unknown:** only the errors that prove nothing was sent, or that the coordinator refused before acting (ADR-aacruzgon-0034): `Error::Timeout` (raised only while connecting), `Error::InvalidProtocol`, a deadline that elapsed while preparing, "No nodes available in query plan!", "No active connections to: …", and the server codes `Unavailable`, `IsBootstrapping`, `Syntax`, `Invalid`, `Unauthorized`, `Config`, `Authentication`, `Protocol` and `Unprepared`. A CAS refused with `Unavailable` is not retried: 503 at once (ADR-aacruzgon-0050).
     - Every CAS is sent as non-idempotent and with `FallthroughRetryPolicy`, so neither the driver's retry policy nor speculative execution ever re-sends one (ADR-aacruzgon-0032).
 - **What to do:** run R2. Contention alone can cause it, with nothing committed.
 
@@ -353,17 +356,29 @@ For an attempt that targeted version `V` (1 for C1):
 | R2 shows | Meaning | Action |
 | --- | --- | --- |
 | `version_id = V`, our `write_id` (this or any earlier attempt of the request, ADR-aacruzgon-0034) | applied | continue at step 4; a create returns 201 |
-| `version_id = N`, or no row for C1 | not applied, and never will be | run again as a new attempt after a random 5 to 25 ms pause, from a budget of 2 re-runs; a create keeps the same `id`; the attempt's I1 is left for the sweeper |
+| `version_id = N`, or no row for C1 | not applied when R2 ran; it can still apply later, after a dropped connection or the client deadline (ADR-aacruzgon-0034) | run again as a new attempt after a random 5 to 25 ms pause, from a budget of 2 re-runs; a create keeps the same `id`; the attempt's `write_id` stays in the request's list, and the next attempt's R1 and any miss are first checked against it (below, ADR-aacruzgon-0051); the attempt's I1 is left for the sweeper |
 | `version_id = V`, another `write_id` (none of this request's attempts', ADR-aacruzgon-0034) | another writer won `V` | a definite miss: `AlreadyExists`, 409, from `create`; 409 from `update` and `delete_versioned`; the next attempt in `create_or_update` and a plain `delete` |
 | `version_id > V` | ours may have applied and been superseded | R3 on row `V`, which now selects `write_id` (ADR-aacruzgon-0026, G36); see the next three rows |
 | `version_id > V`; row `V` has our `write_id` | applied, then superseded | success with version `V`, as for "applied" (201 for a create or revive, 200 for an update, 204 for a delete); steps 4 and 5 are skipped, since a late insert of `K(V)` could outlive a later version's tombstones; I1 is left for the sweeper, whose superseded case deletes `K(V-1)` |
 | `version_id > V`; row `V` has another `write_id` | another writer won `V` | a definite miss, as the third row |
 | `version_id > V`; row `V`'s `write_id` unset | undecidable | after `WriteTimeout`, a client-side timeout or a dropped connection: `BackendError::Timeout`, 504; after `WriteFailure`: `BackendError::Unavailable`, 503. No retry, which could write the body twice; I1 left for the sweeper |
-| R2 times out, or fails | unknown | timed out: `BackendError::Timeout`, 504; failed (`ReadFailure`, `Unavailable`): `BackendError::Unavailable`, 503; I1 kept |
+| R2 times out, or fails | unknown | timed out: `BackendError::Timeout`, 504; failed (`ReadFailure`, `Unavailable`): `BackendError::Unavailable`, 503; I1 kept. R2's error is mapped as a plain statement's (`errors.rs`), never classified as a CAS: a `WriteTimeout`/CAS that R2 itself raises on Paxos v2 (`Paxos.java:893-901`) is R2 timing out, 504, not a new unknown write (ADR-aacruzgon-0050) |
 
 Row `V`'s `write_id` is set by `V`'s own step 4 (V1 or V2), by the sweeper's replay of `V`, or by the next writer's V3 when that writer built it from R1: a `delete`, a `create_or_update` or an `update_with_match`. So the outcome is decided whenever the version that superseded ours came from one of those paths. It stays undecidable when it came from `update`, whose V3 is built from a `StoredResource` without a `write_id`. Row `V` always exists once a later CAS has applied, because that writer's V3 ran before its CAS (G40).
 
 Every timeout is 504 and every unavailable node or replica failure 503, as `crates/rest/src/error.rs` maps them (G26). When the 2 re-runs are used up, the last attempt's error decides the same way: 504 after a `WriteTimeout`, 503 after a `WriteFailure`. `write_type = SIMPLE` is a trigger like `WriteTimeout`/CAS, confirmed by R2, never taken as applied (ADR-aacruzgon-0035).
+
+**A later attempt first checks the earlier ones** (ADR-aacruzgon-0051). Once an attempt `k` of a request had an unknown outcome (target `V_k`, `write_id` `w_k`), every later look at the row in that request is matched against every such attempt before it is acted on:
+- the next attempt's R1, which returns `version_id` and `write_id`;
+- a definite miss of a later C2, C3 or C4, which returns only `version_id` and `deleted_at`, so it is followed by R2. C1's miss returns the whole row, so it needs no read.
+
+| The row shows | For attempt `k` | Then |
+| --- | --- | --- |
+| `version_id = V_k`, `write_id = w_k` | applied late | success with attempt `k`'s values, as "applied" above |
+| `version_id > V_k` | maybe applied and superseded | R3 on row `V_k`, as the `version_id > V` rows above, undecidable included |
+| anything else | did not apply | act on the look as usual: map the miss, or go ahead with the attempt |
+
+Without it, a late attempt makes the request report a lost race against itself: `create_or_update` takes another turn and writes the body twice, `update` and `delete_versioned` answer 409, and a plain `delete` answers `NotFound` or 409 after deleting. It runs only after an unknown outcome and changes no statement.
 
 ### 3.2 Create (`ResourceStorage::create`, `POST /Patient`)
 
@@ -373,7 +388,7 @@ Every timeout is 504 and every unavailable node or replica failure 503, as `crat
 | --- | --- |
 | applied | 201 Created, `ETag: W/"1"` |
 | not applied (row returned): id collision, reachable only with a client-chosen id | `ResourceError::AlreadyExists`, 409 (inside `create_or_update` the loop restarts as an update) |
-| unknown (`WriteTimeout` or `WriteFailure`, `write_type = CAS`) | R2 on the same `id`, then the table in 3.1: our `write_id` is 201; no row is a re-run with the same `id` and a fresh `w`, so a client never gets two resources from one `POST`; another `write_id` is `AlreadyExists`, 409 |
+| unknown (any trigger in 3.1, "Unknown CAS outcome") | R2 on the same `id`, then the table in 3.1: our `write_id` is 201; no row is a re-run with the same `id` and a fresh `w`, so a client never gets two resources from one `POST`; another `write_id` is `AlreadyExists`, 409 |
 
 ### 3.3 Update (`ResourceStorage::update(tenant, current, resource)`, `PUT /Patient/id`)
 

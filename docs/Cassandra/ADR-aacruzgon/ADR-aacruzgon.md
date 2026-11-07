@@ -94,4 +94,6 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0047](2026-11-06/0047-coverage-report-in-ci.md) | 2026-11-06 | A Cassandra coverage report in CI, in its own workflow, not required and with no threshold | accepted |
 | [0048](2026-11-06/0048-more-ci-reports-node-and-build.md) | 2026-11-06 | More CI reports: the R4B build, cargo timings, the node's start, its JVM and container, hfs's memory, and the stored-SearchParameter load | accepted |
 | [0049](2026-11-06/0049-backport-upstream-2518.md) | 2026-11-06 | Carry upstream's versioned-`Location` fix (HeliosSoftware/hfs#2518) in the fork ahead of upstream, as `-x` cherry-picks | accepted |
+| [0050](2026-11-06/0050-one-cas-engine.md) | 2026-11-06 | Every compare-and-swap goes through one write engine, under the rules of ADR-aacruzgon-0034 and 0035 | accepted |
+| [0051](2026-11-06/0051-late-earlier-attempt.md) | 2026-11-06 | After an unknown outcome, a later attempt checks every earlier attempt before it acts on what it sees | accepted |
 | [0052](2026-11-06/0052-backport-upstream-2529.md) | 2026-11-06 | A delete with nothing to delete answers 200/204, through upstream's fix (HeliosSoftware/hfs#2529) carried as a `-x` cherry-pick with one hunk left out | accepted |

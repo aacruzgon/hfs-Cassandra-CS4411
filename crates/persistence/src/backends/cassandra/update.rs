@@ -203,10 +203,14 @@ impl CassandraBackend {
 
     /// R2 for `update`: R1's text at `LOCAL_SERIAL`, which completes or
     /// cancels a proposal still in flight on the partition (walkthrough
-    /// `:179`, `:300-301`). Its error is mapped as a plain statement's, 504
-    /// timed out or 503 failed, never classified as a CAS's
-    /// (ADR-aacruzgon-0050): a `WriteTimeout`/CAS from a Paxos v2 serial read
-    /// is the read timing out.
+    /// `:179`, `:300-301`). It runs before this update's own CAS, not after
+    /// an unknown outcome, so nothing this request wrote can be stored yet,
+    /// and its error goes through the plain table (`errors.rs`,
+    /// [`map_driver_error`]): 504 for a timeout; 503 for `Unavailable`, a
+    /// replica failure or a lost connection; 500 for a node-side exception,
+    /// a refused statement or a decoding error. It is never classified as a
+    /// CAS's (ADR-aacruzgon-0050): a `WriteTimeout`/CAS from a Paxos v2
+    /// serial read is the read timing out, so 504.
     async fn serial_resource_row(
         &self,
         tenant_id: &str,

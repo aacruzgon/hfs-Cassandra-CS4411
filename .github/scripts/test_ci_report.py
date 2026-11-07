@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Tests for ci-report.py's Step 3 commands: the CQL audit check (plan D6) and
+the report parsers (R2, R4, R6, R7, R10). Standard library only, as in
+.github/scripts/fhir-bench/test_*.py:
+
+    python3 -m unittest discover -s .github/scripts -p 'test_ci_report.py'
+
+The audit fixtures are real `auditlogviewer` output, from a Cassandra 5.0.9
+node (`cassandra:5.0.9-trixie`, `docker/cassandra`) with
+`nodetool enableauditlog --included-keyspaces helios --included-categories
+DML,ERROR,PREPARE`, after the statements each fixture names were sent with
+cqlsh.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE / "ci-report.py"
+spec = importlib.util.spec_from_file_location("ci_report", SCRIPT)
+ci_report = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ci_report)
+
+HEAD = "LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:52822|timestamp:1794020082567"
+
+# Recorded: an X1-style insert and delete on resources_by_type, a CQL-text
+# batch holding both, a DELETE on resources, an invalid DELETE on resources
+# (REQUEST_FAILURE) and a DELETE on a quoted "resource_versions".
+RECORDED = """Type: audit
+LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:52822|timestamp:1794020082567|type:UPDATE|category:DML|ks:helios|scope:resources_by_type|operation:INSERT INTO resources_by_type (tenant_id, resource_type, last_updated, id, version_id) VALUES ('t','Patient','2026-01-01',  'a', 1);
+Type: audit
+LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:52822|timestamp:1794020082577|type:DELETE|category:DML|ks:helios|scope:resources_by_type|operation:DELETE FROM resources_by_type WHERE tenant_id='t' AND resource_type='Patient' AND last_updated='2026-01-01' AND id='a';
+Type: audit
+LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:52822|timestamp:1794020082584|type:BATCH|category:DML|ks:helios|operation:BEGIN BATCH INSERT INTO resources_by_type (tenant_id, resource_type, last_updated, id, version_id) VALUES ('t','Patient','2026-01-01','b',1); DELETE FROM resources_by_type WHERE tenant_id='t' AND resource_type='Patient' AND last_updated='2026-01-01' AND id='b'; APPLY BATCH;
+Type: audit
+LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:52822|timestamp:1794020082595|type:DELETE|category:DML|ks:helios|scope:resources|operation:DELETE FROM resources WHERE tenant_id='t' AND resource_type='Patient' AND id='zz';
+Type: audit
+LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:60620|timestamp:1794020100916|type:REQUEST_FAILURE|category:ERROR|ks:helios|operation:DELETE FROM resources WHERE tenant_id='t';; Some partition key parts are missing: resource_type, id
+Type: audit
+LogMessage: user:anonymous|host:/192.168.148.2:7000|source:/127.0.0.1|port:60620|timestamp:1794020100917|type:DELETE|category:DML|ks:helios|scope:resource_versions|operation:DELETE FROM "resource_versions" WHERE tenant_id='t' AND resource_type='Patient' AND id='q' AND version_id = 1;
+"""
+
+
+def entry(type_, scope, operation, ks="helios", category="DML"):
+    scope_part = f"|scope:{scope}" if scope else ""
+    return f"Type: audit\n{HEAD}|type:{type_}|category:{category}|ks:{ks}{scope_part}|operation:{operation}\n"
+
+
+# What Step 3's backend legitimately sends: prepared statements (logged with
+# their `?`), the CAS soft delete, I2 and the X1 delete.
+CLEAN = "".join([
+    entry("UPDATE", "pending_index_writes", "INSERT INTO pending_index_writes (bucket, shard, enqueued_at, tenant_id, resource_type, id, write_id, version_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
+    entry("UPDATE", "resources", "UPDATE resources SET deleted_at = ?, version_id = ?, last_updated = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ? AND deleted_at = 0"),
+    entry("UPDATE", "resource_versions", "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, deleted_at) VALUES (?, ?, ?, ?, ?) USING TIMESTAMP ?"),
+    entry("DELETE", "resources_by_type", "DELETE FROM resources_by_type USING TIMESTAMP ? WHERE tenant_id = ? AND resource_type = ? AND last_updated = ? AND id = ?"),
+    entry("DELETE", "pending_index_writes", "DELETE FROM pending_index_writes WHERE bucket = ? AND shard = ? AND enqueued_at = ? AND tenant_id = ? AND resource_type = ? AND id = ?"),
+    entry("PREPARE_STATEMENT", None, "SELECT version_id FROM resources WHERE tenant_id = ? AND resource_type = ? AND id = ?", category="PREPARE"),
+])
+
+
+class AuditEntries(unittest.TestCase):
+    def test_recorded_fields(self):
+        entries = ci_report.audit_records(RECORDED)
+        self.assertEqual(len(entries), 6)
+        self.assertEqual([(e["type"], e["scope"]) for e in entries], [
+            ("UPDATE", "resources_by_type"), ("DELETE", "resources_by_type"), ("BATCH", None),
+            ("DELETE", "resources"), ("REQUEST_FAILURE", None), ("DELETE", "resource_versions"),
+        ])
+        self.assertTrue(all(e["ks"] == "helios" for e in entries))
+        self.assertTrue(entries[0]["operation"].startswith("INSERT INTO resources_by_type"))
+
+    def test_fields_are_read_before_the_operation_only(self):
+        # The CQL text is free text: a pipe-and-colon look-alike inside it is
+        # not a field.
+        [e] = ci_report.audit_records(entry("UPDATE", "resources_by_type", "INSERT INTO resources_by_type (x) VALUES ('|scope:resources|type:DELETE|')"))
+        self.assertEqual((e["type"], e["scope"]), ("UPDATE", "resources_by_type"))
+        self.assertIsNone(ci_report.audit_violation(e, "helios"))
+
+    def test_multi_line_operation(self):
+        text = entry("DELETE", "resources", "DELETE FROM resources\n  WHERE tenant_id = ?\n  AND id = ?") + entry("UPDATE", "resources", "UPDATE resources SET x = ? WHERE a = ? IF b = ?")
+        entries = ci_report.audit_records(text)
+        self.assertEqual(len(entries), 2)
+        self.assertIn("AND id = ?", entries[0]["operation"])
+
+    def test_recorded_violations(self):
+        reasons = [ci_report.audit_violation(e, "helios") for e in ci_report.audit_records(RECORDED)]
+        self.assertEqual([r is not None for r in reasons], [False, False, False, True, True, True])
+        self.assertIn("scope:resources", reasons[3])
+        self.assertIn("REQUEST_FAILURE", reasons[4])
+        self.assertIn("scope:resource_versions", reasons[5])
+
+    def test_clean_step3_traffic_has_no_violation(self):
+        for e in ci_report.audit_records(CLEAN):
+            self.assertIsNone(ci_report.audit_violation(e, "helios"), e)
+
+    def test_delete_text_matches_exactly_the_protected_tables(self):
+        hits = [
+            "DELETE FROM resources WHERE a = ?",
+            "delete from helios.resources where a = ?",
+            'DELETE FROM "helios"."resource_versions" WHERE a = ?',
+            "DELETE data, deleted_at FROM resources WHERE a = ?",
+            "BEGIN BATCH INSERT INTO resources_by_type (a) VALUES (?); DELETE FROM resource_versions WHERE a = ?; APPLY BATCH",
+            "DELETE FROM resources",
+        ]
+        misses = [
+            "DELETE FROM resources_by_type WHERE a = ?",
+            "DELETE FROM helios.resources_by_type USING TIMESTAMP ? WHERE a = ?",
+            "DELETE FROM pending_index_writes WHERE a = ?",
+            "DELETE FROM resource_versions_old WHERE a = ?",
+            "SELECT deleted_at FROM resources WHERE a = ?",
+            "UPDATE resources SET deleted_at = ? WHERE a = ? IF version_id = ?",
+            "DELETE FROM resources_by_type WHERE a = ?; SELECT * FROM resources",
+        ]
+        for text in hits:
+            self.assertIsNotNone(ci_report.DELETE_TEXT.search(text), text)
+        for text in misses:
+            self.assertIsNone(ci_report.DELETE_TEXT.search(text), text)
+
+    def test_another_keyspace_is_not_ours(self):
+        [e] = ci_report.audit_records(entry("DELETE", "resources", "DELETE FROM other.resources WHERE a = 1", ks="other"))
+        self.assertIsNone(ci_report.audit_violation(e, "helios"))
+
+
+class Scratch(unittest.TestCase):
+    """Each test writes its report into its own directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.env = {k: os.environ.get(k) for k in ("CI_REPORT_DIR", "GITHUB_STEP_SUMMARY")}
+        os.environ["CI_REPORT_DIR"] = str(self.dir / "report")
+        os.environ.pop("GITHUB_STEP_SUMMARY", None)
+
+    def tearDown(self):
+        for key, value in self.env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def write(self, name, text):
+        path = self.dir / name
+        path.write_text(text)
+        return path
+
+    def report(self, report_id):
+        return json.loads((self.dir / "report" / f"{report_id}.json").read_text())["data"]
+
+    def quiet(self, func, *args):
+        with redirect_stdout(io.StringIO()) as out:
+            status = func(*args)
+        return status, out.getvalue()
+
+
+class CqlAuditCommand(Scratch):
+    def audit(self, text, check=True, name="audit.txt"):
+        path = self.write(name, text) if text is not None else self.dir / "missing.txt"
+        args = SimpleNamespace(id="cql-audit", title="CQL audit", file=str(path), keyspace="helios", check=check)
+        return self.quiet(ci_report.cmd_cql_audit, args)
+
+    def test_clean_log_passes(self):
+        status, _ = self.audit(CLEAN)
+        self.assertEqual(status, 0)
+        data = self.report("cql-audit")
+        self.assertTrue(data["check_passed"])
+        self.assertEqual(data["violations"], [])
+        self.assertIn({"table": "resources_by_type", "type": "DELETE", "count": 1}, data["by_table_and_type"])
+
+    def test_delete_on_resources_fails_with_an_error_annotation(self):
+        status, out = self.audit(RECORDED)
+        self.assertEqual(status, 1)
+        self.assertIn("::error title=CQL audit", out)
+        self.assertEqual(len(self.report("cql-audit")["violations"]), 3)
+
+    def test_empty_or_missing_log_fails_the_check(self):
+        self.assertEqual(self.audit("")[0], 1)
+        self.assertEqual(self.audit(None)[0], 1)
+        only_prepares = entry("PREPARE_STATEMENT", None, "SELECT 1", category="PREPARE")
+        self.assertEqual(self.audit(only_prepares)[0], 1)
+
+    def test_without_check_it_only_warns(self):
+        status, out = self.audit(RECORDED, check=False)
+        self.assertEqual(status, 0)
+        self.assertIn("::warning", out)
+        self.assertNotIn("::error", out)
+
+    def test_gzip_input(self):
+        import gzip
+
+        path = self.dir / "audit.txt.gz"
+        with gzip.open(path, "wt") as out:
+            out.write(CLEAN)
+        args = SimpleNamespace(id="cql-audit", title="CQL audit", file=str(path), keyspace="helios", check=True)
+        self.assertEqual(self.quiet(ci_report.cmd_cql_audit, args)[0], 0)
+
+    def test_plain_write_to_resources_and_allow_filtering_warn(self):
+        text = CLEAN + entry("UPDATE", "resources", "INSERT INTO resources (a) VALUES (?)") + entry("UPDATE", "resources_by_type", "SELECT * FROM resources_by_type WHERE x = 1 ALLOW FILTERING")
+        status, out = self.audit(text)
+        self.assertEqual(status, 0)
+        data = self.report("cql-audit")
+        self.assertEqual((data["plain_writes_to_resources"], data["allow_filtering"]), (1, 1))
+        self.assertIn("plain (non-IF) write", out)
+
+    def test_main_exit_status(self):
+        bad = self.write("bad.txt", RECORDED)
+        good = self.write("good.txt", CLEAN)
+        env = {**os.environ}
+        run = lambda *a: subprocess.run([sys.executable, str(SCRIPT), "cql-audit", "cql-audit", "CQL audit", *a], env=env, capture_output=True, text=True)
+        self.assertEqual(run(str(bad), "--check").returncode, 1)
+        self.assertEqual(run(str(good), "--check").returncode, 0)
+        self.assertEqual(run(str(bad)).returncode, 0, "without --check it is a report")
+
+
+class TaggedLines(unittest.TestCase):
+    def test_pairs_quotes_and_colour(self):
+        log = ('noise [cas-stats scope=latency-report:update attempts=100 applied=99 note="two words ]"]\n'
+               "\x1b[32m[spec row=C-4 expected=201 got=201]\x1b[0m and [spec row=D-3 expected=204 got=404 step=7]\n")
+        self.assertEqual(ci_report.tagged_lines(log, "cas-stats"), [{"scope": "latency-report:update", "attempts": "100", "applied": "99", "note": "two words ]"}])
+        self.assertEqual(ci_report.tagged_lines(log, "spec"), [{"row": "C-4", "expected": "201", "got": "201"}, {"row": "D-3", "expected": "204", "got": "404", "step": "7"}])
+
+
+class SpecAndCasCommands(Scratch):
+    def test_spec_mismatch_warns(self):
+        log = self.write("step3-rest.log", "[spec row=U-7 expected=200 got=200]\n[spec row=D-3 expected=204 got=404]\n")
+        status, out = self.quiet(ci_report.cmd_spec, SimpleNamespace(id="spec", title="HL7", log=str(log)))
+        self.assertEqual(status, 0)
+        data = self.report("spec")
+        self.assertEqual((len(data["rows"]), data["mismatches"]), (2, 1))
+        self.assertIn("D-3 expected 204, got 404", out)
+
+    def test_spec_missing_log_warns(self):
+        status, out = self.quiet(ci_report.cmd_spec, SimpleNamespace(id="spec", title="HL7", log=str(self.dir / "none.log")))
+        self.assertEqual(status, 0)
+        self.assertIn("did not run", out)
+
+    def test_cas_rows_and_warnings(self):
+        log = self.write("latency-backend.log", "[cas-stats scope=a attempts=12 applied=10 undecidable=0]\n[cas-stats scope=b attempts=4 applied=4 budget_exhausted=1]\n")
+        status, out = self.quiet(ci_report.cmd_cas, SimpleNamespace(id="cas", title="CAS", logs=[str(log), str(self.dir / "absent.log")]))
+        self.assertEqual(status, 0)
+        data = self.report("cas")
+        self.assertEqual([r["attempts_per_applied"] for r in data["rows"]], [1.2, 1.0])
+        self.assertEqual(data["missing_logs"], ["absent.log"])
+        self.assertIn("budget_exhausted=1", out)
+        self.assertNotIn("undecidable=0", out)
+
+    def test_cas_without_lines_says_so(self):
+        log = self.write("x.log", "nothing\n")
+        self.quiet(ci_report.cmd_cas, SimpleNamespace(id="cas", title="CAS", logs=[str(log)]))
+        self.assertIn("not exposed yet", (self.dir / "report" / "cas.md").read_text())
+
+
+class Intents(unittest.TestCase):
+    def test_buckets_are_utc_hours(self):
+        now = datetime(2026, 11, 7, 0, 30, tzinfo=timezone.utc)
+        self.assertEqual(ci_report.intent_buckets(now, 3), ["2026-11-07T00", "2026-11-06T23", "2026-11-06T22"])
+
+    def test_classify(self):
+        self.assertEqual(ci_report.classify_intent({"version_id": 2}, None), "no resource row")
+        self.assertEqual(ci_report.classify_intent({"version_id": 2}, {"version_id": 2}), "at or below the current version")
+        self.assertEqual(ci_report.classify_intent({"version_id": 3}, {"version_id": 2}), "above the current version")
+
+    def test_tenant_label(self):
+        match = ci_report.TEST_TENANT.match("test-race-puts-0123456789abcdef0123456789abcdef")
+        self.assertEqual(match.group(1), "race-puts")
+
+
+class CrudTombstones(unittest.TestCase):
+    def test_soft_delete_tables_warn_and_resources_by_type_does_not(self):
+        rows, md, warnings = ci_report.crud_tombstone_rows({
+            "resources": {"count": 10, "max": 0, "p99th": 0},
+            "resource_versions": {"count": 5, "max": 2.0, "p99th": 1.0},
+            "resources_by_type": {"count": 9, "max": 40.0, "p99th": 30.0},
+        })
+        self.assertEqual([r["table"] for r in rows], ["resources", "resource_versions", "resources_by_type"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("resource_versions", warnings[0])
+        self.assertIn("`resources_by_type`", md)
+
+    def test_missing_tables_are_blank(self):
+        rows, _, warnings = ci_report.crud_tombstone_rows({})
+        self.assertEqual(warnings, [])
+        self.assertIsNone(rows[0]["max"])
+
+
+if __name__ == "__main__":
+    unittest.main()

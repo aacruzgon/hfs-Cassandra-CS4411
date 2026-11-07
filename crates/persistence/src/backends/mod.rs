@@ -10,7 +10,7 @@
 //! | SQLite | `sqlite` | Lightweight embedded database, great for development |
 //! | PostgreSQL | `postgres` | Full-featured RDBMS with JSONB support |
 //! | MongoDB | `mongodb` | Document store with native JSON support |
-//! | Cassandra | `cassandra` | Wide-column store; standalone primary, roadmap Steps 1 to 3 done: `create`, `read`, `update`, `delete` (soft), `delete_versioned`, `create_or_update` (with revive), `vread`, `list_versions`, `delete_with_match`, `count`, `exists` and `read_batch` are real, every write a compare-and-swap, and `create_many` works through the trait default's logic; `update_with_match` (Step 4) and every search and history method refuse with 501 |
+//! | Cassandra | `cassandra` | Wide-column store; standalone primary; roadmap Step 3's CRUD core is merged: `create`, `read`, `update`, `delete` (soft), `delete_versioned`, `create_or_update` (with revive), `vread`, `list_versions`, `delete_with_match`, `count`, `exists` and `read_batch` are real, every write to `resources` is a compare-and-swap, and `create_many` works through the trait default's logic; `update_with_match` (Step 4), `search` and `search_count` (Step 6), and the history, conditional, include and export stubs refuse with 501 (`cassandra/mod.rs` lists the rest) |
 //! | Elasticsearch | `elasticsearch` | Full-text search optimized |
 //! | S3 | `s3` | Object storage for bulk data |
 //!

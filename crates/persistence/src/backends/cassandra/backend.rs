@@ -29,7 +29,7 @@ use crate::search::{
 const HEALTH_CHECK: &str = "SELECT release_version FROM system.local";
 
 /// Every SearchParameter id a tenant has stored, from its `resources_by_type`
-/// partition, which `create` writes in Step 2 (write.rs, X1).
+/// partition, which every write keeps up to date (write.rs, X1).
 const SELECT_STORED_SEARCH_PARAMETER_IDS: &str =
     "SELECT id FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?";
 
@@ -273,9 +273,9 @@ where
 /// Built with [`CassandraBackend::connect`]. It implements the twelve traits
 /// the server needs (`helios_rest::create_app`'s bound), plus [`Backend`] and
 /// [`SearchCapabilityProvider`](crate::core::SearchCapabilityProvider). The
-/// module docs say which methods are real; the rest return
-/// [`BackendError::UnsupportedCapability`], which the REST layer answers with
-/// 501.
+/// module docs say which methods are real, which refuse with
+/// [`BackendError::UnsupportedCapability`] (501 through REST), and which keep
+/// their trait defaults.
 pub struct CassandraBackend {
     pub(super) config: CassandraConfig,
     pub(super) session: Arc<CassandraSession>,
@@ -408,8 +408,8 @@ impl CassandraBackend {
     ///
     /// From Step 3 that is `SharedSchema`, the one placement (one keyspace,
     /// with the tenant in every partition key), plus `Crud` (create, read,
-    /// update and delete; every write a compare-and-swap, the delete soft) and
-    /// `OptimisticLocking` (`If-Match` through `update`'s and
+    /// update and delete; every write to `resources` a compare-and-swap, the
+    /// delete soft) and `OptimisticLocking` (`If-Match` through `update`'s and
     /// `delete_versioned`'s compare-and-swap). A capability must never be
     /// declared for behaviour that is planned or stubbed (`core/backend.rs`),
     /// so each other one is added here, and to the golden list in

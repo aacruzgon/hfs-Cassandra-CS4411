@@ -106,3 +106,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0059](2026-11-06/0059-step3-ci-reports.md) | 2026-11-06 | Step 3's CI reports: latency per operation, CAS outcomes, statements, intent rows, tombstones, DML and the HL7 rows | accepted |
 | [0060](2026-11-06/0060-step3-scope.md) | 2026-11-06 | Step 3's scope: vread, list_versions and delete_with_match come forward from Step 4, PATCH is in, the multitenancy suites split, and four contradictions are realigned; Steps 4 to 8 left to the group (**X**) | accepted |
 | [0061](2026-11-06/0061-update-v3-from-r1.md) | 2026-11-06 | Plain `update` builds its rewrite of row N from its own pre-read, so every rewrite carries a `write_id` | accepted |
+| [0062](2026-11-06/0062-overlay-on-update-delete-revive.md) | 2026-11-06 | Stored SearchParameters stay current in the overlay on update, delete and revive, with removals ordered by `last_updated` | accepted |

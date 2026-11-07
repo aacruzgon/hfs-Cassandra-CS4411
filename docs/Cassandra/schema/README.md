@@ -77,7 +77,7 @@ The walk-through found places where the design document was wrong. These are now
 
 Two corrections need no ADR because they fix a statement, not a decision:
 - **The sweeper does compare clocks.** "No clocks are compared" was wrong: the grace period is a clock comparison. The design now states its assumption (G11).
-- **A write is 404, never 410, when the resource was deleted in the gap** (G9). 410 is for `read` and `vread` only.
+- **A write is 404, never 410, when the resource was deleted in the gap** (G9). 410 is for `read` and `vread` only. The backend's answer is `NotFound` for every write, `delete` included. For a plain `delete`, REST answers that `NotFound` with 204, the spec's no-op (ADR-aacruzgon-0052).
 
 ## Proposals, decided
 

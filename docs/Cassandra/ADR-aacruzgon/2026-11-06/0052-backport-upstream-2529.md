@@ -1,0 +1,111 @@
+# ADR-aacruzgon-0052: A delete with nothing to delete follows the spec (200/204), through upstream's fix (HeliosSoftware/hfs#2529) carried as a `-x` cherry-pick
+
+- **Date:** 2026-11-06
+- **Status:** accepted (Alan approved it on 2026-11-06)
+- **Context:**
+    - **The deviation from the spec.** R4, R4B and R5 http.html#delete say the same, word for word:
+        - "Upon successful deletion, or if the resource does not exist at all, the server should return either a 200 OK if the response contains a payload, or a 204 No Content with no response payload, or a 202 Accepted if the server wishes to be non-commital about the outcome of the delete."
+        - "Performing this interaction on a resource that is already deleted has no effect, and the server should return either a 200 OK if the response contains a payload, or a 204 No Content with no response payload."
+        - Both are a lower-case *should*, so the 404 is a deviation, not a SHALL violation. The status summary table lists 404 for delete without saying when; everywhere else on that page, a 404 for an interaction means an unsupported type or endpoint.
+    - **What HFS did.** The same "nothing to delete" got five answers (HeliosSoftware/hfs#2523, on upstream `main` `1e6bb3013`):
+        - 404 for `DELETE [type]/[id]` and for batch entries, on SQLite, PostgreSQL and MongoDB;
+        - 400 for the whole Bundle, for a transaction entry on SQLite and PostgreSQL;
+        - 204 for a conditional delete with no match, and for a MongoDB transaction entry;
+        - 410 on S3, for an already-deleted id.
+    - **The history: the 404 was neither chosen nor reasoned.**
+        - **An accident.** `d462f278c` (2026-01-28) wrote `storage.delete(..).await?`, so storage's `NotFound` became 404 through the generic error mapping. A doc line came with it, and no reason.
+        - **Kept as the status quo.** #428 (#312), #1371, #1484 (#1343) and #1421 (#1404) each kept the 404 so that behaviour would not change, never for a reason of its own. #428 and #1484 added the two tests that pin it.
+        - **The 204s HFS chose deliberately.** Wherever HFS decided on the spec text, it chose 204:
+            - the conditional delete with no match (#1371, fixing #1361);
+            - `BundleEntryResult::delete_not_found()`, "deletes are idempotent on the wire" (#1081, #1078);
+            - the MongoDB transaction arm;
+            - Discussion #28's `DeleteOutcome`, "200, 204, or 202".
+    - **In the fork.** The design's CRUD row said "Helios itself returns 404 for both … and we match Helios", and the walkthrough (3.4, G25) and the schema README (G9) said 404. The roadmap's Step 3 Spec line said 200 or 204.
+    - **Step 3's D8.** The Step 3 planning pack recommended option (a): keep the 404 by returning `NotFound`, as SQLite, PostgreSQL and MongoDB do, and correct the roadmap line. Alan asked whether the 404 was a bug or intended by the Helios architecture. A history check of the git log, issues, PRs and docs found the history above. Alan then chose to follow the spec, and to fix it in the shared REST layer upstream and carry it in the fork.
+    - **The upstream fix.** Alan filed HeliosSoftware/hfs#2523 and opened HeliosSoftware/hfs#2529: one signed commit, `4dbc3c7f0`, on branch `fix/2523-delete-absent-is-success`, on upstream `main` `1e6bb3013`. On 2026-11-06 it is open, with review required. It touches 24 files:
+        - REST: `delete_handler`, batch, transaction notices;
+        - storage: the SQLite and PostgreSQL transaction arms, PostgreSQL's `poisoned` reset, S3's tombstone answer, the `ResourceStorage::delete` doc, composite health;
+        - tests, the READMEs, the book and both copies of the `run-hfs-server` skill.
+    - **Why it is a decision.**
+        - It changes what the server answers on the wire, for every backend.
+        - It deviates from what the design, the walkthrough and the schema README recorded.
+        - Like ADR-aacruzgon-0049, it carries an upstream change ahead of upstream. The fork is 90 commits behind upstream `main`.
+- **Decision:**
+    - **Follow the spec.** A delete of an unknown or already-deleted id, with no `If-Match`, is a successful no-op: 204, or 200 with an informational OperationOutcome under `Prefer: return=OperationOutcome`. Nothing is written. This holds on every path: instance, batch and transaction.
+    - **Backport now, as a `-x` pick of `4dbc3c7f0`, unchanged except for one hunk.** It is on branch `cassandra/step3-backport-2523`, in its own PR, as ADR-aacruzgon-0049 set the precedent.
+        - Of its 24 files, 23 merged as upstream wrote them.
+        - **The dropped hunk.** In `crates/persistence/src/backends/sqlite/storage.rs`, the hunk `@@ -11526` edits the test `bundle_delete_rollback_keeps_the_search_index`. That test comes from upstream `7f0ba4f24`, "fix(sqlite): clear the search index when a transaction deletes a resource (#864)", merged upstream in HeliosSoftware/hfs#2504. The fork does not have it, so the hunk was left out and the fork's side of the file was kept. The commit message says so.
+        - Every other hunk is upstream's. The patch-id differs from upstream's (`89c389e0…` upstream, `546443b7…` in the fork) only because of that hunk. Compared file by file, 23 of the 24 have the same `git patch-id --stable`, and the SQLite file's diff matches upstream's in everything but that hunk.
+    - **The Cassandra backend returns `NotFound`,** like SQLite, PostgreSQL and MongoDB, for `delete` and `delete_versioned` of an absent or deleted row. The REST layer turns it into the no-op. `delete_versioned`'s `NotFound`, reached only when an `If-Match` delete loses to another delete, stays 404, as on the other backends.
+- **Alternatives considered:**
+    - **Keep the 404, the Step 3 pack's original recommendation (option a):** lost.
+        - The history showed nobody chose the 404, and wherever HFS read the spec text it chose 204.
+        - Keeping it would leave the fork recording a deviation from the spec that has no reason behind it.
+    - **Cassandra-only 204, by returning `Ok(())` from the backend's `delete` (option b):** lost.
+        - Cassandra would differ from every other backend, and from the shared suites: `crud/delete_tests.rs` expects `NotFound`, and the REST tests pinned 404.
+        - `Ok` would also hide "removed something" from "removed nothing". The REST handler needs that difference to skip the write event, the subscription notice, `release_library` and the audit enrichment.
+    - **Wait for #2529 to merge upstream and come in with a sync:** lost, as for ADR-aacruzgon-0049.
+        - The merge date is in upstream's hands, and syncs are manual.
+        - Step 3's delete (L2b) and its REST test (L4) would be written against a 404 that is about to change.
+    - **Pick `7f0ba4f24` (#864) first, so `4dbc3c7f0` applies unchanged:** lost.
+        - It works: in a scratch worktree both picks applied cleanly, each with the same patch-id as upstream.
+        - Alan chose not to widen this PR with a second, unrelated upstream change. #864 will come in with the next sync.
+- **Consequences:**
+    - **The Cassandra tests are unchanged.** The Cassandra `delete` and `delete_versioned` are stubs that return `UnsupportedCapability` until Step 3's L2b (`crates/persistence/src/backends/cassandra/storage.rs:90-111`). The handler's no-op branch matches only a `NotFound` or `Gone`, so a `DELETE` on Cassandra still answers 501. That holds for `backend_skeleton.rs:137-143`, `cassandra_tests.rs:511-523`, `create_read.rs` (whose delete marker is written through CQL) and Milestone A, which sends no `DELETE`.
+    - **The Cassandra REST assertion is deferred to L4.** No Cassandra REST check is added now. Today it could only assert the stub's 501, which says nothing about this fix. L2b/L4's `step3_crud_through_rest` asserts that a `DELETE` of an unknown id and of an already-deleted id each answers 204 and writes no new version. The roadmap's Step 3 exit criterion now says so.
+    - **What the next upstream sync sees.** These were checked with throwaway merges in a scratch worktree, removed afterwards, from the fork's commit `7cf33ef26`:
+        - **Merging upstream's fix base `1e6bb3013`.** One conflict, in `.github/disabled-workflows/ci.yml`. It comes from the 90 commits of drift, the same conflict ADR-aacruzgon-0049 recorded, not from this pick. This merge brings `7f0ba4f24` (#864) and its test block, with the old trigger: "Deleting an id that does not exist fails the whole Bundle".
+        - **Then merging `fix/2523-delete-absent-is-success`:** no conflict. The only change it makes in the fix's files is the dropped hunk, and `bundle_delete_rollback_keeps_the_search_index` ends up exactly as upstream's version: SQLite `storage.rs` is byte-identical to `4dbc3c7f0`'s.
+        - **A simulated squash** of #2529 gave the same tree as the merge.
+        - **Four of the fix's files still differ from upstream after the merge:** both `SKILL.md` copies, `crates/rest/README.md` and `batch.rs`. Every difference is fork-only content: the Cassandra rows in the skill, and the #2518 backport (ADR-aacruzgon-0049). None comes from this pick.
+    - **If the next sync lands before #2529 merges upstream:**
+        - It brings #864's test block with the old trigger. With the backport in, a delete of a never-existing id no longer fails the Bundle, so `bundle_delete_rollback_keeps_the_search_index` fails at "the second entry must fail the Bundle".
+        - That sync must apply the dropped hunk (`git show 4dbc3c7f0 -- crates/persistence/src/backends/sqlite/storage.rs`, hunk `@@ -11526`). When #2529 later merges upstream, its merge then takes no change in that file.
+    - **If #2529 changes in review:**
+        - each later upstream commit arrives in the sync as an ordinary change on top of the backport;
+        - a hunk that rewrites lines the backport changed conflicts. Resolve it by taking upstream's side in the fix's files, then re-run `delete_nothing_to_delete`, `conditional_delete_no_match`, `rest_conformance`, `dashboard_counts` and the SQLite bundle suite.
+    - **If #2529 is closed without merging, or reverted before a sync:** the three-way merge keeps the backport silently, as ADR-aacruzgon-0049 records.
+    - **What it obliges at each sync.** Check the backport against what merged:
+        - `git log --grep 'cherry picked from commit 4dbc3c7f0'` finds the pick;
+        - `git diff upstream/main HEAD -- <the 24 files>` after the merge is empty, or every difference is explained (today: the fork's Cassandra and #2518 content);
+        - `bundle_delete_rollback_keeps_the_search_index` passes;
+        - if upstream dropped the fix, the sync reverts the backport explicitly, or a new entry records keeping it.
+    - **Behaviour changes for clients of the fork.**
+        - A client that relied on 404 (410 on S3) to detect an absent or deleted resource now gets 204, or 200 with an OperationOutcome under `Prefer: return=OperationOutcome`.
+        - A transaction Bundle containing such a `DELETE` now commits instead of failing with 400.
+        - An `If-Match` delete of an absent or deleted resource is still 412, and a read of a deleted resource is still 410.
+    - **The design is updated in the same commit:**
+        - the design's CRUD row and its plain-delete retry;
+        - the roadmap's Step 3 Spec line and exit criterion;
+        - the walkthrough's 3.4 table and note, G9 and G25;
+        - the schema README's G9 line.
+- **AI involvement:**
+    - **Who.** The Claude Code worker s3-backport-2523 (Opus 5.5) made the branch and the pick, resolved the conflict, ran the sync merges and the checks, drafted the design edits and drafted this entry. The upstream fix itself was written by the worker hfs-2523, in a worktree of upstream.
+    - **What it proposed.** First, picking `7f0ba4f24` (#864) before `4dbc3c7f0`, so the fix would apply unchanged with the same patch-id. It offered dropping the hunk as the second option.
+    - **What Alan changed:**
+        - **D8.** He chose to follow the spec over the pack's 404 recommendation, after asking whether the 404 was a bug or intended. The history showed it was neither chosen nor reasoned.
+        - **Where to fix it.** In the shared REST layer upstream, for every backend, and carried in the fork. Not Cassandra-only.
+        - **The #864 conflict.** He chose to drop the one hunk rather than pick #864 first, so as not to widen this PR. This entry records the sync check that choice adds.
+    - **What it verified, and how:**
+        - the R4, R4B and R5 http.html#delete text, from the HL7 pages (the two sentences above, identical in all three);
+        - the upstream issue and PR in full (`gh issue view 2523`, `gh pr view 2529`), and that `7f0ba4f24` is merged upstream (#2504, merge `89bb6acbf`) and in `1e6bb3013`'s history;
+        - the patch-ids: upstream's and the fork's, per file;
+        - the content: `git show 4dbc3c7f0` against `git show HEAD`, file by file. Only the SQLite file differs, and only by the hunk `@@ -11526`;
+        - the two-pick alternative and the sync merges above, in scratch worktrees removed afterwards;
+        - that the Cassandra `delete` and `delete_versioned` are `UnsupportedCapability` stubs (`storage.rs:90-111`), and that the handler's no-op branch matches only `NotFound`/`Gone` (`crates/rest/src/handlers/delete.rs`);
+        - that `bundle_delete_rollback_keeps_the_search_index`, as it arrives from #864, uses a never-existing delete as its rollback trigger (upstream `1e6bb3013`, `sqlite/storage.rs:11509-11550`);
+        - the checks, with `serial-cargo`, all passing:
+            - `helios-rest`, with default features: the lib tests, 997, which include the 15 `dashboard_counts` tests; `delete_nothing_to_delete` 9/9; `conditional_delete_no_match` 5/5; `rest_conformance` 113/113;
+            - `helios-persistence`, with default features (SQLite): the lib tests, 1830; `crud_suite` 86 (2 ignored); `transactions_suite` 90 (2 ignored), which includes `bundle_tests::instance_delete_with_nothing_to_delete_reports_not_found`;
+            - `--features s3 --lib s3::`: 255, which includes `delete_with_nothing_to_delete_is_not_found_and_writes_nothing`;
+            - the required Cassandra job's tests against the shared node (`HFS_TEST_CASSANDRA_URL=127.0.0.1:59042`): `cassandra_tests` 68/68, `backend_capability_contract` 10/10, and Milestone A's `milestone_a_create_then_read_through_rest` 1/1;
+            - `rustfmt --check` on every `.rs` file the pick changed; clippy `--no-deps --all-targets` on `helios-persistence` and `helios-rest`, with the cassandra, s3, postgres and mongodb features, `-D warnings` and CI's eight `-A` flags: clean;
+            - the R4B check (`check -p helios-persistence --no-default-features --features cassandra,R4B`): passes, with 3 dead-code warnings in `core/bulk_submit*.rs` that were there before this pick.
+- **Links:**
+    - PR (to open), branch `cassandra/step3-backport-2523`, commit `7cf33ef26`;
+    - HeliosSoftware/hfs#2523 (issue) and HeliosSoftware/hfs#2529 (PR, commit `4dbc3c7f0`); HeliosSoftware/hfs#2504 (commit `7f0ba4f24`, #864);
+    - [R4 http.html#delete](https://hl7.org/fhir/R4/http.html#delete), [R4B](https://hl7.org/fhir/R4B/http.html#delete), [R5](https://hl7.org/fhir/R5/http.html#delete);
+    - [cassandra-discussion.md](../../cassandra-discussion.md): "What the FHIR specification requires", the CRUD row; "Consistency, failure handling and rejection", the plain-delete retry;
+    - [development-roadmap.md](../../development-roadmap.md): Step 3, Spec and exit criterion;
+    - `schema/walkthrough.md` 3.4, G9 and G25; `schema/README.md`, G9;
+    - ADR-aacruzgon-0049 (the backport precedent) and ADR-aacruzgon-0024 (G25).

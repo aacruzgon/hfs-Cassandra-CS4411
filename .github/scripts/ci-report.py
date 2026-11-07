@@ -33,7 +33,7 @@ Commands:
   cql-audit ID TITLE FILE [--check] the node's CQL audit log (auditlogviewer
                                     output); --check fails on a CQL DELETE
                                     against resources or resource_versions
-  cas ID TITLE LOG...               the `[cas-stats scope=… key=value …]` lines
+  cas ID TITLE LOG...               the `[cas case=… key=value …]` lines
   intents ID TITLE CONTAINER        intent rows left in pending_index_writes
   spec ID TITLE LOG                 the `[spec row=… expected=… got=…]` lines
 
@@ -906,9 +906,15 @@ PROTECTED_TABLES = ("resources", "resource_versions")
 
 # A DELETE statement against a protected table, anywhere in an entry's CQL
 # text, keyspace-qualified or quoted or not. The name must end there, so
-# resources_by_type never matches. It catches the entries that carry no scope:
-# a CQL-text batch (one BATCH entry holding every child) and a failed statement
-# (REQUEST_FAILURE), whose scope the node drops (AuditLogManager.java, 5.0.9).
+# resources_by_type never matches. It catches what the type and scope alone
+# miss (AuditLogManager.java, 5.0.9): a CQL-text batch, logged as one
+# scope-less BATCH entry holding every child; and a failed statement, whose
+# type becomes REQUEST_FAILURE and whose scope is dropped when it was not
+# prepared. It is not tied to the start of a statement, so a string literal or
+# comment naming such a DELETE would also match: a false failure, never a
+# missed one. A failed native-protocol batch logs no child text at all
+# ("BATCH of N statements"), so a DELETE inside one is not seen; the backend
+# sends no batch to resources or resource_versions.
 DELETE_TEXT = re.compile(
     r'\bDELETE\b[^;]*?\bFROM\s+(?:"?\w+"?\s*\.\s*)?"?(resources|resource_versions)"?(?![\w"])',
     re.IGNORECASE | re.DOTALL,
@@ -917,6 +923,8 @@ DELETE_TEXT = re.compile(
 # text can show: a plain (non-LWT) write to resources, and ALLOW FILTERING.
 # Bound values are not logged, so a bound null cannot be seen here.
 NOT_LWT = re.compile(r"\bIF\b", re.IGNORECASE)
+# Statements that remove a whole table's data: a violation too, by scope.
+TABLE_WIPES = ("TRUNCATE", "DROP_TABLE")
 ALLOW_FILTERING = re.compile(r"\bALLOW\s+FILTERING\b", re.IGNORECASE)
 
 
@@ -976,6 +984,8 @@ def audit_violation(entry: dict, keyspace: str) -> str | None:
         return None
     if entry["type"] == "DELETE" and entry["scope"] in PROTECTED_TABLES:
         return f"type:DELETE with scope:{entry['scope']}"
+    if entry["type"] in TABLE_WIPES and entry["scope"] in PROTECTED_TABLES:
+        return f"type:{entry['type']} with scope:{entry['scope']}"
     match = DELETE_TEXT.search(entry["operation"] or "")
     if match:
         return f"a DELETE FROM {match.group(1)} in the CQL text of a {entry['type']} entry"
@@ -995,7 +1005,7 @@ def cmd_cql_audit(args) -> int:
         reason = audit_violation(entry, args.keyspace)
         if reason:
             violations.append({"reason": reason, "type": entry["type"], "scope": entry["scope"],
-                               "operation": (entry["operation"] or "")[:500]})
+                               "operation": " ".join((entry["operation"] or "").split())[:500]})
     counts = {}
     for entry in ours:
         key = (entry["scope"] or "(none)", entry["type"] or "?")
@@ -1017,7 +1027,7 @@ def cmd_cql_audit(args) -> int:
     if plain_writes:
         warnings.append(f"CQL audit: {len(plain_writes)} plain (non-IF) write(s) to resources; every write there must be a CAS (schema/README.md)")
     if filtering:
-        warnings.append(f"CQL audit: {len(filtering)} statement(s) with ALLOW FILTERING (schema/README.md: never)")
+        warnings.append(f"CQL audit: {len(filtering)} prepared or DML statement(s) with ALLOW FILTERING (schema/README.md: never)")
     if failures:
         warnings.append(f"CQL audit: {len(failures)} failed statement(s) (REQUEST_FAILURE) in keyspace {args.keyspace}")
     if not args.check:
@@ -1027,19 +1037,19 @@ def cmd_cql_audit(args) -> int:
         f"**Check: passed.** No CQL `DELETE` against `{PROTECTED_TABLES[0]}` or `{PROTECTED_TABLES[1]}` "
         f"in {len(entries):,} entries ({len(dml):,} DML in `{args.keyspace}`).")
     md = verdict + "\n\n"
-    md += (f"From the node's audit log (`nodetool enableauditlog`, BinAuditLogger, categories DML, ERROR and PREPARE, "
+    md += (f"From the node's audit log (`nodetool enableauditlog`, BinAuditLogger, categories DML, ERROR, PREPARE and DDL, "
            f"keyspace `{args.keyspace}`), read with `auditlogviewer` after the tests. A violation is an entry with "
            "`type:DELETE` and a scope of exactly `resources` or `resource_versions`, or any entry whose CQL text holds "
            "a `DELETE … FROM` either table: a CQL-text batch logs one scope-less `BATCH` entry, and a failed statement "
-           "a scope-less `REQUEST_FAILURE`. `resources_by_type` (X1) and `pending_index_writes` (I2) are deleted from "
-           f"legitimately. Parsed in {took:.1f} s.\n\n")
+           "a `REQUEST_FAILURE`. A `TRUNCATE` or `DROP TABLE` of either table is one too. `resources_by_type` (X1) and "
+           f"`pending_index_writes` (I2) are deleted from legitimately. Parsed in {took:.1f} s.\n\n")
     md += "**DML by table and type** (R7; `UPDATE` is an INSERT or an UPDATE; the driver may re-send an idempotent statement, so a count can exceed one per operation):\n\n"
     tables = sorted({scope for scope, _ in counts})
     types = sorted({kind for _, kind in counts})
     md += table(["Table"] + [f"`{t}`" for t in types] + ["Total"],
                 [[f"`{s}`"] + [counts.get((s, t)) for t in types] + [sum(counts.get((s, t), 0) for t in types)] for s in tables])
     md += (f"\nPrepared statements: {prepares}. Failed statements: {len(failures)}. Plain writes to `resources`: "
-           f"{len(plain_writes)}. `ALLOW FILTERING`: {len(filtering)}.\n")
+           f"{len(plain_writes)}. `ALLOW FILTERING` (prepared or DML statements; plain queries are not logged): {len(filtering)}.\n")
     if violations:
         md += "\n**Violations:**\n\n" + table(["Reason", "CQL"], [[v["reason"], f"`{v['operation'][:300]}`"] for v in violations[:20]])
     data = {
@@ -1095,29 +1105,29 @@ def cmd_cas(args) -> int:
         if not path.exists():
             missing.append(path.name)
             continue
-        for pairs in tagged_lines(path.read_text(errors="replace"), "cas-stats"):
-            pairs.setdefault("scope", "?")
-            rows.append({"log": path.stem, **{k: number(v) if k != "scope" else v for k, v in pairs.items()}})
+        for pairs in tagged_lines(path.read_text(errors="replace"), "cas"):
+            pairs.setdefault("case", "?")
+            rows.append({"log": path.stem, **{k: number(v) if k != "case" else v for k, v in pairs.items()}})
     keys = []
     for row in rows:
-        keys += [k for k in row if k not in ("log", "scope") and k not in keys]
+        keys += [k for k in row if k not in ("log", "case") and k not in keys]
     warnings = []
     for row in rows:
         for key in keys:
             value = row.get(key)
             if CAS_WARN_KEYS.search(key) and isinstance(value, (int, float)) and value > 0:
-                warnings.append(f"CAS counters: {row['scope']} has {key}={value}; expected 0 on a healthy node")
+                warnings.append(f"CAS counters: {row['case']} has {key}={value}; expected 0 on a healthy node")
         if isinstance(row.get("attempts"), (int, float)) and isinstance(row.get("applied"), (int, float)) and row["applied"]:
             row["attempts_per_applied"] = round(row["attempts"] / row["applied"], 3)
     if rows and any("attempts_per_applied" in r for r in rows):
         keys.append("attempts_per_applied")
     if rows:
-        md = table(["Log", "Scope"] + [f"`{k}`" for k in keys], [[r["log"], f"`{r['scope']}`"] + [r.get(k) for k in keys] for r in rows])
-        md += ("\nOne row per `[cas-stats scope=… key=value …]` line: the backend's CAS outcome counters "
-               "(`CassandraBackend::cas_stats()`, L1) over what that scope did. Rows are per backend instance, "
+        md = table(["Log", "Case"] + [f"`{k}`" for k in keys], [[r["log"], f"`{r['case']}`"] + [r.get(k) for k in keys] for r in rows])
+        md += ("\nOne row per `[cas case=… key=value …]` line: the backend's CAS outcome counters "
+               "(`CassandraBackend::cas_stats()`, L1) over what that case did. Rows are per backend instance, "
                "so they are not summed. `attempts_per_applied` is the contention figure (R3).\n")
     else:
-        md = ("No `[cas-stats …]` line in the logs: the counters are not exposed yet (L1's `cas_stats()`), "
+        md = ("No `[cas case=…]` line in the logs: no test printed the backend's `cas_stats()`, "
               "or no test printed them.\n")
     if missing:
         md += "\nNo log for: " + ", ".join(f"`{m}`" for m in missing) + ".\n"
@@ -1175,7 +1185,9 @@ def intent_buckets(now, hours: int) -> list[str]:
     return [(now - timedelta(hours=h)).strftime("%Y-%m-%dT%H") for h in range(hours)]
 
 
-def classify_intent(intent: dict, current: dict | None) -> str:
+def classify_intent(intent: dict, current: dict | None, read: bool = True) -> str:
+    if not read:
+        return "not read (over --limit)"
     if current is None:
         return "no resource row"
     if intent.get("version_id") is not None and current.get("version_id") is not None and intent["version_id"] <= current["version_id"]:
@@ -1196,6 +1208,7 @@ def cmd_intents(args) -> int:
         warnings.append(f"Intent rows: pending_index_writes could not be read from {args.container}")
     intents = [r for r in json_rows(out) if str(r.get("tenant_id", "")).startswith(args.tenant_prefix)]
     keys = sorted({(r["tenant_id"], r["resource_type"], r["id"]) for r in intents})[: args.limit]
+    looked_up = set(keys)
     current = {}
     if keys:
         reads = " ".join(f"SELECT JSON tenant_id, resource_type, id, version_id, deleted_at FROM {args.keyspace}.resources "
@@ -1206,7 +1219,8 @@ def cmd_intents(args) -> int:
     for intent in intents:
         match = TEST_TENANT.match(intent["tenant_id"])
         label = match.group(1) if match else intent["tenant_id"]
-        kind = classify_intent(intent, current.get((intent["tenant_id"], intent["resource_type"], intent["id"])))
+        key = (intent["tenant_id"], intent["resource_type"], intent["id"])
+        kind = classify_intent(intent, current.get(key), key in looked_up)
         intent["class"] = kind
         by_label.setdefault(label, {}).setdefault(kind, 0)
         by_label[label][kind] += 1

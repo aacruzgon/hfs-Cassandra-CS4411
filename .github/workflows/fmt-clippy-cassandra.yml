@@ -578,15 +578,19 @@ jobs:
       # docker/cassandra/entrypoint.sh rewrites the yaml on every boot, and the
       # developers' shared node runs the same file. BinAuditLogger (the
       # default) writes /opt/cassandra/logs/audit inside the container; DML is
-      # the statements, ERROR the failed ones, PREPARE what was prepared. A
-      # restart turns it off again (AuditLogManager reads only the yaml), so
-      # the check reads it before the readiness test restarts the node.
+      # the statements, ERROR the failed ones, PREPARE what was prepared, DDL
+      # a TRUNCATE or DROP. Blocking, so a full queue slows writers rather
+      # than drops entries. A restart turns it off again (AuditLogManager
+      # reads only the yaml), so the check reads it before the readiness test
+      # restarts the node. Each docker exec runs a JVM in the node's 3 GiB
+      # container, which would inherit its MAX_HEAP_SIZE=1G; each gets its
+      # own script's default instead (nodetool 128m, auditlogviewer 256M).
       - name: Turn on the CQL audit log (Step 3 exit criterion)
         id: cql-audit-on
         run: |
-          docker exec hfs-cassandra-ci-cassandra-1 nodetool enableauditlog \
-            --included-keyspaces helios --included-categories DML,ERROR,PREPARE
-          docker exec hfs-cassandra-ci-cassandra-1 nodetool getauditlog
+          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool enableauditlog \
+            --included-keyspaces helios --included-categories DML,ERROR,PREPARE,DDL --blocking true
+          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool getauditlog
 
       # The start and apply times above, and the container's start to its CQL
       # line from its own log timestamps, which the 10 s healthcheck interval
@@ -649,17 +653,28 @@ jobs:
       # the readiness test, which stays last (ADR-aacruzgon-0042). The test
       # prints one [spec row=… expected=… got=…] line per check, which the
       # HL7 report below tabulates. It must run exactly once: --exact on a
-      # name that matches nothing would pass with 0 tests. Until the test is
-      # written (Step 3 layer L4), the step says so with a warning.
+      # name that matches nothing would pass with 0 tests. A missing test
+      # fails a pull request and a push; only a manual dispatch, which is how
+      # Step 3's layers are run before the test exists, gets a warning. Like
+      # the later report steps, it runs when the round trip passed, so its
+      # failure does not hide them.
       - name: Step 3 CRUD through hfs against this node
         id: step3-rest
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
           log="$RUNNER_TEMP/ci-report/logs/step3-rest.log"
           if ! grep -q 'fn step3_crud_through_rest' crates/hfs/tests/cassandra_milestone_a.rs; then
-            echo "::warning title=Step 3 REST test::step3_crud_through_rest is not in crates/hfs/tests/cassandra_milestone_a.rs yet; nothing ran"
-            exit 0
+            if [ "$EVENT_NAME" = workflow_dispatch ]; then
+              echo "::warning title=Step 3 REST test::step3_crud_through_rest is not in crates/hfs/tests/cassandra_milestone_a.rs yet; nothing ran"
+              exit 0
+            fi
+            echo "::error title=Step 3 REST test::step3_crud_through_rest is not in crates/hfs/tests/cassandra_milestone_a.rs"
+            exit 1
           fi
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-hfs --no-default-features --features R4,cassandra \
@@ -696,8 +711,8 @@ jobs:
       # exists, 20 counts and read_batch calls, then 100 of each Step 3
       # operation (update, vread, list_versions, the three create_or_update
       # branches, delete, delete_versioned), with the statements and CAS
-      # outcomes per call once the backend exposes its counters (Step 3 plan
-      # R1, R2, R5); an operation still answering 501 is listed as not
+      # outcomes per call from the backend's own counters (Step 3 plan R1,
+      # R2, R5); an operation still answering 501 is listed as not
       # implemented yet. Then 50 POST + GET round trips through hfs. Each on a
       # fresh tenant (ADR-aacruzgon-0020). Already built. Report only: no
       # figure fails it; it fails only if an operation fails. Before the audit
@@ -746,8 +761,12 @@ jobs:
           set -o pipefail
           dir="$RUNNER_TEMP/ci-report/inputs/cql-audit"
           mkdir -p "$dir"
-          docker exec hfs-cassandra-ci-cassandra-1 nodetool disableauditlog
-          docker exec hfs-cassandra-ci-cassandra-1 /opt/cassandra/tools/bin/auditlogviewer /opt/cassandra/logs/audit \
+          # Still on: a log that stopped early would leave writes unchecked.
+          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool getauditlog \
+            | tee "$dir/getauditlog.txt" | grep -Eq '^enabled[[:space:]]+true' \
+            || { echo "::error title=CQL audit (Step 3 exit criterion)::the audit log was not enabled at the end of the tests"; exit 1; }
+          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool disableauditlog
+          docker exec -e MAX_HEAP_SIZE=256M hfs-cassandra-ci-cassandra-1 /opt/cassandra/tools/bin/auditlogviewer /opt/cassandra/logs/audit \
             | gzip > "$dir/auditlogviewer.txt.gz"
           python3 .github/scripts/ci-report.py cql-audit cql-audit \
             "CQL audit log: no DELETE on resources or resource_versions (Step 3 exit criterion)" \
@@ -812,7 +831,7 @@ jobs:
       # Step 3's parsed reports, from the test logs, whatever the test steps'
       # results (Step 3 plan section 7): the Step 3 REST test's suite counts
       # (R9); its [spec row=… expected=… got=…] lines as the HL7 rows observed
-      # (R10); and every [cas-stats scope=… …] line, the backend's CAS outcome
+      # (R10); and every [cas case=… …] line, the backend's CAS outcome
       # counters per scope (R2, R3, R8). Report only.
       - name: Report the Step 3 REST test, its HL7 rows and the CAS counters
         if: always()
@@ -823,7 +842,8 @@ jobs:
           python3 .github/scripts/ci-report.py spec spec \
             "HL7 rows observed through hfs on Cassandra (Step 3)" "$logs/step3-rest.log"
           python3 .github/scripts/ci-report.py cas cas "CAS outcome counters" \
-            "$logs/persistence-tests.log" "$logs/latency-backend.log" "$logs/step3-rest.log"
+            "$logs/persistence-tests.log" "$logs/persistence-lib-tests.log" "$logs/latency-backend.log" \
+            "$logs/step3-rest.log"
 
       - name: Cassandra logs
         if: failure()

@@ -128,6 +128,24 @@ class AuditEntries(unittest.TestCase):
         for text in misses:
             self.assertIsNone(ci_report.DELETE_TEXT.search(text), text)
 
+    def test_native_batch_child_scoped_failure_and_table_wipes(self):
+        # A native-protocol BATCH logs each child with its own type and scope,
+        # and a |batch:<uuid>| field; a failed prepared statement keeps its
+        # scope but becomes REQUEST_FAILURE; TRUNCATE is DDL with a scope
+        # (checked on a 5.0.9 node: type:TRUNCATE|category:DDL|ks:helios|scope:resource_versions).
+        child = entry("DELETE", "resources", "DELETE FROM resources WHERE tenant_id = ? AND resource_type = ? AND id = ?").replace(
+            "|category:DML|", "|category:DML|batch:6a1f6b2e-0000-4000-8000-000000000000|")
+        failed = entry("REQUEST_FAILURE", "resources", "DELETE FROM resources WHERE tenant_id = ?; Operation timed out", category="ERROR")
+        wipe = entry("TRUNCATE", "resource_versions", "TRUNCATE resource_versions;", category="DDL")
+        other_wipe = entry("TRUNCATE", "resources_by_type", "TRUNCATE resources_by_type;", category="DDL")
+        entries = ci_report.audit_records(child + failed + wipe + other_wipe)
+        self.assertEqual(entries[0]["batch"], "6a1f6b2e-0000-4000-8000-000000000000")
+        reasons = [ci_report.audit_violation(e, "helios") for e in entries]
+        self.assertIn("type:DELETE with scope:resources", reasons[0])
+        self.assertIsNotNone(reasons[1])
+        self.assertEqual(reasons[2], "type:TRUNCATE with scope:resource_versions")
+        self.assertIsNone(reasons[3])
+
     def test_another_keyspace_is_not_ours(self):
         [e] = ci_report.audit_records(entry("DELETE", "resources", "DELETE FROM other.resources WHERE a = 1", ks="other"))
         self.assertIsNone(ci_report.audit_violation(e, "helios"))
@@ -214,6 +232,18 @@ class CqlAuditCommand(Scratch):
         self.assertEqual((data["plain_writes_to_resources"], data["allow_filtering"]), (1, 1))
         self.assertIn("plain (non-IF) write", out)
 
+    def test_multi_line_violation_is_one_line_in_the_report(self):
+        status, _ = self.audit(CLEAN + entry("DELETE", "resources", "DELETE FROM resources\n  WHERE a = ?"))
+        self.assertEqual(status, 1)
+        self.assertEqual(self.report("cql-audit")["violations"][0]["operation"], "DELETE FROM resources WHERE a = ?")
+
+    def test_corrupt_gzip_fails_the_check(self):
+        bad = self.write("audit.txt.gz", "not gzip at all")
+        result = subprocess.run([sys.executable, str(SCRIPT), "cql-audit", "cql-audit", "CQL audit", str(bad), "--check"],
+                                env={**os.environ}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("could not run", result.stdout)
+
     def test_main_exit_status(self):
         bad = self.write("bad.txt", RECORDED)
         good = self.write("good.txt", CLEAN)
@@ -226,9 +256,9 @@ class CqlAuditCommand(Scratch):
 
 class TaggedLines(unittest.TestCase):
     def test_pairs_quotes_and_colour(self):
-        log = ('noise [cas-stats scope=latency-report:update attempts=100 applied=99 note="two words ]"]\n'
+        log = ('noise [cas case=latency-report:update attempts=100 applied=99 note="two words ]"]\n'
                "\x1b[32m[spec row=C-4 expected=201 got=201]\x1b[0m and [spec row=D-3 expected=204 got=404 step=7]\n")
-        self.assertEqual(ci_report.tagged_lines(log, "cas-stats"), [{"scope": "latency-report:update", "attempts": "100", "applied": "99", "note": "two words ]"}])
+        self.assertEqual(ci_report.tagged_lines(log, "cas"), [{"case": "latency-report:update", "attempts": "100", "applied": "99", "note": "two words ]"}])
         self.assertEqual(ci_report.tagged_lines(log, "spec"), [{"row": "C-4", "expected": "201", "got": "201"}, {"row": "D-3", "expected": "204", "got": "404", "step": "7"}])
 
 
@@ -247,19 +277,19 @@ class SpecAndCasCommands(Scratch):
         self.assertIn("did not run", out)
 
     def test_cas_rows_and_warnings(self):
-        log = self.write("latency-backend.log", "[cas-stats scope=a attempts=12 applied=10 undecidable=0]\n[cas-stats scope=b attempts=4 applied=4 budget_exhausted=1]\n")
+        log = self.write("latency-backend.log", "[cas case=a attempts=12 applied=10 undecidable=0]\n[cas case=b attempts=4 applied=4 miss_budget_exhausted=1]\n[cas-other case=c attempts=1]\n")
         status, out = self.quiet(ci_report.cmd_cas, SimpleNamespace(id="cas", title="CAS", logs=[str(log), str(self.dir / "absent.log")]))
         self.assertEqual(status, 0)
         data = self.report("cas")
         self.assertEqual([r["attempts_per_applied"] for r in data["rows"]], [1.2, 1.0])
         self.assertEqual(data["missing_logs"], ["absent.log"])
-        self.assertIn("budget_exhausted=1", out)
+        self.assertIn("miss_budget_exhausted=1", out)
         self.assertNotIn("undecidable=0", out)
 
     def test_cas_without_lines_says_so(self):
         log = self.write("x.log", "nothing\n")
         self.quiet(ci_report.cmd_cas, SimpleNamespace(id="cas", title="CAS", logs=[str(log)]))
-        self.assertIn("not exposed yet", (self.dir / "report" / "cas.md").read_text())
+        self.assertIn("no test printed", (self.dir / "report" / "cas.md").read_text())
 
 
 class Intents(unittest.TestCase):
@@ -275,6 +305,42 @@ class Intents(unittest.TestCase):
     def test_tenant_label(self):
         match = ci_report.TEST_TENANT.match("test-race-puts-0123456789abcdef0123456789abcdef")
         self.assertEqual(match.group(1), "race-puts")
+
+
+class IntentsCommand(Scratch):
+    def test_classes_labels_and_the_read_limit(self):
+        hexes = "0123456789abcdef0123456789abcdef"
+        intents = "\n".join(json.dumps(r) for r in [
+            {"bucket": "b", "shard": 1, "tenant_id": f"test-race-{hexes}", "resource_type": "Patient", "id": "a", "version_id": 2},
+            {"bucket": "b", "shard": 2, "tenant_id": f"test-race-{hexes}", "resource_type": "Patient", "id": "b", "version_id": 5},
+            {"bucket": "b", "shard": 3, "tenant_id": f"test-crud-{hexes}", "resource_type": "Patient", "id": "c", "version_id": 1},
+            {"bucket": "b", "shard": 4, "tenant_id": "acme", "resource_type": "Patient", "id": "d", "version_id": 1},
+            {"bucket": "b", "shard": 5, "tenant_id": f"test-zz-{hexes}", "resource_type": "Patient", "id": "z", "version_id": 1},
+        ])
+        resources = "\n".join(json.dumps(r) for r in [
+            {"tenant_id": f"test-race-{hexes}", "resource_type": "Patient", "id": "a", "version_id": 3, "deleted_at": 0},
+            {"tenant_id": f"test-race-{hexes}", "resource_type": "Patient", "id": "b", "version_id": 4, "deleted_at": 0},
+        ])
+        calls = []
+
+        def fake_run(command, timeout=60):
+            calls.append(command[-1])
+            return " [json]\n" + (intents if "pending_index_writes" in command[-1] else resources) + "\n"
+
+        original = ci_report.run
+        ci_report.run = fake_run
+        try:
+            args = SimpleNamespace(id="intents", title="Intents", container="c", keyspace="helios", tenant_prefix="test-", hours=3, limit=3)
+            self.assertEqual(self.quiet(ci_report.cmd_intents, args)[0], 0)
+        finally:
+            ci_report.run = original
+        data = self.report("intents")
+        self.assertEqual(data["intents"], 4, "acme is not a test tenant")
+        self.assertEqual(data["by_test"]["race"], {"at or below the current version": 1, "above the current version": 1})
+        self.assertEqual(data["by_test"]["crud"], {"no resource row": 1})
+        self.assertEqual(data["by_test"]["zz"], {"not read (over --limit)": 1})
+        self.assertIn("shard IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)", calls[0])
+        self.assertEqual(calls[1].count("SELECT JSON"), 3, "one point read per resource, up to --limit")
 
 
 class CrudTombstones(unittest.TestCase):

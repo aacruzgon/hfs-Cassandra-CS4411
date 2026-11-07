@@ -19,17 +19,23 @@
 //! - [`SAMPLES`] each of `update`, `vread` (version 1), `list_versions`,
 //!   `create_or_update` on new ids (the create branch) and again on them (the
 //!   update branch), `delete`, `delete_versioned`, and `create_or_update` on
-//!   the deleted ids (the revive branch). Each write operation first runs
+//!   the deleted ids (the revive branch). Each of these first runs
 //!   [`WARM_EACH`] unmeasured calls, which prepare its statements.
 //!
-//! Each operation's ids are its own, so no measured call races another.
+//! No two calls run at once. `update`, `vread`, `list_versions`, `delete` and
+//! the revive work in turn on one slice of the created ids, `delete_versioned`
+//! on another, and the two other `create_or_update` branches on ids of their
+//! own. Each call's result is checked against the trait's contract (a new
+//! version, the `created` flag, a found version), so a wrong answer fails
+//! the report like a failed call does.
 //!
 //! **Statements and CAS outcomes per operation** (reports R5 and R2). Around
 //! each measured stretch it reads the backend's per-kind statement counters
 //! and CAS outcome counters, through [`counters`], the one place that knows
-//! their API. Until the engine (Step 3 layer L1) exposes them, the adapter
-//! returns `None` and the columns say so. For each operation, and for the
-//! whole report, it prints a `[cas-stats scope=… key=value …]` line, which
+//! their API (`CassandraBackend::statement_counts` and `cas_stats`, from Step 3
+//! layer L1). For each operation, and for the
+//! whole report, it prints a `[cas case=… key=value …]` line, the shape the
+//! engine's own node tests print (`CasStats`'s `Display`), which
 //! `ci-report.py cas` tabulates.
 //!
 //! It writes `cassandra-latency.json` and `cassandra-latency.md` into the
@@ -70,13 +76,11 @@ const WARM_EACH: usize = 3;
 /// `read_batch` calls per batch size.
 const BATCHES: usize = 20;
 
-/// The one place that reads the engine's counters (Step 3 plan, section 7:
-/// `CassandraBackend::cas_stats()` and the per-kind statement counters, both
-/// added by layer L1). Everything else in the report sees name-to-count maps,
-/// so when L1's signatures change, only this module does.
-///
-/// Until L1 lands, both return `None`, and the report says the counters are
-/// not exposed yet.
+/// The one place that reads the engine's counters (Step 3 plan, section 7):
+/// [`CassandraBackend::cas_stats`] and [`CassandraBackend::statement_counts`],
+/// from Step 3 layer L1. Everything else in the report sees name-to-count
+/// maps, so when those types change, only this module does. Each returns an
+/// `Option`, so a backend without counters would only blank the columns.
 mod counters {
     use std::collections::BTreeMap;
 
@@ -85,18 +89,38 @@ mod counters {
     /// Counter name to value.
     pub type Counts = BTreeMap<String, u64>;
 
-    /// Statements sent so far, by `StatementKind` (R5).
-    pub fn statements(_backend: &CassandraBackend) -> Option<Counts> {
-        None
+    /// Statements sent so far, by kind (R5): `read`, `serial_read`, `write`
+    /// and `cas`, every request counted, paged pages included.
+    pub fn statements(backend: &CassandraBackend) -> Option<Counts> {
+        let counts = backend.statement_counts();
+        Some(
+            [
+                ("read", counts.read),
+                ("serial_read", counts.serial_read),
+                ("write", counts.write),
+                ("cas", counts.cas),
+            ]
+            .into_iter()
+            .map(|(kind, n)| (kind.to_string(), n))
+            .collect(),
+        )
     }
 
-    /// CAS outcomes so far: attempts, applied, misses by kind, unknown
-    /// outcomes by trigger, serial reads, re-runs, undecidable, budgets
-    /// exhausted and post-CAS write failures (R2, R8). The names become
-    /// `ci-report.py cas` columns; it warns on any `undecidable`, `exhausted`
-    /// or `post_cas` counter above 0.
-    pub fn cas(_backend: &CassandraBackend) -> Option<Counts> {
-        None
+    /// CAS outcomes so far (R2, R3, R8), every `CasStats` counter by its
+    /// field name (`CasStats::pairs`): attempts, applied, misses by kind,
+    /// unknown outcomes by trigger, serial and version reads, re-runs,
+    /// undecidable, `miss_budget_exhausted`, `post_cas_failures`. The names
+    /// become `ci-report.py cas` columns; it warns on any `undecidable`,
+    /// `exhausted` or `post_cas` counter above 0.
+    pub fn cas(backend: &CassandraBackend) -> Option<Counts> {
+        Some(
+            backend
+                .cas_stats()
+                .pairs()
+                .into_iter()
+                .map(|(name, n)| (name.to_string(), n))
+                .collect(),
+        )
     }
 
     /// `after - before`, per counter.
@@ -197,17 +221,33 @@ impl Figures {
         })
     }
 
-    /// The `[cas-stats …]` line for `ci-report.py cas`, if there are counters.
+    /// The `[cas case=…]` line for `ci-report.py cas`, if there are counters.
+    /// Only for an operation that sent a CAS or touched a CAS counter, so the
+    /// read operations' all-zero lines do not crowd the report.
     fn cas_line(&self) -> Option<String> {
         self.cas
             .as_ref()
+            .filter(|cas| cas.values().any(|n| *n > 0))
             .map(|cas| cas_line(&format!("latency-report:{}", self.operation), cas))
     }
 }
 
-fn cas_line(scope: &str, cas: &counters::Counts) -> String {
+/// `[cas case=<case> key=value …]`, the shape the engine's own node tests
+/// print. The case is one token: anything but letters, digits and `_:.-`
+/// becomes `-`, so `read_batch (10 ids)` reads `read_batch-10-ids`.
+fn cas_line(case: &str, cas: &counters::Counts) -> String {
+    let mut token = String::with_capacity(case.len());
+    for c in case.chars() {
+        let keep = c.is_ascii_alphanumeric() || "_:.-".contains(c);
+        if keep {
+            token.push(c);
+        } else if !token.ends_with('-') {
+            token.push('-');
+        }
+    }
+    let token = token.trim_end_matches('-');
     let pairs: Vec<String> = cas.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    format!("[cas-stats scope={scope} {}]", pairs.join(" "))
+    format!("[cas case={token} {}]", pairs.join(" "))
 }
 
 /// One operation being measured: its first [`Stage::warm`] calls are not
@@ -438,8 +478,8 @@ async fn cassandra_latency_report() {
     }
     figures.push(stage.finish());
 
-    let mut stage = Stage::new(&backend, "vread (version 1)", 0);
-    for current in &stored[..SAMPLES] {
+    let mut stage = Stage::new(&backend, "vread (version 1)", WARM_EACH);
+    for current in &stored[..per] {
         match stage
             .call(
                 current.id(),
@@ -455,8 +495,8 @@ async fn cassandra_latency_report() {
     }
     figures.push(stage.finish());
 
-    let mut stage = Stage::new(&backend, "list_versions", 0);
-    for current in &stored[..SAMPLES] {
+    let mut stage = Stage::new(&backend, "list_versions", WARM_EACH);
+    for current in &stored[..per] {
         match stage
             .call(
                 current.id(),
@@ -630,8 +670,7 @@ async fn cassandra_latency_report() {
     }
     if !counters_exposed {
         md.push_str(
-            "\nStatements per call and CAS outcomes: the backend does not expose its counters yet \
-             (Step 3 layer L1 adds `cas_stats()` and the per-kind statement counters).\n",
+            "\nStatements per call and CAS outcomes: the backend's counters could not be read.\n",
         );
     }
 
@@ -687,7 +726,11 @@ fn counter_delta_and_cas_line() {
     );
     assert_eq!(
         cas_line("latency-report:update", &delta),
-        "[cas-stats scope=latency-report:update applied=7 attempts=8 re_runs=1]"
+        "[cas case=latency-report:update applied=7 attempts=8 re_runs=1]"
+    );
+    assert_eq!(
+        cas_line("latency-report:read_batch (10 ids)", &delta),
+        "[cas case=latency-report:read_batch-10-ids applied=7 attempts=8 re_runs=1]"
     );
 }
 

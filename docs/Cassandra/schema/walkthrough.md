@@ -213,7 +213,7 @@ Every reader that decides "deleted" tests `deleted_at > 0`:
 
 | Reader | Where | Deleted means |
 | --- | --- | --- |
-| `read` | 4.1, R1 | `ResourceError::Gone`, 410 (404 if `HFS_RETURN_GONE` is false) |
+| `read` | 4.1, R1 | `ResourceError::Gone`, 410 (`HFS_RETURN_GONE` affects vread only, HeliosSoftware/hfs#2526; ADR-aacruzgon-0064) |
 | `exists` | 4.1, R1 | `false` |
 | `vread` | 4.2, R3 on `resource_versions` | a delete marker: `deleted_at` set, always `> 0`; 410 |
 | `_id` search | 5.4, R1 | not returned |
@@ -444,7 +444,7 @@ Branches b and c write V3 for `N` at step 2, before the CAS (G40): branch b a co
 
 ### 4.1 read (`GET /Patient/id`)
 
-R1 at `LOCAL_QUORUM`, partition `resources (T,P,id)`. Absent: `Ok(None)`, 404. `deleted_at > 0`: `ResourceError::Gone`, 410 (404 if `HFS_RETURN_GONE` is false). Otherwise `StoredResource::from_storage(…)`, 200, `ETag: W/"version_id"`. `exists` is the same read and answers `false` for a deleted row (the trait doc requires MongoDB's behaviour).
+R1 at `LOCAL_QUORUM`, partition `resources (T,P,id)`. Absent: `Ok(None)`, 404. `deleted_at > 0`: `ResourceError::Gone`, 410, whatever `HFS_RETURN_GONE` says: only the vread handler reads that flag (`crates/rest/src/handlers/vread.rs:81`; HeliosSoftware/hfs#2526; ADR-aacruzgon-0064). Otherwise `StoredResource::from_storage(…)`, 200, `ETag: W/"version_id"`. `exists` is the same read and answers `false` for a deleted row (the trait doc requires MongoDB's behaviour).
 
 ### 4.2 vread (`GET /Patient/id/_history/vid`)
 

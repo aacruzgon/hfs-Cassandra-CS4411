@@ -94,6 +94,31 @@ mod common {
 #[path = "common/cassandra_testable.rs"]
 mod cassandra_testable;
 
+/// The seeding writes of #2435, which the shared suites below reach as
+/// `crate::seeding`. Their retry is MongoDB's alone, so on Cassandra every
+/// seeding write runs once.
+#[path = "common/seeding.rs"]
+mod seeding;
+
+/// Step 3: upstream's `tests/crud/` as an adapted copy, its parity test and
+/// the Cassandra-strict additions (rows 3.3 and 3.4).
+#[path = "cassandra/crud.rs"]
+mod crud;
+
+/// Step 3: the backend-agnostic race suite for version-aware writes (#1404,
+/// #1405, #2111), the compare-and-swap contract (row 3.3). Wrappers in
+/// [`step3_suites`].
+#[path = "search/versioned_write_race_suite.rs"]
+mod versioned_write_race_suite;
+
+/// Step 3: the multitenancy suites' tests that need only CRUD (roadmap
+/// section 5). Wrappers in [`step3_suites`].
+#[path = "multitenancy/tenant_id_fidelity_suite.rs"]
+mod tenant_id_fidelity_suite;
+
+#[path = "multitenancy/tenant_existence_suite.rs"]
+mod tenant_existence_suite;
+
 /// The node holds the signed-off schema: the ten tables, and every column,
 /// key position, clustering order and table option recorded in
 /// `docs/Cassandra/schema/expected-schema.txt`. The CI job makes the same
@@ -558,5 +583,191 @@ mod testable_backend {
             3
         );
         assert!(backend.exists(&tenant, "Patient", &ids[0]).await.unwrap());
+    }
+}
+
+/// Step 3's wrappers for the shared suites included above: the race suite
+/// (row 3.3) and the two multitenancy tests that need only CRUD.
+mod step3_suites {
+    use std::sync::Arc;
+
+    use crate::cassandra_node::{self, CassandraNode, TEST_TENANT_PREFIX, URL_VAR};
+    use crate::cassandra_testable::CassandraTestBackend;
+    use crate::{tenant_existence_suite, tenant_id_fidelity_suite, versioned_write_race_suite};
+
+    /// Rounds per race test: PostgreSQL's and MongoDB's 10, not SQLite's 40,
+    /// on a node where each round is eight contending Paxos writers.
+    const RACE_ROUNDS: usize = 10;
+
+    /// The longest label [`unique_base`] takes.
+    const MAX_BASE_LABEL: usize = 8;
+
+    /// A base no other test or run has used, for the shared suites that
+    /// derive their tenants from one: `test-<label>-<32 hex digits>`, at most
+    /// 46 bytes, so that the race suite's `{base}-plain-delete-race` and the
+    /// existence suite's `{base}-parent/child` stay within the 64-byte tenant
+    /// bound (`tenant/id.rs`). PostgreSQL's `unique_base` with the `test-`
+    /// prefix of every Cassandra test tenant (ADR-aacruzgon-0020, 0029).
+    pub(crate) fn unique_base(label: &str) -> String {
+        assert!(
+            label.len() <= MAX_BASE_LABEL
+                && label.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+            "a short label: {label:?}"
+        );
+        format!(
+            "{TEST_TENANT_PREFIX}{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        )
+    }
+
+    #[test]
+    fn unique_bases_fit_every_derived_tenant() {
+        let longest_suffix = [
+            "-plain-delete-race".len(),
+            "-parent/child".len(),
+            "/resources".len(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        let base = unique_base("abcdefgh");
+        assert!(base.starts_with(TEST_TENANT_PREFIX), "{base}");
+        assert!(
+            base.len() + longest_suffix <= helios_persistence::tenant::MAX_TENANT_ID_LEN,
+            "{base}"
+        );
+        assert_ne!(unique_base("a"), unique_base("a"));
+    }
+
+    /// The race suite's backend: the test wrapper, which forwards
+    /// `VersionedStorage` as well as `ResourceStorage`.
+    async fn race_backend(node: &CassandraNode, label: &str) -> Arc<CassandraTestBackend> {
+        Arc::new(CassandraTestBackend::connect(node, label).await)
+    }
+
+    /// #1404: of eight writers holding the same version, one `update` writes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn cassandra_concurrent_updates_from_the_same_version_admit_one() {
+        let node = node_or_skip!("cassandra_concurrent_updates_from_the_same_version_admit_one");
+        versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one(
+            race_backend(node, "race-update").await,
+            &unique_base("upd"),
+            RACE_ROUNDS,
+        )
+        .await;
+    }
+
+    /// #1404: an update and a versioned delete of the same version: one wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn cassandra_concurrent_update_and_versioned_delete_admit_one() {
+        let node = node_or_skip!("cassandra_concurrent_update_and_versioned_delete_admit_one");
+        versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
+            race_backend(node, "race-vdelete").await,
+            &unique_base("vdel"),
+            RACE_ROUNDS,
+        )
+        .await;
+    }
+
+    /// #1404, #1405: an update racing an unconditional delete leaves a
+    /// contiguous history; the plain delete retries once (G25).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn cassandra_concurrent_update_and_plain_delete_stay_consistent() {
+        let node = node_or_skip!("cassandra_concurrent_update_and_plain_delete_stay_consistent");
+        versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+            race_backend(node, "race-pdelete").await,
+            &unique_base("pdel"),
+            RACE_ROUNDS,
+        )
+        .await;
+    }
+
+    /// #2111: four unconditional PUTs racing onto one delete marker all
+    /// succeed, at versions 3 to 6, exactly one of them `created`, and the
+    /// marker stays in the history (the roadmap's Step 3 exit criterion).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn cassandra_concurrent_puts_onto_a_tombstone_all_succeed() {
+        let node = node_or_skip!("cassandra_concurrent_puts_onto_a_tombstone_all_succeed");
+        versioned_write_race_suite::concurrent_puts_onto_a_tombstone_all_succeed(
+            race_backend(node, "race-restore").await,
+            &unique_base("rest"),
+            RACE_ROUNDS,
+        )
+        .await;
+    }
+
+    /// #1404: `delete_versioned` compares and deletes in one step. No race,
+    /// so a plain runtime, as on every backend.
+    #[tokio::test]
+    async fn cassandra_versioned_delete_is_a_compare_and_swap() {
+        let node = node_or_skip!("cassandra_versioned_delete_is_a_compare_and_swap");
+        let backend = CassandraTestBackend::connect(node, "race-cas").await;
+        versioned_write_race_suite::versioned_delete_is_a_compare_and_swap(
+            &backend,
+            &unique_base("cas"),
+        )
+        .await;
+    }
+
+    /// On a current-thread runtime the race tests pass without racing
+    /// (`versioned_write_race_suite.rs`, module docs), so each of the four
+    /// must keep its multi-thread attribute. Read from this file's source.
+    #[test]
+    fn race_wrappers_run_on_eight_worker_threads() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/cassandra_tests.rs"
+        ))
+        .expect("read tests/cassandra_tests.rs");
+        let lines: Vec<&str> = source.lines().map(str::trim).collect();
+        for name in [
+            "cassandra_concurrent_updates_from_the_same_version_admit_one",
+            "cassandra_concurrent_update_and_versioned_delete_admit_one",
+            "cassandra_concurrent_update_and_plain_delete_stay_consistent",
+            "cassandra_concurrent_puts_onto_a_tombstone_all_succeed",
+        ] {
+            let at = lines
+                .iter()
+                .position(|l| *l == format!("async fn {name}() {{"))
+                .unwrap_or_else(|| panic!("no wrapper {name}"));
+            assert_eq!(
+                lines[at - 1],
+                "#[tokio::test(flavor = \"multi_thread\", worker_threads = 8)]",
+                "{name}"
+            );
+        }
+    }
+
+    /// #447: distinct tenant ids (`base`, `/base`, `base/`, `//base`,
+    /// `base/resources`) never share data. Cassandra matches the tenant id
+    /// whole, as the first column of every partition key, so this is the
+    /// "identity" row of the suite's table, asserted rather than read.
+    #[tokio::test]
+    async fn cassandra_distinct_tenant_ids_never_share_data() {
+        let node = node_or_skip!("cassandra_distinct_tenant_ids_never_share_data");
+        let backend = crate::backend_skeleton::backend(node).await;
+        tenant_id_fidelity_suite::distinct_tenant_ids_never_share_data(
+            &backend,
+            &unique_base("fidelity"),
+        )
+        .await;
+    }
+
+    /// #447, #1912: a child tenant's data is not its parent's. The suite's
+    /// discovery half compares `count_by_tenant` with the expected `false`
+    /// for the parent; Cassandra keeps that method's default, an empty list,
+    /// so that half holds trivially here and only `tenant_has_resources` (the
+    /// default, over `count`) is really tested.
+    /// `tenant_has_resources_matches_discovery` is not run: it needs
+    /// `register_tenant`, `deregister_tenant` and `purge_tenant_data`, which
+    /// Cassandra refuses (the trait defaults, `tenant_registry_unsupported`;
+    /// `$purge` is 501, ADR-aacruzgon-0040), and neither is the fidelity
+    /// suite's purge test, for `PurgableStorage`.
+    #[tokio::test]
+    async fn cassandra_child_data_is_not_the_parents() {
+        let node = node_or_skip!("cassandra_child_data_is_not_the_parents");
+        let backend = crate::backend_skeleton::backend(node).await;
+        tenant_existence_suite::child_data_is_not_the_parents(&backend, &unique_base("exist"))
+            .await;
     }
 }

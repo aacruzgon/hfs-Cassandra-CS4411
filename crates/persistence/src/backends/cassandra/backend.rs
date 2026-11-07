@@ -1260,9 +1260,19 @@ mod node_tests {
             paged.len()
         );
         assert_eq!(paged.len(), keys(&paged).len(), "no partition twice");
-        let (whole, paged) = (keys(&whole), keys(&paged));
-        // Other tests may add partitions between the two reads, never remove.
-        assert!(whole.is_subset(&paged), "a page was dropped");
+        // Only this test's own partitions are compared: other tests run at
+        // the same time and both add partitions and, since Step 3's engine
+        // deletes `resources_by_type` rows on update and delete, remove them
+        // (a partition whose only row is deleted leaves `SELECT DISTINCT`,
+        // checked on the 5.0.9 node). This test never removes its own.
+        let ours = |set: BTreeSet<(String, String)>| -> BTreeSet<(String, String)> {
+            set.into_iter()
+                .filter(|(tenant, _)| tenant.starts_with(&format!("s2-paging-{run}-")))
+                .collect()
+        };
+        let (whole, paged) = (ours(keys(&whole)), ours(keys(&paged)));
+        assert_eq!(whole.len(), 16, "this test's partitions, unpaged");
+        assert_eq!(whole, paged, "a page was dropped");
         for tenant in &tenants {
             for resource_type in types {
                 assert!(paged.contains(&(

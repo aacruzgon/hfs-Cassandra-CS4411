@@ -534,11 +534,20 @@ pub(crate) enum Fault {
     /// Fail with `WriteTimeout`/CAS without executing: what a serial read
     /// can raise on Paxos v2 (`Paxos.java:893-901`).
     FailWithCasTimeout,
+    /// Fail with `WriteFailure`/CAS without executing: replicas failed, so
+    /// an unknown outcome that is undecidable answers 503, not 504.
+    FailWithWriteFailure,
+    /// Fail with `Unavailable` without executing: refused before any
+    /// replica acted, so not applied.
+    FailWithUnavailable,
 }
 
 #[cfg(test)]
 mod faults {
-    use cdrs_tokio::frame::message_error::{ErrorBody, ErrorType, WriteTimeoutError, WriteType};
+    use cdrs_tokio::frame::message_error::{
+        ErrorBody, ErrorType, FailureInfo, UnavailableError, WriteFailureError, WriteTimeoutError,
+        WriteType,
+    };
     use parking_lot::Mutex;
 
     use super::*;
@@ -611,27 +620,36 @@ mod faults {
                     values: values.to_vec(),
                     kind,
                 }),
+                Fault::FailWithWriteFailure => return Some(Err(server_error(write_failure()))),
+                Fault::FailWithUnavailable => return Some(Err(server_error(unavailable()))),
                 Fault::TimeOutWithoutApplying | Fault::FailWithCasTimeout => {}
             }
-            Some(Err(cas_write_timeout()))
+            Some(Err(server_error(ErrorType::WriteTimeout(
+                WriteTimeoutError::new(Consistency::LocalSerial, 0, 1, WriteType::Cas, None),
+            ))))
         }
     }
 
-    /// `WriteTimeout` with `write_type = CAS`, as the node sends it.
-    fn cas_write_timeout() -> DriverError {
+    /// A server error of type `ty`, as the node sends it.
+    fn server_error(ty: ErrorType) -> DriverError {
         DriverError::from(cdrs_tokio::error::Error::Server {
-            body: ErrorBody::new(
-                "injected fault",
-                ErrorType::WriteTimeout(WriteTimeoutError::new(
-                    Consistency::LocalSerial,
-                    0,
-                    1,
-                    WriteType::Cas,
-                    None,
-                )),
-            ),
+            body: ErrorBody::new("injected fault", ty),
             addr: "127.0.0.1:9042".parse().expect("an address"),
         })
+    }
+
+    fn write_failure() -> ErrorType {
+        ErrorType::WriteFailure(WriteFailureError::new(
+            Consistency::LocalQuorum,
+            0,
+            1,
+            FailureInfo::NumFailures(1),
+            WriteType::Cas,
+        ))
+    }
+
+    fn unavailable() -> ErrorType {
+        ErrorType::Unavailable(UnavailableError::new(Consistency::LocalSerial, 1, 0))
     }
 }
 

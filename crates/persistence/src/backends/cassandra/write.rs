@@ -35,7 +35,9 @@
 //! **Failure handling** (design, "When the LWT outcome is unknown";
 //! ADR-aacruzgon-0024, 0026, 0034, 0035, 0050, 0051; walkthrough 3.1):
 //!
-//! - V3 or I1 fails: its error (503 or 504); nothing changed.
+//! - V3 or I1 fails: its error (503 or 504); this attempt changed nothing
+//!   (V3 only rewrites row `N` at an older timestamp). An earlier attempt
+//!   whose outcome was unknown is left for the sweeper.
 //! - The CAS answers not applied: a definite miss. The attempt's intent row
 //!   is deleted, and the miss is mapped from the returned columns
 //!   ([`CasMiss::of`]): `[applied]` alone is "no row", `deleted_at > 0` is
@@ -884,6 +886,10 @@ struct Attempt {
     plan: Arc<CasPlan>,
     /// `Some(timed_out)` once its outcome was unknown.
     unknown: Option<bool>,
+    /// Its target version has been decided for good: it applied, or another
+    /// writer took that version. A later look skips it. "Unchanged" never
+    /// settles an attempt, which can still apply later (ADR-aacruzgon-0051).
+    settled: bool,
 }
 
 /// One storage call's attempts, across every turn of its loop: the engine
@@ -904,7 +910,8 @@ impl CasRequest<'_> {
         self.key
     }
 
-    /// How many compare-and-swaps this request has sent.
+    /// How many attempts this request has begun: each sent its CAS, unless
+    /// its V3 or I1 failed first and ended the request.
     #[allow(dead_code)] // L3's loop.
     pub(crate) fn attempts(&self) -> usize {
         self.attempts.len()
@@ -926,6 +933,15 @@ impl CasRequest<'_> {
     #[allow(dead_code)] // L2b's delete and L3's loop.
     pub(crate) fn note_miss_budget_exhausted(&self) {
         self.stats.miss_budget_exhausted();
+    }
+
+    /// Marks every attempt at `target` as decided for good.
+    fn settle(&mut self, target: i32) {
+        for attempt in &mut self.attempts {
+            if attempt.plan.target_version() == target {
+                attempt.settled = true;
+            }
+        }
     }
 
     fn timed_out(&self, attempt: usize) -> bool {
@@ -1224,6 +1240,7 @@ impl CassandraBackend {
                 intent: IntentKey::new(key.tenant_id, key.id, Utc::now()),
                 plan: plan.clone(),
                 unknown: None,
+                settled: false,
             };
             request.attempts.push(attempt.clone());
             let index = request.attempts.len() - 1;
@@ -1328,6 +1345,7 @@ impl CassandraBackend {
                     return Err(undecidable(timed_out, operation));
                 }
                 Decision::AnotherWriter => {
+                    request.settle(target);
                     // An attempt of an earlier turn, at another target, may
                     // still be ours (ADR-aacruzgon-0051).
                     if let Some(applied) = self.late_attempt(request, row, Some(target)).await? {
@@ -1337,7 +1355,7 @@ impl CassandraBackend {
                         CasMiss::Exists
                     } else {
                         CasMiss::VersionMoved {
-                            current: Some(target),
+                            current: row.and_then(|r| r.version_id).or(Some(target)),
                         }
                     };
                     request.stats.miss(miss.counter());
@@ -1395,8 +1413,10 @@ impl CassandraBackend {
     }
 
     /// Matches `row` against every earlier attempt of the request whose
-    /// outcome was unknown, one target version at a time (`skip` is a target
-    /// already decided). A match finishes that attempt.
+    /// outcome was unknown and is not settled, one target version at a time
+    /// (`skip` is a target already decided). A match finishes that attempt.
+    /// An undecidable target fails the request only once every other target
+    /// has been checked and none applied.
     async fn late_attempt(
         &self,
         request: &mut CasRequest<'_>,
@@ -1404,14 +1424,15 @@ impl CassandraBackend {
         skip: Option<i32>,
     ) -> StorageResult<Option<Applied>> {
         let mut decided: Vec<i32> = skip.into_iter().collect();
-        let unknown: Vec<(usize, i32, i32)> = request
+        let open: Vec<(usize, i32, i32)> = request
             .attempts
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.unknown.is_some())
+            .filter(|(_, a)| a.unknown.is_some() && !a.settled)
             .map(|(n, a)| (n, a.plan.target_version(), a.plan.expected_version()))
             .collect();
-        for (n, target, expected) in unknown {
+        let mut undecided: Option<usize> = None;
+        for (n, target, expected) in open {
             if decided.contains(&target) {
                 continue;
             }
@@ -1421,14 +1442,20 @@ impl CassandraBackend {
                 Decision::AppliedSuperseded(k) => {
                     return Ok(Some(self.finish(request, k, true).await));
                 }
+                Decision::AnotherWriter => request.settle(target),
                 Decision::Undecidable => {
-                    request.stats.undecidable();
-                    return Err(undecidable(request.timed_out(n), request.operation));
+                    undecided.get_or_insert(n);
                 }
-                Decision::Unchanged | Decision::AnotherWriter => {}
+                Decision::Unchanged => {}
             }
         }
-        Ok(None)
+        match undecided {
+            Some(n) => {
+                request.stats.undecidable();
+                Err(undecidable(request.timed_out(n), request.operation))
+            }
+            None => Ok(None),
+        }
     }
 
     /// `decide(V)` (walkthrough 3.1's table; D3): from the row, then, past
@@ -1478,7 +1505,9 @@ impl CassandraBackend {
     /// Steps 4 to 6 for attempt `n`, which applied, with its own values and
     /// intent; skipped when superseded, leaving the intent for the sweeper,
     /// whose superseded case deletes `K(V-1)`.
-    async fn finish(&self, request: &CasRequest<'_>, n: usize, superseded: bool) -> Applied {
+    async fn finish(&self, request: &mut CasRequest<'_>, n: usize, superseded: bool) -> Applied {
+        let target = request.attempts[n].plan.target_version();
+        request.settle(target);
         let attempt = &request.attempts[n];
         let plan = attempt.plan.clone();
         let key = request.key;
@@ -1590,10 +1619,12 @@ impl CassandraBackend {
             .map(|p| (p.keys.as_slice(), p.last_updated));
         let (deletes, inserts) = index_delta(previous, (&plan.keys, last_updated));
         let mut all = true;
-        for (index_key, at, insert) in deletes
+        // Inserts first, so a concurrent `count` never sees the resource
+        // missing while its `resources_by_type` row moves.
+        for (index_key, at, insert) in inserts
             .into_iter()
-            .map(|(k, at)| (k, at, false))
-            .chain(inserts.into_iter().map(|(k, at)| (k, at, true)))
+            .map(|(k, at)| (k, at, true))
+            .chain(deletes.into_iter().map(|(k, at)| (k, at, false)))
         {
             let (cql, values) = match (index_key, insert) {
                 (IndexKey::ResourcesByType, true) => (
@@ -1760,7 +1791,7 @@ mod tests {
                         None,
                         *name,
                         ColTypeOption {
-                            id: ty.clone(),
+                            id: *ty,
                             value: None,
                         },
                     )
@@ -2388,7 +2419,9 @@ mod tests {
                 '\'' => {
                     // A char literal ('x', '\n', '"') or a lifetime ('a).
                     if chars.get(i + 1) == Some(&'\\') {
-                        i += 2;
+                        // Past the backslash and the escaped character,
+                        // which may itself be a quote ('\'').
+                        i += 3;
                         while i < chars.len() && chars[i] != '\'' {
                             i += 1;
                         }
@@ -2458,11 +2491,11 @@ mod tests {
     /// of index tables (`resources_by_type`) and intent rows are expected.
     fn forbidden_statements(literals: &[String]) -> Vec<String> {
         let delete = regex::Regex::new(
-            r"(?is)^\s*DELETE\b.*?\bFROM\s+(resources|resource_versions)(\s|;|$)",
+            r#"(?is)\bDELETE\b[^;]*?\bFROM\s+(\w+\.)?"?(resources|resource_versions)"?(\s|;|$)"#,
         )
         .unwrap();
         let writes_to = regex::Regex::new(
-            r"(?is)^\s*(INSERT\s+INTO|UPDATE)\s+(resources|resource_versions)(\s|\()",
+            r#"(?is)\b(INSERT\s+INTO|UPDATE)\s+(\w+\.)?"?(resources|resource_versions)"?(\s|\()"#,
         )
         .unwrap();
         let null = regex::Regex::new(r"(?i)\bnull\b").unwrap();
@@ -2483,11 +2516,19 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backends/cassandra");
         let mut scanned = 0;
         let mut found = Vec::new();
-        for entry in std::fs::read_dir(&dir).expect("the backend's directory") {
-            let path = entry.expect("a directory entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
+        let mut pending = vec![dir.clone()];
+        let mut files = Vec::new();
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).expect("the backend's directory") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    files.push(path);
+                }
             }
+        }
+        for path in files {
             let source = std::fs::read_to_string(&path).expect("a source file");
             scanned += 1;
             for statement in forbidden_statements(&string_literals(&source)) {
@@ -2516,6 +2557,24 @@ mod tests {
             "{verb} FROM pending_index_writes WHERE id = ?"
         )));
         assert!(!refused(SOFT_DELETE_RESOURCE_IF_VERSION));
+        assert!(refused(&format!(
+            "BEGIN BATCH {verb} FROM resources WHERE id = ?; APPLY BATCH"
+        )));
+        assert!(refused(&format!(
+            "{verb} FROM helios.resources WHERE id = ?"
+        )));
+        assert!(refused(&format!(
+            "{verb} FROM \"resource_versions\" WHERE id = ?"
+        )));
+        assert!(refused(&format!(
+            "INSERT INTO helios.resources (id, data) VALUES (?, {})",
+            ["NU", "LL"].concat()
+        )));
+        // A char literal holding an escaped quote opens no string.
+        assert_eq!(
+            string_literals("let q = ['\\'', '\"']; let s = \"x\";"),
+            vec!["x".to_string()]
+        );
         let folded = string_literals("const A: &str = \"DE\\\n     LETE\";");
         assert_eq!(folded, vec![verb.clone()], "a continuation folds");
     }
@@ -2560,6 +2619,7 @@ mod node_tests {
                 vec![IndexKey::ResourcesByType],
             )),
             unknown: Some(true),
+            settled: false,
         }
     }
 
@@ -3115,13 +3175,217 @@ mod node_tests {
         );
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
 
-        // The next pre-read, too: a fresh look at the row matches attempt 1.
-        let late = backend
-            .check_earlier_attempts(&mut request, Some(&row2))
+        // Once applied, attempt 1 is settled: a later look neither finds it
+        // again nor writes its rows twice.
+        let before = backend.cas_stats();
+        assert!(
+            backend
+                .check_earlier_attempts(&mut request, Some(&row2))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(backend.cas_stats().since(&before).applied, 0);
+    }
+
+    /// The budgets and the statuses an unknown outcome ends in, through the
+    /// fault seam: re-runs exhausted after timeouts is 504, after replica
+    /// failures 503; `Unavailable` is not applied and never retried.
+    #[tokio::test]
+    async fn unknown_outcomes_end_in_504_or_503_and_unavailable_is_not_retried() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let version = FhirVersion::default_enabled();
+        let c1 = "INSERT INTO resources";
+
+        // Three timeouts, each "unchanged": two re-runs, then 504.
+        let tenant = tenant_context("reruns-504");
+        for _ in 0..3 {
+            backend
+                .session
+                .inject_fault(StatementKind::Cas, c1, Fault::TimeOutWithoutApplying);
+        }
+        let before = backend.cas_stats();
+        match backend.create(&tenant, "Patient", patient(), version).await {
+            Err(StorageError::Backend(BackendError::Timeout { .. })) => {}
+            other => panic!("expected 504, got {other:?}"),
+        }
+        let stats = backend.cas_stats().since(&before);
+        assert_eq!((stats.attempts, stats.reruns, stats.undecidable), (3, 2, 1));
+        assert!(
+            backend
+                .read(&tenant, "Patient", "p")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Three replica failures: the same budget, then 503.
+        let tenant = tenant_context("reruns-503");
+        for _ in 0..3 {
+            backend
+                .session
+                .inject_fault(StatementKind::Cas, c1, Fault::FailWithWriteFailure);
+        }
+        let before = backend.cas_stats();
+        match backend.create(&tenant, "Patient", patient(), version).await {
+            Err(StorageError::Backend(BackendError::Unavailable { .. })) => {}
+            other => panic!("expected 503, got {other:?}"),
+        }
+        let stats = backend.cas_stats().since(&before);
+        assert_eq!((stats.attempts, stats.unknown_write_failure), (3, 3));
+
+        // Unavailable: refused before anything, 503 at once, no serial read
+        // and no retry (ADR-aacruzgon-0050).
+        let tenant = tenant_context("unavailable");
+        backend
+            .session
+            .inject_fault(StatementKind::Cas, c1, Fault::FailWithUnavailable);
+        let before = backend.cas_stats();
+        match backend.create(&tenant, "Patient", patient(), version).await {
+            Err(StorageError::Backend(BackendError::Unavailable { .. })) => {}
+            other => panic!("expected 503, got {other:?}"),
+        }
+        let stats = backend.cas_stats().since(&before);
+        assert_eq!(
+            (
+                stats.attempts,
+                stats.not_applied,
+                stats.serial_reads,
+                stats.reruns
+            ),
+            (1, 1, 0, 0)
+        );
+    }
+
+    /// G23 on every operation (ADR-aacruzgon-0034, 0050): the CAS applied,
+    /// the version row fails all three tries, and the write still succeeds,
+    /// with the intent row left for the sweeper (no I2).
+    #[tokio::test]
+    async fn a_post_cas_failure_still_succeeds_and_leaves_the_intent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("post-cas");
+        for _ in 0..POST_CAS_WRITE_TRIES {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resource_versions",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        let (before, counted) = (backend.cas_stats(), backend.statement_counts());
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .expect("success after an applied CAS");
+        let stats = backend.cas_stats().since(&before);
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(created.version_id(), "1");
+        assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
+        // I1, three tries of V1, X1; no I2.
+        assert_eq!((spent.write, spent.cas), (5, 1), "{spent}");
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    }
+
+    /// A superseded attempt, found by the pre-read check: the row is past
+    /// the attempt's target, and row `V` (R3) carries its `write_id`. The
+    /// write is ours, with steps 4 and 5 skipped and the intent left.
+    #[tokio::test]
+    async fn a_superseded_earlier_attempt_is_ours_with_its_rows_left_to_the_sweeper() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("superseded");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .unwrap();
+        let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let update = |row: &ResourceRow| {
+            CasPlan::update(
+                PreviousVersion::from_row(row).unwrap(),
+                json.clone(),
+                data.clone(),
+                vec![IndexKey::ResourcesByType],
+            )
+        };
+        // Version 2, written by the engine.
+        let row1 = current(&backend, &tenant).await;
+        let mut first = backend.cas_request("update", key_of(&tenant));
+        let v2 = applied_of(backend.run_cas(&mut first, update(&row1)).await.unwrap());
+        // Version 3 by another request; its V3 rewrites row 2 with w(2).
+        let row2 = current(&backend, &tenant).await;
+        let mut other = backend.cas_request("update", key_of(&tenant));
+        applied_of(backend.run_cas(&mut other, update(&row2)).await.unwrap());
+        let row3 = current(&backend, &tenant).await;
+
+        // A request that sent version 2's CAS and never heard back.
+        let mut request = backend.cas_request("update", key_of(&tenant));
+        request.attempts.push(Attempt {
+            write_id: v2.write_id,
+            last_updated: v2.last_updated,
+            intent: IntentKey::new(tenant.tenant_id().as_str(), "p", Utc::now()),
+            plan: Arc::new(update(&row1)),
+            unknown: Some(true),
+            settled: false,
+        });
+        let before = backend.cas_stats();
+        let found = backend
+            .check_earlier_attempts(&mut request, Some(&row3))
             .await
             .unwrap()
-            .expect("attempt 1, found by the pre-read");
-        assert_eq!(late.write_id, applied.write_id);
+            .expect("ours, superseded");
+        assert_eq!((found.version_id, found.write_id), (2, v2.write_id));
+        assert!(found.superseded && !found.post_cas_complete);
+        let stats = backend.cas_stats().since(&before);
+        assert_eq!((stats.version_reads, stats.applied_superseded), (1, 1));
+    }
+
+    /// An earlier attempt whose row cannot be decided answers by that
+    /// attempt's trigger (ADR-aacruzgon-0051): 503 after a replica failure,
+    /// 504 after a timeout. No statement is needed for a row at the target
+    /// with no readable `write_id`.
+    #[tokio::test]
+    async fn an_undecidable_earlier_attempt_answers_by_its_own_trigger() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let key = RowKey {
+            tenant_id: "s3-engine-undecidable",
+            resource_type: "Patient",
+            id: "p",
+        };
+        let row = Some(CurrentRow {
+            version_id: Some(1),
+            write_id: None,
+        });
+        for (timed_out, want_timeout) in [(false, false), (true, true)] {
+            let mut request = backend.cas_request("create", key);
+            let mut attempt = tried(Uuid::new_v4());
+            attempt.unknown = Some(timed_out);
+            request.attempts.push(attempt);
+            match backend.late_attempt(&mut request, row, None).await {
+                Err(StorageError::Backend(BackendError::Timeout { .. })) if want_timeout => {}
+                Err(StorageError::Backend(BackendError::Unavailable { .. })) if !want_timeout => {}
+                other => panic!("timed_out={timed_out}: {other:?}"),
+            }
+        }
     }
 
     /// D14, measured on the node: what Cassandra answers to a C1 and to a
@@ -3155,7 +3419,17 @@ mod node_tests {
             "refused before any statement"
         );
 
-        // The node itself, past the bound.
+        // The node itself, past the bound: measured once for the ADR, and
+        // only when asked, so the required job does not write 9 MiB rows on
+        // every run.
+        if std::env::var("HFS_TEST_CASSANDRA_SIZE_PROBE")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            eprintln!("not run: the 9 and 17 MiB probe (set HFS_TEST_CASSANDRA_SIZE_PROBE=1)");
+            return;
+        }
         for mib in [9, 17] {
             let t = format!("{}-{mib}", tenant.tenant_id().as_str());
             let key = RowKey {

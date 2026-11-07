@@ -219,7 +219,7 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
         - unchanged: run again after a 5 to 25 ms random pause, with a budget of 2 re-runs; a `create` keeps its `id`;
         - another writer at the target version: a definite miss (`AlreadyExists`, 409, for `create`);
         - past the target version: R3 on row V decides. Our `write_id` there is success, with steps 4 and 5 skipped; another `write_id` is a definite miss; an unset one is undecidable: 504 after a timeout (server or client side) or a dropped connection, 503 after a failure;
-        - the serial read itself times out or fails: 504 or 503, mapped as a plain statement's error and never classified as a new unknown write, including the `WriteTimeout`/CAS a serial read can raise on Paxos v2 (ADR-aacruzgon-0050);
+        - the serial read (or R3 after it) itself times out or fails: 504 for a timeout, including the `WriteTimeout`/CAS a serial read can raise on Paxos v2, and 503 for every other error, even one a plain statement would answer with 500; never classified as a new unknown write (ADR-aacruzgon-0050, 0055);
     - after an unknown outcome, the next attempt's pre-read and any definite miss it meets are first checked against every earlier attempt of the request, so a late earlier attempt is reported as the success it is (ADR-aacruzgon-0051);
     - if the version row or the index delta still fails after its retries, the write returns success and leaves its intent row for the sweeper, on every operation (G23, ADR-aacruzgon-0034, 0050);
     - `WriteTimeout` with `write_type = SIMPLE` is resolved by the same `LOCAL_SERIAL` read, never taken as applied (ADR-aacruzgon-0035);

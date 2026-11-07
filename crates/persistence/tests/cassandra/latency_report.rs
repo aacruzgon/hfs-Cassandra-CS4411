@@ -49,7 +49,6 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use helios_fhir::FhirVersion;
 use helios_persistence::backends::cassandra::CassandraBackend;
 use helios_persistence::core::{ResourceStorage, VersionedStorage};
 use helios_persistence::error::StorageResult;
@@ -323,7 +322,7 @@ async fn cassandra_latency_report() {
     });
     let backend = backend(node).await;
     let tenant = unique_tenant("latency");
-    let version = FhirVersion::default_enabled();
+    let version = crate::cassandra_node::test_fhir_version();
     let started = Instant::now();
     let report_start = Snapshot::take(&backend);
     let mut figures = Vec::new();

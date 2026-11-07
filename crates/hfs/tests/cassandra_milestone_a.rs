@@ -140,6 +140,42 @@ const NANO_CPUS: i64 = 4_000_000_000;
 const NODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(240);
 /// From launch to `/metadata` answering, the conformance seed included.
 const HFS_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// The variable that chooses the tests' FHIR version (fhir-versions,
+/// ADR-aacruzgon-0065), as `crates/persistence/tests/common/cassandra.rs`
+/// reads it for the persistence tests.
+const FHIR_VERSION_VAR: &str = "HFS_TEST_FHIR_VERSION";
+
+/// The FHIR version every `hfs` this file starts serves as its default, or
+/// `None` when [`FHIR_VERSION_VAR`] is unset: `hfs` then picks its own
+/// default, exactly as before the variable existed. A set value this build
+/// cannot parse, or a version it does not enable, panics, so a typo never
+/// quietly runs R4. Decided once and printed once.
+fn test_fhir_version() -> Option<helios_fhir::FhirVersion> {
+    static CHOSEN: std::sync::OnceLock<Option<helios_fhir::FhirVersion>> =
+        std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        let value = std::env::var(FHIR_VERSION_VAR).ok()?;
+        let version = helios_fhir::FhirVersion::from_storage(value.trim()).unwrap_or_else(|| {
+            let enabled: Vec<&str> = helios_fhir::FhirVersion::enabled_versions()
+                .iter()
+                .map(helios_fhir::FhirVersion::as_str)
+                .collect();
+            panic!(
+                "{FHIR_VERSION_VAR}={value:?} is not a FHIR version this build enables \
+                 (enabled: {})",
+                enabled.join(", ")
+            )
+        });
+        eprintln!(
+            "fhir-versions: {FHIR_VERSION_VAR}={value} -> {version:?} ({}), \
+             passed to hfs as HFS_DEFAULT_FHIR_VERSION={}",
+            version.as_mime_param(),
+            version.as_str()
+        );
+        Some(version)
+    })
+}
 /// From `docker stop` to `/_readiness` reporting down.
 const DOWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// From `docker start` to `/_readiness` reporting up again.
@@ -1334,6 +1370,9 @@ impl Hfs {
             .env("HFS_SERVER_PORT", port.to_string())
             .env("HFS_BASE_URL", &base)
             .env("HFS_LOG_LEVEL", "info")
+            // The tests' FHIR version, in the `R5` form the server's
+            // `value_enum` parses; unset, hfs keeps its own default.
+            .envs(test_fhir_version().map(|version| ("HFS_DEFAULT_FHIR_VERSION", version.as_str())))
             .current_dir(repo_path(""))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1388,6 +1427,15 @@ impl Hfs {
             if let Ok(response) = client.get(format!("{}/metadata", self.base)).send().await
                 && response.status() == StatusCode::OK
             {
+                // The version reached hfs: its startup line names it.
+                if let Some(version) = test_fhir_version() {
+                    let expected = format!("fhir_version={version:?}");
+                    assert!(
+                        self.output().contains(&expected),
+                        "hfs does not report {expected}; output:\n{}",
+                        self.output()
+                    );
+                }
                 return;
             }
             if let Some(status) = self.child.try_wait().expect("poll hfs") {

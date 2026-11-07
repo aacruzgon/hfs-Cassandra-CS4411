@@ -364,12 +364,10 @@ mod tests {
 /// goes through L2b's `delete_versioned`.
 #[cfg(test)]
 mod node_tests {
-    use helios_fhir::FhirVersion;
     use serde_json::{Value as Json, json};
     use uuid::Uuid;
 
     use super::*;
-    use crate::backends::cassandra::CassandraConfig;
     use crate::backends::cassandra::index_keys::IndexKey;
     use crate::backends::cassandra::read::ResourceRow;
     use crate::backends::cassandra::session::Fault;
@@ -387,8 +385,7 @@ mod node_tests {
         Some(
             CassandraBackend::connect(crate::backends::cassandra::CassandraConfig {
                 contact_points: vec![url],
-                data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
-                ..CassandraConfig::default()
+                ..crate::backends::cassandra::test_support::test_config()
             })
             .await
             .expect("connect"),
@@ -413,7 +410,7 @@ mod node_tests {
                 tenant,
                 "Patient",
                 patient(id, family),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .expect("create");
@@ -505,7 +502,10 @@ mod node_tests {
         assert!(!one.is_deleted());
         assert_eq!(one.last_modified(), v1.last_updated);
         assert_eq!(one.created_at(), v1.last_updated, "no created_at: lu (G14)");
-        assert_eq!(one.fhir_version(), FhirVersion::default_enabled());
+        assert_eq!(
+            one.fhir_version(),
+            crate::backends::cassandra::test_support::test_fhir_version()
+        );
         assert_eq!(one.tenant_id(), t.tenant_id());
         let two = backend
             .vread(&t, "Patient", "p", "2")

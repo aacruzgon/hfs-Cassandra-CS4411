@@ -272,7 +272,6 @@ mod tests {
     use super::*;
     use crate::error::ResourceError;
     use chrono::{TimeZone, Utc};
-    use helios_fhir::FhirVersion;
 
     fn row(version_id: i32, deleted: bool) -> ResourceRow {
         let at = Utc.timestamp_millis_opt(1_000).single().expect("time");
@@ -282,7 +281,7 @@ mod tests {
             last_updated: at,
             created_at: Some(at),
             deleted_at: deleted.then_some(at),
-            fhir_version: FhirVersion::default_enabled(),
+            fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
             write_ts: Some(1_000_000),
             write_id: None,
             index_keys: Some(vec![0x01, 0x00]),
@@ -371,7 +370,6 @@ mod node_tests {
     use cdrs_tokio::types::IntoRustByName;
     use cdrs_tokio::types::blob::Blob;
     use chrono::{DateTime, Utc};
-    use helios_fhir::FhirVersion;
     use uuid::Uuid;
 
     use super::*;
@@ -392,8 +390,7 @@ mod node_tests {
         Some(
             CassandraBackend::connect(CassandraConfig {
                 contact_points: vec![url],
-                data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
-                ..CassandraConfig::default()
+                ..crate::backends::cassandra::test_support::test_config()
             })
             .await
             .expect("connect"),
@@ -433,7 +430,7 @@ mod node_tests {
                 tenant,
                 "Patient",
                 patient("Smith"),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .expect("create")
@@ -461,7 +458,7 @@ mod node_tests {
             now,
             now,
             None,
-            FhirVersion::default_enabled(),
+            crate::backends::cassandra::test_support::test_fhir_version(),
         )
     }
 
@@ -512,7 +509,9 @@ mod node_tests {
             Value::from(from + 1),
             Value::from(patient("Other").to_string()),
             Value::from(lu),
-            Value::from(FhirVersion::default_enabled().as_mime_param()),
+            Value::from(
+                crate::backends::cassandra::test_support::test_fhir_version().as_mime_param(),
+            ),
             Value::from(write_ts_of(lu)),
             Value::from(write_id),
             Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
@@ -735,7 +734,10 @@ mod node_tests {
                     Value::from(patient("Smith").to_string()),
                     Value::from(lu),
                     Value::from(lu),
-                    Value::from(FhirVersion::default_enabled().as_mime_param()),
+                    Value::from(
+                        crate::backends::cassandra::test_support::test_fhir_version()
+                            .as_mime_param(),
+                    ),
                     Value::from(write_ts_of(lu)),
                     Value::from(writer),
                     Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
@@ -925,7 +927,7 @@ mod node_tests {
             sp.created_at(),
             sp.last_modified(),
             None,
-            FhirVersion::default_enabled(),
+            crate::backends::cassandra::test_support::test_fhir_version(),
         );
         assert!(matches!(
             backend.update(&tenant, &sp, long_code).await,
@@ -1154,7 +1156,7 @@ mod node_tests {
     async fn the_overlay_follows_an_update() {
         let backend = backend_or_skip!();
         let tenant = tenant_context("overlay");
-        let version = FhirVersion::default_enabled();
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
         let url = format!(
             "http://example.org/SearchParameter/{}",
             tenant.tenant_id().as_str()
@@ -1283,7 +1285,7 @@ mod node_tests {
                 &tenant,
                 "SearchParameter",
                 search_parameter("sp", &url, "active", "Patient.gender"),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .unwrap();

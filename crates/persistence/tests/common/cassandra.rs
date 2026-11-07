@@ -57,6 +57,44 @@ use tokio::sync::OnceCell;
 /// The variable that names a running node (ADR-aacruzgon-0020, Rule 1).
 pub const URL_VAR: &str = "HFS_TEST_CASSANDRA_URL";
 
+/// The variable that chooses the tests' FHIR version (fhir-versions,
+/// ADR-aacruzgon-0065), in any form `FhirVersion::from_storage` accepts.
+pub const FHIR_VERSION_VAR: &str = "HFS_TEST_FHIR_VERSION";
+
+/// The FHIR version the tests create, expect and configure the backend with,
+/// decided once per test binary: [`FHIR_VERSION_VAR`] when set, otherwise
+/// `FhirVersion::default_enabled()`, exactly as before the variable existed.
+/// A set value this build cannot parse, or a version it does not enable,
+/// panics: a typo must not quietly run R4 and report green. When the variable
+/// is set the choice is printed once, so every log names the version it ran.
+/// The backend's unit tests apply the same rule
+/// (`backends/cassandra/test_support.rs`).
+pub fn test_fhir_version() -> helios_fhir::FhirVersion {
+    static CHOSEN: std::sync::OnceLock<helios_fhir::FhirVersion> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| match std::env::var(FHIR_VERSION_VAR) {
+        Ok(value) => {
+            let version =
+                helios_fhir::FhirVersion::from_storage(value.trim()).unwrap_or_else(|| {
+                    let enabled: Vec<&str> = helios_fhir::FhirVersion::enabled_versions()
+                        .iter()
+                        .map(helios_fhir::FhirVersion::as_str)
+                        .collect();
+                    panic!(
+                        "{FHIR_VERSION_VAR}={value:?} is not a FHIR version this build enables \
+                     (enabled: {})",
+                        enabled.join(", ")
+                    )
+                });
+            eprintln!(
+                "fhir-versions: {FHIR_VERSION_VAR}={value} -> {version:?} ({})",
+                version.as_mime_param()
+            );
+            version
+        }
+        Err(_) => helios_fhir::FhirVersion::default_enabled(),
+    })
+}
+
 /// The keyspace `keyspace-single-node.cql` creates.
 pub const KEYSPACE: &str = "helios";
 

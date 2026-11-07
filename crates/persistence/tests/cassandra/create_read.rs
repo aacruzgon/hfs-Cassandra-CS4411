@@ -24,7 +24,6 @@ use cdrs_tokio::types::blob::Blob;
 use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, Utc};
-use helios_fhir::FhirVersion;
 use helios_persistence::backends::cassandra::CassandraBackend;
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::error::{ResourceError, StorageError, TenantError, ValidationError};
@@ -114,7 +113,7 @@ async fn cassandra_create_then_read_round_trips() {
     let node = node_or_skip!("cassandra_create_then_read_round_trips");
     let (backend, _cql) = setup(node).await;
     let tenant = unique_tenant("round-trip");
-    let version = FhirVersion::default_enabled();
+    let version = crate::cassandra_node::test_fhir_version();
 
     let created = backend
         .create(&tenant, "Patient", patient("p1"), version)
@@ -169,7 +168,7 @@ async fn cassandra_create_assigns_an_id_when_the_resource_has_none() {
             &tenant,
             "Patient",
             json!({"resourceType": "Patient"}),
-            FhirVersion::default_enabled(),
+            crate::cassandra_node::test_fhir_version(),
         )
         .await
         .expect("create");
@@ -188,7 +187,7 @@ async fn cassandra_duplicate_create_is_already_exists() {
     let node = node_or_skip!("cassandra_duplicate_create_is_already_exists");
     let (backend, _cql) = setup(node).await;
     let tenant = unique_tenant("duplicate");
-    let version = FhirVersion::default_enabled();
+    let version = crate::cassandra_node::test_fhir_version();
     backend
         .create(&tenant, "Patient", patient("dup"), version)
         .await
@@ -216,7 +215,7 @@ async fn cassandra_concurrent_creates_of_one_id_make_exactly_one_resource() {
     let node = node_or_skip!("cassandra_concurrent_creates_of_one_id_make_exactly_one_resource");
     let (backend, _cql) = setup(node).await;
     let tenant = unique_tenant("race");
-    let version = FhirVersion::default_enabled();
+    let version = crate::cassandra_node::test_fhir_version();
     let attempts = (0..8).map(|i| {
         let mut body = patient("race");
         body["gender"] = json!(if i % 2 == 0 { "male" } else { "female" });
@@ -261,7 +260,7 @@ async fn cassandra_read_of_a_deleted_resource_is_gone() {
             &tenant,
             "Patient",
             patient("gone"),
-            FhirVersion::default_enabled(),
+            crate::cassandra_node::test_fhir_version(),
         )
         .await
         .expect("create");
@@ -302,7 +301,7 @@ async fn cassandra_create_writes_every_cell_and_no_null() {
     let node = node_or_skip!("cassandra_create_writes_every_cell_and_no_null");
     let (backend, cql) = setup(node).await;
     let tenant = unique_tenant("cells");
-    let version = FhirVersion::default_enabled();
+    let version = crate::cassandra_node::test_fhir_version();
     let started = Utc::now() - chrono::Duration::seconds(5);
     let created = backend
         .create(&tenant, "Patient", patient("cells"), version)
@@ -436,7 +435,7 @@ async fn cassandra_count_scans_resources_by_type() {
     let node = node_or_skip!("cassandra_count_scans_resources_by_type");
     let (backend, _cql) = setup(node).await;
     let tenant = unique_tenant("count");
-    let version = FhirVersion::default_enabled();
+    let version = crate::cassandra_node::test_fhir_version();
     assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
     assert_eq!(backend.count(&tenant, None).await.unwrap(), 0);
     for id in ["c1", "c2", "c3"] {
@@ -471,7 +470,12 @@ async fn cassandra_create_many_seeds_through_create() {
     let tenant = unique_tenant("many");
     let bodies: Vec<_> = (0..20).map(|i| patient(&format!("m{i}"))).collect();
     let results = backend
-        .create_many(&tenant, "Patient", bodies, FhirVersion::default_enabled())
+        .create_many(
+            &tenant,
+            "Patient",
+            bodies,
+            crate::cassandra_node::test_fhir_version(),
+        )
         .await;
     assert!(results.iter().all(Result::is_ok), "{results:?}");
     assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 20);
@@ -488,7 +492,7 @@ async fn cassandra_create_checks_permission_before_writing() {
             &reader,
             "Patient",
             patient("ro"),
-            FhirVersion::default_enabled(),
+            crate::cassandra_node::test_fhir_version(),
         )
         .await
     {
@@ -524,7 +528,7 @@ async fn cassandra_search_parameter_code_is_bounded_at_128_bytes() {
             "expression": "Patient.gender"
         })
     };
-    let version = FhirVersion::default_enabled();
+    let version = crate::cassandra_node::test_fhir_version();
     match backend
         .create(
             &tenant,

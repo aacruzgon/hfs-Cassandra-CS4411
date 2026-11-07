@@ -318,7 +318,6 @@ fn cql_comments_and_strings_do_not_split_statements() {
 mod testable_backend {
     use std::collections::HashSet;
 
-    use helios_fhir::FhirVersion;
     use helios_persistence::backends::cassandra::CassandraBackend;
     use helios_persistence::core::{BackendCapability, BackendKind, ResourceStorage};
     use helios_persistence::error::{ResourceError, StorageError};
@@ -431,7 +430,7 @@ mod testable_backend {
             &b.tenant(),
             "Patient",
             json!({"resourceType": "Patient", "id": extra}),
-            FhirVersion::default_enabled(),
+            crate::cassandra_node::test_fhir_version(),
         )
         .await
         .unwrap();
@@ -543,7 +542,7 @@ mod testable_backend {
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": id}),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .expect("create");
@@ -568,7 +567,7 @@ mod testable_backend {
                 ids.iter()
                     .map(|id| json!({"resourceType": "Patient", "id": id}))
                     .collect(),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await;
         assert!(results.iter().all(Result::is_ok), "{results:?}");

@@ -304,7 +304,7 @@ mod tests {
             last_updated: at,
             created_at: Some(at),
             deleted_at: deleted.then_some(at),
-            fhir_version: FhirVersion::default_enabled(),
+            fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
             write_ts: Some(at.timestamp_millis() * 1000),
             write_id: None,
             index_keys: Some(vec![1, 0]),
@@ -392,8 +392,7 @@ mod node_tests {
         Some(
             CassandraBackend::connect(CassandraConfig {
                 contact_points: vec![url],
-                data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
-                ..CassandraConfig::default()
+                ..crate::backends::cassandra::test_support::test_config()
             })
             .await
             .expect("connect"),
@@ -442,7 +441,13 @@ mod node_tests {
         body: Json,
     ) -> StorageResult<(StoredResource, bool)> {
         backend
-            .create_or_update(tenant, "Patient", "p", body, FhirVersion::default_enabled())
+            .create_or_update(
+                tenant,
+                "Patient",
+                "p",
+                body,
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
             .await
     }
 
@@ -459,7 +464,7 @@ mod node_tests {
                 "Patient",
                 "p",
                 body,
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
                 Seam {
                     before_cas: Some(step),
                 },
@@ -560,7 +565,9 @@ mod node_tests {
             Value::from(from + 1),
             Value::from(patient("Theirs").to_string()),
             Value::from(lu),
-            Value::from(FhirVersion::default_enabled().as_mime_param()),
+            Value::from(
+                crate::backends::cassandra::test_support::test_fhir_version().as_mime_param(),
+            ),
             Value::from(write_ts_of(lu)),
             Value::from(write_id),
             Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
@@ -600,7 +607,10 @@ mod node_tests {
         eprintln!("[cas case=upsert-a statements {spent}]");
         assert_eq!((v1.version_id(), created), ("1", true));
         assert_eq!(v1.created_at(), v1.last_modified());
-        assert_eq!(v1.fhir_version(), FhirVersion::default_enabled());
+        assert_eq!(
+            v1.fhir_version(),
+            crate::backends::cassandra::test_support::test_fhir_version()
+        );
         assert_eq!((spent.read, spent.serial_read, spent.cas), (1, 0, 1));
 
         let mut body = patient("Two");
@@ -664,7 +674,7 @@ mod node_tests {
                     "Patient",
                     id,
                     patient("Other"),
-                    FhirVersion::default_enabled(),
+                    crate::backends::cassandra::test_support::test_fhir_version(),
                 )
                 .await
                 .unwrap();
@@ -696,7 +706,7 @@ mod node_tests {
                     "Patient",
                     id,
                     patient("Smith"),
-                    FhirVersion::default_enabled(),
+                    crate::backends::cassandra::test_support::test_fhir_version(),
                 )
                 .await;
             assert!(
@@ -718,7 +728,7 @@ mod node_tests {
                 "Patient",
                 &longest,
                 patient("Smith"),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -809,7 +819,7 @@ mod node_tests {
                     "SearchParameter",
                     "sp",
                     long_code,
-                    FhirVersion::default_enabled()
+                    crate::backends::cassandra::test_support::test_fhir_version()
                 )
                 .await,
             Err(StorageError::Validation(_))
@@ -841,7 +851,7 @@ mod node_tests {
                                 t,
                                 "Patient",
                                 patient("Theirs1"),
-                                FhirVersion::default_enabled(),
+                                crate::backends::cassandra::test_support::test_fhir_version(),
                             )
                             .await
                             .unwrap();
@@ -1070,7 +1080,10 @@ mod node_tests {
                     Value::from(3),
                     Value::from(patient("Theirs").to_string()),
                     Value::from(lu),
-                    Value::from(FhirVersion::default_enabled().as_mime_param()),
+                    Value::from(
+                        crate::backends::cassandra::test_support::test_fhir_version()
+                            .as_mime_param(),
+                    ),
                     Value::from(write_ts_of(lu)),
                     Value::from(theirs),
                     Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
@@ -1360,7 +1373,7 @@ mod node_tests {
                 "SearchParameter",
                 "sp",
                 body,
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
         };
 

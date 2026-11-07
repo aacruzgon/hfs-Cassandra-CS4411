@@ -296,7 +296,7 @@ mod testable_backend {
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::cassandra::CassandraBackend;
     use helios_persistence::core::{BackendCapability, BackendKind, ResourceStorage};
-    use helios_persistence::error::{BackendError, ResourceError, StorageError};
+    use helios_persistence::error::{ResourceError, StorageError};
     use helios_persistence::tenant::TenantContext;
     use serde_json::json;
 
@@ -508,18 +508,30 @@ mod testable_backend {
         // apart needs a node that is down (L7's `/_readiness` check).
         backend.readiness_check().await.expect("readiness_check");
 
-        // The default `delete_versioned` reads first and answers NotFound for a
-        // missing id; the backend's stub refuses before reading.
+        // `delete_versioned` reaches the backend's compare-and-swap, not the
+        // trait default, which reads and then calls `delete`: that would be
+        // two pre-reads, where the backend's own needs one.
         let tenant = backend.tenant();
-        match backend
-            .delete_versioned(&tenant, "Patient", &unique_id("missing"), "1")
+        let id = unique_id("testable-delete");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default_enabled(),
+            )
             .await
-        {
-            Err(StorageError::Backend(BackendError::UnsupportedCapability {
-                backend_name,
-                ..
-            })) => assert_eq!(backend_name, "cassandra"),
-            other => panic!("delete_versioned went to the default: {other:?}"),
+            .expect("create");
+        let before = inner.statement_counts();
+        backend
+            .delete_versioned(&tenant, "Patient", &id, "1")
+            .await
+            .expect("delete_versioned");
+        let spent = inner.statement_counts().since(&before);
+        assert_eq!((spent.read, spent.cas), (1, 1), "{spent}");
+        match backend.delete_versioned(&tenant, "Patient", &id, "1").await {
+            Err(StorageError::Resource(ResourceError::NotFound { .. })) => {}
+            other => panic!("a repeated delete_versioned is NotFound: {other:?}"),
         }
 
         // `create_many` reaches the backend's `create`.

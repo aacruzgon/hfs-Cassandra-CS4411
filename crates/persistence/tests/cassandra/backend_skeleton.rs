@@ -142,13 +142,28 @@ async fn cassandra_stubs_refuse_with_unsupported_capability() {
         ),
         "update: {err:?}"
     );
+    // `delete` and `delete_versioned` are real from Step 3's L2b: an id that
+    // was never created is `NotFound` (REST answers the plain one with 204,
+    // ADR-aacruzgon-0052).
     let err = backend.delete(&tenant, "Patient", "p1").await.unwrap_err();
-    assert!(is_unsupported(&err), "delete: {err:?}");
+    assert!(
+        matches!(
+            err,
+            StorageError::Resource(helios_persistence::error::ResourceError::NotFound { .. })
+        ),
+        "delete: {err:?}"
+    );
     let err = backend
         .delete_versioned(&tenant, "Patient", "p1", "1")
         .await
         .unwrap_err();
-    assert!(is_unsupported(&err), "delete_versioned: {err:?}");
+    assert!(
+        matches!(
+            err,
+            StorageError::Resource(helios_persistence::error::ResourceError::NotFound { .. })
+        ),
+        "delete_versioned: {err:?}"
+    );
     let err = backend
         .vread(&tenant, "Patient", "p1", "1")
         .await

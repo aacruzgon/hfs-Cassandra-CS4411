@@ -873,10 +873,14 @@ def cmd_node_stats(args) -> int:
 # so a read of either that scans one means a CQL DELETE or a bound null reached
 # it. resources_by_type moves on every update and loses its row on every delete
 # (the X1 delta), so it is expected to show tombstones from Step 3 on.
+# The histogram's lowest bucket is 1: a read that scanned no tombstone reports
+# 1 (checked on a 5.0.9 node: a table never deleted from showed max 1.0, and
+# two deleted rows showed 2.0). So only a figure above 1 shows a tombstone.
+TOMBSTONE_FLOOR = 1
 CRUD_TOMBSTONE_TABLES = [
-    ("resources", "0: soft delete writes cells, never a tombstone (G39)"),
-    ("resource_versions", "0: history rows are never deleted (G39)"),
-    ("resources_by_type", "above 0 from Step 3: update and delete remove the X1 row"),
+    ("resources", "1 or less: soft delete writes cells, never a tombstone (G39)"),
+    ("resource_versions", "1 or less: history rows are never deleted (G39)"),
+    ("resources_by_type", "above 1 from Step 3: update and delete remove the X1 row"),
 ]
 
 
@@ -888,10 +892,11 @@ def crud_tombstone_rows(tombstones: dict) -> tuple[list[dict], str, list[str]]:
         row = tombstones.get(name, {})
         entry = {"table": name, "reads": row.get("count"), "max": row.get("max"), "p99": row.get("p99th"), "expected": expected}
         rows.append(entry)
-        if name != "resources_by_type" and (row.get("max") or 0) > 0:
-            warnings.append(f"Node statistics: a read of {name} scanned {row['max']:.0f} tombstone(s); it should never hold one (G39)")
+        if name != "resources_by_type" and (row.get("max") or 0) > TOMBSTONE_FLOOR:
+            warnings.append(f"Node statistics: a read of {name} scanned up to {row['max']:.0f} tombstones; it should never hold one (G39)")
     md = ("\n**Tombstones on the tables Step 3 writes** (`system_views.tombstones_per_read`, a recent, decaying "
-          "histogram; it shows tombstones that reads scanned, not every one written):\n\n")
+          "histogram; it shows tombstones that reads scanned, not every one written. Its lowest bucket is 1, so 1 also means "
+          "none: only a figure above 1 shows a tombstone):\n\n")
     md += table(["Table", "Reads", "Tombstones per read (max)", "(p99)", "Expected"],
                 [[f"`{r['table']}`", r["reads"], r["max"], r["p99"], r["expected"]] for r in rows])
     return rows, md, warnings

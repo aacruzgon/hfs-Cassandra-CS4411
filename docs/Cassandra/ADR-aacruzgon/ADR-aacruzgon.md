@@ -95,3 +95,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0048](2026-11-06/0048-more-ci-reports-node-and-build.md) | 2026-11-06 | More CI reports: the R4B build, cargo timings, the node's start, its JVM and container, hfs's memory, and the stored-SearchParameter load | accepted |
 | [0049](2026-11-06/0049-backport-upstream-2518.md) | 2026-11-06 | Carry upstream's versioned-`Location` fix (HeliosSoftware/hfs#2518) in the fork ahead of upstream, as `-x` cherry-picks | accepted |
 | [0052](2026-11-06/0052-backport-upstream-2529.md) | 2026-11-06 | A delete with nothing to delete answers 200/204, through upstream's fix (HeliosSoftware/hfs#2529) carried as a `-x` cherry-pick with one hunk left out | accepted |
+| [0056](2026-11-06/0056-backport-upstream-2530.md) | 2026-11-06 | A batch `ifMatch` PUT or DELETE is pinned to the version its gate checked, through upstream's fix (HeliosSoftware/hfs#2530) carried as a `-x` cherry-pick | accepted |

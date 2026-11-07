@@ -216,7 +216,7 @@ The data model splits a resource across several tables, so the resource row and 
 
 - **The REST layer checks `If-Match` itself** for single PUT, PATCH and DELETE. It returns 412 on a mismatch, then calls `ResourceStorage::update(tenant, current, resource)` or `delete_versioned`, and relies on that call as the compare-and-swap.
 - **Losing the race is a 409.** A writer that changed the row after the REST layer's read must get `ConcurrencyError::VersionConflict`. A row soft-deleted in that gap must make the swap miss (404). `tests/search/versioned_write_race_suite.rs` states this contract.
-- **`create_or_update` absorbs the race.** Every unconditional PUT goes through `create_or_update`: a single PUT without `If-Match`, and every batch PUT, with or without `ifMatch`. Its trait contract (`crates/persistence/src/core/storage.rs`, "# Concurrency", upstream #2111) makes an unconditional PUT last-writer-wins. Callers racing on one id must all succeed, with distinct versions and a complete history, and a `VersionConflict`, `AlreadyExists` or `NotFound` from a lost race must never reach the caller (ADR-aacruzgon-0024). So `create_or_update` is a loop of attempts:
+- **`create_or_update` absorbs the race.** Every unconditional PUT goes through `create_or_update`: a single PUT without `If-Match`, and every batch PUT without `ifMatch`. A batch PUT with `ifMatch` goes through `update`, a compare-and-swap against the row its gate checked, as a single PUT with `If-Match` does (upstream #2527, carried ahead of upstream as #2530, ADR-aacruzgon-0056). Its trait contract (`crates/persistence/src/core/storage.rs`, "# Concurrency", upstream #2111) makes an unconditional PUT last-writer-wins. Callers racing on one id must all succeed, with distinct versions and a complete history, and a `VersionConflict`, `AlreadyExists` or `NotFound` from a lost race must never reach the caller (ADR-aacruzgon-0024). So `create_or_update` is a loop of attempts:
     - **Each attempt** reads the row and picks create (C1), update (C2) or revive (C4). It takes a fresh `write_id`, computes `last_updated` and `write_ts` from that read, writes its own intent row (step 2, with a new `enqueued_at`), and runs the compare-and-swap.
     - **A definite miss** deletes that attempt's intent row and starts the next attempt at once, with no pause. A miss means another writer has committed, so the next read sees it.
     - **The bound.** At most 3 retries after definite misses, so 4 attempts in all. A fourth definite miss is returned as `VersionConflict` (409). This is the bound SQLite, PostgreSQL and MongoDB use (`MAX_CAS_RETRIES = 3`), and the one `tests/search/versioned_write_race_suite.rs` relies on: a writer can lose three times and succeed on its fourth attempt.
@@ -384,7 +384,7 @@ A related default also needs justification. The default no-op `ensure_writes_vis
 - the intent row's `write_id` (G32, kept as a diagnostic);
 - `_id` with a pipe (C2), the AND driver order (C5), `MaxPageSize` (C6), the composite 400 and `_has` through the shared resolver (C7), and `_filter` (C11).
 
-Batch `ifMatch` (G28) is the upstream window ADR-aacruzgon-0024 records. Nothing else is open.
+Batch `ifMatch` (G28), the upstream window ADR-aacruzgon-0024 recorded, is closed by the backport of upstream #2530 (ADR-aacruzgon-0056). Nothing else is open.
 
 ## What else the server expects from a primary backend
 

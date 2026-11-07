@@ -229,11 +229,11 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
     - if the version row or the index delta still fails after its retries, the write returns success and leaves its intent row for the sweeper, on every operation (G23, ADR-aacruzgon-0034, 0050);
     - `WriteTimeout` with `write_type = SIMPLE` is resolved by the same `LOCAL_SERIAL` read, never taken as applied (ADR-aacruzgon-0035);
     - every timeout is 504, and every unavailable node or replica failure is 503, as `crates/rest/src/error.rs` maps them.
-- `create_or_update` is one loop over create, update and revive. Each attempt does a fresh read, takes a fresh `write_id`, writes its own intent row (new `enqueued_at`), and runs the CAS. A definite miss retries at once, for at most 3 retries (4 attempts in all); a fourth definite miss is `VersionConflict` (409).
+- `create_or_update` is one loop over create, update and revive. Each attempt does a fresh read, takes a fresh `write_id`, writes its own intent row (new `enqueued_at`), and runs the CAS. A definite miss retries at once, for at most 3 retries (4 attempts in all); a fourth definite miss is `VersionConflict` (409), whatever it was, unlike SQLite, PostgreSQL and MongoDB (ADR-aacruzgon-0063). Before the first turn `check_id` refuses an id that is not a FHIR `id` with 400 (D11, ADR-aacruzgon-0064).
 - A plain `delete` that loses to an update retries once from its pre-read (G25); `delete_versioned` never retries.
 - Revive via `create_or_update` with `IF version_id = N` and no `deleted_at` condition, setting `deleted_at = 0`, returning `created = true` (201); `create` via `INSERT … IF NOT EXISTS` with `deleted_at = 0`; update and delete conditioned on `deleted_at = 0` (walkthrough G39).
 - Every reader that decides "deleted" tests `deleted_at > 0`: `read` (410), `exists`, `vread` (a marker), `_id`, the tag check, the CAS-miss mapping, the pre-reads, `create_or_update`'s branch choice and the sweeper (walkthrough section 2, "`deleted_at` and its readers").
-- `tenant.check_permission` at the start of every write.
+- `tenant.check_permission` at the start of every write; `create_or_update` checks it per turn after its pre-read, for the branch the read picks (ADR-aacruzgon-0063).
 - Stored SearchParameters stay current in the in-process overlay on update, delete and revive, not only on create: every definition per `url` is kept, a removal ordered by `last_updated` hides older versions from a reload, and every removal invalidates the tenant's registry (ADR-aacruzgon-0062).
 - An 8 MiB bound on what a CAS carries, 400 before any write, measured against the node (ADR-aacruzgon-0053).
 

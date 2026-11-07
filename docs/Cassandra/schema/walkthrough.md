@@ -320,7 +320,7 @@ SELECT DISTINCT tenant_id, resource_type FROM resources_by_type;
 
 ## 3. Writes
 
-Every write first calls `tenant.check_permission(Operation::…, resource_type)`; a refusal is a `TenantError` before any statement runs.
+Every write first calls `tenant.check_permission(Operation::…, resource_type)`; a refusal is a `TenantError` before any statement runs. The exception is `create_or_update`, whose operation depends on what its pre-read finds: each turn checks `Create` (branch a) or `Update` (branches b and c) after its R1 and before anything is written, as SQLite, PostgreSQL and MongoDB check inside `create`, `update` and `restore_deleted` (3.5, ADR-aacruzgon-0063).
 
 ### 3.1 Write-path skeleton (design steps 1 to 6)
 
@@ -428,7 +428,7 @@ A delete of an unknown or already-deleted id is `NotFound` from the backend, as 
 
 ### 3.5 Revive and `create_or_update` (`PUT` onto a deleted or unknown id; batch PUT)
 
-The REST update handler maps `Gone` to "no current resource" and calls `create_or_update`, a bounded loop (ADR-aacruzgon-0024). It is reached by every unconditional `PUT` and every batch `PUT` without `ifMatch`. A batch `PUT` with `ifMatch` calls `update` against the row its gate checked (G28). Each turn runs R1, whose `index_keys` is `K(N)` (G22), takes a fresh `w`, and writes a new I1 (new `enqueued_at`) with that turn's version, never rewriting an earlier turn's row. Then:
+The REST update handler maps `Gone` to "no current resource" and calls `create_or_update`, a bounded loop (ADR-aacruzgon-0024). It is reached by every unconditional `PUT` and every batch `PUT` without `ifMatch`. A batch `PUT` with `ifMatch` calls `update` against the row its gate checked (G28). Before the first turn, `check_id` refuses an id that is not a FHIR `id` with 400 `invalid` and no statement sent (D11, ADR-aacruzgon-0064). Each turn runs R1, whose `index_keys` is `K(N)` (G22), then the check against earlier unknown attempts (3.1, ADR-aacruzgon-0051), then the branch's permission (`Create` for a, `Update` for b and c) and, for a SearchParameter, the G38 `code` bound; a refusal there ends the call at once, unretried. The turn then takes a fresh `w`, and writes a new I1 (new `enqueued_at`) with that turn's version, never rewriting an earlier turn's row. Then:
 
 | Branch | Row | CAS | Not applied |
 | --- | --- | --- | --- |
@@ -438,7 +438,7 @@ The REST update handler maps `Gone` to "no current resource" and calls `create_o
 
 A definite miss starts the next turn at once, with no pause, for at most 3 retries, so 4 turns in all. An unknown outcome is settled first by the table in 3.1, from its own budget of 2 re-runs.
 
-Branches b and c write V3 for `N` at step 2, before the CAS (G40): branch b a content row from R1; branch c a delete marker, `deleted_at` set and `data` unset, although `resources.data` still holds the old content. After the CAS applies, steps 4 to 6 run as for update: V1 for `N+1`; inserts of `K(N+1)` (branch b also deletes `K(N) \ K(N+1)`), I2. Returned: branch a 201 (`created = true`); branch b 200 (`created = false`); branch c 201 (`created = true`, PostgreSQL parity; R4 and R4B http.html#update require 201 for a resource "brought back to life"); a fourth definite miss is `VersionConflict`, 409 (that turn's I2 already ran). On revive, `fhir_version` is the original from R1 (G13, ADR-aacruzgon-0024) and `created_at` is kept (G14, ADR-aacruzgon-0011).
+Branches b and c write V3 for `N` at step 2, before the CAS (G40): branch b a content row from R1; branch c a delete marker, `deleted_at` set and `data` unset, although `resources.data` still holds the old content. After the CAS applies, steps 4 to 6 run as for update: V1 for `N+1`; inserts of `K(N+1)` (branch b also deletes `K(N) \ K(N+1)`), I2. Returned: branch a 201 (`created = true`); branch b 200 (`created = false`); branch c 201 (`created = true`, PostgreSQL parity; R4 and R4B http.html#update require 201 for a resource "brought back to life"); a fourth definite miss is `VersionConflict`, 409, whatever the miss was (that turn's I2 already ran). SQLite, PostgreSQL and MongoDB return the last miss's own error there, so `AlreadyExists` or `NotFound` is possible on them; Cassandra answers 409 on purpose (ADR-aacruzgon-0063). A SearchParameter is noted in the overlay as `create` notes it on branch a, and replaced on branches b and c (ADR-aacruzgon-0062, 0063). On revive, `fhir_version` is the original from R1 (G13, ADR-aacruzgon-0024) and `created_at` is kept (G14, ADR-aacruzgon-0011).
 
 ## 4. Reads
 

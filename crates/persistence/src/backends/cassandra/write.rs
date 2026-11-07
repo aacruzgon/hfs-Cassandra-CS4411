@@ -2820,12 +2820,12 @@ mod node_tests {
     }
 
     fn tenant(case: &str) -> String {
-        format!("s2-resolve-{case}-{}", Uuid::new_v4().simple())
+        format!("test-resolve-{case}-{}", Uuid::new_v4().simple())
     }
 
     fn tenant_context(case: &str) -> TenantContext {
         TenantContext::new(
-            TenantId::new(format!("s3-engine-{case}-{}", Uuid::new_v4().simple())),
+            TenantId::new(format!("test-engine-{case}-{}", Uuid::new_v4().simple())),
             TenantPermissions::full_access(),
         )
     }
@@ -3580,7 +3580,7 @@ mod node_tests {
             return;
         };
         let key = RowKey {
-            tenant_id: "s3-engine-undecidable",
+            tenant_id: "test-engine-undecidable",
             resource_type: "Patient",
             id: "p",
         };

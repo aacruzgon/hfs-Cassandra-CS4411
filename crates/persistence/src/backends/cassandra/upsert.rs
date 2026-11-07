@@ -402,7 +402,7 @@ mod node_tests {
 
     fn tenant_with(case: &str, permissions: TenantPermissions) -> TenantContext {
         TenantContext::new(
-            TenantId::new(format!("s3-upsert-{case}-{}", Uuid::new_v4().simple())),
+            TenantId::new(format!("test-upsert-{case}-{}", Uuid::new_v4().simple())),
             permissions,
         )
     }

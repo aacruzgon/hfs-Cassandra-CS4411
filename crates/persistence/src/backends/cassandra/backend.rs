@@ -1603,7 +1603,7 @@ mod node_tests {
         let tenants: Vec<crate::tenant::TenantContext> = (0..4)
             .map(|n| {
                 crate::tenant::TenantContext::new(
-                    crate::tenant::TenantId::new(format!("s2-paging-{run}-{n}")),
+                    crate::tenant::TenantId::new(format!("test-paging-{n}-{run}")),
                     crate::tenant::TenantPermissions::full_access(),
                 )
             })
@@ -1649,7 +1649,9 @@ mod node_tests {
         // checked on the 5.0.9 node). This test never removes its own.
         let ours = |set: BTreeSet<(String, String)>| -> BTreeSet<(String, String)> {
             set.into_iter()
-                .filter(|(tenant, _)| tenant.starts_with(&format!("s2-paging-{run}-")))
+                .filter(|(tenant, _)| {
+                    tenant.starts_with("test-paging-") && tenant.ends_with(&format!("-{run}"))
+                })
                 .collect()
         };
         let (whole, paged) = (ours(keys(&whole)), ours(keys(&paged)));

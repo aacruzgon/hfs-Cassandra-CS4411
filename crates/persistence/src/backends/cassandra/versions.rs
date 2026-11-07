@@ -361,7 +361,7 @@ mod tests {
 /// `the_engine_updates_deletes_and_revives_through_c2_c3_and_c4` does, so
 /// these tests need neither L2a's `update` nor L2b's `delete`. The one
 /// exception is `delete_with_match_deletes_the_version_it_compared`, which
-/// needs L2b's `delete_versioned` and fails until L2b is merged.
+/// goes through L2b's `delete_versioned`.
 #[cfg(test)]
 mod node_tests {
     use helios_fhir::FhirVersion;
@@ -712,8 +712,7 @@ mod node_tests {
 
     /// A matching tag deletes exactly the version it named, through L2b's
     /// `delete_versioned` with the bare version: `W/"2"` reaches it as `2`
-    /// (Step 3 plan D1). Until L2b is merged, `delete_versioned` is a stub,
-    /// and this test fails with its `UnsupportedCapability("delete_versioned")`.
+    /// (Step 3 plan D1).
     #[tokio::test]
     async fn delete_with_match_deletes_the_version_it_compared() {
         let Some(backend) = backend().await else {

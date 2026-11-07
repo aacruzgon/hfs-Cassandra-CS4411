@@ -561,8 +561,9 @@ impl CassandraBackend {
     /// update to a body the overlay does not hold, records a removal; a
     /// definition the reload read at or before the removal's `last_updated`
     /// is an older version of a removed id, so it is dropped, whenever the
-    /// reload read it. Removals are kept until no reload that began before
-    /// them is still running.
+    /// reload read it. A removal is kept until a newer version of its id
+    /// replaces it (a revive, or an update back to a body the overlay holds),
+    /// whether this process notes it or a reload reads it ([`Removal::at`]).
     ///
     /// **Except when that row was not written.** `create` also notes a
     /// SearchParameter whose index row failed (it only warns, and the intent
@@ -728,7 +729,6 @@ impl CassandraBackend {
     /// force; the removal is kept, so that neither a reload begun before the
     /// delete nor a late note of an older version puts it back; and the
     /// tenant's cached registry is dropped.
-    #[allow(dead_code)] // L2b's delete calls it.
     pub(super) fn forget_stored_search_parameter(
         &self,
         tenant_id: &str,
@@ -788,8 +788,8 @@ impl CassandraBackend {
     }
 
     /// Removes `id` from `tenant_id`'s overlay as of `at`, records the
-    /// removal under a fresh sequence number, and drops the tenant's cached
-    /// registry: every removal invalidates (D9).
+    /// removal (the newest `at` per id, [`TenantOverlay::remove`]), and drops
+    /// the tenant's cached registry: every removal invalidates (D9).
     fn remove_stored_search_parameter(
         &self,
         tenant_id: &str,

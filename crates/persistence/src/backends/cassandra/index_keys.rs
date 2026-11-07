@@ -35,7 +35,6 @@ use std::fmt;
 pub(crate) const FORMAT_1: u8 = 0x01;
 
 /// The empty key set, `0x01 0x00`: a delete marker's.
-#[allow(dead_code)] // Written by Step 3's delete.
 pub(crate) const EMPTY: [u8; 2] = [FORMAT_1, 0x00];
 
 /// One index row, by the key columns the version row does not imply.
@@ -145,7 +144,6 @@ pub(crate) fn encode(keys: &[IndexKey]) -> Vec<u8> {
 }
 
 /// Decodes a format-1 key set.
-#[allow(dead_code)] // Read back by Step 3's update and delete, and the sweeper.
 pub(crate) fn decode(blob: &[u8]) -> Result<Vec<IndexKey>, DecodeError> {
     let mut reader = Reader { blob, at: 0 };
     let format = reader.byte()?;

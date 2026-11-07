@@ -10,7 +10,7 @@
 //! | SQLite | `sqlite` | Lightweight embedded database, great for development |
 //! | PostgreSQL | `postgres` | Full-featured RDBMS with JSONB support |
 //! | MongoDB | `mongodb` | Document store with native JSON support |
-//! | Cassandra | `cassandra` | Wide-column store; standalone primary, in progress (roadmap Step 2 done: `create`, `read` and `count`; every other storage method refuses with 501 until its step) |
+//! | Cassandra | `cassandra` | Wide-column store; standalone primary, in progress (roadmap Step 3): `create`, `read` and `count` are real, `exists`, `read_batch` and `create_many` work through the trait defaults' logic, and the other storage methods refuse with 501 until their step |
 //! | Elasticsearch | `elasticsearch` | Full-text search optimized |
 //! | S3 | `s3` | Object storage for bulk data |
 //!

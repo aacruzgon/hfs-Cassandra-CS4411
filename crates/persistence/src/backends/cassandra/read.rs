@@ -23,14 +23,17 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use cdrs_tokio::types::IntoRustByName;
+use cdrs_tokio::types::blob::Blob;
 use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
 use helios_fhir::{FhirResourceTypeProvider, FhirVersion};
+use uuid::Uuid;
 
 use super::backend::CassandraBackend;
 use super::errors::{BACKEND_NAME, map_driver_error};
+use super::index_keys::{self, IndexKey};
 use super::session::StatementKind;
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -75,6 +78,98 @@ pub(super) fn fhir_version_of(row: &Row) -> FhirVersion {
         .flatten()
         .and_then(|stored| FhirVersion::from_storage(&stored))
         .unwrap_or_else(FhirVersion::default_enabled)
+}
+
+/// An R1 row of `resources`, decoded: the pre-read every Step 3 write runs
+/// (`update`'s read of `K(N)`, the pre-reads of `delete`, `delete_versioned`
+/// and each `create_or_update` turn; walkthrough section 2, "Reads", and
+/// G22). [`CassandraBackend::read_resource_row`] reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResourceRow {
+    /// `N`.
+    pub(crate) version_id: i32,
+    /// The stored JSON; unset only if the row was written without it, which
+    /// the backend never does on `resources`.
+    pub(crate) data: Option<String>,
+    /// `lu(N)`.
+    pub(crate) last_updated: DateTime<Utc>,
+    /// When the resource was created; `None` if unset.
+    pub(crate) created_at: Option<DateTime<Utc>>,
+    /// `Some` only when `deleted_at > 0`: a delete marker. The live sentinel
+    /// 0 and an unset cell are both `None` (G39).
+    pub(crate) deleted_at: Option<DateTime<Utc>>,
+    /// The FHIR version the resource was created with, falling back to the
+    /// build's default as [`fhir_version_of`] does.
+    pub(crate) fhir_version: FhirVersion,
+    /// `write_ts(N)`, in microseconds.
+    pub(crate) write_ts: Option<i64>,
+    /// `w(N)`, the `write_id` of the CAS that wrote `N`.
+    pub(crate) write_id: Option<Uuid>,
+    /// `K(N)`, in the stored encoding (`index_keys.rs`).
+    pub(crate) index_keys: Option<Vec<u8>>,
+}
+
+impl ResourceRow {
+    /// Decodes a row of [`SELECT_RESOURCE`] (R1, or R2 at `LOCAL_SERIAL`).
+    /// `version_id` and `last_updated` must be readable; the rest may be
+    /// unset.
+    pub(crate) fn decode(row: &Row) -> StorageResult<Self> {
+        let version_id: i32 = row
+            .get_r_by_name("version_id")
+            .map_err(|error| internal(format!("pre-read: version_id: {error}")))?;
+        let last_updated: DateTime<Utc> = row
+            .get_r_by_name("last_updated")
+            .map_err(|error| internal(format!("pre-read: last_updated: {error}")))?;
+        let optional = |name: &str| -> StorageResult<()> {
+            if row.contains_column(name) {
+                Ok(())
+            } else {
+                Err(internal(format!("pre-read: no {name} column")))
+            }
+        };
+        for name in ["data", "created_at", "write_ts", "write_id", "index_keys"] {
+            optional(name)?;
+        }
+        Ok(Self {
+            version_id,
+            data: row
+                .get_by_name("data")
+                .map_err(|error| internal(format!("pre-read: data: {error}")))?,
+            last_updated,
+            created_at: row
+                .get_by_name("created_at")
+                .map_err(|error| internal(format!("pre-read: created_at: {error}")))?,
+            deleted_at: deleted_at_of(row)?,
+            fhir_version: fhir_version_of(row),
+            write_ts: row
+                .get_by_name("write_ts")
+                .map_err(|error| internal(format!("pre-read: write_ts: {error}")))?,
+            write_id: row
+                .get_by_name("write_id")
+                .map_err(|error| internal(format!("pre-read: write_id: {error}")))?,
+            index_keys: IntoRustByName::<Blob>::get_by_name(row, "index_keys")
+                .map_err(|error| internal(format!("pre-read: index_keys: {error}")))?
+                .map(Blob::into_vec),
+        })
+    }
+
+    /// Whether the row is a delete marker (`deleted_at > 0`).
+    #[allow(dead_code)] // L2's and L3's branch choice.
+    pub(crate) fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
+
+    /// `K(N)`, decoded from the stored `index_keys`. An unset or undecodable
+    /// key set is an error: it is never left unset, and guessing it would
+    /// leave index rows nobody deletes (G22).
+    #[allow(dead_code)] // L2's and L3's key sets.
+    pub(crate) fn keys(&self) -> StorageResult<Vec<IndexKey>> {
+        let blob = self
+            .index_keys
+            .as_deref()
+            .ok_or_else(|| internal("pre-read: index_keys is unset".to_string()))?;
+        index_keys::decode(blob).map_err(|error| internal(format!("pre-read: {error}")))
+    }
 }
 
 impl CassandraBackend {
@@ -138,6 +233,34 @@ impl CassandraBackend {
             None,
             fhir_version_of(row),
         )))
+    }
+
+    /// R1 at `LOCAL_QUORUM`: the current row of `(tenant_id, resource_type,
+    /// id)`, decoded, or `None` when there is none. A deleted row is
+    /// returned, with [`ResourceRow::deleted_at`] set; deciding what that
+    /// means is the caller's. Its failure is mapped as a plain read's (504
+    /// timed out, 503 failed).
+    #[allow(dead_code)] // The pre-read of L2's and L3's writes.
+    pub(crate) async fn read_resource_row(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<ResourceRow>> {
+        let rows = self
+            .session
+            .rows(
+                SELECT_RESOURCE,
+                vec![
+                    Value::from(tenant_id),
+                    Value::from(resource_type),
+                    Value::from(id),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .map_err(|error| StorageError::Backend(map_driver_error(&error, "pre-read")))?;
+        rows.first().map(ResourceRow::decode).transpose()
     }
 
     /// `ResourceStorage::count`; see the module docs.

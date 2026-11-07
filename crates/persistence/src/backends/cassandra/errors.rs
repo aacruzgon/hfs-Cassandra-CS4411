@@ -30,7 +30,9 @@
 //!   (503) for the first two;
 //! - an error code the driver does not know (`ErrorType::Unknown`) is an
 //!   unknown outcome, where this table gives `Internal` (500);
-//! - a `WriteTimeout` with `write_type = SIMPLE` means the CAS applied.
+//! - a `WriteTimeout` with `write_type = SIMPLE` is an unknown outcome like
+//!   any other `WriteTimeout`, confirmed by the serial read, never taken as
+//!   applied (ADR-aacruzgon-0035).
 //!
 //! A `WriteTimeout` or `WriteFailure` with `write_type = CAS` that the serial
 //! read cannot decide gets what this table gives: 504 and 503.
@@ -109,7 +111,8 @@ fn classify(error: &DriverError, operation: &str) -> BackendError {
                 message: format!("{operation}: {}", body.message),
             },
             // `Server`, `Protocol`, `Truncate`, `Unprepared` (the driver
-            // already re-prepared once), `Unknown` (a code the driver cannot
+            // already re-prepared and re-sent it, up to 5 times,
+            // `cluster/session.rs:65-70`, `:331-377`), `Unknown` (a code the driver cannot
             // name), and any variant a later driver adds (`ErrorType` is
             // `#[non_exhaustive]`).
             _ => internal(format!("{operation}: {}", body.message)),

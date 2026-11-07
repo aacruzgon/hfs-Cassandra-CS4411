@@ -16,7 +16,8 @@ use parking_lot::RwLock;
 use super::config::CassandraConfig;
 use super::errors::{BACKEND_NAME, map_driver_error};
 use super::schema;
-use super::session::{CassandraSession, DriverError, StatementKind};
+use super::session::{CassandraSession, DriverError, StatementCounts, StatementKind};
+use super::stats::{CasCounters, CasStats};
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::{
@@ -141,8 +142,8 @@ where
 ///
 /// Built with [`CassandraBackend::connect`]. It implements the twelve traits
 /// the server needs (`helios_rest::create_app`'s bound), plus [`Backend`] and
-/// [`SearchCapabilityProvider`](crate::core::SearchCapabilityProvider). Step 2
-/// serves only what the design's Milestone A needs; every other method returns
+/// [`SearchCapabilityProvider`](crate::core::SearchCapabilityProvider). The
+/// module docs say which methods are real; the rest return
 /// [`BackendError::UnsupportedCapability`], which the REST layer answers with
 /// 501.
 pub struct CassandraBackend {
@@ -156,6 +157,8 @@ pub struct CassandraBackend {
     /// Counts the SearchParameters this process has noted in the overlay
     /// ([`StoredDefinition::noted_at`]).
     note_seq: AtomicU64,
+    /// The write engine's outcome counters ([`Self::cas_stats`]).
+    pub(super) cas_counters: Arc<CasCounters>,
 }
 
 impl fmt::Debug for CassandraBackend {
@@ -233,7 +236,24 @@ impl CassandraBackend {
             registries,
             stored_by_tenant,
             note_seq: AtomicU64::new(0),
+            cas_counters: Arc::new(CasCounters::default()),
         })
+    }
+
+    /// The write engine's outcome counters since this backend was built:
+    /// attempts, applied, definite misses by kind, unknown outcomes by
+    /// trigger, serial and version reads, re-runs, undecidable outcomes and
+    /// post-CAS failures (Step 3 CI reports R2, R3 and R8). Subtract two
+    /// snapshots with [`CasStats::since`].
+    pub fn cas_stats(&self) -> CasStats {
+        self.cas_counters.snapshot()
+    }
+
+    /// How many statements of each kind this backend has sent since it was
+    /// built (Step 3 CI report R5). Subtract two snapshots with
+    /// [`StatementCounts::since`].
+    pub fn statement_counts(&self) -> StatementCounts {
+        self.session.statement_counts()
     }
 
     /// The configuration this backend was built with.
@@ -546,6 +566,43 @@ impl CassandraBackend {
         if inserted {
             self.registries.invalidate(tenant_id);
         }
+    }
+
+    /// Records that the stored SearchParameter `id` of `tenant_id` now holds
+    /// `resource`, written at `last_updated` by an update or a revive, and
+    /// drops the tenant's cached registry if that can change it (D9).
+    ///
+    /// **A stub until roadmap Step 3's L2a**, which keeps every stored
+    /// definition per `url` and replaces the one this `id` held. Until then
+    /// `update` and `create_or_update` are themselves stubs, so nothing calls
+    /// it and the overlay behaves as it did in Step 2.
+    #[allow(dead_code)] // L2a's update and L3's revive call it.
+    pub(super) fn replace_stored_search_parameter(
+        &self,
+        tenant_id: &str,
+        id: &str,
+        resource: &serde_json::Value,
+        last_updated: chrono::DateTime<chrono::Utc>,
+    ) {
+        let _ = (tenant_id, id, resource, last_updated);
+    }
+
+    /// Records that the stored SearchParameter `id` of `tenant_id` was
+    /// deleted at `deleted_at`, so that neither this overlay nor a reload
+    /// begun before the delete keeps it, and drops the tenant's cached
+    /// registry (D9).
+    ///
+    /// **A stub until roadmap Step 3's L2a**; see
+    /// [`Self::replace_stored_search_parameter`]. `delete` is a stub until
+    /// L2b, so nothing calls it yet.
+    #[allow(dead_code)] // L2b's delete calls it.
+    pub(super) fn forget_stored_search_parameter(
+        &self,
+        tenant_id: &str,
+        id: &str,
+        deleted_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let _ = (tenant_id, id, deleted_at);
     }
 
     /// Lists the tables of the configured keyspace and fails unless all ten
@@ -928,7 +985,10 @@ mod restart_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_backend_recovers_after_its_node_restarts() {
         let (Ok(url), Ok(container)) = (std::env::var(URL), std::env::var(CONTAINER)) else {
-            eprintln!("skipping: set {URL} and {CONTAINER} to a node of the test's own");
+            // Not "skipping": the required job runs --lib against its own
+            // node, and ci-report.py's test report flags a live test that
+            // skips there. This one needs a node it may stop, never that one.
+            eprintln!("not run: set {URL} and {CONTAINER} to a node of the test's own");
             return;
         };
         let backend = CassandraBackend::connect(CassandraConfig {

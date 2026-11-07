@@ -591,7 +591,7 @@ jobs:
               --test cassandra_tests --test backend_capability_contract -- --show-output 2>&1 \
             | tee "$RUNNER_TEMP/ci-report/logs/persistence-tests.log"
 
-      # The backend's unit tests, so every engine test gates the pull request:
+      # The backend's unit tests, so every engine test gates the pull request (ADR-aacruzgon-0054):
       # the pure ones (CAS classification, the miss mapping, decide(V), the
       # key delta, the binds, the no-DELETE source scan) and the live ones in
       # write.rs and backend.rs, against this node. backend.rs's restart_tests

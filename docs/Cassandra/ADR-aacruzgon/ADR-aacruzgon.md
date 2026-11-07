@@ -98,3 +98,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0051](2026-11-06/0051-late-earlier-attempt.md) | 2026-11-06 | After an unknown outcome, a later attempt checks every earlier attempt before it acts on what it sees | accepted |
 | [0052](2026-11-06/0052-backport-upstream-2529.md) | 2026-11-06 | A delete with nothing to delete answers 200/204, through upstream's fix (HeliosSoftware/hfs#2529) carried as a `-x` cherry-pick with one hunk left out | accepted |
 | [0053](2026-11-06/0053-cas-size-bound.md) | 2026-11-06 | An 8 MiB bound on what a compare-and-swap carries, refused with 400 before any write | accepted |
+| [0054](2026-11-06/0054-required-job-lib-step.md) | 2026-11-06 | The required Cassandra job runs the backend's `--lib` tests | accepted |

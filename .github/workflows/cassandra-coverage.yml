@@ -188,7 +188,7 @@ jobs:
 
       # With the node's URL, so the node_tests modules in write.rs and
       # backend.rs run instead of skipping. The required job runs the same
-      # --lib tests (fmt-clippy-cassandra.yml, Step 3); this run measures
+      # --lib tests (fmt-clippy-cassandra.yml, ADR-aacruzgon-0054); this run measures
       # their coverage.
       - name: Backend unit tests (--lib, backends::cassandra) against this node
         run: |

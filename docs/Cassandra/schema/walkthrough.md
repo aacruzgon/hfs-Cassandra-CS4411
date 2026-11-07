@@ -15,7 +15,7 @@ Code facts were checked against the working tree on 2026-10-13 (`crates/persiste
 1. Conventions
 2. Statement catalogue
 3. Writes: create, update, delete, revive
-4. Reads: read, vread, list_versions
+4. Reads: read, vread, list_versions, and delete_with_match
 5. Search
 6. The sweeper
 7. Worked example: one Patient, four versions
@@ -463,6 +463,10 @@ R3 at `LOCAL_QUORUM`, partition `resource_versions (T,P,id)`, one row. `vid` is 
 ### 4.3 list_versions
 
 R4 at `LOCAL_QUORUM`, one partition. `ORDER BY version_id ASC` reverses the clustering order, which a single-partition query may do (or read `DESC` and reverse in Rust). Returns `["1", "2", …]`, numerically ordered past 9 because `version_id` is an `int`; an unknown id gives an empty list. The race suite requires "no gap, no duplicate"; V3 before the CAS keeps that through any number of crashes (G2, G40).
+
+### 4.4 delete_with_match
+
+`VersionedStorage::delete_with_match(…, expected_version)` takes the client's `If-Match` field value (`W/"1"`, a list, `*`), not a bare version, and is Step 3's, with `vread` and `list_versions` (ADR-aacruzgon-0060). `Operation::Delete`; R1 (absent or `deleted_at > 0`: `NotFound`); the field is compared with R1's version by the shared `if_match_field_satisfied`, and a mismatch is `VersionConflict` with nothing written; then `delete_versioned` with R1's bare version, which runs 3.4 from its own R1. So the compare-and-swap is `delete_versioned`'s, and a writer landing after the comparison makes it miss rather than being deleted with it (#1404). It costs two R1s (`read=2 write=5 cas=1`).
 
 ## 5. Search
 

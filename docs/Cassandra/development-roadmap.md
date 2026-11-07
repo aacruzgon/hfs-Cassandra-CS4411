@@ -54,7 +54,7 @@ flowchart TD
 
 ### Progress matrix
 
-One row per checkable item, grouped by step; the milestone column says which gate it feeds. Update the row in the same commit that completes the item, and put the pull request or commit in the evidence column. Status: ☐ not started · ◐ in progress · ✅ done. Owner codes are the ones used in section 4 (**W** wiring owner, **A** to **E** as suggested there).
+One row per checkable item, grouped by step; the milestone column says which gate it feeds. Update the row in the same commit that completes the item, and put the pull request or commit in the evidence column. Status: ☐ not started · ◐ in progress · ✅ done. Owner codes are the ones used in section 4 (**W** wiring owner, **A** to **E** as suggested there); **X** means not assigned yet: the group decides.
 
 | # | Item | Milestone | Owner | Status | Date | Evidence |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -85,39 +85,39 @@ One row per checkable item, grouped by step; the milestone column says which gat
 | 3.2 | CAS outcome mapping (404/409 from condition columns; 410 only from `read`/`vread`), timeout and failure handling (`WriteTimeout`/`WriteFailure` with `CAS`, `CAS_WRITE_UNKNOWN`, `SIMPLE`, serial-read timeout; 504 or 503), the `create_or_update` retry loop and the plain-delete retry (ADR-aacruzgon-0024) | B | A | ☐ | | |
 | 3.3 | `crud_suite.rs`'s tests, as an adapted copy with a parity test and four Cassandra-strict tests (ADR-aacruzgon-0057), and every test in `search/versioned_write_race_suite.rs` pass, `concurrent_puts_onto_a_tombstone_all_succeed` included | B | A | ✅ | 2026-11-07 | `tests/cassandra/crud.rs`: upstream's 88 CRUD tests on fresh tenants, `crud::parity::crud_copy_matches_upstream` against `tests/crud/` and the four `crud::strict::cassandra_strict_*` tests, 94 in all; the race suite's five wrappers in `tests/cassandra_tests.rs` (`step3_suites`, four on 8 worker threads, 10 rounds), `cassandra_concurrent_puts_onto_a_tombstone_all_succeed` included (ADR-aacruzgon-0057; PR #60). In the required job, run 42401552753: `cassandra_tests` 172/172, every `crud::` and race test passing, no CAS budget run out |
 | 3.4 | 410 after delete, 200 after revive; the node's CQL audit log shows no CQL `DELETE` against `resources` or `resource_versions`, checked in the required Cassandra job (ADR-aacruzgon-0058) | B | A | ✅ | 2026-11-07 | `step3_crud_through_rest` in `crates/hfs/tests/cassandra_milestone_a.rs`, through `hfs`: `GET` after `DELETE` 410 (R-3, and D-4 after a second `DELETE`), the marker's vread 410 (V-1), the revive's `PUT` 201 and the `GET` after it 200 (U-14); the step "Check the CQL audit log for a DELETE on resources or resource_versions" (ADR-aacruzgon-0058; PR #60). In the required job, run 42401552753: 109 HL7 rows, 0 mismatches; the audit check passed on 32,652 entries (31,159 DML in `helios`), with no violation |
-| 4.1 | `VersionedStorage` real; `versioning_suite.rs` and `search/conditional_if_match_suite.rs` pass; `list_versions` numeric order past 9 | B | A | ☐ | | |
-| 5.1 | Index maintenance on every write with fixed timestamps; every batch under 5 KiB on the fixtures | B | A | ☐ | | |
-| 5.2 | Sweeper: 32 partitions polled, grace period, the current version's keys from the `resources` row's `index_keys`, previous keys from row V−1's `index_keys`, which always exists for V > 1 (G40), intent deleted; it never compares `write_id` | B | B | ☐ | | |
-| 5.3 | Repair-on-read hook | B | B | ☐ | | |
-| 5.4 | Index-versus-fresh-extraction consistency utility passes after any write sequence | B | B | ☐ | | |
-| 6.1 | Search framework entry validation and every documented rejection with its status code | B | B | ☐ | | |
-| 6.2 | `_id`, `_lastUpdated`, unfiltered type search, `search_count`, `_count=0` | B | B | ☐ | | |
-| 6.3 | Streaming AND/OR, dedupe on `(last_updated, id)`, candidate cap (distinct candidates point-read; 422 `TooManyResults`, G27), `next_cursor` always minted | B | B | ☐ | | |
-| 6.4 | `search/meta_params_suite.rs` and `total_mode_suite.rs` pass; `large_id_set_suite.rs::large_id_set_search_count_cursor_not_and_tenant` passes up to its `:not` block; the token, date and URI cases of `empty_value_suite.rs` pass as a copy in `tests/cassandra/` (section 5) | B | B | ☐ | | |
-| 6a | Token: four forms, implicit system merge, case-sensitive, pipe form on ContactPoint and boolean matched by the general rules (`coverage.md` C4); `token_code_system_suite.rs` passes as a copy in `tests/cassandra/` without its `:not` cases, and without `system_qualified_tokens_in_chains` (section 5) | B | C | ☐ | | |
-| 6b | Date: both tables, nine prefixes, residual filter; `date_boundary` and `date_precision` suites pass, and the date-prefix cases of `date_period_suite` pass as a copy in `tests/cassandra/` (section 5); parity with PostgreSQL on the fixtures | B | D | ☐ | | |
-| 6c | URI: exact match; coverage-table cases pass; trailing-slash variant does not match | B | C | ☐ | | |
-| 6d | Cursor paging: default order, reserved bucket slot, `InvalidCursor`; 100,000 resources paged with no duplicates or gaps | B | D | ☐ | | |
-| 6.5 | Multitenancy suites pass (`tenant_id_fidelity`, `tenant_existence`, `multitenancy_suite`) | B | B | ☐ | | |
+| 4.1 | `VersionedStorage` real: `vread`, `list_versions` and `delete_with_match` since Step 3 (ADR-aacruzgon-0060), `update_with_match` at Step 4; `versioning_suite.rs` passes, and `search/conditional_if_match_suite.rs` or what replaces it (pending Step 4's ADR: the suite cannot pass on Cassandra, Step 4's handover); `list_versions` numeric order past 9; `Versioning` declared (ADR-aacruzgon-0037) | B | X | ☐ | | |
+| 5.1 | Index maintenance on every write with fixed timestamps; every batch under 5 KiB on the fixtures | B | X | ☐ | | |
+| 5.2 | Sweeper: 32 partitions polled, grace period, the current version's keys from the `resources` row's `index_keys`, previous keys from row V−1's `index_keys`, which always exists for V > 1 (G40), intent deleted; it never compares `write_id` | B | X | ☐ | | |
+| 5.3 | Repair-on-read hook | B | X | ☐ | | |
+| 5.4 | Index-versus-fresh-extraction consistency utility passes after any write sequence | B | X | ☐ | | |
+| 6.1 | Search framework entry validation and every documented rejection with its status code | B | X | ☐ | | |
+| 6.2 | `_id`, `_lastUpdated`, unfiltered type search, `search_count`, `_count=0` | B | X | ☐ | | |
+| 6.3 | Streaming AND/OR, dedupe on `(last_updated, id)`, candidate cap (distinct candidates point-read; 422 `TooManyResults`, G27), `next_cursor` always minted | B | X | ☐ | | |
+| 6.4 | `search/meta_params_suite.rs` and `total_mode_suite.rs` pass; `large_id_set_suite.rs::large_id_set_search_count_cursor_not_and_tenant` passes up to its `:not` block; the token, date and URI cases of `empty_value_suite.rs` pass as a copy in `tests/cassandra/` (section 5) | B | X | ☐ | | |
+| 6a | Token: four forms, implicit system merge, case-sensitive, pipe form on ContactPoint and boolean matched by the general rules (`coverage.md` C4); `token_code_system_suite.rs` passes as a copy in `tests/cassandra/` without its `:not` cases, and without `system_qualified_tokens_in_chains` (section 5) | B | X | ☐ | | |
+| 6b | Date: both tables, nine prefixes, residual filter; `date_boundary` and `date_precision` suites pass, and the date-prefix cases of `date_period_suite` pass as a copy in `tests/cassandra/` (section 5); parity with PostgreSQL on the fixtures | B | X | ☐ | | |
+| 6c | URI: exact match; coverage-table cases pass; trailing-slash variant does not match | B | X | ☐ | | |
+| 6d | Cursor paging: default order, reserved bucket slot, `InvalidCursor`; 100,000 resources paged with no duplicates or gaps | B | X | ☐ | | |
+| 6.5 | Multitenancy: a `count_by_tenant` override for the Tenants UI and `/admin/tenants`, from ADR-aacruzgon-0041's partition-key scan. The two CRUD-only suite tests run since Step 3, and the rest are out of scope (section 5, ADR-aacruzgon-0060) | B | X | ☐ | | |
 | 7.1 | `supported_param_types` and `supports_history` hooks; handler filters parameters and omits history; existing capabilities tests green for all backends | B | W | ☐ | | |
 | 7.2 | `GET /metadata` on Cassandra lists only token, date and URI parameters and no history interactions | B | W | ☐ | | |
 | 7.3 | Handler patch opened upstream as its own pull request | C | W | ☐ | | |
-| 8.1 | Failure tests in section 6 pass on the single node | B | E | ☐ | | |
+| 8.1 | Failure tests in section 6 pass on the single node | B | X | ☐ | | |
 | 8.2 | **Milestone B**: all items 2.1 to 8.1 done and CI green | B | W | ☐ | | |
-| 8.3 | Failure tests pass on the three-node cluster | C | E | ☐ | | |
-| 8.4 | Benchmarks on both backends: raw CSVs, environment record, `nodetool` histograms, tombstones per read | C | E | ☐ | | |
-| 8.5 | Measure-first triggers in section 7 evaluated and the outcome recorded | C | E | ☐ | | |
+| 8.3 | Failure tests pass on the three-node cluster | C | X | ☐ | | |
+| 8.4 | Benchmarks on both backends: raw CSVs, environment record, `nodetool` histograms, tombstones per read | C | X | ☐ | | |
+| 8.5 | Measure-first triggers in section 7 evaluated and the outcome recorded | C | X | ☐ | | |
 | 8.6 | Demonstration script passes on Cassandra and on PostgreSQL in CI | C | all | ☐ | | |
-| 8.7 | Inferno test kit (`utils/inferno-test-kit/`): capability-truth, CRUD and versioning, supported-search and declared-rejection groups; every test passes against Cassandra, in the UI and headless in CI | C | C | ☐ | | |
-| 8.8 | The same kit against PostgreSQL: capability-truth, CRUD and supported-search groups pass; the rejection group fails as expected and the contrast is recorded for the report | C | C | ☐ | | |
-| 8.9 | One-off US Core v3.1.1 server-suite run against Cassandra, headless, pinned kit version; results JSON kept; every failure mapped to a declared rejection or a CapabilityStatement line | C | A | ☐ | | |
+| 8.7 | Inferno test kit (`utils/inferno-test-kit/`): capability-truth, CRUD and versioning, supported-search and declared-rejection groups; every test passes against Cassandra, in the UI and headless in CI | C | X | ☐ | | |
+| 8.8 | The same kit against PostgreSQL: capability-truth, CRUD and supported-search groups pass; the rejection group fails as expected and the contrast is recorded for the report | C | X | ☐ | | |
+| 8.9 | One-off US Core v3.1.1 server-suite run against Cassandra, headless, pinned kit version; results JSON kept; every failure mapped to a declared rejection or a CapabilityStatement line | C | X | ☐ | | |
 | 8.10 | README Cassandra column and the upstream touch list updated | C | W | ☐ | | |
 | 8.11 | Report draft reviewed by all five | C | all | ☐ | | |
 | 8.12 | **Milestone C**: all items done; artifacts in section 11 committed with the commit hash | C | all | ☐ | | |
 
 ## 4. Steps in detail
 
-Each step lists goal, tasks, exit criterion, and who. "Who" is a suggested split for five people and can be reshuffled; the owner of shared files (called **W** below) does not change mid-project.
+Each step lists goal, tasks, exit criterion, and who. "Who" is a suggested split for five people and can be reshuffled; the owner of shared files (called **W** below) does not change mid-project. From Step 4 on, **X** means not assigned yet: the group decides who takes each step and makes that step's decisions, and Alan audits them (ADR-aacruzgon-0060).
 
 Each step also lists **Spec**: the FHIR pages to have open while implementing it. R4 is normative for this project; a build link appears only where the design document's "What the FHIR specification requires" table says the build differs, and that table remains the one-page summary of the rules. Links were checked on 2026-10-13.
 
@@ -211,6 +211,11 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 
 **Tasks.**
 - `update`, `delete`, `create_or_update`, `delete_versioned`, `exists`, `read_batch` (concurrent point reads); `count` is real since Step 2 (ADR-aacruzgon-0033).
+- `vread`, `list_versions` and `delete_with_match`, pulled forward from Step 4 because the race suite calls them; `delete_with_match` checks the client's `If-Match` field value against a pre-read, then calls `delete_versioned` with the bare version (ADR-aacruzgon-0060). Milestone A's `GET` of the create's `Location` then answers 200 with version 1.
+- PATCH (JSON Patch and FHIRPath Patch) works through `update` with no backend code, and is tested through REST: 200 with `ETag: W/"N+1"`, 412 for a stale `If-Match`, 410 for a deleted resource with no revive (ADR-aacruzgon-0060; [R4 #patch](https://hl7.org/fhir/R4/http.html#patch)).
+- The delete marker: `resource_versions` row N+1 has `deleted_at` and `last_updated` set to the delete's instant, `data` unset and `index_keys` the empty set, so vread of it is 410 and a later history entry can carry its time (walkthrough 3.4).
+- `step3_crud_through_rest` in `crates/hfs/tests/cassandra_milestone_a.rs`, a required step of the Cassandra job, checks Step 3's statuses through REST, one `[spec row=…]` line per HL7 row (ADR-aacruzgon-0059).
+- The two multitenancy tests that need only CRUD, `distinct_tenant_ids_never_share_data` and `child_data_is_not_the_parents`, run on Cassandra (section 5; ADR-aacruzgon-0060).
 - The six-step write path from the design: permission check and extraction; on update, delete and revive, a rewrite of the row for N from `current` at `write_ts(N) − 1` before the intent row (ADR-aacruzgon-0012, moved before the CAS by ADR-aacruzgon-0027, walkthrough G40; one more round trip on those operations); intent row; CAS with `last_updated(N+1) = max(now_ms, last_updated(N) + 1 ms)`, `write_ts = last_updated × 1000` and `write_id`; `resource_versions` row for N+1; index batches under 5 KiB (only the `resources_by_type` row until step 5, ADR-aacruzgon-0033); intent delete and return.
 - CAS outcome handling (ADR-aacruzgon-0024):
     - not-applied rows are mapped from the returned condition columns to 404 (no row, or deleted in the gap) or 409 (other version, or an existing row on `IF NOT EXISTS`), and that attempt's intent row is deleted;
@@ -243,22 +248,22 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 
 **Goal.** `VersionedStorage` is real.
 
-**Tasks.** `vread`, `list_versions`, `current_version`, `update_with_match` and `delete_with_match` (same CAS, returning `VersionConflict`), delete markers as version rows with no content, `version_id int` ordering verified past 9.
+**Tasks.** `update_with_match` (a pre-read, then `update`'s compare-and-swap; which error a mismatch returns is open for the Step 4 group, see the handover; with the G38 `code` bound), and `current_version` if it is overridden; `version_id int` ordering verified past 9. `vread`, `list_versions`, `delete_with_match` and the delete markers are real since Step 3 (ADR-aacruzgon-0060).
 
 **Spec.** [R4 http.html#vread](https://hl7.org/fhir/R4/http.html#vread) (`GET [type]/[id]/_history/[vid]`; a deleted version should return 410; `versionId` is opaque to clients but we keep it a counter) and [R4 http.html#history](https://hl7.org/fhir/R4/http.html#history) for the shape of a delete marker, which we store even though the history interactions themselves are not offered (see step 7). `update_with_match` and `delete_with_match` implement [R4 http.html#concurrency](https://hl7.org/fhir/R4/http.html#concurrency) at the storage layer. `versioning: versioned` is defined in [versioning-policy](https://hl7.org/fhir/R4/valueset-versioning-policy.html).
 
 **Cassandra docs.** [SELECT](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/dml.html#select-statement) with [ORDER BY](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/dml.html#ordering-clause) and [LIMIT](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/dml.html#limit-clause) on one partition, and [clustering order](https://cassandra.apache.org/doc/5.0/cassandra/developing/cql/ddl.html#clustering-order) (`version_id DESC`).
 
-**Exit criterion.** `versioning_suite.rs` and `search/conditional_if_match_suite.rs` pass; vread of a deleted version returns 410; `list_versions` returns 12 versions in numeric order; Milestone A's `GET` of the create's `Location` answers `200 OK` with version 1, replacing its 501 assertion (ADR-aacruzgon-0049).
+**Exit criterion.** `versioning_suite.rs` and `search/conditional_if_match_suite.rs` pass (the second pending Step 4's ADR: it cannot pass on Cassandra, see the handover below); vread of a deleted version returns 410; `list_versions` returns 12 versions in numeric order; `Versioning` is declared in the same commit (ADR-aacruzgon-0037). Milestone A's `GET` of the create's `Location` already answers `200 OK` with version 1 since Step 3 (ADR-aacruzgon-0049, 0060).
 
-**Who.** **A**.
+**Who.** **X**.
 
 ### Step 5 · Index writes and the sweeper
 
 **Goal.** Every create, update and delete maintains the six index tables and `resources_by_type`, and a crash between the CAS and the index writes is healed automatically.
 
 **Tasks.**
-- `SearchParameterExtractor::extract` for the new key set on every write; the old key set from the `resources` row's `index_keys`, read at the version the CAS is conditioned on, never re-extracted (one extra read, for `update` only; ADR-aacruzgon-0027, walkthrough G22); write the new set in the CAS as `resources.index_keys` and as the version row's `index_keys`; diff old and new key sets; deletes and upserts `USING TIMESTAMP write_ts`; batches grouped under the warn threshold and sent concurrently; `BATCH` vs `BATCH_LOG` timeout handling.
+- `SearchParameterExtractor::extract` for the new key set on every write; the old key set from the `resources` row's `index_keys`, read at the version the CAS is conditioned on, never re-extracted (one extra read, for `update` only, done since Step 3 for the `resources_by_type` row; ADR-aacruzgon-0027, 0060, walkthrough G22); write the new set in the CAS as `resources.index_keys` and as the version row's `index_keys`; diff old and new key sets; deletes and upserts `USING TIMESTAMP write_ts`; batches grouped under the warn threshold and sent concurrently; `BATCH` vs `BATCH_LOG` timeout handling.
 - `pending_index_writes` sweeper as a backend-owned background task:
     - Poll interval and grace period come from config.
     - It polls the 16 shards of the current and previous hour bucket, each from an in-memory low-water mark on `enqueued_at`. After each poll the mark moves to `now − grace`. At startup it first scans the 25 most recent buckets in one-minute slices (ADR-aacruzgon-0014 and 0015).
@@ -267,7 +272,7 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
     - One sweeper per Helios process, with no lease row. Several processes would duplicate reads only, since every replay writes the same cells at the same timestamps (G12, ADR-aacruzgon-0027).
 - Repair on read hook (used by step 6): given a mismatched tag, re-run index maintenance for the current version inline at its `write_ts`, with the `index_keys` of the `resources` row the tag check read. Delete the stale key only if the current version does not produce it; otherwise upsert it with the current tag (ADR-aacruzgon-0017).
 - Measure and record batch sizes per fixture resource; assert the largest fixture stays under 5 KiB per batch.
-- Refuse to store a SearchParameter whose `code` is over 128 bytes in UTF-8, with 400 `ValidationError::InvalidResource`, and measure each row's `param` in the step 1 size check (ADR-aacruzgon-0027, walkthrough G38). Measure and record `index_keys` sizes per fixture resource, next to its `data`.
+- Measure each row's `param` in the step 1 size check, as a backstop for the 128-byte bound on a stored SearchParameter's `code` (ADR-aacruzgon-0027, walkthrough G38). The bound itself is checked on `create` since Step 2, on `update` and `create_or_update` since Step 3, and on `update_with_match` from Step 4 (ADR-aacruzgon-0034, 0060). Measure and record `index_keys` sizes per fixture resource, next to its `data`.
 
 **Spec.** What gets extracted is defined by each SearchParameter's `expression` ([R4 SearchParameter](https://hl7.org/fhir/R4/searchparameter.html), evaluated with [FHIRPath](https://hl7.org/fhir/R4/fhirpath.html)); the shared extractor already does this and we only store its output. Which elements feed a token, date or uri key is listed per type in [R4 search.html#token](https://hl7.org/fhir/R4/search.html#token), [#date](https://hl7.org/fhir/R4/search.html#date) and [#uri](https://hl7.org/fhir/R4/search.html#uri), and per resource in [Patient](https://hl7.org/fhir/R4/patient.html#search) and [Observation](https://hl7.org/fhir/R4/observation.html#search). The requirement the sweeper exists to meet is [R4 search.html#currency](https://hl7.org/fhir/R4/search.html#currency): search results must reflect the current state of the resources, so a committed write that is missing from an index table is a correctness bug, not a performance one.
 
@@ -275,7 +280,7 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 
 **Exit criterion.** After any sequence of writes on the fixtures, a full scan of each index table matches a fresh extraction of every live resource (a test utility does this comparison), and every version row's `index_keys` decodes to exactly the rows its version wrote; the crash-window tests in section 6 pass; batch size assertion passes.
 
-**Who.** **A** on the write path, **B** on the sweeper.
+**Who.** **X** on the write path, **X** on the sweeper.
 
 ### Step 6 · Search framework
 
@@ -301,16 +306,16 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 
 **Exit criterion.** `search/meta_params_suite.rs` (for `_id` and `_lastUpdated`) and `search/total_mode_suite.rs` pass, and the token, date and URI cases of `search/empty_value_suite.rs` pass as a copy in `tests/cassandra/`; a test asserts each rejection above returns the documented status, and `tests/cassandra/` pins the rows of section 5 that name Step 6's own tests (C2, C7, C11); the four scope rows of section 5 pass (C7, #2501), a gate: Cassandra search is not signed off while they fail; a search with no parameters pages through 1,000 fixtures with no duplicates and no gaps.
 
-**Who.** **B**.
+**Who.** **X**.
 
 ### Steps 6a to 6d · Search types and paging (parallel, one file each)
 
 | Step | File | Scope | Exit criterion | Who |
 | --- | --- | --- | --- | --- |
-| 6a Token | `search/token.rs` | `code`, `system\|code`, `\|code`, `system\|`; `''` sentinel; `IMPLICIT_TOKEN_SYSTEM` two-partition merge; case-sensitive matching; the pipe form on ContactPoint and boolean elements accepted and matched by the general token rules, as SQLite and PostgreSQL do (`coverage.md` C4, ADR-aacruzgon-0027) | the cases of `search/token_code_system_suite.rs` that use no modifier pass, as a copy in `tests/cassandra/` (section 5): `system_qualified_tokens_match_code_elements` without its five `:not` cases, and `unmarked_rows_keep_their_old_behaviour` without its `:not` case, with the marker-stripping step that test needs written in CQL; `system_qualified_tokens_in_chains` (chains over a reference parameter) is out; a token search for a code present under two systems returns each resource once | **C** |
-| 6b Date | `search/date.rs` | `date_index` and `date_index_by_end`; slice choice per prefix per the design (`ge` as the single slice `end > s`); `RangePredicate::matches` on every row; native paging in the table's order with the table named in the cursor; `ne` and comma lists over both tables read `date_index`, then `date_index_by_end`; one sliced date and residuals for the rest; candidate cap (G20, ADR-aacruzgon-0027) | `search/date_boundary_suite.rs` and `date_precision_suite.rs` pass; the prefix cases of `date_period_suite.rs::period_targets_are_ranges` (Encounter, Procedure and ServiceRequest, without its `_sort`, forward-chain and `_has` assertions) pass as a copy in `tests/cassandra/`; every prefix verified against PostgreSQL on the same fixtures | **D** |
-| 6c URI | `search/uri.rs` | exact, case- and accent-sensitive whole-URI match on `uri_index` | the URI cases from the coverage table pass; a trailing-slash variant does not match | **C** |
-| 6d Cursor | `search/paging.rs` | `PageCursor` with millisecond RFC 3339 and reserved bucket slot; `(last_updated, id) < (?, ?)` slices; `InvalidCursor` on malformed input; no `previous` on page one, no `next` after the last | `search/pagination_tests.rs` adapted to the backend passes; paging through all 100,000 benchmark resources, with no writes during the run, yields exactly 100,000 distinct ids (keyset paging on a changing key can skip a resource updated mid-run: walkthrough G21) | **D** |
+| 6a Token | `search/token.rs` | `code`, `system\|code`, `\|code`, `system\|`; `''` sentinel; `IMPLICIT_TOKEN_SYSTEM` two-partition merge; case-sensitive matching; the pipe form on ContactPoint and boolean elements accepted and matched by the general token rules, as SQLite and PostgreSQL do (`coverage.md` C4, ADR-aacruzgon-0027) | the cases of `search/token_code_system_suite.rs` that use no modifier pass, as a copy in `tests/cassandra/` (section 5): `system_qualified_tokens_match_code_elements` without its five `:not` cases, and `unmarked_rows_keep_their_old_behaviour` without its `:not` case, with the marker-stripping step that test needs written in CQL; `system_qualified_tokens_in_chains` (chains over a reference parameter) is out; a token search for a code present under two systems returns each resource once | **X** |
+| 6b Date | `search/date.rs` | `date_index` and `date_index_by_end`; slice choice per prefix per the design (`ge` as the single slice `end > s`); `RangePredicate::matches` on every row; native paging in the table's order with the table named in the cursor; `ne` and comma lists over both tables read `date_index`, then `date_index_by_end`; one sliced date and residuals for the rest; candidate cap (G20, ADR-aacruzgon-0027) | `search/date_boundary_suite.rs` and `date_precision_suite.rs` pass; the prefix cases of `date_period_suite.rs::period_targets_are_ranges` (Encounter, Procedure and ServiceRequest, without its `_sort`, forward-chain and `_has` assertions) pass as a copy in `tests/cassandra/`; every prefix verified against PostgreSQL on the same fixtures | **X** |
+| 6c URI | `search/uri.rs` | exact, case- and accent-sensitive whole-URI match on `uri_index` | the URI cases from the coverage table pass; a trailing-slash variant does not match | **X** |
+| 6d Cursor | `search/paging.rs` | `PageCursor` with millisecond RFC 3339 and reserved bucket slot; `(last_updated, id) < (?, ?)` slices; `InvalidCursor` on malformed input; no `previous` on page one, no `next` after the last | `search/pagination_tests.rs` adapted to the backend passes; paging through all 100,000 benchmark resources, with no writes during the run, yields exactly 100,000 distinct ids (keyset paging on a changing key can skip a resource updated mid-run: walkthrough G21) | **X** |
 
 **Spec for 6a to 6d.**
 - **6a Token:** [R4 search.html#token](https://hl7.org/fhir/R4/search.html#token) (four forms; literal, case-sensitive matching; `_id` always case-sensitive; no pipe form on ContactPoint, uri or boolean elements), [#escaping](https://hl7.org/fhir/R4/search.html#escaping) (`\|` and `\,` inside values), and the source datatypes [Coding](https://hl7.org/fhir/R4/datatypes.html#Coding), [CodeableConcept](https://hl7.org/fhir/R4/datatypes.html#CodeableConcept), [Identifier](https://hl7.org/fhir/R4/datatypes.html#Identifier), [ContactPoint](https://hl7.org/fhir/R4/datatypes.html#ContactPoint), [code](https://hl7.org/fhir/R4/datatypes.html#code), [boolean](https://hl7.org/fhir/R4/datatypes.html#boolean). The build adds `id` to the token table ([build #token](https://build.fhir.org/search.html#token)).
@@ -367,7 +372,7 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 
 **Exit criterion.** Raw CSVs for every configuration committed with the commit hash and environment record; failure-test log committed; demo script passes on both backends in CI; the Inferno kit passes on Cassandra in CI and its PostgreSQL contrast and the US Core mapping are committed; report draft reviewed by all five.
 
-**Who.** **E** leads benchmarks and failure tests; **C** writes the Inferno kit after 6a and 6c land; **A** runs the US Core leg on the inherited workflow; everyone contributes to the demo and report.
+**Who.** **X** leads benchmarks and failure tests; **X** writes the Inferno kit after 6a and 6c land; **X** runs the US Core leg on the inherited workflow; everyone contributes to the demo and report.
 
 ## 5. Test gates by step
 
@@ -390,7 +395,7 @@ The shared suites live under `crates/persistence/tests/` and are `#[path]`-inclu
 | `search/fhir_version_filter_suite.rs` | — | Not in CI. It needs a test build with both the `R4` and `R5` features, which no CI job makes (the clippy jobs compile `--all-features` but run nothing, and functional tests stay on R4, `cassandra-discussion.md`). It also pages by `_offset` and uses `_contained`, both refused. Its first-page, cursor, count, `_total` and `search_ids` cases are run by hand on an R4+R5 build, as a copy in `tests/cassandra/` (ADR-aacruzgon-0026) |
 | `search/pagination_tests.rs` | 6d | Yes, cursor cases only; offset cases must be skipped via the harness capability flags |
 | `search/large_id_set_suite.rs` | 6 | Partly: `large_id_set_search_count_cursor_not_and_tenant` up to its `_id:not` block (`:not` is refused), which exercises `_id` lists and `read_batch`; not `wide_chain_and_nested_has` (chains and `_has`) |
-| `multitenancy/tenant_id_fidelity_suite.rs`, `tenant_existence_suite.rs`, `multitenancy_suite.rs` | 3 | Yes |
+| `multitenancy/tenant_id_fidelity_suite.rs`, `tenant_existence_suite.rs`, `multitenancy_suite.rs` | 3 | Partly (ADR-aacruzgon-0060): `distinct_tenant_ids_never_share_data` and `child_data_is_not_the_parents` run, whose discovery half passes trivially while `count_by_tenant` is the trait's empty default. Not `tenant_has_resources_matches_discovery`, which needs `register_tenant`, `deregister_tenant` and `purge_tenant_data`; not `purging_one_tenant_leaves_the_look_alikes_intact`, which needs `PurgableStorage` (`$purge` is 501, ADR-aacruzgon-0040); not `multitenancy_suite.rs`, which is SQLite-only. A `count_by_tenant` override is row 6.5's |
 | `transactions/if_match_suite.rs` | 4 | Yes if it uses single-resource PUT; transaction-bundle cases are out |
 | `search/modifier_parity_suite.rs`, `sort_*`, `string_tests.rs`, `number_*`, `quantity_tests.rs`, `reference_tests.rs`, `chained_tests.rs`, `include_tests.rs`, `contained_suite.rs`, `composite_*`, `fts_*` | — | No: unsupported parameter types, modifiers, sort, chaining, include, contained, composite, full text |
 | `transactions_suite.rs`, `transactions/bundle_*`, `rollback_tests.rs`, `conditional_*` | — | No: transactions and conditional operations are ✗ |

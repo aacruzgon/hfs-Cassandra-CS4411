@@ -49,8 +49,10 @@
 //!   then [`decide`](CassandraBackend::decide) against every `write_id` the
 //!   request has used. "Unchanged" re-runs the attempt, with a fresh
 //!   `write_id`, `last_updated` and intent, after a 5 to 25 ms pause, at most
-//!   [`UNKNOWN_OUTCOME_RERUNS`] times per request. R2's own error is mapped
-//!   as a plain statement's, never classified as a CAS (ADR-aacruzgon-0050).
+//!   [`UNKNOWN_OUTCOME_RERUNS`] times per request. R2's and R3's own errors
+//!   are never classified as a CAS (ADR-aacruzgon-0050): a timeout is 504,
+//!   and every other error is 503, since the write may have applied
+//!   ([`map_lookup_error`]; D3 sub-decision 4, ADR-aacruzgon-0055).
 //! - **An earlier attempt may apply late** (ADR-aacruzgon-0051). Once any
 //!   attempt's outcome was unknown, every later look at the row is first
 //!   matched against it: a definite miss (C1's returned row, or an R2 after
@@ -1173,6 +1175,30 @@ fn already_exists(resource_type: &str, id: &str) -> StorageError {
     })
 }
 
+/// The error of R2 or R3, which run only after a CAS whose outcome is
+/// unknown, so the write may have applied (D3 sub-decision 4,
+/// ADR-aacruzgon-0055). A timeout keeps the plain table's 504, and an
+/// unavailable node, a replica failure or a lost connection its 503.
+/// Whatever the plain table would make 500 (`Internal` or `QueryError`: a
+/// `Server` error, an unmatched stream id, a row that cannot be decoded) is
+/// 503 too, never reported as a server bug for a write that may be stored.
+/// The client-facing message names no host; [`map_driver_error`] logs the
+/// driver's detail.
+fn map_lookup_error(error: &DriverError, operation: &str) -> StorageError {
+    StorageError::Backend(match map_driver_error(error, operation) {
+        mapped @ (BackendError::Timeout { .. }
+        | BackendError::Unavailable { .. }
+        | BackendError::ConnectionFailed { .. }) => mapped,
+        _ => BackendError::Unavailable {
+            backend_name: BACKEND_NAME.to_string(),
+            message: format!(
+                "the write's outcome could not be read back ({operation} failed); \
+                 it may have been stored"
+            ),
+        },
+    })
+}
+
 /// ADR-aacruzgon-0053: refuses, before anything is written, a write whose CAS would carry
 /// more than [`MAX_CAS_PAYLOAD_BYTES`]. A larger mutation cannot succeed,
 /// and under Paxos v2 the node may refuse it only at the commit, after
@@ -1478,15 +1504,15 @@ impl CassandraBackend {
             .session
             .rows(SELECT_VERSION_WRITE_ID, values, StatementKind::Read)
             .await
-            .map_err(|error| StorageError::Backend(map_driver_error(&error, "version read")))?;
+            .map_err(|error| map_lookup_error(&error, "version read"))?;
         let row_v = rows.first().map(CurrentRow::of).and_then(|r| r.write_id);
         Ok(decide_from_version_row(&write_ids, row_v))
     }
 
-    /// R2 at `LOCAL_SERIAL`. Its own error is mapped as a plain statement's
-    /// (504 for a timeout, `WriteTimeout`/CAS included, which Paxos v2's read
-    /// can raise, `Paxos.java:893-901`; 503 for a failure), never classified
-    /// as a CAS (ADR-aacruzgon-0050).
+    /// R2 at `LOCAL_SERIAL`. Its own error is never classified as a CAS
+    /// (ADR-aacruzgon-0050): 504 for a timeout, `WriteTimeout`/CAS included,
+    /// which Paxos v2's read can raise (`Paxos.java:893-901`), and 503 for
+    /// anything else ([`map_lookup_error`]).
     async fn serial_read(&self, request: &CasRequest<'_>) -> StorageResult<Option<CurrentRow>> {
         let result = self
             .session
@@ -1497,8 +1523,7 @@ impl CassandraBackend {
             )
             .await;
         request.stats.serial_read(result.is_err());
-        let rows = result
-            .map_err(|error| StorageError::Backend(map_driver_error(&error, "serial read")))?;
+        let rows = result.map_err(|error| map_lookup_error(&error, "serial read"))?;
         Ok(rows.first().map(CurrentRow::of))
     }
 
@@ -2007,6 +2032,65 @@ mod tests {
                 "serial read"
             ),
             BackendError::Unavailable { .. }
+        ));
+    }
+
+    /// ADR-aacruzgon-0055: after an unknown outcome, R2's and R3's own
+    /// errors are 504 for a timeout and 503 for everything else; what the
+    /// plain table makes 500 (`Server`, `Invalid`, an unmatched stream id, a
+    /// decode error) is 503, since the write may have applied.
+    #[test]
+    fn an_r2_or_r3_error_is_504_for_a_timeout_and_503_otherwise() {
+        let read_timeout =
+            ErrorType::ReadTimeout(cdrs_tokio::frame::message_error::ReadTimeoutError::new(
+                Consistency::LocalSerial,
+                0,
+                1,
+                false,
+            ));
+        let timeouts = [
+            server(write_timeout(WriteType::Cas)),
+            server(read_timeout),
+            DriverError::Deadline {
+                after: Duration::from_millis(12_000),
+                sent: true,
+            },
+        ];
+        let others = [
+            server(ErrorType::Server),
+            server(ErrorType::Invalid),
+            server(ErrorType::Overloaded),
+            DriverError::from(CdrsError::General("Unmatched stream id: 17".to_string())),
+            DriverError::from(CdrsError::General(
+                "Connection closed when writing data!".to_string(),
+            )),
+            DriverError::from(CdrsError::General("cannot decode column data".to_string())),
+        ];
+        for operation in ["serial read", "version read"] {
+            for error in &timeouts {
+                assert!(
+                    matches!(
+                        map_lookup_error(error, operation),
+                        StorageError::Backend(BackendError::Timeout { .. })
+                    ),
+                    "{operation}: {error:?}"
+                );
+            }
+            for error in &others {
+                match map_lookup_error(error, operation) {
+                    StorageError::Backend(
+                        BackendError::Unavailable { message, .. }
+                        | BackendError::ConnectionFailed { message, .. },
+                    ) => assert!(!message.contains("127.0.0.1"), "{message}"),
+                    other => panic!("{operation}: {error:?} gave {other:?}"),
+                }
+            }
+        }
+        // The plain table itself is unchanged: the same `Server` error on any
+        // other statement is still 500.
+        assert!(matches!(
+            map_driver_error(&server(ErrorType::Server), "intent row"),
+            BackendError::Internal { .. }
         ));
     }
 

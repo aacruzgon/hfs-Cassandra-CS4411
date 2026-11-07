@@ -771,8 +771,13 @@ jobs:
           dir="$RUNNER_TEMP/ci-report/inputs/cql-audit"
           mkdir -p "$dir"
           # Still on: a log that stopped early would leave writes unchecked.
+          # Written to the file first, then grepped: grep -q exits at its
+          # first match, so behind a tee under pipefail the tee could die of
+          # SIGPIPE (141) and fail the check although the log was enabled.
           docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool getauditlog \
-            | tee "$dir/getauditlog.txt" | grep -Eq '^enabled[[:space:]]+true' \
+            > "$dir/getauditlog.txt"
+          cat "$dir/getauditlog.txt"
+          grep -Eq '^enabled[[:space:]]+true' "$dir/getauditlog.txt" \
             || { echo "::error title=CQL audit (Step 3 exit criterion)::the audit log was not enabled at the end of the tests"; exit 1; }
           docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool disableauditlog
           docker exec -e MAX_HEAP_SIZE=256M hfs-cassandra-ci-cassandra-1 /opt/cassandra/tools/bin/auditlogviewer /opt/cassandra/logs/audit \

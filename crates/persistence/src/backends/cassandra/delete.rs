@@ -395,7 +395,7 @@ mod node_tests {
     use crate::backends::cassandra::index_keys::{self, IndexKey};
     use crate::backends::cassandra::session::{Fault, StatementKind};
     use crate::backends::cassandra::write::normalized_body;
-    use crate::core::ResourceStorage;
+    use crate::core::{ResourceStorage, SearchProvider};
     use crate::error::BackendError;
     use crate::tenant::{TenantId, TenantPermissions};
 
@@ -1350,6 +1350,218 @@ mod node_tests {
         assert_eq!(
             (stats.undecidable, stats.version_reads, stats.miss_retries),
             (1, 1, 0)
+        );
+    }
+
+    /// A stored, `active` SearchParameter `id` on Patient, with `url` and
+    /// `expression`.
+    fn search_parameter(id: &str, url: &str, expression: &str) -> Json {
+        serde_json::json!({
+            "resourceType": "SearchParameter",
+            "id": id,
+            "url": url,
+            "name": id,
+            "status": "active",
+            "description": "a stored SearchParameter for delete.rs's node tests",
+            "code": format!("delete-{id}"),
+            "base": ["Patient"],
+            "type": "token",
+            "expression": expression,
+        })
+    }
+
+    /// The expression in force for `url` in `tenant`'s registry, which a
+    /// search would use.
+    fn expression_of(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        url: &str,
+    ) -> Option<String> {
+        backend
+            .search_param_registry(tenant)
+            .read()
+            .get_by_url(url)
+            .map(|definition| definition.expression.clone())
+    }
+
+    /// D9 with L2a's overlay, through `delete`: deleting the SearchParameter
+    /// in force for a `url` brings back the other definition of that `url`,
+    /// and deleting that one as well leaves none. The removals hold: a
+    /// reload in this process, and one in a new process, bring nothing back.
+    #[tokio::test]
+    async fn a_searchparameter_delete_takes_it_out_of_the_overlay() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("sp-overlay");
+        let t = tenant.tenant_id().as_str();
+        let url = format!("http://example.org/SearchParameter/{t}");
+        let version = FhirVersion::default_enabled();
+        for (id, expression) in [("a", "Patient.gender"), ("b", "Patient.birthDate")] {
+            backend
+                .create(
+                    &tenant,
+                    "SearchParameter",
+                    search_parameter(id, &url, expression),
+                    version,
+                )
+                .await
+                .expect("create");
+        }
+        // `b` is the later write (and the higher id), so it is in force.
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.birthDate")
+        );
+
+        backend
+            .delete(&tenant, "SearchParameter", "b")
+            .await
+            .expect("delete b");
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.gender"),
+            "deleting b brings a back"
+        );
+        backend
+            .delete(&tenant, "SearchParameter", "a")
+            .await
+            .expect("delete a");
+        assert_eq!(expression_of(&backend, &tenant, &url), None);
+
+        let held = backend
+            .load_stored_search_parameters(t)
+            .await
+            .expect("reload");
+        assert_eq!(
+            (held, expression_of(&backend, &tenant, &url)),
+            (0, None),
+            "reload in this process"
+        );
+        let restarted = self::backend().await.expect("connect");
+        let held = restarted
+            .load_stored_search_parameters(t)
+            .await
+            .expect("reload");
+        assert_eq!(
+            (held, expression_of(&restarted, &tenant, &url)),
+            (0, None),
+            "reload in a new process"
+        );
+    }
+
+    /// The `!applied.superseded` gate in [`CassandraBackend::deleted`]. This
+    /// process's delete wrote marker 2, and before it learned so, another
+    /// instance revived the parameter as version 3 (C4), so the engine
+    /// answers the delete applied and superseded (G36). This process's
+    /// overlay still holds version 1 and the id is live: recording the
+    /// removal would take its `url` out of force until the next reload.
+    ///
+    /// The engine's superseded answer is W1's, tested in `write.rs`
+    /// (`a_superseded_earlier_attempt_is_ours_with_its_rows_left_to_the_sweeper`).
+    /// The fault seam has no point between a delete's C3 and its R2 at which
+    /// another writer can revive, and an earlier attempt can be built only
+    /// inside `write.rs`. So this test writes the marker and the revive
+    /// through the engine and hands `deleted` the C3's own `Applied`, once as
+    /// superseded and once as it came back.
+    #[tokio::test]
+    async fn a_superseded_searchparameter_delete_leaves_the_overlay_alone() {
+        let (Some(backend), Some(other)) = (backend().await, backend().await) else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("sp-superseded");
+        let t = tenant.tenant_id().as_str();
+        let url = format!("http://example.org/SearchParameter/{t}");
+        backend
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter("s", &url, "Patient.gender"),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .expect("create");
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.gender")
+        );
+        let key = RowKey {
+            tenant_id: t,
+            resource_type: "SearchParameter",
+            id: "s",
+        };
+
+        // This process's C3, through the engine but not through `delete`, so
+        // `deleted` has not run yet.
+        let row = backend
+            .read_resource_row(t, "SearchParameter", "s")
+            .await
+            .expect("R1")
+            .expect("version 1");
+        let mut request = backend.cas_request("delete", key);
+        let plan = CasPlan::delete(PreviousVersion::from_row(&row).unwrap());
+        let applied = match backend.run_cas(&mut request, plan).await.unwrap() {
+            CasOutcome::Applied(applied) => applied,
+            other => panic!("the delete: {other:?}"),
+        };
+        assert_eq!((applied.version_id, applied.superseded), (2, false));
+
+        // Another instance, with its own overlay, revives it as version 3.
+        let marker = other
+            .read_resource_row(t, "SearchParameter", "s")
+            .await
+            .expect("R1")
+            .expect("the marker");
+        let (json, data) = normalized_body(
+            "create",
+            "SearchParameter",
+            "s",
+            search_parameter("s", &url, "Patient.birthDate"),
+        )
+        .unwrap();
+        let plan = CasPlan::revive(
+            PreviousVersion::from_row(&marker).unwrap(),
+            json,
+            data,
+            vec![IndexKey::ResourcesByType],
+        );
+        let mut revive = other.cas_request("create", key);
+        match other.run_cas(&mut revive, plan).await.unwrap() {
+            CasOutcome::Applied(revived) => assert_eq!(revived.version_id, 3),
+            outcome => panic!("the revive: {outcome:?}"),
+        }
+
+        // Superseded: the overlay is left alone, and `url` stays in force.
+        let superseded = Applied {
+            version_id: applied.version_id,
+            last_updated: applied.last_updated,
+            write_id: applied.write_id,
+            superseded: true,
+            post_cas_complete: false,
+            plan: applied.plan.clone(),
+        };
+        backend.deleted(t, "SearchParameter", "s", &superseded);
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.gender"),
+            "a superseded delete leaves the overlay alone"
+        );
+        // The same delete, not superseded, takes `url` out of force: the gate
+        // is what kept it.
+        backend.deleted(t, "SearchParameter", "s", &applied);
+        assert_eq!(expression_of(&backend, &tenant, &url), None);
+
+        // A reload reads version 3, and the removal at lu(2) does not hold it
+        // back.
+        let held = backend
+            .load_stored_search_parameters(t)
+            .await
+            .expect("reload");
+        assert_eq!(
+            (held, expression_of(&backend, &tenant, &url).as_deref()),
+            (1, Some("Patient.birthDate"))
         );
     }
 }

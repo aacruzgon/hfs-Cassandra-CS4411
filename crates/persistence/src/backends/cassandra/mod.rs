@@ -13,12 +13,12 @@
 //! so far: the connection, the health and schema checks, the capability
 //! declaration, the per-tenant search-parameter registries, the shared write
 //! engine every compare-and-swap goes through (`write.rs`,
-//! ADR-aacruzgon-0050), and, through it, `create`, `update`, `delete` and
-//! `delete_versioned`; `read`, `count`, `exists`, `read_batch`, `vread`,
-//! `list_versions` and `delete_with_match`; and the stored-SearchParameter
-//! overlay. `create_many` works through the trait default's logic, on
-//! `create`. `create_or_update` (Step 3, L3), `update_with_match` (Step 4)
-//! and every other storage, search and history method refuse with
+//! ADR-aacruzgon-0050), and, through it, `create`, `update`, `delete`,
+//! `delete_versioned` and `create_or_update`; `read`, `count`, `exists`,
+//! `read_batch`, `vread`, `list_versions` and `delete_with_match`; and the
+//! stored-SearchParameter overlay. `create_many` works through the trait
+//! default's logic, on `create`. `update_with_match` (Step 4) and every
+//! other storage, search and history method refuse with
 //! [`BackendError::UnsupportedCapability`](crate::error::BackendError), which
 //! the REST layer answers with 501. Each is replaced in its own file
 //! (`storage.rs` lists them).

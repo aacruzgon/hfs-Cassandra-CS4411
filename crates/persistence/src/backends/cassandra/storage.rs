@@ -9,7 +9,7 @@
 //! | `read`, `count` | `read.rs` | real |
 //! | `update` | `update.rs`, on the write engine | real (Step 3, L2a) |
 //! | `delete`, `delete_versioned` | `delete.rs`, on the write engine | real (Step 3, L2b) |
-//! | `create_or_update` | `upsert.rs` | stub (Step 3, L3) |
+//! | `create_or_update` | `upsert.rs`, on the write engine | real (Step 3, L3), including revive |
 //! | `vread`, `list_versions`, `delete_with_match` | `versions.rs` | real (Step 3, L2c; pulled forward from Step 4, D1) |
 //! | `exists`, `read_batch` | `versions.rs` | real (Step 3, L2c): `exists` reads only `deleted_at`, `read_batch` reads concurrently (D10) |
 //! | `update_with_match` | here | stub (Step 4) |

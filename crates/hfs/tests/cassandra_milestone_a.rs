@@ -8,8 +8,8 @@
 //!   `[base]/Patient/[id]/_history/1`, `ETag: W/"1"`, `meta.versionId` "1"
 //!   and a `meta.lastUpdated` instant; `GET /Patient/[id]` is `200 OK` with
 //!   the same resource, version and ETag. A `GET` of the `Location` itself
-//!   reaches [#vread], which the backend does not serve before roadmap
-//!   Step 4.
+//!   is a [#vread] of version 1, `200 OK` with the same resource (Step 3
+//!   plan D1, D19), and a version past it is `404 Not Found`.
 //! - **Readiness**: `/_readiness` is `200` with the node up, `503` once it is
 //!   stopped, and `200` again once it is back, after which the round trip
 //!   works again (the `cdrs-tokio` session recovers by itself once the node
@@ -389,31 +389,28 @@ async fn round_trip(hfs: &Hfs) {
     assert_eq!(read["meta"]["lastUpdated"], last_updated, "{read}");
     assert_eq!(read["name"], body["name"], "{read}");
 
-    // The `Location` is a vread (R4 http.html#vread). The backend leaves
-    // `vread` to roadmap Step 4, so today it routes to the vread handler and
-    // answers 501 `not-supported`, not a 404. Step 4 makes this `200 OK` with
-    // version 1: assert that then, as `read` is asserted above.
+    // The `Location` is a vread (R4 http.html#vread), real from Step 3
+    // (plan D1, D19): version 1, the resource as the read gave it. "The
+    // returned resource SHALL have an id element with a value that is the
+    // [id], and a meta.versionId element with a value of [vid]."
     let vread = client
         .get(&location)
         .send()
         .await
         .expect("GET of the create's Location");
-    assert_eq!(
-        vread.status(),
-        StatusCode::NOT_IMPLEMENTED,
-        "GET {location} (vread)"
-    );
-    let outcome: Value = vread.json().await.expect("the vread's body is JSON");
-    assert_eq!(outcome["resourceType"], "OperationOutcome", "{outcome}");
-    assert_eq!(outcome["issue"][0]["code"], "not-supported", "{outcome}");
-    // The backend's stub names the capability (`unsupported("vread")`), so a
-    // 501 from anywhere else fails here.
-    assert!(
-        outcome["issue"][0]["details"]["text"]
-            .as_str()
-            .is_some_and(|d| d.contains("'vread'")),
-        "{outcome}"
-    );
+    assert_eq!(vread.status(), StatusCode::OK, "GET {location} (vread)");
+    assert_eq!(header(&vread, ETAG), "W/\"1\"", "ETag of the vread");
+    let vread: Value = vread.json().await.expect("the vread's body is JSON");
+    assert_eq!(vread, read, "GET {location} (vread)");
+
+    // A version the resource never had is 404 (R4 http.html, the summary
+    // table's vread row: 200, 404).
+    let unknown = client
+        .get(format!("{}/Patient/{id}/_history/2", hfs.base))
+        .send()
+        .await
+        .expect("GET of version 2");
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND, "GET _history/2");
 }
 
 fn header(response: &reqwest::Response, name: reqwest::header::HeaderName) -> String {

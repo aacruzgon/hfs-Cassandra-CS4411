@@ -164,11 +164,9 @@ async fn cassandra_stubs_refuse_with_unsupported_capability() {
         ),
         "delete_versioned: {err:?}"
     );
-    let err = backend
-        .vread(&tenant, "Patient", "p1", "1")
-        .await
-        .unwrap_err();
-    assert!(is_unsupported(&err), "vread: {err:?}");
+    // `vread` is real from Step 3 (L2c): a version of an unknown id is none.
+    let found = backend.vread(&tenant, "Patient", "p1", "1").await.unwrap();
+    assert!(found.is_none(), "vread: {found:?}");
     let err = backend
         .search(&tenant, &SearchQuery::new("Patient"))
         .await

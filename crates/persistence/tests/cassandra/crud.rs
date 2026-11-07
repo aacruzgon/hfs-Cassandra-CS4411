@@ -33,10 +33,10 @@
 //! renames or removes a CRUD test, or a whole file, fails it until this copy
 //! follows.
 //!
-//! Until roadmap Step 3's write path lands, `update`, `delete`,
-//! `delete_versioned` and `create_or_update` answer `UnsupportedCapability`,
-//! so the tests that call them fail; the others (`create`, `read`, `count`,
-//! `exists` and `read_batch`) pass from Step 2.
+//! Every test here runs against the real Step 3 backend: `update`, `delete`
+//! and `delete_versioned` (roadmap Step 3's write path), `vread`,
+//! `list_versions` and `delete_with_match`, and `create_or_update`, as well
+//! as Step 2's `create`, `read`, `count`, `exists` and `read_batch`.
 
 /// The Cassandra backend on the test node, or a skip (`return`) when there is
 /// no node. Stands in for upstream's `create_sqlite_backend()`.

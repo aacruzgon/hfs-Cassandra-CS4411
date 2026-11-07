@@ -22,8 +22,8 @@
 //! and `/metadata` through the same `hfs`, each check against its HL7 FHIR R4
 //! rule, and prints one `[spec row=… expected=… got=…]` line per check. A
 //! `DELETE` of an unknown id, and of an already-deleted one, answers 204 and
-//! writes no version (ADR-aacruzgon-0052). It needs every Step 3 method, so
-//! it fails until roadmap Step 3's write path and versioned reads land.
+//! writes no version (ADR-aacruzgon-0052). It needs every Step 3 method:
+//! roadmap Step 3's write path, `create_or_update` and the versioned reads.
 //!
 //! # Where the node comes from
 //!

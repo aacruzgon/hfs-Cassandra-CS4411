@@ -1135,6 +1135,16 @@ def tagged_lines(text: str, tag: str) -> list[dict]:
 # tries (G23, R8). Matched by name, so the adapter's names decide.
 CAS_WARN_KEYS = re.compile(r"undecidable|exhausted|post_cas")
 
+# Logs whose CAS lines come from the engine's own tests, which drive those
+# outcomes on purpose through the fault seam (an undecidable write, a budget
+# run out): tabulated, never warned on, so a real one elsewhere stands out.
+CAS_FAULT_LOGS = {"persistence-lib-tests"}
+
+# Cases a full run prints: the race wrappers' (`cassandra_tests.rs`,
+# `step3_suites`) and the latency report's. A run with none of one kind has
+# lost its lines (a dropped --show-output, a renamed case), so it warns.
+CAS_EXPECTED_CASES = ("race:", "latency-report:")
+
 
 def cmd_cas(args) -> int:
     rows, missing = [], []
@@ -1149,10 +1159,15 @@ def cmd_cas(args) -> int:
     keys = []
     for row in rows:
         keys += [k for k in row if k not in ("log", "case") and k not in keys]
-    warnings = []
+    warnings = [f"CAS counters: no log {m}" for m in missing]
+    for prefix in CAS_EXPECTED_CASES:
+        if not any(str(r["case"]).startswith(prefix) for r in rows):
+            warnings.append(f"CAS counters: no `{prefix}…` case in the logs; its lines were not printed")
     for row in rows:
         for key in keys:
             value = row.get(key)
+            if row["log"] in CAS_FAULT_LOGS:
+                continue
             if CAS_WARN_KEYS.search(key) and isinstance(value, (int, float)) and value > 0:
                 warnings.append(f"CAS counters: {row['case']} has {key}={value}; expected 0 on a healthy node")
         if isinstance(row.get("attempts"), (int, float)) and isinstance(row.get("applied"), (int, float)) and row["applied"]:
@@ -1163,7 +1178,10 @@ def cmd_cas(args) -> int:
         md = table(["Log", "Case"] + [f"`{k}`" for k in keys], [[r["log"], f"`{r['case']}`"] + [r.get(k) for k in keys] for r in rows])
         md += ("\nOne row per `[cas case=… key=value …]` line: the backend's CAS outcome counters "
                "(`CassandraBackend::cas_stats()`, L1) over what that case did. Rows are per backend instance, "
-               "so they are not summed. `attempts_per_applied` is the contention figure (R3).\n")
+               "so they are not summed. `attempts_per_applied` is the contention figure (R3). Rows from "
+               + ", ".join(f"`{n}`" for n in sorted(CAS_FAULT_LOGS))
+               + " are the engine's own fault-seam tests, which provoke undecidable writes and exhausted "
+               "budgets on purpose, so they are never warned on.\n")
     else:
         md = ("No `[cas case=…]` line in the logs: no test printed the backend's `cas_stats()`, "
               "or no test printed them.\n")

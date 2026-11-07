@@ -332,6 +332,27 @@ class SpecAndCasCommands(Scratch):
         self.assertIn("miss_budget_exhausted=1", out)
         self.assertNotIn("undecidable=0", out)
 
+    def test_cas_fault_seam_rows_are_not_warned_on(self):
+        lib = self.write("persistence-lib-tests.log", "[cas case=c2-undecidable attempts=3 applied=0 undecidable=1]\n")
+        suites = self.write("persistence-tests.log", "[cas case=race:x attempts=9 applied=2 undecidable=0]\n"
+                            "[cas case=race:y attempts=9 applied=2 miss_budget_exhausted=1]\n")
+        latency = self.write("latency-backend.log", "[cas case=latency-report:update attempts=100 applied=100]\n")
+        status, out = self.quiet(ci_report.cmd_cas, SimpleNamespace(id="cas", title="CAS", logs=[str(lib), str(suites), str(latency)]))
+        self.assertEqual(status, 0)
+        self.assertEqual(len(self.report("cas")["rows"]), 4)
+        self.assertNotIn("c2-undecidable has", out)
+        self.assertEqual(len(self.report("cas")["warnings"]), 1)
+        self.assertIn("race:y has miss_budget_exhausted=1", out)
+        self.assertNotIn("case in the logs", out)
+
+    def test_cas_warns_on_a_missing_log_and_missing_cases(self):
+        lib = self.write("persistence-lib-tests.log", "[cas case=lost-reply attempts=2 applied=1]\n")
+        status, out = self.quiet(ci_report.cmd_cas, SimpleNamespace(id="cas", title="CAS", logs=[str(lib), str(self.dir / "latency-backend.log")]))
+        self.assertEqual(status, 0)
+        self.assertIn("no log latency-backend.log", out)
+        self.assertIn("no `race:…` case", out)
+        self.assertIn("no `latency-report:…` case", out)
+
     def test_cas_without_lines_says_so(self):
         log = self.write("x.log", "nothing\n")
         self.quiet(ci_report.cmd_cas, SimpleNamespace(id="cas", title="CAS", logs=[str(log)]))

@@ -919,7 +919,7 @@ PROTECTED_TABLES = ("resources", "resource_versions")
 # comment naming such a DELETE would also match: a false failure, never a
 # missed one.
 DELETE_TEXT = re.compile(
-    r'\bDELETE\b[^;]*?\bFROM\s+(?:"?\w+"?\s*\.\s*)?"?(resources|resource_versions)"?(?![\w"])',
+    r'\bDELETE\b[^;]*?\bFROM\s+(?:"?(?P<ks>\w+)"?\s*\.\s*)?"?(?P<table>resources|resource_versions)"?(?![\w"])',
     re.IGNORECASE | re.DOTALL,
 )
 # Things the schema says must never exist (schema/README.md), that the audit
@@ -1004,9 +1004,25 @@ def audit_unverifiable(entry: dict, keyspace: str) -> str | None:
     return None
 
 
+def delete_naming(text: str, keyspace: str):
+    """A DELETE in `text` whose table is qualified with `keyspace`, or None."""
+    for match in DELETE_TEXT.finditer(text):
+        if (match.group("ks") or "").lower() == keyspace.lower():
+            return match
+    return None
+
+
 def audit_violation(entry: dict, keyspace: str) -> str | None:
     """Why an entry is a CQL DELETE against a protected table, or None."""
     if not in_keyspace(entry, keyspace):
+        # A failed unprepared statement logs its session's keyspace, not the
+        # one its text names (AuditLogManager.queryFailure, 5.0.9). So from a
+        # session using another keyspace, rule (b) still applies when the text
+        # names ours (ADR-aacruzgon-0058's known limit, closed).
+        match = delete_naming(entry["operation"] or "", keyspace)
+        if match:
+            return (f"a DELETE FROM {keyspace}.{match.group('table')} in the CQL text of a {entry['type']} "
+                    f"entry logged under ks:{entry['ks']}")
         return None
     if entry["type"] == "DELETE" and entry["scope"] in PROTECTED_TABLES:
         return f"type:DELETE with scope:{entry['scope']}"
@@ -1014,7 +1030,7 @@ def audit_violation(entry: dict, keyspace: str) -> str | None:
         return f"type:{entry['type']} with scope:{entry['scope']}"
     match = DELETE_TEXT.search(entry["operation"] or "")
     if match:
-        return f"a DELETE FROM {match.group(1)} in the CQL text of a {entry['type']} entry"
+        return f"a DELETE FROM {match.group('table')} in the CQL text of a {entry['type']} entry"
     return None
 
 

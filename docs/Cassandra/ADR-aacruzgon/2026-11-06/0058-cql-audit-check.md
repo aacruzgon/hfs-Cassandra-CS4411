@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0058: The node's CQL audit log proves that no CQL `DELETE` reaches `resources` or `resource_versions`, as a check in the required Cassandra job
 
 - **Date:** 2026-11-06
-- **Status:** accepted (Alan chose D6 of the Step 3 plan on 2026-11-06 and approved this entry on 2026-11-07).
+- **Status:** accepted (Alan chose D6 of the Step 3 plan on 2026-11-06 and approved this entry on 2026-11-07); the known limit for an entry logged under another keyspace is closed by the Step 3 cleanup's commit "ci(cassandra): the CQL audit check catches a DELETE on helios logged under another keyspace" (branch `cassandra/step3-cleanup`), which applies rule (b) whatever the entry's `ks` when its text names `helios.`.
 - **Context:**
     - **The exit criterion.** Roadmap Step 3's exit criterion and row 3.4 said "`cqlsh` shows no CQL `DELETE` was ever issued against `resources`". That cannot be done literally: Cassandra keeps no table of past statements (Step 3 plan, D6).
     - **The design forbids such a DELETE.**

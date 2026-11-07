@@ -165,6 +165,20 @@ class AuditEntries(unittest.TestCase):
         [e] = ci_report.audit_records(entry("DELETE", "resources", "DELETE FROM other.resources WHERE a = 1", ks="other"))
         self.assertIsNone(ci_report.audit_violation(e, "helios"))
 
+    def test_a_delete_naming_helios_from_another_keyspace_is_ours(self):
+        # A failed, unprepared statement logs its session's keyspace, not the
+        # one its text names (AuditLogManager.queryFailure, 5.0.9), so a
+        # session using another keyspace can log a DELETE on helios.resources
+        # under ks:other, with no scope (ADR-aacruzgon-0058's known limit).
+        failed, quoted, batch, unqualified = ci_report.audit_records(
+            entry("REQUEST_FAILURE", None, "DELETE FROM helios.resources WHERE tenant_id = 'x'; Operation timed out", ks="other", category="ERROR")
+            + entry("REQUEST_FAILURE", None, 'DELETE FROM "helios"."resource_versions" WHERE a = 1; x', ks="other", category="ERROR")
+            + entry("BATCH", None, "BEGIN BATCH DELETE FROM helios.resources WHERE a = 1; APPLY BATCH", ks="other")
+            + entry("REQUEST_FAILURE", None, "DELETE FROM resources WHERE a = 1; x", ks="other", category="ERROR"))
+        for e in (failed, quoted, batch):
+            self.assertIsNotNone(ci_report.audit_violation(e, "helios"), e)
+        self.assertIsNone(ci_report.audit_violation(unqualified, "helios"), "other.resources, not ours")
+
     def test_a_failed_native_batch_is_unverifiable(self):
         timed_out, no_keyspace, single = ci_report.audit_records(FAILED_BATCHES)
         self.assertEqual(timed_out["ks"], "helios")
@@ -228,6 +242,13 @@ class CqlAuditCommand(Scratch):
         self.assertEqual(status, 1)
         self.assertIn("::error title=CQL audit", out)
         self.assertEqual(len(self.report("cql-audit")["violations"]), 3)
+
+    def test_a_delete_on_helios_logged_under_another_keyspace_fails_the_check(self):
+        other = entry("REQUEST_FAILURE", None, "DELETE FROM helios.resources WHERE tenant_id = 'x'; Operation timed out", ks="other", category="ERROR")
+        status, out = self.audit(CLEAN + other)
+        self.assertEqual(status, 1)
+        self.assertIn("::error title=CQL audit", out)
+        self.assertEqual(len(self.report("cql-audit")["violations"]), 1)
 
     def test_a_failed_native_batch_fails_the_check(self):
         status, out = self.audit(CLEAN + FAILED_BATCHES)

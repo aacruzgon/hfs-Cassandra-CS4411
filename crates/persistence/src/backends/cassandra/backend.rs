@@ -55,7 +55,10 @@ type Precedence = (chrono::DateTime<chrono::Utc>, String);
 #[derive(Clone)]
 struct StoredDefinition {
     definition: SearchParameterDefinition,
-    /// The stored resource's `last_updated` and `id` ([`Precedence`]).
+    /// The stored resource's `last_updated` and `id` ([`Precedence`]). The
+    /// `last_updated` is also the version it holds: a resource's versions
+    /// have strictly increasing `last_updated` (ADR-aacruzgon-0016), so of
+    /// two definitions of one id the later one is the newer version.
     precedence: Precedence,
     /// The [`CassandraBackend::note_seq`] value when this process stored it,
     /// or 0 when a reload read it. A reload keeps the definitions noted after
@@ -63,9 +66,155 @@ struct StoredDefinition {
     noted_at: u64,
 }
 
-/// Each tenant's stored, `active` SearchParameters, read by the registry
+impl StoredDefinition {
+    fn id(&self) -> &str {
+        &self.precedence.1
+    }
+
+    fn last_updated(&self) -> chrono::DateTime<chrono::Utc> {
+        self.precedence.0
+    }
+}
+
+/// A stored SearchParameter this process deleted, or updated to a body the
+/// overlay does not hold (not `active`, or a `url` the shared base has), at
+/// `at` (Step 3 plan D9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Removal {
+    id: String,
+    /// The `last_updated` of the write that removed it. A definition of the
+    /// same id with a `last_updated` at or before it is an older version, so
+    /// it is not in force, whoever read it and whenever its note arrives: a
+    /// reload that read before the removal, or a slow write's late note. A
+    /// resource's versions have strictly increasing `last_updated`
+    /// (ADR-aacruzgon-0016), so this orders a removal against any version of
+    /// its id exactly, also one another instance wrote. The removal is kept
+    /// until a newer version of the id replaces it (a revive, or an update
+    /// back to a body the overlay holds), whether this process notes it or a
+    /// reload reads it.
+    at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One tenant's overlay (Step 3 plan D9, option a′): every stored, `active`
+/// SearchParameter the overlay holds, **one entry per id and every one kept
+/// whatever its `url`**, and the removals a reload has to honour. Of the
+/// definitions sharing a `url`, the one with the highest [`Precedence`] is in
+/// force; [`Self::in_force`] picks it each time the registry is built, so
+/// removing the one in force brings the next one back instead of losing it.
+#[derive(Clone, Default)]
+struct TenantOverlay {
+    defs: Vec<StoredDefinition>,
+    removals: Vec<Removal>,
+}
+
+impl TenantOverlay {
+    /// The definitions in force: for each `url`, the one with the highest
+    /// [`Precedence`], in the order they were added. The registry is built
+    /// from these (`TenantSearchRegistries::build_and_cache` keeps the first
+    /// definition of a `url` it is given).
+    fn in_force(&self) -> Vec<&StoredDefinition> {
+        self.defs
+            .iter()
+            .filter(|candidate| {
+                !self.defs.iter().any(|other| {
+                    other.definition.url == candidate.definition.url
+                        && other.precedence > candidate.precedence
+                })
+            })
+            .collect()
+    }
+
+    /// What the registry is built from: each in-force definition's `url` and
+    /// [`Precedence`]. Two overlays with the same list build the same
+    /// registry.
+    fn in_force_keys(&self) -> Vec<(String, Precedence)> {
+        self.in_force()
+            .into_iter()
+            .map(|d| (d.definition.url.clone(), d.precedence.clone()))
+            .collect()
+    }
+
+    /// Whether a removal holds back `definition`: one of the same id, at or
+    /// after its `last_updated`.
+    fn removed(&self, definition: &StoredDefinition) -> bool {
+        self.removals
+            .iter()
+            .any(|r| r.id == definition.id() && r.at >= definition.last_updated())
+    }
+
+    /// Puts `candidate` in as its id's definition, replacing an older version
+    /// of the same id. A candidate older than the id's definition, or than a
+    /// removal of the id, is refused. Returns whether the definitions in
+    /// force changed, which is when the registry must be rebuilt.
+    fn put(&mut self, candidate: StoredDefinition) -> bool {
+        if self.removed(&candidate)
+            || self
+                .defs
+                .iter()
+                .any(|d| d.id() == candidate.id() && d.last_updated() > candidate.last_updated())
+        {
+            return false;
+        }
+        let before = self.in_force_keys();
+        let (id, at) = (candidate.id().to_string(), candidate.last_updated());
+        self.defs.retain(|d| d.id() != id);
+        // A removal older than this version is superseded by it.
+        self.removals.retain(|r| !(r.id == id && r.at < at));
+        self.defs.push(candidate);
+        self.in_force_keys() != before
+    }
+
+    /// Removes `id`'s definition, unless it is a version newer than `at`, and
+    /// records the removal (the newest `at` per id).
+    fn remove(&mut self, id: &str, at: chrono::DateTime<chrono::Utc>) {
+        self.defs
+            .retain(|d| !(d.id() == id && d.last_updated() <= at));
+        match self.removals.iter_mut().find(|r| r.id == id) {
+            Some(removal) => removal.at = removal.at.max(at),
+            None => self.removals.push(Removal {
+                id: id.to_string(),
+                at,
+            }),
+        }
+    }
+
+    /// Replaces the definitions with what a reload read, given that it began
+    /// at `since`:
+    /// - a definition read is dropped if a removal holds it back (it was read
+    ///   before the delete or the update that removed it);
+    /// - a removal is forgotten only when the reload read a newer version of
+    ///   its id (another instance revived it);
+    /// - a definition noted after `since` is kept, unless the reload read a
+    ///   newer version of the same id.
+    ///
+    /// Returns how many definitions the overlay holds, in force or not.
+    fn merge_reload(&mut self, read: Vec<StoredDefinition>, since: u64) -> usize {
+        let mut merged: Vec<StoredDefinition> =
+            read.into_iter().filter(|d| !self.removed(d)).collect();
+        self.removals.retain(|r| {
+            !merged
+                .iter()
+                .any(|d| d.id() == r.id && d.last_updated() > r.at)
+        });
+        for noted in self.defs.iter().filter(|d| d.noted_at > since) {
+            match merged.iter().position(|m| m.id() == noted.id()) {
+                Some(at) if merged[at].last_updated() > noted.last_updated() => {}
+                Some(at) => merged[at] = noted.clone(),
+                None => merged.push(noted.clone()),
+            }
+        }
+        self.defs = merged;
+        self.defs.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.defs.is_empty() && self.removals.is_empty()
+    }
+}
+
+/// Each tenant's stored-SearchParameter overlay, read by the registry
 /// loader. A map lookup cannot fail, so the loader always reports success.
-type StoredByTenant = Arc<RwLock<HashMap<String, Vec<StoredDefinition>>>>;
+type StoredByTenant = Arc<RwLock<HashMap<String, TenantOverlay>>>;
 
 /// What [`CassandraBackend::load_all_stored_search_parameters`] loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,32 +223,13 @@ pub struct StoredSearchParameterReload {
     /// whose overlay held a definition.
     pub tenants: usize,
     /// Stored, `active`, non-spec definitions the overlay now holds across
-    /// them.
+    /// them, whether in force or kept behind a newer definition of the same
+    /// `url` (D9).
     pub definitions: usize,
     /// Tenants whose reload failed and who keep their previous overlay. Only
     /// a refresh continues past a failure; the startup load stops at the
     /// first one, so it is always 0 there.
     pub failed: usize,
-}
-
-/// Puts `candidate` into `defs`, unless a definition with the same `url` and
-/// a higher [`Precedence`] is already there, in which case `defs` is left as
-/// it was. Returns whether `candidate` went in.
-fn insert_by_precedence(defs: &mut Vec<StoredDefinition>, candidate: StoredDefinition) -> bool {
-    match defs
-        .iter()
-        .position(|existing| existing.definition.url == candidate.definition.url)
-    {
-        Some(at) if defs[at].precedence > candidate.precedence => false,
-        Some(at) => {
-            defs[at] = candidate;
-            true
-        }
-        None => {
-            defs.push(candidate);
-            true
-        }
-    }
 }
 
 /// Reloads each of `tenants` with `load`, summing what it returns. With
@@ -215,7 +345,13 @@ impl CassandraBackend {
                     loader_cache
                         .read()
                         .get(tenant_id)
-                        .map(|defs| defs.iter().map(|d| d.definition.clone()).collect())
+                        .map(|overlay| {
+                            overlay
+                                .in_force()
+                                .into_iter()
+                                .map(|d| d.definition.clone())
+                                .collect()
+                        })
                         .unwrap_or_default(),
                 )
             },
@@ -343,7 +479,16 @@ impl CassandraBackend {
         fail_fast: bool,
     ) -> StorageResult<StoredSearchParameterReload> {
         let mut tenants = self.stored_search_parameter_tenants().await?;
-        tenants.extend(self.stored_by_tenant.read().keys().cloned());
+        // Overlays holding a definition, so one whose SearchParameters are all
+        // gone is cleared. An overlay holding only removals has nothing to
+        // clear.
+        tenants.extend(
+            self.stored_by_tenant
+                .read()
+                .iter()
+                .filter(|(_, overlay)| !overlay.defs.is_empty())
+                .map(|(tenant_id, _)| tenant_id.clone()),
+        );
         let reload = reload_each(&tenants, fail_fast, |tenant_id| async move {
             self.load_stored_search_parameters(&tenant_id).await
         })
@@ -401,15 +546,23 @@ impl CassandraBackend {
     /// whose `url` the shared base
     /// already holds is skipped, as [`Self::note_stored_search_parameter`]
     /// skips it, so the spec definitions the conformance seed stores never
-    /// enter the overlay. Of two with the same `url`, the one with the newest
-    /// `last_updated`, then the higher `id`, is kept ([`Precedence`]).
+    /// enter the overlay. Every definition read is kept; of two with the same
+    /// `url`, the one with the newest `last_updated`, then the higher `id`, is
+    /// in force ([`Precedence`], [`TenantOverlay::in_force`]).
     ///
-    /// **A concurrent create is kept.** A SearchParameter this process stores
-    /// while the reload runs is noted after the reload took `since`, so the
-    /// replacement keeps it, under the same [`Precedence`] as the reloaded
-    /// definitions.
-    /// One noted before `since` was noted after `create` wrote its
-    /// `resources_by_type` row, so the id scan, sent after `since`, lists it.
+    /// **A concurrent write is kept.** A SearchParameter this process stores,
+    /// updates or revives while the reload runs is noted after the reload
+    /// took `since`, so the replacement keeps it, unless the reload read a
+    /// newer version of the same id. One noted before `since` was noted after
+    /// its write's `resources_by_type` row, so the id scan, sent after
+    /// `since`, lists it.
+    ///
+    /// **A concurrent removal is honoured** (Step 3 plan D9). A delete, or an
+    /// update to a body the overlay does not hold, records a removal; a
+    /// definition the reload read at or before the removal's `last_updated`
+    /// is an older version of a removed id, so it is dropped, whenever the
+    /// reload read it. Removals are kept until no reload that began before
+    /// them is still running.
     ///
     /// **Except when that row was not written.** `create` also notes a
     /// SearchParameter whose index row failed (it only warns, and the intent
@@ -457,7 +610,7 @@ impl CassandraBackend {
             .map(|id| async move { self.read_resource(tenant, "SearchParameter", &id).await })
             .collect();
         let mut reads = stream::iter(pending).buffer_unordered(STORED_SEARCH_PARAMETER_READS);
-        let mut defs: Vec<StoredDefinition> = Vec::new();
+        let mut loaded: Vec<StoredDefinition> = Vec::new();
         while let Some(read) = reads.next().await {
             let stored = match read {
                 Ok(Some(stored)) => stored,
@@ -481,102 +634,79 @@ impl CassandraBackend {
             }
             definition.source = SearchParameterSource::Stored;
             let precedence = (stored.last_modified(), stored.id().to_string());
-            insert_by_precedence(
-                &mut defs,
-                StoredDefinition {
-                    definition,
-                    precedence,
-                    noted_at: 0,
-                },
-            );
+            loaded.push(StoredDefinition {
+                definition,
+                precedence,
+                noted_at: 0,
+            });
         }
 
+        Ok(self.merge_into_overlay(tenant_id, loaded, since))
+    }
+
+    /// The end of a reload of `tenant_id` that began at `since` and read
+    /// `loaded` ([`TenantOverlay::merge_reload`]), then the tenant's cached
+    /// registry is dropped. Returns how many definitions the overlay holds.
+    fn merge_into_overlay(
+        &self,
+        tenant_id: &str,
+        loaded: Vec<StoredDefinition>,
+        since: u64,
+    ) -> usize {
         let count = {
             let mut stored = self.stored_by_tenant.write();
-            let noted: Vec<StoredDefinition> = stored
-                .get(tenant_id)
-                .into_iter()
-                .flatten()
-                .filter(|d| d.noted_at > since)
-                .cloned()
-                .collect();
-            let mut merged = defs;
-            for noted in noted {
-                insert_by_precedence(&mut merged, noted);
-            }
-            let count = merged.len();
-            if merged.is_empty() {
+            let overlay = stored.entry(tenant_id.to_string()).or_default();
+            let count = overlay.merge_reload(loaded, since);
+            if overlay.is_empty() {
                 stored.remove(tenant_id);
-            } else {
-                stored.insert(tenant_id.to_string(), merged);
             }
             count
         };
         self.registries.invalidate(tenant_id);
-        Ok(count)
+        count
     }
 
-    /// Records a SearchParameter `tenant_id` just stored in the overlay, if it
+    /// Records a SearchParameter `tenant_id` just created in the overlay, if it
     /// can change that tenant's registry, and only then drops the tenant's
     /// cached registry.
     ///
     /// `create_affects_overlay` skips anything that is not `active` and
     /// anything whose `url` the shared base already holds, so seeding the spec
     /// SearchParameters (R6 ships them `active`) does not rebuild the registry
-    /// once per resource (#667).
+    /// once per resource (#667). A definition that does not change which
+    /// definition of its `url` is in force (an older one beside a newer one)
+    /// is kept, and does not invalidate either.
     pub(super) fn note_stored_search_parameter(
         &self,
         tenant_id: &str,
         resource: &serde_json::Value,
         last_updated: chrono::DateTime<chrono::Utc>,
     ) {
-        use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
-
-        if !self.registries.create_affects_overlay(resource) {
-            return;
-        }
-        let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let Ok(mut definition) = loader.parse_resource(resource) else {
+        let Some(definition) = self.overlay_definition(resource) else {
             return;
         };
-        if definition.status != SearchParameterStatus::Active {
-            return;
-        }
-        definition.source = SearchParameterSource::Stored;
         let id = resource
             .get("id")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let inserted = {
-            let mut stored = self.stored_by_tenant.write();
-            let noted_at = self.note_seq.fetch_add(1, Ordering::SeqCst) + 1;
-            let defs = stored.entry(tenant_id.to_string()).or_default();
-            insert_by_precedence(
-                defs,
-                StoredDefinition {
-                    definition,
-                    precedence: (last_updated, id),
-                    noted_at,
-                },
-            )
-        };
-        // A newer stored definition of the same `url` stays in force, so the
-        // registry is unchanged.
-        if inserted {
-            self.registries.invalidate(tenant_id);
-        }
+            .unwrap_or_default();
+        self.put_stored_search_parameter(tenant_id, id, definition, last_updated);
     }
 
     /// Records that the stored SearchParameter `id` of `tenant_id` now holds
-    /// `resource`, written at `last_updated` by an update or a revive, and
-    /// drops the tenant's cached registry if that can change it (D9).
+    /// `resource`, written at `last_updated` by an update or a revive (Step 3
+    /// plan D9, option a′):
     ///
-    /// **A stub until roadmap Step 3's L2a**, which keeps every stored
-    /// definition per `url` and replaces the one this `id` held. Until then
-    /// `update` and `create_or_update` are themselves stubs, so nothing calls
-    /// it and the overlay behaves as it did in Step 2.
-    #[allow(dead_code)] // L2a's update and L3's revive call it.
+    /// - a body the overlay holds (`active`, a `url` the shared base does not
+    ///   have, and one that parses) replaces the definition this `id` held,
+    ///   whatever its `url` was, and every other definition of either `url`
+    ///   stays; the registry is dropped when that changes a definition in
+    ///   force;
+    /// - any other body (deactivated, or moved to a base `url`) is a removal
+    ///   of `id`, as [`Self::forget_stored_search_parameter`] records it, and
+    ///   always drops the registry.
+    ///
+    /// A version older than one this process already holds for `id`, or than
+    /// a removal of it, changes nothing.
     pub(super) fn replace_stored_search_parameter(
         &self,
         tenant_id: &str,
@@ -584,17 +714,20 @@ impl CassandraBackend {
         resource: &serde_json::Value,
         last_updated: chrono::DateTime<chrono::Utc>,
     ) {
-        let _ = (tenant_id, id, resource, last_updated);
+        match self.overlay_definition(resource) {
+            Some(definition) => {
+                self.put_stored_search_parameter(tenant_id, id, definition, last_updated);
+            }
+            None => self.remove_stored_search_parameter(tenant_id, id, last_updated),
+        }
     }
 
     /// Records that the stored SearchParameter `id` of `tenant_id` was
-    /// deleted at `deleted_at`, so that neither this overlay nor a reload
-    /// begun before the delete keeps it, and drops the tenant's cached
-    /// registry (D9).
-    ///
-    /// **A stub until roadmap Step 3's L2a**; see
-    /// [`Self::replace_stored_search_parameter`]. `delete` is a stub until
-    /// L2b, so nothing calls it yet.
+    /// deleted at `deleted_at` (Step 3 plan D9): its definition leaves the
+    /// overlay, so another definition of the same `url` comes back into
+    /// force; the removal is kept, so that neither a reload begun before the
+    /// delete nor a late note of an older version puts it back; and the
+    /// tenant's cached registry is dropped.
     #[allow(dead_code)] // L2b's delete calls it.
     pub(super) fn forget_stored_search_parameter(
         &self,
@@ -602,7 +735,102 @@ impl CassandraBackend {
         id: &str,
         deleted_at: chrono::DateTime<chrono::Utc>,
     ) {
-        let _ = (tenant_id, id, deleted_at);
+        self.remove_stored_search_parameter(tenant_id, id, deleted_at);
+    }
+
+    /// The overlay definition of a stored SearchParameter `resource`, or
+    /// `None` when the overlay does not hold it: not `active`, a `url` the
+    /// shared base already holds (`create_affects_overlay`), or a body the
+    /// loader cannot parse. The reload applies the same rules.
+    fn overlay_definition(
+        &self,
+        resource: &serde_json::Value,
+    ) -> Option<SearchParameterDefinition> {
+        use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
+
+        if !self.registries.create_affects_overlay(resource) {
+            return None;
+        }
+        let mut definition = SearchParameterLoader::new(self.config.fhir_version)
+            .parse_resource(resource)
+            .ok()?;
+        if definition.status != SearchParameterStatus::Active {
+            return None;
+        }
+        definition.source = SearchParameterSource::Stored;
+        Some(definition)
+    }
+
+    /// Puts `definition` in `tenant_id`'s overlay as `id`'s, noted now, and
+    /// drops the tenant's cached registry if the definitions in force changed.
+    fn put_stored_search_parameter(
+        &self,
+        tenant_id: &str,
+        id: &str,
+        definition: SearchParameterDefinition,
+        last_updated: chrono::DateTime<chrono::Utc>,
+    ) {
+        let changed = {
+            let mut stored = self.stored_by_tenant.write();
+            let noted_at = self.note_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            stored
+                .entry(tenant_id.to_string())
+                .or_default()
+                .put(StoredDefinition {
+                    definition,
+                    precedence: (last_updated, id.to_string()),
+                    noted_at,
+                })
+        };
+        if changed {
+            self.registries.invalidate(tenant_id);
+        }
+    }
+
+    /// Removes `id` from `tenant_id`'s overlay as of `at`, records the
+    /// removal under a fresh sequence number, and drops the tenant's cached
+    /// registry: every removal invalidates (D9).
+    fn remove_stored_search_parameter(
+        &self,
+        tenant_id: &str,
+        id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.stored_by_tenant
+            .write()
+            .entry(tenant_id.to_string())
+            .or_default()
+            .remove(id, at);
+        self.registries.invalidate(tenant_id);
+    }
+
+    /// Tests only: the `since` a reload beginning now takes, as
+    /// [`Self::load_stored_search_parameters`] does before its id scan.
+    #[cfg(test)]
+    pub(super) fn reload_since_for_test(&self) -> u64 {
+        self.note_seq.load(Ordering::SeqCst)
+    }
+
+    /// Tests only: finishes a reload begun at `since` as if its reads had
+    /// returned `read`, the stored SearchParameter as it was when read,
+    /// through the same merge as [`Self::load_stored_search_parameters`].
+    #[cfg(test)]
+    pub(super) fn merge_reload_for_test(
+        &self,
+        tenant_id: &str,
+        read: &crate::types::StoredResource,
+        since: u64,
+    ) {
+        let loaded: Vec<StoredDefinition> = self
+            .overlay_definition(read.content())
+            .map(|definition| StoredDefinition {
+                definition,
+                precedence: (read.last_modified(), read.id().to_string()),
+                noted_at: 0,
+            })
+            .into_iter()
+            .collect();
+        self.merge_into_overlay(tenant_id, loaded, since);
     }
 
     /// Lists the tables of the configured keyspace and fails unless all ten
@@ -1081,13 +1309,30 @@ mod reload_rules {
         }
     }
 
-    /// The ids in force after inserting `order`, whatever order that is.
+    /// The ids in force after putting `order`, whatever order that is.
     fn winners(order: &[StoredDefinition]) -> Vec<String> {
-        let mut defs = Vec::new();
+        let mut overlay = TenantOverlay::default();
         for candidate in order {
-            insert_by_precedence(&mut defs, candidate.clone());
+            overlay.put(candidate.clone());
         }
-        defs.iter().map(|d| d.precedence.1.clone()).collect()
+        in_force(&overlay)
+    }
+
+    fn in_force(overlay: &TenantOverlay) -> Vec<String> {
+        overlay
+            .in_force()
+            .into_iter()
+            .map(|d| d.precedence.1.clone())
+            .collect()
+    }
+
+    fn noted(mut definition: StoredDefinition, noted_at: u64) -> StoredDefinition {
+        definition.noted_at = noted_at;
+        definition
+    }
+
+    fn at(millis: i64) -> chrono::DateTime<Utc> {
+        Utc.timestamp_millis_opt(millis).single().expect("time")
     }
 
     #[test]
@@ -1113,14 +1358,133 @@ mod reload_rules {
         assert_eq!(winners(&[one, two]), ["x", "y"]);
     }
 
+    /// An older definition of the same `url` under another id is kept, but
+    /// is not in force, so the registry is unchanged.
     #[test]
-    fn an_older_candidate_is_refused() {
-        let mut defs = vec![stored("http://example.org/sp", "new", 2_000)];
-        assert!(!insert_by_precedence(
-            &mut defs,
-            stored("http://example.org/sp", "old", 1_000)
-        ));
-        assert_eq!(defs[0].precedence.1, "new");
+    fn an_older_candidate_is_kept_but_not_in_force() {
+        let mut overlay = TenantOverlay::default();
+        assert!(overlay.put(stored("http://example.org/sp", "new", 2_000)));
+        assert!(
+            !overlay.put(stored("http://example.org/sp", "old", 1_000)),
+            "the registry does not change"
+        );
+        assert_eq!(in_force(&overlay), ["new"]);
+        assert_eq!(overlay.defs.len(), 2, "both are kept (D9 a')");
+    }
+
+    /// D9's first flaw of option (a): removing the definition in force must
+    /// bring back the other definition of its `url`, not lose it.
+    #[test]
+    fn removing_the_one_in_force_brings_the_next_back() {
+        let mut overlay = TenantOverlay::default();
+        overlay.put(stored("http://example.org/sp", "older", 1_000));
+        overlay.put(stored("http://example.org/sp", "newer", 2_000));
+        assert_eq!(in_force(&overlay), ["newer"]);
+        overlay.remove("newer", at(3_000));
+        assert_eq!(in_force(&overlay), ["older"]);
+    }
+
+    /// An update replaces its id's definition, whatever the `url` was, and
+    /// an older version of the id is refused.
+    #[test]
+    fn an_update_replaces_its_own_id_only() {
+        let mut overlay = TenantOverlay::default();
+        overlay.put(stored("http://example.org/a", "sp", 1_000));
+        overlay.put(stored("http://example.org/b", "other", 1_500));
+        assert!(overlay.put(stored("http://example.org/moved", "sp", 2_000)));
+        let urls: Vec<&str> = overlay
+            .in_force()
+            .into_iter()
+            .map(|d| d.definition.url.as_str())
+            .collect();
+        assert_eq!(urls, ["http://example.org/b", "http://example.org/moved"]);
+        assert!(
+            !overlay.put(stored("http://example.org/a", "sp", 1_000)),
+            "a late note of an older version changes nothing"
+        );
+        assert_eq!(overlay.defs.len(), 2);
+    }
+
+    /// A removal holds back older versions of its id, however they arrive,
+    /// and a newer version (a revive) supersedes it.
+    #[test]
+    fn a_removal_holds_back_older_versions_until_a_newer_one() {
+        let mut overlay = TenantOverlay::default();
+        overlay.put(stored("http://example.org/sp", "sp", 1_000));
+        overlay.remove("sp", at(2_000));
+        assert!(in_force(&overlay).is_empty());
+        assert!(
+            !overlay.put(stored("http://example.org/sp", "sp", 1_000)),
+            "an older version noted late"
+        );
+        assert!(in_force(&overlay).is_empty());
+        assert!(
+            overlay.put(stored("http://example.org/sp", "sp", 3_000)),
+            "revived"
+        );
+        assert_eq!(in_force(&overlay), ["sp"]);
+        assert!(overlay.removals.is_empty(), "superseded by the revive");
+    }
+
+    /// D9's second flaw of option (a): a reload that read the parameter
+    /// before its delete must not put it back, and the removal outlives the
+    /// reload, so a late note of an older version arriving after it is still
+    /// refused (audit F1).
+    #[test]
+    fn a_reload_that_read_before_a_delete_drops_it() {
+        let mut overlay = TenantOverlay::default();
+        overlay.put(noted(stored("http://example.org/sp", "sp", 1_000), 1));
+        // The reload begins at since = 1, reads the parameter at 1_000, and
+        // the delete (at 2_000) lands before it merges.
+        overlay.remove("sp", at(2_000));
+        let count = overlay.merge_reload(vec![stored("http://example.org/sp", "sp", 1_000)], 1);
+        assert_eq!(count, 0);
+        assert!(in_force(&overlay).is_empty());
+        overlay.merge_reload(Vec::new(), 2);
+        assert_eq!(overlay.removals.len(), 1, "a later reload keeps it");
+        assert!(
+            !overlay.put(noted(stored("http://example.org/sp", "sp", 1_500), 3)),
+            "an older update's late note, after the reloads"
+        );
+        assert!(in_force(&overlay).is_empty());
+    }
+
+    /// A reload keeps what this process noted after it began, unless it read
+    /// a newer version of the same id, and keeps every same-url definition.
+    #[test]
+    fn a_reload_keeps_later_notes_and_every_same_url_definition() {
+        let mut overlay = TenantOverlay::default();
+        overlay.put(noted(stored("http://example.org/sp", "fresh", 5_000), 7));
+        overlay.put(noted(stored("http://example.org/x", "stale", 1_000), 3));
+        let count = overlay.merge_reload(
+            vec![
+                stored("http://example.org/sp", "other", 4_000),
+                stored("http://example.org/x", "stale", 2_000),
+            ],
+            5,
+        );
+        assert_eq!(count, 3, "fresh (noted after 5), other and stale as read");
+        assert_eq!(in_force(&overlay), ["stale", "fresh"]);
+        let stale = overlay.defs.iter().find(|d| d.id() == "stale").unwrap();
+        assert_eq!(
+            stale.last_updated(),
+            at(2_000),
+            "the newer version read wins"
+        );
+    }
+
+    /// A removal is forgotten once a reload reads a newer version of its id
+    /// (another instance revived it), and that version is in force.
+    #[test]
+    fn a_reload_of_a_newer_version_supersedes_a_removal() {
+        let mut overlay = TenantOverlay::default();
+        overlay.remove("sp", at(2_000));
+        overlay.merge_reload(vec![stored("http://example.org/sp", "sp", 1_000)], 0);
+        assert!(in_force(&overlay).is_empty(), "older than the removal");
+        assert_eq!(overlay.removals.len(), 1);
+        overlay.merge_reload(vec![stored("http://example.org/sp", "sp", 3_000)], 0);
+        assert_eq!(in_force(&overlay), ["sp"]);
+        assert!(overlay.removals.is_empty());
     }
 
     fn failing_on<'a>(

@@ -1008,8 +1008,12 @@ def in_keyspace(entry: dict, keyspace: str) -> bool:
 
 
 def audit_unverifiable(entry: dict, keyspace: str) -> str | None:
-    """Why an entry hides statements the check cannot see, or None."""
-    if (in_keyspace(entry, keyspace) and entry["type"] == "REQUEST_FAILURE"
+    """Why an entry hides statements the check cannot see, or None. Whatever
+    its keyspace: batchFailure logs the session's (AuditLogEntry.Builder(state),
+    5.0.9), not its statements', so a failed batch from a session on another
+    keyspace may hold DELETEs on ours just the same. The node logs no system
+    keyspace, so in CI every such entry is from a test's own session."""
+    if (entry["type"] == "REQUEST_FAILURE"
             and FAILED_BATCH.match(entry["operation"] or "")):
         return "a failed native-protocol batch, whose statements the audit log does not record"
     return None

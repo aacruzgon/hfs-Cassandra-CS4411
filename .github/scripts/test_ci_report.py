@@ -243,8 +243,11 @@ class AuditEntries(unittest.TestCase):
             self.assertIsNone(ci_report.audit_violation(e, "helios"))
             self.assertIn("failed native-protocol batch", ci_report.audit_unverifiable(e, "helios"))
         self.assertIsNone(ci_report.audit_unverifiable(single, "helios"))
+        # batchFailure logs the session's keyspace (AuditLogEntry.Builder(state),
+        # 5.0.9), so a failed batch from a session on another keyspace may hold
+        # DELETEs on helios.resources just the same: unverifiable too.
         other = ci_report.audit_records(entry("REQUEST_FAILURE", None, "BATCH of 2 statements at consistency ONE; x", ks="other", category="ERROR"))[0]
-        self.assertIsNone(ci_report.audit_unverifiable(other, "helios"))
+        self.assertIn("failed native-protocol batch", ci_report.audit_unverifiable(other, "helios"))
 
 
 class Scratch(unittest.TestCase):
@@ -305,6 +308,13 @@ class CqlAuditCommand(Scratch):
         self.assertEqual(status, 1)
         self.assertIn("::error title=CQL audit", out)
         self.assertEqual(len(self.report("cql-audit")["violations"]), 1)
+
+    def test_a_failed_native_batch_from_another_keyspace_fails_the_check(self):
+        other = entry("REQUEST_FAILURE", None, "BATCH of 400 statements at consistency ONE; Operation timed out", ks="other", category="ERROR")
+        status, out = self.audit(CLEAN + other)
+        self.assertEqual(status, 1)
+        self.assertIn("cannot rule out a CQL DELETE", out)
+        self.assertEqual(len(self.report("cql-audit")["unverifiable"]), 1)
 
     def test_an_unprepared_truncate_fails_the_check(self):
         wipe = entry("REQUEST_FAILURE", None, "TRUNCATE helios.resources; Truncate timed out", ks="other", category="ERROR")

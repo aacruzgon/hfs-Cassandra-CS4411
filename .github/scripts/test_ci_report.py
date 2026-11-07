@@ -355,6 +355,15 @@ class CrudTombstones(unittest.TestCase):
         self.assertIn("resource_versions", warnings[0])
         self.assertIn("`resources_by_type`", md)
 
+    def test_the_histogram_floor_of_1_is_not_a_tombstone(self):
+        # Recorded on CI run 42336353732: no DELETE in the audit log, yet both
+        # soft-delete tables read max 1.0, the histogram's lowest bucket.
+        _, _, warnings = ci_report.crud_tombstone_rows({
+            "resources": {"count": 24103, "max": 1.0, "p99th": 1.0},
+            "resource_versions": {"count": 5, "max": 1.0, "p99th": 1.0},
+        })
+        self.assertEqual(warnings, [])
+
     def test_missing_tables_are_blank(self):
         rows, _, warnings = ci_report.crud_tombstone_rows({})
         self.assertEqual(warnings, [])

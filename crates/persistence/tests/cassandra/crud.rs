@@ -23,7 +23,11 @@
 //!   its ValueSet an id of its own ([`unique_id`](crate::cassandra_node::unique_id),
 //!   ADR-aacruzgon-0038);
 //! - **the two tests upstream ignores for #306** run: SQLite has no
-//!   `created_at` column, Cassandra does (`docs/Cassandra/schema/schema.cql`).
+//!   `created_at` column, Cassandra does (`docs/Cassandra/schema/schema.cql`);
+//! - **`FhirVersion::default_enabled()`** in place of upstream's
+//!   `FhirVersion::default()`, which exists only with the `R4` feature, so the
+//!   copy also compiles in the R4B-only check (`r4b-compile-check.yml`). With
+//!   `R4` on, both return R4, so the tests run as upstream's do.
 //!
 //! Where an upstream assertion accepts two answers, the copy keeps it as it
 //! is, for parity, and [`strict`] adds a `cassandra_strict_*` test that pins

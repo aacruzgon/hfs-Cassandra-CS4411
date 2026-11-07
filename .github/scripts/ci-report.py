@@ -927,9 +927,11 @@ DELETE_TEXT = re.compile(
 )
 # A TRUNCATE or DROP TABLE of a protected table in the CQL text, for rule (b'):
 # a failed, unprepared one has no scope (queryFailure, 5.0.9), and a TRUNCATE
-# that timed out may still have applied on a replica.
+# that timed out may still have applied on a replica. COLUMNFAMILY is TABLE's
+# synonym in both statements (Lexer.g K_COLUMNFAMILY; Parser.g
+# truncateStatement and dropTableStatement, 5.0.9).
 WIPE_TEXT = re.compile(
-    r'\b(?P<verb>TRUNCATE(?:\s+TABLE)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?)(?:\s+|(?="))'
+    r'\b(?P<verb>TRUNCATE(?:\s+(?:TABLE|COLUMNFAMILY))?|DROP\s+(?:TABLE|COLUMNFAMILY)(?:\s+IF\s+EXISTS)?)(?:\s+|(?="))'
     r'(?:"?(?P<ks>\w+)"?\s*\.\s*)?"?(?P<table>resources|resource_versions)"?(?![\w"])',
     re.IGNORECASE | re.DOTALL,
 )

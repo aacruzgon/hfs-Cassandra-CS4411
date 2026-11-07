@@ -190,7 +190,14 @@ class AuditEntries(unittest.TestCase):
             + failed("TRUNCATE TABLE resource_versions")
             + failed('truncate "helios"."resources"', ks="other")
             + failed("DROP TABLE IF EXISTS helios.resource_versions", ks="other")
-            + failed("DROP TABLE resources"))
+            + failed("DROP TABLE resources")
+            # COLUMNFAMILY is TABLE's synonym in both statements (Lexer.g
+            # K_COLUMNFAMILY; Parser.g truncateStatement, dropTableStatement,
+            # 5.0.9); each reached semantic validation in cqlsh on a 5.0.9 node.
+            + failed("TRUNCATE COLUMNFAMILY helios.resources", ks="other")
+            + failed("truncate columnfamily resources")
+            + failed("DROP COLUMNFAMILY resource_versions")
+            + failed("DROP COLUMNFAMILY IF EXISTS helios.resource_versions", ks="other"))
         for e in hits:
             self.assertIsNotNone(ci_report.audit_violation(e, "helios"), e)
         passes = ci_report.audit_records(
@@ -199,6 +206,8 @@ class AuditEntries(unittest.TestCase):
             + failed("TRUNCATE resources", ks="other")
             + failed("TRUNCATE other.resources", ks="other")
             + failed("DROP TABLE helios.resources_by_type", ks="other")
+            + failed("TRUNCATE COLUMNFAMILY resources_by_type")
+            + failed("DROP COLUMNFAMILY IF EXISTS helios.pending_index_writes", ks="other")
             + entry("UPDATE", "resources_by_type", "INSERT INTO resources_by_type (a) VALUES ('TRUNCATE resources')"))
         for e in passes:
             self.assertIsNone(ci_report.audit_violation(e, "helios"), e)
@@ -318,6 +327,12 @@ class CqlAuditCommand(Scratch):
 
     def test_an_unprepared_truncate_fails_the_check(self):
         wipe = entry("REQUEST_FAILURE", None, "TRUNCATE helios.resources; Truncate timed out", ks="other", category="ERROR")
+        status, out = self.audit(CLEAN + wipe)
+        self.assertEqual(status, 1)
+        self.assertEqual(len(self.report("cql-audit")["violations"]), 1)
+
+    def test_an_unprepared_truncate_columnfamily_fails_the_check(self):
+        wipe = entry("REQUEST_FAILURE", None, "TRUNCATE COLUMNFAMILY helios.resources; Truncate timed out", ks="other", category="ERROR")
         status, out = self.audit(CLEAN + wipe)
         self.assertEqual(status, 1)
         self.assertEqual(len(self.report("cql-audit")["violations"]), 1)

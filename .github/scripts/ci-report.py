@@ -1105,9 +1105,11 @@ def cmd_cql_audit(args) -> int:
 
 # --- key=value lines: CAS counters (R2, R3, R8) and HL7 rows (R10) ----------
 
-# One `key=value` pair: the value is a bare token or a double-quoted string
-# with JSON escapes (Rust's `{:?}` of a plain string).
-PAIR = re.compile(r'([A-Za-z_][\w.-]*)=("(?:[^"\\]|\\.)*"|[^\s\]"]+)')
+# One `key=value` pair: the value is a double-quoted string with JSON
+# escapes (Rust's `{:?}` of a plain string), or a bare token, which may hold
+# quoted runs, so a weak ETag `W/"1"` is one value, not `W/`.
+QUOTED = r'"(?:[^"\\]|\\.)*"'
+PAIR = re.compile(r'([A-Za-z_][\w.-]*)=((?:' + QUOTED + r'|[^\s\]"])+)')
 
 
 def tagged_lines(text: str, tag: str) -> list[dict]:
@@ -1118,7 +1120,7 @@ def tagged_lines(text: str, tag: str) -> list[dict]:
         for match in pattern.finditer(ANSI.sub("", raw)):
             pairs = {}
             for key, value in PAIR.findall(match.group(1)):
-                if value.startswith('"'):
+                if re.fullmatch(QUOTED, value):
                     try:
                         value = json.loads(value)
                     except ValueError:

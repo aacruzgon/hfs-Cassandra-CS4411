@@ -293,6 +293,14 @@ class TaggedLines(unittest.TestCase):
         self.assertEqual(ci_report.tagged_lines(log, "cas"), [{"case": "latency-report:update", "attempts": "100", "applied": "99", "note": "two words ]"}])
         self.assertEqual(ci_report.tagged_lines(log, "spec"), [{"row": "C-4", "expected": "201", "got": "201"}, {"row": "D-3", "expected": "204", "got": "404", "step": "7"}])
 
+    def test_a_weak_etag_is_one_value(self):
+        # The Step 3 REST test prints ETags as they are, quotes included.
+        log = '[spec row=CC-2:etag expected=W/"1" got=W/"2"]\n[spec row=X expected="a b" got=W/"x y"z]\n'
+        self.assertEqual(ci_report.tagged_lines(log, "spec"), [
+            {"row": "CC-2:etag", "expected": 'W/"1"', "got": 'W/"2"'},
+            {"row": "X", "expected": "a b", "got": 'W/"x y"z'},
+        ])
+
 
 class SpecAndCasCommands(Scratch):
     def test_spec_mismatch_warns(self):
@@ -302,6 +310,12 @@ class SpecAndCasCommands(Scratch):
         data = self.report("spec")
         self.assertEqual((len(data["rows"]), data["mismatches"]), (2, 1))
         self.assertIn("D-3 expected 204, got 404", out)
+
+    def test_spec_etag_mismatch_warns(self):
+        log = self.write("step3-rest.log", '[spec row=CC-2:etag expected=W/"1" got=W/"2"]\n')
+        status, out = self.quiet(ci_report.cmd_spec, SimpleNamespace(id="spec", title="HL7", log=str(log)))
+        self.assertEqual((status, self.report("spec")["mismatches"]), (0, 1))
+        self.assertIn('CC-2:etag expected W/"1", got W/"2"', out)
 
     def test_spec_missing_log_warns(self):
         status, out = self.quiet(ci_report.cmd_spec, SimpleNamespace(id="spec", title="HL7", log=str(self.dir / "none.log")))

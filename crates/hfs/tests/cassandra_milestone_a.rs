@@ -15,11 +15,21 @@
 //!   works again (the `cdrs-tokio` session recovers by itself once the node
 //!   is back).
 //!
+//! # Step 3 through REST
+//!
+//! `step3_crud_through_rest` (roadmap Step 3, D24 of its plan) runs update,
+//! delete, revive, PATCH, HEAD, `Prefer`, `If-Match`, the id check, one batch
+//! and `/metadata` through the same `hfs`, each check against its HL7 FHIR R4
+//! rule, and prints one `[spec row=… expected=… got=…]` line per check. A
+//! `DELETE` of an unknown id, and of an already-deleted one, answers 204 and
+//! writes no version (ADR-aacruzgon-0052). It needs every Step 3 method:
+//! roadmap Step 3's write path, `create_or_update` and the versioned reads.
+//!
 //! # Where the node comes from
 //!
-//! - The round trip uses `HFS_TEST_CASSANDRA_URL` (one `host:port`, the schema
-//!   already applied; ADR-aacruzgon-0020) when it is set, and otherwise a
-//!   container of its own.
+//! - The round trip and the Step 3 test use `HFS_TEST_CASSANDRA_URL` (one
+//!   `host:port`, the schema already applied; ADR-aacruzgon-0020) when it is
+//!   set, and otherwise a container of its own.
 //! - The readiness test stops the node, so it uses a container of its own,
 //!   never the `HFS_TEST_CASSANDRA_URL` node, unless
 //!   `HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER` opts in: that names the container
@@ -66,6 +76,9 @@
 //!
 //! Run with:
 //! `HFS_TEST_CASSANDRA_URL=127.0.0.1:59042 cargo test -p helios-hfs --features cassandra --test cassandra_milestone_a`
+//!
+//! and the Step 3 test alone with:
+//! `HFS_TEST_CASSANDRA_URL=127.0.0.1:59042 cargo test -p helios-hfs --features cassandra --test cassandra_milestone_a -- --exact step3_crud_through_rest --show-output`
 //!
 //! and the boot-time report with:
 //! `HFS_TEST_CASSANDRA_URL=127.0.0.1:59042 HFS_TEST_BOOT_REPORT=target/boot-report cargo test -p helios-hfs --features cassandra --test cassandra_milestone_a -- --exact boot_time_report`
@@ -411,6 +424,737 @@ async fn round_trip(hfs: &Hfs) {
         .await
         .expect("GET of version 2");
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND, "GET _history/2");
+}
+
+// Roadmap Step 3 through REST (D24 of the Step 3 plan).
+
+/// Roadmap Step 3 (CRUD core) through the real `hfs`: update, delete,
+/// revive, PATCH, HEAD, `Prefer`, `If-Match`, the id check, one batch, and
+/// what `/metadata` says, each against the HL7 FHIR R4 rule it checks (the
+/// Step 3 matrix's rows; R4B's text is the same).
+///
+/// Every check prints one `[spec row=<row> expected=<value> got=<value>]`
+/// line before it asserts, for the CI report that tabulates them; keep the
+/// shape. Values never contain a space.
+///
+/// It runs on the node `HFS_TEST_CASSANDRA_URL` names, or a container of its
+/// own, under a fresh tenant and without the conformance seed, as
+/// [`milestone_a_create_then_read_through_rest`] does.
+#[tokio::test]
+async fn step3_crud_through_rest() {
+    let _lock;
+    let _container;
+    let contact_point = match test_url() {
+        Some(url) => url,
+        None => {
+            _lock = CONTAINER_LOCK.lock().await;
+            let Some(node) = OwnNode::start().await else {
+                return;
+            };
+            let contact_point = node.contact_point();
+            _container = node;
+            contact_point
+        }
+    };
+    let mut hfs = Hfs::start(&contact_point, &unique_tenant("step3-rest"), false);
+    hfs.wait_until_serving().await;
+    let rest = Rest::new(&hfs);
+    let suffix = unique_suffix().replace('-', "");
+
+    update_through_rest(&rest, &suffix).await;
+    patch_through_rest(&rest, &suffix).await;
+    delete_and_revive_through_rest(&rest, &suffix).await;
+    invalid_ids_through_rest(&rest).await;
+    batch_through_rest(&rest, &suffix).await;
+    metadata_through_rest(&rest).await;
+}
+
+/// One printed, then asserted, spec check.
+fn spec(row: &str, expected: impl std::fmt::Display, got: impl std::fmt::Display, hfs: &Hfs) {
+    let (expected, got) = (expected.to_string(), got.to_string());
+    println!("[spec row={row} expected={expected} got={got}]");
+    assert_eq!(
+        got,
+        expected,
+        "spec row {row}; hfs output:\n{}",
+        hfs.output()
+    );
+}
+
+/// A response's status, headers and body, read once.
+struct Answer {
+    status: StatusCode,
+    headers: reqwest::header::HeaderMap,
+    body: Value,
+    /// The body's length in bytes, before any JSON parse.
+    len: usize,
+}
+
+impl Answer {
+    async fn of(response: reqwest::Response) -> Self {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.bytes().await.expect("read the body");
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        Self {
+            status,
+            headers,
+            body,
+            len: bytes.len(),
+        }
+    }
+
+    fn code(&self) -> u16 {
+        self.status.as_u16()
+    }
+
+    /// A header's value, or `-` when absent.
+    fn header(&self, name: reqwest::header::HeaderName) -> String {
+        self.headers
+            .get(&name)
+            .map(|v| v.to_str().expect("an ASCII header").to_owned())
+            .unwrap_or_else(|| "-".to_owned())
+    }
+
+    /// The first issue's `code` of an OperationOutcome body, or `-`.
+    fn issue(&self) -> String {
+        self.body["issue"][0]["code"]
+            .as_str()
+            .unwrap_or("-")
+            .to_owned()
+    }
+}
+
+/// `hfs`'s REST surface for these checks.
+struct Rest<'a> {
+    hfs: &'a Hfs,
+    client: reqwest::Client,
+}
+
+impl<'a> Rest<'a> {
+    fn new(hfs: &'a Hfs) -> Self {
+        Self {
+            hfs,
+            client: http(),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}/{path}", self.hfs.base)
+    }
+
+    async fn send(&self, request: reqwest::RequestBuilder) -> Answer {
+        Answer::of(request.send().await.expect("the request is answered")).await
+    }
+
+    async fn get(&self, path: &str) -> Answer {
+        self.send(self.client.get(self.url(path))).await
+    }
+
+    async fn head(&self, path: &str) -> Answer {
+        self.send(self.client.head(self.url(path))).await
+    }
+
+    async fn post(&self, path: &str, body: &Value) -> Answer {
+        self.send(
+            self.client
+                .post(self.url(path))
+                .header(CONTENT_TYPE, "application/fhir+json")
+                .json(body),
+        )
+        .await
+    }
+
+    /// `PUT`, with each `(name, value)` of `headers` added.
+    async fn put(&self, path: &str, body: &Value, headers: &[(&str, &str)]) -> Answer {
+        let mut request = self
+            .client
+            .put(self.url(path))
+            .header(CONTENT_TYPE, "application/fhir+json")
+            .json(body);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        self.send(request).await
+    }
+
+    async fn delete(&self, path: &str, headers: &[(&str, &str)]) -> Answer {
+        let mut request = self.client.delete(self.url(path));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        self.send(request).await
+    }
+
+    async fn patch(
+        &self,
+        path: &str,
+        content_type: &str,
+        body: &Value,
+        headers: &[(&str, &str)],
+    ) -> Answer {
+        let mut request = self
+            .client
+            .patch(self.url(path))
+            .header(CONTENT_TYPE, content_type)
+            .body(body.to_string());
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        self.send(request).await
+    }
+}
+
+/// A JSON value as a spec line shows it: a string without its quotes.
+fn text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn patient(id: &str, family: &str) -> Value {
+    json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]})
+}
+
+/// `meta.lastUpdated` of a body, as Unix seconds.
+fn last_updated_seconds(body: &Value) -> i64 {
+    let instant = body["meta"]["lastUpdated"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no meta.lastUpdated: {body}"));
+    chrono::DateTime::parse_from_rfc3339(instant)
+        .unwrap_or_else(|e| panic!("meta.lastUpdated {instant}: {e}"))
+        .timestamp()
+}
+
+/// PUT as create and as update, client `meta` ignored, `Prefer`, a stale
+/// `If-Match` on PUT and DELETE, HEAD (matrix rows U-7, U-8, U-3, C-2, G4,
+/// CC-4, G13; T-5, T-6, T-7, T-12).
+async fn update_through_rest(rest: &Rest<'_>, suffix: &str) {
+    let hfs = rest.hfs;
+    let id = format!("s3-put-{suffix}");
+    let path = format!("Patient/{id}");
+
+    // R4 #update: a PUT to an id that does not exist creates it: 201, with
+    // the versioned Location (#create's "SHALL also return a Location") and
+    // the ETag.
+    let created = rest.put(&path, &patient(&id, "One"), &[]).await;
+    spec("U-7:put-new", 201, created.code(), hfs);
+    spec(
+        "U-8:location",
+        format!("{}/{path}/_history/1", hfs.base),
+        created.header(LOCATION),
+        hfs,
+    );
+    spec("CC-2:etag", "W/\"1\"", created.header(ETAG), hfs);
+    // R4 #prefer: with no `Prefer`, the server may return the resource, but
+    // never an OperationOutcome; Helios returns the resource.
+    spec(
+        "G4:default-body",
+        "Patient",
+        created.body["resourceType"].as_str().unwrap_or("-"),
+        hfs,
+    );
+
+    // R4 #update: "200 OK HTTP status code if the resource was updated …
+    // with a Last-Modified header, and an ETag header which contains the new
+    // versionId". No Location on a 200 (R4: "If the resource was created").
+    let updated = rest.put(&path, &patient(&id, "Two"), &[]).await;
+    spec("U-7:put-existing", 200, updated.code(), hfs);
+    spec("U-7:etag", "W/\"2\"", updated.header(ETAG), hfs);
+    spec("U-8:no-location", "-", updated.header(LOCATION), hfs);
+    let last_modified = chrono::DateTime::parse_from_rfc2822(&updated.header(LAST_MODIFIED))
+        .unwrap_or_else(|e| panic!("Last-Modified {}: {e}", updated.header(LAST_MODIFIED)))
+        .timestamp();
+    spec(
+        "U-7:last-modified",
+        last_updated_seconds(&updated.body),
+        last_modified,
+        hfs,
+    );
+    spec(
+        "U-4:versionId",
+        "2",
+        text(&updated.body["meta"]["versionId"]),
+        hfs,
+    );
+
+    // R4 #update and #create: "the server SHALL ignore the provided versionId
+    // and lastUpdated values", on PUT and on POST.
+    let mut with_meta = patient(&id, "Three");
+    with_meta["meta"] = json!({"versionId": "99", "lastUpdated": "2001-01-01T00:00:00Z"});
+    let put_meta = rest.put(&path, &with_meta, &[]).await;
+    spec("U-3:put", 200, put_meta.code(), hfs);
+    spec(
+        "U-3:versionId",
+        "3",
+        text(&put_meta.body["meta"]["versionId"]),
+        hfs,
+    );
+    spec(
+        "U-3:lastUpdated-not-2001",
+        true,
+        last_updated_seconds(&put_meta.body) > 978_307_200,
+        hfs,
+    );
+    let reread_put = rest.get(&path).await;
+    spec(
+        "U-3:read-versionId",
+        "3",
+        text(&reread_put.body["meta"]["versionId"]),
+        hfs,
+    );
+    spec(
+        "U-3:read-lastUpdated-not-2001",
+        true,
+        last_updated_seconds(&reread_put.body) > 978_307_200,
+        hfs,
+    );
+    let mut post_meta = json!({"resourceType": "Patient", "name": [{"family": "Posted"}]});
+    post_meta["meta"] = json!({"versionId": "99", "lastUpdated": "2001-01-01T00:00:00Z"});
+    let posted = rest.post("Patient", &post_meta).await;
+    spec("C-2:post", 201, posted.code(), hfs);
+    spec(
+        "C-2:versionId",
+        "1",
+        text(&posted.body["meta"]["versionId"]),
+        hfs,
+    );
+    let posted_id = posted.body["id"]
+        .as_str()
+        .expect("the POST's id")
+        .to_owned();
+    let reread = rest.get(&format!("Patient/{posted_id}")).await;
+    spec(
+        "C-2:read-versionId",
+        "1",
+        text(&reread.body["meta"]["versionId"]),
+        hfs,
+    );
+    spec(
+        "C-2:read-lastUpdated-not-2001",
+        true,
+        last_updated_seconds(&reread.body) > 978_307_200,
+        hfs,
+    );
+
+    // R4 #prefer: "Servers SHOULD honor this header": no body for minimal,
+    // an OperationOutcome when asked for one.
+    let minimal = rest
+        .put(
+            &path,
+            &patient(&id, "Four"),
+            &[("Prefer", "return=minimal")],
+        )
+        .await;
+    spec("G4:minimal-status", 200, minimal.code(), hfs);
+    spec("G4:minimal-body-bytes", 0, minimal.len, hfs);
+    spec("G4:minimal-etag", "W/\"4\"", minimal.header(ETAG), hfs);
+    let outcome = rest
+        .put(
+            &path,
+            &patient(&id, "Five"),
+            &[("Prefer", "return=OperationOutcome")],
+        )
+        .await;
+    spec("G4:outcome-status", 200, outcome.code(), hfs);
+    spec(
+        "G4:outcome-body",
+        "OperationOutcome",
+        outcome.body["resourceType"].as_str().unwrap_or("-"),
+        hfs,
+    );
+    spec("G4:outcome-etag", "W/\"5\"", outcome.header(ETAG), hfs);
+
+    // R4 #concurrency: "If the version id given in the If-Match header does
+    // not match, the server returns a 412 Precondition Failed status code
+    // instead of updating the resource." DELETE honours it the same way.
+    let stale_put = rest
+        .put(&path, &patient(&id, "Stale"), &[("If-Match", "W/\"1\"")])
+        .await;
+    spec("CC-4:put-stale", 412, stale_put.code(), hfs);
+    let stale_delete = rest.delete(&path, &[("If-Match", "W/\"1\"")]).await;
+    spec("CC-4:delete-stale", 412, stale_delete.code(), hfs);
+    let still = rest.get(&path).await;
+    spec("CC-4:unchanged-status", 200, still.code(), hfs);
+    spec("CC-4:unchanged-etag", "W/\"5\"", still.header(ETAG), hfs);
+    spec(
+        "CC-4:unchanged-body",
+        "Five",
+        still.body["name"][0]["family"].as_str().unwrap_or("-"),
+        hfs,
+    );
+    let matching = rest
+        .put(&path, &patient(&id, "Six"), &[("If-Match", "W/\"5\"")])
+        .await;
+    spec("CC-4:put-matching", 200, matching.code(), hfs);
+    spec(
+        "CC-4:put-matching-etag",
+        "W/\"6\"",
+        matching.header(ETAG),
+        hfs,
+    );
+
+    // R4 #head: "same response as a GET, but with no body".
+    let head = rest.head(&path).await;
+    spec("G13:head-status", 200, head.code(), hfs);
+    spec("G13:head-etag", "W/\"6\"", head.header(ETAG), hfs);
+    spec("G13:head-body-bytes", 0, head.len, hfs);
+}
+
+/// PATCH goes through `update` (D17): JSON Patch and FHIRPath Patch, a stale
+/// `If-Match`, and a PATCH of a deleted resource, which never revives it
+/// (matrix row CC-11; T-11).
+async fn patch_through_rest(rest: &Rest<'_>, suffix: &str) {
+    let hfs = rest.hfs;
+    let id = format!("s3-patch-{suffix}");
+    let path = format!("Patient/{id}");
+    let created = rest.put(&path, &patient(&id, "Original"), &[]).await;
+    spec("CC-11:setup", 201, created.code(), hfs);
+
+    let json_patch = json!([{"op": "replace", "path": "/name/0/family", "value": "JsonPatched"}]);
+    let patched = rest
+        .patch(&path, "application/json-patch+json", &json_patch, &[])
+        .await;
+    spec("CC-11:json-patch", 200, patched.code(), hfs);
+    spec(
+        "CC-11:json-patch-etag",
+        "W/\"2\"",
+        patched.header(ETAG),
+        hfs,
+    );
+    spec(
+        "CC-11:json-patch-body",
+        "JsonPatched",
+        patched.body["name"][0]["family"].as_str().unwrap_or("-"),
+        hfs,
+    );
+
+    let fhirpath_patch = json!({"resourceType": "Parameters", "parameter": [{"name": "operation", "part": [
+        {"name": "type", "valueCode": "replace"},
+        {"name": "path", "valueString": "Patient.active"},
+        {"name": "value", "valueBoolean": true}
+    ]}]});
+    let mut with_active = patient(&id, "JsonPatched");
+    with_active["active"] = json!(false);
+    let reset = rest
+        .put(&path, &with_active, &[("If-Match", "W/\"2\"")])
+        .await;
+    spec("CC-11:setup-active", 200, reset.code(), hfs);
+    let patched = rest
+        .patch(&path, "application/fhir+json", &fhirpath_patch, &[])
+        .await;
+    spec("CC-11:fhirpath-patch", 200, patched.code(), hfs);
+    spec(
+        "CC-11:fhirpath-patch-etag",
+        "W/\"4\"",
+        patched.header(ETAG),
+        hfs,
+    );
+    spec(
+        "CC-11:fhirpath-patch-body",
+        true,
+        text(&patched.body["active"]),
+        hfs,
+    );
+
+    // R4 #patch: "servers SHALL support conditional PATCH, which works exactly
+    // the same as specified for update in Concurrency Management".
+    let stale = rest
+        .patch(
+            &path,
+            "application/json-patch+json",
+            &json_patch,
+            &[("If-Match", "W/\"1\"")],
+        )
+        .await;
+    spec("CC-11:stale", 412, stale.code(), hfs);
+    let still = rest.get(&path).await;
+    spec("CC-11:stale-unchanged", "W/\"4\"", still.header(ETAG), hfs);
+
+    // A deleted resource: its read is `Gone`, so the PATCH is 410, and it
+    // writes nothing. A PATCH never brings a resource back.
+    let deleted = rest.delete(&path, &[]).await;
+    spec("CC-11:delete", 204, deleted.code(), hfs);
+    let on_deleted = rest
+        .patch(&path, "application/json-patch+json", &json_patch, &[])
+        .await;
+    spec("CC-11:patch-deleted", 410, on_deleted.code(), hfs);
+    let after = rest.get(&path).await;
+    spec("CC-11:patch-deleted-no-revive", 410, after.code(), hfs);
+}
+
+/// DELETE, the 410 read, a second DELETE and a DELETE of an unknown id (each
+/// a 204 no-op that writes no version, ADR-aacruzgon-0052), HEAD after the
+/// delete, the revive's 201 at N+2, and vread of the marker (matrix rows
+/// D-3, D-4, R-3, G11, G13, U-7, U-14, V-1; T-4, T-9, T-12).
+async fn delete_and_revive_through_rest(rest: &Rest<'_>, suffix: &str) {
+    let hfs = rest.hfs;
+    let id = format!("s3-delete-{suffix}");
+    let path = format!("Patient/{id}");
+    let created = rest.put(&path, &patient(&id, "One"), &[]).await;
+    spec("D-3:setup", 201, created.code(), hfs);
+    let updated = rest.put(&path, &patient(&id, "Two"), &[]).await;
+    spec("D-3:setup-update", "W/\"2\"", updated.header(ETAG), hfs);
+
+    // R4 #delete: "Upon successful deletion … a 204 No Content".
+    let deleted = rest.delete(&path, &[]).await;
+    spec("D-3:delete", 204, deleted.code(), hfs);
+    spec("D-3:delete-body-bytes", 0, deleted.len, hfs);
+
+    // R4 #read: "a GET for a deleted resource returns a 410 status code";
+    // issue type `deleted`.
+    let gone = rest.get(&path).await;
+    spec("R-3:read-deleted", 410, gone.code(), hfs);
+    spec("G11:issue", "deleted", gone.issue(), hfs);
+    let head = rest.head(&path).await;
+    spec("G13:head-deleted", 410, head.code(), hfs);
+
+    // R4 #delete: "Performing this interaction on a resource that is already
+    // deleted has no effect, and the server should return either a 200 OK …
+    // or a 204 No Content" (ADR-aacruzgon-0052).
+    let again = rest.delete(&path, &[]).await;
+    spec("D-4:delete-again", 204, again.code(), hfs);
+    let no_new_version = rest.get(&format!("{path}/_history/4")).await;
+    spec("D-4:no-new-version", 404, no_new_version.code(), hfs);
+    let still_gone = rest.get(&path).await;
+    spec("D-4:still-gone", 410, still_gone.code(), hfs);
+
+    // R4 #delete: "if the resource does not exist at all, the server should
+    // return either a 200 OK … or a 204 No Content"; nothing is written, so the
+    // id stays unknown (404), not deleted (410).
+    let unknown = format!("Patient/s3-unknown-{suffix}");
+    let delete_unknown = rest.delete(&unknown, &[]).await;
+    spec("D-3:delete-unknown", 204, delete_unknown.code(), hfs);
+    let read_unknown = rest.get(&unknown).await;
+    spec("D-3:unknown-stays-unknown", 404, read_unknown.code(), hfs);
+    let vread_unknown = rest.get(&format!("{unknown}/_history/1")).await;
+    spec("D-3:unknown-no-version", 404, vread_unknown.code(), hfs);
+
+    // R4 #delete: "Resources that have been deleted may be "brought back to
+    // life" by a subsequent update interaction using an HTTP PUT", and #update:
+    // "201 Created … (or brought back to life/re-created)". N = 2, the marker
+    // is 3, so the revive is 4: neither second DELETE wrote a version.
+    let revived = rest.put(&path, &patient(&id, "Back"), &[]).await;
+    spec("U-14:revive", 201, revived.code(), hfs);
+    spec(
+        "U-14:revive-location",
+        format!("{}/{path}/_history/4", hfs.base),
+        revived.header(LOCATION),
+        hfs,
+    );
+    spec("U-14:revive-etag", "W/\"4\"", revived.header(ETAG), hfs);
+    let read = rest.get(&path).await;
+    spec("U-14:read-revived", 200, read.code(), hfs);
+    spec(
+        "U-14:read-revived-body",
+        "Back",
+        read.body["name"][0]["family"].as_str().unwrap_or("-"),
+        hfs,
+    );
+
+    // R4 #vread: "If the version referred to is actually one where the
+    // resource was deleted, the server should return a 410 status code."
+    let marker = rest.get(&format!("{path}/_history/3")).await;
+    spec("V-1:vread-marker", 410, marker.code(), hfs);
+    let before = rest.get(&format!("{path}/_history/2")).await;
+    spec("V-1:vread-before", 200, before.code(), hfs);
+    spec(
+        "V-1:vread-before-body",
+        "Two",
+        before.body["name"][0]["family"].as_str().unwrap_or("-"),
+        hfs,
+    );
+}
+
+/// The id check on PUT (D11): an id that is not a FHIR id is 400 `invalid`
+/// (resource.html#id; #rejecting-updates "failed basic FHIR validation
+/// rules"; matrix row RS1; T-3), where SQLite stores it.
+async fn invalid_ids_through_rest(rest: &Rest<'_>) {
+    let hfs = rest.hfs;
+    for (row, id) in [
+        ("RS1:underscore", "a_b".to_owned()),
+        ("RS1:65-characters", "a".repeat(65)),
+    ] {
+        let answer = rest
+            .put(&format!("Patient/{id}"), &patient(&id, "Invalid"), &[])
+            .await;
+        spec(row, 400, answer.code(), hfs);
+        spec(&format!("{row}-issue"), "invalid", answer.issue(), hfs);
+    }
+}
+
+/// One batch with each entry kind Step 3 serves (matrix rows B-4 to B-7;
+/// T-15): PUT new 201, PUT existing 200 (both with a versioned `location`
+/// and an `etag`), DELETE 204, DELETE of an unknown id 204
+/// (ADR-aacruzgon-0052), GET of a deleted resource 410, and a stale `ifMatch`
+/// 412. No two entries name the same resource (R4 #brules: "there SHALL be no
+/// interdependencies between the different entries").
+async fn batch_through_rest(rest: &Rest<'_>, suffix: &str) {
+    let hfs = rest.hfs;
+    let existing = format!("s3-batch-existing-{suffix}");
+    let to_delete = format!("s3-batch-delete-{suffix}");
+    let deleted = format!("s3-batch-deleted-{suffix}");
+    let stale = format!("s3-batch-stale-{suffix}");
+    let new = format!("s3-batch-new-{suffix}");
+    for id in [&existing, &to_delete, &deleted, &stale] {
+        let created = rest
+            .put(&format!("Patient/{id}"), &patient(id, "Setup"), &[])
+            .await;
+        spec("B-7:setup", 201, created.code(), hfs);
+    }
+    let gone = rest.delete(&format!("Patient/{deleted}"), &[]).await;
+    spec("B-7:setup-delete", 204, gone.code(), hfs);
+    let bumped = rest
+        .put(&format!("Patient/{stale}"), &patient(&stale, "Bumped"), &[])
+        .await;
+    spec("B-7:setup-bump", "W/\"2\"", bumped.header(ETAG), hfs);
+
+    let bundle = json!({
+        "resourceType": "Bundle",
+        "type": "batch",
+        "entry": [
+            {"resource": patient(&new, "BatchNew"),
+             "request": {"method": "PUT", "url": format!("Patient/{new}")}},
+            {"resource": patient(&existing, "BatchUpdated"),
+             "request": {"method": "PUT", "url": format!("Patient/{existing}")}},
+            {"request": {"method": "DELETE", "url": format!("Patient/{to_delete}")}},
+            {"request": {"method": "DELETE", "url": format!("Patient/s3-batch-unknown-{suffix}")}},
+            {"request": {"method": "GET", "url": format!("Patient/{deleted}")}},
+            {"resource": patient(&stale, "BatchStale"),
+             "request": {"method": "PUT", "url": format!("Patient/{stale}"), "ifMatch": "W/\"1\""}}
+        ]
+    });
+    let answer = rest.post("", &bundle).await;
+    spec("B-4:batch", 200, answer.code(), hfs);
+    spec(
+        "B-5:type",
+        "batch-response",
+        answer.body["type"].as_str().unwrap_or("-"),
+        hfs,
+    );
+    let entries = answer.body["entry"].as_array().cloned().unwrap_or_default();
+    spec("B-5:entries", 6, entries.len(), hfs);
+    let status = |n: usize| {
+        entries[n]["response"]["status"]
+            .as_str()
+            .unwrap_or("-")
+            .split_whitespace()
+            .next()
+            .unwrap_or("-")
+            .to_owned()
+    };
+    spec("B-7:put-new", "201", status(0), hfs);
+    spec("B-7:put-existing", "200", status(1), hfs);
+    spec("B-7:delete", "204", status(2), hfs);
+    spec("B-7:delete-unknown", "204", status(3), hfs);
+    spec("B-7:get-deleted", "410", status(4), hfs);
+    spec("B-7:stale-if-match", "412", status(5), hfs);
+    for (n, (id, version)) in [(0, (&new, 1)), (1, (&existing, 2))] {
+        let response = &entries[n]["response"];
+        spec(
+            "B-6:location",
+            true,
+            response["location"]
+                .as_str()
+                .is_some_and(|l| l.ends_with(&format!("Patient/{id}/_history/{version}"))),
+            hfs,
+        );
+        spec(
+            "B-6:etag",
+            format!("W/\"{version}\""),
+            response["etag"].as_str().unwrap_or("-"),
+            hfs,
+        );
+    }
+
+    // Each entry did what its status says, and the refused one nothing.
+    let read = rest.get(&format!("Patient/{to_delete}")).await;
+    spec("B-7:deleted-reads-410", 410, read.code(), hfs);
+    let read = rest.get(&format!("Patient/{stale}")).await;
+    spec("B-7:stale-unchanged", "W/\"2\"", read.header(ETAG), hfs);
+    let read = rest.get(&format!("Patient/{existing}")).await;
+    spec(
+        "B-7:existing-updated",
+        "BatchUpdated",
+        read.body["name"][0]["family"].as_str().unwrap_or("-"),
+        hfs,
+    );
+}
+
+/// What `/metadata` says for Patient once Step 3 is in, where it is true
+/// (the matrix's section 4): the six interactions Step 3 serves,
+/// `updateCreate`, no conditional create, update or delete, and no
+/// `transaction`. Its remaining false claims (history interactions and every
+/// registered search parameter) are Step 7's.
+async fn metadata_through_rest(rest: &Rest<'_>) {
+    let hfs = rest.hfs;
+    let metadata = rest.get("metadata").await;
+    spec("G1:metadata", 200, metadata.code(), hfs);
+    let server = &metadata.body["rest"][0];
+    let patient = server["resource"]
+        .as_array()
+        .and_then(|types| types.iter().find(|t| t["type"] == "Patient"))
+        .unwrap_or_else(|| panic!("no Patient in /metadata: {}", metadata.body));
+    let interactions: Vec<&str> = patient["interaction"]
+        .as_array()
+        .map(|list| list.iter().filter_map(|i| i["code"].as_str()).collect())
+        .unwrap_or_default();
+    for code in ["read", "vread", "create", "update", "patch", "delete"] {
+        spec(
+            &format!("CS-4:{code}"),
+            true,
+            interactions.contains(&code),
+            hfs,
+        );
+    }
+    spec(
+        "CS-3:updateCreate",
+        true,
+        text(&patient["updateCreate"]),
+        hfs,
+    );
+    spec(
+        "CS-1:versioning",
+        "versioned",
+        text(&patient["versioning"]),
+        hfs,
+    );
+    spec(
+        "R-6:conditionalRead",
+        "full-support",
+        text(&patient["conditionalRead"]),
+        hfs,
+    );
+    spec(
+        "CD-2:conditionalCreate",
+        false,
+        text(&patient["conditionalCreate"]),
+        hfs,
+    );
+    spec(
+        "CD-2:conditionalUpdate",
+        false,
+        text(&patient["conditionalUpdate"]),
+        hfs,
+    );
+    spec(
+        "CD-2:conditionalDelete",
+        "not-supported",
+        text(&patient["conditionalDelete"]),
+        hfs,
+    );
+    let system: Vec<&str> = server["interaction"]
+        .as_array()
+        .map(|list| list.iter().filter_map(|i| i["code"].as_str()).collect())
+        .unwrap_or_default();
+    spec(
+        "B-1:no-transaction",
+        false,
+        system.contains(&"transaction"),
+        hfs,
+    );
+    spec("B-1:batch", true, system.contains(&"batch"), hfs);
 }
 
 fn header(response: &reqwest::Response, name: reqwest::header::HeaderName) -> String {

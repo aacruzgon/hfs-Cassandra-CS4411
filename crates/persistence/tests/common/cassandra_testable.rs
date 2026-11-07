@@ -43,20 +43,24 @@
 //!
 //! `seed` writes every fixture under [`tenant`](CassandraTestBackend::tenant)
 //! with the backend's real `create`, one at a time, keeping each fixture's id.
-//! Every [`TestFixtures`] entry is a create, so no fixture needs `update` or
-//! `delete`, which are Step 3's stubs until then. Seeding the same tenant twice
-//! fails with the backend's `AlreadyExists`, as it should: reset first. A
+//! Every [`TestFixtures`] entry is a create, so seeding needs no `update` or
+//! `delete`, which a suite calls itself when it needs them. Seeding the same
+//! tenant twice fails with the backend's `AlreadyExists`, as it should: reset
+//! first. A
 //! `reset` while a `seed` is running does not move it: the seed keeps the
 //! tenant it started with, so its fixtures land, whole, under the old tenant.
 //!
 //! # Forwarding
 //!
-//! The wrapper forwards **every** [`ResourceStorage`] method to the backend,
-//! defaulted ones included, so that the backend's overrides (today
-//! `readiness_check`, `is_cluster_shared`, `delete_versioned`,
-//! `bulk_write_concurrency`; later Step 3's `read_batch`) are what the tests
-//! exercise, never the trait's defaults running over the wrapper. The other
-//! traits (`VersionedStorage`, `SearchProvider`, …) are reached through
+//! The wrapper forwards **every** [`ResourceStorage`] and [`VersionedStorage`]
+//! method to the backend, defaulted ones included (`exists`, `read_batch`,
+//! `create_many`, `current_version`, …), so that the backend's overrides
+//! (`readiness_check`, `is_cluster_shared`, `delete_versioned`,
+//! `bulk_write_concurrency`, and Step 3's `exists` and `read_batch`) are what
+//! the tests exercise, never the trait's defaults running over the wrapper.
+//! `VersionedStorage` is forwarded for the shared race suite
+//! (`search/versioned_write_race_suite.rs`), whose bound it is. The other
+//! traits (`SearchProvider`, …) are reached through
 //! [`inner`](CassandraTestBackend::inner).
 
 use std::collections::HashSet;
@@ -70,7 +74,7 @@ use helios_persistence::core::sof_terminology::SofTerminologyStore;
 use helios_persistence::core::{
     ActivityCell, Backend, BackendCapability, BackendKind, CountBasis, DailyResourceCount,
     DiscoveryRequest, ResourceCountDelta, ResourceStorage, SofRunner, TenantDiscovery,
-    TenantRecord, WriteMarker,
+    TenantRecord, VersionedStorage, WriteMarker,
 };
 use helios_persistence::error::{BackendError, StorageError, StorageResult};
 use helios_persistence::search::ReindexTarget;
@@ -492,5 +496,65 @@ impl ResourceStorage for CassandraTestBackend {
 
     fn tenant_registry_unsupported(&self) -> StorageError {
         self.inner.tenant_registry_unsupported()
+    }
+}
+
+/// Every method forwards to the backend, `current_version` included; see the
+/// module docs ("Forwarding").
+#[async_trait]
+impl VersionedStorage for CassandraTestBackend {
+    async fn vread(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        version_id: &str,
+    ) -> StorageResult<Option<StoredResource>> {
+        self.inner
+            .vread(tenant, resource_type, id, version_id)
+            .await
+    }
+
+    async fn update_with_match(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.inner
+            .update_with_match(tenant, resource_type, id, expected_version, resource)
+            .await
+    }
+
+    async fn delete_with_match(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        self.inner
+            .delete_with_match(tenant, resource_type, id, expected_version)
+            .await
+    }
+
+    async fn current_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<String>> {
+        self.inner.current_version(tenant, resource_type, id).await
+    }
+
+    async fn list_versions(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Vec<String>> {
+        self.inner.list_versions(tenant, resource_type, id).await
     }
 }

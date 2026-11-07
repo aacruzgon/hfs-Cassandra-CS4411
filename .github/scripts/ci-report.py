@@ -30,8 +30,19 @@ Commands:
   tests ID TITLE LOG...             parse libtest output (`-- --show-output`)
   readiness ID TITLE LOG            the readiness test's `[key=ms]` pairs
   node-stats ID TITLE CONTAINER     nodetool and system_views on a node
+  cql-audit ID TITLE FILE [--check] the node's CQL audit log (auditlogviewer
+                                    output); --check fails on a CQL DELETE
+                                    against resources or resource_versions
+  cas ID TITLE LOG...               the `[cas case=… key=value …]` lines
+  intents ID TITLE CONTAINER        intent rows left in pending_index_writes
+  spec ID TITLE LOG                 the `[spec row=… expected=… got=…]` lines
 
 A later step adds a section with `add`, or with a new command here.
+
+`cql-audit --check` is the one command that is a check rather than a report:
+it exits 1 when the audit log shows a CQL DELETE against `resources` or
+`resource_versions`, or when it shows nothing, which would prove nothing
+(roadmap Step 3's exit criterion; Step 3 plan D6).
 """
 
 from __future__ import annotations
@@ -846,11 +857,444 @@ def cmd_node_stats(args) -> int:
             warnings.append(f"Node statistics: a read of {name} scanned {row['max']:.0f} tombstones, over the design's bucketing trigger of {TOMBSTONE_TRIGGER}")
     if dropped_any:
         warnings.append("Node statistics: the node dropped messages: " + ", ".join(d["message_type"] for d in dropped_any))
+    crud_tombstones, crud_md, crud_warnings = crud_tombstone_rows(views.get("tombstones_per_read", {}))
+    md += crud_md
+    warnings += crud_warnings
     data = {"container": container, "keyspace": args.keyspace, "seconds": round(took, 1), "tables": tables,
+            "crud_tombstones": crud_tombstones,
             "system_views": views, "cas_counts": cas, "cas_latency_us": histogram, "thread_pools": pools,
             "jvm": jvm, "gc": gc, "compaction": compaction, "container_memory": memory,
             "dropped_messages": dropped, "warnings": warnings}
     add(args.id, args.title, md, data)
+    return 0
+
+
+# The soft-delete tables never hold a tombstone (schema.cql, G39; ADR-aacruzgon-0027),
+# so a read of either that scans one means a CQL DELETE or a bound null reached
+# it. resources_by_type moves on every update and loses its row on every delete
+# (the X1 delta), so it is expected to show tombstones from Step 3 on.
+# The histogram's lowest bucket is 1: a read that scanned no tombstone reports
+# 1 (checked on a 5.0.9 node: a table never deleted from showed max 1.0, and
+# two deleted rows showed 2.0). So only a figure above 1 shows a tombstone.
+TOMBSTONE_FLOOR = 1
+CRUD_TOMBSTONE_TABLES = [
+    ("resources", "1 or less: soft delete writes cells, never a tombstone (G39)"),
+    ("resource_versions", "1 or less: history rows are never deleted (G39)"),
+    ("resources_by_type", "above 1 from Step 3: update and delete remove the X1 row"),
+]
+
+
+def crud_tombstone_rows(tombstones: dict) -> tuple[list[dict], str, list[str]]:
+    """R6: `tombstones_per_read` for the three tables Step 3 writes, with what
+    each should show, and a warning when a soft-delete table read one."""
+    rows, warnings = [], []
+    for name, expected in CRUD_TOMBSTONE_TABLES:
+        row = tombstones.get(name, {})
+        entry = {"table": name, "reads": row.get("count"), "max": row.get("max"), "p99": row.get("p99th"), "expected": expected}
+        rows.append(entry)
+        if name != "resources_by_type" and (row.get("max") or 0) > TOMBSTONE_FLOOR:
+            warnings.append(f"Node statistics: a read of {name} scanned up to {row['max']:.0f} tombstones; it should never hold one (G39)")
+    md = ("\n**Tombstones on the tables Step 3 writes** (`system_views.tombstones_per_read`, a recent, decaying "
+          "histogram; it shows tombstones that reads scanned, not every one written. Its lowest bucket is 1, so 1 also means "
+          "none: only a figure above 1 shows a tombstone):\n\n")
+    md += table(["Table", "Reads", "Tombstones per read (max)", "(p99)", "Expected"],
+                [[f"`{r['table']}`", r["reads"], r["max"], r["p99"], r["expected"]] for r in rows])
+    return rows, md, warnings
+
+
+# --- the CQL audit log (Step 3 plan D6 and report R7) -----------------------
+
+# The tables that only ever take a soft delete (schema.cql "never a CQL DELETE
+# against resources"; G39). Compared exactly: Step 3 legitimately deletes from
+# resources_by_type (X1) and pending_index_writes (I2).
+PROTECTED_TABLES = ("resources", "resource_versions")
+
+# A DELETE statement against a protected table, anywhere in an entry's CQL
+# text, keyspace-qualified or quoted or not. The name must end there, so
+# resources_by_type never matches. It catches what the type and scope alone
+# miss (AuditLogManager.java, 5.0.9): a CQL-text batch, logged as one
+# scope-less BATCH entry holding every child; and a failed statement, whose
+# type becomes REQUEST_FAILURE and whose scope is dropped when it was not
+# prepared. It is not tied to the start of a statement, so a string literal or
+# comment naming such a DELETE would also match: a false failure, never a
+# missed one.
+DELETE_TEXT = re.compile(
+    r'\bDELETE\b[^;]*?\bFROM\s+(?:"?\w+"?\s*\.\s*)?"?(resources|resource_versions)"?(?![\w"])',
+    re.IGNORECASE | re.DOTALL,
+)
+# Things the schema says must never exist (schema/README.md), that the audit
+# text can show: a plain (non-LWT) write to resources, and ALLOW FILTERING.
+# Bound values are not logged, so a bound null cannot be seen here.
+NOT_LWT = re.compile(r"\bIF\b", re.IGNORECASE)
+# Statements that remove a whole table's data: a violation too, by scope.
+TABLE_WIPES = ("TRUNCATE", "DROP_TABLE")
+ALLOW_FILTERING = re.compile(r"\bALLOW\s+FILTERING\b", re.IGNORECASE)
+# A failed native-protocol batch logs one REQUEST_FAILURE entry, "BATCH of N
+# statements at consistency X; <error>", with no keyspace from its statements,
+# no scope and no child text (AuditLogManager.batchFailure, 5.0.9). So a DELETE
+# inside it cannot be ruled out, and it may have applied: a logged batch that
+# timed out is still replayed from the batchlog (verified on 5.0.9: 400
+# DELETEs on resources, applied about a minute after the WriteTimeout). Under
+# --check it fails the check as unverifiable. The backend sends no native
+# batch, so the backend never trips it.
+FAILED_BATCH = re.compile(r"^BATCH of \d+ statements\b")
+
+
+def open_text(path: Path) -> str:
+    if path.suffix == ".gz":
+        import gzip
+
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as source:
+            return source.read()
+    return path.read_text(errors="replace")
+
+
+def audit_records(text: str) -> list[dict]:
+    """`auditlogviewer` output: each record is a `Type: <type>` line, then
+    `LogMessage: <entry>` (tools/AuditLogViewer.java). An entry's CQL text may
+    span lines, so a record runs to the next `Type: ` line."""
+    messages, current = [], None
+    for line in text.splitlines():
+        if line.startswith("Type: "):
+            if current is not None:
+                messages.append(current)
+            current = None
+        elif line.startswith("LogMessage: "):
+            if current is not None:
+                messages.append(current)
+            current = line[len("LogMessage: "):]
+        elif current is not None:
+            current += "\n" + line
+    if current is not None:
+        messages.append(current)
+    return [audit_entry(message) for message in messages]
+
+
+def audit_entry(message: str) -> dict:
+    """One entry, `user:…|host:…|source:…|port:…|timestamp:…|type:…|category:…
+    [|batch:…][|ks:…][|scope:…][|operation:<CQL>]` (AuditLogEntry.getLogString).
+    `operation` is last and is free text, so the fields are read only from the
+    part before it."""
+    head, found, operation = message.partition("|operation:")
+    fields = {}
+    for part in head.split("|"):
+        key, _, value = part.partition(":")
+        fields.setdefault(key, value)
+    return {
+        "type": fields.get("type"),
+        "category": fields.get("category"),
+        "ks": fields.get("ks"),
+        "scope": fields.get("scope"),
+        "batch": fields.get("batch"),
+        "operation": operation if found else None,
+    }
+
+
+def in_keyspace(entry: dict, keyspace: str) -> bool:
+    """An entry from `keyspace`, or one with no keyspace: a failed batch, or a
+    scope-less entry from a session with no current keyspace, may be ours."""
+    return entry["ks"] in (None, "", keyspace)
+
+
+def audit_unverifiable(entry: dict, keyspace: str) -> str | None:
+    """Why an entry hides statements the check cannot see, or None."""
+    if (in_keyspace(entry, keyspace) and entry["type"] == "REQUEST_FAILURE"
+            and FAILED_BATCH.match(entry["operation"] or "")):
+        return "a failed native-protocol batch, whose statements the audit log does not record"
+    return None
+
+
+def audit_violation(entry: dict, keyspace: str) -> str | None:
+    """Why an entry is a CQL DELETE against a protected table, or None."""
+    if not in_keyspace(entry, keyspace):
+        return None
+    if entry["type"] == "DELETE" and entry["scope"] in PROTECTED_TABLES:
+        return f"type:DELETE with scope:{entry['scope']}"
+    if entry["type"] in TABLE_WIPES and entry["scope"] in PROTECTED_TABLES:
+        return f"type:{entry['type']} with scope:{entry['scope']}"
+    match = DELETE_TEXT.search(entry["operation"] or "")
+    if match:
+        return f"a DELETE FROM {match.group(1)} in the CQL text of a {entry['type']} entry"
+    return None
+
+
+def cmd_cql_audit(args) -> int:
+    path = Path(args.file)
+    started = time.monotonic()
+    text = open_text(path) if path.exists() else None
+    entries = audit_records(text or "")
+    took = time.monotonic() - started
+    ours = [e for e in entries if e["ks"] == args.keyspace]
+    dml = [e for e in ours if e["category"] == "DML"]
+    violations, unverifiable = [], []
+    for entry in entries:
+        for found, reason in ((violations, audit_violation(entry, args.keyspace)),
+                              (unverifiable, audit_unverifiable(entry, args.keyspace))):
+            if reason:
+                found.append({"reason": reason, "type": entry["type"], "scope": entry["scope"],
+                              "operation": " ".join((entry["operation"] or "").split())[:500]})
+    counts = {}
+    for entry in ours:
+        key = (entry["scope"] or "(none)", entry["type"] or "?")
+        counts[key] = counts.get(key, 0) + 1
+    plain_writes = [e for e in ours if e["scope"] == "resources" and e["type"] == "UPDATE"
+                    and not NOT_LWT.search(e["operation"] or "")]
+    filtering = [e for e in ours if ALLOW_FILTERING.search(e["operation"] or "")]
+    prepares = sum(1 for e in ours if e["type"] == "PREPARE_STATEMENT")
+    failures = [e for e in entries if in_keyspace(e, args.keyspace) and e["category"] == "ERROR"]
+
+    problems, warnings = [], []
+    if text is None:
+        problems.append(f"no audit log: {path} does not exist (the audit-log dump did not run)")
+    elif not dml:
+        problems.append(f"the audit log has no DML entry for keyspace {args.keyspace}, so it proves nothing "
+                        "(was `nodetool enableauditlog` run before the tests?)")
+    for v in violations:
+        problems.append(f"CQL DELETE against a soft-delete table: {v['reason']}: {v['operation'][:200]}")
+    for u in unverifiable:
+        problems.append(f"cannot rule out a CQL DELETE: {u['reason']}: {u['operation'][:200]}")
+    if plain_writes:
+        warnings.append(f"CQL audit: {len(plain_writes)} plain (non-IF) write(s) to resources; every write there must be a CAS (schema/README.md)")
+    if filtering:
+        warnings.append(f"CQL audit: {len(filtering)} prepared or DML statement(s) with ALLOW FILTERING (schema/README.md: never)")
+    if failures:
+        warnings.append(f"CQL audit: {len(failures)} failed statement(s) (REQUEST_FAILURE) in keyspace {args.keyspace} or with none")
+    if not args.check:
+        warnings += problems
+
+    verdict = ("**Check: failed.** " + " ".join(problems)) if problems else (
+        f"**Check: passed.** No CQL `DELETE` against `{PROTECTED_TABLES[0]}` or `{PROTECTED_TABLES[1]}` "
+        f"in {len(entries):,} entries ({len(dml):,} DML in `{args.keyspace}`).")
+    md = verdict + "\n\n"
+    md += (f"From the node's audit log (`nodetool enableauditlog`, BinAuditLogger, categories DML, ERROR, PREPARE and DDL, "
+           "every keyspace but the system ones, so an entry with no keyspace is kept), read with `auditlogviewer` after "
+           "the tests. A violation is an entry with "
+           "`type:DELETE` and a scope of exactly `resources` or `resource_versions`, or any entry whose CQL text holds "
+           "a `DELETE … FROM` either table: a CQL-text batch logs one scope-less `BATCH` entry, and a failed statement "
+           "a `REQUEST_FAILURE`. A `TRUNCATE` or `DROP TABLE` of either table is one too. A failed native-protocol batch "
+           "fails the check as well: its entry holds no statement text, and a logged batch that timed out may still "
+           "apply. `resources_by_type` (X1) and "
+           f"`pending_index_writes` (I2) are deleted from legitimately. Parsed in {took:.1f} s.\n\n")
+    md += "**DML by table and type** (R7; `UPDATE` is an INSERT or an UPDATE; the driver may re-send an idempotent statement, so a count can exceed one per operation):\n\n"
+    tables = sorted({scope for scope, _ in counts})
+    types = sorted({kind for _, kind in counts})
+    md += table(["Table"] + [f"`{t}`" for t in types] + ["Total"],
+                [[f"`{s}`"] + [counts.get((s, t)) for t in types] + [sum(counts.get((s, t), 0) for t in types)] for s in tables])
+    md += (f"\nPrepared statements: {prepares}. Failed statements: {len(failures)}, of which failed native batches: "
+           f"{len(unverifiable)}. Plain writes to `resources`: "
+           f"{len(plain_writes)}. `ALLOW FILTERING` (prepared or DML statements; plain queries are not logged): {len(filtering)}.\n")
+    if violations:
+        md += "\n**Violations:**\n\n" + table(["Reason", "CQL"], [[v["reason"], f"`{v['operation'][:300]}`"] for v in violations[:20]])
+    if unverifiable:
+        md += "\n**Unverifiable:**\n\n" + table(["Reason", "Entry"], [[u["reason"], f"`{u['operation'][:300]}`"] for u in unverifiable[:20]])
+    data = {
+        "file": str(path), "entries": len(entries), "keyspace_entries": len(ours), "dml_entries": len(dml),
+        "by_table_and_type": [{"table": s, "type": t, "count": n} for (s, t), n in sorted(counts.items())],
+        "prepares": prepares, "failures": len(failures), "plain_writes_to_resources": len(plain_writes),
+        "allow_filtering": len(filtering), "violations": violations, "unverifiable": unverifiable,
+        "check": bool(args.check),
+        "check_passed": not problems, "parse_seconds": round(took, 2), "warnings": warnings,
+    }
+    add(args.id, args.title, md, data)
+    if args.check and problems:
+        for problem in problems[:10]:
+            print(f"::error title=CQL audit (Step 3 exit criterion)::{problem.replace(chr(10), ' ')}", flush=True)
+        return 1
+    return 0
+
+
+# --- key=value lines: CAS counters (R2, R3, R8) and HL7 rows (R10) ----------
+
+# One `key=value` pair: the value is a double-quoted string with JSON
+# escapes (Rust's `{:?}` of a plain string), or a bare token, which may hold
+# quoted runs, so a weak ETag `W/"1"` is one value, not `W/`.
+QUOTED = r'"(?:[^"\\]|\\.)*"'
+PAIR = re.compile(r'([A-Za-z_][\w.-]*)=((?:' + QUOTED + r'|[^\s\]"])+)')
+
+
+def tagged_lines(text: str, tag: str) -> list[dict]:
+    """Every `[<tag> key=value …]` in a log, in order, as a dict of strings."""
+    pattern = re.compile(r"\[" + re.escape(tag) + r'\s+((?:"(?:[^"\\]|\\.)*"|[^\]"])*)\]')
+    found = []
+    for raw in text.splitlines():
+        for match in pattern.finditer(ANSI.sub("", raw)):
+            pairs = {}
+            for key, value in PAIR.findall(match.group(1)):
+                if re.fullmatch(QUOTED, value):
+                    try:
+                        value = json.loads(value)
+                    except ValueError:
+                        value = value[1:-1]
+                pairs[key] = value
+            found.append(pairs)
+    return found
+
+
+# CAS counters that should be 0 on a healthy single node: a write left
+# undecidable, a retry budget run out, a post-CAS write that ran out of its
+# tries (G23, R8). Matched by name, so the adapter's names decide.
+CAS_WARN_KEYS = re.compile(r"undecidable|exhausted|post_cas")
+
+# Logs whose CAS lines come from the engine's own tests, which drive those
+# outcomes on purpose through the fault seam (an undecidable write, a budget
+# run out): tabulated, never warned on, so a real one elsewhere stands out.
+CAS_FAULT_LOGS = {"persistence-lib-tests"}
+
+# Cases a full run prints: the race wrappers' (`cassandra_tests.rs`,
+# `step3_suites`) and the latency report's. A run with none of one kind has
+# lost its lines (a dropped --show-output, a renamed case), so it warns.
+CAS_EXPECTED_CASES = ("race:", "latency-report:")
+
+
+def cmd_cas(args) -> int:
+    rows, missing = [], []
+    for log in args.logs:
+        path = Path(log)
+        if not path.exists():
+            missing.append(path.name)
+            continue
+        for pairs in tagged_lines(path.read_text(errors="replace"), "cas"):
+            pairs.setdefault("case", "?")
+            rows.append({"log": path.stem, **{k: number(v) if k != "case" else v for k, v in pairs.items()}})
+    keys = []
+    for row in rows:
+        keys += [k for k in row if k not in ("log", "case") and k not in keys]
+    warnings = [f"CAS counters: no log {m}" for m in missing]
+    for prefix in CAS_EXPECTED_CASES:
+        if not any(str(r["case"]).startswith(prefix) for r in rows):
+            warnings.append(f"CAS counters: no `{prefix}…` case in the logs; its lines were not printed")
+    for row in rows:
+        for key in keys:
+            value = row.get(key)
+            if row["log"] in CAS_FAULT_LOGS:
+                continue
+            if CAS_WARN_KEYS.search(key) and isinstance(value, (int, float)) and value > 0:
+                warnings.append(f"CAS counters: {row['case']} has {key}={value}; expected 0 on a healthy node")
+        if isinstance(row.get("attempts"), (int, float)) and isinstance(row.get("applied"), (int, float)) and row["applied"]:
+            row["attempts_per_applied"] = round(row["attempts"] / row["applied"], 3)
+    if rows and any("attempts_per_applied" in r for r in rows):
+        keys.append("attempts_per_applied")
+    if rows:
+        md = table(["Log", "Case"] + [f"`{k}`" for k in keys], [[r["log"], f"`{r['case']}`"] + [r.get(k) for k in keys] for r in rows])
+        md += ("\nOne row per `[cas case=… key=value …]` line: the backend's CAS outcome counters "
+               "(`CassandraBackend::cas_stats()`, L1) over what that case did. Rows are per backend instance, "
+               "so they are not summed. `attempts_per_applied` is the contention figure (R3). Rows from "
+               + ", ".join(f"`{n}`" for n in sorted(CAS_FAULT_LOGS))
+               + " are the engine's own fault-seam tests, which provoke undecidable writes and exhausted "
+               "budgets on purpose, so they are never warned on.\n")
+    else:
+        md = ("No `[cas case=…]` line in the logs: no test printed the backend's `cas_stats()`, "
+              "or no test printed them.\n")
+    if missing:
+        md += "\nNo log for: " + ", ".join(f"`{m}`" for m in missing) + ".\n"
+    add(args.id, args.title, md, {"rows": rows, "keys": keys, "missing_logs": missing, "warnings": warnings})
+    return 0
+
+
+def cmd_spec(args) -> int:
+    path = Path(args.log)
+    lines = tagged_lines(path.read_text(errors="replace"), "spec") if path.exists() else []
+    rows = [{"row": p.get("row"), "expected": p.get("expected"), "got": p.get("got"),
+             "detail": " ".join(f"{k}={v}" for k, v in p.items() if k not in ("row", "expected", "got")) or None}
+            for p in lines]
+    mismatches = [r for r in rows if r["expected"] != r["got"]]
+    warnings = []
+    if not path.exists():
+        warnings.append(f"HL7 rows: no log {path.name} (the Step 3 REST test did not run)")
+    elif not rows:
+        warnings.append(f"HL7 rows: {path.name} has no `[spec row=… expected=… got=…]` line")
+    for r in mismatches:
+        warnings.append(f"HL7 rows: {r['row']} expected {r['expected']}, got {r['got']}")
+    md = table(["Matrix row", "Expected", "Observed", "Match", "Detail"],
+               [[f"`{r['row']}`", r["expected"], r["got"], "yes" if r["expected"] == r["got"] else "**no**", r["detail"]] for r in rows]) if rows else ""
+    md += (f"\n{len(rows)} check(s) observed through `hfs` on Cassandra, {len(mismatches)} mismatch(es). Each row is one "
+           "`[spec row=… expected=… got=…]` line the test printed; the row ids are the Step 3 HL7 requirements matrix's.\n")
+    add(args.id, args.title, md, {"rows": rows, "mismatches": len(mismatches), "warnings": warnings})
+    return 0
+
+
+# --- intent rows left behind (R4) -------------------------------------------
+
+INTENT_SHARDS = 16  # schema.cql, pending_index_writes; write.rs INTENT_SHARDS
+TEST_TENANT = re.compile(r"^test-(.*)-[0-9a-f]{32}$")
+
+
+def cql_text(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def json_rows(out: str) -> list[dict]:
+    rows = []
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass
+    return rows
+
+
+def intent_buckets(now, hours: int) -> list[str]:
+    from datetime import timedelta
+
+    return [(now - timedelta(hours=h)).strftime("%Y-%m-%dT%H") for h in range(hours)]
+
+
+def classify_intent(intent: dict, current: dict | None, read: bool = True) -> str:
+    if not read:
+        return "not read (over --limit)"
+    if current is None:
+        return "no resource row"
+    if intent.get("version_id") is not None and current.get("version_id") is not None and intent["version_id"] <= current["version_id"]:
+        return "at or below the current version"
+    return "above the current version"
+
+
+def cmd_intents(args) -> int:
+    from datetime import datetime, timezone
+
+    started = time.monotonic()
+    buckets = intent_buckets(datetime.now(timezone.utc), args.hours)
+    cqlsh = lambda q: run(["docker", "exec", args.container, "cqlsh", "-e", q], timeout=120)
+    out = cqlsh(f"SELECT JSON bucket, shard, tenant_id, resource_type, id, version_id FROM {args.keyspace}.pending_index_writes "
+                f"WHERE bucket IN ({', '.join(cql_text(b) for b in buckets)}) AND shard IN ({', '.join(str(s) for s in range(INTENT_SHARDS))});")
+    warnings = []
+    if out is None:
+        warnings.append(f"Intent rows: pending_index_writes could not be read from {args.container}")
+    intents = [r for r in json_rows(out) if str(r.get("tenant_id", "")).startswith(args.tenant_prefix)]
+    keys = sorted({(r["tenant_id"], r["resource_type"], r["id"]) for r in intents})[: args.limit]
+    looked_up = set(keys)
+    current = {}
+    if keys:
+        reads = " ".join(f"SELECT JSON tenant_id, resource_type, id, version_id, deleted_at FROM {args.keyspace}.resources "
+                         f"WHERE tenant_id = {cql_text(t)} AND resource_type = {cql_text(rt)} AND id = {cql_text(i)};" for t, rt, i in keys)
+        for row in json_rows(cqlsh(reads)):
+            current[(row.get("tenant_id"), row.get("resource_type"), row.get("id"))] = row
+    by_label, by_class = {}, {}
+    for intent in intents:
+        match = TEST_TENANT.match(intent["tenant_id"])
+        label = match.group(1) if match else intent["tenant_id"]
+        key = (intent["tenant_id"], intent["resource_type"], intent["id"])
+        kind = classify_intent(intent, current.get(key), key in looked_up)
+        intent["class"] = kind
+        by_label.setdefault(label, {}).setdefault(kind, 0)
+        by_label[label][kind] += 1
+        by_class[kind] = by_class.get(kind, 0) + 1
+    took = time.monotonic() - started
+    md = (f"**{len(intents)} intent row(s)** left in `pending_index_writes` for `{args.tenant_prefix}` tenants, in the buckets "
+          f"{', '.join(f'`{b}`' for b in buckets)} (all {INTENT_SHARDS} shards). Read in {took:.1f} s.\n\n")
+    if intents:
+        kinds = sorted(by_class)
+        md += table(["Test (tenant label)"] + kinds + ["Total"],
+                    [[f"`{label}`"] + [counts.get(k) for k in kinds] + [sum(counts.values())] for label, counts in sorted(by_label.items())])
+    md += ("\nA finished write deletes its intent (I2), and so does a definite miss. One is left on purpose after an "
+           "unknown outcome, an undecidable write, a failed serial read, or a post-CAS write that ran out of its tries "
+           "(cassandra-discussion.md, the failure table; ADR-aacruzgon-0034), for the sweeper (Step 5). \"Above the current "
+           "version\" is an attempt that never applied; \"at or below\" one that applied and left its intent. Report only.\n")
+    add(args.id, args.title, md, {"buckets": buckets, "tenant_prefix": args.tenant_prefix, "intents": len(intents),
+                                  "by_class": by_class, "by_test": by_label, "rows": intents[:500],
+                                  "seconds": round(took, 1), "warnings": warnings})
     return 0
 
 
@@ -865,7 +1309,8 @@ def main() -> int:
     c.add_argument("label")
     c.add_argument("command", nargs=argparse.REMAINDER)
     c.set_defaults(func=cmd_timed)
-    for name, func in [("add", cmd_add), ("build", cmd_build), ("tests", cmd_tests), ("readiness", cmd_readiness), ("node-stats", cmd_node_stats), ("node-start", cmd_node_start)]:
+    for name, func in [("add", cmd_add), ("build", cmd_build), ("tests", cmd_tests), ("readiness", cmd_readiness), ("node-stats", cmd_node_stats), ("node-start", cmd_node_start),
+                       ("cql-audit", cmd_cql_audit), ("cas", cmd_cas), ("intents", cmd_intents), ("spec", cmd_spec)]:
         c = commands.add_parser(name)
         c.add_argument("id")
         c.add_argument("title")
@@ -885,7 +1330,31 @@ def main() -> int:
         elif name == "node-start":
             c.add_argument("container")
             c.add_argument("group")
+        elif name == "cql-audit":
+            c.add_argument("file")
+            c.add_argument("--keyspace", default="helios")
+            c.add_argument("--check", action="store_true",
+                           help="exit 1 on a CQL DELETE against resources or resource_versions, or an empty log")
+        elif name == "cas":
+            c.add_argument("logs", nargs="+")
+        elif name == "intents":
+            c.add_argument("container")
+            c.add_argument("--keyspace", default="helios")
+            c.add_argument("--tenant-prefix", default="test-")
+            # The job runs well under 40 minutes, so this hour and the two
+            # before it hold every intent it wrote.
+            c.add_argument("--hours", type=int, default=3)
+            c.add_argument("--limit", type=int, default=500, help="most resources whose current version is read")
+        elif name == "spec":
+            c.add_argument("log")
     args = parser.parse_args()
+    if args.cmd == "cql-audit" and args.check:
+        # A check, not a report: an error must not pass as "no DELETE found".
+        try:
+            return args.func(args)
+        except Exception as error:  # noqa: BLE001
+            print(f"::error title=CQL audit (Step 3 exit criterion)::the check could not run: {error!r}", flush=True)
+            return 1
     if args.cmd not in ("build", "timed"):
         # A report must never fail the job: an unexpected error is a warning.
         try:

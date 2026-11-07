@@ -10,7 +10,7 @@
 //! 1. The operation's own: `tenant.check_permission`; for a SearchParameter,
 //!    the 128-byte bound on `code` (G38); `K(N+1)`; `K(N)` from R1's
 //!    `index_keys` (G22). The engine adds the size bound on what the CAS
-//!    carries ([`MAX_CAS_PAYLOAD_BYTES`], D14) before anything is written.
+//!    carries ([`MAX_CAS_PAYLOAD_BYTES`], ADR-aacruzgon-0053) before anything is written.
 //! 2. On update, delete and revive, V3: row `N` rewritten at `ts(N) − 1`,
 //!    before the CAS (G40). Then I1, the intent row, at `LOCAL_QUORUM`,
 //!    carrying this attempt's `write_id` and target version.
@@ -176,7 +176,7 @@ pub(crate) const UPSERT_MISS_RETRIES: usize = 3;
 pub(crate) const PLAIN_DELETE_MISS_RETRIES: usize = 1;
 /// Tries of each plain write after the CAS applied (steps 4 and 5).
 const POST_CAS_WRITE_TRIES: u32 = 3;
-/// The most a CAS may carry, `data` plus `index_keys`, in bytes (D14): half
+/// The most a CAS may carry, `data` plus `index_keys`, in bytes (ADR-aacruzgon-0053): half
 /// of the node's default `max_mutation_size` (16 MiB, half of the default
 /// 32 MiB `commitlog_segment_size`), which leaves room for the rest of the
 /// row and for Paxos's own copy of the update.
@@ -1173,7 +1173,7 @@ fn already_exists(resource_type: &str, id: &str) -> StorageError {
     })
 }
 
-/// D14: refuses, before anything is written, a write whose CAS would carry
+/// ADR-aacruzgon-0053: refuses, before anything is written, a write whose CAS would carry
 /// more than [`MAX_CAS_PAYLOAD_BYTES`]. A larger mutation cannot succeed,
 /// and under Paxos v2 the node may refuse it only at the commit, after
 /// consensus, which would read as an unknown outcome (503) for a request

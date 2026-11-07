@@ -1,0 +1,63 @@
+# ADR-aacruzgon-0054: The required Cassandra job runs the backend's `--lib` tests
+
+- **Date:** 2026-11-06
+- **Status:** accepted (Alan approved it on 2026-11-06, as recommended)
+- **Context:**
+    - **What gated a pull request.** Until Step 3, the required `Cassandra schema (single node)` job ran only the integration binaries: `--test cassandra_tests --test backend_capability_contract` (`fmt-clippy-cassandra.yml:578-587`) and Milestone A.
+    - **Where the backend's own tests ran.** They live in `#[cfg(test)]` modules of `crates/persistence/src/backends/cassandra/*.rs`, and ran only in `cassandra-coverage.yml`, which is not required. Its comment said so: "the required job runs no --lib tests" (`:189-191` before this change).
+    - **What Step 3 puts there.** L1, the shared write engine (ADR-aacruzgon-0050, 0051), puts nearly all of Step 3's correctness tests in `--lib`:
+        - the CAS failure classification;
+        - the miss mapping;
+        - `decide(V)` for `V = 1` and `V > 1`;
+        - the R2-error rule;
+        - the key delta and the binds;
+        - V3's timestamp;
+        - the size bound;
+        - the no-DELETE source scan (the Step 3 plan's D6);
+        - the live engine tests against the node, run through the `cfg(test)` fault seam, including the late-attempt cases.
+
+      L2 and L3 add their unknown-outcome tables there too. Without a required step, none of them can fail a pull request.
+    - **Why it is a decision.** It changes what a required check runs (ADR-aacruzgon-0021, 0030). It adds build time and memory to a job that must stay on `hfs-cassandra-light`, under acruzdebian's 9 GiB service cap (ADR-aacruzgon-0023).
+- **Decision:**
+    - **The step.** It is named "cargo test --lib backends::cassandra against this node". It runs `cargo test -p helios-persistence --features cassandra --lib -- backends::cassandra --show-output` with `HFS_TEST_CASSANDRA_URL` set to the job's own node (port 59142), and tees its log into the test report. It runs after the integration tests and before Milestone A, so the readiness test stays last (ADR-aacruzgon-0042).
+    - **Its build.** The `--lib` test binary is built in the existing build step, before the node starts, under its own `ci-report.py build` entry, `build-persistence-lib`. Its time and memory peak are reported separately from the integration binaries'.
+    - **The tests that need their own node.** `backend.rs`'s `restart_tests` stop and start a node, so they run only when `HFS_TEST_CASSANDRA_RESTART_*` name a node of their own; the job never sets them. They print "not run", not "skipping", so the test report does not flag them as live tests skipped in a job that has a node.
+    - **What does not change.**
+        - The job's name, runner label, timeout and actions.
+        - No `paths:` filter.
+        - `cassandra-coverage.yml` keeps its own `--lib` run, for coverage. Its comment is updated.
+- **Alternatives considered:**
+    - **Keep `--lib` out of the required job, with coverage as its only run:** lost. The engine's tests would not gate the pull requests that change the engine, which are exactly L1 to L3.
+    - **Move the engine's tests into `tests/cassandra_tests.rs`:** lost. The fault seam is `cfg(test)`, so an integration binary cannot reach it, and a Cargo feature would edit `crates/persistence/Cargo.toml`, a one-owner shared file (roadmap `:12`). The pure tests also need the engine's private items.
+    - **A separate job for `--lib`:** lost. It would need its own node, or a second job sharing one, and a second required check name in the ruleset (ADR-aacruzgon-0021). The step costs less than a job's start-up.
+- **Consequences, measured on CI** (run 42337593891, commit `27a1b327c`; attempt 1 ran on `sam-7900x`, attempt 2 on `acruzdebian`):
+    - **The `--lib` build** (`build-persistence-lib`). Only `helios-persistence`'s test unit compiled each time; its dependencies were up to date, which is the usual case for a pull request that touches the crate.
+        - On `acruzdebian`: 35 s, with a peak anonymous memory of 3,488 MiB against the 9,216 MiB cap. That leaves a 5,728 MiB margin, with 0 OOM kills.
+        - On `sam-7900x`: 40 s, peaking at 3,368 MiB.
+        - The integration binaries' build, for comparison: 22 s and 45 s, peaking at 1,834 MiB and 1,892 MiB.
+        - The builds run one after another, so their peaks never add up.
+        - A fully cold build, after a target reset, adds the same dependency build that the integration binaries already pay; that was not measured separately.
+    - **The step itself:** 1 s; libtest reports 64 tests in 0.43 s.
+    - **The job's total:**
+        - `main` at `e32b02184`: 147 s, with a 14 s build;
+        - this branch: 210 s on `sam-7900x` and 211 s on `acruzdebian`, with builds of 104 s and 80 s.
+
+      Of the roughly 64 s added, the `--lib` build is 35 to 40 s and the step about 1 s. The rest is recompiling the changed crate for the other binaries, which any change to `helios-persistence` costs.
+    - **The runner:** the job stays light. Its worst peak is 3.5 GiB of anonymous memory, under acruzdebian's 9 GiB cap with 5.6 GiB to spare (ADR-aacruzgon-0023).
+    - **Locally (Apple M3 Pro, debug):** after `cargo clean -p helios-persistence`, the `--lib` test build takes 35.5 s with a peak RSS of 3.36 GiB, and 8.4 s warm after a touch. The 64 tests run in 1.3 to 1.9 s against the shared node, and were green in 8 of 8 runs beside other workers' writes.
+    - **What becomes easier.** Every engine change, and every C2, C3 and C4 table L2 and L3 add, gates the pull request.
+    - **What becomes harder.** Each change to `helios-persistence` rebuilds one more test binary in the required job.
+    - **To revisit.** If the job approaches its 40-minute timeout or the memory cap, split the build across steps or move to `hfs-cassandra-heavy`, with an ADR.
+- **AI involvement:**
+    - **Who and what.** A Claude Code worker (W1, `s3-engine`, Opus 5.5) drafted this entry for roadmap Step 3, layer L1, and wrote the step and its build entry. It worked from the Step 3 plan's section 6, which Alan accepted on 2026-11-06.
+    - **Verified:**
+        - `actionlint` on both workflows: the 4 findings it reports (`runner.workspace`) are identical on `main`;
+        - that `restart_tests` do not run without their variables, by reading `backend.rs` and a local run, where they print "not run" and pass;
+        - that `the_partition_key_scan_follows_every_page` now creates its own 16 partitions (the fix is on `main`), so the step's order does not matter for it;
+        - CI run 42337593891, both attempts green: the step passes, and the test report flags no skipped live test.
+    - **What Alan changed:** approved as recommended, on 2026-11-06, after reviewing the draft and its measurements.
+- **Links:**
+    - Step 3 layer L1, branch `cassandra/step3-write-engine`, commit `03285e92f` (the step) and `27a1b327c` (measured); draft PR #56;
+    - CI run [42337593891](https://github.com/aacruzgon/hfs-Cassandra-CS4411/actions/runs/42337593891), attempts 1 and 2;
+    - `.github/workflows/fmt-clippy-cassandra.yml` (the build step and the new step); `cassandra-coverage.yml`;
+    - ADR-aacruzgon-0021, 0023, 0030, 0042, 0050.

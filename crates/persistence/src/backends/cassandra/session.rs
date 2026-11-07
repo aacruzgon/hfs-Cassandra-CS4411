@@ -46,6 +46,15 @@
 //! rebuilding the session. `backend.rs`, `restart_tests`, checks the recovery
 //! against a node of its own.
 //!
+//! **Counting.** Every statement is counted by kind before it is sent
+//! ([`StatementCounts`], `CassandraBackend::statement_counts`), for the
+//! write-amplification report (Step 3 CI report R5).
+//!
+//! **Fault injection, tests only.** Under `cfg(test)`, and only there, a test
+//! can make the next matching statement report `WriteTimeout`/CAS, with or
+//! without executing it, or execute it late (`Fault`). It has no Cargo
+//! feature, so nothing outside this crate's unit tests can reach it.
+//!
 //! **Deadlines.** `cdrs-tokio` 10 has no per-request timeout, so every
 //! statement runs under the configured request deadline. When it elapses the
 //! caller gets [`DriverError::Deadline`]; for a CAS that is an unknown outcome
@@ -53,6 +62,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use cdrs_tokio::authenticators::StaticPasswordAuthenticatorProvider;
@@ -220,6 +230,11 @@ pub(crate) struct CassandraSession {
     prepared: RwLock<HashMap<String, Arc<PreparedQuery>>>,
     request_timeout: Duration,
     no_retry: Arc<dyn RetryPolicy + Send + Sync>,
+    /// Statements sent, per kind (CI report R5).
+    counts: StatementCounters,
+    /// The faults tests inject (`cfg(test)` only; see [`Fault`]).
+    #[cfg(test)]
+    faults: faults::Faults,
 }
 
 impl std::fmt::Debug for CassandraSession {
@@ -258,6 +273,9 @@ impl CassandraSession {
             prepared: RwLock::new(HashMap::new()),
             request_timeout: Duration::from_millis(config.request_timeout_ms),
             no_retry: Arc::new(FallthroughRetryPolicy),
+            counts: StatementCounters::default(),
+            #[cfg(test)]
+            faults: faults::Faults::default(),
         })
     }
 
@@ -265,6 +283,18 @@ impl CassandraSession {
     #[cfg(test)]
     pub(crate) fn prepared_count(&self) -> usize {
         self.prepared.read().len()
+    }
+
+    /// How many statements of each kind this session has been asked to send.
+    pub(crate) fn statement_counts(&self) -> StatementCounts {
+        self.counts.snapshot()
+    }
+
+    /// Makes the next statement of `kind` whose CQL contains `cql_contains`
+    /// fail as `fault` says (tests only).
+    #[cfg(test)]
+    pub(crate) fn inject_fault(&self, kind: StatementKind, cql_contains: &str, fault: Fault) {
+        self.faults.inject(kind, cql_contains, fault);
     }
 
     /// The prepared form of `cql`, preparing it on first use within
@@ -299,6 +329,25 @@ impl CassandraSession {
 
     /// [`Self::execute`], for one page when `paging` is set.
     async fn execute_with(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        kind: StatementKind,
+        paging: Option<Paging>,
+    ) -> Result<Envelope, DriverError> {
+        self.counts.count(kind);
+        #[cfg(test)]
+        if paging.is_none() {
+            if let Some(result) = self.faults.intercept(self, cql, &values, kind).await {
+                return result;
+            }
+        }
+        self.send(cql, values, kind, paging).await
+    }
+
+    /// Prepares (on first use) and sends one statement under the request
+    /// deadline, with no counting and no injected fault.
+    async fn send(
         &self,
         cql: &str,
         values: Vec<Value>,
@@ -384,6 +433,223 @@ impl CassandraSession {
                 None => return Ok(all),
             }
         }
+    }
+}
+
+/// Statements sent, one counter per [`StatementKind`].
+#[derive(Debug, Default)]
+struct StatementCounters {
+    read: AtomicU64,
+    serial_read: AtomicU64,
+    write: AtomicU64,
+    cas: AtomicU64,
+}
+
+impl StatementCounters {
+    fn count(&self, kind: StatementKind) {
+        let counter = match kind {
+            StatementKind::Read => &self.read,
+            StatementKind::SerialRead => &self.serial_read,
+            StatementKind::Write => &self.write,
+            StatementKind::Cas => &self.cas,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> StatementCounts {
+        StatementCounts {
+            read: self.read.load(Ordering::Relaxed),
+            serial_read: self.serial_read.load(Ordering::Relaxed),
+            write: self.write.load(Ordering::Relaxed),
+            cas: self.cas.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// How many statements of each kind a backend's session has been asked to
+/// send since it was built: every request, one per page of a paged read,
+/// failed ones included (Step 3 CI report R5, write amplification). Take one
+/// snapshot before and one after an operation and subtract with
+/// [`StatementCounts::since`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StatementCounts {
+    /// Plain reads at `LOCAL_QUORUM` (R1, R3, `count`, …).
+    pub read: u64,
+    /// Reads at `LOCAL_SERIAL` (R2).
+    pub serial_read: u64,
+    /// Plain writes at `LOCAL_QUORUM` (V1 to V3, index rows, I1, I2).
+    pub write: u64,
+    /// Compare-and-swaps (C1 to C4).
+    pub cas: u64,
+}
+
+impl StatementCounts {
+    /// What was sent between `earlier` and `self`.
+    pub fn since(&self, earlier: &StatementCounts) -> StatementCounts {
+        StatementCounts {
+            read: self.read.saturating_sub(earlier.read),
+            serial_read: self.serial_read.saturating_sub(earlier.serial_read),
+            write: self.write.saturating_sub(earlier.write),
+            cas: self.cas.saturating_sub(earlier.cas),
+        }
+    }
+
+    /// Every statement, whatever its kind.
+    pub fn total(&self) -> u64 {
+        self.read + self.serial_read + self.write + self.cas
+    }
+}
+
+impl std::fmt::Display for StatementCounts {
+    /// `read=1 serial_read=0 write=4 cas=1`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "read={} serial_read={} write={} cas={}",
+            self.read, self.serial_read, self.write, self.cas
+        )
+    }
+}
+
+/// A fault a test injects into the next matching statement, so that the
+/// engine's unknown-outcome paths run on one healthy node (Step 3 plan,
+/// section 6). Compiled only under `cfg(test)`: there is no Cargo feature, so
+/// no build outside the crate's own unit tests can reach it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// Execute the statement, then report `WriteTimeout`/CAS: applied, but
+    /// the reply was lost.
+    ApplyThenTimeOut,
+    /// Report `WriteTimeout`/CAS without executing it: not applied.
+    TimeOutWithoutApplying,
+    /// Report `WriteTimeout`/CAS now, and execute the statement just before
+    /// the next statement of kind `before`: an attempt that applies late,
+    /// after the serial read said it had not (ADR-aacruzgon-0051).
+    ApplyLate {
+        /// The kind of statement the late apply runs just before.
+        before: StatementKind,
+    },
+    /// Fail with `WriteTimeout`/CAS without executing: what a serial read
+    /// can raise on Paxos v2 (`Paxos.java:893-901`).
+    FailWithCasTimeout,
+    /// Fail with `WriteFailure`/CAS without executing: replicas failed, so
+    /// an unknown outcome that is undecidable answers 503, not 504.
+    FailWithWriteFailure,
+    /// Fail with `Unavailable` without executing: refused before any
+    /// replica acted, so not applied.
+    FailWithUnavailable,
+}
+
+#[cfg(test)]
+mod faults {
+    use cdrs_tokio::frame::message_error::{
+        ErrorBody, ErrorType, FailureInfo, UnavailableError, WriteFailureError, WriteTimeoutError,
+        WriteType,
+    };
+    use parking_lot::Mutex;
+
+    use super::*;
+
+    struct Pending {
+        kind: StatementKind,
+        cql_contains: String,
+        fault: Fault,
+    }
+
+    struct Deferred {
+        before: StatementKind,
+        cql: String,
+        values: Vec<Value>,
+        kind: StatementKind,
+    }
+
+    #[derive(Default)]
+    pub(super) struct Faults {
+        pending: Mutex<Vec<Pending>>,
+        deferred: Mutex<Vec<Deferred>>,
+    }
+
+    impl Faults {
+        pub(super) fn inject(&self, kind: StatementKind, cql_contains: &str, fault: Fault) {
+            self.pending.lock().push(Pending {
+                kind,
+                cql_contains: cql_contains.to_string(),
+                fault,
+            });
+        }
+
+        /// Runs any late apply due before a statement of `kind`, then the
+        /// fault for this statement, if one matches. `None` sends it as usual.
+        pub(super) async fn intercept(
+            &self,
+            session: &CassandraSession,
+            cql: &str,
+            values: &[Value],
+            kind: StatementKind,
+        ) -> Option<Result<Envelope, DriverError>> {
+            let due: Vec<Deferred> = {
+                let mut deferred = self.deferred.lock();
+                let (due, keep) = deferred.drain(..).partition(|d| d.before == kind);
+                *deferred = keep;
+                due
+            };
+            for late in due {
+                session
+                    .send(&late.cql, late.values, late.kind, None)
+                    .await
+                    .expect("the late apply of an injected fault");
+            }
+            let fault = {
+                let mut pending = self.pending.lock();
+                let at = pending
+                    .iter()
+                    .position(|p| p.kind == kind && cql.contains(&p.cql_contains))?;
+                pending.remove(at).fault
+            };
+            match fault {
+                Fault::ApplyThenTimeOut => {
+                    if let Err(error) = session.send(cql, values.to_vec(), kind, None).await {
+                        return Some(Err(error));
+                    }
+                }
+                Fault::ApplyLate { before } => self.deferred.lock().push(Deferred {
+                    before,
+                    cql: cql.to_string(),
+                    values: values.to_vec(),
+                    kind,
+                }),
+                Fault::FailWithWriteFailure => return Some(Err(server_error(write_failure()))),
+                Fault::FailWithUnavailable => return Some(Err(server_error(unavailable()))),
+                Fault::TimeOutWithoutApplying | Fault::FailWithCasTimeout => {}
+            }
+            Some(Err(server_error(ErrorType::WriteTimeout(
+                WriteTimeoutError::new(Consistency::LocalSerial, 0, 1, WriteType::Cas, None),
+            ))))
+        }
+    }
+
+    /// A server error of type `ty`, as the node sends it.
+    fn server_error(ty: ErrorType) -> DriverError {
+        DriverError::from(cdrs_tokio::error::Error::Server {
+            body: ErrorBody::new("injected fault", ty),
+            addr: "127.0.0.1:9042".parse().expect("an address"),
+        })
+    }
+
+    fn write_failure() -> ErrorType {
+        ErrorType::WriteFailure(WriteFailureError::new(
+            Consistency::LocalQuorum,
+            0,
+            1,
+            FailureInfo::NumFailures(1),
+            WriteType::Cas,
+        ))
+    }
+
+    fn unavailable() -> ErrorType {
+        ErrorType::Unavailable(UnavailableError::new(Consistency::LocalSerial, 1, 0))
     }
 }
 

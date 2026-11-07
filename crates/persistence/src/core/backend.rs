@@ -22,8 +22,9 @@ pub enum BackendKind {
     Postgres,
     /// Apache Cassandra (wide-column store).
     ///
-    /// Reserved: no backend is implemented for this kind. It is accepted by
-    /// composite configuration and the advisor but cannot be instantiated.
+    /// Implemented by `backends::cassandra::CassandraBackend` (feature
+    /// `cassandra`), a standalone primary still in progress: see that
+    /// module's docs for what is real and what still refuses with 501.
     Cassandra,
     /// MongoDB (document store).
     MongoDB,

@@ -1,7 +1,20 @@
-//! [`ResourceStorage`] and [`VersionedStorage`] for [`CassandraBackend`].
+//! [`ResourceStorage`] and [`VersionedStorage`] for [`CassandraBackend`]:
+//! one-line delegations to the file that implements each method, so that
+//! each of roadmap Step 3's parts owns its own file (`development-roadmap.md`
+//! ground rule "One owner per shared file").
 //!
-//! Roadmap Step 2 serves `create` (`write.rs`), `read` and `count`
-//! (`read.rs`); Step 3 and Step 4 fill in the rest. A stub returns
+//! | Methods | File | Status |
+//! | --- | --- | --- |
+//! | `create` | `write.rs`, on the shared write engine | real |
+//! | `read`, `count` | `read.rs` | real |
+//! | `update` | `update.rs` | stub (Step 3, L2a) |
+//! | `delete`, `delete_versioned` | `delete.rs` | stubs (Step 3, L2b) |
+//! | `create_or_update` | `upsert.rs` | stub (Step 3, L3) |
+//! | `vread`, `list_versions`, `delete_with_match` | `versions.rs` | stubs (Step 3, L2c) |
+//! | `exists`, `read_batch` | `versions.rs` | the trait defaults' logic, on `read` |
+//! | `update_with_match` | here | stub (Step 4) |
+//!
+//! A stub returns
 //! [`BackendError::UnsupportedCapability`](crate::error::BackendError), which
 //! the REST layer answers with 501. `count` is pulled forward from Step 3
 //! with the `resources_by_type` row every create writes, so the conformance
@@ -10,9 +23,8 @@
 //! The provided defaults the design lists as wrong for a networked store are
 //! overridden here (`cassandra-discussion.md`, "Defaults we must override"):
 //! `readiness_check`, `is_cluster_shared`, `bulk_write_concurrency` and
-//! `delete_versioned`. `read_batch` and `create_many` keep their defaults for
-//! now: both only call `read` and `create`, so they are correct, and Step 3
-//! makes `read_batch` concurrent.
+//! `delete_versioned`. `create_many` keeps its default, which calls
+//! `create`; Step 3 makes `read_batch` concurrent.
 
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
@@ -60,13 +72,14 @@ impl ResourceStorage for CassandraBackend {
 
     async fn create_or_update(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _id: &str,
-        _resource: Value,
-        _fhir_version: FhirVersion,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        Err(unsupported("create_or_update"))
+        self.create_or_update_resource(tenant, resource_type, id, resource, fhir_version)
+            .await
     }
 
     async fn read(
@@ -78,36 +91,55 @@ impl ResourceStorage for CassandraBackend {
         self.read_resource(tenant, resource_type, id).await
     }
 
+    async fn exists(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<bool> {
+        self.exists_resource(tenant, resource_type, id).await
+    }
+
+    async fn read_batch(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[&str],
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.read_batch_resources(tenant, resource_type, ids).await
+    }
+
     async fn update(
         &self,
-        _tenant: &TenantContext,
-        _current: &StoredResource,
-        _resource: Value,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
     ) -> StorageResult<StoredResource> {
-        Err(unsupported("update"))
+        self.update_resource(tenant, current, resource).await
     }
 
     async fn delete(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _id: &str,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
     ) -> StorageResult<()> {
-        Err(unsupported("delete"))
+        self.delete_resource(tenant, resource_type, id).await
     }
 
-    /// Refused outright until Step 3 gives it its compare-and-swap. The
-    /// default reads, compares and then calls `delete`, which is not atomic:
-    /// a writer between the read and the delete would be deleted along with
-    /// the version the client named (#1404).
+    /// Overridden, never the default: the default reads, compares and then
+    /// calls `delete`, which is not atomic, so a writer between the read and
+    /// the delete would be deleted along with the version the client named
+    /// (#1404). `delete.rs` gives it its own compare-and-swap.
     async fn delete_versioned(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _id: &str,
-        _expected_version: &str,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
     ) -> StorageResult<()> {
-        Err(unsupported("delete_versioned"))
+        self.delete_versioned_resource(tenant, resource_type, id, expected_version)
+            .await
     }
 
     async fn count(
@@ -127,12 +159,13 @@ impl ResourceStorage for CassandraBackend {
 impl VersionedStorage for CassandraBackend {
     async fn vread(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _id: &str,
-        _version_id: &str,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        version_id: &str,
     ) -> StorageResult<Option<StoredResource>> {
-        Err(unsupported("vread"))
+        self.vread_resource(tenant, resource_type, id, version_id)
+            .await
     }
 
     async fn update_with_match(
@@ -148,20 +181,21 @@ impl VersionedStorage for CassandraBackend {
 
     async fn delete_with_match(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _id: &str,
-        _expected_version: &str,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
     ) -> StorageResult<()> {
-        Err(unsupported("delete_with_match"))
+        self.delete_with_match_resource(tenant, resource_type, id, expected_version)
+            .await
     }
 
     async fn list_versions(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _id: &str,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
     ) -> StorageResult<Vec<String>> {
-        Err(unsupported("list_versions"))
+        self.list_resource_versions(tenant, resource_type, id).await
     }
 }

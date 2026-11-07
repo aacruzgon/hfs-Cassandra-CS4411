@@ -5,18 +5,23 @@
 //! design is `docs/Cassandra/cassandra-discussion.md`; the order the work
 //! lands in is `docs/Cassandra/development-roadmap.md`.
 //!
-//! # Status: roadmap Step 2
+//! # Status: roadmap Step 3 in progress
 //!
 //! The backend implements every trait the server's bound requires (the twelve
 //! of `helios_rest::create_app`), plus [`Backend`](crate::core::Backend) and
-//! [`SearchCapabilityProvider`](crate::core::SearchCapabilityProvider). In
-//! this step the connection, the health and schema checks, the capability
+//! [`SearchCapabilityProvider`](crate::core::SearchCapabilityProvider). Real
+//! so far: the connection, the health and schema checks, the capability
 //! declaration, the per-tenant search-parameter registries, `create`, `read`
-//! and `count` are real; every other storage, search and history method
-//! refuses with
+//! and `count`, and the shared write engine every compare-and-swap goes
+//! through (`write.rs`, ADR-aacruzgon-0050). `exists`, `read_batch` and
+//! `create_many` work through the trait defaults' logic. Every other storage,
+//! search and history method refuses with
 //! [`BackendError::UnsupportedCapability`](crate::error::BackendError), which
-//! the REST layer answers with 501. Later steps replace the stubs in their own
-//! files.
+//! the REST layer answers with 501. Each is replaced in its own file
+//! (`storage.rs` lists them).
+//!
+//! [`CassandraBackend::cas_stats`] and [`CassandraBackend::statement_counts`]
+//! count the engine's outcomes and the statements sent, for the CI reports.
 //!
 //! # What the backend assumes
 //!
@@ -46,14 +51,19 @@
 
 mod backend;
 mod config;
+mod delete;
 mod errors;
 mod index_keys;
 mod read;
 mod schema;
 mod search;
 mod session;
+mod stats;
 mod storage;
 mod stubs;
+mod update;
+mod upsert;
+mod versions;
 mod write;
 
 pub use backend::{CassandraBackend, CassandraConnection, StoredSearchParameterReload};
@@ -62,3 +72,5 @@ pub use config::{
     DEFAULT_KEYSPACE, DEFAULT_LOCAL_DC, DEFAULT_POOL_SIZE, DEFAULT_REQUEST_TIMEOUT_MS,
 };
 pub use schema::TABLES;
+pub use session::StatementCounts;
+pub use stats::CasStats;

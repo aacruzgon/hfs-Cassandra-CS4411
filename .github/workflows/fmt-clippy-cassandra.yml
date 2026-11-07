@@ -714,10 +714,10 @@ jobs:
       # operation (update, vread, list_versions, the three create_or_update
       # branches, delete, delete_versioned), with the statements and CAS
       # outcomes per call from the backend's own counters (Step 3 plan R1,
-      # R2, R5); an operation still answering 501 is listed as not
-      # implemented yet. Then 50 POST + GET round trips through hfs. Each on a
-      # fresh tenant (ADR-aacruzgon-0020). Already built. Report only: no
-      # figure fails it; it fails only if an operation fails. Before the audit
+      # R2, R5). Then 50 POST + GET round trips through hfs. Each on a fresh
+      # tenant (ADR-aacruzgon-0020). Already built. Report only: no figure
+      # fails it; it fails if an operation fails, a 501 included, since every
+      # one is real from Step 3 on (ADR-aacruzgon-0059). Before the audit
       # check and the node statistics, so they include its writes, and before
       # the readiness test, which stays last.
       - name: Latency report against this node (report only)

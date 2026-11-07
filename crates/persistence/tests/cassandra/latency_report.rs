@@ -5,10 +5,9 @@
 //! `HFS_TEST_LATENCY_REPORT` names an output directory, and otherwise returns
 //! at once, so a plain `cargo test` is unchanged. It is a report, not a
 //! check: no figure fails it, and it fails only when an operation itself
-//! fails. An operation the backend still answers with a 501 stub
-//! (`UnsupportedCapability`) is reported as "not implemented yet" instead, so
-//! the report runs at every layer of the Step 3 stack and fills in as the
-//! layers land.
+//! fails. Every operation it measures is real from roadmap Step 3 on, so any
+//! error fails it, a 501 (`UnsupportedCapability`) included: that would be a
+//! regression, not a layer still to land (ADR-aacruzgon-0059).
 //!
 //! On a fresh tenant ([`unique_tenant`]; ADR-aacruzgon-0020, rule 2), one
 //! operation at a time, through [`CassandraBackend`] (Step 3 plan, report R1):
@@ -53,7 +52,7 @@ use std::time::{Duration, Instant};
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::cassandra::CassandraBackend;
 use helios_persistence::core::{ResourceStorage, VersionedStorage};
-use helios_persistence::error::{BackendError, StorageError, StorageResult};
+use helios_persistence::error::StorageResult;
 use helios_persistence::types::StoredResource;
 use serde_json::json;
 
@@ -161,21 +160,10 @@ fn ms(d: Duration) -> f64 {
     (d.as_secs_f64() * 1_000_000.0).round() / 1000.0
 }
 
-/// Whether an error is the backend's 501 for a method that is still a stub.
-fn is_unsupported(error: &StorageError) -> bool {
-    matches!(
-        error,
-        StorageError::Backend(BackendError::UnsupportedCapability { backend_name, .. })
-            if backend_name == "cassandra"
-    )
-}
-
 /// One operation's figures.
 struct Figures {
     operation: &'static str,
     samples: Vec<Duration>,
-    /// Why the operation was not measured: still a stub, or it needs one that is.
-    not_measured: Option<String>,
     /// Statements per measured call, by kind.
     statements: Option<BTreeMap<String, f64>>,
     /// CAS outcome counters over the measured calls.
@@ -183,29 +171,7 @@ struct Figures {
 }
 
 impl Figures {
-    fn skipped(operation: &'static str, why: impl Into<String>) -> Self {
-        Figures {
-            operation,
-            samples: Vec::new(),
-            not_measured: Some(why.into()),
-            statements: None,
-            cas: None,
-        }
-    }
-
-    fn measured(&self) -> bool {
-        self.not_measured.is_none() && !self.samples.is_empty()
-    }
-
     fn json(&self) -> serde_json::Value {
-        if !self.measured() {
-            return json!({
-                "operation": self.operation,
-                "status": "not measured",
-                "reason": self.not_measured,
-                "n": 0,
-            });
-        }
         let mut sorted = self.samples.clone();
         sorted.sort_unstable();
         json!({
@@ -261,13 +227,6 @@ struct Stage<'a> {
     before: Option<Snapshot>,
 }
 
-/// What one call came to.
-enum Call<T> {
-    Done(T),
-    /// The operation is still a 501 stub; stop calling it.
-    Stub,
-}
-
 impl<'a> Stage<'a> {
     fn new(backend: &'a CassandraBackend, operation: &'static str, warm: usize) -> Self {
         Stage {
@@ -280,13 +239,9 @@ impl<'a> Stage<'a> {
         }
     }
 
-    /// Times one call. A stub on the first call is [`Call::Stub`]; any other
-    /// error, or a stub after a success, is a broken measurement and panics.
-    async fn call<T>(
-        &mut self,
-        what: &str,
-        future: impl Future<Output = StorageResult<T>>,
-    ) -> Call<T> {
+    /// Times one call. Any error, a 501 included, is a broken measurement
+    /// and panics.
+    async fn call<T>(&mut self, what: &str, future: impl Future<Output = StorageResult<T>>) -> T {
         let started = Instant::now();
         let result = future.await;
         let took = started.elapsed();
@@ -299,20 +254,18 @@ impl<'a> Stage<'a> {
                 if self.calls == self.warm {
                     self.before = Some(Snapshot::take(self.backend));
                 }
-                Call::Done(value)
+                value
             }
-            Err(error) if self.calls == 0 && is_unsupported(&error) => Call::Stub,
             Err(error) => panic!("{} {what}: {error}", self.operation),
         }
     }
 
     fn finish(self) -> Figures {
-        if self.samples.is_empty() {
-            return Figures::skipped(
-                self.operation,
-                "not implemented yet (the backend answers 501)",
-            );
-        }
+        assert!(
+            !self.samples.is_empty(),
+            "{}: no measured call",
+            self.operation
+        );
         let after = Snapshot::take(self.backend);
         let before = self.before.unwrap_or_else(|| after.clone());
         let n = self.samples.len() as f64;
@@ -332,7 +285,6 @@ impl<'a> Stage<'a> {
         Figures {
             operation: self.operation,
             samples: self.samples,
-            not_measured: None,
             statements,
             cas,
         }
@@ -381,16 +333,13 @@ async fn cassandra_latency_report() {
     let mut stage = Stage::new(&backend, "create", WARM_UP);
     let mut stored: Vec<StoredResource> = Vec::with_capacity(WARM_UP + CREATES);
     for i in 0..WARM_UP + CREATES {
-        match stage
+        let resource = stage
             .call(
                 &format!("{i}"),
                 backend.create(&tenant, "Patient", patient(i), version),
             )
-            .await
-        {
-            Call::Done(resource) => stored.push(resource),
-            Call::Stub => panic!("create is a stub"),
-        }
+            .await;
+        stored.push(resource);
     }
     figures.push(stage.finish());
     let measured_ids: Vec<String> = stored[WARM_UP..]
@@ -400,31 +349,27 @@ async fn cassandra_latency_report() {
 
     let mut stage = Stage::new(&backend, "read", 0);
     for id in &measured_ids {
-        if let Call::Done(found) = stage.call(id, backend.read(&tenant, "Patient", id)).await {
-            assert!(
-                found.is_some(),
-                "Patient/{id} was created but reads as absent"
-            );
-        }
+        let found = stage.call(id, backend.read(&tenant, "Patient", id)).await;
+        assert!(
+            found.is_some(),
+            "Patient/{id} was created but reads as absent"
+        );
     }
     figures.push(stage.finish());
 
     let mut stage = Stage::new(&backend, "count", 0);
     for i in 0..COUNTS {
-        if let Call::Done(n) = stage
+        let n = stage
             .call(&format!("{i}"), backend.count(&tenant, Some("Patient")))
-            .await
-        {
-            assert_eq!(n, (WARM_UP + CREATES) as u64, "count {i}");
-        }
+            .await;
+        assert_eq!(n, (WARM_UP + CREATES) as u64, "count {i}");
     }
     figures.push(stage.finish());
 
     let mut stage = Stage::new(&backend, "exists", 0);
     for id in &measured_ids {
-        if let Call::Done(found) = stage.call(id, backend.exists(&tenant, "Patient", id)).await {
-            assert!(found, "Patient/{id} was created but does not exist");
-        }
+        let found = stage.call(id, backend.exists(&tenant, "Patient", id)).await;
+        assert!(found, "Patient/{id} was created but does not exist");
     }
     figures.push(stage.finish());
 
@@ -434,15 +379,13 @@ async fn cassandra_latency_report() {
             let ids: Vec<&str> = (0..size)
                 .map(|k| measured_ids[(i * size + k) % measured_ids.len()].as_str())
                 .collect();
-            if let Call::Done(found) = stage
+            let found = stage
                 .call(
                     &format!("{i}"),
                     backend.read_batch(&tenant, "Patient", &ids),
                 )
-                .await
-            {
-                assert_eq!(found.len(), size, "{operation} {i}");
-            }
+                .await;
+            assert_eq!(found.len(), size, "{operation} {i}");
         }
         figures.push(stage.finish());
     }
@@ -460,57 +403,46 @@ async fn cassandra_latency_report() {
 
     let mut stage = Stage::new(&backend, "update", WARM_EACH);
     for (i, current) in stored[..per].iter().enumerate() {
-        match stage
+        let updated = stage
             .call(
                 current.id(),
                 backend.update(&tenant, current, patient_with_id(current.id(), 1000 + i)),
             )
-            .await
-        {
-            Call::Done(updated) => assert_ne!(
-                updated.version_id(),
-                current.version_id(),
-                "update of Patient/{}",
-                current.id()
-            ),
-            Call::Stub => break,
-        }
+            .await;
+        assert_ne!(
+            updated.version_id(),
+            current.version_id(),
+            "update of Patient/{}",
+            current.id()
+        );
     }
     figures.push(stage.finish());
 
     let mut stage = Stage::new(&backend, "vread (version 1)", WARM_EACH);
     for current in &stored[..per] {
-        match stage
+        let found = stage
             .call(
                 current.id(),
                 backend.vread(&tenant, "Patient", current.id(), "1"),
             )
-            .await
-        {
-            Call::Done(found) => {
-                assert!(found.is_some(), "vread Patient/{}/_history/1", current.id())
-            }
-            Call::Stub => break,
-        }
+            .await;
+        assert!(found.is_some(), "vread Patient/{}/_history/1", current.id());
     }
     figures.push(stage.finish());
 
     let mut stage = Stage::new(&backend, "list_versions", WARM_EACH);
     for current in &stored[..per] {
-        match stage
+        let versions = stage
             .call(
                 current.id(),
                 backend.list_versions(&tenant, "Patient", current.id()),
             )
-            .await
-        {
-            Call::Done(versions) => assert!(
-                !versions.is_empty(),
-                "list_versions Patient/{}",
-                current.id()
-            ),
-            Call::Stub => break,
-        }
+            .await;
+        assert!(
+            !versions.is_empty(),
+            "list_versions Patient/{}",
+            current.id()
+        );
     }
     figures.push(stage.finish());
 
@@ -523,7 +455,7 @@ async fn cassandra_latency_report() {
     ] {
         let mut stage = Stage::new(&backend, operation, WARM_EACH);
         for (i, id) in upsert_ids.iter().enumerate() {
-            match stage
+            let (_, created) = stage
                 .call(
                     id,
                     backend.create_or_update(
@@ -534,13 +466,8 @@ async fn cassandra_latency_report() {
                         version,
                     ),
                 )
-                .await
-            {
-                Call::Done((_, created)) => {
-                    assert_eq!(created, expect_created, "{operation} Patient/{id}")
-                }
-                Call::Stub => break,
-            }
+                .await;
+            assert_eq!(created, expect_created, "{operation} Patient/{id}");
         }
         figures.push(stage.finish());
     }
@@ -548,58 +475,41 @@ async fn cassandra_latency_report() {
     let mut stage = Stage::new(&backend, "delete", WARM_EACH);
     let mut deleted = Vec::with_capacity(per);
     for current in &stored[..per] {
-        match stage
+        stage
             .call(
                 current.id(),
                 backend.delete(&tenant, "Patient", current.id()),
             )
-            .await
-        {
-            Call::Done(()) => deleted.push(current.id().to_string()),
-            Call::Stub => break,
-        }
+            .await;
+        deleted.push(current.id().to_string());
     }
     figures.push(stage.finish());
 
     let mut stage = Stage::new(&backend, "delete_versioned", WARM_EACH);
     for current in &stored[per..2 * per] {
         let call = backend.delete_versioned(&tenant, "Patient", current.id(), current.version_id());
-        if let Call::Stub = stage.call(current.id(), call).await {
-            break;
-        }
+        stage.call(current.id(), call).await;
     }
     figures.push(stage.finish());
 
     let operation = "create_or_update (revive branch)";
-    if deleted.is_empty() {
-        figures.push(Figures::skipped(
-            operation,
-            "needs delete, which is not implemented yet",
-        ));
-    } else {
-        let mut stage = Stage::new(&backend, operation, WARM_EACH);
-        for (i, id) in deleted.iter().enumerate() {
-            match stage
-                .call(
+    let mut stage = Stage::new(&backend, operation, WARM_EACH);
+    for (i, id) in deleted.iter().enumerate() {
+        let (_, created) = stage
+            .call(
+                id,
+                backend.create_or_update(
+                    &tenant,
+                    "Patient",
                     id,
-                    backend.create_or_update(
-                        &tenant,
-                        "Patient",
-                        id,
-                        patient_with_id(id, 3000 + i),
-                        version,
-                    ),
-                )
-                .await
-            {
-                Call::Done((_, created)) => {
-                    assert!(created, "a revive of Patient/{id} is a create (201)")
-                }
-                Call::Stub => break,
-            }
-        }
-        figures.push(stage.finish());
+                    patient_with_id(id, 3000 + i),
+                    version,
+                ),
+            )
+            .await;
+        assert!(created, "a revive of Patient/{id} is a create (201)");
     }
+    figures.push(stage.finish());
 
     let total = started.elapsed();
     let report_end = Snapshot::take(&backend);
@@ -639,14 +549,6 @@ async fn cassandra_latency_report() {
         total.as_secs_f64()
     );
     for (row, figure) in rows.iter().zip(&figures) {
-        if !figure.measured() {
-            md.push_str(&format!(
-                "| `{}` | 0 | – | – | – | – | {} |\n",
-                figure.operation,
-                figure.not_measured.as_deref().unwrap_or("not measured")
-            ));
-            continue;
-        }
         let statements = match &figure.statements {
             Some(kinds) if !kinds.is_empty() => kinds
                 .iter()
@@ -732,18 +634,4 @@ fn counter_delta_and_cas_line() {
         cas_line("latency-report:read_batch (10 ids)", &delta),
         "[cas case=latency-report:read_batch-10-ids applied=7 attempts=8 re_runs=1]"
     );
-}
-
-#[test]
-fn a_stub_is_recognised_and_other_errors_are_not() {
-    let stub = StorageError::Backend(BackendError::UnsupportedCapability {
-        backend_name: "cassandra".to_string(),
-        capability: "vread".to_string(),
-    });
-    assert!(is_unsupported(&stub));
-    let other = StorageError::Backend(BackendError::UnsupportedCapability {
-        backend_name: "sqlite".to_string(),
-        capability: "vread".to_string(),
-    });
-    assert!(!is_unsupported(&other));
 }

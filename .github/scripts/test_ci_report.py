@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import re
 import os
 import subprocess
 import sys
@@ -408,6 +409,66 @@ class IntentsCommand(Scratch):
         self.assertEqual(data["by_test"]["zz"], {"not read (over --limit)": 1})
         self.assertIn("shard IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)", calls[0])
         self.assertEqual(calls[1].count("SELECT JSON"), 3, "one point read per resource, up to --limit")
+
+
+    HEXES = "0123456789abcdef0123456789abcdef"
+
+    def intents_with(self, n, resources_answer, limit=500):
+        """cmd_intents over n intents (versions 1), with the resources reads answered by
+        resources_answer(statement_text) -> stdout or None. Returns (data, output, calls)."""
+        rows = [{"bucket": "b", "shard": k % 16, "tenant_id": f"test-crud-{self.HEXES}", "resource_type": "Patient",
+                 "id": f"p{k:04d}", "version_id": 1} for k in range(n)]
+        calls = []
+
+        def fake_run(command, timeout=60):
+            if command[:2] != ["docker", "exec"]:
+                return None  # the report's own context commands
+            calls.append(command[-1])
+            if "pending_index_writes" in command[-1]:
+                return " [json]\n" + "\n".join(json.dumps(r) for r in rows) + "\n"
+            return resources_answer(command[-1])
+
+        original = ci_report.run
+        ci_report.run = fake_run
+        try:
+            args = SimpleNamespace(id="intents", title="Intents", container="c", keyspace="helios", tenant_prefix="test-", hours=3, limit=limit)
+            status, out = self.quiet(ci_report.cmd_intents, args)
+        finally:
+            ci_report.run = original
+        self.assertEqual(status, 0)
+        return self.report("intents"), out, calls
+
+    @staticmethod
+    def found(statements):
+        """A resources read that finds every resource it asks for, at version 2."""
+        ids = re.findall(r"id = '(p\d+)'", statements)
+        return " [json]\n" + "\n".join(json.dumps({"tenant_id": f"test-crud-{IntentsCommand.HEXES}", "resource_type": "Patient",
+                                                    "id": i, "version_id": 2, "deleted_at": 0}) for i in ids) + "\n"
+
+    def test_a_failed_resources_read_is_not_read_and_warns(self):
+        data, out, _ = self.intents_with(3, lambda q: None)
+        self.assertEqual(data["by_class"], {"not read (resources read failed)": 3})
+        self.assertEqual(len(data["warnings"]), 1)
+        self.assertIn("resources could not be read from c", data["warnings"][0])
+        self.assertIn("::warning", out)
+
+    def test_the_resources_reads_are_chunked(self):
+        data, out, calls = self.intents_with(250, self.found)
+        reads = [c for c in calls if "pending_index_writes" not in c]
+        self.assertEqual([r.count("SELECT JSON") for r in reads], [100, 100, 50])
+        self.assertTrue(all(len(r.encode()) < 128 * 1024 for r in reads), "each -e argument under MAX_ARG_STRLEN")
+        self.assertEqual(data["by_class"], {"at or below the current version": 250})
+        self.assertEqual(data["warnings"], [])
+
+    def test_a_failed_middle_chunk_marks_only_its_own_intents(self):
+        answers = iter([self.found, lambda q: None, self.found])
+        data, out, _ = self.intents_with(250, lambda q: next(answers)(q))
+        self.assertEqual(data["by_class"], {"at or below the current version": 150, "not read (resources read failed)": 100})
+        self.assertEqual(len(data["warnings"]), 1)
+        self.assertIn("1 of 3 read(s) failed", data["warnings"][0])
+        self.assertIn("100 resource(s)", data["warnings"][0])
+        failed = sorted(r["id"] for r in data["rows"] if r["class"].startswith("not read"))
+        self.assertEqual(failed, [f"p{k:04d}" for k in range(100, 200)], "the second chunk of the sorted keys")
 
 
 class CrudTombstones(unittest.TestCase):

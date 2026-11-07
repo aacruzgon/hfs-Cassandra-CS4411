@@ -1217,6 +1217,11 @@ def cmd_spec(args) -> int:
 
 INTENT_SHARDS = 16  # schema.cql, pending_index_writes; write.rs INTENT_SHARDS
 TEST_TENANT = re.compile(r"^test-(.*)-[0-9a-f]{32}$")
+# Point reads of `resources` per cqlsh call. All of them go in one `-e`
+# argument, and Linux refuses an argument of 128 KiB or more
+# (MAX_ARG_STRLEN): a read is up to about 300 bytes (a 64-byte tenant, a
+# long resource type, a 64-character id), so 100 stay near 30 KiB.
+INTENT_READ_CHUNK = 100
 
 
 def cql_text(value: str) -> str:
@@ -1241,9 +1246,11 @@ def intent_buckets(now, hours: int) -> list[str]:
     return [(now - timedelta(hours=h)).strftime("%Y-%m-%dT%H") for h in range(hours)]
 
 
-def classify_intent(intent: dict, current: dict | None, read: bool = True) -> str:
+def classify_intent(intent: dict, current: dict | None, read: bool = True, failed: bool = False) -> str:
     if not read:
         return "not read (over --limit)"
+    if failed:
+        return "not read (resources read failed)"
     if current is None:
         return "no resource row"
     if intent.get("version_id") is not None and current.get("version_id") is not None and intent["version_id"] <= current["version_id"]:
@@ -1265,18 +1272,29 @@ def cmd_intents(args) -> int:
     intents = [r for r in json_rows(out) if str(r.get("tenant_id", "")).startswith(args.tenant_prefix)]
     keys = sorted({(r["tenant_id"], r["resource_type"], r["id"]) for r in intents})[: args.limit]
     looked_up = set(keys)
-    current = {}
-    if keys:
+    current, unread, failed_reads, chunks = {}, set(), 0, 0
+    # In chunks, each checked: a failed read is not "no resource row".
+    for start in range(0, len(keys), INTENT_READ_CHUNK):
+        chunk = keys[start:start + INTENT_READ_CHUNK]
+        chunks += 1
         reads = " ".join(f"SELECT JSON tenant_id, resource_type, id, version_id, deleted_at FROM {args.keyspace}.resources "
-                         f"WHERE tenant_id = {cql_text(t)} AND resource_type = {cql_text(rt)} AND id = {cql_text(i)};" for t, rt, i in keys)
-        for row in json_rows(cqlsh(reads)):
+                         f"WHERE tenant_id = {cql_text(t)} AND resource_type = {cql_text(rt)} AND id = {cql_text(i)};" for t, rt, i in chunk)
+        out = cqlsh(reads)
+        if out is None:
+            unread.update(chunk)
+            failed_reads += 1
+            continue
+        for row in json_rows(out):
             current[(row.get("tenant_id"), row.get("resource_type"), row.get("id"))] = row
+    if unread:
+        warnings.append(f"Intent rows: resources could not be read from {args.container} ({failed_reads} of {chunks} "
+                        f"read(s) failed); {len(unread)} resource(s) are classed as not read")
     by_label, by_class = {}, {}
     for intent in intents:
         match = TEST_TENANT.match(intent["tenant_id"])
         label = match.group(1) if match else intent["tenant_id"]
         key = (intent["tenant_id"], intent["resource_type"], intent["id"])
-        kind = classify_intent(intent, current.get(key), key in looked_up)
+        kind = classify_intent(intent, current.get(key), key in looked_up, key in unread)
         intent["class"] = kind
         by_label.setdefault(label, {}).setdefault(kind, 0)
         by_label[label][kind] += 1
@@ -1291,7 +1309,8 @@ def cmd_intents(args) -> int:
     md += ("\nA finished write deletes its intent (I2), and so does a definite miss. One is left on purpose after an "
            "unknown outcome, an undecidable write, a failed serial read, or a post-CAS write that ran out of its tries "
            "(cassandra-discussion.md, the failure table; ADR-aacruzgon-0034), for the sweeper (Step 5). \"Above the current "
-           "version\" is an attempt that never applied; \"at or below\" one that applied and left its intent. Report only.\n")
+           "version\" is an attempt that never applied; \"at or below\" one that applied and left its intent. \"Not read\" is "
+           "over `--limit`, or in a `resources` read that failed. Report only.\n")
     add(args.id, args.title, md, {"buckets": buckets, "tenant_prefix": args.tenant_prefix, "intents": len(intents),
                                   "by_class": by_class, "by_test": by_label, "rows": intents[:500],
                                   "seconds": round(took, 1), "warnings": warnings})

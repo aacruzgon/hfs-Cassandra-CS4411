@@ -245,9 +245,90 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 
 **Who.** **A**, with **W** reviewing the CAS code.
 
+### Reading Step 3's records: layers, plan items and matrix rows
+
+Step 3's ADRs (0050 to 0064), this roadmap and the walkthrough cite names from the Step 3 working notes, which are not in the repository: the Step 3 plan, its D-numbered decisions, Alan's record of his choices on them, and an HL7 matrix. This key gives each one cited in the repository a meaning, so no reference needs a file outside it. Where an ADR records the decision itself, that ADR is the authority; the key only says what a name points to.
+
+**Layers and PRs.** Step 3 landed as six layers, one PR each:
+
+| Layer | PR | What |
+| --- | --- | --- |
+| L1 | #56 (merge `957129f45`) | the shared compare-and-swap write engine, `create` moved onto it (branch `cassandra/step3-write-engine`) |
+| L2 | #58 (`b8cf2d4f4`) | built in three parts: **L2a** `update` and the SearchParameter overlay, **L2b** `delete` and `delete_versioned`, **L2c** `vread`, `list_versions`, `delete_with_match`, `exists` and `read_batch` |
+| L3 | #59 (`25eddd3b8`) | `create_or_update`, revive included |
+| L4 | #60 (`9c8c8f4f3`) | the CRUD suite copy, the race and multitenancy suites, `step3_crud_through_rest`; its CI part, **L4-ci**, is the CQL audit check and Step 3's CI reports |
+| L5 | #61 | this documentation: ADRs 0060 to 0064 and the handover |
+| L6 | #57 (`dcc21a9ca`) | the backport of HeliosSoftware/hfs#2530, batch `ifMatch` |
+
+**Who.** The ADRs' AI-involvement fields name Claude Code workers: `s3-plan` wrote the Step 3 plan, `s3-spec` the HL7 matrix, W1 (`s3-engine`) L1, W2 (`s3-update`) L2a and L3, W4 (`s3-suites`) L4, W5 (`s3-ci`) L4-ci and L6, and `s3-docs` L5. Each layer was checked before its PR by an audit subagent of its own worker: the "L1 audit" is L1's, and "finding F3" in ADR-aacruzgon-0063 is one of L3's.
+
+**Other names.**
+- **The Step 3 plan** is the working plan for Step 3, on whose D-numbered questions Alan decided on 2026-11-06 and 2026-11-07. Its sections cited here: §2d, the gaps the HL7 and Cassandra matrix found (gap 1: on Paxos v2 the serial read can itself fail with `WriteTimeout`/CAS; gap 2: driver errors after the CAS was sent, such as "Write channel failure!" and "Unmatched stream id", ADR-aacruzgon-0050); §3a, the deviations from the spec to record; §4a, its reading of `PaxosState` lock timeouts; §5, the layer list (§5 L6 is the backport layer); §7, CI reports R1 to R10 (defined in ADR-aacruzgon-0059 itself); §9, its open items (#6: the spec tensions, now ADR-aacruzgon-0064; #10: the cost of the `--lib` step, now ADR-aacruzgon-0054); its checklist (item 9: record each spec tension; item 13: a Cassandra REST case for the batch `ifMatch` backport); "the L3 row", its row for layer L3.
+- **"decisions"**, cited as `decisions :N` in some entries, is Alan's record of what he chose on each D-number; every entry also says in words what he chose, under "What Alan changed".
+- **UP-n** is the plan's numbering of draft upstream issues: UP-5+6 is batch `ifMatch`, filed as HeliosSoftware/hfs#2527 and fixed by #2530.
+- **F8** is ADR-aacruzgon-0058's known limitation: the CQL audit check skips a failed `DELETE` sent from a session whose keyspace is not `helios`.
+- **R1 to R5** are the reads of the walkthrough's statement catalogue (section 2); **R1 to R10** in ADR-aacruzgon-0059 are its CI reports. The context tells them apart.
+- **`[spec row=…]` ids** in `crates/hfs/tests/cassandra_milestone_a.rs` (`R-3`, `D-4`, `V-1`, `U-14`, `CC-9:twins-one-write`, `B-7:delete-unknown`, …) are that test's own labels, printed in CI; each is defined where the test prints it.
+
+**The plan's decisions (D-numbers).** D15 is cited nowhere.
+
+| D | Meaning | Recorded in |
+| --- | --- | --- |
+| D1 | Pull `vread`, `list_versions` and `delete_with_match` forward from Step 4, because the race suite calls them | ADR-aacruzgon-0060 |
+| D2 | Run upstream's `crud_suite` as an adapted copy with a parity test | 0057 |
+| D3 | One compare-and-swap engine for C1 to C4; its sub-decision 4: an error of the serial read is 504 or 503 | 0050, 0055 |
+| D4 | Map a missed compare-and-swap from the columns it returns | 0050 |
+| D5 | Plain `update`'s rewrite of row N (V3) is built from its own pre-read, so it carries a `write_id` | 0061 |
+| D6 | Check the node's CQL audit log for a `DELETE` on `resources` or `resource_versions` | 0058 |
+| D7 | Declare `Crud` and `OptimisticLocking` in the commit that first runs their suites green | 0060 item 7 |
+| D8 | A delete of an unknown or deleted id: the plan recommended keeping 404; Alan chose the spec's 204, through upstream #2529 carried in the fork | 0052 |
+| D9 | How the SearchParameter overlay follows updates, deletes and revives; option (a′) was chosen | 0062 |
+| D10 | Override `exists` (reads only `deleted_at`) and `read_batch` (concurrent reads) | walkthrough 4.1 |
+| D11 | `create_or_update` refuses an id that is not a FHIR `id` with 400 before any statement | 0063, 0064 item 1 |
+| D12 | Each Step 3 PR is opened against `main` only after the one below it merges | 0050 |
+| D13 | After an unknown outcome, check later looks at the row against every earlier attempt | 0051 |
+| D14 | An 8 MiB bound on what a compare-and-swap carries | 0053 |
+| D16 | A revive answers 201 in every FHIR version | 0064 item 2 |
+| D17 | PATCH is in Step 3, with no backend code, tested through REST | 0060 item 2 |
+| D18 | `HFS_RETURN_GONE` affects vread only; correct the documents that said otherwise | 0064 item 11 |
+| D19 | With vread real, every versioned `Location` resolves from Step 3 | 0060 item 1 |
+| D20 | Apply PR #50's unresolved CodeRabbit comments to the documents | 0050, 0051 |
+| D21 | Realign six places where the roadmap contradicted the design or an ADR (its rows 1 to 6) | 0050, 0060 |
+| D22 | Which REST-layer problems are filed upstream, and which fixes the fork carries (#2529, #2530) | 0056, 0064 |
+| D23 | Split the multitenancy suites: the two CRUD-only tests at Step 3, the rest later | 0057, 0060 item 3 |
+| D24 | The Step 3 REST test is a required step of the Cassandra job | 0059 |
+
+A letter after a D-number (D1 b, D9 a′) is one of that decision's options; the citing entry's "Alternatives considered" says what each was.
+
+**The HL7 matrix rows.** The `s3-spec` worker's table, about 90 rows, set each HL7 rule for Step 3's interactions (R4, with R4B and R5 where they differ) against the code. The rows cited:
+
+| Row | The rule, or what it found |
+| --- | --- |
+| RS1 | An id on PUT must be a valid FHIR `id`; Cassandra refuses others with 400 (ADR-aacruzgon-0064 item 1) |
+| RS5 | `meta.lastUpdated` is "the current time on the server"; Cassandra's can run 1 ms ahead (0064 item 5) |
+| U-2 | A PUT whose body has no `id` should be 400; REST accepts it (0064 item 9) |
+| U-7, U-9, VD-4 | The status of an update that revives a deleted resource: 201 in R4 and R4B, ambiguous in R5 (0064 item 2) |
+| V-5 | "There is no way to update or delete past versions" (0061) |
+| V-6 | A versioned `Location` must resolve, so vread must be real (0060) |
+| T-4 | A read after a delete is `Gone` |
+| T-9 | A revive is `created = true` and keeps `created_at` and the FHIR version |
+| T-14 | A delete of an unknown or deleted id is `NotFound` and writes no version |
+| CC-7 | `HFS_REQUIRE_IF_MATCH` answers 412 where the spec names 400 (0064 item 10) |
+| CC-9, CC-10 | A batch PUT, and a batch DELETE, with `ifMatch` were check-then-act until #57 (0056, 0064 item 6) |
+| B-2 | A batch PUT's id is never compared with its URL (0064 item 9) |
+| B-3 | Two batch entries on one resource are not rejected (0064 item 7) |
+| CS-2 | `readHistory: true` is true only if vread works (0060) |
+| CS-4, G1 | `/metadata` over-advertises the history interactions and every search parameter until Step 7 (0064 item 8); this G1 is a matrix row, not the walkthrough's gap G1 |
+| DS-1 | `read` of a deleted resource is 410 whatever `HFS_RETURN_GONE` says; only vread reads the flag (0064 item 11) |
+| DS-2, DS-3, DS-4 | Corrections to the design's CRUD row and its "Where R4 and the build differ" paragraph (0064) |
+| DS-6 | An `If-Match` PUT that races a delete answers 404 (0064 item 3) |
+| DS-7 | PATCH works through `update`, and neither the design nor the roadmap named it (0060) |
+| DS-8 | `check_id`'s 400, where SQLite answers 201 (0064 item 1) |
+| DS-12 | The design said a missed compare-and-swap had written nothing; it has written V3 and its intent row (0051) |
+
 ### Steps 4 and 5 in parallel: what Step 3 hands over (2026-11-07)
 
-Steps 4 and 5 both build on Step 3 and can run at the same time, by two people. This subsection is what both need; each step's own section below adds what is particular to it. Paths are relative to `crates/persistence/src/backends/cassandra/` (`C/`) unless given in full; line numbers are on `main` `dcc21a9ca` (Step 3's last merge, layer L6's PR #57).
+Steps 4 and 5 both build on Step 3 and can run at the same time, by two people. This subsection is what both need; each step's own section below adds what is particular to it. Paths are relative to `crates/persistence/src/backends/cassandra/` (`C/`) unless given in full; line numbers are on `main` `dcc21a9ca` (Step 3's last merge, layer L6's PR #57). Layer names, D-numbers and matrix rows are explained in the key just above.
 
 **Running what exists.** The test-hfs skill does not cover Cassandra, so the commands are here. Every test writes under its own tenant (`unique_tenant`, `tests/common/cassandra.rs:630`) and never cleans up (ADR-aacruzgon-0020, 0029); never drop or truncate on a shared node.
 - **The node.** `docker/cassandra` on `127.0.0.1:59042` (`docker/cassandra/README.md`), with `docs/Cassandra/schema/keyspace-single-node.cql` and then `docs/Cassandra/schema/schema.cql` applied by hand; the harness never runs DDL against that node (`crates/persistence/tests/common/cassandra.rs:13-15`). Without `HFS_TEST_CASSANDRA_URL` the tests start their own container instead (roadmap Step 2, ADR-aacruzgon-0029).

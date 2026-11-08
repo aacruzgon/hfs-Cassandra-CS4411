@@ -1,0 +1,100 @@
+# ADR-aacruzgon-0065: The Cassandra backend is tested on R4, R4B, R5 and R6, with R4 as the required gate
+
+- **Date:** 2026-11-07
+- **Status:** accepted (Alan approved it on 2026-11-07).
+- **Context:** Alan asked whether R4B, R5 and R6 are "basically plug in" or need a refactor, since Helios supports all four and Cassandra must too.
+    - **What the design said.** "Nothing in the backend is tied to R4". Functional tests stay on R4, the R4B compile check is the gate, and running the suites under R5 is "a follow-up once the R4 backend is accepted" (`cassandra-discussion.md`, "FHIR versions"; ADR-aacruzgon-0026).
+    - **What the investigation found** (2026-11-07, on `25eddd3b8` and `9c8c8f4f3`, by the Rex worker `fhir-versions`). Everything the backend does today works under R4B-only, R5, R6 and all-versions builds:
+        - creates, reads, updates, deletes and revives;
+        - `count`;
+        - the search registry and the seed for the server's default version;
+        - each resource keeping its creation version.
+    - **What was R4-only was the testing:**
+        - the tests could not choose a version, since `FhirVersion::default_enabled()` is R4 in any build with R4, and R4B in an R5 or R6 build (helios-audit's R5 and R6 features enable R4B);
+        - Milestone A stripped `HFS_DEFAULT_FHIR_VERSION`, so it could not boot an R5 or R6 hfs;
+        - no CI job ran a non-R4 test.
+    - **One gap had already merged.** PR #60 left `cassandra_tests` uncompilable without R4: `FhirVersion::default()`, which exists only with the `R4` feature, appeared 109 times, through `tests/cassandra/crud.rs` and three shared suites. All five required checks still passed, because the R4B check compiled only the library and the Cassandra job builds its tests with R4.
+    - **Why it is a decision:** how far to test, and how to select the version, are choices between workable designs, and the choice adds CI jobs and a step to the required R4B check.
+- **Decision:** the backend's tests run under every FHIR version from one all-versions build, chosen at run time, and R4 stays the only required functional gate.
+    - **The compile fix and the guard (PR #63, `cassandra/fhir-versions-compile`).**
+        - `FhirVersion::default()` becomes `default_enabled()` in `tests/cassandra/crud.rs` and in the three shared suites `cassandra_tests` includes: `tests/multitenancy/tenant_existence_suite.rs`, `tests/multitenancy/tenant_id_fidelity_suite.rs` and `tests/search/versioned_write_race_suite.rs`. This follows ADR-aacruzgon-0039's fix to `tests/common/fixtures.rs`. With `R4` on, both calls return R4, so the R4 tests run as before. `crud.rs`'s module doc lists the swap among the copy's changes from upstream (ADR-aacruzgon-0057).
+        - **The required R4B check gains a second step**, under the same job name `cargo check (cassandra, R4B)` and with no `paths:` filter (ADR-aacruzgon-0019): `cargo check -p helios-persistence --no-default-features --features cassandra,R4B --test cassandra_tests --test backend_capability_contract --timings`. It names the two targets, not `--tests`, because `--tests` also selects the crate's own unit tests, which need R4 and `sqlite` and so cannot build there.
+        - **The upstream canary runs the same second command** (`.github/workflows/upstream-canary.yml`), after its library check passes, on upstream's `main` merged into ours. A failure is drift, under the step name "cargo check of the Cassandra test targets", and the issue shows that command's last 50 lines. ADR-sam-michaels-0005 has the canary run 0.4's required check because "that is the required check every pull request must pass, so the canary predicts exactly what the weekly sync branch will meet". With 0.4's second command, that stays true only if the canary runs it too. The two targets compile three upstream suites and upstream's `tests/common/` harness, and upstream calls `FhirVersion::default()` throughout `crates/persistence/tests/`, so an upstream edit there would fail the weekly sync branch while the canary stayed green. ADR-sam-michaels-0005 is unchanged: this entry extends what it checks under its own rule.
+    - **The selector (PR B, `cassandra/fhir-versions-tests`).** Decided, not yet merged (roadmap row 0.12): this part says what PR B will do. `HFS_TEST_FHIR_VERSION` will name the tests' version, in any form `FhirVersion::from_storage` accepts (`R5`, `r5`, `5.0`).
+        - **The name follows upstream's subscriptions tests,** which read `HFS_TEST_FHIR_VERSION` for the same purpose (`crates/subscriptions/tests/rest_hook_integration.rs:15-28`, `websocket_integration.rs:15-28`, `email_integration.rs:26-36`, `messaging_integration.rs:27-37`). Upstream's parser accepts only `R4B`, `R5` and `R6` and falls back to `FhirVersion::default()`, which is R4, on any other value, `5.0` and `r5` included. This one is stricter on purpose: it panics instead, because a typo or a misconfigured job would otherwise run R4 and report green (the fallback alternative below).
+        - **Unset:** the tests use `default_enabled()`, exactly as before, so the required R4 job is unchanged.
+        - **Set to a value the build cannot parse, or to a version it does not enable:** the first test that asks panics, with the build's enabled list, rather than quietly running R4.
+        - **Where it is read:** once per test binary, in three places that apply the same rule:
+            - `backends/cassandra/test_support.rs` for the unit tests, a `cfg(test)` module with `test_fhir_version()` and `test_config()`, through which every unit test's `CassandraConfig` is built;
+            - `tests/common/cassandra.rs` for `cassandra_tests`, with `config_for` carrying the version;
+            - `crates/hfs/tests/cassandra_milestone_a.rs`, which forwards it to every hfs it starts as `HFS_DEFAULT_FHIR_VERSION` in `as_str()` form, and asserts that hfs's startup line names that version.
+        - **Each binary prints its choice once:** `fhir-versions: HFS_TEST_FHIR_VERSION=R5 -> R5 (5.0)`.
+        - **Every call site that means "the test's version" uses it:** 43 in the unit tests, 124 in the integration tests (the 104 of `crud.rs` among them), and the server default in Milestone A.
+        - **Two places keep `default_enabled()`:**
+            - the three shared suites, which are upstream files that other backends' binaries also include and that cannot name a Cassandra helper;
+            - the capability contract, which writes no resource.
+        - **`CassandraConfig::default()` is unchanged.** The only non-test line is the `#[cfg(test)] mod test_support;` declaration.
+    - **The CI jobs (PR C, `cassandra/fhir-versions-ci`).** Decided, not yet merged (roadmap row 0.12): this part says what PR C will add. A new workflow, `fhir-versions.yml`, will hold three jobs. None of them is required, and none edits a required workflow.
+        - `cargo check (cassandra, R5)` and `cargo check (cassandra, R6)`: light, compile-only, without R4. An all-versions build has every `cfg` arm, so it cannot catch a missing catch-all arm.
+        - `Cassandra tests (all FHIR versions)`: heavy (ADR-aacruzgon-0023). It builds once with `cassandra,sqlite,R4,R4B,R5,R6,helios-fhir/skip-r6-download`. On its own node (Compose project `hfs-cassandra-fhir-versions`, port 59242), it runs the backend's `--lib` tests, `cassandra_tests`, the capability contract, Milestone A and `step3_crud_through_rest` under each of R4, R4B, R5 and R6. Its per-version results, with each binary's selector line checked, go in the step summary and in the artifact `ci-report-fhir-versions` (ADR-aacruzgon-0045, 0046, 0048).
+    - **R4 stays the required gate.** `Cassandra schema (single node)` runs R4, as it does today.
+    - **The upstream touch list.** The roadmap's §8 line for the three shared suites, added on PR #63 in `62ff307d5`, is this decision's record of that upstream change: they join `tests/common/fixtures.rs`'s line, in its form.
+- **Alternatives considered:**
+    - **Keep the R4 tests and the R4B library check only:** lost. "Plug-in" would stay proven by compilation alone, and that check had already missed #60's break.
+    - **Widen the R4B check with `--tests`:** lost. It also selects the crate's unit tests, which do not build without R4 and `sqlite`. On `ec949adc3`, `cargo check -p helios-persistence --no-default-features --features cassandra,R4B --lib --profile test` fails with 99 errors whose primary locations are in 24 files, all upstream code outside `backends/cassandra/`.
+    - **Leave the canary on the library check alone:** lost. The canary would no longer run what the sync branch must pass, against ADR-sam-michaels-0005's reason for it.
+    - **One build per version (R4B-only, R5, R6) running the tests:** lost.
+        - It needs three builds where one suffices.
+        - The crate's `--lib` tests do not build without R4 and `sqlite`.
+        - An R5 or R6 build tests R4B unless a selector exists anyway.
+    - **A cargo feature per test version:** lost. Features add up, so a build with R4B and R5 still couldn't say which one to test.
+    - **Fall back to the default when `HFS_TEST_FHIR_VERSION` doesn't parse:** lost. A typo or a misconfigured job would run R4 and report green.
+    - **Change `CassandraConfig::default()` to read the variable:** lost. It would put a test switch into the production default. The tests build their configs from `test_config()` or `config_for` instead.
+    - **Run the four versions in the required light job:** lost for now.
+        - It adds the four-version `helios-fhir` build to a job that must fit `acruzdebian`'s 9 GiB.
+        - It would make a failure on a non-R4 version block merges before its cost is known.
+    - **A search registry per FHIR version:** out of scope, and recorded as a known upstream limit in the design. Every Helios backend builds one registry, one conformance seed and one stored-SearchParameter parser from the server's default version, and SQLite behaves the same (reproduced 2026-11-07).
+- **Consequences:**
+    - **Easier.**
+        - One build tests four versions.
+        - A test that assumes R4 fails the required R4B check, and an upstream change that brings one in shows up on the canary the night it lands.
+        - Once PR B lands, new tests start on `test_fhir_version()` and `test_config()`.
+    - **Harder.**
+        - The required R4B job has a second step, and the canary a second check (both on PR #63).
+        - With PR C, one more workflow with three report-only jobs.
+        - With PR C, the heavy job's node next to its build on `sam-7900x`, and its own target directory there.
+    - **Measured on CI, the R4B test-target step (PR #63):**
+        - `acruzdebian`: cold 72 s, `anon` peak 3,333 MiB of the 9,216 MiB cap, no OOM kill (run 42409703670); warm 9.2 s, `anon` peak 985 MiB (run 42412193902).
+        - `sam-7900x`: cold 59.7 s, `anon` peak 3,287 MiB of 20 GiB (run 42418772920); warm 8.2 s, 980 MiB (run 42428114060).
+        - The library step before it is unchanged: 7 s warm on `acruzdebian` in run 42409703670.
+        - The canary's extra command was measured locally on upstream `1e6bb3013` merged into the branch: 65 s cold, 3.4 GiB peak RSS, 0.7 GiB more target directory. The canary itself has failed at its merge step since 2026-11-05 (issue #40), so the step first runs on CI once that conflict is resolved.
+    - **Measured locally, for scale, PR C's jobs** (a Mac, cold): the R5 and R6 checks take 102 s and 94 s; the all-versions build takes 283 s for persistence and 274 s for hfs, and its twelve runs about 90 s. Their CI figures come with PR C, in that PR's own ADR entry if they change a decision.
+    - **To revisit.** After a week of the all-versions job's runs, decide from its figures whether it becomes required.
+    - **Amends ADR-aacruzgon-0026.** Its "No CI job is added" for an R4+R5 build no longer holds as a decision: the all-versions job (PR C, not yet merged) will be that build, and the in-scope copy of `fhir_version_filter_suite.rs` can run there once Step 6 has search.
+    - **Amends ADR-aacruzgon-0030.** Its rejection of a second Cassandra node on the runner still holds for the required job, but not for PR C's report-only heavy job, which will have its own Compose project and port.
+    - **No schema change, so no sign-off (ADR-aacruzgon-0028).** Every version shares the same tables, and no key holds the version. The longest type name across the four versions is 34 bytes and the longest SearchParameter code 46 bytes, both inside the design's bounds.
+- **AI involvement:** Claude Code (Opus 5.5), as the Rex worker `fhir-versions`, with one subagent.
+    - **Proposed by the assistant:** the investigation and its answer (the backend is plug-in; the testing and CI were R4-only), gaps G1 to G10 with a fix or an owner for each, the six recommendations, the selector's design (one variable, parsed once, a panic on a bad value, unset meaning today's behaviour), the split into three PRs, and this entry.
+    - **Changed by the human.** Alan approved the six recommendations on 2026-11-07 ("lets send a Rex agent to do all this work and address any of the issues and fill all the gaps") and this entry as drafted ("okay lets go with all the recommendations, i approve them"). After PR #63's independent audits, he had six commits added to it in other sessions, by two other Claude Code workers, PR #63's independent reviewers, which this entry records:
+        - the canary's second check and its drift message (`5851ad332`, `5eb319efa`);
+        - `--timings` on the new step (`3a8da211a`);
+        - the step's comment citing only existing entries (`5957690e9`);
+        - `crud.rs`'s list of changes from upstream (`ced5f9868`);
+        - the §8 touch-list line (`62ff307d5`).
+
+      The reviewer `pr63-review` wrote five of them, and a second reviewer wrote `5eb319efa`; each was audited by the worker that did not write it. He asked for the canary and the touch list to be named here. After this entry's own audit, `pr63-review` corrected it for accuracy in a later commit: the tense of the PR B and PR C parts, the unit-test failure count, the commit count above, roadmap §4's two R4B commands and its dated "today", and the selector's upstream precedent. No decision, alternative or approval changed.
+    - **Written by:**
+        - PR #63's first commit, PR B, and this entry with its design and roadmap edits: the worker;
+        - PR C's workflow and report script: drafted by a subagent in its own worktree and reviewed and corrected by the worker. Its test fixtures gave the contract binary a selector line it never prints; the worker rebuilt them from real logs.
+    - **Verified by running** (logs in the `fhir-versions` run folder):
+        - on `main` the R4B test-target check fails with 109 × E0599, and with PR #63 it passes;
+        - the R4 tests pass, `crud::parity::crud_copy_matches_upstream` included;
+        - with PR B, the `--lib` tests (115), `cassandra_tests` (172), the contract (10) and the two REST tests pass unset and under R4, R4B, R5, R6 and `5.0`, each log naming its version; the REST tests also assert hfs's startup line, and `R7` panics;
+        - PR C's test-step commands, run locally against the shared node, give 12 of 12 runs ok with every selector line matched;
+        - the shared registry limit, on Cassandra and on SQLite.
+    - **Verified on CI:** PR #63's required checks, the runs above for the figures.
+- **Links:**
+    - PRs: #63 (`cassandra/fhir-versions-compile`), PR B (`cassandra/fhir-versions-tests`), PR C (`cassandra/fhir-versions-ci`), and PR #60.
+    - Design: `cassandra-discussion.md` §"FHIR versions: R4 now, R4B, R5 and R6 without rework", with its known-limit paragraph.
+    - Roadmap: §1 ("Nothing is R4-specific"), §3 matrix rows 0.4 and 0.12, Step 0's canary task, Steps 6a to 6d, Step 8, §5's `fhir_version_filter_suite.rs` row, §8.
+    - ADRs: ADR-aacruzgon-0019, 0021, 0023, 0026, 0028, 0030, 0039, 0045, 0046, 0048, 0057; ADR-sam-michaels-0002, 0005.

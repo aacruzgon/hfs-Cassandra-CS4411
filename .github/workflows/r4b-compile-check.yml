@@ -105,6 +105,22 @@ jobs:
           python3 .github/scripts/ci-report.py build build-r4b-check "Build: cargo check (cassandra, R4B)" -- \
             cargo check -p helios-persistence --no-default-features --features cassandra,R4B --timings
 
+      # The Cassandra test targets in the same R4B-only build. The library
+      # check above compiles no test, so when PR #60 put 109 calls to
+      # FhirVersion::default() (gated on the R4 feature) into cassandra_tests,
+      # through tests/cassandra/crud.rs and three shared suites, no required
+      # check saw it: this job (ADR-aacruzgon-0019) checks the library only,
+      # and the Cassandra job (ADR-aacruzgon-0021) builds the tests with R4.
+      # cassandra_tests also compiles the shared harness under tests/common/
+      # (ADR-aacruzgon-0039). The two targets are named rather than --tests,
+      # because --tests also selects the crate's own unit tests, which need R4
+      # and sqlite and so cannot build here.
+      - name: cargo check the Cassandra test targets (cassandra, R4B)
+        run: |
+          python3 .github/scripts/ci-report.py build build-r4b-check-tests "Build: cargo check the Cassandra test targets (cassandra, R4B)" -- \
+            cargo check -p helios-persistence --no-default-features --features cassandra,R4B \
+              --test cassandra_tests --test backend_capability_contract --timings
+
       # The persistent target directory before and after this job, and
       # whether the reset step reset it and why
       # (.github/scripts/build-size-report.py). Report only.

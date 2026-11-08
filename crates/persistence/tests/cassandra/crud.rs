@@ -23,7 +23,11 @@
 //!   its ValueSet an id of its own ([`unique_id`](crate::cassandra_node::unique_id),
 //!   ADR-aacruzgon-0038);
 //! - **the two tests upstream ignores for #306** run: SQLite has no
-//!   `created_at` column, Cassandra does (`docs/Cassandra/schema/schema.cql`).
+//!   `created_at` column, Cassandra does (`docs/Cassandra/schema/schema.cql`);
+//! - **`FhirVersion::default_enabled()`** in place of upstream's
+//!   `FhirVersion::default()`, which exists only with the `R4` feature, so the
+//!   copy also compiles in the R4B-only check (`r4b-compile-check.yml`). With
+//!   `R4` on, both return R4, so the tests run as upstream's do.
 //!
 //! Where an upstream assertion accepts two answers, the copy keeps it as it
 //! is, for parity, and [`strict`] adds a `cassandra_strict_*` test that pins
@@ -103,7 +107,7 @@ pub mod create_tests {
         let patient = create_patient_json(None);
 
         let result = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await;
 
         assert!(result.is_ok(), "Create should succeed");
@@ -122,7 +126,7 @@ pub mod create_tests {
         let patient = create_patient_json(None);
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .expect("Create should succeed");
 
@@ -157,7 +161,7 @@ pub mod create_tests {
         let patient = create_patient_json(None);
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .expect("Create should succeed");
 
@@ -173,7 +177,7 @@ pub mod create_tests {
         // Create a Patient
         let patient = create_patient_json(None);
         let patient_stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         assert_eq!(patient_stored.resource_type(), "Patient");
@@ -187,7 +191,12 @@ pub mod create_tests {
             }
         });
         let obs_stored = backend
-            .create(&tenant, "Observation", observation, FhirVersion::default())
+            .create(
+                &tenant,
+                "Observation",
+                observation,
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
         assert_eq!(obs_stored.resource_type(), "Observation");
@@ -202,7 +211,7 @@ pub mod create_tests {
                 &tenant,
                 "Organization",
                 organization,
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -221,7 +230,7 @@ pub mod create_tests {
         let patient = create_patient_json(None);
 
         let result = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await;
 
         assert!(result.is_err(), "Create without permission should fail");
@@ -249,7 +258,7 @@ pub mod create_tests {
                 "Patient",
                 "new-patient-123",
                 patient,
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .expect("create_or_update should succeed");
@@ -273,7 +282,7 @@ pub mod create_tests {
                 "Patient",
                 "patient-456",
                 patient1,
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -290,7 +299,7 @@ pub mod create_tests {
                 "Patient",
                 "patient-456",
                 patient2,
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -320,7 +329,7 @@ pub mod create_tests {
                 "Patient",
                 "patient-789",
                 patient1,
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -337,7 +346,7 @@ pub mod create_tests {
                 "Patient",
                 "patient-789",
                 patient2,
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -370,7 +379,7 @@ pub mod create_tests {
                 "name": [{"family": format!("Patient{}", i)}]
             });
             let stored = backend
-                .create(&tenant, "Patient", patient, FhirVersion::default())
+                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
                 .await
                 .unwrap();
             ids.push(stored.id().to_string());
@@ -399,11 +408,16 @@ pub mod create_tests {
         let patient = create_patient_json(None);
 
         let stored1 = backend
-            .create(&tenant1, "Patient", patient.clone(), FhirVersion::default())
+            .create(
+                &tenant1,
+                "Patient",
+                patient.clone(),
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
         let stored2 = backend
-            .create(&tenant2, "Patient", patient, FhirVersion::default())
+            .create(&tenant2, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -451,7 +465,7 @@ pub mod create_tests {
         });
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let content = stored.content();
@@ -505,7 +519,12 @@ pub mod create_tests {
         });
 
         let stored = backend
-            .create(&tenant, "Observation", observation, FhirVersion::default())
+            .create(
+                &tenant,
+                "Observation",
+                observation,
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
         let content = stored.content();
@@ -532,7 +551,7 @@ pub mod create_tests {
         });
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let content = stored.content();
@@ -554,7 +573,7 @@ pub mod create_tests {
         });
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let content = stored.content();
@@ -581,7 +600,7 @@ pub mod create_tests {
         });
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let content = stored.content();
@@ -612,7 +631,7 @@ pub mod create_tests {
         });
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let content = stored.content();
@@ -665,7 +684,7 @@ pub mod read_tests {
         // Create a resource first
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -694,7 +713,7 @@ pub mod read_tests {
             "birthDate": "1980-01-15"
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -734,7 +753,7 @@ pub mod read_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -771,7 +790,7 @@ pub mod read_tests {
         // Create resource in tenant1
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default())
+            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -802,7 +821,12 @@ pub mod read_tests {
             "name": "TestValueSet"
         });
         let created = backend
-            .create(&system, "ValueSet", value_set, FhirVersion::default())
+            .create(
+                &system,
+                "ValueSet",
+                value_set,
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
 
@@ -828,7 +852,7 @@ pub mod read_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -873,7 +897,7 @@ pub mod read_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default())
+            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -904,7 +928,7 @@ pub mod read_tests {
         for i in 0..5 {
             let patient = create_patient_json(&format!("Patient{}", i));
             let created = backend
-                .create(&tenant, "Patient", patient, FhirVersion::default())
+                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
                 .await
                 .unwrap();
             ids.push(created.id().to_string());
@@ -929,12 +953,12 @@ pub mod read_tests {
         // Create 2 resources
         let patient1 = create_patient_json("Smith");
         let created1 = backend
-            .create(&tenant, "Patient", patient1, FhirVersion::default())
+            .create(&tenant, "Patient", patient1, FhirVersion::default_enabled())
             .await
             .unwrap();
         let patient2 = create_patient_json("Jones");
         let created2 = backend
-            .create(&tenant, "Patient", patient2, FhirVersion::default())
+            .create(&tenant, "Patient", patient2, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -962,7 +986,7 @@ pub mod read_tests {
                 &tenant,
                 "Patient",
                 create_patient_json("Live"),
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -971,7 +995,7 @@ pub mod read_tests {
                 &tenant,
                 "Patient",
                 create_patient_json("Doomed"),
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -1025,7 +1049,7 @@ pub mod read_tests {
         // Create resources in tenant1
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default())
+            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1055,7 +1079,7 @@ pub mod read_tests {
         for i in 0..3 {
             let patient = create_patient_json(&format!("Patient{}", i));
             backend
-                .create(&tenant, "Patient", patient, FhirVersion::default())
+                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
                 .await
                 .unwrap();
         }
@@ -1068,7 +1092,7 @@ pub mod read_tests {
                 "code": {"coding": [{"code": format!("code-{}", i)}]}
             });
             backend
-                .create(&tenant, "Observation", obs, FhirVersion::default())
+                .create(&tenant, "Observation", obs, FhirVersion::default_enabled())
                 .await
                 .unwrap();
         }
@@ -1090,7 +1114,7 @@ pub mod read_tests {
         for i in 0..3 {
             let patient = create_patient_json(&format!("Patient{}", i));
             backend
-                .create(&tenant, "Patient", patient, FhirVersion::default())
+                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
                 .await
                 .unwrap();
         }
@@ -1101,7 +1125,7 @@ pub mod read_tests {
                 "code": {"coding": [{"code": format!("code-{}", i)}]}
             });
             backend
-                .create(&tenant, "Observation", obs, FhirVersion::default())
+                .create(&tenant, "Observation", obs, FhirVersion::default_enabled())
                 .await
                 .unwrap();
         }
@@ -1138,7 +1162,7 @@ pub mod read_tests {
         for i in 0..5 {
             let patient = create_patient_json(&format!("Patient{}", i));
             backend
-                .create(&tenant1, "Patient", patient, FhirVersion::default())
+                .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
                 .await
                 .unwrap();
         }
@@ -1147,7 +1171,7 @@ pub mod read_tests {
         for i in 0..3 {
             let patient = create_patient_json(&format!("Patient{}", i));
             backend
-                .create(&tenant2, "Patient", patient, FhirVersion::default())
+                .create(&tenant2, "Patient", patient, FhirVersion::default_enabled())
                 .await
                 .unwrap();
         }
@@ -1172,7 +1196,7 @@ pub mod read_tests {
         // Create resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1209,7 +1233,7 @@ pub mod read_tests {
         // Create resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1240,7 +1264,7 @@ pub mod read_tests {
         // Create resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1270,7 +1294,7 @@ pub mod read_tests {
         for i in 0..3 {
             let patient = create_patient_json(&format!("Patient{}", i));
             let created = backend
-                .create(&tenant, "Patient", patient, FhirVersion::default())
+                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
                 .await
                 .unwrap();
             ids.push(created.id().to_string());
@@ -1303,7 +1327,12 @@ pub mod read_tests {
         // Create resource with full access
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&full_access, "Patient", patient, FhirVersion::default())
+            .create(
+                &full_access,
+                "Patient",
+                patient,
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
 
@@ -1364,7 +1393,7 @@ pub mod update_tests {
         // Create a resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1390,7 +1419,7 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let v1 = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         assert_eq!(v1.version_id(), "1");
@@ -1424,7 +1453,7 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let created_time = created.last_modified();
@@ -1456,7 +1485,7 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1493,7 +1522,7 @@ pub mod update_tests {
             "gender": "male"
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1523,7 +1552,7 @@ pub mod update_tests {
             "name": [{"family": "Smith"}]
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1555,7 +1584,7 @@ pub mod update_tests {
             "gender": "male"
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1599,7 +1628,12 @@ pub mod update_tests {
             }
         });
         let created = backend
-            .create(&tenant, "Observation", observation, FhirVersion::default())
+            .create(
+                &tenant,
+                "Observation",
+                observation,
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
 
@@ -1632,7 +1666,7 @@ pub mod update_tests {
             "nonexistent-id",
             tenant.tenant_id().clone(),
             json!({"resourceType": "Patient"}),
-            FhirVersion::default(),
+            FhirVersion::default_enabled(),
         );
 
         let result = backend
@@ -1658,7 +1692,12 @@ pub mod update_tests {
         // Create with full access
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&full_access, "Patient", patient, FhirVersion::default())
+            .create(
+                &full_access,
+                "Patient",
+                patient,
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
 
@@ -1684,7 +1723,7 @@ pub mod update_tests {
         // Create and delete a resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         backend
@@ -1724,7 +1763,7 @@ pub mod update_tests {
         // Create in tenant1
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default())
+            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1749,7 +1788,7 @@ pub mod update_tests {
         // Create a resource
         let patient = create_patient_json("Smith");
         let v1 = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1787,7 +1826,7 @@ pub mod update_tests {
 
         let patient = create_patient_json("Name0");
         let mut current = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1820,7 +1859,7 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1846,7 +1885,7 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1871,7 +1910,7 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1942,7 +1981,7 @@ pub mod delete_tests {
         // Create a resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -1960,7 +1999,7 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -1984,7 +2023,7 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -2006,7 +2045,7 @@ pub mod delete_tests {
         for i in 0..3 {
             let patient = create_patient_json(&format!("Patient{}", i));
             let created = backend
-                .create(&tenant, "Patient", patient, FhirVersion::default())
+                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
                 .await
                 .unwrap();
             ids.push(created.id().to_string());
@@ -2051,7 +2090,7 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -2082,7 +2121,12 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&full_access, "Patient", patient, FhirVersion::default())
+            .create(
+                &full_access,
+                "Patient",
+                patient,
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
 
@@ -2112,7 +2156,7 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default())
+            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2152,7 +2196,7 @@ pub mod delete_tests {
                 "Patient",
                 "shared-id",
                 patient.clone(),
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -2162,7 +2206,7 @@ pub mod delete_tests {
                 "Patient",
                 "shared-id",
                 patient,
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -2203,7 +2247,7 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -2220,7 +2264,13 @@ pub mod delete_tests {
         // But create_or_update with same ID creates a new version
         let patient2 = create_patient_json("Restored");
         let (restored, _created_new) = backend
-            .create_or_update(&tenant, "Patient", &id, patient2, FhirVersion::default())
+            .create_or_update(
+                &tenant,
+                "Patient",
+                &id,
+                patient2,
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
 
@@ -2252,7 +2302,7 @@ pub mod delete_tests {
         for i in 0..5 {
             let patient = create_patient_json(&format!("Patient{}", i));
             let created = backend
-                .create(&tenant, "Patient", patient, FhirVersion::default())
+                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
                 .await
                 .unwrap();
             ids.push(created.id().to_string());
@@ -2280,7 +2330,7 @@ pub mod delete_tests {
         // Create various resources
         let patient = create_patient_json("Smith");
         let patient_created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2290,7 +2340,12 @@ pub mod delete_tests {
             "code": {"coding": [{"code": "test"}]}
         });
         let obs_created = backend
-            .create(&tenant, "Observation", observation, FhirVersion::default())
+            .create(
+                &tenant,
+                "Observation",
+                observation,
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
 
@@ -2329,7 +2384,7 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2368,7 +2423,7 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -2446,7 +2501,7 @@ pub mod conditional_tests {
         // For now, we test basic create since conditional_create needs SearchProvider
         let patient = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN001")));
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2465,7 +2520,7 @@ pub mod conditional_tests {
         // Create initial resource
         let patient = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN002")));
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2497,11 +2552,11 @@ pub mod conditional_tests {
         let patient2 = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN004")));
 
         backend
-            .create(&tenant, "Patient", patient1, FhirVersion::default())
+            .create(&tenant, "Patient", patient1, FhirVersion::default_enabled())
             .await
             .unwrap();
         backend
-            .create(&tenant, "Patient", patient2, FhirVersion::default())
+            .create(&tenant, "Patient", patient2, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2530,7 +2585,7 @@ pub mod conditional_tests {
         // Create a resource
         let patient = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN005")));
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2567,7 +2622,7 @@ pub mod conditional_tests {
                 "Patient",
                 "new-patient-id",
                 patient,
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -2594,7 +2649,7 @@ pub mod conditional_tests {
         // Create a resource
         let patient = create_patient_json("ToDelete", Some(("http://example.org/mrn", "MRN007")));
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -2641,11 +2696,11 @@ pub mod conditional_tests {
             create_patient_json("DeleteTest", Some(("http://example.org/mrn", "MRN009")));
 
         let created1 = backend
-            .create(&tenant, "Patient", patient1, FhirVersion::default())
+            .create(&tenant, "Patient", patient1, FhirVersion::default_enabled())
             .await
             .unwrap();
         let created2 = backend
-            .create(&tenant, "Patient", patient2, FhirVersion::default())
+            .create(&tenant, "Patient", patient2, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2679,7 +2734,7 @@ pub mod conditional_tests {
 
         let patient = create_patient_json("Smith", None);
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2701,7 +2756,7 @@ pub mod conditional_tests {
 
         let patient = create_patient_json("Smith", None);
         let v1 = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2740,7 +2795,7 @@ pub mod conditional_tests {
                 "Patient",
                 "unique-id-123",
                 patient,
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -2763,7 +2818,7 @@ pub mod conditional_tests {
                 "Patient",
                 "existing-id",
                 patient1,
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -2778,7 +2833,7 @@ pub mod conditional_tests {
                 "Patient",
                 "existing-id",
                 patient2,
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -2811,7 +2866,7 @@ pub mod conditional_tests {
         let patient =
             create_patient_json("PatchTest", Some(("http://example.org/mrn", "PATCH-001")));
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2876,11 +2931,11 @@ pub mod conditional_tests {
             create_patient_json("DuplicateName", Some(("http://example.org/mrn", "DUP-002")));
 
         backend
-            .create(&tenant, "Patient", patient1, FhirVersion::default())
+            .create(&tenant, "Patient", patient1, FhirVersion::default_enabled())
             .await
             .unwrap();
         backend
-            .create(&tenant, "Patient", patient2, FhirVersion::default())
+            .create(&tenant, "Patient", patient2, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2910,7 +2965,7 @@ pub mod conditional_tests {
             "active": true
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -2958,7 +3013,7 @@ pub mod conditional_tests {
             "birthDate": "1990-01-15"
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
 
@@ -3005,7 +3060,7 @@ pub mod conditional_tests {
         let patient =
             create_patient_json("TenantPatch", Some(("http://example.org/mrn", "T1-001")));
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default())
+            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -3054,7 +3109,12 @@ pub mod strict {
         let backend = cassandra_backend!("cassandra_strict_read_after_delete_is_gone");
         let tenant = unique_tenant("strict-gone");
         let created = backend
-            .create(&tenant, "Patient", patient("Smith"), FhirVersion::default())
+            .create(
+                &tenant,
+                "Patient",
+                patient("Smith"),
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
 
@@ -3123,7 +3183,12 @@ pub mod strict {
         );
 
         let created = backend
-            .create(&tenant, "Patient", patient("Twice"), FhirVersion::default())
+            .create(
+                &tenant,
+                "Patient",
+                patient("Twice"),
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
         backend
@@ -3148,7 +3213,7 @@ pub mod strict {
                 "Patient",
                 created.id(),
                 json!({"resourceType": "Patient", "id": created.id()}),
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -3175,7 +3240,7 @@ pub mod strict {
                 "Patient",
                 &id,
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "One"}]}),
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -3198,7 +3263,7 @@ pub mod strict {
                 "Patient",
                 &id,
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "Back"}]}),
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -3232,7 +3297,12 @@ pub mod strict {
         let backend = cassandra_backend!("cassandra_strict_update_of_deleted_is_not_found");
         let tenant = unique_tenant("strict-upd");
         let created = backend
-            .create(&tenant, "Patient", patient("Smith"), FhirVersion::default())
+            .create(
+                &tenant,
+                "Patient",
+                patient("Smith"),
+                FhirVersion::default_enabled(),
+            )
             .await
             .unwrap();
         backend

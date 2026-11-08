@@ -347,9 +347,6 @@ reviews:
         - Each person edits only their own log (ADR-<their GitHub
           username>/). A disagreement is a new entry in the disagreeing
           person's log.
-        - The entry is the human's. Flag a reason or preference attributed
-          to a named person (Alan or any member) that the PR does not show
-          they gave.
         - Every cited ADR, file:line, commit and PR must exist and say what
           the entry claims. Check them.
 

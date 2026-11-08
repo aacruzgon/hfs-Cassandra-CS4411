@@ -100,10 +100,15 @@ reviews:
     # into another branch waits until it targets main, as CI does.
     base_branches: []
     # Each push is re-reviewed, and each such review counts against the
-    # limit. Automatic reviews pause after five reviewed commits (the
-    # default; resume with "@coderabbitai resume" or "@coderabbitai review").
+    # limit (https://docs.coderabbit.ai/management/rate-limits). Automatic
+    # reviews pause after two reviewed commits, not the default five: PRs
+    # #58 and #63 got no review at all ("Review limit reached"), and the
+    # docs suggest 1 or 2 for that case
+    # (https://docs.coderabbit.ai/configuration/auto-review). After the
+    # pause, push the fixes together and ask for the next pass with
+    # "@coderabbitai review".
     auto_incremental_review: true
-    auto_pause_after_reviewed_commits: 5
+    auto_pause_after_reviewed_commits: 2
     # The Sunday upstream sync (sync/upstream-YYYY-MM-DD) merges hundreds of
     # upstream files; its titles start "chore(sync)". Run
     # "@coderabbitai review" on it by hand when wanted.

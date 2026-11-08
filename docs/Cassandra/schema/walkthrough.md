@@ -402,7 +402,9 @@ REST has already read the row, checked `If-Match` (412 on a mismatch, before sto
 | `deleted_at > 0` | soft-deleted after REST's read | `NotFound`, 404 (design step 3; the race suite also accepts `Gone`, G9) |
 | `version_id ≠ N`, `deleted_at` 0 | lost the race | `ConcurrencyError::VersionConflict`, 409 |
 
-`update_with_match(…, expected_version, …)` adds a pre-read R1: an `If-Match` field that names another current version is `VersionConflict` (409) without a CAS, and a CAS miss after that is 409 too. That is the recommendation for Step 4's ADR, which decides it (roadmap Step 4, "Open for the Step 4 group"): `versioning_suite` asserts 409, as SQLite, PostgreSQL, MongoDB and this backend's `delete_with_match` (4.4) answer; REST answers the mismatch with 412 itself and never calls this method. Its V3, at step 2, is built from that R1, so it carries R1's `write_id`, as plain `update`'s does (ADR-aacruzgon-0061).
+`update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `OptimisticLockFailure` (412) without a CAS; a CAS miss after that is 409. Its V3, at step 2, is built from that R1, so it carries R1's `write_id`, as plain `update`'s does (ADR-aacruzgon-0061).
+
+*Open for Step 4.* Which error the mismatch answers is Step 4's to decide, in its ADR, which updates this paragraph. Step 4's handover (roadmap Step 4, "Open for the Step 4 group") recommends `VersionConflict` (409): `versioning_suite`'s `test_update_with_match_etag_mismatch` asserts it, SQLite, PostgreSQL, MongoDB and this backend's `delete_with_match` (4.4) answer it, and REST answers an `If-Match` mismatch with 412 from its own read and never calls this method.
 
 ### 3.4 Delete (`delete` and `delete_versioned`, `DELETE /Patient/id`)
 

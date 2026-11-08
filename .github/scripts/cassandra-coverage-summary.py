@@ -198,7 +198,7 @@ def main(argv):
         + ("**recorded**." if path_in_main["hfs_coverage_recorded"] else "**not recorded**: the `main.rs` figures are not a measurement.")
     )
     if run.get("milestone_a_profile_files") is not None:
-        out[-1] += (f" Profile files the two Milestone A steps added: {run['milestone_a_profile_files']}"
+        out[-1] += (f" Profile files the three Milestone A steps added: {run['milestone_a_profile_files']}"
                     " (one per test binary run plus one per `hfs` started).")
     out.append("")
     not_run = [f for f in path_in_main["symbols"] if not f["ran"]]

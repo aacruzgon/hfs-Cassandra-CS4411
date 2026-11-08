@@ -74,9 +74,9 @@ jobs:
       # The CI report script's own tests (standard library unittest, about a
       # second): above all the CQL audit check, which is the one ci-report.py
       # command that fails the Cassandra job. Here because fmt is the cheapest
-      # job and needs no node.
+      # job and needs no node. A new script's tests are added here by module name.
       - name: Test the CI report script
-        run: python3 -m unittest discover -s .github/scripts -p 'test_ci_report.py' -v
+        run: PYTHONPATH=.github/scripts python3 -m unittest -v test_ci_report test_cassandra_coverage_rest_summary
 
       # The CI half of the dependency rule (check a dependency's newer
       # releases before working around its bug): each chosen crate's locked
@@ -208,6 +208,12 @@ jobs:
             rm -rf "$TARGET_DIR"
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          # The tag cargo writes only into a target dir it creates itself; see
+          # cassandra-coverage.yml's reset step.
+          printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+            '# This file is a cache directory tag created by cargo.' \
+            '# For information about cache directory tags see https://bford.info/cachedir/' \
+            > "$TARGET_DIR/CACHEDIR.TAG"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
@@ -326,6 +332,12 @@ jobs:
             rm -rf "$TARGET_DIR"
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          # The tag cargo writes only into a target dir it creates itself; see
+          # cassandra-coverage.yml's reset step.
+          printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+            '# This file is a cache directory tag created by cargo.' \
+            '# For information about cache directory tags see https://bford.info/cachedir/' \
+            > "$TARGET_DIR/CACHEDIR.TAG"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
@@ -460,6 +472,12 @@ jobs:
             rm -rf "$TARGET_DIR"
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          # The tag cargo writes only into a target dir it creates itself; see
+          # cassandra-coverage.yml's reset step.
+          printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+            '# This file is a cache directory tag created by cargo.' \
+            '# For information about cache directory tags see https://bford.info/cachedir/' \
+            > "$TARGET_DIR/CACHEDIR.TAG"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {

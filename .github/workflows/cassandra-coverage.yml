@@ -4,14 +4,16 @@ name: Cassandra coverage
 # (crates/persistence/src/backends/cassandra/) and the Cassandra startup path
 # in crates/hfs/src/main.rs, measured by the tests that run against a node:
 # tests/cassandra_tests.rs, tests/backend_capability_contract.rs, the
-# backend's unit tests (its node tests included) and the Milestone A tests,
-# which start the real hfs binary.
+# backend's unit tests (its node tests included) and the Milestone A tests
+# (the round trip, Step 3 CRUD through REST and readiness), which start the
+# real hfs binary.
 #
 # A report, not a check: its job name is in no ruleset, so it is not
 # required, and it has no coverage threshold. It fails only when the build,
-# a test or the report itself breaks. It is a workflow of its own, so it never
-# touches the five required checks in fmt-clippy-cassandra.yml and
-# r4b-compile-check.yml (ADR-aacruzgon-0019, 0021).
+# the clean before it, a test or the report itself breaks. It is a workflow
+# of its own, so it never touches the five required checks in
+# fmt-clippy-cassandra.yml and r4b-compile-check.yml (ADR-aacruzgon-0019,
+# 0021).
 #
 # The job starts its own single-node Cassandra, with its own Compose project
 # (hfs-cassandra-cov) and host port (59242), the way the required Cassandra
@@ -93,6 +95,11 @@ jobs:
       # (ADR-sam-michaels-0002), of its own: an instrumented build shares no
       # artifacts with an ordinary one. The stamp also names cargo-llvm-cov's
       # version, since its wrapper decides which crates are instrumented.
+      # Cargo writes CACHEDIR.TAG only into a target dir it creates itself,
+      # and since 1.97 (cargo #16712) `cargo clean --target-dir`, which
+      # `cargo llvm-cov clean` runs, refuses a dir without one. The step
+      # writes cargo's own text (cargo-util's paths.rs, exclude_from_backups)
+      # on every run, so a dir made before this line gets it too.
       - name: Reset the target dir if it is stale or over its cap
         env:
           TARGET_DIR: ${{ runner.workspace }}/target/cassandra-coverage
@@ -105,6 +112,10 @@ jobs:
             rm -rf "$TARGET_DIR"
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+            '# This file is a cache directory tag created by cargo.' \
+            '# For information about cache directory tags see https://bford.info/cachedir/' \
+            > "$TARGET_DIR/CACHEDIR.TAG"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
 
       # cargo-llvm-cov's documented flow for coverage of tests it does not run
@@ -129,7 +140,12 @@ jobs:
       # `clean --workspace` first (README: after show-env, before the build):
       # it removes the workspace's artifacts and every old profile from this
       # persistent directory, so the report counts this run only; dependencies
-      # stay built. The check after it makes sure no profile survived.
+      # stay built. The checks after it make sure no profile and none of the
+      # test binaries the report reads survived: `cargo llvm-cov clean` only
+      # warns when its `cargo clean` fails (its clean.rs), and `report` passes
+      # every workspace executable it finds to llvm-cov (its report.rs), so a
+      # binary of an earlier run, under another hash, would add its functions
+      # to the figures with zero counts.
       # Each build runs under ci-report.py build, which samples the runner's
       # cgroup (peak memory.current and anon, OOM kills) and reports the wall
       # time, as in the required job. Built before Cassandra starts, so the
@@ -137,9 +153,17 @@ jobs:
       # Sam's desktop.
       - name: Build the instrumented test binaries and hfs, and report the memory peak
         run: |
+          before=$(find "$CARGO_TARGET_DIR" -type f | wc -l)
           cargo llvm-cov clean --workspace
+          echo "Files in $CARGO_TARGET_DIR: $before before cargo llvm-cov clean --workspace, $(find "$CARGO_TARGET_DIR" -type f | wc -l) after"
           if [ -n "$(find "$CARGO_LLVM_COV_TARGET_DIR" -maxdepth 1 -name '*.profraw' -print -quit)" ]; then
             echo "::error::profiles of an earlier run are still in $CARGO_LLVM_COV_TARGET_DIR"; exit 1
+          fi
+          stale=$(find "$CARGO_TARGET_DIR/debug" -maxdepth 2 -type f -perm -u+x \( -name 'hfs' -o -name 'hfs-*' \
+            -o -name 'helios_persistence-*' -o -name 'cassandra_tests-*' -o -name 'backend_capability_contract-*' \
+            -o -name 'cassandra_milestone_a-*' \) 2>/dev/null || true)
+          if [ -n "$stale" ]; then
+            echo "::error::cargo llvm-cov clean left test binaries of an earlier run in $CARGO_TARGET_DIR:"; echo "$stale"; exit 1
           fi
           python3 .github/scripts/ci-report.py build build-coverage-persistence \
             "Build: helios-persistence Cassandra tests, instrumented" -- \
@@ -205,9 +229,9 @@ jobs:
       # program runs (clang, SourceBasedCodeCoverage, "Running the
       # instrumented program"), so a killed hfs still leaves its coverage. The
       # test passes LLVM_PROFILE_FILE through to hfs: it removes only HFS_*,
-      # OTEL_* and RUST_LOG. The two steps count the profile files they add
-      # (one per test binary plus one per hfs), and the coverage section says
-      # whether hfs's start_cassandra was recorded.
+      # OTEL_* and RUST_LOG. The three Milestone A steps count the profile
+      # files they add (one per test binary plus one per hfs), and the
+      # coverage section says whether hfs's start_cassandra was recorded.
       - name: Milestone A round trip through hfs against this node
         id: round-trip
         run: |
@@ -220,6 +244,45 @@ jobs:
               --test cassandra_milestone_a -- --exact milestone_a_create_then_read_through_rest \
               --show-output 2>&1 \
             | tee "$RUNNER_TEMP/ci-report/logs/milestone-a-round-trip.log"
+
+      # Roadmap Step 3 through REST: PUT, PATCH, DELETE, HEAD, revive, the
+      # batches with ifMatch and /metadata through the real hfs binary, as the
+      # required job's "Step 3 CRUD through hfs against this node"
+      # (fmt-clippy-cassandra.yml) runs it: the same command, the same
+      # exactly-once checks (--exact on a name that matches nothing would pass
+      # with 0 tests) and the same timeout. Its own tenant and ids
+      # (unique_tenant, unique_suffix), so it cannot meet the round trip's
+      # rows; before the readiness test, which restarts the node. %c as above:
+      # it kills its hfs too. It runs when the round trip passed, like the
+      # readiness test, so its failure fails the job but hides neither that
+      # test nor the report steps, which run unless the run is cancelled.
+      # The profile files it adds are listed for the crates/rest section,
+      # which reports them apart; the trap writes the list on a failure too.
+      # Under bash -e a failing command in an EXIT trap would turn the step's
+      # status into 1 even when the test passed, so the trap ends in || true.
+      - name: Step 3 CRUD through hfs against this node
+        id: step3-rest
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/ci-report/logs"
+          log="$RUNNER_TEMP/ci-report/logs/step3-rest.log"
+          profiles() { find "$CARGO_LLVM_COV_TARGET_DIR" -maxdepth 1 -name '*.profraw' | sed 's#.*/##' | sort; }
+          profiles > "$RUNNER_TEMP/profiles-before-step3.txt"
+          trap '{ profiles | comm -13 "$RUNNER_TEMP/profiles-before-step3.txt" - > "$RUNNER_TEMP/step3-profiles.txt"; } || true' EXIT
+          if ! grep -q 'fn step3_crud_through_rest' crates/hfs/tests/cassandra_milestone_a.rs; then
+            echo "::error title=Step 3 REST test::step3_crud_through_rest is not in crates/hfs/tests/cassandra_milestone_a.rs"
+            exit 1
+          fi
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+          LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%.profraw}%c.profraw" \
+            cargo test -p helios-hfs --no-default-features --features R4,cassandra \
+              --test cassandra_milestone_a -- --exact step3_crud_through_rest \
+              --show-output 2>&1 \
+            | tee "$log"
+          grep -Eq '^test result: ok\. 1 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$log") \
+            || { echo "::error title=Step 3 REST test::step3_crud_through_rest did not run exactly once"; exit 1; }
 
       # Last test step, as in the required job: it stops and starts this job's
       # own node, named by HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER (the test
@@ -246,7 +309,7 @@ jobs:
           logs="$RUNNER_TEMP/ci-report/logs"
           python3 .github/scripts/ci-report.py tests tests "Tests" \
             "$logs/persistence-tests.log" "$logs/persistence-lib-tests.log" \
-            "$logs/milestone-a-round-trip.log" "$logs/readiness.log"
+            "$logs/milestone-a-round-trip.log" "$logs/step3-rest.log" "$logs/readiness.log"
 
       # The report keeps only the backend's files and hfs's main.rs: the
       # ignore regex names every other crate, every other entry of
@@ -257,7 +320,7 @@ jobs:
       - name: Report the coverage (section, lcov.info, HTML)
         if: ${{ !cancelled() }}
         env:
-          COVERAGE_MEASURED: cassandra_tests, backend_capability_contract, the backend's unit tests (node tests included), Milestone A round trip and readiness
+          COVERAGE_MEASURED: cassandra_tests, backend_capability_contract, the backend's unit tests (node tests included), Milestone A round trip, Step 3 CRUD through REST and readiness
         run: |
           # Every entry of directory $1 but $2 (an ERE), dots escaped, joined by |.
           others() {
@@ -280,6 +343,45 @@ jobs:
             "$export_json" "$RUNNER_TEMP/coverage-section.md" "$RUNNER_TEMP/coverage-section.json"
           python3 .github/scripts/ci-report.py add coverage "Coverage: Cassandra backend (report only)" \
             --markdown "$RUNNER_TEMP/coverage-section.md" --json "$RUNNER_TEMP/coverage-section.json"
+
+      # Report only, and a section of its own: the backend's scope, figures
+      # and files above do not change (ADR-aacruzgon-0070). REST runs in the
+      # hfs processes the Milestone A tests start, so a second export of the
+      # same profiles, with its own regex keeping only crates/rest/src, shows
+      # what the round trip, Step 3 CRUD through REST and readiness reach.
+      # A third export sets step 3's profiles aside (into $RUNNER_TEMP, and
+      # back), so the section also shows what that step alone adds. A
+      # failure here fails neither the job nor the backend report.
+      - name: Report the coverage of crates/rest (section)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          others() {
+            for entry in "$1"/*; do
+              entry=${entry##*/}
+              if ! echo "$entry" | grep -qxE "$2"; then echo "$entry"; fi
+            done | sed 's/\./\\./g' | paste -sd'|' -
+          }
+          ignore="crates/(($(others crates rest))/|rest/($(others crates/rest src))(/|$))"
+          echo "ignore-filename-regex: $ignore"
+          all="$RUNNER_TEMP/llvm-cov-rest.json" without="$RUNNER_TEMP/llvm-cov-rest-without-step3.json"
+          cargo llvm-cov report --json --output-path "$all" --ignore-filename-regex "$ignore"
+          list="$RUNNER_TEMP/step3-profiles.txt" aside="$RUNNER_TEMP/step3-profiles-aside"
+          if [ -s "$list" ]; then
+            echo "Step 3's profile files: $(wc -l < "$list")"
+            mkdir -p "$aside"
+            while IFS= read -r name; do mv "$CARGO_LLVM_COV_TARGET_DIR/$name" "$aside/"; done < "$list"
+            cargo llvm-cov report --json --output-path "$without" --ignore-filename-regex "$ignore" || without=-
+            mv "$aside"/*.profraw "$CARGO_LLVM_COV_TARGET_DIR/"
+          else
+            echo "No profile files listed for step 3"; without=-
+          fi
+          COVERAGE_LLVM_COV_VERSION=$(cargo llvm-cov --version)
+          export COVERAGE_LLVM_COV_VERSION
+          python3 .github/scripts/cassandra-coverage-rest-summary.py \
+            "$all" "$without" "$RUNNER_TEMP/coverage-rest-section.md" "$RUNNER_TEMP/coverage-rest-section.json"
+          python3 .github/scripts/ci-report.py add coverage-rest "Coverage: crates/rest through the Cassandra tests (report only)" \
+            --markdown "$RUNNER_TEMP/coverage-rest-section.md" --json "$RUNNER_TEMP/coverage-rest-section.json"
 
       - name: Cassandra logs
         if: failure()

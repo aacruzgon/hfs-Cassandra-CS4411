@@ -972,8 +972,13 @@ def open_text(path: Path) -> str:
 # fields up to category are always there (AuditLogEntry.java:74-106). Each line
 # ends with System.lineSeparator(), "\n" in the Linux container.
 RECORD_TYPE_LINE = "Type: audit"
+# The user, host and source fields come before the first "|". A trusted header
+# holds no quote, "$$", "/*", "--" or "//" in them (CI's user is anonymous, and
+# host and source are /address:port), so nothing on a trusted header line can
+# open a CQL literal, quoted name or comment before its first "|".
+HEADER_FIELD = r"(?:(?!\$\$|/\*|--|//)[^|'\"])*"
 RECORD_MESSAGE = re.compile(
-    r"LogMessage: user:[^|]*\|host:[^|]*\|source:[^|]*(?:\|port:\d+)?\|timestamp:\d+"
+    rf"LogMessage: user:{HEADER_FIELD}\|host:{HEADER_FIELD}\|source:{HEADER_FIELD}(?:\|port:\d+)?\|timestamp:\d+"
     r"\|type:[A-Z_]+\|category:[A-Z]+(?:\||$)")
 HEADER_LOOKALIKE = ("Type: ", "LogMessage: ")
 
@@ -991,16 +996,29 @@ def audit_records(text: str) -> list[dict]:
       rest, a DELETE after it included);
     - its CQL text ends inside a string literal, quoted name or block comment
       while another record follows, so that next header may be part of its
-      text. A well-formed header line holds `|`, which is no CQL token
-      (Lexer.g, Parser.g, 5.0.9), and any lexer error rejects the statement
-      (CQLFragmentParser.parseAnyUnhandled); a `--` or `//` comment ends at
-      the line break before it. So in a statement that ran, a header line can
-      only sit inside a literal, quoted name or block comment, and the text
-      before it then ends inside one;
+      text (but see failure_query_end for a failed statement's message);
     - or it is text before the first record.
 
-    What stays possible is a header line in the code of a statement that
-    failed to parse, which never ran.
+    Why a trusted header cannot hide inside a statement that ran, by the
+    5.0.9 lexer and parser:
+
+    - Lexer. A well-formed `LogMessage:` line holds `|`, which is no CQL token
+      (Lexer.g has no rule for it, Parser.g no literal), and any lexer error
+      rejects the statement (CQLFragmentParser.parseAnyUnhandled collects it
+      and throwFirstSyntaxError throws). Before its first `|` a trusted line
+      holds only `LogMessage: user:` and a user field that opens nothing
+      (HEADER_FIELD), and the `Type: audit` line above it opens nothing
+      either; a `--` or `//` comment ends at the line break before it. So the
+      first `|` is code unless a literal, quoted name or block comment opened
+      before the header, and then the text before it ends inside one.
+    - Parser. Even read as code, the tokens every header starts with,
+      `Type : audit LogMessage : user :`, are no valid CQL anywhere: an
+      identifier is no term, so `Type: audit` fits no map, UDT or bind
+      marker form (Parser.g). The 5.0.9 server answers a syntax error for
+      them after a batch child, in a map or UDT literal, after `= :`, in a
+      select list, in `IN (`, after `USING`, in a column list, in ALTER and in
+      a WITH map. So a header line in the code of a statement can only frame
+      a false record from a statement that failed to parse, which never ran.
 
     Lines are split on "\n" only, with a trailing "\r" dropped (a CRLF dump);
     a bare "\r" stays in the text."""
@@ -1032,6 +1050,8 @@ def audit_records(text: str) -> list[dict]:
         framing = record["framing"]
         if framing is None and k + 1 < len(records):
             unclosed = cql_scan(entry["operation"] or "")[1]
+            if unclosed and entry["type"] == "REQUEST_FAILURE" and failure_query_end(entry["operation"]) is not None:
+                unclosed = None  # the open quote is in the server's message, after the query
             if unclosed:
                 framing = (f"its CQL text ends inside {unclosed}, so the record header after it "
                            "may be part of that text")
@@ -1117,6 +1137,46 @@ def cql_scan(text: str) -> tuple[str, str | None]:
             out.append(text[i])
             i += 1
     return "".join(out), None
+
+
+# What may follow a top-level ";" in a statement that ran: another batch child,
+# or the batch's APPLY (Parser.g batchStatement; a lone statement takes only
+# ";"* and EOF after it).
+BATCH_CONTINUATION = {"INSERT", "UPDATE", "DELETE", "APPLY", "BEGIN"}
+
+
+def failure_query_end(text: str) -> int | None:
+    """Where a failed statement's query ends in its entry's text, or None.
+
+    A failure's text is the query, "; " and the server's message
+    (AuditLogEntry.Builder.appendToOperation, 5.0.9). The message can leave a
+    quote open: "no viable alternative at input 'it's'" (a literal token's
+    text is unescaped), "Invalid STRING constant (it's) for ...". This finds a
+    "; " that is code (not in a literal, quoted name or comment: cql_scan of
+    the text up to the word after it is closed and still ends with it),
+    followed by a word no statement that ran could continue with. After a
+    top-level ";" a statement that ran holds only another batch child or
+    APPLY, so that "; " is where the query ended, and an open quote after it
+    is in the message. The message echoes input only for a statement that
+    failed before it ran, and an execution failure's message (a timeout, too
+    few replicas) holds no input.
+
+    A failure whose query itself ends open stays unverifiable, since no such
+    "; " is found. The false failure that stays: a failed parse whose query
+    holds "password" is logged cut after it, inside its literal
+    (PasswordObfuscator.obfuscate, through QueryEvents.maybeObfuscatePassword).
+    An unterminated literal is not one: the 5.0.9 message for it ("mismatched
+    character '<EOF>' expecting" and a quote) closes it again."""
+    start = 0
+    while (p := text.find("; ", start)) >= 0:
+        start = p + 1
+        word = re.match(r"[A-Za-z]+\b", text[p + 2:])
+        if not word or word.group().upper() in BATCH_CONTINUATION:
+            continue
+        code, unclosed = cql_scan(text[:p + 2 + len(word.group())])
+        if unclosed is None and code.endswith("; " + word.group()):
+            return p
+    return None
 
 
 def cql_code(text: str) -> str:

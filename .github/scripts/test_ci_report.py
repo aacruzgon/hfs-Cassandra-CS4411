@@ -120,6 +120,85 @@ CLEAN = "".join([
 ])
 
 
+# A fake record header, as a statement's CQL text could carry it on lines of
+# its own.
+FAKE_HEADER = ("\nType: audit\nLogMessage: user:x|host:/1.1.1.1:7000|source:/1.1.1.1|timestamp:1"
+               "|type:SELECT|category:QUERY|ks:other|operation:x")
+DELETE_AFTER = "; DELETE FROM resources WHERE a = 1; APPLY BATCH"
+
+
+def batch_with(before, after, type_="BATCH", tail=""):
+    """A CQL-text batch whose child holds FAKE_HEADER between `before` and
+    `after`, then a real DELETE on resources: the attack the framing must fail
+    closed on (on a 5.0.9 node such a batch ran, and its DELETE applied)."""
+    category = "ERROR" if type_ == "REQUEST_FAILURE" else "DML"
+    return entry(type_, None, before + FAKE_HEADER + after + DELETE_AFTER + tail, category=category)
+
+
+def header_in_user_field(user):
+    """A batch whose text carries, on lines of its own, a fake header whose
+    user field opens a comment or literal before the header's first "|"."""
+    return entry("BATCH", None, "BEGIN BATCH INSERT INTO t (a) VALUES (1);\nType: audit\nLogMessage: user:" + user
+                 + "|type:SELECT|category:QUERY|ks:other|operation:x" + DELETE_AFTER)
+
+
+# Each framing attack of PR #62's second delta audit, as a statement that runs
+# would carry it, between two clean records. Every one must fail the check.
+FRAMING_ATTACKS = {
+    "literal": batch_with("BEGIN BATCH INSERT INTO t (a) VALUES ('x", "')"),
+    "$$ literal": batch_with("BEGIN BATCH INSERT INTO t (a) VALUES ($$x", "$$)"),
+    "block comment": batch_with("BEGIN BATCH /* x", " */"),
+    "quoted name": batch_with('BEGIN BATCH INSERT INTO t ("x', '") VALUES (1)'),
+    "'' escape": batch_with("BEGIN BATCH INSERT INTO t (a) VALUES ('it''s", "')"),
+    '"" escape': batch_with('BEGIN BATCH INSERT INTO t ("a""b', '") VALUES (1)'),
+    "-- comment ended by CR": batch_with("BEGIN BATCH -- c\rINSERT INTO t (a) VALUES ('x", "')"),
+    "CRLF": batch_with("BEGIN BATCH INSERT INTO t (a) VALUES ('x\r", "')").replace(FAKE_HEADER, FAKE_HEADER.replace("\n", "\r\n")),
+    "lookalike, not a pair": entry("BATCH", None, "BEGIN BATCH INSERT INTO t (a) VALUES ('x\nType: audit\nnot a message')" + DELETE_AFTER),
+    "timed out, '; INSERT' first": batch_with(
+        "BEGIN BATCH INSERT INTO t (a) VALUES ('a'); INSERT INTO t (a) VALUES ('x", "')", "REQUEST_FAILURE", "; Operation timed out"),
+    "timed out, '; /* c */ INSERT' first": batch_with(
+        "BEGIN BATCH INSERT INTO t (a) VALUES ('a'); /* c */ INSERT INTO t (a) VALUES ('x", "')", "REQUEST_FAILURE", "; Operation timed out"),
+    "timed out, lower-case '; insert'": batch_with(
+        "BEGIN BATCH insert INTO t (a) VALUES ('a'); insert INTO t (a) VALUES ('x", "')", "REQUEST_FAILURE", "; Operation timed out"),
+    "timed out, '; word' in a -- comment": batch_with(
+        "BEGIN BATCH INSERT INTO t (a) VALUES ('a') -- x; zzz\nINSERT INTO t (a) VALUES ('x", "')", "REQUEST_FAILURE", "; Operation timed out"),
+    "timed out, '; word' in a block comment": batch_with(
+        "BEGIN BATCH INSERT INTO t (a) VALUES ('a') /* ; zzz */ INSERT INTO t (a) VALUES ('x", "')", "REQUEST_FAILURE", "; Operation timed out"),
+    # The literal opened in the batch closes in the fake header's user field,
+    # so the fake record's own text is closed.
+    "timed out, '; word' in a -- comment, closed in the header": entry(
+        "REQUEST_FAILURE", None,
+        "BEGIN BATCH INSERT INTO t (a) VALUES ('a') -- x; zzz\nINSERT INTO t (a) VALUES ('x\nType: audit\n"
+        "LogMessage: user:'|host:/1.1.1.1:7000|source:/1.1.1.1|timestamp:1|type:SELECT|category:QUERY|ks:other|operation:x)"
+        + DELETE_AFTER + "; Operation timed out", category="ERROR"),
+    # A comment or literal opening on the fake header line itself, before its
+    # first "|": the text before the header is closed, so only a header that
+    # refuses such a field keeps this from framing a false record.
+    "comment opened in the header's user field": header_in_user_field("/*|host:*/x|source:/1.1.1.1|timestamp:1"),
+    "literal opened in the header's user field": header_in_user_field("'x|host:/1.1.1.1:7000|source:/1.1.1.1|timestamp:1'"),
+    "$$ opened in the header's user field": header_in_user_field("$$|host:$$x|source:/1.1.1.1|timestamp:1"),
+    "-- comment in the header's user field": header_in_user_field("--|host:/1.1.1.1:7000|source:/1.1.1.1|timestamp:1"),
+}
+
+# Failed statements as the 5.0.9 server logs them, each with a quote left open
+# in the message it appends (each answer recorded from the shared node, sent raw
+# by the bundled driver). None of these statements ran.
+FAILED_WITH_OPEN_MESSAGE = [
+    "SELECT * FROM review_nosuch_ks.t WHERE 'it''s'; line 1:39 no viable alternative at input 'it's' "
+    "(...* FROM review_nosuch_ks.t WHERE ['it''s']...)",
+    "SELECT * FROM resources WHERE tenant_id = 't' AND resource_type = 'P' AND id = 'i' AND version_id = 'it''s'; "
+    "Invalid STRING constant (it's) for \"version_id\" of type int",
+    "SELECT * FROM resources WHERE tenant_id = 't' AND resource_type = 'P' AND id = 'i' AND write_id = 'x''y' ALLOW FILTERING; "
+    "Invalid STRING constant (x'y) for \"write_id\" of type uuid",
+]
+# A failed statement whose query itself ends open stays unverifiable: a failed
+# parse holding "password" is logged cut after it (recorded on a 5.0.9 node).
+FAILED_WITH_OPEN_QUERY = [
+    "INSERT INTO resources_by_type (tenant_id) VALUES ('my password *******; Syntax Exception. Obscured for security reasons.",
+]
+# An unterminated literal: the 5.0.9 server's message happens to close it again.
+FAILED_UNTERMINATED = "SELECT * FROM review_nosuch_ks.t WHERE a = 'oops; line 1:48 mismatched character '<EOF>' expecting '''"
+
 class AuditEntries(unittest.TestCase):
     def test_recorded_fields(self):
         entries = ci_report.audit_records(RECORDED)
@@ -305,6 +384,47 @@ class AuditEntries(unittest.TestCase):
         [last] = ci_report.audit_records(entry("REQUEST_FAILURE", None, "SELECT 'a; line 1:9 mismatched character '<EOF>'", category="ERROR"))
         self.assertIsNone(last["framing"])
 
+    def test_every_framing_attack_fails_closed(self):
+        for name, attack in FRAMING_ATTACKS.items():
+            entries = ci_report.audit_records(CLEAN + attack + CLEAN)
+            self.assertTrue(any(ci_report.audit_unverifiable(e, "helios") or ci_report.audit_violation(e, "helios")
+                                for e in entries), name)
+
+    def test_a_header_line_that_opens_a_comment_or_literal_is_not_a_record(self):
+        # Its user field holds "/*", "'", "$$" or "--", which no trusted header
+        # does, so the line is CQL text, and a lookalike, not a record of its own.
+        for name in FRAMING_ATTACKS:
+            if "header's user field" in name:
+                clean = len(ci_report.audit_records(CLEAN))
+                entries = ci_report.audit_records(CLEAN + FRAMING_ATTACKS[name] + CLEAN)
+                self.assertEqual(len(entries), 2 * clean + 1, name)
+                self.assertIn("starts like a record header", ci_report.audit_unverifiable(entries[clean], "helios"), name)
+        self.assertIsNotNone(ci_report.RECORD_MESSAGE.match(
+            "LogMessage: user:anonymous|host:/192.168.224.2:7000|source:/127.0.0.1|port:44912|timestamp:1|type:DELETE|category:DML|ks:helios"))
+
+    def test_a_failed_statement_whose_message_leaves_a_quote_open_is_framed(self):
+        for text in FAILED_WITH_OPEN_MESSAGE:
+            failed = ci_report.audit_records(entry("REQUEST_FAILURE", None, text, category="ERROR") + CLEAN)[0]
+            self.assertIsNotNone(ci_report.cql_scan(failed["operation"])[1], text)
+            self.assertIsNone(ci_report.audit_unverifiable(failed, "helios"), text)
+            self.assertIsNotNone(ci_report.failure_query_end(text), text)
+
+    def test_a_failed_statement_whose_query_ends_open_stays_unverifiable(self):
+        for text in FAILED_WITH_OPEN_QUERY:
+            failed = ci_report.audit_records(entry("REQUEST_FAILURE", None, text, category="ERROR") + CLEAN)[0]
+            self.assertIsNone(ci_report.failure_query_end(text), text)
+            self.assertIn("ends inside", ci_report.audit_unverifiable(failed, "helios"), text)
+        unterminated = ci_report.audit_records(entry("REQUEST_FAILURE", None, FAILED_UNTERMINATED, category="ERROR") + CLEAN)[0]
+        self.assertIsNone(ci_report.cql_scan(FAILED_UNTERMINATED)[1])
+        self.assertIsNone(ci_report.audit_unverifiable(unterminated, "helios"))
+
+    def test_failure_query_end_needs_code_and_a_word_no_batch_continues_with(self):
+        self.assertEqual(ci_report.failure_query_end("SELECT 'a'; Invalid x 'y"), len("SELECT 'a'"))
+        for text in ("INSERT INTO t (a) VALUES ('a; Invalid'", "SELECT 1 -- a; Invalid\n'",
+                     "SELECT 1 /* ; Invalid */ '", "BEGIN BATCH INSERT INTO t (a) VALUES (1); INSERT INTO t (a) VALUES ('",
+                     "BEGIN BATCH INSERT INTO t (a) VALUES (1); apply BATCH '", "SELECT \"a; Invalid\" FROM t '"):
+            self.assertIsNone(ci_report.failure_query_end(text), text)
+
     def test_text_before_the_first_record_is_unverifiable(self):
         first, *_ = ci_report.audit_records("DELETE FROM resources WHERE a = 1\n" + CLEAN)
         self.assertIn("before the first record", ci_report.audit_unverifiable(first, "helios"))
@@ -418,6 +538,24 @@ class CqlAuditCommand(Scratch):
         data = self.report("cql-audit")
         self.assertEqual(len(data["unverifiable"]), 4, data["unverifiable"])
         self.assertIn("cannot be framed unambiguously", out)
+
+    def test_framing_attacks_fail_the_check(self):
+        for name, attack in FRAMING_ATTACKS.items():
+            status, _ = self.audit(CLEAN + attack + CLEAN)
+            self.assertEqual(status, 1, name)
+
+    def test_failed_statements_with_an_open_quote_in_their_message_pass(self):
+        failures = "".join(entry("REQUEST_FAILURE", None, text, category="ERROR") for text in FAILED_WITH_OPEN_MESSAGE)
+        status, _ = self.audit(CLEAN + failures + CLEAN)
+        self.assertEqual(status, 0)
+        data = self.report("cql-audit")
+        self.assertEqual((len(data["violations"]), len(data["unverifiable"]), data["failures"]), (0, 0, 3))
+
+    def test_a_failed_statement_whose_query_ends_open_fails_the_check(self):
+        failures = "".join(entry("REQUEST_FAILURE", None, text, category="ERROR") for text in FAILED_WITH_OPEN_QUERY)
+        status, _ = self.audit(CLEAN + failures + CLEAN)
+        self.assertEqual(status, 1)
+        self.assertEqual(len(self.report("cql-audit")["unverifiable"]), 1)
 
     def test_a_bare_cr_in_a_file_stays_in_the_cql_text(self):
         # Read with newline="": a CR inside an entry is the CQL text's, not a

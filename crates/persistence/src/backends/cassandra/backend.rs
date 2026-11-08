@@ -29,7 +29,7 @@ use crate::search::{
 const HEALTH_CHECK: &str = "SELECT release_version FROM system.local";
 
 /// Every SearchParameter id a tenant has stored, from its `resources_by_type`
-/// partition, which `create` writes in Step 2 (write.rs, X1).
+/// partition, which every write keeps up to date (write.rs, X1).
 const SELECT_STORED_SEARCH_PARAMETER_IDS: &str =
     "SELECT id FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?";
 
@@ -273,9 +273,9 @@ where
 /// Built with [`CassandraBackend::connect`]. It implements the twelve traits
 /// the server needs (`helios_rest::create_app`'s bound), plus [`Backend`] and
 /// [`SearchCapabilityProvider`](crate::core::SearchCapabilityProvider). The
-/// module docs say which methods are real; the rest return
-/// [`BackendError::UnsupportedCapability`], which the REST layer answers with
-/// 501.
+/// module docs say which methods are real, which refuse with
+/// [`BackendError::UnsupportedCapability`] (501 through REST), and which keep
+/// their trait defaults.
 pub struct CassandraBackend {
     pub(super) config: CassandraConfig,
     pub(super) session: Arc<CassandraSession>,
@@ -408,8 +408,8 @@ impl CassandraBackend {
     ///
     /// From Step 3 that is `SharedSchema`, the one placement (one keyspace,
     /// with the tenant in every partition key), plus `Crud` (create, read,
-    /// update and delete; every write a compare-and-swap, the delete soft) and
-    /// `OptimisticLocking` (`If-Match` through `update`'s and
+    /// update and delete; every write to `resources` a compare-and-swap, the
+    /// delete soft) and `OptimisticLocking` (`If-Match` through `update`'s and
     /// `delete_versioned`'s compare-and-swap). A capability must never be
     /// declared for behaviour that is planned or stubbed (`core/backend.rs`),
     /// so each other one is added here, and to the golden list in
@@ -1264,13 +1264,15 @@ mod restart_tests {
         assert!(status.success(), "docker {args:?}: {status}");
     }
 
-    async fn read_one(backend: &CassandraBackend) -> Result<usize, String> {
+    /// Reads one absent row under `tenant`, a `test-restart-<uuid>` tenant of
+    /// the run's own (ADR-aacruzgon-0029); it writes nothing.
+    async fn read_one(backend: &CassandraBackend, tenant: &str) -> Result<usize, String> {
         backend
             .session
             .rows(
                 "SELECT id FROM resources WHERE tenant_id = ? AND resource_type = ? AND id = ?",
                 vec![
-                    Value::from("s2-restart"),
+                    Value::from(tenant),
                     Value::from("Patient"),
                     Value::from("p1"),
                 ],
@@ -1330,8 +1332,9 @@ mod restart_tests {
         .await
         .unwrap_or_else(|e| panic!("connect to {url}: {e}"));
 
+        let tenant = format!("test-restart-{}", uuid::Uuid::new_v4().simple());
         backend.health_check().await.expect("health_check before");
-        assert_eq!(read_one(&backend).await, Ok(0), "read before");
+        assert_eq!(read_one(&backend, &tenant).await, Ok(0), "read before");
         backend.check_schema().await.expect("schema check before");
         let prepared_before = backend.session.prepared_count();
         assert!(prepared_before >= 3, "{prepared_before} prepared");
@@ -1343,7 +1346,10 @@ mod restart_tests {
             .await
             .expect_err("health_check while down");
         eprintln!("down: health_check failed {down_after:?} after the stop: {failed}");
-        assert!(read_one(&backend).await.is_err(), "a read while down");
+        assert!(
+            read_one(&backend, &tenant).await.is_err(),
+            "a read while down"
+        );
 
         docker(&["start", &container]);
         // The readiness budget of the Milestone A test (`UP_TIMEOUT`).
@@ -1361,7 +1367,11 @@ mod restart_tests {
             backend.health_check().await.unwrap_or_else(|e| {
                 panic!("health_check {:?} after recovery: {e}", started.elapsed())
             });
-            assert_eq!(read_one(&backend).await, Ok(0), "read after recovery");
+            assert_eq!(
+                read_one(&backend, &tenant).await,
+                Ok(0),
+                "read after recovery"
+            );
             checks += 1;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -1686,7 +1696,7 @@ mod node_tests {
         let tenants: Vec<crate::tenant::TenantContext> = (0..4)
             .map(|n| {
                 crate::tenant::TenantContext::new(
-                    crate::tenant::TenantId::new(format!("s2-paging-{run}-{n}")),
+                    crate::tenant::TenantId::new(format!("test-paging-{n}-{run}")),
                     crate::tenant::TenantPermissions::full_access(),
                 )
             })
@@ -1732,7 +1742,9 @@ mod node_tests {
         // checked on the 5.0.9 node). This test never removes its own.
         let ours = |set: BTreeSet<(String, String)>| -> BTreeSet<(String, String)> {
             set.into_iter()
-                .filter(|(tenant, _)| tenant.starts_with(&format!("s2-paging-{run}-")))
+                .filter(|(tenant, _)| {
+                    tenant.starts_with("test-paging-") && tenant.ends_with(&format!("-{run}"))
+                })
                 .collect()
         };
         let (whole, paged) = (ours(keys(&whole)), ours(keys(&paged)));

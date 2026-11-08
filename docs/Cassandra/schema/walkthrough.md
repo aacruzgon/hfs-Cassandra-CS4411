@@ -1,6 +1,6 @@
 # Paper walk-through of the schema
 
-**DRAFT for the schema session (roadmap item 1.2).** Not reviewed by the team. Nothing here is decided. Where the walk-through had to pick something the design leaves open, it points to the gap list at the end (G1, G2, …).
+**Status: signed off by Alan with the schema (ADR-aacruzgon-0028); four sign-offs pending, recorded against `67f9e0532` (roadmap item 1.4), and item 1.2 is done when they are in.** Since then it has been kept in step with the code, each change through the ADR it names (the schema README lists them). Where it had to pick something the design leaves open, it points to the gap list at the end (G1, G2, …).
 
 This walks every in-scope operation through the ten tables, statement by statement. It follows the design in [`cassandra-discussion.md`](../cassandra-discussion.md) ("Proposed Cassandra data model" and "Consistency, failure handling and rejection"), the Step 1 checklist of [`development-roadmap.md`](../development-roadmap.md), and [`spike-findings.md`](../spike-findings.md). The tables are in [`schema.cql`](schema.cql); the directory overview is [`README.md`](README.md).
 
@@ -15,7 +15,7 @@ Code facts were checked against the working tree on 2026-10-13 (`crates/persiste
 1. Conventions
 2. Statement catalogue
 3. Writes: create, update, delete, revive
-4. Reads: read, vread, list_versions
+4. Reads: read, vread, list_versions, and delete_with_match
 5. Search
 6. The sweeper
 7. Worked example: one Patient, four versions
@@ -91,7 +91,7 @@ Partition: one `(bucket, shard)`. `bucket` is the UTC hour of `enqueued_at` (`'2
 
 ### Compare-and-swap on `resources`
 
-All four use `LOCAL_SERIAL` for Paxos and `LOCAL_QUORUM` for the commit, on partition `(T, P, id)`. Absent columns are left unset, never bound to null, with no exception. `resources.deleted_at` is always written: `0` (1970-01-01T00:00:00Z) means live, and a delete writes its own time, so `resources` never holds a tombstone (G39). `fhir_version` is the request's only in C1. C2 and C4 bind the version the resource was created with, from `current` or R1, as every other backend keeps it (ADR-aacruzgon-0024).
+All four use `LOCAL_SERIAL` for Paxos and `LOCAL_QUORUM` for the commit, on partition `(T, P, id)`. Absent columns are left unset, never bound to null, with no exception. `resources.deleted_at` is always written: `0` (1970-01-01T00:00:00Z) means live, and a delete writes its own time, so `resources` never holds a tombstone (G39). `fhir_version` is the request's only in C1. C2 and C4 bind the version the resource was created with, from R1, as every other backend keeps it (ADR-aacruzgon-0024, 0061).
 
 ```sql
 -- C1: create (POST, or create_or_update on a missing id). Version 1.
@@ -154,13 +154,12 @@ USING TIMESTAMP ?;                       -- ts(V)
 -- V1, or V2 for a marker (deleted_at > 0, data unset), from what the writer holds,
 -- USING TIMESTAMP ts(N) - 1.  One microsecond older than the original row.
 -- A content row leaves deleted_at unset: the live sentinel 0 is only for resources.
--- Built from R1 (delete, create_or_update, update_with_match): write_id = R1's write_id.
--- Built from update's StoredResource, which has no write_id: write_id left unset (G36).
+-- Built from R1 on every operation, update included (ADR-aacruzgon-0061): write_id = R1's write_id.
 -- index_keys: K(N), the index_keys of the resources row the writer read at
 -- version N (R1; G22). Never left unset, and never re-extracted.
 ```
 
-Partition: `(T, P, id)` of `resource_versions`, a different table from `resources`. Every version row carries the resource's own `fhir_version`, the one it was created with (G13), and the `write_id` of the CAS that created it, except a V3 built from `update`'s `StoredResource` (G36), and the `index_keys` of the version (G22, below). V3 is written at step 2, before the CAS (G40), so it no longer shares a batch with the `N+1` row. If row `N` exists, the original wins every cell, even if the content re-serialises differently; if `N`'s request crashed or paused before its step 4, V3 restores it. So whenever a CAS creating `N+1` has applied, row `N` exists, with the exact `K(N)`.
+Partition: `(T, P, id)` of `resource_versions`, a different table from `resources`. Every version row carries the resource's own `fhir_version`, the one it was created with (G13), and the `write_id` of the CAS that created it (a V3 copies it from R1, ADR-aacruzgon-0061), and the `index_keys` of the version (G22, below). V3 is written at step 2, before the CAS (G40), so it no longer shares a batch with the `N+1` row. If row `N` exists, the original wins every cell, even if the content re-serialises differently; if `N`'s request crashed or paused before its step 4, V3 restores it. So whenever a CAS creating `N+1` has applied, row `N` exists, with the exact `K(N)`.
 
 ### Stored key sets (`index_keys`, G22)
 
@@ -176,7 +175,7 @@ Each version row stores `K(V)`, the index rows that version wrote, and the `reso
 - **`update` reads `resources`, not row `N`** (R1, the one extra read). Its `StoredResource` has no blob, and row `N` of `resource_versions` may not exist yet: `N`'s writer may have crashed or paused between its CAS and step 4, which is exactly the race below. `resources` always holds `N`'s key set while `N` is current, because the CAS that made `N` current wrote it.
     - R1 shows `version_id = N`: use its `index_keys`.
     - R1 shows a higher version: the CAS could not apply. Return what C2's miss would give, without running it: `NotFound` (404) if `deleted_at > 0`, otherwise `VersionConflict` (409).
-    - R1 shows a lower version: `N`'s CAS is still committing. Run R2 at `LOCAL_SERIAL`, which completes it, and use R2's row.
+    - R1 shows a lower version: `N`'s CAS is still committing. Run R2 at `LOCAL_SERIAL`, which completes it, and use R2's row. If R2 still shows a version below `N`, `current` is ahead of anything committed: `VersionConflict` (409), or `NotFound` if deleted, with nothing written and no third read (ADR-aacruzgon-0061).
     - No row: `NotFound` (404).
 - **Why the CAS carries it (CodeRabbit's review of PR #33).** With the key set only on `resource_versions`, a writer that found row `N` missing re-extracted `K(N)` under today's registry, and this sequence left orphans:
     1. Writer A extracts `K_A(N+1)` under registry R1, writes its intent, and its CAS applies `N+1`. A pauses before step 4.
@@ -214,7 +213,7 @@ Every reader that decides "deleted" tests `deleted_at > 0`:
 
 | Reader | Where | Deleted means |
 | --- | --- | --- |
-| `read` | 4.1, R1 | `ResourceError::Gone`, 410 (404 if `HFS_RETURN_GONE` is false) |
+| `read` | 4.1, R1 | `ResourceError::Gone`, 410 (`HFS_RETURN_GONE` affects vread only, HeliosSoftware/hfs#2526; ADR-aacruzgon-0064) |
 | `exists` | 4.1, R1 | `false` |
 | `vread` | 4.2, R3 on `resource_versions` | a delete marker: `deleted_at` set, always `> 0`; 410 |
 | `_id` search | 5.4, R1 | not returned |
@@ -321,14 +320,14 @@ SELECT DISTINCT tenant_id, resource_type FROM resources_by_type;
 
 ## 3. Writes
 
-Every write first calls `tenant.check_permission(Operation::…, resource_type)`; a refusal is a `TenantError` before any statement runs.
+Every write first calls `tenant.check_permission(Operation::…, resource_type)`; a refusal is a `TenantError` before any statement runs. The exception is `create_or_update`, whose operation depends on what its pre-read finds: each turn checks `Create` (branch a) or `Update` (branches b and c) after its R1 and before anything is written, as SQLite, PostgreSQL and MongoDB check inside `create`, `update` and `restore_deleted` (3.5, ADR-aacruzgon-0063).
 
 ### 3.1 Write-path skeleton (design steps 1 to 6)
 
 | Step | Statement | Partition | On failure |
 | --- | --- | --- | --- |
 | 1 | permission check; for a SearchParameter, the `code` bound (G38, below); extract `K(N+1)`; `K(N)` is the `index_keys` of the `resources` row read at version `N`: the pre-read R1 of `delete`, `update_with_match` and `create_or_update`, or `update`'s own R1 (G22, section 2); size check of `K(N+1)` and the payload bound (below) | `resources (T,P,id)` for `update`'s R1 | `TenantError`; a value over 2,048 bytes, a `param` over 128, a SearchParameter `code` over 128, or a CAS payload over 8 MiB is `ValidationError::InvalidResource`, 400; `update`'s R1 timed out is 504, failed is 503; nothing written |
-| 2 | on update, delete and revive (`update`, `update_with_match`, `delete`, `delete_versioned`, and `create_or_update` on a live row or a delete marker): V3 for `N` at `ts(N) − 1`, from R1 or `current`, with R1's `K(N)` (G40); then I1, with `version_id = N+1` | `resource_versions (T,P,id)` for V3, then `(bucket, shard)` | V3 timed out: 504; failed: 503; nothing changed, since V3 only rewrites row `N` at an older timestamp. I1 `Unavailable`: 503, nothing changed. I1 `WriteTimeout`: an unused intent is swept, so harmless; 504 (`BackendError::Timeout`, G26) |
+| 2 | on update, delete and revive (`update`, `update_with_match`, `delete`, `delete_versioned`, and `create_or_update` on a live row or a delete marker): V3 for `N` at `ts(N) − 1`, from R1, with R1's `write_id` and `K(N)` (G40, ADR-aacruzgon-0061); then I1, with `version_id = N+1` | `resource_versions (T,P,id)` for V3, then `(bucket, shard)` | V3 timed out: 504; failed: 503; nothing changed, since V3 only rewrites row `N` at an older timestamp. I1 `Unavailable`: 503, nothing changed. I1 `WriteTimeout`: an unused intent is swept, so harmless; 504 (`BackendError::Timeout`, G26) |
 | 3 | C1 to C4 | `resources (T,P,id)` | not applied: I2, then the mapped error; unknown outcome below |
 | 4 | V1 or V2 for `N+1` at `ts(N+1)` (V3 for `N` already ran at step 2) | `resource_versions (T,P,id)` | retry with the same timestamps. Retries exhausted: return success, with I1 left for the sweeper (G23, ADR-aacruzgon-0034), on every operation (ADR-aacruzgon-0050) |
 | 5 | index batches, at `ts(N+1)` | index partitions | retry with the same timestamps; `WriteTimeout` type `BATCH` needs no retry (batchlog replays), `BATCH_LOG` does. Retries exhausted: return success, with I1 left for the sweeper, which makes the write searchable within one poll interval plus the grace period (G23, ADR-aacruzgon-0027) |
@@ -340,7 +339,7 @@ Every write first calls `tenant.check_permission(Operation::…, resource_type)`
 
 **SearchParameter `code` bound** (ADR-aacruzgon-0027, G38). On `create`, `update`, `update_with_match` and `create_or_update` of a `SearchParameter`, the same calls inside a batch Bundle included, a `code` longer than 128 bytes in UTF-8 is refused with `StorageError::Validation(ValidationError::InvalidResource { message, details })`, one `ValidationDetail` on `SearchParameter.code` with the byte length, before step 2, so nothing is written. REST answers 400, issue `invalid`, as for the size check. The FHIR `code` datatype has no length limit, so this is a stated server restriction (G38).
 
-**Timestamps** (ADR-aacruzgon-0016). `lu(1) = now_ms`; `lu(N+1) = max(now_ms, lu(N) + 1 ms)`; `ts(V) = lu(V) · 1000`. `lu(N)` comes from `current.last_modified()` on update and from R1 on delete and revive, so V3's timestamp is exact with no extra read. `K(N)` comes from R1's `index_keys`; only `update` runs an R1 for it (G22). `w(N+1)` is a fresh uuid per CAS attempt (ADR-aacruzgon-0024), and `lu` and `ts` are computed from that attempt's R1.
+**Timestamps** (ADR-aacruzgon-0016). `lu(1) = now_ms`; `lu(N+1) = max(now_ms, lu(N) + 1 ms)`; `ts(V) = lu(V) · 1000`. `lu(N)` comes from R1 on every operation (on update it equals `current.last_modified()` whenever R1 shows `N`), so V3's timestamp is exact with no extra read. `K(N)` comes from R1's `index_keys`; only `update` runs an R1 for it (G22). `w(N+1)` is a fresh uuid per CAS attempt (ADR-aacruzgon-0024), and `lu` and `ts` are computed from that attempt's R1.
 
 **Unknown CAS outcome** (ADR-aacruzgon-0024, amended 2026-11-05).
 - **Triggers:** on any of C1 to C4, so for `create`, `create_or_update`, `update`, `delete` and `delete_versioned`, every error that does not prove the CAS was not executed (ADR-aacruzgon-0034; one engine for all four, ADR-aacruzgon-0050):
@@ -366,7 +365,7 @@ For an attempt that targeted version `V` (1 for C1):
 | `version_id > V`; row `V`'s `write_id` unset | undecidable | after `WriteTimeout`, a client-side timeout or a dropped connection: `BackendError::Timeout`, 504; after `WriteFailure`: `BackendError::Unavailable`, 503. No retry, which could write the body twice; I1 left for the sweeper |
 | R2 times out, or fails | unknown | timed out: `BackendError::Timeout`, 504; any other error: `BackendError::Unavailable`, 503, including those the plain table makes 500 (`Server`, an unmatched stream id, a decoding error), since the write may have applied (ADR-aacruzgon-0055); I1 kept. The same holds for R3. R2's error is never classified as a CAS: a `WriteTimeout`/CAS that R2 itself raises on Paxos v2 (`Paxos.java:893-901`) is R2 timing out, 504, not a new unknown write (ADR-aacruzgon-0050) |
 
-Row `V`'s `write_id` is set by `V`'s own step 4 (V1 or V2), by the sweeper's replay of `V`, or by the next writer's V3 when that writer built it from R1: a `delete`, a `create_or_update` or an `update_with_match`. So the outcome is decided whenever the version that superseded ours came from one of those paths. It stays undecidable when it came from `update`, whose V3 is built from a `StoredResource` without a `write_id`. Row `V` always exists once a later CAS has applied, because that writer's V3 ran before its CAS (G40).
+Row `V`'s `write_id` is set by `V`'s own step 4 (V1 or V2), by the sweeper's replay of `V`, or by the next writer's V3, which every operation builds from R1, `update` included (ADR-aacruzgon-0061). So the outcome is decided whichever path superseded ours; the "unset" row above is left for a `write_id` that cannot be decoded. Row `V` always exists once a later CAS has applied, because that writer's V3 ran before its CAS (G40).
 
 Every timeout is 504 and every unavailable node or replica failure 503, as `crates/rest/src/error.rs` maps them (G26). When the 2 re-runs are used up, the last attempt's error decides the same way: 504 after a `WriteTimeout`, 503 after a `WriteFailure`. `write_type = SIMPLE` is a trigger like `WriteTimeout`/CAS, confirmed by R2, never taken as applied (ADR-aacruzgon-0035).
 
@@ -396,7 +395,7 @@ Without it, a late attempt makes the request report a lost race against itself: 
 
 ### 3.3 Update (`ResourceStorage::update(tenant, current, resource)`, `PUT /Patient/id`)
 
-REST has already read the row, checked `If-Match` (412 on a mismatch, before storage is called), and passes `current`, version `N`. `Operation::Update`. `K(N)` is the `index_keys` of one R1 of `resources` (G22; section 2 says what to do when R1 shows another version). Steps: R1; V3 rewrites `N` from `current` with that `K(N)` (G40); I1; C2 with `IF version_id = N AND deleted_at = 0`, writing `K(N+1)`; V1 for `N+1` with `K(N+1)`; delete `K(N) \ K(N+1)` and insert `K(N+1)` at `ts(N+1)`; I2.
+REST has already read the row, checked `If-Match` (412 on a mismatch, before storage is called), and passes `current`, version `N`. `Operation::Update`. `K(N)` is the `index_keys` of one R1 of `resources` (G22; section 2 says what to do when R1 shows another version). Steps: R1; V3 rewrites `N` from R1, with its `write_id` and that `K(N)` (G40, ADR-aacruzgon-0061); I1; C2 with `IF version_id = N AND deleted_at = 0`, writing `K(N+1)`; V1 for `N+1` with `K(N+1)`; delete `K(N) \ K(N+1)` and insert `K(N+1)` at `ts(N+1)`; I2.
 
 | CAS result | Meaning | Returned |
 | --- | --- | --- |
@@ -405,7 +404,9 @@ REST has already read the row, checked `If-Match` (412 on a mismatch, before sto
 | `deleted_at > 0` | soft-deleted after REST's read | `NotFound`, 404 (design step 3; the race suite also accepts `Gone`, G9) |
 | `version_id ≠ N`, `deleted_at` 0 | lost the race | `ConcurrencyError::VersionConflict`, 409 |
 
-`update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `OptimisticLockFailure` (412) without a CAS; a CAS miss after that is 409. Its V3, at step 2, is built from that R1, so it carries R1's `write_id`; plain `update`'s V3 leaves `write_id` unset (G36).
+`update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `OptimisticLockFailure` (412) without a CAS; a CAS miss after that is 409. Its V3, at step 2, is built from that R1, so it carries R1's `write_id`, as plain `update`'s does (ADR-aacruzgon-0061).
+
+*Open for Step 4.* Until Step 4, `update_with_match` is a stub that answers `UnsupportedCapability` (501) (`crates/persistence/src/backends/cassandra/storage.rs:171-180`); this paragraph is its design. Which error the mismatch answers is Step 4's to decide, in its ADR, which updates this paragraph. Step 4's handover (roadmap Step 4, "Open for the Step 4 group") recommends `VersionConflict` (409): `versioning_suite`'s `test_update_with_match_etag_mismatch` asserts it, SQLite, PostgreSQL, MongoDB and this backend's `delete_with_match` (4.4) answer it, and REST answers an `If-Match` mismatch with 412 from its own read and never calls this method.
 
 ### 3.4 Delete (`delete` and `delete_versioned`, `DELETE /Patient/id`)
 
@@ -431,7 +432,7 @@ A delete of an unknown or already-deleted id is `NotFound` from the backend, as 
 
 ### 3.5 Revive and `create_or_update` (`PUT` onto a deleted or unknown id; batch PUT)
 
-The REST update handler maps `Gone` to "no current resource" and calls `create_or_update`, a bounded loop (ADR-aacruzgon-0024). It is reached by every unconditional `PUT` and every batch `PUT` without `ifMatch`. A batch `PUT` with `ifMatch` calls `update` against the row its gate checked (G28). Each turn runs R1, whose `index_keys` is `K(N)` (G22), takes a fresh `w`, and writes a new I1 (new `enqueued_at`) with that turn's version, never rewriting an earlier turn's row. Then:
+The REST update handler maps `Gone` to "no current resource" and calls `create_or_update`, a bounded loop (ADR-aacruzgon-0024). It is reached by every unconditional `PUT` and every batch `PUT` without `ifMatch`. A batch `PUT` with `ifMatch` calls `update` against the row its gate checked (G28). Before the first turn, `check_id` refuses an id that is not a FHIR `id` with 400 `invalid` and no statement sent (D11, ADR-aacruzgon-0064). Each turn runs R1, whose `index_keys` is `K(N)` (G22), then the check against earlier unknown attempts (3.1, ADR-aacruzgon-0051), then the branch's permission (`Create` for a, `Update` for b and c) and, for a SearchParameter, the G38 `code` bound; a refusal there ends the call at once, unretried. The turn then takes a fresh `w`, and writes a new I1 (new `enqueued_at`) with that turn's version, never rewriting an earlier turn's row. Then:
 
 | Branch | Row | CAS | Not applied |
 | --- | --- | --- | --- |
@@ -441,13 +442,13 @@ The REST update handler maps `Gone` to "no current resource" and calls `create_o
 
 A definite miss starts the next turn at once, with no pause, for at most 3 retries, so 4 turns in all. An unknown outcome is settled first by the table in 3.1, from its own budget of 2 re-runs.
 
-Branches b and c write V3 for `N` at step 2, before the CAS (G40): branch b a content row from R1; branch c a delete marker, `deleted_at` set and `data` unset, although `resources.data` still holds the old content. After the CAS applies, steps 4 to 6 run as for update: V1 for `N+1`; inserts of `K(N+1)` (branch b also deletes `K(N) \ K(N+1)`), I2. Returned: branch a 201 (`created = true`); branch b 200 (`created = false`); branch c 201 (`created = true`, PostgreSQL parity; R4 and R4B http.html#update require 201 for a resource "brought back to life"); a fourth definite miss is `VersionConflict`, 409 (that turn's I2 already ran). On revive, `fhir_version` is the original from R1 (G13, ADR-aacruzgon-0024) and `created_at` is kept (G14, ADR-aacruzgon-0011).
+Branches b and c write V3 for `N` at step 2, before the CAS (G40): branch b a content row from R1; branch c a delete marker, `deleted_at` set and `data` unset, although `resources.data` still holds the old content. After the CAS applies, steps 4 to 6 run as for update: V1 for `N+1`; inserts of `K(N+1)` (branch b also deletes `K(N) \ K(N+1)`), I2. Returned: branch a 201 (`created = true`); branch b 200 (`created = false`); branch c 201 (`created = true`, PostgreSQL parity; R4 and R4B http.html#update require 201 for a resource "brought back to life"); a fourth definite miss is `VersionConflict`, 409, whatever the miss was (that turn's I2 already ran). SQLite, PostgreSQL and MongoDB return the last miss's own error there, so `AlreadyExists` or `NotFound` is possible on them; Cassandra answers 409 on purpose (ADR-aacruzgon-0063). A SearchParameter is noted in the overlay as `create` notes it on branch a, and replaced on branches b and c (ADR-aacruzgon-0062, 0063). On revive, `fhir_version` is the original from R1 (G13, ADR-aacruzgon-0024) and `created_at` is kept (G14, ADR-aacruzgon-0011).
 
 ## 4. Reads
 
 ### 4.1 read (`GET /Patient/id`)
 
-R1 at `LOCAL_QUORUM`, partition `resources (T,P,id)`. Absent: `Ok(None)`, 404. `deleted_at > 0`: `ResourceError::Gone`, 410 (404 if `HFS_RETURN_GONE` is false). Otherwise `StoredResource::from_storage(…)`, 200, `ETag: W/"version_id"`. `exists` is the same read and answers `false` for a deleted row (the trait doc requires MongoDB's behaviour).
+R1 at `LOCAL_QUORUM`, partition `resources (T,P,id)`. Absent: `Ok(None)`, 404. `deleted_at > 0`: `ResourceError::Gone`, 410, whatever `HFS_RETURN_GONE` says: only the vread handler reads that flag (`crates/rest/src/handlers/vread.rs:81`; HeliosSoftware/hfs#2526; ADR-aacruzgon-0064). Otherwise `StoredResource::from_storage(…)`, 200, `ETag: W/"version_id"`. `exists` is R1 reduced to `deleted_at`, so a yes/no answer does not ship the resource, and answers `false` for no row or a deleted one (the trait doc requires MongoDB's behaviour; `versions.rs`, Step 3 plan D10).
 
 ### 4.2 vread (`GET /Patient/id/_history/vid`)
 
@@ -455,7 +456,7 @@ R3 at `LOCAL_QUORUM`, partition `resource_versions (T,P,id)`, one row. `vid` is 
 
 | Case | Backend returns | REST returns |
 | --- | --- | --- |
-| `vid` not a valid `int` (`"abc"`, `"1.0"`) | `Ok(None)` without a query | 404 |
+| `vid` not the canonical decimal of a positive `int` (`"abc"`, `"1.0"`, `"01"`, `"+1"`, `"0"`) | `Ok(None)` without a query | 404 |
 | no such row | `Ok(None)` | 404 |
 | content row | `StoredResource` with content | 200 |
 | delete marker (`deleted_at` set, `data` unset) | `StoredResource` with `deleted_at` set and content `Value::Null`, as PostgreSQL | 410 when `HFS_RETURN_GONE` is true (the default), else 404 (`vread.rs`) |
@@ -465,6 +466,10 @@ R3 at `LOCAL_QUORUM`, partition `resource_versions (T,P,id)`, one row. `vid` is 
 ### 4.3 list_versions
 
 R4 at `LOCAL_QUORUM`, one partition. `ORDER BY version_id ASC` reverses the clustering order, which a single-partition query may do (or read `DESC` and reverse in Rust). Returns `["1", "2", …]`, numerically ordered past 9 because `version_id` is an `int`; an unknown id gives an empty list. The race suite requires "no gap, no duplicate"; V3 before the CAS keeps that through any number of crashes (G2, G40).
+
+### 4.4 delete_with_match
+
+`VersionedStorage::delete_with_match(…, expected_version)` takes the client's `If-Match` field value (`W/"1"`, a list, `*`), not a bare version, and is Step 3's, with `vread` and `list_versions` (ADR-aacruzgon-0060). `Operation::Delete`; R1 (absent or `deleted_at > 0`: `NotFound`); the field is compared with R1's version by the shared `if_match_field_satisfied`, and a mismatch is `VersionConflict` with nothing written; then `delete_versioned` with R1's bare version, which runs 3.4 from its own R1. So the compare-and-swap is `delete_versioned`'s, and a writer landing after the comparison makes it miss rather than being deleted with it (#1404). It costs two R1s (`read=2 write=5 cas=1`).
 
 ## 5. Search
 
@@ -478,7 +483,7 @@ Expected results for every case are in [`coverage.md`](coverage.md). This sectio
 4. **Tag check:** R1 for the candidate. Keep it only if the row exists, `deleted_at` is 0 (live; G39) and `resources.version_id` equals the index row's `version_id`. A mismatch hides the candidate and triggers repair on read (ADR-aacruzgon-0017): maintenance for the current version at its `ts`, with its key set from the `index_keys` of the R1 row just loaded (G22), so repair reads nothing more. A stale key the current version does not produce is deleted; one it produces is upserted with the current tag. Repair is logged as a write made from a read.
 5. Apply residual filters: dates and `_lastUpdated` combined with another parameter (5.8); `query.fhir_version`, kept only if `resources.fhir_version` equals `as_mime_param()` of it (5.9, G34); `query.compartment` (5.11, G33).
 6. Stop at `_count + 1` kept resources; the extra one decides whether `next` exists. `LIMIT` is a batch size, not the page size.
-7. **Cap** (G27, ADR-aacruzgon-0027). The search counts the distinct candidates it point-reads (R1) for one page, or for one `search_count`. Past the configured cap it fails with `SearchError::TooManyResults`, which REST answers with 422, issue `processing` (`crates/rest/src/error.rs:1123-1125`, `591-595`). No search error produces `too-costly`; its only producer is the batch handler's 500 for a transaction too large for MongoDB's cache (`crates/rest/src/handlers/batch.rs:3745`). Stale rows count too: a candidate the tag check hides is still a candidate point-read, so enough resurrected or orphan rows ahead of the live matches can make a page fail before it fills (G7). Repair on read at step 4 deletes each one it reads, so a retry gets further.
+7. **Cap** (G27, ADR-aacruzgon-0027). The search counts the distinct candidates it point-reads (R1) for one page, or for one `search_count`. Past the configured cap it fails with `SearchError::TooManyResults`, which REST answers with 422, issue `processing` (`crates/rest/src/error.rs:1123-1125`, `591-595`). No search error produces `too-costly`; its only producer is the batch handler's 500 for a transaction too large for MongoDB's cache (`crates/rest/src/handlers/batch.rs:3818`). Stale rows count too: a candidate the tag check hides is still a candidate point-read, so enough resurrected or orphan rows ahead of the live matches can make a page fail before it fills (G7). Repair on read at step 4 deletes each one it reads, so a retry gets further.
 
 Index and R1 reads are `LOCAL_QUORUM`. A candidate whose index tag is `N` while `resources` is at `N+1` (a write between steps 3 and 5) is hidden: the design's in-flight window.
 
@@ -741,7 +746,7 @@ Eight partitions, eight rows; at an estimated 150 to 250 bytes per row, one batc
 
 ### Version 2: update (gender `male` → `female`)
 
-`current` is version 1. R1 reads `resources` at version 1, whose `index_keys` is `K(1)`, the table above (G22). V3 rewrites version 1 from `current` at `ts(1) − 1`, with the `K(1)` R1 returned, so the original wins and nothing changes. I1 `(tu(2), acme, Patient, p1)`, `w2`, `version_id 2`. C2 `IF version_id = 1 AND deleted_at = 0` applies: `version_id 2`, `lu(2)`, `ts(2)`, `w2`, new `data`, `index_keys` `K(2)`, 293 bytes. V1 writes version 2 at `ts(2)`, with the same `K(2)`. Index changes, all `USING TIMESTAMP 1791972300456000`:
+`current` is version 1. R1 reads `resources` at version 1, whose `index_keys` is `K(1)`, the table above (G22). V3 rewrites version 1 from R1 at `ts(1) − 1`, with its `write_id` `w1`, with the `K(1)` R1 returned, so the original wins and nothing changes. I1 `(tu(2), acme, Patient, p1)`, `w2`, `version_id 2`. C2 `IF version_id = 1 AND deleted_at = 0` applies: `version_id 2`, `lu(2)`, `ts(2)`, `w2`, new `data`, `index_keys` `K(2)`, 293 bytes. V1 writes version 2 at `ts(2)`, with the same `K(2)`. Index changes, all `USING TIMESTAMP 1791972300456000`:
 
 - **6 deletes:** every non-date row of `K(1)`.
 - **8 inserts, tag 2:** `K(2)`, which is `K(1)` with `lu(2)` for `lu(1)` and `female` for `male`. The two date keys are unchanged, so they are only re-inserted (tag 1 → 2).
@@ -855,7 +860,7 @@ The CAS had already applied when step 5 failed, so no retry, sweep or repair cou
 **G36. A superseded unknown outcome was always undecidable.** *Resolved in the design (ADR-aacruzgon-0026, refining ADR-aacruzgon-0024).*
 - `resource_versions` gains `write_id`, written by V1 and V2 and by any V3 built from R1.
 - When the serial read finds a version past ours, R3 on row `V` decides it: our `write_id` is success with no index writes; another is a definite miss.
-- It stays undecidable (504 or 503) when row `V` has no `write_id` (row `V` can no longer be missing once superseded, G40), which is the case when `update`, whose `StoredResource` has no `write_id`, superseded it (3.1).
+- It stays undecidable (504 or 503) when row `V` has no readable `write_id` (row `V` can no longer be missing once superseded, G40). Since Step 3 every V3 is built from R1, `update`'s included, so that is unreachable in practice (ADR-aacruzgon-0061).
 
 **G37. Two `_id` parameters must intersect.** *Resolved in the design (ADR-aacruzgon-0026).* A `patient/` scope appends `_id=<patient>` to every Patient search. If it had been checked against an index table, P5 would have made such searches empty; if only the first `_id` had been used, they would have leaked other patients. All `_id` parameters are now intersected before any read (5.4).
 
@@ -898,7 +903,7 @@ The CAS had already applied when step 5 failed, so no retry, sweep or repair cou
 - `bucket` is the UTC hour of `enqueued_at` itself, never a second clock reading (now in the design).
 - The sweeper reads `shard` back from the row, so any function works, even random. If it is a hash, name one stable across processes and Rust releases (not `DefaultHasher`).
 - `create_or_update` writes a new intent row for each turn, with its own `enqueued_at` and that turn's version, and a turn whose CAS misses deletes its own row (ADR-aacruzgon-0024). Rewriting one key with a new version, or deleting it and writing it again, would depend on coordinator timestamps.
-- HTTP retries: a `POST` after a timeout creates a duplicate; a `PUT` with `If-Match: W/"N"` after success gets 412; a `DELETE` after success gets 404. The other backends do the same; the demo script and the benchmark harness must not count these as Cassandra errors.
+- HTTP retries: a `POST` after a timeout creates a duplicate; a `PUT` with `If-Match: W/"N"` after success gets 412; a `DELETE` after success gets 204 again, writing nothing (ADR-aacruzgon-0052). The other backends do the same; the demo script and the benchmark harness must not count these as Cassandra errors.
 
 **G28. Batch `ifMatch` plus the `create_or_update` retry is last-writer-wins.** *Resolved (ADR-aacruzgon-0024 recorded it as an upstream limitation; ADR-aacruzgon-0056 closes it with the backport of upstream #2530).* REST used to check a batch entry's `ifMatch` with a read, then call `create_or_update`, so our loop, which retries on a newer version, let an entry conditioned on `W/"1"` overwrite a version 2 it never saw. Since the backport, the gate keeps the row it checked: a batch `PUT` with `ifMatch` calls `update` against that row (`VersionConflict` → 409, a delete since → 404), and a batch `DELETE` with `ifMatch` calls `delete_under_precondition`, as the single requests do. The `create_or_update` loop, with its bound of 3 retries or 4 attempts (ADR-aacruzgon-0024), now serves only entries without `ifMatch`, where last-writer-wins is the upstream contract (#2111).
 

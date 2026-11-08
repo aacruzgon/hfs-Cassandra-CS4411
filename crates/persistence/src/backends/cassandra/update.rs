@@ -414,7 +414,7 @@ mod node_tests {
 
     fn tenant_context(case: &str) -> TenantContext {
         TenantContext::new(
-            TenantId::new(format!("s3-update-{case}-{}", Uuid::new_v4().simple())),
+            TenantId::new(format!("test-update-{case}-{}", Uuid::new_v4().simple())),
             TenantPermissions::full_access(),
         )
     }

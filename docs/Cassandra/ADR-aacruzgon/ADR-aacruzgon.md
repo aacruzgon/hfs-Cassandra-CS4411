@@ -56,7 +56,7 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0009](2026-10-13/0009-gc-grace-seconds.md) | 2026-10-13 | `gc_grace_seconds` per table | accepted |
 | [0010](2026-10-13/0010-compaction-default.md) | 2026-10-13 | Compaction stays at the node default for every table | accepted |
 | [0011](2026-10-13/0011-created-at.md) | 2026-10-13 | Where `created_at` lives and what revive does to it | accepted |
-| [0012](2026-10-14/0012-rewrite-previous-version-row.md) | 2026-10-14 | Every write also rewrites the previous version's history row | accepted |
+| [0012](2026-10-14/0012-rewrite-previous-version-row.md) | 2026-10-14 | Every write also rewrites the previous version's history row | accepted; partly superseded by [0027](2026-11-05/0027-step-1-open-items-decided.md) (G40: the rewrite runs before the CAS; [0060](2026-11-06/0060-step3-scope.md)); its source is R1, not `current` ([0061](2026-11-06/0061-update-v3-from-r1.md)) |
 | [0013](2026-10-14/0013-sweeper-replays-versions.md) | 2026-10-14 | The sweeper replays the intent's version, even if superseded | accepted |
 | [0014](2026-10-14/0014-sweeper-startup-scan.md) | 2026-10-14 | The sweeper scans every live bucket when it starts | accepted |
 | [0015](2026-10-14/0015-outbox-clustered-by-time.md) | 2026-10-14 | `pending_index_writes` is clustered by `enqueued_at` first | accepted |
@@ -68,10 +68,10 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0021](2026-10-15/0021-item-0.5-required-checks.md) | 2026-10-15 | Item 0.5's four checks are required on `main`, the Cassandra schema job included | accepted |
 | [0022](2026-10-15/0022-require-sha-pinned-actions.md) | 2026-10-15 | Every action is pinned to a commit SHA, and the repository requires it | accepted |
 | [0023](2026-11-04/0023-light-heavy-runners-acruzdebian.md) | 2026-11-04 | CI splits into light and heavy jobs, and `acruzdebian` joins as a second runner for light jobs only | accepted |
-| [0024](2026-11-05/0024-create-or-update-race-loop.md) | 2026-11-05 | `create_or_update` is a bounded CAS loop on every branch, with one intent row per attempt and a fixed rule for unknown outcomes | accepted |
+| [0024](2026-11-05/0024-create-or-update-race-loop.md) | 2026-11-05 | `create_or_update` is a bounded CAS loop on every branch, with one intent row per attempt and a fixed rule for unknown outcomes | accepted; partly superseded by [0027](2026-11-05/0027-step-1-open-items-decided.md) (G39: a revive writes `deleted_at = 0`, not null; [0060](2026-11-06/0060-step3-scope.md)) |
 | [0025](2026-11-05/0025-readhistory-stays-true.md) | 2026-11-05 | `readHistory` stays `true` on Cassandra; only the history interactions are omitted | accepted |
 | [0026](2026-11-05/0026-schema-audit-fixes.md) | 2026-11-05 | Schema audit fixes: compartment and FHIR-version residuals, a 2 KiB limit on indexed values, `write_id` on version rows, and intersected `_id` parameters | accepted |
-| [0027](2026-11-05/0027-step-1-open-items-decided.md) | 2026-11-05 | The open items are decided: `count`, date-only paging, stored index keys, the cap, the unread rows, `_sort`, the rejections, the sweeper and the schema's setup | accepted |
+| [0027](2026-11-05/0027-step-1-open-items-decided.md) | 2026-11-05 | The open items are decided: `count`, date-only paging, stored index keys, the cap, the unread rows, `_sort`, the rejections, the sweeper and the schema's setup | accepted; its `HFS_RETURN_GONE` note on `read` corrected by [0064](2026-11-06/0064-spec-tensions-accepted.md) |
 | [0028](2026-11-06/0028-schema-sign-off.md) | 2026-11-06 | Sign-off on `schema.cql` as merged at `67f9e0532` | accepted |
 | [0029](2026-11-06/0029-cassandra-test-node.md) | 2026-11-06 | How the Cassandra test node is reached, started and shared | accepted |
 | [0030](2026-11-06/0030-ci-cassandra-tests.md) | 2026-11-06 | The Cassandra job builds its tests before starting the node, and stays on the light runners | accepted |
@@ -93,16 +93,23 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0046](2026-11-06/0046-more-ci-reports.md) | 2026-11-06 | More CI reports: latency, dependency freshness, advisories, sizes and step timings | accepted |
 | [0047](2026-11-06/0047-coverage-report-in-ci.md) | 2026-11-06 | A Cassandra coverage report in CI, in its own workflow, not required and with no threshold | accepted |
 | [0048](2026-11-06/0048-more-ci-reports-node-and-build.md) | 2026-11-06 | More CI reports: the R4B build, cargo timings, the node's start, its JVM and container, hfs's memory, and the stored-SearchParameter load | accepted |
-| [0049](2026-11-06/0049-backport-upstream-2518.md) | 2026-11-06 | Carry upstream's versioned-`Location` fix (HeliosSoftware/hfs#2518) in the fork ahead of upstream, as `-x` cherry-picks | accepted |
+| [0049](2026-11-06/0049-backport-upstream-2518.md) | 2026-11-06 | Carry upstream's versioned-`Location` fix (HeliosSoftware/hfs#2518) in the fork ahead of upstream, as `-x` cherry-picks | accepted; the Milestone A vread flip came at Step 3, not Step 4 ([0060](2026-11-06/0060-step3-scope.md)) |
 | [0050](2026-11-06/0050-one-cas-engine.md) | 2026-11-06 | Every compare-and-swap goes through one write engine, under the rules of ADR-aacruzgon-0034 and 0035 | accepted; R2/R3 error mapping amended by [0055](2026-11-06/0055-r2-r3-errors-503.md) |
 | [0051](2026-11-06/0051-late-earlier-attempt.md) | 2026-11-06 | After an unknown outcome, a later attempt checks every earlier attempt before it acts on what it sees | accepted |
-| [0052](2026-11-06/0052-backport-upstream-2529.md) | 2026-11-06 | A delete with nothing to delete answers 200/204, through upstream's fix (HeliosSoftware/hfs#2529) carried as a `-x` cherry-pick with one hunk left out | accepted |
+| [0052](2026-11-06/0052-backport-upstream-2529.md) | 2026-11-06 | A delete with nothing to delete follows the spec (200/204), through upstream's fix (HeliosSoftware/hfs#2529) carried as a `-x` cherry-pick | accepted |
 | [0053](2026-11-06/0053-cas-size-bound.md) | 2026-11-06 | An 8 MiB bound on what a compare-and-swap carries, refused with 400 before any write | accepted |
 | [0054](2026-11-06/0054-required-job-lib-step.md) | 2026-11-06 | The required Cassandra job runs the backend's `--lib` tests | accepted |
 | [0055](2026-11-06/0055-r2-r3-errors-503.md) | 2026-11-06 | After an unknown CAS outcome, an R2 or R3 error is 504 for a timeout and 503 for anything else | accepted; amended by [0067](2026-11-07/0067-errors-after-unknown-outcome-503.md) |
 | [0056](2026-11-06/0056-backport-upstream-2530.md) | 2026-11-06 | A batch `ifMatch` PUT or DELETE is pinned to the version its gate checked, through upstream's fix (HeliosSoftware/hfs#2530) carried as a `-x` cherry-pick | accepted |
 | [0057](2026-11-06/0057-crud-suite-adapted-copy.md) | 2026-11-06 | Upstream's CRUD suite runs on Cassandra as an adapted copy, with a parity test and four Cassandra-strict tests | accepted |
-| [0058](2026-11-06/0058-cql-audit-check.md) | 2026-11-06 | The node's CQL audit log proves that no CQL `DELETE` reaches `resources` or `resource_versions`, as a check in the required Cassandra job | accepted |
+| [0058](2026-11-06/0058-cql-audit-check.md) | 2026-11-06 | The node's CQL audit log proves that no CQL `DELETE` reaches `resources` or `resource_versions`, as a check in the required Cassandra job | accepted; matching rules and known limits amended by [0066](2026-11-07/0066-cql-audit-check-after-pr62.md) |
 | [0059](2026-11-06/0059-step3-ci-reports.md) | 2026-11-06 | Step 3's CI reports: latency per operation, CAS outcomes, statements, intent rows, tombstones, DML and the HL7 rows | accepted |
+| [0060](2026-11-06/0060-step3-scope.md) | 2026-11-06 | Step 3's scope: vread, list_versions and delete_with_match come forward from Step 4, PATCH is in, the multitenancy suites split, and four contradictions are realigned; Steps 4 to 8 left to the group (**X**) | accepted |
+| [0061](2026-11-06/0061-update-v3-from-r1.md) | 2026-11-06 | Plain `update` builds its rewrite of row N from its own pre-read, so every rewrite carries a `write_id` | accepted |
+| [0062](2026-11-06/0062-overlay-on-update-delete-revive.md) | 2026-11-06 | Stored SearchParameters stay current in the overlay on update, delete and revive, with removals ordered by `last_updated` | accepted |
+| [0063](2026-11-07/0063-create-or-update-loop.md) | 2026-11-07 | `create_or_update` is a four-turn loop that checks the id first and each branch's permission after its pre-read, and answers 409 after four definite misses | accepted |
+| [0064](2026-11-06/0064-spec-tensions-accepted.md) | 2026-11-06 | The places where Step 3 departs from, or sits uneasily with, the FHIR specification, accepted on purpose | accepted |
+| [0065](2026-11-07/0065-fhir-versions-tested.md) | 2026-11-07 | The Cassandra backend is tested on R4, R4B, R5 and R6, with R4 as the required gate | accepted |
+| [0066](2026-11-07/0066-cql-audit-check-after-pr62.md) | 2026-11-07 | The CQL audit check after PR #62: each rule also reads the CQL text, across keyspaces, and the audit dump is read fail-closed | accepted |
 | [0067](2026-11-07/0067-errors-after-unknown-outcome-503.md) | 2026-11-07 | After an unknown CAS outcome, every later statement's error is 504 for a timeout and 503 for anything else | accepted |
 | [0068](2026-11-07/0068-overlay-follows-undecided-writes.md) | 2026-11-07 | A SearchParameter write whose outcome could not be decided reads its row back, and the overlay follows it | accepted |

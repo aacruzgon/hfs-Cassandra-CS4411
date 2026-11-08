@@ -34,7 +34,7 @@ async fn create_patient<S: ResourceStorage>(backend: &S, tenant: &str, id: &str)
             &ctx(tenant),
             "Patient",
             json!({"resourceType": "Patient", "id": id}),
-            FhirVersion::default(),
+            FhirVersion::default_enabled(),
         )
         .await
         .unwrap_or_else(|e| panic!("create Patient/{id} in {tenant}: {e}"));

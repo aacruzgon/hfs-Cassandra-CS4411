@@ -24,7 +24,8 @@ pub(crate) const TEST_FHIR_VERSION_VAR: &str = "HFS_TEST_FHIR_VERSION";
 
 /// The FHIR version the tests create, expect and load the registry for,
 /// decided once per test binary. When the variable is set, the choice is
-/// printed once, so every log names the version it ran.
+/// printed once on stderr, which `cargo test` shows with `--nocapture` or
+/// `--show-output`.
 pub(crate) fn test_fhir_version() -> FhirVersion {
     static CHOSEN: OnceLock<FhirVersion> = OnceLock::new();
     *CHOSEN.get_or_init(|| match std::env::var_os(TEST_FHIR_VERSION_VAR) {

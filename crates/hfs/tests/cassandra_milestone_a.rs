@@ -150,7 +150,8 @@ const FHIR_VERSION_VAR: &str = "HFS_TEST_FHIR_VERSION";
 /// `None` when [`FHIR_VERSION_VAR`] is unset: `hfs` then picks its own
 /// default, exactly as before the variable existed. A set value this build
 /// cannot parse, or a version it does not enable, panics, so a typo never
-/// quietly runs R4. Decided once and printed once.
+/// quietly runs R4. Decided once and printed once on stderr, which
+/// `cargo test` shows with `--nocapture` or `--show-output`.
 fn test_fhir_version() -> Option<helios_fhir::FhirVersion> {
     static CHOSEN: std::sync::OnceLock<Option<helios_fhir::FhirVersion>> =
         std::sync::OnceLock::new();

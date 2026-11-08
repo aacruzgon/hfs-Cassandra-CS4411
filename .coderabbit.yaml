@@ -153,7 +153,8 @@ reviews:
     - "!crates/hfs/tests/inferno/*.json"
     - "!crates/fhir-validator/tests/fixtures/**"
     - "!crates/hts/terminology-data/**"
-    # Upstream workflows kept for reference; GitHub loads none of them
+    # Disabled workflows, kept for reference: upstream's, and the fork's own
+    # cassandra-integration.yml. GitHub loads none of them
     # (.github/disabled-workflows/README.md).
     - "!.github/disabled-workflows/*.yml"
 
@@ -418,9 +419,10 @@ reviews:
           else).
         - A report never fails the job: on a parse error it warns and exits
           0. The exception is ci-report.py cql-audit --check, which must fail
-          closed: an empty or missing log, an unreadable record, a DELETE,
-          TRUNCATE or DROP on resources or resource_versions, or a failed
-          native batch is exit 1 (ADR-aacruzgon-0058; 0066 when merged). Flag
+          closed: an empty or missing log, a log with no DML in helios, an
+          unreadable record, a DELETE, TRUNCATE or DROP on resources or
+          resource_versions, or a failed native batch is exit 1
+          (ADR-aacruzgon-0058, 0066). Flag
           any path where it would pass on input it could not read.
         - A change to a report or the audit rules comes with a test in
           test_ci_report.py (stdlib unittest, run in the cargo fmt --check
@@ -437,7 +439,7 @@ reviews:
   # Commit messages: CodeRabbit's docs do not say that a review or a
   # pre-merge check reads commit messages (custom checks see "relevant git
   # history", undefined;
-  # https://docs.coderabbit.ai/pr-reviews/pre-merge-checks).
+  # https://docs.coderabbit.ai/pr-reviews/custom-checks).
   # So the commit rules (no AI attribution, no [skip ci], one concern per
   # commit) are checked on the PR title and description only, and the
   # commits themselves stay the author's and the audit's job.
@@ -495,9 +497,14 @@ reviews:
           "*Corrected YYYY-MM-DD:*" note are not failures. Pass otherwise.
 
   tools:
-    # GitHub Actions: the fork's six workflows. actionlint reads
-    # .github/actionlint.yaml (the custom runner labels); zizmor checks the
-    # security rules that ADR-aacruzgon-0018 and 0022 set.
+    # GitHub Actions: the fork's six workflows. .github/actionlint.yaml
+    # declares every self-hosted label they use. actionlint finds that file
+    # by itself (1.7.12, run from the root or from .github/workflows), but
+    # CodeRabbit's docs say only that it runs actionlint "with its default
+    # configuration" (https://docs.coderabbit.ai/tools/actionlint), so
+    # whether CodeRabbit reads it is unconfirmed. Without it, actionlint
+    # reports "label ... is unknown" for each runs-on line. zizmor checks
+    # the security rules that ADR-aacruzgon-0018 and 0022 set.
     actionlint:
       enabled: true
     zizmor:
@@ -547,7 +554,9 @@ reviews:
       enabled: false
     opengrep:
       enabled: false
-    # Dockerfile and docker/ compose files.
+    # The Dockerfile. Hadolint reads only Dockerfile, *.dockerfile and
+    # Dockerfile.* (https://docs.coderabbit.ai/tools/hadolint); the
+    # docker/ compose files are checked by yamllint.
     hadolint:
       enabled: true
     # Off: hadolint covers the Dockerfile, and gitleaks and trufflehog the

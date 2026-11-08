@@ -261,8 +261,9 @@ jobs:
           if-no-files-found: warn
           overwrite: true
 
-  # The backend's Cassandra tests, once per FHIR version, from one build with
-  # all four on: the persistence tests choose their version from
+  # The backend's Cassandra tests, once per FHIR version, from two builds with
+  # all four on, one per test crate because their feature sets differ, never
+  # one per version: the persistence tests choose their version from
   # HFS_TEST_FHIR_VERSION (each binary prints the
   # `fhir-versions: HFS_TEST_FHIR_VERSION=… -> …` line once), and the hfs
   # tests pass it on to the hfs they start. The same tests the required job
@@ -273,7 +274,7 @@ jobs:
     name: Cassandra tests (all FHIR versions)
     # Fork guard (ADR-aacruzgon-0018).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # Every FHIR version's generated models in one build: heavy, sam-7900x
+    # Every FHIR version's generated models in each build: heavy, sam-7900x
     # only (ADR-aacruzgon-0023).
     runs-on: [self-hosted, hfs-cassandra-heavy]
     timeout-minutes: 60

@@ -2,8 +2,9 @@
 """Cassandra tests per FHIR version: one row per version and suite (report only).
 
 The `all-versions` job of .github/workflows/fhir-versions.yml builds the
-Cassandra test binaries once with every FHIR version on, then runs them once
-per version with HFS_TEST_FHIR_VERSION set, and keeps each run's output in
+Cassandra test binaries with every FHIR version on (two builds, one per test
+crate, never one per version), then runs them once per version with
+HFS_TEST_FHIR_VERSION set, and keeps each run's output in
 `<logs-dir>/fhir-<version>-<suite>.log`, ending with a line `exit=<status>`.
 The suites are:
 
@@ -206,7 +207,7 @@ def build(logs: Path, versions: list[str]) -> tuple[str, dict]:
     ok = sum(r["ok"] for r in rows)
     markdown = "\n".join([
         f"{ok} of {len(rows)} runs ok, over {len(versions)} FHIR version{"s" if len(versions) != 1 else ""} ({', '.join(versions)}), "
-        "one build with every version on, one Cassandra node.",
+        "built once per test crate with every version on, one Cassandra node.",
         "",
         *lines,
         "",

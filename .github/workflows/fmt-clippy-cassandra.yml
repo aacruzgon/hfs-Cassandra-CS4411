@@ -740,16 +740,23 @@ jobs:
           dir="$RUNNER_TEMP/ci-report/inputs/latency"
           export HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" HFS_TEST_LATENCY_REPORT="$dir"
           status=0
+          # A test that ran and failed fails the step through cargo's exit
+          # code; only a cargo run that passed is checked for its one test,
+          # so the annotation names only a test that did not run.
+          ran_once() {
+            grep -Eq '^test result: ok\. 1 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$1") \
+              || { echo "::error title=Latency report::$2 did not run exactly once"; status=1; }
+          }
+          rc=0
           cargo test -p helios-persistence --features cassandra --test cassandra_tests \
             -- --exact latency_report::cassandra_latency_report --nocapture 2>&1 \
-            | tee "$logs/latency-backend.log" || status=1
-          grep -Eq '^test result: ok\. 1 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$logs/latency-backend.log") \
-            || { echo "::error title=Latency report::latency_report::cassandra_latency_report did not run exactly once"; status=1; }
+            | tee "$logs/latency-backend.log" || rc=$?
+          if [ "$rc" -ne 0 ]; then status=1; else ran_once "$logs/latency-backend.log" latency_report::cassandra_latency_report; fi
+          rc=0
           cargo test -p helios-hfs --no-default-features --features R4,cassandra \
             --test cassandra_milestone_a -- --exact rest_latency_report --nocapture 2>&1 \
-            | tee "$logs/latency-rest.log" || status=1
-          grep -Eq '^test result: ok\. 1 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$logs/latency-rest.log") \
-            || { echo "::error title=Latency report::rest_latency_report did not run exactly once"; status=1; }
+            | tee "$logs/latency-rest.log" || rc=$?
+          if [ "$rc" -ne 0 ]; then status=1; else ran_once "$logs/latency-rest.log" rest_latency_report; fi
           python3 .github/scripts/ci-report.py add latency-backend \
             "Latency: CassandraBackend per operation (smoke trend)" \
             --markdown "$dir/cassandra-latency.md" --json "$dir/cassandra-latency.json"

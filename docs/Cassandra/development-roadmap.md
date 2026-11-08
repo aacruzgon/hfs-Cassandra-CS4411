@@ -456,14 +456,19 @@ Steps 4 and 5 both build on Step 3 and can run at the same time: one person on S
     - **The overlay's two limitations** close here (ADR-aacruzgon-0062, the task above).
     - **Statement counts are pinned.** Step 3's live tests assert per-operation counts, for example `update`'s `(read, serial_read, write, cas) = (1, 0, 6, 1)` (`C/update.rs:663`), and the latency report prints them. More index rows change them; those tests are in Step 5's files.
     - **Test tenants.** The `--lib` tests in `write.rs`, `update.rs`, `delete.rs` and `upsert.rs` use `s3-engine-…`, `s3-update-…`, `s3-delete-…` and `s3-upsert-…` tenants (and Step 2's `s2-paging-…` and `s2-resolve-…`, `C/backend.rs:1606`, `C/write.rs:2832`), not ADR-aacruzgon-0029's `test-`, so R4 cannot see the intents their fault-seam cases leave. Draft PR #62 renames them to `test-update-…`, `test-delete-…`, `test-upsert-…`, `test-engine-…`, `test-resolve-…` and `test-paging-…` (`038d0b473`), and moves the driver-restart test off its fixed `s2-restart` tenant to a `test-restart-<32 hex>` one per run (`94424095a`); until it merges they read as above.
-    - **The CQL audit check** skips a failed `DELETE` sent from a session whose keyspace is not `helios` (ADR-aacruzgon-0058's known limitation F8). Draft PR #62 closes it and hardens the check further, commit by commit (as of `95fde3bc4`):
+    - **The CQL audit check** skips a failed `DELETE` sent from a session whose keyspace is not `helios` (ADR-aacruzgon-0058's known limitation F8). Draft PR #62 closes it and hardens the check further, commit by commit (as of `62074645e`):
         - `093ca1233`: rule (b) also checks an entry logged under another keyspace when its text names `helios`, which closes F8;
         - `22f3f58ae`: the text rules run on the statement with comments blanked and string literals emptied, so rule (b) sees past a comment after `FROM`, a quoted name right after `FROM` and a `;` in a literal; and rule (b′) matches `TRUNCATE` and `DROP TABLE` of either table by text, so an unprepared one that failed is caught too;
         - `2ddcb663d`: rule (d) counts a failed native-protocol batch as unverifiable whatever keyspace its entry names;
         - `5387007fe`: rule (b′) also takes `COLUMNFAMILY`, `TABLE`'s synonym;
         - `fc6396036`: `auditlogviewer` records are framed fail-closed, so a `Type: ` or `LogMessage: ` line inside a statement's text cannot split a record and hide what follows, and a CR ends a `--` comment;
-        - `95fde3bc4`: a failed statement whose server message leaves a quote open is framed where its query ends, rather than failing the check as unverifiable, and no header line that opens a quote is trusted;
-        - `bdb5fc38c`: ADR-aacruzgon-0058's Status line lists what the check catches after these commits, and what stays open (an entry under an excluded system keyspace is never written).
+        - `95fde3bc4`: a failed statement whose server message leaves a quote open is framed where its query ends, rather than failing the check as unverifiable, and no header is trusted whose user, host or source field holds a quote, `$$`, `/*`, `--` or `//`, since any of those could open a literal, quoted name or comment;
+        - `bdb5fc38c`: ADR-aacruzgon-0058's Status line lists what the check catches after these commits, and what stays open; `3e6cdd927` later moves that into ADR-aacruzgon-0066;
+        - `8c2ca443a`: the reader's docstring rests its soundness on the 5.0.9 lexer and the header-field rule, and its fixtures match what 5.0.9 logs;
+        - `3e6cdd927`: ADR-aacruzgon-0066, the CQL audit check after PR #62, records each rule, what stays open and the accepted false failures; 0058's Status line goes back to its original text, amended by 0066;
+        - `62074645e`: wording in ADR-0066 and the docstring.
+
+      ADR-aacruzgon-0066 is the record of what the check catches and what stays open.
 
       Step 5 owns the workflow and `ci-report.py` once #62 has merged.
     - **`SELECT DISTINCT` drops a partition whose only row is deleted** (Step 3 L1 audit, reproduced on a node). The tenant scan of ADR-aacruzgon-0041 reads `resources_by_type`'s partition keys, so a type whose last resource was deleted is no longer listed; any sweeper or repair scan over partition keys has the same property.

@@ -306,7 +306,7 @@ A letter after a D-number (D1 b, D9 a′) is one of that decision's options; the
 | Row | The rule, or what it found |
 | --- | --- |
 | RS1 | An id on PUT must be a valid FHIR `id`; Cassandra refuses others with 400 (ADR-aacruzgon-0064 item 1) |
-| RS5 | `meta.lastUpdated` is "the current time on the server"; Cassandra's can run 1 ms ahead (0064 item 5) |
+| RS5 | `meta.lastUpdated` is "the current time on the server"; Cassandra's can run ahead, by a writer's clock skew carried forward or 1 ms per same-millisecond write (0064 item 5) |
 | U-2 | A PUT whose body has no `id` should be 400; REST accepts it (0064 item 9) |
 | U-7, U-9, VD-4 | The status of an update that revives a deleted resource: 201 in R4 and R4B, ambiguous in R5 (0064 item 2) |
 | V-5 | "There is no way to update or delete past versions" (0061) |

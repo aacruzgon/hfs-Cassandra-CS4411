@@ -357,10 +357,12 @@ reviews:
     - path: "docs/Cassandra/schema/**"
       instructions: |
         Signed off by ADR-aacruzgon-0028 at 67f9e0532.
-        - Never reword a signed-off sentence, and never change a table, key,
-          column type or table option, without a new sign-off entry from
-          every member. Corrections are added as notes that cite their ADR
-          (schema.cql: "comment changes since cite their ADR").
+        - Never change a table, key, column type or table option without a
+          new sign-off entry from every member.
+        - A signed-off comment or sentence may be reworded, or a note added,
+          only when the change cites its ADR (schema.cql: "comment changes
+          since cite their ADR"; for example 2da7bd598, ADR-aacruzgon-0061).
+          Flag a rewording that cites none.
         - expected-schema.txt must still match schema.cql.
         - The statement rules at the top of schema.cql bind the backend; a
           note that changes their meaning is a schema change.

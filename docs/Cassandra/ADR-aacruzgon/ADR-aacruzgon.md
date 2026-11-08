@@ -99,8 +99,9 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0052](2026-11-06/0052-backport-upstream-2529.md) | 2026-11-06 | A delete with nothing to delete answers 200/204, through upstream's fix (HeliosSoftware/hfs#2529) carried as a `-x` cherry-pick with one hunk left out | accepted |
 | [0053](2026-11-06/0053-cas-size-bound.md) | 2026-11-06 | An 8 MiB bound on what a compare-and-swap carries, refused with 400 before any write | accepted |
 | [0054](2026-11-06/0054-required-job-lib-step.md) | 2026-11-06 | The required Cassandra job runs the backend's `--lib` tests | accepted |
-| [0055](2026-11-06/0055-r2-r3-errors-503.md) | 2026-11-06 | After an unknown CAS outcome, an R2 or R3 error is 504 for a timeout and 503 for anything else | accepted |
+| [0055](2026-11-06/0055-r2-r3-errors-503.md) | 2026-11-06 | After an unknown CAS outcome, an R2 or R3 error is 504 for a timeout and 503 for anything else | accepted; amended by [0067](2026-11-07/0067-errors-after-unknown-outcome-503.md) |
 | [0056](2026-11-06/0056-backport-upstream-2530.md) | 2026-11-06 | A batch `ifMatch` PUT or DELETE is pinned to the version its gate checked, through upstream's fix (HeliosSoftware/hfs#2530) carried as a `-x` cherry-pick | accepted |
 | [0057](2026-11-06/0057-crud-suite-adapted-copy.md) | 2026-11-06 | Upstream's CRUD suite runs on Cassandra as an adapted copy, with a parity test and four Cassandra-strict tests | accepted |
 | [0058](2026-11-06/0058-cql-audit-check.md) | 2026-11-06 | The node's CQL audit log proves that no CQL `DELETE` reaches `resources` or `resource_versions`, as a check in the required Cassandra job | accepted |
 | [0059](2026-11-06/0059-step3-ci-reports.md) | 2026-11-06 | Step 3's CI reports: latency per operation, CAS outcomes, statements, intent rows, tombstones, DML and the HL7 rows | accepted |
+| [0067](2026-11-07/0067-errors-after-unknown-outcome-503.md) | 2026-11-07 | After an unknown CAS outcome, every later statement's error is 504 for a timeout and 503 for anything else | accepted |

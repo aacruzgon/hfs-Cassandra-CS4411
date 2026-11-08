@@ -169,7 +169,12 @@ impl CassandraBackend {
             if turn > 0 {
                 request.note_miss_retry();
             }
-            let row = self.read_resource_row(tenant_id, resource_type, id).await?;
+            // After an unknown outcome, R1's error answers as R2's does
+            // (ADR-aacruzgon-0067).
+            let row = request.after_unknown(
+                self.read_resource_row(tenant_id, resource_type, id).await,
+                "pre-read",
+            )?;
             if let Some(row) = &row {
                 created_at = row.created_at;
             }

@@ -35,9 +35,13 @@
 //! **Failure handling** (design, "When the LWT outcome is unknown";
 //! ADR-aacruzgon-0024, 0026, 0034, 0035, 0050, 0051; walkthrough 3.1):
 //!
-//! - V3 or I1 fails: its error (503 or 504); this attempt changed nothing
-//!   (V3 only rewrites row `N` at an older timestamp). An earlier attempt
-//!   whose outcome was unknown is left for the sweeper.
+//! - V3 or I1 fails: its error, by the table for plain statements; this
+//!   attempt changed nothing (V3 only rewrites row `N` at an older
+//!   timestamp). Once an earlier attempt's outcome was unknown, that attempt
+//!   may have applied, so the error answers as R2's does, 504 for a timeout
+//!   and 503 for anything else, and the earlier attempt is left for the
+//!   sweeper (ADR-aacruzgon-0067). So does a later turn's R1
+//!   ([`CasRequest::after_unknown`]).
 //! - The CAS answers not applied: a definite miss. The attempt's intent row
 //!   is deleted, and the miss is mapped from the returned columns
 //!   ([`CasMiss::of`]): `[applied]` alone is "no row", `deleted_at > 0` is
@@ -928,6 +932,37 @@ impl CasRequest<'_> {
         self.attempts.iter().any(|a| a.unknown.is_some())
     }
 
+    /// A statement's error, by the table for plain statements, until an
+    /// attempt's outcome was unknown; from then on the write may have
+    /// applied, so it answers as R2's error does: 504 for a timeout, 503 for
+    /// anything else ([`may_have_applied`], ADR-aacruzgon-0067).
+    fn statement_error(&self, error: &DriverError, operation: &str) -> StorageError {
+        let mapped = map_driver_error(error, operation);
+        StorageError::Backend(if self.had_unknown_outcome() {
+            may_have_applied(mapped, operation)
+        } else {
+            mapped
+        })
+    }
+
+    /// The result of a statement the operation sends between its turns, its
+    /// next pre-read (R1): unchanged until an attempt's outcome was unknown;
+    /// from then on a backend error answers as R2's does
+    /// (ADR-aacruzgon-0067). Its other errors (a permission, a validation)
+    /// are the request's own, so they are kept.
+    pub(crate) fn after_unknown<T>(
+        &self,
+        result: StorageResult<T>,
+        operation: &str,
+    ) -> StorageResult<T> {
+        match result {
+            Err(StorageError::Backend(mapped)) if self.had_unknown_outcome() => {
+                Err(StorageError::Backend(may_have_applied(mapped, operation)))
+            }
+            other => other,
+        }
+    }
+
     /// Counts a retry the operation takes after a definite miss.
     #[allow(dead_code)] // L2b's delete and L3's loop.
     pub(crate) fn note_miss_retry(&self) {
@@ -1214,18 +1249,46 @@ fn already_exists(resource_type: &str, id: &str) -> StorageError {
 /// The client-facing message names no host; [`map_driver_error`] logs the
 /// driver's detail.
 fn map_lookup_error(error: &DriverError, operation: &str) -> StorageError {
-    StorageError::Backend(match map_driver_error(error, operation) {
-        mapped @ (BackendError::Timeout { .. }
-        | BackendError::Unavailable { .. }
-        | BackendError::ConnectionFailed { .. }) => mapped,
-        _ => BackendError::Unavailable {
-            backend_name: BACKEND_NAME.to_string(),
-            message: format!(
+    StorageError::Backend(unavailable_unless_timeout(
+        map_driver_error(error, operation),
+        || {
+            format!(
                 "the write's outcome could not be read back ({operation} failed); \
                  it may have been stored"
-            ),
+            )
         },
+    ))
+}
+
+/// The rule of [`map_lookup_error`] for any statement a request sends once
+/// an earlier attempt's outcome was unknown (ADR-aacruzgon-0067): that
+/// attempt may have applied, so a 500 of the plain table is 503.
+fn may_have_applied(mapped: BackendError, operation: &str) -> BackendError {
+    unavailable_unless_timeout(mapped, || {
+        format!(
+            "{operation} failed after an earlier attempt's outcome was unknown; \
+             the write may have been stored"
+        )
     })
+}
+
+/// An error already mapped by the table for plain statements: a timeout
+/// (504), an unavailable node or a lost connection (503) is kept, and
+/// anything else is `Unavailable` (503) with `message`, which names no host
+/// (REST sends it to the client verbatim).
+fn unavailable_unless_timeout(
+    mapped: BackendError,
+    message: impl FnOnce() -> String,
+) -> BackendError {
+    match mapped {
+        BackendError::Timeout { .. }
+        | BackendError::Unavailable { .. }
+        | BackendError::ConnectionFailed { .. } => mapped,
+        _ => BackendError::Unavailable {
+            backend_name: BACKEND_NAME.to_string(),
+            message: message(),
+        },
+    }
 }
 
 /// ADR-aacruzgon-0053: refuses, before anything is written, a write whose CAS would carry
@@ -1306,9 +1369,7 @@ impl CassandraBackend {
                 self.session
                     .execute(cql, values, StatementKind::Write)
                     .await
-                    .map_err(|error| {
-                        StorageError::Backend(map_driver_error(&error, "previous version row"))
-                    })?;
+                    .map_err(|error| request.statement_error(&error, "previous version row"))?;
             }
             self.write_intent(
                 &attempt.intent,
@@ -1316,7 +1377,8 @@ impl CassandraBackend {
                 attempt.write_id,
                 plan.target_version(),
             )
-            .await?;
+            .await
+            .map_err(|error| request.statement_error(&error, "intent row"))?;
 
             // Step 3.
             request.stats.attempt();
@@ -1604,7 +1666,7 @@ impl CassandraBackend {
         key: &RowKey<'_>,
         write_id: Uuid,
         version_id: i32,
-    ) -> StorageResult<()> {
+    ) -> Result<(), DriverError> {
         self.session
             .execute(
                 INSERT_INTENT,
@@ -1622,7 +1684,6 @@ impl CassandraBackend {
             )
             .await
             .map(|_| ())
-            .map_err(|error| StorageError::Backend(map_driver_error(&error, "intent row")))
     }
 
     /// I2, best effort: a failure leaves the intent for the sweeper.
@@ -2503,6 +2564,84 @@ mod tests {
         assert!(matches!(
             CasMiss::Exists.into_error("Patient", "p", 0),
             StorageError::Resource(ResourceError::AlreadyExists { .. })
+        ));
+    }
+
+    /// ADR-aacruzgon-0067: until an attempt's outcome is unknown, a
+    /// statement's error is the plain table's, 500 included; from then on a
+    /// timeout stays 504, and everything else is 503. A non-backend error of
+    /// the request (here a permission) is kept as it is.
+    #[test]
+    fn after_an_unknown_outcome_no_statement_error_is_500() {
+        let key = RowKey {
+            tenant_id: "t",
+            resource_type: "Patient",
+            id: "p",
+        };
+        let mut request = CasRequest {
+            operation: "update",
+            key,
+            attempts: Vec::new(),
+            reruns: 0,
+            stats: Arc::new(CasCounters::default()),
+        };
+        let server_error = server(ErrorType::Server);
+        assert!(matches!(
+            request.statement_error(&server_error, "intent row"),
+            StorageError::Backend(BackendError::Internal { .. })
+        ));
+        let internal = || {
+            Err::<(), _>(StorageError::Backend(map_driver_error(
+                &server_error,
+                "pre-read",
+            )))
+        };
+        assert!(matches!(
+            request.after_unknown(internal(), "pre-read"),
+            Err(StorageError::Backend(BackendError::Internal { .. }))
+        ));
+
+        let mut attempt = Attempt {
+            write_id: Uuid::new_v4(),
+            last_updated: Utc::now(),
+            intent: IntentKey::new("t", "p", Utc::now()),
+            plan: Arc::new(CasPlan::create(
+                Json::Null,
+                "{}".to_string(),
+                FhirVersion::default_enabled(),
+                vec![IndexKey::ResourcesByType],
+            )),
+            unknown: None,
+            settled: false,
+        };
+        attempt.unknown = Some(true);
+        request.attempts.push(attempt);
+        for error in [server(ErrorType::Server), server(ErrorType::Invalid)] {
+            assert!(
+                matches!(
+                    request.statement_error(&error, "intent row"),
+                    StorageError::Backend(BackendError::Unavailable { .. })
+                ),
+                "{error:?}"
+            );
+        }
+        assert!(matches!(
+            request.statement_error(&server(write_timeout(WriteType::Simple)), "intent row"),
+            StorageError::Backend(BackendError::Timeout { .. })
+        ));
+        assert!(matches!(
+            request.after_unknown(internal(), "pre-read"),
+            Err(StorageError::Backend(BackendError::Unavailable { .. }))
+        ));
+        let denied = Err::<(), _>(StorageError::Tenant(
+            crate::error::TenantError::OperationNotPermitted {
+                tenant_id: crate::tenant::TenantId::new("t"),
+                operation: "delete".to_string(),
+            },
+        ));
+        assert!(matches!(
+            request.after_unknown(denied, "pre-read"),
+            Err(StorageError::Tenant(_))
         ));
     }
 
@@ -3921,5 +4060,168 @@ mod node_tests {
         let row = current(&backend, &tenant).await;
         assert!(row.is_deleted() && row.version_id == 2, "(d) row {row:?}");
         assert!(not_found_unit(&d), "(d) after an unknown outcome: {d:?}");
+    }
+
+    /// After an unknown outcome, the write may be stored: an error of any
+    /// later statement must answer 503 or 504, never 500 (ADR-aacruzgon-0067).
+    fn is_503_or_504<T: std::fmt::Debug>(result: &StorageResult<T>) -> bool {
+        matches!(
+            result,
+            Err(StorageError::Backend(
+                BackendError::Unavailable { .. } | BackendError::Timeout { .. }
+            ))
+        )
+    }
+
+    /// Attempt 1's C1 is reported as timed out and applies late, after R2
+    /// said "no row"; the re-run's I1 then fails with a node-side `Server`
+    /// error. The resource is stored, by attempt 1, so the request answers
+    /// 503, not the plain table's 500.
+    #[tokio::test]
+    async fn a_reruns_intent_error_after_an_unknown_outcome_is_503() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = hardening_tenant("rerun-i1");
+        let intent = "INSERT INTO pending_index_writes";
+        backend
+            .session
+            .inject_fault(StatementKind::Write, intent, Fault::PassThrough);
+        backend
+            .session
+            .inject_fault(StatementKind::Write, intent, Fault::FailWithServerError);
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "INSERT INTO resources",
+            Fault::ApplyLate {
+                before: StatementKind::Write,
+            },
+        );
+        let before = backend.cas_stats();
+        let result = backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                FhirVersion::default_enabled(),
+            )
+            .await;
+        let stats = backend.cas_stats().since(&before);
+        let row = backend
+            .read_resource_row(tenant.tenant_id().as_str(), "Patient", "p")
+            .await
+            .unwrap();
+        eprintln!("[e2 case=rerun-i1 result={result:?} stats={stats}]");
+        assert_eq!(stats.reruns, 1, "{stats}");
+        assert_eq!(row.map(|r| r.version_id), Some(1), "attempt 1 stored it");
+        assert!(is_503_or_504(&result), "{result:?}");
+    }
+
+    /// An update's C2 times out without applying, R2 shows the row
+    /// unchanged, and the re-run's V3 fails with a `Server` error. Attempt 1
+    /// may still apply (it did not here), so the request answers 503.
+    #[tokio::test]
+    async fn a_reruns_previous_version_row_error_after_an_unknown_outcome_is_503() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = hardening_tenant("rerun-v3");
+        let stored = backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .unwrap();
+        let v3 = "INSERT INTO resource_versions";
+        backend
+            .session
+            .inject_fault(StatementKind::Write, v3, Fault::PassThrough);
+        backend
+            .session
+            .inject_fault(StatementKind::Write, v3, Fault::FailWithServerError);
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "SET version_id = ?, data = ?",
+            Fault::TimeOutWithoutApplying,
+        );
+        let before = backend.cas_stats();
+        let result = backend.update(&tenant, &stored, patient()).await;
+        let stats = backend.cas_stats().since(&before);
+        eprintln!("[e2 case=rerun-v3 result={result:?} stats={stats}]");
+        assert_eq!(stats.reruns, 1, "{stats}");
+        assert_eq!(current(&backend, &tenant).await.version_id, 1);
+        assert!(is_503_or_504(&result), "{result:?}");
+    }
+
+    /// A plain delete's C3 times out without applying, and R2 shows another
+    /// request's update in the gap, so the delete takes its retry; that
+    /// turn's R1 fails with a `Server` error. The first attempt's outcome was
+    /// unknown, so the request answers 503.
+    #[tokio::test]
+    async fn a_later_turns_pre_read_error_after_an_unknown_outcome_is_503() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = hardening_tenant("later-r1");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .unwrap();
+        // Another request's C2 of v1, held back until just before our R2.
+        let row = current(&backend, &tenant).await;
+        let (body, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let plan = CasPlan::update(
+            PreviousVersion::from_row(&row).unwrap(),
+            body,
+            data,
+            vec![IndexKey::ResourcesByType],
+        );
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "SET version_id = ?, data = ?",
+            Fault::ApplyLate {
+                before: StatementKind::SerialRead,
+            },
+        );
+        let lu = next_last_updated(Utc::now(), Some(row.last_updated));
+        let held = backend
+            .session
+            .rows(
+                plan.kind.cql(),
+                plan.cas_values(&key_of(&tenant), Uuid::new_v4(), lu),
+                StatementKind::Cas,
+            )
+            .await;
+        assert!(held.is_err(), "the other request's update is held back");
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "deleted_at = ?, last_updated",
+            Fault::TimeOutWithoutApplying,
+        );
+        let r1 = "SELECT version_id, data, last_updated";
+        backend
+            .session
+            .inject_fault(StatementKind::Read, r1, Fault::PassThrough);
+        backend
+            .session
+            .inject_fault(StatementKind::Read, r1, Fault::FailWithServerError);
+        let before = backend.cas_stats();
+        let result = backend.delete(&tenant, "Patient", "p").await;
+        let stats = backend.cas_stats().since(&before);
+        eprintln!("[e2 case=later-r1 result={result:?} stats={stats}]");
+        assert_eq!(stats.miss_retries, 1, "the delete took its retry: {stats}");
+        assert_eq!(current(&backend, &tenant).await.version_id, 2);
+        assert!(is_503_or_504(&result), "{result:?}");
     }
 }

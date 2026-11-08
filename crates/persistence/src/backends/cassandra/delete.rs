@@ -211,8 +211,9 @@ impl CassandraBackend {
         let mut request = self.cas_request(expect.operation(), key);
         let mut retries_left = expect.miss_retries();
         loop {
-            // Step 0.
-            let row = pre_read().await?;
+            // Step 0. After an unknown outcome, R1's error answers as R2's
+            // does (ADR-aacruzgon-0067).
+            let row = request.after_unknown(pre_read().await, "pre-read")?;
             if let Some(applied) = self
                 .check_earlier_attempts(&mut request, row.as_ref())
                 .await?

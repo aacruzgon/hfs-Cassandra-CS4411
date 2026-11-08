@@ -85,8 +85,8 @@ reviews:
   # (https://docs.coderabbit.ai/management/plans#rate-limits). This one
   # has 2, yet CodeRabbit reviewed PR #61 three times on 2026-11-08 with no
   # request (reviews on ff8a6e974, cf97f766d and 86a9a2605), and tried on
-  # PRs #58 and #63 until the rate limit stopped it. So these settings
-  # apply now.
+  # PR #58, also unasked, until the rate limit stopped it. So these
+  # settings apply now.
   auto_review:
     enabled: true
     # Drafts are reviewed only once they leave draft (fork rule: open a PR as

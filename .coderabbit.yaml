@@ -301,6 +301,29 @@ reviews:
           These files also build in the R4B-only CI check (the instruction
           below).
 
+    # ---- The Cassandra tests through hfs -----------------------------------
+    - path: "crates/hfs/tests/cassandra_milestone_a.rs"
+      instructions: |
+        The Cassandra tests that run the real hfs binary: the Milestone A
+        round trip, Step 3 through REST, the readiness, boot-time and
+        latency tests. The Cassandra test rules apply (ADR-aacruzgon-0020,
+        0029, 0038):
+        - Each run writes under its own fresh tenant (HFS_DEFAULT_TENANT,
+          prefix "test-": CI report R4 reads only those). Flag a fixed
+          tenant, a DROP or TRUNCATE, or an assumption that the node is
+          empty: tests share one node.
+        - On the HFS_TEST_CASSANDRA_URL node, whose schema is already
+          applied, a test never runs DDL. Only a container of the test's
+          own gets the schema from the harness (ADR-aacruzgon-0027, P6).
+        - The readiness test stops its node, so it never stops the
+          HFS_TEST_CASSANDRA_URL node unless
+          HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER names that node's
+          container, and never the shared docker/cassandra node
+          (hfs-cassandra-cassandra-1).
+        This file builds with R4 (the Cassandra job's --features
+        R4,cassandra) and not in the R4B-only check, so the R4B rules below
+        do not apply to it.
+
     # ---- What the R4B-only check builds ------------------------------------
     # r4b-compile-check.yml runs cargo check -p helios-persistence
     # --no-default-features --features cassandra,R4B twice: for the library,

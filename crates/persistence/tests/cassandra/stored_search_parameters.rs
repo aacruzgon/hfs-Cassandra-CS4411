@@ -8,7 +8,6 @@
 
 use std::collections::HashSet;
 
-use helios_fhir::FhirVersion;
 use helios_persistence::backends::cassandra::CassandraBackend;
 use helios_persistence::core::patient_compartment::PatientCompartmentMatcher;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
@@ -46,7 +45,7 @@ fn has_url(backend: &CassandraBackend, tenant: &TenantContext, url: &str) -> boo
 /// tenant; returns the tenant and the active one's url.
 async fn store_three(writer: &CassandraBackend, label: &str) -> (TenantContext, String) {
     let tenant = unique_tenant(label);
-    let version = FhirVersion::default_enabled();
+    let version = crate::cassandra_node::test_fhir_version();
     let url = format!(
         "http://example.org/SearchParameter/{}",
         tenant.tenant_id().as_str()
@@ -160,7 +159,7 @@ async fn cassandra_refresh_picks_up_another_process_write() {
             &tenant,
             "SearchParameter",
             search_parameter("activesp", &url, "active"),
-            FhirVersion::default_enabled(),
+            crate::cassandra_node::test_fhir_version(),
         )
         .await
         .expect("create");
@@ -185,7 +184,7 @@ async fn cassandra_refresh_picks_up_another_process_write() {
 #[tokio::test]
 async fn cassandra_a_stored_compartment_parameter_applies_after_a_restart() {
     let node = node_or_skip!("cassandra_a_stored_compartment_parameter_applies_after_a_restart");
-    let version = FhirVersion::default_enabled();
+    let version = crate::cassandra_node::test_fhir_version();
     let writer = backend(node).await;
     let tenant = unique_tenant("stored-sp-compartment");
     // Shadows the spec's Observation `subject` (a Patient-compartment
@@ -269,7 +268,7 @@ async fn cassandra_the_newest_of_two_same_url_search_parameters_wins() {
                 &tenant,
                 "SearchParameter",
                 resource,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap_or_else(|e| panic!("create {id}: {e}"));

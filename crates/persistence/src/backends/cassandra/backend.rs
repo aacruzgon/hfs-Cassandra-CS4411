@@ -1207,13 +1207,7 @@ mod tests {
     #[test]
     fn base_registry_loads_for_the_configured_version() {
         let registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
-        let config = CassandraConfig {
-            data_dir: Some(PathBuf::from(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../data"
-            ))),
-            ..Default::default()
-        };
+        let config = crate::backends::cassandra::test_support::test_config();
         initialize_search_registry(&registry, &config);
         let reg = registry.read();
         assert!(!reg.get_active_params("Patient").is_empty());
@@ -1326,8 +1320,7 @@ mod restart_tests {
             contact_points: vec![url.clone()],
             connect_timeout_ms: 2_000,
             request_timeout_ms: 3_000,
-            data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
-            ..CassandraConfig::default()
+            ..crate::backends::cassandra::test_support::test_config()
         })
         .await
         .unwrap_or_else(|e| panic!("connect to {url}: {e}"));
@@ -1407,9 +1400,11 @@ mod reload_rules {
             "type": "token",
             "expression": "Patient.gender"
         });
-        let definition = SearchParameterLoader::new(helios_fhir::FhirVersion::default_enabled())
-            .parse_resource(&resource)
-            .expect("parse");
+        let definition = SearchParameterLoader::new(
+            crate::backends::cassandra::test_support::test_fhir_version(),
+        )
+        .parse_resource(&resource)
+        .expect("parse");
         StoredDefinition {
             definition,
             precedence: (
@@ -1660,8 +1655,7 @@ mod node_tests {
         Some(
             CassandraBackend::connect(CassandraConfig {
                 contact_points: vec![url],
-                data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
-                ..CassandraConfig::default()
+                ..crate::backends::cassandra::test_support::test_config()
             })
             .await
             .expect("connect"),
@@ -1690,7 +1684,7 @@ mod node_tests {
         let page_size = 7;
         // 16 partitions of its own (4 tenants by 4 types, one resource each),
         // so even an empty node gives more than two pages of 7.
-        let version = helios_fhir::FhirVersion::default_enabled();
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
         let types = ["Patient", "Observation", "Encounter", "Condition"];
         let run = uuid::Uuid::new_v4().simple().to_string();
         let tenants: Vec<crate::tenant::TenantContext> = (0..4)

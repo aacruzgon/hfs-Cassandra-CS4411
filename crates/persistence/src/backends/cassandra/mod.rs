@@ -83,6 +83,8 @@ mod session;
 mod stats;
 mod storage;
 mod stubs;
+#[cfg(test)]
+mod test_support;
 mod update;
 mod upsert;
 mod versions;

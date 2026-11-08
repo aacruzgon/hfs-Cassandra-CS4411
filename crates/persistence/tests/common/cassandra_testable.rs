@@ -217,7 +217,7 @@ impl TestableBackend for CassandraTestBackend {
     /// error unchanged, so a caller can still match `AlreadyExists`.
     async fn seed(&self, fixtures: &TestFixtures) -> StorageResult<()> {
         let tenant = self.tenant();
-        let fhir_version = FhirVersion::default_enabled();
+        let fhir_version = crate::cassandra_node::test_fhir_version();
         for (resource_type, id, resource) in fixtures.all_resources() {
             let stored = self
                 .inner

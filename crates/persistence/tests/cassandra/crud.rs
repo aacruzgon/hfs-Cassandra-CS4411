@@ -24,10 +24,13 @@
 //!   ADR-aacruzgon-0038);
 //! - **the two tests upstream ignores for #306** run: SQLite has no
 //!   `created_at` column, Cassandra does (`docs/Cassandra/schema/schema.cql`);
-//! - **`FhirVersion::default_enabled()`** in place of upstream's
-//!   `FhirVersion::default()`, which exists only with the `R4` feature, so the
-//!   copy also compiles in the R4B-only check (`r4b-compile-check.yml`). With
-//!   `R4` on, both return R4, so the tests run as upstream's do.
+//! - **[`test_fhir_version`](crate::cassandra_node::test_fhir_version)** in
+//!   place of upstream's `FhirVersion::default()`, which exists only with the
+//!   `R4` feature, so the copy also compiles in the R4B-only check
+//!   (`r4b-compile-check.yml`) and runs under the version
+//!   `HFS_TEST_FHIR_VERSION` names (ADR-aacruzgon-0065). Unset, it is
+//!   `FhirVersion::default_enabled()`, which is R4 when `R4` is on, so the
+//!   tests run as upstream's do.
 //!
 //! Where an upstream assertion accepts two answers, the copy keeps it as it
 //! is, for parity, and [`strict`] adds a `cassandra_strict_*` test that pins
@@ -68,7 +71,6 @@ pub mod create_tests {
 
     use serde_json::json;
 
-    use helios_fhir::FhirVersion;
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::error::StorageError;
     use helios_persistence::tenant::{TenantContext, TenantPermissions};
@@ -107,7 +109,12 @@ pub mod create_tests {
         let patient = create_patient_json(None);
 
         let result = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await;
 
         assert!(result.is_ok(), "Create should succeed");
@@ -126,7 +133,12 @@ pub mod create_tests {
         let patient = create_patient_json(None);
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .expect("Create should succeed");
 
@@ -161,7 +173,12 @@ pub mod create_tests {
         let patient = create_patient_json(None);
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .expect("Create should succeed");
 
@@ -177,7 +194,12 @@ pub mod create_tests {
         // Create a Patient
         let patient = create_patient_json(None);
         let patient_stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         assert_eq!(patient_stored.resource_type(), "Patient");
@@ -195,7 +217,7 @@ pub mod create_tests {
                 &tenant,
                 "Observation",
                 observation,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -211,7 +233,7 @@ pub mod create_tests {
                 &tenant,
                 "Organization",
                 organization,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -230,7 +252,12 @@ pub mod create_tests {
         let patient = create_patient_json(None);
 
         let result = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await;
 
         assert!(result.is_err(), "Create without permission should fail");
@@ -258,7 +285,7 @@ pub mod create_tests {
                 "Patient",
                 "new-patient-123",
                 patient,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .expect("create_or_update should succeed");
@@ -282,7 +309,7 @@ pub mod create_tests {
                 "Patient",
                 "patient-456",
                 patient1,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -299,7 +326,7 @@ pub mod create_tests {
                 "Patient",
                 "patient-456",
                 patient2,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -329,7 +356,7 @@ pub mod create_tests {
                 "Patient",
                 "patient-789",
                 patient1,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -346,7 +373,7 @@ pub mod create_tests {
                 "Patient",
                 "patient-789",
                 patient2,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -379,7 +406,12 @@ pub mod create_tests {
                 "name": [{"family": format!("Patient{}", i)}]
             });
             let stored = backend
-                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+                .create(
+                    &tenant,
+                    "Patient",
+                    patient,
+                    crate::cassandra_node::test_fhir_version(),
+                )
                 .await
                 .unwrap();
             ids.push(stored.id().to_string());
@@ -412,12 +444,17 @@ pub mod create_tests {
                 &tenant1,
                 "Patient",
                 patient.clone(),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
         let stored2 = backend
-            .create(&tenant2, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant2,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -465,7 +502,12 @@ pub mod create_tests {
         });
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let content = stored.content();
@@ -523,7 +565,7 @@ pub mod create_tests {
                 &tenant,
                 "Observation",
                 observation,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -551,7 +593,12 @@ pub mod create_tests {
         });
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let content = stored.content();
@@ -573,7 +620,12 @@ pub mod create_tests {
         });
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let content = stored.content();
@@ -600,7 +652,12 @@ pub mod create_tests {
         });
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let content = stored.content();
@@ -631,7 +688,12 @@ pub mod create_tests {
         });
 
         let stored = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let content = stored.content();
@@ -648,7 +710,6 @@ pub mod read_tests {
 
     use serde_json::json;
 
-    use helios_fhir::FhirVersion;
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::error::{ResourceError, StorageError};
     use helios_persistence::tenant::{TenantContext, TenantPermissions};
@@ -684,7 +745,12 @@ pub mod read_tests {
         // Create a resource first
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -713,7 +779,12 @@ pub mod read_tests {
             "birthDate": "1980-01-15"
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -753,7 +824,12 @@ pub mod read_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -790,7 +866,12 @@ pub mod read_tests {
         // Create resource in tenant1
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant1,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -825,7 +906,7 @@ pub mod read_tests {
                 &system,
                 "ValueSet",
                 value_set,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -852,7 +933,12 @@ pub mod read_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -897,7 +983,12 @@ pub mod read_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant1,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -928,7 +1019,12 @@ pub mod read_tests {
         for i in 0..5 {
             let patient = create_patient_json(&format!("Patient{}", i));
             let created = backend
-                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+                .create(
+                    &tenant,
+                    "Patient",
+                    patient,
+                    crate::cassandra_node::test_fhir_version(),
+                )
                 .await
                 .unwrap();
             ids.push(created.id().to_string());
@@ -953,12 +1049,22 @@ pub mod read_tests {
         // Create 2 resources
         let patient1 = create_patient_json("Smith");
         let created1 = backend
-            .create(&tenant, "Patient", patient1, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient1,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let patient2 = create_patient_json("Jones");
         let created2 = backend
-            .create(&tenant, "Patient", patient2, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient2,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -986,7 +1092,7 @@ pub mod read_tests {
                 &tenant,
                 "Patient",
                 create_patient_json("Live"),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -995,7 +1101,7 @@ pub mod read_tests {
                 &tenant,
                 "Patient",
                 create_patient_json("Doomed"),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -1049,7 +1155,12 @@ pub mod read_tests {
         // Create resources in tenant1
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant1,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1079,7 +1190,12 @@ pub mod read_tests {
         for i in 0..3 {
             let patient = create_patient_json(&format!("Patient{}", i));
             backend
-                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+                .create(
+                    &tenant,
+                    "Patient",
+                    patient,
+                    crate::cassandra_node::test_fhir_version(),
+                )
                 .await
                 .unwrap();
         }
@@ -1092,7 +1208,12 @@ pub mod read_tests {
                 "code": {"coding": [{"code": format!("code-{}", i)}]}
             });
             backend
-                .create(&tenant, "Observation", obs, FhirVersion::default_enabled())
+                .create(
+                    &tenant,
+                    "Observation",
+                    obs,
+                    crate::cassandra_node::test_fhir_version(),
+                )
                 .await
                 .unwrap();
         }
@@ -1114,7 +1235,12 @@ pub mod read_tests {
         for i in 0..3 {
             let patient = create_patient_json(&format!("Patient{}", i));
             backend
-                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+                .create(
+                    &tenant,
+                    "Patient",
+                    patient,
+                    crate::cassandra_node::test_fhir_version(),
+                )
                 .await
                 .unwrap();
         }
@@ -1125,7 +1251,12 @@ pub mod read_tests {
                 "code": {"coding": [{"code": format!("code-{}", i)}]}
             });
             backend
-                .create(&tenant, "Observation", obs, FhirVersion::default_enabled())
+                .create(
+                    &tenant,
+                    "Observation",
+                    obs,
+                    crate::cassandra_node::test_fhir_version(),
+                )
                 .await
                 .unwrap();
         }
@@ -1162,7 +1293,12 @@ pub mod read_tests {
         for i in 0..5 {
             let patient = create_patient_json(&format!("Patient{}", i));
             backend
-                .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
+                .create(
+                    &tenant1,
+                    "Patient",
+                    patient,
+                    crate::cassandra_node::test_fhir_version(),
+                )
                 .await
                 .unwrap();
         }
@@ -1171,7 +1307,12 @@ pub mod read_tests {
         for i in 0..3 {
             let patient = create_patient_json(&format!("Patient{}", i));
             backend
-                .create(&tenant2, "Patient", patient, FhirVersion::default_enabled())
+                .create(
+                    &tenant2,
+                    "Patient",
+                    patient,
+                    crate::cassandra_node::test_fhir_version(),
+                )
                 .await
                 .unwrap();
         }
@@ -1196,7 +1337,12 @@ pub mod read_tests {
         // Create resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1233,7 +1379,12 @@ pub mod read_tests {
         // Create resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1264,7 +1415,12 @@ pub mod read_tests {
         // Create resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1294,7 +1450,12 @@ pub mod read_tests {
         for i in 0..3 {
             let patient = create_patient_json(&format!("Patient{}", i));
             let created = backend
-                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+                .create(
+                    &tenant,
+                    "Patient",
+                    patient,
+                    crate::cassandra_node::test_fhir_version(),
+                )
                 .await
                 .unwrap();
             ids.push(created.id().to_string());
@@ -1331,7 +1492,7 @@ pub mod read_tests {
                 &full_access,
                 "Patient",
                 patient,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -1357,7 +1518,6 @@ pub mod update_tests {
 
     use serde_json::json;
 
-    use helios_fhir::FhirVersion;
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::error::{ConcurrencyError, ResourceError, StorageError};
     use helios_persistence::tenant::{TenantContext, TenantPermissions};
@@ -1393,7 +1553,12 @@ pub mod update_tests {
         // Create a resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1419,7 +1584,12 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let v1 = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         assert_eq!(v1.version_id(), "1");
@@ -1453,7 +1623,12 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let created_time = created.last_modified();
@@ -1485,7 +1660,12 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1522,7 +1702,12 @@ pub mod update_tests {
             "gender": "male"
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1552,7 +1737,12 @@ pub mod update_tests {
             "name": [{"family": "Smith"}]
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1584,7 +1774,12 @@ pub mod update_tests {
             "gender": "male"
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1632,7 +1827,7 @@ pub mod update_tests {
                 &tenant,
                 "Observation",
                 observation,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -1666,7 +1861,7 @@ pub mod update_tests {
             "nonexistent-id",
             tenant.tenant_id().clone(),
             json!({"resourceType": "Patient"}),
-            FhirVersion::default_enabled(),
+            crate::cassandra_node::test_fhir_version(),
         );
 
         let result = backend
@@ -1696,7 +1891,7 @@ pub mod update_tests {
                 &full_access,
                 "Patient",
                 patient,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -1723,7 +1918,12 @@ pub mod update_tests {
         // Create and delete a resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         backend
@@ -1763,7 +1963,12 @@ pub mod update_tests {
         // Create in tenant1
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant1,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1788,7 +1993,12 @@ pub mod update_tests {
         // Create a resource
         let patient = create_patient_json("Smith");
         let v1 = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1826,7 +2036,12 @@ pub mod update_tests {
 
         let patient = create_patient_json("Name0");
         let mut current = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1859,7 +2074,12 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1885,7 +2105,12 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1910,7 +2135,12 @@ pub mod update_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1945,7 +2175,6 @@ pub mod delete_tests {
 
     use serde_json::json;
 
-    use helios_fhir::FhirVersion;
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::error::{ResourceError, StorageError};
     use helios_persistence::tenant::{TenantContext, TenantPermissions};
@@ -1981,7 +2210,12 @@ pub mod delete_tests {
         // Create a resource
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -1999,7 +2233,12 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -2023,7 +2262,12 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -2045,7 +2289,12 @@ pub mod delete_tests {
         for i in 0..3 {
             let patient = create_patient_json(&format!("Patient{}", i));
             let created = backend
-                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+                .create(
+                    &tenant,
+                    "Patient",
+                    patient,
+                    crate::cassandra_node::test_fhir_version(),
+                )
                 .await
                 .unwrap();
             ids.push(created.id().to_string());
@@ -2090,7 +2339,12 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -2125,7 +2379,7 @@ pub mod delete_tests {
                 &full_access,
                 "Patient",
                 patient,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -2156,7 +2410,12 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant1,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2196,7 +2455,7 @@ pub mod delete_tests {
                 "Patient",
                 "shared-id",
                 patient.clone(),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -2206,7 +2465,7 @@ pub mod delete_tests {
                 "Patient",
                 "shared-id",
                 patient,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -2247,7 +2506,12 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -2269,7 +2533,7 @@ pub mod delete_tests {
                 "Patient",
                 &id,
                 patient2,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -2302,7 +2566,12 @@ pub mod delete_tests {
         for i in 0..5 {
             let patient = create_patient_json(&format!("Patient{}", i));
             let created = backend
-                .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+                .create(
+                    &tenant,
+                    "Patient",
+                    patient,
+                    crate::cassandra_node::test_fhir_version(),
+                )
                 .await
                 .unwrap();
             ids.push(created.id().to_string());
@@ -2330,7 +2599,12 @@ pub mod delete_tests {
         // Create various resources
         let patient = create_patient_json("Smith");
         let patient_created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2344,7 +2618,7 @@ pub mod delete_tests {
                 &tenant,
                 "Observation",
                 observation,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -2384,7 +2658,12 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2423,7 +2702,12 @@ pub mod delete_tests {
 
         let patient = create_patient_json("Smith");
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -2444,7 +2728,6 @@ pub mod conditional_tests {
 
     use serde_json::json;
 
-    use helios_fhir::FhirVersion;
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::tenant::TenantContext;
 
@@ -2501,7 +2784,12 @@ pub mod conditional_tests {
         // For now, we test basic create since conditional_create needs SearchProvider
         let patient = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN001")));
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2520,7 +2808,12 @@ pub mod conditional_tests {
         // Create initial resource
         let patient = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN002")));
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2552,11 +2845,21 @@ pub mod conditional_tests {
         let patient2 = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN004")));
 
         backend
-            .create(&tenant, "Patient", patient1, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient1,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         backend
-            .create(&tenant, "Patient", patient2, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient2,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2585,7 +2888,12 @@ pub mod conditional_tests {
         // Create a resource
         let patient = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN005")));
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2622,7 +2930,7 @@ pub mod conditional_tests {
                 "Patient",
                 "new-patient-id",
                 patient,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -2649,7 +2957,12 @@ pub mod conditional_tests {
         // Create a resource
         let patient = create_patient_json("ToDelete", Some(("http://example.org/mrn", "MRN007")));
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -2696,11 +3009,21 @@ pub mod conditional_tests {
             create_patient_json("DeleteTest", Some(("http://example.org/mrn", "MRN009")));
 
         let created1 = backend
-            .create(&tenant, "Patient", patient1, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient1,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let created2 = backend
-            .create(&tenant, "Patient", patient2, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient2,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2734,7 +3057,12 @@ pub mod conditional_tests {
 
         let patient = create_patient_json("Smith", None);
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2756,7 +3084,12 @@ pub mod conditional_tests {
 
         let patient = create_patient_json("Smith", None);
         let v1 = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2795,7 +3128,7 @@ pub mod conditional_tests {
                 "Patient",
                 "unique-id-123",
                 patient,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -2818,7 +3151,7 @@ pub mod conditional_tests {
                 "Patient",
                 "existing-id",
                 patient1,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -2833,7 +3166,7 @@ pub mod conditional_tests {
                 "Patient",
                 "existing-id",
                 patient2,
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -2866,7 +3199,12 @@ pub mod conditional_tests {
         let patient =
             create_patient_json("PatchTest", Some(("http://example.org/mrn", "PATCH-001")));
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2931,11 +3269,21 @@ pub mod conditional_tests {
             create_patient_json("DuplicateName", Some(("http://example.org/mrn", "DUP-002")));
 
         backend
-            .create(&tenant, "Patient", patient1, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient1,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         backend
-            .create(&tenant, "Patient", patient2, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient2,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -2965,7 +3313,12 @@ pub mod conditional_tests {
             "active": true
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -3013,7 +3366,12 @@ pub mod conditional_tests {
             "birthDate": "1990-01-15"
         });
         let created = backend
-            .create(&tenant, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
 
@@ -3060,7 +3418,12 @@ pub mod conditional_tests {
         let patient =
             create_patient_json("TenantPatch", Some(("http://example.org/mrn", "T1-001")));
         let created = backend
-            .create(&tenant1, "Patient", patient, FhirVersion::default_enabled())
+            .create(
+                &tenant1,
+                "Patient",
+                patient,
+                crate::cassandra_node::test_fhir_version(),
+            )
             .await
             .unwrap();
         let id = created.id().to_string();
@@ -3087,7 +3450,6 @@ pub mod conditional_tests {
 /// Cassandra's one answer where an upstream assertion accepts two (the Step 3
 /// matrix's T-4, T-9 and T-14). Each is on [`parity`]'s list of additions.
 pub mod strict {
-    use helios_fhir::FhirVersion;
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::error::{ResourceError, StorageError};
     use serde_json::json;
@@ -3113,7 +3475,7 @@ pub mod strict {
                 &tenant,
                 "Patient",
                 patient("Smith"),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -3187,7 +3549,7 @@ pub mod strict {
                 &tenant,
                 "Patient",
                 patient("Twice"),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -3213,7 +3575,7 @@ pub mod strict {
                 "Patient",
                 created.id(),
                 json!({"resourceType": "Patient", "id": created.id()}),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -3240,7 +3602,7 @@ pub mod strict {
                 "Patient",
                 &id,
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "One"}]}),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -3263,7 +3625,7 @@ pub mod strict {
                 "Patient",
                 &id,
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "Back"}]}),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -3301,7 +3663,7 @@ pub mod strict {
                 &tenant,
                 "Patient",
                 patient("Smith"),
-                FhirVersion::default_enabled(),
+                crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();

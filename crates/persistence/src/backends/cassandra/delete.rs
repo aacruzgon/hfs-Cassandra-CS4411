@@ -323,7 +323,6 @@ impl CassandraBackend {
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
-    use helios_fhir::FhirVersion;
 
     fn row(version_id: i32, deleted: bool) -> ResourceRow {
         let at = DateTime::<Utc>::from_timestamp_millis(1_791_972_000_123).unwrap();
@@ -333,7 +332,7 @@ mod tests {
             last_updated: at,
             created_at: Some(at),
             deleted_at: deleted.then_some(at),
-            fhir_version: FhirVersion::default_enabled(),
+            fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
             write_ts: Some(at.timestamp_millis() * 1000),
             write_id: None,
             index_keys: Some(super::super::index_keys::EMPTY.to_vec()),
@@ -442,7 +441,6 @@ mod node_tests {
     use cdrs_tokio::types::blob::Blob;
     use cdrs_tokio::types::value::Value;
     use chrono::{DateTime, Utc};
-    use helios_fhir::FhirVersion;
     use serde_json::Value as Json;
     use uuid::Uuid;
 
@@ -466,8 +464,7 @@ mod node_tests {
         Some(
             CassandraBackend::connect(CassandraConfig {
                 contact_points: vec![url],
-                data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
-                ..CassandraConfig::default()
+                ..crate::backends::cassandra::test_support::test_config()
             })
             .await
             .expect("connect"),
@@ -491,7 +488,7 @@ mod node_tests {
                 tenant,
                 "Patient",
                 patient(id),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .expect("create");
@@ -1453,7 +1450,7 @@ mod node_tests {
         let tenant = tenant_context("sp-overlay");
         let t = tenant.tenant_id().as_str();
         let url = format!("http://example.org/SearchParameter/{t}");
-        let version = FhirVersion::default_enabled();
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
         for (id, expression) in [("a", "Patient.gender"), ("b", "Patient.birthDate")] {
             backend
                 .create(
@@ -1535,7 +1532,7 @@ mod node_tests {
                 &tenant,
                 "SearchParameter",
                 search_parameter("s", &url, "Patient.gender"),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .expect("create");
@@ -1648,7 +1645,7 @@ mod node_tests {
                 &tenant,
                 "SearchParameter",
                 search_parameter("s", &url, "Patient.gender"),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .expect("create");

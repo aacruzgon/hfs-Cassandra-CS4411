@@ -1982,7 +1982,7 @@ mod tests {
             data: (!deleted).then(|| Arc::from(r#"{"resourceType":"Patient","id":"p"}"#)),
             last_updated: at("2026-11-06T10:00:00.123Z"),
             deleted_at: deleted.then(|| at("2026-11-06T10:00:00.123Z")),
-            fhir_version: FhirVersion::default_enabled(),
+            fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
             write_id: Some(Uuid::new_v4()),
             keys_blob: index_keys::encode(&keys),
             keys,
@@ -2013,7 +2013,7 @@ mod tests {
             CasPlan::create(
                 json.clone(),
                 data.clone(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
                 vec![IndexKey::ResourcesByType],
             ),
             CasPlan::update(
@@ -2359,7 +2359,7 @@ mod tests {
             CasPlan::create(
                 Json::Null,
                 "x".repeat(n),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
                 keys.clone(),
             )
         };
@@ -2610,7 +2610,7 @@ mod tests {
             plan: Arc::new(CasPlan::create(
                 Json::Null,
                 "{}".to_string(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
                 vec![IndexKey::ResourcesByType],
             )),
             unknown: None,
@@ -2958,8 +2958,7 @@ mod node_tests {
         Some(
             CassandraBackend::connect(CassandraConfig {
                 contact_points: vec![url],
-                data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
-                ..CassandraConfig::default()
+                ..crate::backends::cassandra::test_support::test_config()
             })
             .await
             .expect("connect"),
@@ -2975,7 +2974,7 @@ mod node_tests {
             plan: Arc::new(CasPlan::create(
                 Json::Null,
                 "{}".to_string(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
                 vec![IndexKey::ResourcesByType],
             )),
             unknown: Some(true),
@@ -2988,7 +2987,7 @@ mod node_tests {
         let plan = CasPlan::create(
             Json::Null,
             r#"{"resourceType":"Patient","id":"p"}"#.to_string(),
-            FhirVersion::default_enabled(),
+            crate::backends::cassandra::test_support::test_fhir_version(),
             vec![IndexKey::ResourcesByType],
         );
         let key = RowKey {
@@ -3042,7 +3041,10 @@ mod node_tests {
                     Value::from(1_i32),
                     Value::from("{}"),
                     Value::from(lu),
-                    Value::from(FhirVersion::default_enabled().as_mime_param()),
+                    Value::from(
+                        crate::backends::cassandra::test_support::test_fhir_version()
+                            .as_mime_param(),
+                    ),
                     Value::from(write_ts_of(lu)),
                     Value::from(writer),
                     Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
@@ -3200,7 +3202,7 @@ mod node_tests {
                 &tenant,
                 "Patient",
                 patient(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .expect("create");
@@ -3376,7 +3378,7 @@ mod node_tests {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
         };
-        let version = FhirVersion::default_enabled();
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
 
         // Applied, reply lost: R2 finds our write_id. One attempt.
         let tenant = tenant_context("lost-reply");
@@ -3483,7 +3485,7 @@ mod node_tests {
                 &tenant,
                 "Patient",
                 patient(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -3557,7 +3559,7 @@ mod node_tests {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
         };
-        let version = FhirVersion::default_enabled();
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
         let c1 = "INSERT INTO resources";
 
         // Three timeouts, each "unchanged": two re-runs, then 504.
@@ -3643,7 +3645,7 @@ mod node_tests {
                 &tenant,
                 "Patient",
                 patient(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .expect("success after an applied CAS");
@@ -3673,7 +3675,7 @@ mod node_tests {
                 &tenant,
                 "Patient",
                 patient(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -3772,7 +3774,7 @@ mod node_tests {
                 &tenant,
                 "Patient",
                 patient(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -3869,7 +3871,12 @@ mod node_tests {
         };
         let before = backend.statement_counts();
         match backend
-            .create(&tenant, "Patient", big(9), FhirVersion::default_enabled())
+            .create(
+                &tenant,
+                "Patient",
+                big(9),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
             .await
         {
             Err(StorageError::Validation(ValidationError::InvalidResource { .. })) => {}
@@ -3902,7 +3909,7 @@ mod node_tests {
             let plan = CasPlan::create(
                 Json::Null,
                 serde_json::to_string(&big(mib)).unwrap(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
                 vec![IndexKey::ResourcesByType],
             );
             let lu = now_millis();
@@ -3988,7 +3995,7 @@ mod node_tests {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
         };
-        let version = FhirVersion::default_enabled();
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
         let not_found = |r: &StorageResult<StoredResource>| {
             matches!(
                 r,
@@ -4106,7 +4113,7 @@ mod node_tests {
                 &tenant,
                 "Patient",
                 patient(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await;
         let stats = backend.cas_stats().since(&before);
@@ -4135,7 +4142,7 @@ mod node_tests {
                 &tenant,
                 "Patient",
                 patient(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -4176,7 +4183,7 @@ mod node_tests {
                 &tenant,
                 "Patient",
                 patient(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await
             .unwrap();
@@ -4257,7 +4264,7 @@ mod node_tests {
                 &tenant,
                 "Patient",
                 patient(),
-                FhirVersion::default_enabled(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
             )
             .await;
         let stats = backend.cas_stats().since(&before);

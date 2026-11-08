@@ -9,7 +9,6 @@
 //! ([`unique_tenant`]), so it can share the node with any other test
 //! (ADR-aacruzgon-0020, rule 2).
 
-use helios_fhir::FhirVersion;
 use helios_persistence::backends::cassandra::{CassandraBackend, CassandraConfig, TABLES};
 use helios_persistence::core::{
     Backend, BackendKind, BundleProvider, ConditionalInteraction, ConditionalStorage,
@@ -23,11 +22,14 @@ use crate::cassandra_node::{self, CassandraNode, URL_VAR, unique_tenant};
 
 /// The backend's configuration for the test node: its contact point, which
 /// has `HFS_TEST_CASSANDRA_URL`'s `host:port` form, and the repository's
-/// `data/` directory for the search-parameter registry.
+/// `data/` directory for the search-parameter registry, and the tests' FHIR
+/// version ([`crate::cassandra_node::test_fhir_version`]), so the registry and
+/// the stored-SearchParameter parser follow the version the tests write.
 pub(crate) fn config_for(node: &CassandraNode) -> CassandraConfig {
     CassandraConfig {
         contact_points: vec![node.contact_point().to_string()],
         data_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data").into()),
+        fhir_version: crate::cassandra_node::test_fhir_version(),
         ..CassandraConfig::default()
     }
 }
@@ -116,7 +118,7 @@ async fn cassandra_stubs_refuse_with_unsupported_capability() {
     let node = node_or_skip!("cassandra_stubs_refuse_with_unsupported_capability");
     let backend = backend(node).await;
     let tenant = unique_tenant("stubs");
-    let version = FhirVersion::default_enabled();
+    let version = crate::cassandra_node::test_fhir_version();
 
     // `create`, `read` and `count` are real from L3 on (`create_read.rs`).
     // `update` is real from Step 3's L2a: on an id that was never created it

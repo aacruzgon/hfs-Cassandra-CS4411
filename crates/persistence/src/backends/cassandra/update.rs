@@ -145,18 +145,23 @@ impl CassandraBackend {
             id,
         };
         let mut request = self.cas_request("update", key);
-        let applied = match self
-            .check_earlier_attempts(&mut request, Some(&row))
-            .await?
-        {
-            Some(applied) => applied,
-            None => match self.update_attempt(&mut request, &row, resource).await? {
-                CasOutcome::Applied(applied) => applied,
-                CasOutcome::Missed(miss) => {
-                    return Err(miss.into_error(resource_type, id, expected));
-                }
-            },
-        };
+        let outcome = async {
+            match self
+                .check_earlier_attempts(&mut request, Some(&row))
+                .await?
+            {
+                Some(applied) => Ok(applied),
+                None => match self.update_attempt(&mut request, &row, resource).await? {
+                    CasOutcome::Applied(applied) => Ok(applied),
+                    CasOutcome::Missed(miss) => Err(miss.into_error(resource_type, id, expected)),
+                },
+            }
+        }
+        .await;
+        // An undecided SearchParameter update: the overlay follows the row
+        // (ADR-aacruzgon-0068).
+        self.settle_overlay_after_unknown(&request, &outcome).await;
+        let applied = outcome?;
 
         let content = applied.plan.body().cloned().unwrap_or(Json::Null);
         if resource_type == "SearchParameter" {
@@ -195,7 +200,9 @@ impl CassandraBackend {
         resource: Json,
     ) -> StorageResult<CasOutcome> {
         let key = request.key();
-        let previous = PreviousVersion::from_row(row)?;
+        // R1's row, decoded: after an unknown outcome its error answers as
+        // R2's does (ADR-aacruzgon-0067).
+        let previous = request.after_unknown(PreviousVersion::from_row(row), "pre-read")?;
         let (body, data) = normalized_body("update", key.resource_type, key.id, resource)?;
         let plan = CasPlan::update(previous, body, data, vec![IndexKey::ResourcesByType]);
         self.run_cas(request, plan).await

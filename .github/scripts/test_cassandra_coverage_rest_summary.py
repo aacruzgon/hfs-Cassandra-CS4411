@@ -127,7 +127,8 @@ class Summary(Fixture):
     def test_instances_and_closures_count_as_one_function_with_summed_calls(self):
         all_path, _ = self.exports()
         loaded = rest.load(all_path, self.sources)
-        self.assertEqual(loaded["functions"][("handlers/batch.rs", "check_entry_if_match")], 9)
+        self.assertEqual(loaded["functions"][("handlers/batch.rs", 3)], 9)
+        self.assertEqual(rest.calls_named(loaded, "handlers/batch.rs", "check_entry_if_match"), 9)
         self.assertEqual(rest.totals(loaded)["functions"], {"covered": 3, "count": 3, "percent": 100.0})
 
     def test_totals_keep_llvm_cov_lines_and_regions_and_only_rest_files(self):
@@ -175,6 +176,93 @@ class Summary(Fixture):
         self.assertIn("| Batch entry `ifMatch` check | `handlers/batch.rs`: `check_entry_if_match` | 9 | 0 |", text)
         self.assertIn("Functions only step 3 reaches: **2**", text)
         self.assertIn("| `handlers/batch.rs` | 1 | 6 | 8 |", text)
+
+
+ERROR_RS = """\
+pub struct A; pub struct B; pub struct E;
+impl From<A> for E {
+    fn from(_: A) -> E {
+        E
+    }
+}
+impl From<B> for E {
+    fn from(_: B) -> E {
+        E
+    }
+}
+fn helper() {}
+static TABLE: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+    7
+});
+"""
+
+
+STATE_RS = """\
+impl State {
+    pub fn new<T>(t: T) -> Self
+    where
+        T: Into<u32>,
+    {
+        let n = t.into();
+        let s = Self { n };
+        s
+    }
+
+    pub fn get(&self) -> u32 { self.n }
+    fn declared(&self) -> u32;
+}
+static S: u32 = 1;
+"""
+
+
+class FnItems(Fixture):
+    """Functions are counted per `fn` item: two items with one name stay two,
+    and code outside every item (a static's closure) is no function."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "crates/rest/src/error.rs").write_text(ERROR_RS)
+
+    def error_export(self, from_a, from_b, helper, table):
+        fns = [function("_RNvXs_from_A", "error.rs", 4, from_a),
+               function("_RNvXs0_from_B", "error.rs", 9, from_b),
+               function("_RNvhelper", "error.rs", 12, helper),
+               function("_RNCNvTABLE0", "error.rs", 13, table)]
+        return export({"error.rs": summary((3, 6), (3, 6), (2, 4))}, fns)
+
+    def test_one_of_three_items_covered_is_one_third(self):
+        # from<A> ran, from<B> and helper never did; the static's closure ran.
+        path = self.write("error.json", self.error_export(5, 0, 0, 1))
+        self.assertEqual(rest.totals(rest.load(path, self.sources))["functions"],
+                         {"covered": 1, "count": 3, "percent": 33.33})
+
+    def test_an_item_spans_to_its_closing_brace(self):
+        self.assertEqual(self.sources.item("error.rs", 3), (3, "from"))
+        self.assertEqual(self.sources.item("error.rs", 5), (3, "from"))
+        self.assertEqual(self.sources.item("error.rs", 8), (8, "from"))
+        self.assertEqual(self.sources.item("error.rs", 12), (12, "helper"))
+        self.assertIsNone(self.sources.item("error.rs", 13))
+        self.assertIsNone(self.sources.item("error.rs", 6))
+        self.assertEqual(self.sources.item("handlers/batch.rs", 8), (8, "process_batch_entry"))
+
+    def test_a_struct_literal_inside_a_body_does_not_end_it(self):
+        (self.root / "crates/rest/src/state.rs").write_text(STATE_RS)
+        self.assertEqual(self.sources.item("state.rs", 7), (2, "new"))
+        self.assertEqual(self.sources.item("state.rs", 9), (2, "new"))
+        self.assertIsNone(self.sources.item("state.rs", 10))
+        self.assertEqual(self.sources.item("state.rs", 11), (11, "get"))
+        self.assertEqual(self.sources.item("state.rs", 12), (12, "declared"))
+        self.assertIsNone(self.sources.item("state.rs", 14))
+
+    def test_same_named_items_are_listed_apart(self):
+        all_path = self.write("all.json", self.error_export(5, 2, 0, 1))
+        without_path = self.write("without.json", self.error_export(0, 2, 0, 0))
+        report = rest.summarise(rest.load(all_path, self.sources), rest.load(without_path, self.sources))
+        self.assertEqual(report["only_step3"]["functions"],
+                         [{"file": "error.rs", "function": "from", "line": 3, "calls": 5}])
+        self.assertEqual(report["total"]["functions"]["count"], 3)
+        text = rest.markdown(report, {})
+        self.assertIn("Functions only step 3 reaches: **1**: `error.rs:3`: `from` (5).", text)
 
 
 if __name__ == "__main__":

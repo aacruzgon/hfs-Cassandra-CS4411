@@ -23,12 +23,17 @@ whose scope and figures it does not touch. It reports:
   they ran with and without step 3's profiles;
 - how many functions only step 3 reaches, and the first of them.
 
-A function is named by the `fn` item that encloses the first line of its
-code in the source: closures and async bodies fold into their function, and
-every instantiation of a generic one counts as one function, covered if any
-of them ran. Its count is the sum of theirs. llvm-cov's own function figures
-count each instantiation; the totals here keep llvm-cov's lines and regions
-and use the folded function count. Nothing here fails on a low figure: the
+A function is the `fn` item whose span holds the first line of its code in
+the source: closures and async bodies fold into their item, and every
+instantiation of a generic one counts as one function, covered if any of
+them ran. Its count is the sum of theirs. Two items of one name in one file
+(the `fn from` of each `From` impl) stay two functions. An item spans from
+its `fn` line to its closing `}` alone at the item's own indentation, as
+rustfmt writes it, or to the end of its line for a one-line body. Code
+outside every item, such as a static's initializer closure, counts in lines
+and regions but not as a function. llvm-cov's own function figures count
+each instantiation; the totals here keep llvm-cov's lines and regions and
+use the per-item function count. Nothing here fails on a low figure: the
 report has no threshold.
 """
 
@@ -64,31 +69,65 @@ def repo_path(filename):
     return None if at < 0 else filename[at + len(REST_DIR):]
 
 
+def item_end(lines, start):
+    """The last line (1-based) of the `fn` item starting at `start`.
+
+    A declaration without a body ends at its `;`; a one-line body at the line
+    its braces close on; any other body at its closing `}` alone at the
+    item's own indentation (rustfmt). Without one, the file's end."""
+    indent = lines[start - 1][: len(lines[start - 1]) - len(lines[start - 1].lstrip())]
+    opened = False
+    for number in range(start, len(lines) + 1):
+        text = lines[number - 1].rstrip()
+        if not opened:
+            if "{" in text:
+                opened = True
+                body = text[text.index("{"):]
+                if body.endswith("}") and body.count("{") == body.count("}"):
+                    return number
+            elif text.endswith(";"):
+                return number
+        elif text == indent + "}":
+            return number
+    return len(lines)
+
+
 class Sources:
-    """The `fn` items of each crates/rest/src file, read once, by line."""
+    """The `fn` items of each crates/rest/src file, read once: (start, end, name)."""
 
     def __init__(self, root):
         self.root, self.items = root, {}
 
-    def enclosing(self, rel, line):
-        """The name of the last `fn` item at or above `line` (1-based), or None."""
+    def spans(self, rel):
         if rel not in self.items:
             items = []
             try:
                 with open(os.path.join(self.root, REST_DIR, rel), encoding="utf-8") as fh:
-                    for number, text in enumerate(fh, 1):
-                        m = FN_ITEM.match(text)
-                        if m:
-                            items.append((number, m.group(1)))
+                    lines = fh.read().split("\n")
             except OSError:
-                pass
+                lines = []
+            for number, text in enumerate(lines, 1):
+                m = FN_ITEM.match(text)
+                if m:
+                    items.append((number, item_end(lines, number), m.group(1)))
             self.items[rel] = items
-        name = None
-        for number, item in self.items[rel]:
-            if number > line:
+        return self.items[rel]
+
+    def item(self, rel, line):
+        """(start line, name) of the innermost `fn` item whose span holds
+        `line` (1-based), or None when no item does."""
+        found = None
+        for start, end, name in self.spans(rel):
+            if start > line:
                 break
-            name = item
-        return name
+            if end >= line:
+                found = (start, name)
+        return found
+
+    def enclosing(self, rel, line):
+        """The name of the `fn` item that holds `line`, or None."""
+        found = self.item(rel, line)
+        return found and found[1]
 
 
 def first_code_line(fn):
@@ -100,21 +139,30 @@ def load(path, sources):
     """Per-file summaries and per-function counts of an export."""
     with open(path, encoding="utf-8") as fh:
         export = json.load(fh)
-    files, functions = {}, {}
+    files, functions, names = {}, {}, {}
     for data in export.get("data", []):
         for entry in data.get("files", []):
             rel = repo_path(entry.get("filename", ""))
             if rel is not None:
                 files[rel] = entry.get("summary", {})
         for fn in data.get("functions", []):
-            names = [repo_path(f) for f in fn.get("filenames", [])]
+            paths = [repo_path(f) for f in fn.get("filenames", [])]
             line = first_code_line(fn)
-            if not names or names[0] is None or line is None:
+            if not paths or paths[0] is None or line is None:
                 continue
-            name = sources.enclosing(names[0], line) or f"line {line}"
-            key = (names[0], name)
+            found = sources.item(paths[0], line)
+            if found is None:
+                continue
+            key = (paths[0], found[0])
+            names[key] = found[1]
             functions[key] = functions.get(key, 0) + fn.get("count", 0)
-    return {"files": files, "functions": functions}
+    return {"files": files, "functions": functions, "names": names}
+
+
+def calls_named(loaded, file, name):
+    """The summed count of the items called `name` in `file`, or None if none is in the export."""
+    counts = [c for k, c in loaded["functions"].items() if k[0] == file and loaded["names"][k] == name]
+    return sum(counts) if counts else None
 
 
 def pct(covered, total):
@@ -154,14 +202,15 @@ def summarise(with_all, without):
         report["files_step3_changes"] = changes
         only = sorted(k for k, c in with_all["functions"].items() if c > 0 and without["functions"].get(k, 0) == 0)
         report["only_step3"] = {"count": len(only), "functions": [
-            {"file": f, "function": n, "calls": with_all["functions"][(f, n)]} for f, n in only]}
+            {"file": f, "function": with_all["names"][(f, line)], "line": line,
+             "calls": with_all["functions"][(f, line)]} for f, line in only]}
     for label, file, name in WATCH:
-        key = (file, name)
-        present = key in with_all["functions"]
+        calls = calls_named(with_all, file, name)
+        present = calls is not None
         report["watch"].append({
             "label": label, "file": file, "function": name, "present": present,
-            "calls": with_all["functions"][key] if present else None,
-            "calls_without_step3": without["functions"].get(key, 0) if (present and without is not None) else None,
+            "calls": calls,
+            "calls_without_step3": (calls_named(without, file, name) or 0) if (present and without is not None) else None,
         })
     return report
 
@@ -182,7 +231,9 @@ def markdown(report, run):
          else "| Without step 3's profiles | not available: the step did not run, or that export failed | – | – |"),
         "",
         "A function is the `fn` item its code is in: closures, async bodies and generic instances fold into it, "
-        "and its count sums their entry counts (an async body counts once per poll).",
+        "and its count sums their entry counts (an async body counts once per poll). Two items of one name in one "
+        "file count as two; code outside every `fn` item, such as a static's initializer, counts in lines and "
+        "regions only.",
         "",
         "| REST path | Function | Count | Without step 3 |",
         "| --- | --- | --- | --- |",
@@ -206,7 +257,7 @@ def markdown(report, run):
         line = f"Functions only step 3 reaches: **{only['count']}**"
         if only["functions"]:
             listed = only["functions"][:LIST_LIMIT]
-            line += ": " + ", ".join(f"`{f['file']}`: `{f['function']}` ({f['calls']})" for f in listed)
+            line += ": " + ", ".join(f"`{f['file']}:{f['line']}`: `{f['function']}` ({f['calls']})" for f in listed)
             line += ", …" if only["count"] > LIST_LIMIT else ""
         out += [line + ".", ""]
     return "\n".join(out)

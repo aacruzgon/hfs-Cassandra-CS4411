@@ -118,7 +118,7 @@ To list what is owed: `SELECT * FROM secondary_sync_failures ORDER BY last_faile
 | PostgreSQL plus Elasticsearch | `postgres-elasticsearch` or `pg-es` |
 | S3 | `s3` |
 | S3 plus Elasticsearch | `s3-elasticsearch` or `s3-es` |
-| Cassandra (in development: create and read) | `cassandra` |
+| Cassandra (in development: CRUD, vread and batch; no search yet) | `cassandra` |
 
 Cassandra requires `--features cassandra` and a node with `docs/Cassandra/schema/keyspace-single-node.cql` and `schema.cql` already applied (the server only checks that the ten tables exist). `HFS_AUDIT_BACKEND=database` is refused at startup on Cassandra, which stores no AuditEvents. SQL-on-FHIR is turned off with a warning (no in-DB runner); an explicit `HFS_SOF_ENABLED=true` fails startup.
 Connection settings are `HFS_CASSANDRA_CONTACT_POINTS` (default `127.0.0.1:9042`; the local Compose node is `127.0.0.1:59042`), `_KEYSPACE` (`helios`), `_LOCAL_DC` (`helios-dc1`), `_USERNAME`/`_PASSWORD`, `_POOL_SIZE` (`2`), `_CONNECT_TIMEOUT_MS` (`5000`) and `_REQUEST_TIMEOUT_MS` (`10000`); see `crates/persistence/README.md`, "Cassandra".
@@ -395,3 +395,13 @@ the `system/purge` / `system/reindex` scopes, never ordinary resource scopes.
 standalone (no search index exists to rebuild) and its job state is per-process,
 so poll the node you kicked off against. See the
 [helios-rest README](../../../crates/rest/README.md#administrative-operations).
+
+A `batch` `PUT`/`DELETE` entry with `request.ifMatch` answers like the same
+request with `If-Match` (#2527): a stale tag is a `412` entry; a satisfied one
+writes against the version it was checked against, so another writer landing
+after the check makes the entry `409` (its version survives), and a `PUT` on a
+resource deleted after the check is `404` (no revive). Two entries with the same
+`ifMatch` for one id write once; the other is `409` if checked before the winner
+wrote, `412` if after (always `412` on SQLite, which runs entries serially).
+Entries without `ifMatch` stay last-writer-wins. Code: `check_entry_if_match` in
+`crates/rest/src/handlers/batch.rs`; tests: `crates/rest/tests/if_match_write_race.rs`.

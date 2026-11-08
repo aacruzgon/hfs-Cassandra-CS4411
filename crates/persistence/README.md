@@ -351,13 +351,13 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | Feature                                                                     | SQLite | PostgreSQL | MongoDB | Cassandra | Neo4j | Elasticsearch | S3  |
 | --------------------------------------------------------------------------- | ------ | ---------- | ------- | --------- | ----- | ------------- | --- |
 | **Core Operations**                                                         |
-| [CRUD](https://build.fhir.org/http.html#crud)                               | ✓      | ✓          | ✓       | ◐         | ○     | ✓             | ✓   |
-| [Versioning (vread)](https://build.fhir.org/http.html#vread)                | ✓      | ✓          | ✓       | ○         | ○     | ○             | ✓   |
-| [Optimistic Locking](https://build.fhir.org/http.html#concurrency)          | ✓      | ✓          | ✓       | ○         | ○     | ✗             | ✓   |
+| [CRUD](https://build.fhir.org/http.html#crud)                               | ✓      | ✓          | ✓       | ✓         | ○     | ✓             | ✓   |
+| [Versioning (vread)](https://build.fhir.org/http.html#vread)                | ✓      | ✓          | ✓       | ◐         | ○     | ○             | ✓   |
+| [Optimistic Locking](https://build.fhir.org/http.html#concurrency)          | ✓      | ✓          | ✓       | ✓         | ○     | ✗             | ✓   |
 | [Instance History](https://build.fhir.org/http.html#history)                | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✓   |
 | [Type History](https://build.fhir.org/http.html#history)                    | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✓   |
 | [System History](https://build.fhir.org/http.html#history)                  | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✓   |
-| [Batch Bundles](https://build.fhir.org/http.html#batch)                     | ✓      | ✓          | ✓       | ○         | ○     | ○             | ✓   |
+| [Batch Bundles](https://build.fhir.org/http.html#batch)                     | ✓      | ✓          | ✓       | ✓         | ○     | ○             | ✓   |
 | [Transaction Bundles](https://build.fhir.org/http.html#transaction)         | ✓      | ✓          | ✓       | ✗         | ○     | ✗             | ◐   |
 | [Conditional Operations](https://build.fhir.org/http.html#cond-update)      | ✓      | ✓          | ✓       | ✗         | ○     | ○             | ✗   |
 | [Conditional Patch](https://build.fhir.org/http.html#patch)                 | ✓      | ✓          | ✓       | ✗         | ○     | ○             | ✗   |
@@ -523,7 +523,7 @@ The S3 backend is intentionally storage-focused (CRUD/version/history and the fu
 - **○ means no backend implements it today.** Unwired SQL generators for these topologies (shared-schema + RLS, schema-per-tenant `search_path`, database-per-tenant pools) once lived in `src/strategy/`; they were removed in issue #370. Do not read a `○` cell as a deployable isolation guarantee.
 - **✗ for PostgreSQL is a decision, not a gap.** Design discussion #28 chose shared-schema for PostgreSQL and declined the per-schema and per-database topologies; advertising them anyway was the defect issue #369 corrected.
 - **— Neo4j has no backend in this tree** (`src/backends/mod.rs`), so it has no tenant placement to report. **Cassandra** declares exactly one placement, *Shared Schema*: every table's partition key starts with `tenant_id` (`docs/Cassandra/schema/schema.cql`), and the keyspace is shared by all tenants.
-- **◐ CRUD on Cassandra** means create and read only, while the backend is in development (`docs/Cassandra/development-roadmap.md`); every other interaction answers `501`.
+- **◐ Versioning on Cassandra** means `vread` and `list_versions` are real (roadmap Step 3), and `update_with_match` and the versioning tests are Step 4's (`docs/Cassandra/development-roadmap.md`). Search, history, transactions and conditional interactions answer `501` until their step, or for good where the column says ✗.
 - **Row-Level Security has no `BackendCapability` counterpart**, so the contract test cannot police it. PostgreSQL is `○` because no backend issues `ALTER TABLE … ENABLE ROW LEVEL SECURITY`; a database-enforced layer is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
 
 ### Polling `_history` with `_since`
@@ -612,7 +612,7 @@ Backends can serve as primary (CRUD, versioning, and — where the backend suppo
 | PostgreSQL alone           | PostgreSQL | —                      | ✓ Implemented                   | Production OLTP                         |
 | PostgreSQL + Elasticsearch | PostgreSQL | Elasticsearch (search) | ✓ Implemented                   | OLTP + advanced search                  |
 | PostgreSQL + Neo4j         | PostgreSQL | Neo4j (graph)          | Planned                         | Graph-heavy queries                     |
-| Cassandra alone            | Cassandra  | —                      | In development (create, read)   | High write throughput                   |
+| Cassandra alone            | Cassandra  | —                      | In development (CRUD, vread)    | High write throughput                   |
 | Cassandra + Elasticsearch  | Cassandra  | Elasticsearch (search) | Planned                         | Write-heavy + search                    |
 | MongoDB alone              | MongoDB    | —                      | ✓ Implemented                   | Document-centric                        |
 | MongoDB + Elasticsearch    | MongoDB    | Elasticsearch (search) | ✓ Implemented                   | Document-centric + offloaded search     |
@@ -1833,7 +1833,7 @@ let composite = CompositeStorage::new(composite_config, backends)?
 
 ### Cassandra
 
-In development: create and read work, and every other interaction answers `501` (`docs/Cassandra/development-roadmap.md`). Standalone only; there is no Cassandra + Elasticsearch mode.
+In development: create, read, update, delete (soft, with revive), PATCH, vread and batch work, and every write is a compare-and-swap; search, history, transactions and conditional interactions answer `501` (`docs/Cassandra/development-roadmap.md`). Standalone only; there is no Cassandra + Elasticsearch mode.
 
 ```bash
 # Build with Cassandra support
@@ -2857,7 +2857,7 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 
 ### Phase 5+: Additional Backends (Planned)
 
-- [ ] Cassandra backend (wide-column, partition keys): in development; skeleton, server wiring, create and read first (`docs/Cassandra/development-roadmap.md`)
+- [ ] Cassandra backend (wide-column, partition keys): in development; CRUD, vread and batch done (roadmap Step 3), versioning, index writes and search next (`docs/Cassandra/development-roadmap.md`)
 - [x] MongoDB Phase 1 scaffold (module wiring, config, Backend trait baseline)
 - [x] MongoDB Phase 2 core storage parity (CRUD/count/read_batch/create_or_update, tenant isolation, soft-delete, schema bootstrap)
 - [x] MongoDB Phase 3 versioning/history plus best-effort session-backed consistency

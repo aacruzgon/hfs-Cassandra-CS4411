@@ -1,5 +1,7 @@
 -- Helios Cassandra backend: table definitions.
--- DRAFT for the schema session (roadmap Step 1, item 1.1). Not signed off.
+-- Signed off by Alan (ADR-aacruzgon-0028); four sign-offs pending, recorded
+-- against 67f9e0532 (roadmap item 1.4). A change to a table, key, column type or table option needs new
+-- sign-offs; comment changes since cite their ADR.
 --
 -- The design document fixes the keys and clustering; this file states what
 -- it leaves implicit (roadmap Step 1 checklist). Reasons are in README.md
@@ -28,13 +30,12 @@
 --     resources never holds a tombstone, and a replica that missed a revive
 --     cannot bring the delete back (ADR-aacruzgon-0027, walkthrough G39);
 --   * every update, delete and revive also rewrites resource_versions row N
---     from current, USING TIMESTAMP write_ts(N) - 1, before its intent row and
+--     from the writer's read of resources at N (R1), USING TIMESTAMP
+--     write_ts(N) - 1, before its intent row and
 --     its CAS, so row N exists whenever a CAS creating N+1 has applied, a crash
 --     cannot lose it, and an existing row always wins (ADR-aacruzgon-0027,
---     walkthrough G40); a rewrite built from a read of
---     resources (delete, create_or_update, update_with_match) also carries
---     that read's write_id, one built from update's StoredResource leaves it
---     unset (ADR-aacruzgon-0026);
+--     walkthrough G40); every rewrite carries that read's write_id, update's
+--     included (ADR-aacruzgon-0026, 0061);
 --   * every resource_versions row carries index_keys, the key set its version
 --     wrote, never unset: V1 and V2 write the writer's own K(V), the sweeper's
 --     replay writes the index_keys of the resources row it read, and a
@@ -153,6 +154,9 @@ CREATE TABLE IF NOT EXISTS resource_versions (
                               -- the row came from a rewrite built from update's
                               -- StoredResource. Decides an unknown CAS outcome
                               -- that a later version superseded (ADR-aacruzgon-0026)
+                              -- Note (ADR-aacruzgon-0061): update's rewrite is now
+                              -- built from its R1 and carries R1's write_id, so
+                              -- no rewrite leaves it unset (the rule at the top).
     index_keys    blob,       -- the index rows this version wrote, encoded as
                               -- below; never unset (ADR-aacruzgon-0027)
     PRIMARY KEY ((tenant_id, resource_type, id), version_id)

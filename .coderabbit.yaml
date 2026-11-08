@@ -153,16 +153,14 @@ reviews:
     # ---- Every Rust file ---------------------------------------------------
     - path: "**/*.rs"
       instructions: |
-        Rules from CLAUDE.md ("Important Notes") and roadmap section 1:
+        Rules from CLAUDE.md ("Important Notes"):
         - Code may assume at least one FHIR version feature (R4, R4B, R5, R6)
           is on. Flag a new cfg ladder or fallback for "no version enabled".
-        - FhirVersion::default() exists only with the R4 feature. Outside a
-          file that requires R4, flag a call to it;
-          FhirVersion::default_enabled() works in any build (the R4B-only
-          CI check compiles the persistence crate and the Cassandra test
-          targets without R4).
-        - Flag a FhirVersion::R4 literal outside tests (roadmap section 1,
-          "Nothing is R4-specific").
+        - Elsewhere in the workspace, FhirVersion::default() (R4 only) and
+          FhirVersion::R4 arms behind #[cfg(feature = "R4")] are allowed
+          (CLAUDE.md, "FHIR version feature assumption"). The stricter rules
+          for the Cassandra backend and its tests are in their own
+          instructions below.
         - Minimum Rust is 1.91.1, edition 2024 (rust-version in the root
           Cargo.toml). Flag a std or language feature stabilised after 1.91.
         - Clippy runs with -D warnings on all targets and all features in CI;
@@ -179,6 +177,15 @@ reviews:
         of docs/Cassandra/schema/schema.cql, the walkthrough
         (docs/Cassandra/schema/walkthrough.md, section 3.1) and these ADRs in
         docs/Cassandra/ADR-aacruzgon/.
+
+        FHIR versions (roadmap section 1, "Nothing is R4-specific";
+        ADR-aacruzgon-0039, 0065): this code also builds in the R4B-only
+        CI check, without R4.
+        - Flag FhirVersion::default(), which exists only with the R4
+          feature; use FhirVersion::default_enabled() or the config's
+          fhir_version.
+        - Flag a FhirVersion::R4 literal that is not one arm of a
+          #[cfg(feature = "R4")] match over the versions.
 
         Tenant first (CLAUDE.md, "Tenant-First Design"):
         - Every operation takes the TenantContext first, and every statement
@@ -272,6 +279,11 @@ reviews:
         - Without HFS_TEST_CASSANDRA_URL a test skips or starts its own
           container; it never runs DDL against the shared node.
         - Test tenants start with "test-" (CI report R4 reads only those).
+        - These files build in the R4B-only CI check, without R4
+          (ADR-aacruzgon-0039, 0065). Flag FhirVersion::default(), which
+          exists only with the R4 feature (use
+          FhirVersion::default_enabled()), and a FhirVersion::R4 literal
+          that is not behind #[cfg(feature = "R4")].
 
     # ---- Upstream files the fork changes -----------------------------------
     - path: "{crates,book,utils,docker}/**"

@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0066: The CQL audit check after PR #62: each rule also reads the CQL text, across keyspaces, and the audit dump is read fail-closed
 
 - **Date:** 2026-11-07
-- **Status:** accepted (Alan chose a new entry over 0058's Status line on 2026-11-07, as recommended, accepted its two fail-closed false failures the same day, and approved this entry on 2026-11-07). It amends ADR-aacruzgon-0058's matching rules and its known limits.
+- **Status:** accepted (Alan chose a new entry over 0058's Status line on 2026-11-07, as recommended, accepted its three fail-closed false failures the same day, and approved this entry on 2026-11-07). It amends ADR-aacruzgon-0058's matching rules and its known limits.
 - **Context:**
     - **What ADR-0058 decided.** The required Cassandra job turns the node's audit log on, dumps it with `auditlogviewer`, and `ci-report.py cql-audit --check` fails the job on any of these:
         - **(a)** a `type:DELETE` entry scoped exactly to `resources` or `resource_versions`;
@@ -78,11 +78,11 @@
     - **What stays open:**
         - **Entries under an excluded keyspace are never written.** The node drops an entry whose keyspace is excluded (`AuditLogFilter.isFiltered`, 5.0.9). So a failed unprepared statement or batch, sent from a session using a system keyspace, leaves nothing to check. No CI session uses one today. Only a change to the job's `--excluded-keyspaces` could close it.
         - **`DROP KEYSPACE helios`** is not a rule (b′) case. It is outside ADR-0058's scope, and it would break every later step anyway.
-        - **A role name with a quote, `$$`, `/*`, `--` or `//`** makes its own headers untrusted: each is read as text of the record before it, or as text before the first record, which is then unverifiable, so the check fails. It fails closed, and it cannot arise in CI today, since CI's user is `anonymous`. No acceptance of it is recorded yet.
-    - **The accepted false failures,** each of which fails closed. Alan accepted the truncated-password and the unresolved-quote cases on 2026-11-07, next to case folding:
+    - **The accepted false failures,** each of which fails closed. Alan accepted the truncated-password, the unresolved-quote and the role-name cases on 2026-11-07, next to case folding:
         - **Quoted names fold case.** `"Helios"` and `"Resources"` match, though in CQL they are another keyspace and another table.
         - **The truncated-password query.** A query holding "password" that fails to parse or to prepare is logged cut after that word, inside its literal (`PasswordObfuscator.obfuscate`, through `QueryEvents.maybeObfuscatePassword`). Preparing includes validation, such as a wrong-typed literal, and `QueryMessage.execute` has no statement until both succeed. It is unverifiable either way when any record follows. The syntax-error case was recorded on a 5.0.9 node. The validation-failure case was recorded on a 5.0.9 node too, byte for byte as the test's fixture has it (the source path is `QueryProcessor.getStatement`).
         - **A failed statement whose message leaves a quote open where the guard cannot find the query's end.** `failure_query_end` resolves the three recorded messages. It finds no end, and the record stays unverifiable when another record follows, if the query itself ends open (the password case), or if no `"; "` that is code is followed by a word other than `INSERT`, `UPDATE`, `DELETE`, `APPLY` or `BEGIN`: for example a message that starts with a quote or a digit, or whose first word is one of those five. None of the messages recorded on 5.0.9 starts that way; the case is accepted so that the guard never trusts what it cannot place.
+        - **A role name with a quote, `$$`, `/*`, `--` or `//`** makes its own headers untrusted: each is read as text of the record before it, or as text before the first record, which is then unverifiable, so the check fails. It cannot arise in CI today, since CI's user is `anonymous`.
         - **A failed native batch,** as ADR-0058 accepted.
 
       An unterminated literal is not one: its 5.0.9 message closes it again.
@@ -135,7 +135,7 @@
         - that `Type : audit LogMessage : user :` is invalid in *every* CQL context; that was tested in ten;
         - the system-keyspace gap on a node;
         - an execution failure whose message echoes user input. None was found in the 5.0.9 source read, and user-defined functions are off.
-    - **What Alan changed:** on 2026-11-07 he chose the new-entry approach, so 0058's Status line goes back to its original text plus "; amended by ADR-aacruzgon-0066", and he accepted both fail-closed false failures: a failed statement whose message leaves a quote open that the guard cannot resolve, and the truncated-password query. On the same day he settled the two open alternatives: the system keyspaces stay excluded, revisited only if a CI step starts using another keyspace, and no other dump format is investigated (the reasons are under Alternatives considered). Otherwise he approved the entry as drafted, on 2026-11-07.
+    - **What Alan changed:** on 2026-11-07 he chose the new-entry approach, so 0058's Status line goes back to its original text plus "; amended by ADR-aacruzgon-0066", and he accepted both fail-closed false failures: a failed statement whose message leaves a quote open that the guard cannot resolve, and the truncated-password query. On the same day he settled the two open alternatives: the system keyspaces stay excluded, revisited only if a CI step starts using another keyspace, and no other dump format is investigated (the reasons are under Alternatives considered). Later on 2026-11-07 he accepted the role-name false failure as well, as recommended ("okay lets go with all your recommendations"). Otherwise he approved the entry as drafted, on 2026-11-07.
 - **Links:**
     - PR #62, branch `cassandra/step3-cleanup`: commits `093ca1233`, `22f3f58ae`, `2ddcb663d`, `5387007fe`, `fc6396036`, `95fde3bc4`, `8c2ca443a`; this entry's commit;
     - ADR-aacruzgon-0058 (amended here), and 0050 → 0055 (the precedent);

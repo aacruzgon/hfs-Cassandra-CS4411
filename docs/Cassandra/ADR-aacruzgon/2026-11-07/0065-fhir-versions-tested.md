@@ -82,7 +82,7 @@
         - `crud.rs`'s list of changes from upstream (`ced5f9868`);
         - the §8 touch-list line (`62ff307d5`).
 
-      The reviewer `pr63-review` wrote five of them, and a second reviewer wrote `5eb319efa`; each was audited by the worker that did not write it. He asked for the canary and the touch list to be named here. After this entry's own audit, `pr63-review` corrected it for accuracy in a later commit: the tense of the PR B and PR C parts, the unit-test failure count, this commit count and the selector's upstream precedent. No decision, alternative or approval changed.
+      The reviewer `pr63-review` wrote five of them, and a second reviewer wrote `5eb319efa`; each was audited by the worker that did not write it. He asked for the canary and the touch list to be named here. After this entry's own audit, `pr63-review` corrected it for accuracy in a later commit: the tense of the PR B and PR C parts, the unit-test failure count, the commit count above, roadmap §4's two R4B commands and its dated "today", and the selector's upstream precedent. No decision, alternative or approval changed.
     - **Written by:**
         - PR #63's first commit, PR B, and this entry with its design and roadmap edits: the worker;
         - PR C's workflow and report script: drafted by a subagent in its own worktree and reviewed and corrected by the worker. Its test fixtures gave the contract binary a selector line it never prints; the worker rebuilt them from real logs.

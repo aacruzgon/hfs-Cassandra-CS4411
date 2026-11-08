@@ -30,8 +30,9 @@ them ran. Its count is the sum of theirs. Two items of one name in one file
 (the `fn from` of each `From` impl) stay two functions. An item spans from
 its `fn` line to its closing `}` alone at the item's own indentation, as
 rustfmt writes it, or to the end of its line for a one-line body. Code
-outside every item, such as a static's initializer closure, counts in lines
-and regions but not as a function. llvm-cov's own function figures count
+outside every item, such as a static's initializer closure or a `fn $name`
+that a `macro_rules!` writes, counts in lines and regions but not as a
+function. llvm-cov's own function figures count
 each instantiation; the totals here keep llvm-cov's lines and regions and
 use the per-item function count. Nothing here fails on a low figure: the
 report has no threshold.
@@ -232,8 +233,8 @@ def markdown(report, run):
         "",
         "A function is the `fn` item its code is in: closures, async bodies and generic instances fold into it, "
         "and its count sums their entry counts (an async body counts once per poll). Two items of one name in one "
-        "file count as two; code outside every `fn` item, such as a static's initializer, counts in lines and "
-        "regions only.",
+        "file count as two; code outside every `fn` item, such as a static's initializer or a `fn $name` that a `macro_rules!` writes, "
+        "counts in lines and regions only.",
         "",
         "| REST path | Function | Count | Without step 3 |",
         "| --- | --- | --- | --- |",

@@ -308,7 +308,7 @@ On every compare-and-swap (`create`, `create_or_update`, `update`, `delete` and 
 - **Another `write_id` at version V:** another writer won V, and ours did not apply. This is a definite miss and is handled as in step 3, from the row the serial read returned as from the compare-and-swap's own columns:
     - `create` returns `AlreadyExists`, which REST answers with 409 (`crates/rest/src/error.rs`, `From<ResourceError>`);
     - `update` and `delete_versioned` return 409 (`VersionConflict`) for a live row, and `NotFound` (404) when the row read back is deleted: the resource was deleted in the gap, as when the compare-and-swap misses outright (G9);
-    - `create_or_update` and a plain `delete` retry as described above.
+    - `create_or_update` retries as described above, and a plain `delete` does too for a live row; a plain `delete` whose row read back is deleted answers `NotFound` at once (REST 204), as when its compare-and-swap misses outright (G9).
 - **A version past V:** ours may have applied and been superseded. We read `resource_versions` row V, which carries the `write_id` of the attempt that created it (ADR-aacruzgon-0026, refining ADR-aacruzgon-0024):
     - **Our `write_id`:** ours applied and was then superseded. We return success with version V, as for an applied write. We write no index rows, because a late insert of V's keys could outlive the later version's tombstones. The intent row is left to the sweeper, whose superseded case deletes V−1's keys.
     - **Another `write_id`:** another writer won V. This is a definite miss, handled as in step 3.

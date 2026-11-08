@@ -402,8 +402,10 @@ jobs:
       #          --no-fail-fast, so a failure in the first binary does not
       #          keep the second from running
       #   rest   the Milestone A round trip and the Step 3 CRUD test through
-      #          hfs; never readiness_reports_down_while_cassandra_is_stopped,
-      #          which stops a node. It must run exactly its two tests:
+      #          hfs, and the_startup_check_matches_the_whole_version, the
+      #          unit test of the check on hfs's startup line, which no other
+      #          job runs; never readiness_reports_down_while_cassandra_is_stopped,
+      #          which stops a node. It must run exactly its three tests:
       #          --exact on names that match nothing passes with 0 tests, so,
       #          as in the required job's --exact steps, a renamed test fails
       #          the run instead of turning it green
@@ -428,8 +430,8 @@ jobs:
             HFS_TEST_FHIR_VERSION="$version" "$@" 2>&1 | tee -a "$log"
             local status=${PIPESTATUS[0]}
             if [ "$suite" = rest ] && [ "$status" -eq 0 ] \
-              && ! grep -Eq '^test result: ok\. 2 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$log"); then
-              echo "::error title=FHIR versions::$version rest did not run exactly its two tests"
+              && ! grep -Eq '^test result: ok\. 3 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$log"); then
+              echo "::error title=FHIR versions::$version rest did not run exactly its three tests"
               status=1
             fi
             echo "exit=$status" | tee -a "$log"
@@ -446,7 +448,8 @@ jobs:
             run_suite "$version" rest \
               cargo test -p helios-hfs --no-default-features --features "$HFS_FEATURES" \
                 --test cassandra_milestone_a -- \
-                --exact milestone_a_create_then_read_through_rest step3_crud_through_rest --nocapture
+                --exact milestone_a_create_then_read_through_rest step3_crud_through_rest \
+                the_startup_check_matches_the_whole_version --nocapture
           done
           if [ "${#failed[@]}" -gt 0 ]; then
             for run in "${failed[@]}"; do

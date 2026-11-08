@@ -63,13 +63,14 @@ exit=0
 
 REST_R5 = """     Running tests/cassandra_milestone_a.rs (target/debug/deps/cassandra_milestone_a-26ca34be4cc4dec9)
 
-running 2 tests
+running 3 tests
+test the_startup_check_matches_the_whole_version ... ok
 fhir-versions: HFS_TEST_FHIR_VERSION=R5 -> R5 (5.0), passed to hfs as HFS_DEFAULT_FHIR_VERSION=R5
 test milestone_a_create_then_read_through_rest ... ok
 [spec row=U-7:put-new expected=201 got=201]
 test step3_crud_through_rest ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 7.21s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 7.21s
 
 exit=0
 """
@@ -184,11 +185,11 @@ class Report(Scratch):
         self.assertIn("no selector line: the version selector may not have applied", row["problems"])
         self.assertEqual(rows[("R4", "lib")]["problems"], ["log missing"])
 
-    def test_rest_must_run_exactly_its_two_tests_and_a_cut_off_run_is_flagged(self):
-        self.write("R5", "rest", REST_R5.replace("2 passed", "1 passed").replace("exit=0\n", ""))
+    def test_rest_must_run_exactly_its_three_tests_and_a_cut_off_run_is_flagged(self):
+        self.write("R5", "rest", REST_R5.replace("3 passed", "1 passed").replace("exit=0\n", ""))
         _, rows = self.run_report("--versions", "R5")
         problems = rows[("R5", "rest")]["problems"]
-        self.assertIn("1 tests ran, expected exactly 2", problems)
+        self.assertIn("1 tests ran, expected exactly 3", problems)
         self.assertIn("no `exit=` line: the run was cut off", problems)
 
     def test_a_filter_that_matches_nothing_is_flagged(self):

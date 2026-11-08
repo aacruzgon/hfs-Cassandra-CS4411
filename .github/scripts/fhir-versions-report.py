@@ -10,8 +10,9 @@ The suites are:
 
   lib    helios-persistence `--lib -- backends::cassandra`
   tests  helios-persistence `--test cassandra_tests --test backend_capability_contract`
-  rest   helios-hfs `--test cassandra_milestone_a`, the Milestone A round trip
-         and the Step 3 CRUD test (`--exact`, so exactly 2 tests)
+  rest   helios-hfs `--test cassandra_milestone_a`, the Milestone A round trip,
+         the Step 3 CRUD test and the unit test of the startup-line check
+         (`--exact`, so exactly 3 tests)
 
 For each log this reads:
 
@@ -69,7 +70,7 @@ VARIANT = {
 SUITES = [
     {"id": "lib", "label": "persistence --lib backends::cassandra", "tests": None},
     {"id": "tests", "label": "persistence cassandra_tests + backend_capability_contract", "tests": None},
-    {"id": "rest", "label": "hfs cassandra_milestone_a (round trip + Step 3 CRUD)", "tests": 2},
+    {"id": "rest", "label": "hfs cassandra_milestone_a (round trip + Step 3 CRUD + startup-line check)", "tests": 3},
 ]
 
 

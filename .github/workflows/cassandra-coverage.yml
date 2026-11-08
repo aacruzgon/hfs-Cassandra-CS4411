@@ -258,6 +258,8 @@ jobs:
       # test nor the report steps, which run unless the run is cancelled.
       # The profile files it adds are listed for the crates/rest section,
       # which reports them apart; the trap writes the list on a failure too.
+      # Under bash -e a failing command in an EXIT trap would turn the step's
+      # status into 1 even when the test passed, so the trap ends in || true.
       - name: Step 3 CRUD through hfs against this node
         id: step3-rest
         if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
@@ -268,7 +270,7 @@ jobs:
           log="$RUNNER_TEMP/ci-report/logs/step3-rest.log"
           profiles() { find "$CARGO_LLVM_COV_TARGET_DIR" -maxdepth 1 -name '*.profraw' | sed 's#.*/##' | sort; }
           profiles > "$RUNNER_TEMP/profiles-before-step3.txt"
-          trap 'profiles | comm -13 "$RUNNER_TEMP/profiles-before-step3.txt" - > "$RUNNER_TEMP/step3-profiles.txt"' EXIT
+          trap '{ profiles | comm -13 "$RUNNER_TEMP/profiles-before-step3.txt" - > "$RUNNER_TEMP/step3-profiles.txt"; } || true' EXIT
           if ! grep -q 'fn step3_crud_through_rest' crates/hfs/tests/cassandra_milestone_a.rs; then
             echo "::error title=Step 3 REST test::step3_crud_through_rest is not in crates/hfs/tests/cassandra_milestone_a.rs"
             exit 1

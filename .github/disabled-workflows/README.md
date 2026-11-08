@@ -42,5 +42,7 @@ jobs before moving it into `.github/workflows/`; an empty active workflow would
 fail validation.
 
 To restore an inherited workflow, move its YAML file into `.github/workflows/`
-and restore any necessary caller jobs or dependencies. Calls from `ci.yml` to
-HTS conformance, extended CI, and deployment workflows have been removed.
+and restore any necessary caller jobs or dependencies. `ci.yml` is upstream's
+copy as of the 2026-11-08 sync, so it still calls `hts.yml`,
+`hts-ig-conformance.yml`, `release-build.yml` and `deploy-server.yml`, all of
+which are in this directory: restore those too, or remove the calls.

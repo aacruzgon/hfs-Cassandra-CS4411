@@ -329,9 +329,12 @@ reviews:
           ADR-<user>-NNNN"), and a correction is a new entry or a dated
           "*Update YYYY-MM-DD:*" note. Flag any other edit to a merged
           entry.
-        - Numbers are sequential across the whole log, not per folder, with
-          no gap or duplicate, and the file is
-          YYYY-MM-DD/NNNN-<short-slug>.md under the day it was worked on.
+        - Numbers are counted across the whole log, not per folder. Flag a
+          new entry whose number is already used by an entry on main, or is
+          used twice in the PR. Do not flag a gap: a lower number may be held
+          by another open PR (ADR-aacruzgon-0065 was on PR #63 while PR #62
+          added 0066). The file is YYYY-MM-DD/NNNN-<short-slug>.md under the
+          day it was worked on.
         - Every template field is present and filled: Date, Status, Context,
           Decision, Alternatives considered, Consequences, AI involvement,
           Links. AI involvement says what the assistant proposed, what the
@@ -483,7 +486,9 @@ reviews:
           (otherwise pass). Fail if a new entry leaves a template field
           (Date, Status, Context, Decision, Alternatives considered,
           Consequences, AI involvement, Links) missing or empty; if its
-          number is not the next unused number in that log; if it has no
+          number is already used by another entry in that log on main, or
+          twice in the PR (a gap is not a failure: another open PR may hold
+          the lower number); if it has no
           matching row in that log's index; or if the PR edits more than the
           Status line of an entry that is already on main, other than a
           dated Update note. Pass otherwise.

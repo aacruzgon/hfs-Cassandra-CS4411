@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0065: The Cassandra backend is tested on R4, R4B, R5 and R6, with R4 as the required gate
 
 - **Date:** 2026-11-07
-- **Status:** accepted (Alan approved it on 2026-11-07).
+- **Status:** accepted (Alan approved it on 2026-11-07). Amended by ADR-aacruzgon-0071.
 - **Context:** Alan asked whether R4B, R5 and R6 are "basically plug in" or need a refactor, since Helios supports all four and Cassandra must too.
     - **What the design said.** "Nothing in the backend is tied to R4". Functional tests stay on R4, the R4B compile check is the gate, and running the suites under R5 is "a follow-up once the R4 backend is accepted" (`cassandra-discussion.md`, "FHIR versions"; ADR-aacruzgon-0026).
     - **What the investigation found** (2026-11-07, on `25eddd3b8` and `9c8c8f4f3`, by the Rex worker `fhir-versions`). Everything the backend does today works under R4B-only, R5, R6 and all-versions builds:

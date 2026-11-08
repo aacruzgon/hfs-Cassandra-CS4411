@@ -155,7 +155,10 @@ fn test_fhir_version() -> Option<helios_fhir::FhirVersion> {
     static CHOSEN: std::sync::OnceLock<Option<helios_fhir::FhirVersion>> =
         std::sync::OnceLock::new();
     *CHOSEN.get_or_init(|| {
-        let value = std::env::var(FHIR_VERSION_VAR).ok()?;
+        // Lossy: a value that is not UTF-8 keeps a U+FFFD, which no version
+        // parses, so it panics like any other bad value.
+        let value = std::env::var_os(FHIR_VERSION_VAR)?;
+        let value = value.to_string_lossy();
         let version = helios_fhir::FhirVersion::from_storage(value.trim()).unwrap_or_else(|| {
             let enabled: Vec<&str> = helios_fhir::FhirVersion::enabled_versions()
                 .iter()

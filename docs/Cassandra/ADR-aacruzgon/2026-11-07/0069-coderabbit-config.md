@@ -165,6 +165,7 @@
         - the `CLAUDE.md`/`AGENTS.md` line: `9f173a997`, reworded by `76b47097a`, `810b9f51a` and `656f7eef5`;
         - the delta audits' fixes: `a9b1fcaeb` (the R4B scope), `e31d56536` (#58 and #63 tried unasked), `76b47097a` (the Autofix line), `a253b83b1` (the hfs Cassandra tests), `810b9f51a` (the Autofix line's authorship cases, and the `advisor` wording), `656f7eef5` (`advisor` back among the cfg gates, and "not signed by the member who asked for them").
         - the merge of `main` before this entry: `818de1c4f`;
-        - this entry's commit, with its index row and the roadmap section 8 line.
+        - this entry's commit, with its index row and the roadmap section 8 line;
+        - after this entry: `0aee29020` (CodeRabbit's roadmap instruction scopes the section 8 rule to `crates/`, `book/`, `utils/` and `docker/`), and the roadmap commit that scopes the rule the same way in sections 1 and 8.
     - `.coderabbit.yaml`; roadmap section 8; `CLAUDE.md` and `AGENTS.md`, "Commits and CI" and "Decision records (ADR)".
     - ADR-aacruzgon-0018, 0019, 0020, 0021, 0022, 0023, 0027, 0028, 0029, 0034, 0035, 0038, 0039, 0045, 0050, 0051, 0055, 0057, 0058, 0065, 0066.

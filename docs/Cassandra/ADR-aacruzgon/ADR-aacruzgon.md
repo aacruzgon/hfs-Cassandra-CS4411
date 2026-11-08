@@ -103,3 +103,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0057](2026-11-06/0057-crud-suite-adapted-copy.md) | 2026-11-06 | Upstream's CRUD suite runs on Cassandra as an adapted copy, with a parity test and four Cassandra-strict tests | accepted |
 | [0058](2026-11-06/0058-cql-audit-check.md) | 2026-11-06 | The node's CQL audit log proves that no CQL `DELETE` reaches `resources` or `resource_versions`, as a check in the required Cassandra job | accepted |
 | [0059](2026-11-06/0059-step3-ci-reports.md) | 2026-11-06 | Step 3's CI reports: latency per operation, CAS outcomes, statements, intent rows, tombstones, DML and the HL7 rows | accepted |
+| [0065](2026-11-07/0065-fhir-versions-tested.md) | 2026-11-07 | The Cassandra backend is tested on R4, R4B, R5 and R6, with R4 as the required gate | accepted |

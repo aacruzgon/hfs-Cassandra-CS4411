@@ -7,8 +7,9 @@ name: FHIR versions (report only)
 # Report only. None of these jobs is a required check, and none will be: R4
 # stays the required gate, through the required jobs in r4b-compile-check.yml
 # and fmt-clippy-cassandra.yml (ADR-aacruzgon-0019, 0021). A job here still
-# goes red when its build or its tests fail, so a broken version shows, but
-# nothing waits on it. Each report step is if: always() and
+# goes red when its build or its tests fail, or, in the test job, when its
+# report finds a version that did not really run, so a broken version shows,
+# but nothing waits on it. Each report step is if: always() and
 # continue-on-error: true, as in the other two workflows (ADR-aacruzgon-0045).
 #
 # Runs on the team's self-hosted runners with the fork guard on every job
@@ -473,6 +474,34 @@ jobs:
             for suite in lib tests rest; do set -- "$@" "$logs/fhir-$version-$suite.log"; done
           done
           python3 .github/scripts/ci-report.py tests tests "Tests (all FHIR versions)" "$@"
+
+      # The gate on what that report found. The test step fails on a failed or
+      # cut-off run, but only the report reads the selector lines and each
+      # suite's counts: without this step, a version whose selector did not
+      # apply, which really tests the build's default version, or a --lib
+      # filter that matches nothing, would leave the job green. A report that
+      # cannot be read confirms nothing, so it fails too. No if: it runs only
+      # when the test step passed (a failed one has already failed the job),
+      # and the if: always() reports after it still upload.
+      - name: Fail unless every version really ran its tests
+        run: |
+          python3 -I - "$RUNNER_TEMP/ci-report/inputs/fhir-versions/fhir-versions.json" <<'PY'
+          import json
+          import sys
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as report_file:
+                  report = json.load(report_file)
+          except (OSError, ValueError) as error:
+              print(f"::error title=FHIR versions::the report cannot be read, so no version is confirmed: {error}")
+              sys.exit(1)
+          if report.get("all_ok") is not True:
+              runs, ok = report.get("runs", 0), report.get("ok", 0)
+              problems = "; ".join(report.get("warnings", []))
+              print(f"::error title=FHIR versions::{runs - ok} of {runs} runs not ok: {problems}")
+              sys.exit(1)
+          print(f"{report['ok']} of {report['runs']} runs ok")
+          PY
 
       - name: Cassandra logs
         if: failure()

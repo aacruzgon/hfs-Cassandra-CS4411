@@ -32,9 +32,10 @@ Usage: fhir-versions-report.py <logs-dir> <out-dir> [--versions R4,R4B,R5,R6]
 Without --versions: R4, R4B, R5 and R6, plus any other version a log in
 <logs-dir> is named for. Writes <out-dir>/fhir-versions.md and .json and
 prints the Markdown; the JSON's "warnings" list becomes ::warning::
-annotations through `ci-report.py add`. Exits 0 whatever the logs say: the
-job's test step is what fails on a failed run. Standard library only; runs
-with `python3 -I`. Tests: .github/scripts/test_fhir_versions_report.py.
+annotations through `ci-report.py add`. Exits 0 whatever the logs say: this
+writes the report, and the job's next step fails it unless the JSON's "all_ok"
+is true. Standard library only; runs with `python3 -I`. Tests:
+.github/scripts/test_fhir_versions_report.py.
 """
 
 from __future__ import annotations

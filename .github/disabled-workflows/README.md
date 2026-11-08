@@ -4,11 +4,13 @@ These inherited workflows are outside the Cassandra project scope and are
 preserved here for reference. GitHub Actions only loads workflows from
 `.github/workflows/`, so the YAML files in this directory do not run.
 
-Five workflows are active. Four run on the team's self-hosted runners
+Seven workflows are active. Six run on the team's self-hosted runners
 (ADR-aacruzgon-0018, ADR-sam-michaels-0001, ADR-aacruzgon-0023):
 `r4b-compile-check.yml` (roadmap item 0.4), `fmt-clippy-cassandra.yml` (0.5),
-`upstream-canary.yml` (0.11) and `runner-docker-prune.yml`. Light jobs use
-`[self-hosted, hfs-cassandra-light]`, the two clippy jobs
+`upstream-canary.yml` (0.11), `runner-docker-prune.yml`,
+`cassandra-coverage.yml` and `fhir-versions.yml`. Light jobs use
+`[self-hosted, hfs-cassandra-light]`, the two clippy jobs and
+`fhir-versions.yml`'s all-versions test job
 `[self-hosted, hfs-cassandra-heavy]`, and the Rust jobs keep a bounded cargo
 target directory on each machine instead of a cache (ADR-sam-michaels-0002).
 
@@ -24,10 +26,12 @@ the service setup. Coverage runs on pushes to `main`, pull requests targeting
 `main`, and manual dispatches.
 
 `ci.yml` and `fhir-benchmark.yml` were
-archived as well: every job in them targets `self-hosted` runner labels, and
+archived as well: apart from one `ubuntu-latest` job in each (`publish-report`
+in `ci.yml`, `compare` in `fhir-benchmark.yml`), the jobs in them that name a
+runner target `self-hosted` labels, and
 `ci.yml` also needs a remote Docker host (`DOCKER_HOST` secret) for
 testcontainers. When they were archived this fork had no self-hosted runner, so
-their jobs queued indefinitely. Since #16 it has `sam-7900x`
+those jobs queued indefinitely. Since #16 it has `sam-7900x`
 (ADR-sam-michaels-0001), and since 2026-11-04 also `acruzdebian`
 (ADR-aacruzgon-0023), but `ci.yml` still lacks the remote Docker host. Several
 `ci.yml` jobs target plain `[self-hosted]` or `[self-hosted, Linux]`, which both

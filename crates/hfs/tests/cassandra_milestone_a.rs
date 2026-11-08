@@ -18,11 +18,14 @@
 //! # Step 3 through REST
 //!
 //! `step3_crud_through_rest` (roadmap Step 3, D24 of its plan) runs update,
-//! delete, revive, PATCH, HEAD, `Prefer`, `If-Match`, the id check, one batch
-//! and `/metadata` through the same `hfs`, each check against its HL7 FHIR R4
-//! rule, and prints one `[spec row=… expected=… got=…]` line per check. A
-//! `DELETE` of an unknown id, and of an already-deleted one, answers 204 and
-//! writes no version (ADR-aacruzgon-0052). It needs every Step 3 method:
+//! delete, revive, PATCH, HEAD, `Prefer`, `If-Match`, the id check, one batch,
+//! the batches with `ifMatch`, and `/metadata` through the same `hfs`, each
+//! check against its HL7 FHIR R4 rule, and prints one
+//! `[spec row=… expected=… got=…]` line per check. A `DELETE` of an unknown
+//! id, and of an already-deleted one, answers 204 and writes no version
+//! (ADR-aacruzgon-0052). A batch `ifMatch` PUT goes through `update` and a
+//! batch `ifMatch` DELETE through `delete_versioned`, pinned to the version
+//! their gate checked (ADR-aacruzgon-0056). It needs every Step 3 method:
 //! roadmap Step 3's write path, `create_or_update` and the versioned reads.
 //!
 //! # Where the node comes from
@@ -429,9 +432,9 @@ async fn round_trip(hfs: &Hfs) {
 // Roadmap Step 3 through REST (D24 of the Step 3 plan).
 
 /// Roadmap Step 3 (CRUD core) through the real `hfs`: update, delete,
-/// revive, PATCH, HEAD, `Prefer`, `If-Match`, the id check, one batch, and
-/// what `/metadata` says, each against the HL7 FHIR R4 rule it checks (the
-/// Step 3 matrix's rows; R4B's text is the same).
+/// revive, PATCH, HEAD, `Prefer`, `If-Match`, the id check, one batch, the
+/// batches with `ifMatch`, and what `/metadata` says, each against the HL7
+/// FHIR R4 rule it checks (the Step 3 matrix's rows; R4B's text is the same).
 ///
 /// Every check prints one `[spec row=<row> expected=<value> got=<value>]`
 /// line before it asserts, for the CI report that tabulates them; keep the
@@ -466,6 +469,7 @@ async fn step3_crud_through_rest() {
     delete_and_revive_through_rest(&rest, &suffix).await;
     invalid_ids_through_rest(&rest).await;
     batch_through_rest(&rest, &suffix).await;
+    batch_if_match_through_rest(&rest, &suffix).await;
     metadata_through_rest(&rest).await;
 }
 
@@ -1080,6 +1084,127 @@ async fn batch_through_rest(rest: &Rest<'_>, suffix: &str) {
         read.body["name"][0]["family"].as_str().unwrap_or("-"),
         hfs,
     );
+}
+
+/// A batch `ifMatch` is pinned to the version its gate checked (Step 3 plan
+/// L6 and D22; HeliosSoftware/hfs#2530, ADR-aacruzgon-0056; matrix rows CC-9
+/// and CC-10, checklist 13). One batch sends a satisfied `ifMatch` PUT, which
+/// REST now routes to `update`, beside a PUT without one, which still goes to
+/// `create_or_update`, and a satisfied `ifMatch` DELETE, which goes to
+/// `delete_under_precondition` and so `delete_versioned`. A second batch holds
+/// two `ifMatch: W/"1"` PUTs for one id. That is the client's error (R4
+/// #brules), but `ifMatch` must still prevent the lost update: exactly one
+/// writes, and the other answers 409 if it was checked before the winner
+/// wrote, or 412 if after. A race inside one entry cannot be staged through
+/// the binary; `crates/rest/tests/if_match_write_race.rs` covers it on SQLite.
+async fn batch_if_match_through_rest(rest: &Rest<'_>, suffix: &str) {
+    let hfs = rest.hfs;
+    let held = format!("s3-batch-held-{suffix}");
+    let plain = format!("s3-batch-plain-{suffix}");
+    let held_delete = format!("s3-batch-held-delete-{suffix}");
+    let twin = format!("s3-batch-twin-{suffix}");
+    for id in [&held, &plain, &held_delete, &twin] {
+        let created = rest
+            .put(&format!("Patient/{id}"), &patient(id, "Setup"), &[])
+            .await;
+        spec("CC-9:setup", 201, created.code(), hfs);
+    }
+    let status = |entries: &[Value], n: usize| {
+        entries[n]["response"]["status"]
+            .as_str()
+            .unwrap_or("-")
+            .split_whitespace()
+            .next()
+            .unwrap_or("-")
+            .to_owned()
+    };
+
+    let bundle = json!({
+        "resourceType": "Bundle",
+        "type": "batch",
+        "entry": [
+            {"resource": patient(&held, "BatchHeld"),
+             "request": {"method": "PUT", "url": format!("Patient/{held}"), "ifMatch": "W/\"1\""}},
+            {"resource": patient(&plain, "BatchPlain"),
+             "request": {"method": "PUT", "url": format!("Patient/{plain}")}},
+            {"request": {"method": "DELETE", "url": format!("Patient/{held_delete}"), "ifMatch": "W/\"1\""}}
+        ]
+    });
+    let answer = rest.post("", &bundle).await;
+    spec("CC-9:batch", 200, answer.code(), hfs);
+    let entries = answer.body["entry"].as_array().cloned().unwrap_or_default();
+    spec("CC-9:entries", 3, entries.len(), hfs);
+    // `update` (with ifMatch) and `create_or_update` (without) answer alike.
+    for (n, (row, id)) in [
+        (0, ("CC-9:held-put", &held)),
+        (1, ("CC-9:plain-put", &plain)),
+    ] {
+        spec(row, "200", status(&entries, n), hfs);
+        let response = &entries[n]["response"];
+        spec(
+            &format!("{row}-etag"),
+            "W/\"2\"",
+            response["etag"].as_str().unwrap_or("-"),
+            hfs,
+        );
+        spec(
+            &format!("{row}-location"),
+            true,
+            response["location"]
+                .as_str()
+                .is_some_and(|l| l.ends_with(&format!("Patient/{id}/_history/2"))),
+            hfs,
+        );
+    }
+    spec("CC-10:held-delete", "204", status(&entries, 2), hfs);
+
+    // Each entry did what its status says.
+    for (row, id, family) in [
+        ("CC-9:held-read", &held, "BatchHeld"),
+        ("CC-9:plain-read", &plain, "BatchPlain"),
+    ] {
+        let read = rest.get(&format!("Patient/{id}")).await;
+        spec(
+            row,
+            family,
+            read.body["name"][0]["family"].as_str().unwrap_or("-"),
+            hfs,
+        );
+        spec(&format!("{row}-etag"), "W/\"2\"", read.header(ETAG), hfs);
+    }
+    let read = rest.get(&format!("Patient/{held_delete}")).await;
+    spec("CC-10:held-delete-reads-410", 410, read.code(), hfs);
+
+    // Two `ifMatch: W/"1"` PUTs for one id: one write, never two.
+    let twins = json!({
+        "resourceType": "Bundle",
+        "type": "batch",
+        "entry": [
+            {"resource": patient(&twin, "TwinA"),
+             "request": {"method": "PUT", "url": format!("Patient/{twin}"), "ifMatch": "W/\"1\""}},
+            {"resource": patient(&twin, "TwinB"),
+             "request": {"method": "PUT", "url": format!("Patient/{twin}"), "ifMatch": "W/\"1\""}}
+        ]
+    });
+    let answer = rest.post("", &twins).await;
+    spec("CC-9:twins-batch", 200, answer.code(), hfs);
+    let entries = answer.body["entry"].as_array().cloned().unwrap_or_default();
+    spec("CC-9:twins-entries", 2, entries.len(), hfs);
+    let codes: Vec<String> = (0..entries.len()).map(|n| status(&entries, n)).collect();
+    spec(
+        "CC-9:twins-one-write",
+        1,
+        codes.iter().filter(|c| *c == "200").count(),
+        hfs,
+    );
+    spec(
+        "CC-9:twins-loser-409-or-412",
+        true,
+        codes.iter().any(|c| c == "409" || c == "412"),
+        hfs,
+    );
+    let read = rest.get(&format!("Patient/{twin}")).await;
+    spec("CC-9:twins-version", "W/\"2\"", read.header(ETAG), hfs);
 }
 
 /// What `/metadata` says for Patient once Step 3 is in, where it is true

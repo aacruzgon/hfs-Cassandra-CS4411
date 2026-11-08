@@ -256,6 +256,8 @@ jobs:
       # it kills its hfs too. It runs when the round trip passed, like the
       # readiness test, so its failure fails the job but hides neither that
       # test nor the report steps, which run unless the run is cancelled.
+      # The profile files it adds are listed for the crates/rest section,
+      # which reports them apart; the trap writes the list on a failure too.
       - name: Step 3 CRUD through hfs against this node
         id: step3-rest
         if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
@@ -264,6 +266,9 @@ jobs:
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
           log="$RUNNER_TEMP/ci-report/logs/step3-rest.log"
+          profiles() { find "$CARGO_LLVM_COV_TARGET_DIR" -maxdepth 1 -name '*.profraw' | sed 's#.*/##' | sort; }
+          profiles > "$RUNNER_TEMP/profiles-before-step3.txt"
+          trap 'profiles | comm -13 "$RUNNER_TEMP/profiles-before-step3.txt" - > "$RUNNER_TEMP/step3-profiles.txt"' EXIT
           if ! grep -q 'fn step3_crud_through_rest' crates/hfs/tests/cassandra_milestone_a.rs; then
             echo "::error title=Step 3 REST test::step3_crud_through_rest is not in crates/hfs/tests/cassandra_milestone_a.rs"
             exit 1
@@ -336,6 +341,45 @@ jobs:
             "$export_json" "$RUNNER_TEMP/coverage-section.md" "$RUNNER_TEMP/coverage-section.json"
           python3 .github/scripts/ci-report.py add coverage "Coverage: Cassandra backend (report only)" \
             --markdown "$RUNNER_TEMP/coverage-section.md" --json "$RUNNER_TEMP/coverage-section.json"
+
+      # Report only, and a section of its own: the backend's scope, figures
+      # and files above do not change (ADR-aacruzgon-0070). REST runs in the
+      # hfs processes the Milestone A tests start, so a second export of the
+      # same profiles, with its own regex keeping only crates/rest/src, shows
+      # what the round trip, Step 3 CRUD through REST and readiness reach.
+      # A third export sets step 3's profiles aside (into $RUNNER_TEMP, and
+      # back), so the section also shows what that step alone adds. A
+      # failure here fails neither the job nor the backend report.
+      - name: Report the coverage of crates/rest (section)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          others() {
+            for entry in "$1"/*; do
+              entry=${entry##*/}
+              if ! echo "$entry" | grep -qxE "$2"; then echo "$entry"; fi
+            done | sed 's/\./\\./g' | paste -sd'|' -
+          }
+          ignore="crates/(($(others crates rest))/|rest/($(others crates/rest src))(/|$))"
+          echo "ignore-filename-regex: $ignore"
+          all="$RUNNER_TEMP/llvm-cov-rest.json" without="$RUNNER_TEMP/llvm-cov-rest-without-step3.json"
+          cargo llvm-cov report --json --output-path "$all" --ignore-filename-regex "$ignore"
+          list="$RUNNER_TEMP/step3-profiles.txt" aside="$RUNNER_TEMP/step3-profiles-aside"
+          if [ -s "$list" ]; then
+            echo "Step 3's profile files: $(wc -l < "$list")"
+            mkdir -p "$aside"
+            while IFS= read -r name; do mv "$CARGO_LLVM_COV_TARGET_DIR/$name" "$aside/"; done < "$list"
+            cargo llvm-cov report --json --output-path "$without" --ignore-filename-regex "$ignore" || without=-
+            mv "$aside"/*.profraw "$CARGO_LLVM_COV_TARGET_DIR/"
+          else
+            echo "No profile files listed for step 3"; without=-
+          fi
+          COVERAGE_LLVM_COV_VERSION=$(cargo llvm-cov --version)
+          export COVERAGE_LLVM_COV_VERSION
+          python3 .github/scripts/cassandra-coverage-rest-summary.py \
+            "$all" "$without" "$RUNNER_TEMP/coverage-rest-section.md" "$RUNNER_TEMP/coverage-rest-section.json"
+          python3 .github/scripts/ci-report.py add coverage-rest "Coverage: crates/rest through the Cassandra tests (report only)" \
+            --markdown "$RUNNER_TEMP/coverage-rest-section.md" --json "$RUNNER_TEMP/coverage-rest-section.json"
 
       - name: Cassandra logs
         if: failure()

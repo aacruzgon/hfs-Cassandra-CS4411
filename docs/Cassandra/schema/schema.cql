@@ -154,6 +154,9 @@ CREATE TABLE IF NOT EXISTS resource_versions (
                               -- the row came from a rewrite built from update's
                               -- StoredResource. Decides an unknown CAS outcome
                               -- that a later version superseded (ADR-aacruzgon-0026)
+                              -- Note (ADR-aacruzgon-0061): update's rewrite is now
+                              -- built from its R1 and carries R1's write_id, so
+                              -- no rewrite leaves it unset (the rule at the top).
     index_keys    blob,       -- the index rows this version wrote, encoded as
                               -- below; never unset (ADR-aacruzgon-0027)
     PRIMARY KEY ((tenant_id, resource_type, id), version_id)

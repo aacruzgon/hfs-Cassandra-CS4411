@@ -404,7 +404,7 @@ REST has already read the row, checked `If-Match` (412 on a mismatch, before sto
 
 `update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `OptimisticLockFailure` (412) without a CAS; a CAS miss after that is 409. Its V3, at step 2, is built from that R1, so it carries R1's `write_id`, as plain `update`'s does (ADR-aacruzgon-0061).
 
-*Open for Step 4.* Which error the mismatch answers is Step 4's to decide, in its ADR, which updates this paragraph. Step 4's handover (roadmap Step 4, "Open for the Step 4 group") recommends `VersionConflict` (409): `versioning_suite`'s `test_update_with_match_etag_mismatch` asserts it, SQLite, PostgreSQL, MongoDB and this backend's `delete_with_match` (4.4) answer it, and REST answers an `If-Match` mismatch with 412 from its own read and never calls this method.
+*Open for Step 4.* Until Step 4, `update_with_match` is a stub that answers `UnsupportedCapability` (501) (`crates/persistence/src/backends/cassandra/storage.rs:171-180`); this paragraph is its design. Which error the mismatch answers is Step 4's to decide, in its ADR, which updates this paragraph. Step 4's handover (roadmap Step 4, "Open for the Step 4 group") recommends `VersionConflict` (409): `versioning_suite`'s `test_update_with_match_etag_mismatch` asserts it, SQLite, PostgreSQL, MongoDB and this backend's `delete_with_match` (4.4) answer it, and REST answers an `If-Match` mismatch with 412 from its own read and never calls this method.
 
 ### 3.4 Delete (`delete` and `delete_versioned`, `DELETE /Patient/id`)
 

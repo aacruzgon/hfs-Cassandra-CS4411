@@ -521,6 +521,10 @@ reviews:
     # Dockerfile and docker/ compose files.
     hadolint:
       enabled: true
+    # Off: hadolint covers the Dockerfile, and gitleaks and trufflehog the
+    # secrets; there is no Terraform or Kubernetes here for its IaC rules.
+    trivy:
+      enabled: false
     # The CQL and SQL files are Cassandra and PostgreSQL scripts that
     # sqlfluff's dialects misread; the schema is signed off.
     sqlfluff:

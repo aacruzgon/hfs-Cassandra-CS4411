@@ -23,16 +23,16 @@
 - **Consequences:**
     - **What it guarantees.** A request that has had an unknown outcome never answers 500 for a backend error, whatever statement failed, so the client knows to retry later and to check before retrying a create.
     - **What becomes harder.** As with ADR-0055, an operator cannot tell a server bug on these statements from an outage by the HTTP status. `map_driver_error` still logs the driver's detail at `error` level for a statement the plain table makes 500.
-    - **Tests** (in the same commit; each fails on the parent commit's code):
+    - **Tests**, in three groups, each from its own commit on PR #64. The first four and the two fault modes came in `d90270edd`, with this entry; each of those tests fails on the parent commit's code:
         - `a_reruns_intent_error_after_an_unknown_outcome_is_503`: the review's reproduction; the resource is stored by attempt 1, and the answer is 503.
         - `a_reruns_previous_version_row_error_after_an_unknown_outcome_is_503`: an update's re-run V3 fails with a `Server` error.
         - `a_later_turns_pre_read_error_after_an_unknown_outcome_is_503`: a plain delete's C3 times out, R2 shows another request's update, and the retry's R1 fails with a `Server` error.
         - `after_an_unknown_outcome_no_statement_error_is_500` (pure): 500 before any unknown outcome, 503 after for `Server` and `Invalid`, 504 kept for a timeout, a permission error kept.
         - Two test-only fault modes in the `cfg(test)` seam (`session.rs`): `FailWithServerError`, and `PassThrough`, which lets a fault land on the second statement of the same text.
-        - Added by the independent audit of PR #64 (`pr64-review`), which found the two cases the first change missed; each fails on the parent commit's code:
+        - Added in `dcd520db2` by the independent audit of PR #64 (`pr64-review`), which found the two cases the first change missed; each fails on the parent commit's code:
             - `a_reruns_cas_refused_before_it_runs_after_an_unknown_outcome_is_503`: attempt 1's C1 applies late, and the re-run's C1 is refused with a `Protocol` error; the resource is stored, and the answer is 503, not 500. It adds the fault mode `FailWithProtocolError`.
             - `a_later_turns_undecodable_pre_read_after_an_unknown_outcome_is_503`: a plain delete's retry reads a row whose `index_keys` does not decode; 503, not 500.
-        - Added after that audit's own review (finding A1), for the two other decoding sites; each fails when its own site is reverted:
+        - Added in `8a6e4bbd9`, after that audit's own review (finding A1), for the two other decoding sites; each fails when its own site is reverted:
             - `a_later_turns_undecodable_live_row_after_an_unknown_outcome_is_503`: a `create_or_update`'s turn 1 reads a live row whose `index_keys` does not decode (`update_attempt`); 503.
             - `a_later_turns_undecodable_marker_after_an_unknown_outcome_is_503`: the same on a delete marker (the revive branch); 503.
     - **To revisit.** Step 8's three-node failure tests, with the third alternative above.

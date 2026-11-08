@@ -91,7 +91,7 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0044](2026-11-06/0044-upgrade-cdrs-tokio.md) | 2026-11-06 | Upgrade `cdrs-tokio` to 10.0.0, and drop the workarounds it makes unnecessary | accepted |
 | [0045](2026-11-06/0045-ci-reports-and-boot-time.md) | 2026-11-06 | CI reports measured figures on every run, starting with the boot time; they never fail a job | accepted |
 | [0046](2026-11-06/0046-more-ci-reports.md) | 2026-11-06 | More CI reports: latency, dependency freshness, advisories, sizes and step timings | accepted |
-| [0047](2026-11-06/0047-coverage-report-in-ci.md) | 2026-11-06 | A Cassandra coverage report in CI, in its own workflow, not required and with no threshold | accepted |
+| [0047](2026-11-06/0047-coverage-report-in-ci.md) | 2026-11-06 | A Cassandra coverage report in CI, in its own workflow, not required and with no threshold | accepted; its clean and its scope amended by [0070](2026-11-07/0070-coverage-cachedir-tag.md) |
 | [0048](2026-11-06/0048-more-ci-reports-node-and-build.md) | 2026-11-06 | More CI reports: the R4B build, cargo timings, the node's start, its JVM and container, hfs's memory, and the stored-SearchParameter load | accepted |
 | [0049](2026-11-06/0049-backport-upstream-2518.md) | 2026-11-06 | Carry upstream's versioned-`Location` fix (HeliosSoftware/hfs#2518) in the fork ahead of upstream, as `-x` cherry-picks | accepted; the Milestone A vread flip came at Step 3, not Step 4 ([0060](2026-11-06/0060-step3-scope.md)) |
 | [0050](2026-11-06/0050-one-cas-engine.md) | 2026-11-06 | Every compare-and-swap goes through one write engine, under the rules of ADR-aacruzgon-0034 and 0035 | accepted; R2/R3 error mapping amended by [0055](2026-11-06/0055-r2-r3-errors-503.md) |
@@ -114,3 +114,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0067](2026-11-07/0067-errors-after-unknown-outcome-503.md) | 2026-11-07 | After an unknown CAS outcome, every later statement's error is 504 for a timeout and 503 for anything else | accepted |
 | [0068](2026-11-07/0068-overlay-follows-undecided-writes.md) | 2026-11-07 | A SearchParameter write whose outcome could not be decided reads its row back, and the overlay follows it | accepted |
 | [0069](2026-11-07/0069-coderabbit-config.md) | 2026-11-07 | A `.coderabbit.yaml` that reviews against the fork's own rules, on the chill profile, with every pre-merge check at warning | accepted |
+| [0070](2026-11-07/0070-coverage-cachedir-tag.md) | 2026-11-07 | The persistent target dirs carry cargo's `CACHEDIR.TAG`, so `cargo llvm-cov clean` really cleans the coverage dir; the coverage report also runs `step3_crud_through_rest` and gets a `crates/rest` section | accepted |

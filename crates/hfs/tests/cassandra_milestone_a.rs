@@ -1001,6 +1001,7 @@ async fn batch_through_rest(rest: &Rest<'_>, suffix: &str) {
     let deleted = format!("s3-batch-deleted-{suffix}");
     let stale = format!("s3-batch-stale-{suffix}");
     let new = format!("s3-batch-new-{suffix}");
+    let unknown = format!("s3-batch-unknown-{suffix}");
     for id in [&existing, &to_delete, &deleted, &stale] {
         let created = rest
             .put(&format!("Patient/{id}"), &patient(id, "Setup"), &[])
@@ -1023,7 +1024,7 @@ async fn batch_through_rest(rest: &Rest<'_>, suffix: &str) {
             {"resource": patient(&existing, "BatchUpdated"),
              "request": {"method": "PUT", "url": format!("Patient/{existing}")}},
             {"request": {"method": "DELETE", "url": format!("Patient/{to_delete}")}},
-            {"request": {"method": "DELETE", "url": format!("Patient/s3-batch-unknown-{suffix}")}},
+            {"request": {"method": "DELETE", "url": format!("Patient/{unknown}")}},
             {"request": {"method": "GET", "url": format!("Patient/{deleted}")}},
             {"resource": patient(&stale, "BatchStale"),
              "request": {"method": "PUT", "url": format!("Patient/{stale}"), "ifMatch": "W/\"1\""}}
@@ -1075,6 +1076,13 @@ async fn batch_through_rest(rest: &Rest<'_>, suffix: &str) {
     // Each entry did what its status says, and the refused one nothing.
     let read = rest.get(&format!("Patient/{to_delete}")).await;
     spec("B-7:deleted-reads-410", 410, read.code(), hfs);
+    // The DELETE of an id that never existed answered 204 and wrote nothing,
+    // as the instance DELETE's D-3 rows check: the id stays unknown (404),
+    // not deleted (410), and has no version.
+    let read = rest.get(&format!("Patient/{unknown}")).await;
+    spec("B-7:delete-unknown-stays-unknown", 404, read.code(), hfs);
+    let vread = rest.get(&format!("Patient/{unknown}/_history/1")).await;
+    spec("B-7:delete-unknown-no-version", 404, vread.code(), hfs);
     let read = rest.get(&format!("Patient/{stale}")).await;
     spec("B-7:stale-unchanged", "W/\"2\"", read.header(ETAG), hfs);
     let read = rest.get(&format!("Patient/{existing}")).await;

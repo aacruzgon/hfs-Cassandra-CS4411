@@ -165,11 +165,14 @@ reviews:
         Rules from CLAUDE.md ("Important Notes"):
         - Code may assume at least one FHIR version feature (R4, R4B, R5, R6)
           is on. Flag a new cfg ladder or fallback for "no version enabled".
-        - Elsewhere in the workspace, FhirVersion::default() (R4 only) and
-          FhirVersion::R4 arms behind #[cfg(feature = "R4")] are allowed
-          (CLAUDE.md, "FHIR version feature assumption"). The stricter rules
-          for the Cassandra backend and its tests are in their own
-          instructions below.
+        - FhirVersion::default() exists only with the R4 feature; code that
+          calls it assumes R4 is on (CLAUDE.md, "FHIR version feature
+          assumption"). Outside what the R4B-only CI check builds, it and
+          FhirVersion::R4 arms behind #[cfg(feature = "R4")] are allowed.
+          That check builds helios-persistence without R4: its library, and
+          the test files of the cassandra_tests and
+          backend_capability_contract targets. The rules for those files are
+          in their own instructions below.
         - Minimum Rust is 1.91.1, edition 2024 (rust-version in the root
           Cargo.toml). Flag a std or language feature stabilised after 1.91.
         - Clippy runs with -D warnings on all targets and all features in CI;
@@ -291,11 +294,50 @@ reviews:
         - Without HFS_TEST_CASSANDRA_URL a test skips or starts its own
           container; it never runs DDL against the shared node.
         - Test tenants start with "test-" (CI report R4 reads only those).
-        - These files build in the R4B-only CI check, without R4
-          (ADR-aacruzgon-0039, 0065). Flag FhirVersion::default(), which
-          exists only with the R4 feature (use
-          FhirVersion::default_enabled()), and a FhirVersion::R4 literal
-          that is not behind #[cfg(feature = "R4")].
+          These files also build in the R4B-only CI check (the instruction
+          below).
+
+    # ---- What the R4B-only check builds ------------------------------------
+    # r4b-compile-check.yml runs cargo check -p helios-persistence
+    # --no-default-features --features cassandra,R4B twice: for the library,
+    # and for --test cassandra_tests --test backend_capability_contract. The
+    # two globs below are what those builds compile, read from cargo's
+    # dep-info files: the library under crates/persistence/src, less what
+    # another feature or test gates, and 17 test files.
+    - path: "crates/persistence/src/**"
+      instructions: |
+        The R4B-only CI check (r4b-compile-check.yml; ADR-aacruzgon-0019,
+        0039) compiles this library without R4, with only the cassandra
+        feature: every item that no sqlite, postgres, mongodb,
+        elasticsearch, s3, advisor or test cfg gates. In that code
+        (CLAUDE.md, "FHIR version feature assumption"):
+        - Flag FhirVersion::default(), which exists only with the R4
+          feature, unless the item is behind #[cfg(feature = "R4")]. Use
+          FhirVersion::default_enabled() instead.
+        - Flag a FhirVersion::R4 literal that is not behind
+          #[cfg(feature = "R4")].
+        Code under #[cfg(test)], doc comments, and modules gated on another
+        backend's feature are not built there and may use both. The
+        Cassandra backend's own rule is stricter (its instruction above).
+
+    - path: "crates/persistence/tests/{cassandra/**,cassandra_tests.rs,\
+        backend_capability_contract.rs,common/{capabilities,cassandra,\
+        cassandra_testable,container_cleanup,fixtures,harness,seeding}.rs,\
+        multitenancy/tenant_{existence,id_fidelity}_suite.rs,\
+        search/versioned_write_race_suite.rs}"
+      instructions: |
+        These files are the test targets of the R4B-only CI check
+        (r4b-compile-check.yml: --test cassandra_tests --test
+        backend_capability_contract; ADR-aacruzgon-0039, 0065), built
+        without R4. cassandra_tests.rs pulls in the shared harness files and
+        the three shared suites in this glob through #[path] and mod items.
+        - Flag FhirVersion::default(), which exists only with the R4
+          feature; use FhirVersion::default_enabled().
+        - Flag a FhirVersion::R4 literal that is not behind
+          #[cfg(feature = "R4")].
+        - A new #[path] or mod item in cassandra_tests.rs adds a file to
+          this build, and this instruction's glob in .coderabbit.yaml should
+          then name it.
 
     # ---- Upstream files the fork changes -----------------------------------
     - path: "{crates,book,utils,docker}/**"

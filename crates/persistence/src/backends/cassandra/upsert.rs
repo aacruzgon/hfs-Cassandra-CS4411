@@ -164,66 +164,76 @@ impl CassandraBackend {
         // the answer takes the new version's `last_updated`, as `read` would.
         let mut created_at: Option<DateTime<Utc>> = None;
         let mut last_miss = (CasMiss::VersionMoved { current: None }, 0);
-
-        for turn in 0..=UPSERT_MISS_RETRIES {
-            if turn > 0 {
-                request.note_miss_retry();
-            }
-            // After an unknown outcome, R1's error answers as R2's does
-            // (ADR-aacruzgon-0067).
-            let row = request.after_unknown(
-                self.read_resource_row(tenant_id, resource_type, id).await,
-                "pre-read",
-            )?;
-            if let Some(row) = &row {
-                created_at = row.created_at;
-            }
-            if let Some(applied) = self
-                .check_earlier_attempts(&mut request, row.as_ref())
-                .await?
-            {
-                return self.upserted(tenant, resource_type, id, applied, created_at);
-            }
-
-            let branch = Branch::of(row.as_ref());
-            tenant.check_permission(branch.operation(), resource_type)?;
-            check_search_parameter_code(resource_type, &resource)?;
-            seam.before_cas(turn).await;
-
-            let body = resource.clone();
-            let (outcome, expected) = match (branch, &row) {
-                (Branch::Update, Some(row)) => (
-                    self.update_attempt(&mut request, row, body).await?,
-                    row.version_id,
-                ),
-                (Branch::Revive, Some(row)) => {
-                    let previous = PreviousVersion::from_row(row)?;
-                    let (body, data) =
-                        normalized_body("create_or_update", resource_type, id, body)?;
-                    let plan =
-                        CasPlan::revive(previous, body, data, vec![IndexKey::ResourcesByType]);
-                    (self.run_cas(&mut request, plan).await?, row.version_id)
+        let result = async {
+            for turn in 0..=UPSERT_MISS_RETRIES {
+                if turn > 0 {
+                    request.note_miss_retry();
                 }
-                // Branch a, the only one `Branch::of` picks for no row.
-                _ => {
-                    let (body, data) =
-                        normalized_body("create_or_update", resource_type, id, body)?;
-                    let plan =
-                        CasPlan::create(body, data, fhir_version, vec![IndexKey::ResourcesByType]);
-                    (self.run_cas(&mut request, plan).await?, 0)
+                // After an unknown outcome, R1's error answers as R2's does
+                // (ADR-aacruzgon-0067).
+                let row = request.after_unknown(
+                    self.read_resource_row(tenant_id, resource_type, id).await,
+                    "pre-read",
+                )?;
+                if let Some(row) = &row {
+                    created_at = row.created_at;
                 }
-            };
-            match outcome {
-                CasOutcome::Applied(applied) => {
+                if let Some(applied) = self
+                    .check_earlier_attempts(&mut request, row.as_ref())
+                    .await?
+                {
                     return self.upserted(tenant, resource_type, id, applied, created_at);
                 }
-                CasOutcome::Missed(miss) => last_miss = (miss, expected),
-            }
-        }
 
-        request.note_miss_budget_exhausted();
-        let (miss, expected) = last_miss;
-        Err(budget_exhausted(miss, resource_type, id, expected))
+                let branch = Branch::of(row.as_ref());
+                tenant.check_permission(branch.operation(), resource_type)?;
+                check_search_parameter_code(resource_type, &resource)?;
+                seam.before_cas(turn).await;
+
+                let body = resource.clone();
+                let (outcome, expected) = match (branch, &row) {
+                    (Branch::Update, Some(row)) => (
+                        self.update_attempt(&mut request, row, body).await?,
+                        row.version_id,
+                    ),
+                    (Branch::Revive, Some(row)) => {
+                        let previous = PreviousVersion::from_row(row)?;
+                        let (body, data) =
+                            normalized_body("create_or_update", resource_type, id, body)?;
+                        let plan =
+                            CasPlan::revive(previous, body, data, vec![IndexKey::ResourcesByType]);
+                        (self.run_cas(&mut request, plan).await?, row.version_id)
+                    }
+                    // Branch a, the only one `Branch::of` picks for no row.
+                    _ => {
+                        let (body, data) =
+                            normalized_body("create_or_update", resource_type, id, body)?;
+                        let plan = CasPlan::create(
+                            body,
+                            data,
+                            fhir_version,
+                            vec![IndexKey::ResourcesByType],
+                        );
+                        (self.run_cas(&mut request, plan).await?, 0)
+                    }
+                };
+                match outcome {
+                    CasOutcome::Applied(applied) => {
+                        return self.upserted(tenant, resource_type, id, applied, created_at);
+                    }
+                    CasOutcome::Missed(miss) => last_miss = (miss, expected),
+                }
+            }
+
+            request.note_miss_budget_exhausted();
+            let (miss, expected) = last_miss;
+            Err(budget_exhausted(miss, resource_type, id, expected))
+        }
+        .await;
+        // An undecided SearchParameter write: the overlay follows the row
+        // (ADR-aacruzgon-0068).
+        self.settle_overlay_after_unknown(&request, &result).await;
+        result
     }
 
     /// The answer for the attempt that applied, from its own plan (it may be

@@ -745,6 +745,89 @@ impl CassandraBackend {
         self.remove_stored_search_parameter(tenant_id, id, deleted_at);
     }
 
+    /// Makes `id`'s entry in `tenant_id`'s overlay follow `row`, the
+    /// stored SearchParameter as read (ADR-aacruzgon-0068), with the same
+    /// rules a write that knows what it wrote uses: a delete marker is a
+    /// removal at its `last_updated`, as `delete` records it; a live row is
+    /// put in or removed by its body, as `update` records it; no row changes
+    /// nothing. A removal this overlay already holds, at or after the
+    /// marker, with no older definition of `id` left, is not recorded again,
+    /// so a repeated `delete` of a deleted SearchParameter does not drop the
+    /// tenant's registry each time.
+    pub(super) fn follow_stored_search_parameter(
+        &self,
+        tenant_id: &str,
+        id: &str,
+        row: Option<&super::read::ResourceRow>,
+    ) {
+        let Some(row) = row else {
+            return;
+        };
+        if row.is_deleted() {
+            let recorded = self
+                .stored_by_tenant
+                .read()
+                .get(tenant_id)
+                .is_some_and(|overlay| {
+                    overlay
+                        .removals
+                        .iter()
+                        .any(|r| r.id == id && r.at >= row.last_updated)
+                        && !overlay
+                            .defs
+                            .iter()
+                            .any(|d| d.id() == id && d.last_updated() <= row.last_updated)
+                });
+            if !recorded {
+                self.forget_stored_search_parameter(tenant_id, id, row.last_updated);
+            }
+            return;
+        }
+        let Some(body) = row
+            .data
+            .as_deref()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        else {
+            return;
+        };
+        self.replace_stored_search_parameter(tenant_id, id, &body, row.last_updated);
+    }
+
+    /// After a SearchParameter write that answered an error once one of its
+    /// attempts' outcome was unknown (`undecidable`, ADR-aacruzgon-0055 or
+    /// 0067): the write may or may not be stored, so it could record nothing
+    /// in the overlay, and a delete or deactivation that did apply would stay
+    /// in force here until the TTL refresh. One serial read of the row tells
+    /// which, and the overlay follows it ([`Self::follow_stored_search_parameter`],
+    /// ADR-aacruzgon-0068). A failed read is logged and changes nothing: the
+    /// refresh, or a later write of the same id, settles it then.
+    pub(super) async fn settle_overlay_after_unknown<T>(
+        &self,
+        request: &super::write::CasRequest<'_>,
+        result: &StorageResult<T>,
+    ) {
+        let key = request.key();
+        if key.resource_type != "SearchParameter"
+            || result.is_ok()
+            || !request.had_unknown_outcome()
+        {
+            return;
+        }
+        match self
+            .serial_read_resource_row(key.tenant_id, key.resource_type, key.id)
+            .await
+        {
+            Ok(row) => self.follow_stored_search_parameter(key.tenant_id, key.id, row.as_ref()),
+            Err(error) => tracing::warn!(
+                tenant_id = key.tenant_id,
+                id = %key.id,
+                error = %error,
+                "a SearchParameter write's outcome is unknown and its row could not be read \
+                 back; the overlay keeps its entry until the next refresh or write of it"
+            ),
+        }
+    }
+
     /// The overlay definition of a stored SearchParameter `resource`, or
     /// `None` when the overlay does not hold it: not `active`, a `url` the
     /// shared base already holds (`create_affects_overlay`), or a body the

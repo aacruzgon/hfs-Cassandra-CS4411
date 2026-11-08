@@ -145,18 +145,23 @@ impl CassandraBackend {
             id,
         };
         let mut request = self.cas_request("update", key);
-        let applied = match self
-            .check_earlier_attempts(&mut request, Some(&row))
-            .await?
-        {
-            Some(applied) => applied,
-            None => match self.update_attempt(&mut request, &row, resource).await? {
-                CasOutcome::Applied(applied) => applied,
-                CasOutcome::Missed(miss) => {
-                    return Err(miss.into_error(resource_type, id, expected));
-                }
-            },
-        };
+        let outcome = async {
+            match self
+                .check_earlier_attempts(&mut request, Some(&row))
+                .await?
+            {
+                Some(applied) => Ok(applied),
+                None => match self.update_attempt(&mut request, &row, resource).await? {
+                    CasOutcome::Applied(applied) => Ok(applied),
+                    CasOutcome::Missed(miss) => Err(miss.into_error(resource_type, id, expected)),
+                },
+            }
+        }
+        .await;
+        // An undecided SearchParameter update: the overlay follows the row
+        // (ADR-aacruzgon-0068).
+        self.settle_overlay_after_unknown(&request, &outcome).await;
+        let applied = outcome?;
 
         let content = applied.plan.body().cloned().unwrap_or(Json::Null);
         if resource_type == "SearchParameter" {

@@ -263,6 +263,37 @@ impl CassandraBackend {
         rows.first().map(ResourceRow::decode).transpose()
     }
 
+    /// R1's statement at `LOCAL_SERIAL`, which first completes a proposal
+    /// the replicas already accepted, so it reads at least what a plain read
+    /// would (ADR-aacruzgon-0068: the overlay follows the row after a
+    /// SearchParameter write whose outcome could not be decided). A proposal
+    /// its coordinator is still running can still apply after it
+    /// (ADR-aacruzgon-0034). Its error is the table for plain statements';
+    /// the caller only logs it.
+    pub(crate) async fn serial_read_resource_row(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<ResourceRow>> {
+        let rows = self
+            .session
+            .rows(
+                SELECT_RESOURCE,
+                vec![
+                    Value::from(tenant_id),
+                    Value::from(resource_type),
+                    Value::from(id),
+                ],
+                StatementKind::SerialRead,
+            )
+            .await
+            .map_err(|error| {
+                StorageError::Backend(map_driver_error(&error, "overlay serial read"))
+            })?;
+        rows.first().map(ResourceRow::decode).transpose()
+    }
+
     /// `ResourceStorage::count`; see the module docs.
     pub(super) async fn count_resources(
         &self,

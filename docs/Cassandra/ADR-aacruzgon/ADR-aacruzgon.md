@@ -105,3 +105,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0058](2026-11-06/0058-cql-audit-check.md) | 2026-11-06 | The node's CQL audit log proves that no CQL `DELETE` reaches `resources` or `resource_versions`, as a check in the required Cassandra job | accepted |
 | [0059](2026-11-06/0059-step3-ci-reports.md) | 2026-11-06 | Step 3's CI reports: latency per operation, CAS outcomes, statements, intent rows, tombstones, DML and the HL7 rows | accepted |
 | [0067](2026-11-07/0067-errors-after-unknown-outcome-503.md) | 2026-11-07 | After an unknown CAS outcome, every later statement's error is 504 for a timeout and 503 for anything else | accepted |
+| [0068](2026-11-07/0068-overlay-follows-undecided-writes.md) | 2026-11-07 | A SearchParameter write whose outcome could not be decided reads its row back, and the overlay follows it | accepted |

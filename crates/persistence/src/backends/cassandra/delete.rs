@@ -210,45 +210,59 @@ impl CassandraBackend {
         };
         let mut request = self.cas_request(expect.operation(), key);
         let mut retries_left = expect.miss_retries();
-        loop {
-            // Step 0. After an unknown outcome, R1's error answers as R2's
-            // does (ADR-aacruzgon-0067).
-            let row = request.after_unknown(pre_read().await, "pre-read")?;
-            if let Some(applied) = self
-                .check_earlier_attempts(&mut request, row.as_ref())
-                .await?
-            {
-                self.deleted(tenant_id, resource_type, id, &applied);
-                return Ok(());
-            }
-            let row = deletable(row.as_ref(), expect, resource_type, id)?;
-            let expected = row.version_id;
-
-            // Steps 2 to 6.
-            let plan = CasPlan::delete(PreviousVersion::from_row(row)?);
-            match self.run_cas(&mut request, plan).await? {
-                CasOutcome::Applied(applied) => {
+        let result: StorageResult<()> = async {
+            loop {
+                // Step 0. After an unknown outcome, R1's error answers as R2's
+                // does (ADR-aacruzgon-0067).
+                let row = request.after_unknown(pre_read().await, "pre-read")?;
+                if let Some(applied) = self
+                    .check_earlier_attempts(&mut request, row.as_ref())
+                    .await?
+                {
                     self.deleted(tenant_id, resource_type, id, &applied);
                     return Ok(());
                 }
-                CasOutcome::Missed(miss) => {
-                    match after_miss(miss, retries_left > 0, resource_type, id, expected) {
-                        AfterMiss::Retry => {
-                            retries_left -= 1;
-                            request.note_miss_retry();
-                        }
-                        AfterMiss::Fail(error) => {
-                            if matches!(miss, CasMiss::VersionMoved { .. })
-                                && expect.miss_retries() > 0
-                            {
-                                request.note_miss_budget_exhausted();
+                // A SearchParameter already deleted, by an earlier request
+                // whose outcome this instance never learned or by another
+                // instance: the overlay catches up before the NotFound
+                // (ADR-aacruzgon-0068).
+                if resource_type == "SearchParameter"
+                    && row.as_ref().is_some_and(ResourceRow::is_deleted)
+                {
+                    self.follow_stored_search_parameter(tenant_id, id, row.as_ref());
+                }
+                let row = deletable(row.as_ref(), expect, resource_type, id)?;
+                let expected = row.version_id;
+
+                // Steps 2 to 6.
+                let plan = CasPlan::delete(PreviousVersion::from_row(row)?);
+                match self.run_cas(&mut request, plan).await? {
+                    CasOutcome::Applied(applied) => {
+                        self.deleted(tenant_id, resource_type, id, &applied);
+                        return Ok(());
+                    }
+                    CasOutcome::Missed(miss) => {
+                        match after_miss(miss, retries_left > 0, resource_type, id, expected) {
+                            AfterMiss::Retry => {
+                                retries_left -= 1;
+                                request.note_miss_retry();
                             }
-                            return Err(error);
+                            AfterMiss::Fail(error) => {
+                                if matches!(miss, CasMiss::VersionMoved { .. })
+                                    && expect.miss_retries() > 0
+                                {
+                                    request.note_miss_budget_exhausted();
+                                }
+                                return Err(error);
+                            }
                         }
                     }
                 }
             }
         }
+        .await;
+        self.settle_overlay_after_unknown(&request, &result).await;
+        result
     }
 
     /// After a delete applied: a stored SearchParameter leaves the overlay
@@ -1564,5 +1578,226 @@ mod node_tests {
             (held, expression_of(&backend, &tenant, &url).as_deref()),
             (1, Some("Patient.birthDate"))
         );
+    }
+
+    /// Fresh `test-` tenants for the hardening tests (ADR-aacruzgon-0020).
+    fn hardening_tenant(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-s3-hardening-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    /// A tenant holding the stored SearchParameter `s` for its own `url`, in
+    /// force with `Patient.gender`.
+    async fn tenant_with_parameter(
+        backend: &CassandraBackend,
+        case: &str,
+    ) -> (TenantContext, String) {
+        let tenant = hardening_tenant(case);
+        let url = format!(
+            "http://example.org/SearchParameter/{}",
+            tenant.tenant_id().as_str()
+        );
+        backend
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter("s", &url, "Patient.gender"),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .expect("create");
+        assert_eq!(
+            expression_of(backend, &tenant, &url).as_deref(),
+            Some("Patient.gender")
+        );
+        (tenant, url)
+    }
+
+    /// ADR-aacruzgon-0068. A SearchParameter delete whose C3 applied but
+    /// whose outcome R2 could not read answers 503; one serial read of the
+    /// row then shows the marker, so the parameter is out of force at once,
+    /// not at the TTL refresh.
+    #[tokio::test]
+    async fn an_undecided_searchparameter_delete_that_applied_leaves_the_overlay() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (tenant, url) = tenant_with_parameter(&backend, "sp-undecided-delete").await;
+        backend
+            .session
+            .inject_fault(StatementKind::Cas, C3_ONLY, Fault::ApplyThenTimeOut);
+        backend.session.inject_fault(
+            StatementKind::SerialRead,
+            "FROM resources",
+            Fault::FailWithUnavailable,
+        );
+        let result = backend.delete(&tenant, "SearchParameter", "s").await;
+        assert!(
+            matches!(
+                result,
+                Err(StorageError::Backend(BackendError::Unavailable { .. }))
+            ),
+            "{result:?}"
+        );
+        assert!(
+            !backend
+                .exists(&tenant, "SearchParameter", "s")
+                .await
+                .unwrap()
+        );
+        assert_eq!(expression_of(&backend, &tenant, &url), None);
+    }
+
+    /// The same undecided delete, where C3 did not apply: the row read back
+    /// is live, so the parameter stays in force, as it must.
+    #[tokio::test]
+    async fn an_undecided_searchparameter_delete_that_did_not_apply_stays_in_force() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (tenant, url) = tenant_with_parameter(&backend, "sp-undecided-kept").await;
+        backend
+            .session
+            .inject_fault(StatementKind::Cas, C3_ONLY, Fault::TimeOutWithoutApplying);
+        backend.session.inject_fault(
+            StatementKind::SerialRead,
+            "FROM resources",
+            Fault::FailWithUnavailable,
+        );
+        let result = backend.delete(&tenant, "SearchParameter", "s").await;
+        assert!(
+            matches!(result, Err(StorageError::Backend(_))),
+            "{result:?}"
+        );
+        assert!(
+            backend
+                .exists(&tenant, "SearchParameter", "s")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.gender")
+        );
+    }
+
+    /// When that serial read fails too, the overlay cannot know, and keeps
+    /// the parameter; the client's retried DELETE finds the marker in its
+    /// pre-read, answers `NotFound` (REST 204), and takes it out of force.
+    #[tokio::test]
+    async fn a_retried_searchparameter_delete_catches_the_overlay_up() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (tenant, url) = tenant_with_parameter(&backend, "sp-retried-delete").await;
+        backend
+            .session
+            .inject_fault(StatementKind::Cas, C3_ONLY, Fault::ApplyThenTimeOut);
+        for _ in 0..2 {
+            backend.session.inject_fault(
+                StatementKind::SerialRead,
+                "FROM resources",
+                Fault::FailWithUnavailable,
+            );
+        }
+        let result = backend.delete(&tenant, "SearchParameter", "s").await;
+        assert!(
+            matches!(result, Err(StorageError::Backend(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.gender"),
+            "neither read could say, so the overlay is unchanged"
+        );
+        let retry = backend.delete(&tenant, "SearchParameter", "s").await;
+        assert!(
+            matches!(
+                retry,
+                Err(StorageError::Resource(ResourceError::NotFound { .. }))
+            ),
+            "{retry:?}"
+        );
+        assert_eq!(expression_of(&backend, &tenant, &url), None);
+    }
+
+    /// Another instance deleted the parameter: this one's DELETE finds the
+    /// marker in its pre-read and takes it out of force here too, before the
+    /// refresh would.
+    #[tokio::test]
+    async fn a_delete_of_a_parameter_another_instance_deleted_catches_up() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (tenant, url) = tenant_with_parameter(&backend, "sp-other-instance").await;
+        let other = self::backend().await.expect("connect");
+        other
+            .delete(&tenant, "SearchParameter", "s")
+            .await
+            .expect("the other instance's delete");
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.gender"),
+            "this instance has not heard of it"
+        );
+        let here = backend.delete(&tenant, "SearchParameter", "s").await;
+        assert!(
+            matches!(
+                here,
+                Err(StorageError::Resource(ResourceError::NotFound { .. }))
+            ),
+            "{here:?}"
+        );
+        assert_eq!(expression_of(&backend, &tenant, &url), None);
+    }
+
+    /// An update that deactivates the parameter (status `retired`), whose C2
+    /// applied but whose outcome R2 could not read: the row read back holds
+    /// the retired body, so the parameter is out of force at once.
+    #[tokio::test]
+    async fn an_undecided_deactivating_update_leaves_the_overlay() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (tenant, url) = tenant_with_parameter(&backend, "sp-undecided-update").await;
+        let current = backend
+            .read(&tenant, "SearchParameter", "s")
+            .await
+            .unwrap()
+            .expect("stored");
+        let mut retired = search_parameter("s", &url, "Patient.gender");
+        retired["status"] = Json::from("retired");
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "SET version_id = ?, data = ?",
+            Fault::ApplyThenTimeOut,
+        );
+        backend.session.inject_fault(
+            StatementKind::SerialRead,
+            "FROM resources",
+            Fault::FailWithUnavailable,
+        );
+        let result = backend.update(&tenant, &current, retired).await;
+        assert!(
+            matches!(result, Err(StorageError::Backend(_))),
+            "{result:?}"
+        );
+        let stored = backend
+            .read(&tenant, "SearchParameter", "s")
+            .await
+            .unwrap()
+            .expect("stored");
+        assert_eq!(stored.version_id(), "2", "the update applied");
+        assert_eq!(expression_of(&backend, &tenant, &url), None);
     }
 }

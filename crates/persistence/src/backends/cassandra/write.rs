@@ -1862,10 +1862,15 @@ impl CassandraBackend {
         );
 
         let mut request = self.cas_request("create", key);
-        let applied = match self.run_cas(&mut request, plan).await? {
-            CasOutcome::Applied(applied) => applied,
-            CasOutcome::Missed(miss) => return Err(miss.into_error(resource_type, &id, 0)),
+        let outcome = match self.run_cas(&mut request, plan).await {
+            Ok(CasOutcome::Applied(applied)) => Ok(applied),
+            Ok(CasOutcome::Missed(miss)) => Err(miss.into_error(resource_type, &id, 0)),
+            Err(error) => Err(error),
         };
+        // An undecided SearchParameter create: the overlay follows the row
+        // (ADR-aacruzgon-0068).
+        self.settle_overlay_after_unknown(&request, &outcome).await;
+        let applied = outcome?;
 
         let resource = applied.plan.body().cloned().unwrap_or(Json::Null);
         if resource_type == "SearchParameter" {

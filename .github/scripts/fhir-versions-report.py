@@ -66,11 +66,9 @@ VARIANT = {
 }
 
 SUITES = [
-    {"id": "lib", "label": "persistence --lib backends::cassandra", "selector": True, "tests": None},
-    {"id": "tests", "label": "persistence cassandra_tests + backend_capability_contract",
-     "selector": True, "tests": None},
-    {"id": "rest", "label": "hfs cassandra_milestone_a (round trip + Step 3 CRUD)",
-     "selector": True, "tests": 2},
+    {"id": "lib", "label": "persistence --lib backends::cassandra", "tests": None},
+    {"id": "tests", "label": "persistence cassandra_tests + backend_capability_contract", "tests": None},
+    {"id": "rest", "label": "hfs cassandra_milestone_a (round trip + Step 3 CRUD)", "tests": 2},
 ]
 
 
@@ -107,7 +105,7 @@ def parse_log(text: str) -> dict:
     return {"binaries": binaries, "exit": exit_status}
 
 
-def check_selector(binaries: list[dict], version: str, expected: bool) -> tuple[str, dict | None, list[str]]:
+def check_selector(binaries: list[dict], version: str) -> tuple[str, dict | None, list[str]]:
     """The selector cell, the first selector line, and the problems found."""
     problems = []
     lines = [s for b in binaries for s in b["selectors"]]
@@ -120,28 +118,27 @@ def check_selector(binaries: list[dict], version: str, expected: bool) -> tuple[
                 f"not {version}" + (f" -> {want_variant}" if want_variant else "")
             )
             break
-    if expected:
-        ran = [b for b in binaries if b["result"] and (b["result"]["passed"] + b["result"]["failed"]) > 0]
-        silent = [b for b in ran if not b["selectors"]
-                  and not any(n in (b["name"] or "") for n in VERSION_NEUTRAL)]
-        if ran and len(silent) == len(ran):
-            problems.append("no selector line: the version selector may not have applied")
-        elif silent:
-            names = ", ".join(b["name"] or "?" for b in silent)
-            problems.append(f"no selector line in {len(silent)} of {len(ran)} binaries ({names})")
+    ran = [b for b in binaries if b["result"] and (b["result"]["passed"] + b["result"]["failed"]) > 0]
+    silent = [b for b in ran if not b["selectors"]
+              and not any(n in (b["name"] or "") for n in VERSION_NEUTRAL)]
+    if ran and len(silent) == len(ran):
+        problems.append("no selector line: the version selector may not have applied")
+    elif silent:
+        names = ", ".join(b["name"] or "?" for b in silent)
+        problems.append(f"no selector line in {len(silent)} of {len(ran)} binaries ({names})")
     if problems:
         cell = "NOT OK"
     elif first:
         cell = f"ok ({first['variant']})"
     else:
-        cell = "not expected (hfs)" if not expected else "–"
+        cell = "–"
     return cell, first, problems
 
 
 def report_cell(path: Path, version: str, suite: dict) -> dict:
     row = {"version": version, "suite": suite["id"], "log": path.name, "passed": None, "failed": None,
            "ignored": None, "exit": None, "binaries": 0, "selector": None, "selector_line": None,
-           "selector_expected": suite["selector"], "problems": []}
+           "problems": []}
     try:
         text = path.read_text(errors="replace")
     except OSError:
@@ -172,7 +169,7 @@ def report_cell(path: Path, version: str, suite: dict) -> dict:
     ran = (row["passed"] or 0) + (row["failed"] or 0) + (row["ignored"] or 0)
     if results and suite["tests"] is not None and ran != suite["tests"]:
         row["problems"].append(f"{ran} tests ran, expected exactly {suite['tests']}")
-    cell, first, problems = check_selector(parsed["binaries"], version, suite["selector"])
+    cell, first, problems = check_selector(parsed["binaries"], version)
     row["selector"], row["selector_line"] = cell, first
     row["problems"] += problems
     row["ok"] = not row["problems"]

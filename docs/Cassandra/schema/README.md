@@ -1,6 +1,6 @@
 # Cassandra schema: draft for the schema session
 
-**Status: agreed by the team; sign-offs being recorded against `67f9e0532` (PR #33's merge), roadmap item 1.4.** Signed off so far: Alan (ADR-aacruzgon-0028). Each member records their sign-off, or objection, in their own ADR log against that commit; items 1.1 to 1.4 are done when all five are in. A later change to a table, key, column type or table option needs new sign-offs.
+**Status: signed off by Alan (ADR-aacruzgon-0028); four sign-offs pending, recorded against `67f9e0532` (PR #33's merge), roadmap item 1.4.** Each member records their sign-off, or objection, in their own ADR log against that commit; items 1.1 to 1.4 are done when all five are in. A later change to a table, key, column type or table option needs new sign-offs.
 
 **"The schema session"** in these files means the two team design sessions that roadmap Step 1 plans for week 1 (13 to 18 October), led by the owner of the shared files (**W**). The team decides there. Each member then records their sign-off, or objection, in their own ADR log (item 1.4). Rows 1.1 to 1.3 are marked done only after that.
 
@@ -10,7 +10,7 @@ Read [`spike-findings.md`](../spike-findings.md) first, then this page. The othe
 | --- | --- | --- |
 | [`schema.cql`](schema.cql) | The ten tables, keys and table options, as the design document fixes them (revised by ADR-aacruzgon-0012 to 0017 and 0026) | 1.1 |
 | [`keyspace-single-node.cql`](keyspace-single-node.cql) | The keyspace for one local node, plus the `system_traces` setup step | 1.1 |
-| [`walkthrough.md`](walkthrough.md) | Every in-scope operation walked through the tables in CQL, one Patient's worked example, and the gaps G1 to G37 | 1.2 |
+| [`walkthrough.md`](walkthrough.md) | Every in-scope operation walked through the tables in CQL, one Patient's worked example, and the gaps G1 to G40 | 1.2 |
 | [`coverage.md`](coverage.md) | The query coverage table: parameter × form or prefix × table × expected result, plus every rejection | 1.3 |
 
 ## Apply it
@@ -56,7 +56,7 @@ The Apache docs recommend UCS "for new workloads". They say tiered (`T`) setting
 
 ## Changes made to the design
 
-The walk-through found places where the design document was wrong. These are now fixed in `cassandra-discussion.md`, in the roadmap and in `schema.cql`, each with an entry in `ADR-aacruzgon/`. Every member reviews them with the rest of the schema at the session. The rows marked Step 2 (ADR-aacruzgon-0032, 0034, 0035, 0041 and 0044) came from building the backend after the sign-off at `67f9e0532` (ADR-aacruzgon-0028): they change the walk-through's error handling or add a read path, not a table, key, column type or option.
+The walk-through found places where the design document was wrong. These are now fixed in `cassandra-discussion.md`, in the roadmap and in `schema.cql`, each with an entry in `ADR-aacruzgon/`. Every member reviews them with the rest of the schema at the session. The rows marked Step 2 (ADR-aacruzgon-0032, 0034, 0035, 0041 and 0044) and Step 3 (0050, 0051, 0053, 0055, 0061, 0063 and 0064) came from building the backend after the sign-off at `67f9e0532` (ADR-aacruzgon-0028): they change the walk-through's error handling, its write path's details or add a read path, not a table, key, column type or option.
 
 | ADR | Problem found (walk-through gap) | Change | Schema change |
 | --- | --- | --- | --- |
@@ -74,6 +74,13 @@ The walk-through found places where the design document was wrong. These are now
 | 0035 | **`WriteTimeout`/`SIMPLE` was taken as applied (Step 2),** but the timed-out commit can be another coordinator's proposal. | Walkthrough 3.1 makes `SIMPLE` a trigger confirmed by R2, never taken as applied. Changes error handling only, not a table, key, column type or option. | None |
 | 0041 | **No statement listed the tenants (Step 2).** With no tenant registry, the stored-SearchParameter reload had no way to find every tenant. | Walkthrough section 2 adds R5, `SELECT DISTINCT tenant_id, resource_type FROM resources_by_type` (paged, `LOCAL_QUORUM`), and `coverage.md` lists it. Adds a read path, not a table, key, column type or option. | None |
 | 0044 | **The walk-through named cdrs-tokio 8.1.9 (Step 2),** which could not decode `CAS_WRITE_UNKNOWN`. | Walkthrough 3.1 names cdrs-tokio 10, which decodes it as `ErrorType::CasWriteUnknown`; it is still an unknown outcome. Changes error handling only, not a table, key, column type or option. | None |
+| 0050 | **Every CAS needed the same outcome rules (Step 3).** C2 to C4 would each have copied `create`'s loop, and the trigger list in the walk-through omitted `Server`, `Overloaded` and an unreadable `[applied]`. | One engine runs every CAS; walkthrough 3.1's trigger list is ADR-aacruzgon-0034's in full; R2's own error is never classified as a CAS; no CAS is retried after `Unavailable`. | None |
+| 0051 | **A late earlier attempt read as a lost race (Step 3).** C2 to C4 misses return no `write_id`, so a request could report a conflict against its own late attempt. | Walkthrough 3.1 checks every later look at the row against every earlier unknown attempt; "never will be" is corrected. No CQL change. | None |
+| 0053 | **A CAS over the node's message or mutation limit (Step 3)** failed late, or as an unknown outcome. | Walkthrough 3.1's payload bound: 8 MiB of `data` plus `index_keys`, 400 before any statement. | None |
+| 0055 | **An R2 or R3 error after an unknown outcome was 500 (Step 3)** for a write that may have applied. | Walkthrough 3.1: 504 for a timeout, 503 for anything else. | None |
+| 0061 | **`update`'s V3 left `write_id` unset (G36, Step 3),** so an outcome it superseded stayed undecidable. | V3 is built from `update`'s own R1 and carries its `write_id`; R2 still below `N` is 409. | None (a `schema.cql` comment) |
+| 0063 | **`create_or_update` could not check its permission before any statement (Step 3).** | Walkthrough section 3 and 3.5: each turn checks `Create` or `Update` after its R1; a fourth definite miss is 409 whatever it was. | None |
+| 0064 | **`HFS_RETURN_GONE` was said to change `read` (Step 3).** Only vread reads it. | Walkthrough section 2 and 4.1 corrected. | None |
 
 Two corrections need no ADR because they fix a statement, not a decision:
 - **The sweeper does compare clocks.** "No clocks are compared" was wrong: the grace period is a clock comparison. The design now states its assumption (G11).

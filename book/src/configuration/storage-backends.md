@@ -12,7 +12,7 @@ The Helios FHIR Server supports several storage backend configurations. Set `HFS
 | PostgreSQL + Elasticsearch | `postgres-elasticsearch` or `pg-es` | PostgreSQL for CRUD, Elasticsearch for search |
 | S3 | `s3` | Object storage for CRUD, versioning, history, and bulk ops. No search. |
 | S3 + Elasticsearch | `s3-elasticsearch` or `s3-es` | S3 for CRUD, Elasticsearch for search |
-| Cassandra | `cassandra` | Apache Cassandra for CRUD (in development: create and read). Search on token, date and URI parameters is planned. |
+| Cassandra | `cassandra` | Apache Cassandra for CRUD (in development: CRUD, vread and batch work). Search on token, date and URI parameters is planned. |
 
 ## Running with Each Backend
 
@@ -111,7 +111,7 @@ AWS_REGION=us-east-1 \
 
 ### Cassandra
 
-The Cassandra backend is in development: create and read work, and the rest of the RESTful API answers `501 Not Implemented` until it lands. Build with the `cassandra` feature; without it, `HFS_STORAGE_BACKEND=cassandra` fails at startup.
+The Cassandra backend is in development: create, read, update, delete, PATCH, vread and batch work, and search, history, transactions and conditional interactions answer `501 Not Implemented` until they land. Build with the `cassandra` feature; without it, `HFS_STORAGE_BACKEND=cassandra` fails at startup.
 
 ```bash
 cargo build -p helios-hfs --features cassandra

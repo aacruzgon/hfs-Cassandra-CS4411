@@ -540,6 +540,16 @@ pub(crate) enum Fault {
     /// Fail with `Unavailable` without executing: refused before any
     /// replica acted, so not applied.
     FailWithUnavailable,
+    /// Fail with a node-side `Server` error without executing: what the
+    /// table for plain statements maps to 500 (ADR-aacruzgon-0067).
+    FailWithServerError,
+    /// Send the statement as usual. It only uses up its match, so that a
+    /// fault queued after it lands on a later statement of the same text.
+    PassThrough,
+    /// Fail with a node-side `Protocol` error without executing: a CAS the
+    /// engine takes as not applied, which the table for plain statements
+    /// maps to 500 (ADR-aacruzgon-0067).
+    FailWithProtocolError,
 }
 
 #[cfg(test)]
@@ -622,6 +632,13 @@ mod faults {
                 }),
                 Fault::FailWithWriteFailure => return Some(Err(server_error(write_failure()))),
                 Fault::FailWithUnavailable => return Some(Err(server_error(unavailable()))),
+                Fault::FailWithServerError => return Some(Err(server_error(ErrorType::Server))),
+                Fault::FailWithProtocolError => {
+                    return Some(Err(server_error(ErrorType::Protocol)));
+                }
+                Fault::PassThrough => {
+                    return Some(session.send(cql, values.to_vec(), kind, None).await);
+                }
                 Fault::TimeOutWithoutApplying | Fault::FailWithCasTimeout => {}
             }
             Some(Err(server_error(ErrorType::WriteTimeout(

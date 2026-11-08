@@ -369,6 +369,8 @@ Row `V`'s `write_id` is set by `V`'s own step 4 (V1 or V2), by the sweeper's rep
 
 Every timeout is 504 and every unavailable node or replica failure 503, as `crates/rest/src/error.rs` maps them (G26). When the 2 re-runs are used up, the last attempt's error decides the same way: 504 after a `WriteTimeout`, 503 after a `WriteFailure`. `write_type = SIMPLE` is a trigger like `WriteTimeout`/CAS, confirmed by R2, never taken as applied (ADR-aacruzgon-0035).
 
+**Note (2026-11-07) on the table's third row, "another writer won `V`", and the sixth, which refers to it.** When the row R2 returns is deleted (`deleted_at > 0`), another request deleted the resource in the gap, and `update` and `delete_versioned` answer `NotFound` (404), not 409. That is the same answer as when their C2 or C3 misses outright, as 3.3's and 3.4's tables and the design's step 3 say ("deleted in the gap", G9). A live row is 409, as the row says. PR #64 makes the code do this (finding E1 of the independent review of Step 3; `another_writers_miss` in `write.rs`).
+
 **A later attempt first checks the earlier ones** (ADR-aacruzgon-0051). Once an attempt `k` of a request had an unknown outcome (target `V_k`, `write_id` `w_k`), every later look at the row in that request is matched against every such attempt before it is acted on:
 - the next attempt's R1, which returns `version_id` and `write_id`;
 - a definite miss of a later C2, C3 or C4, which returns only `version_id` and `deleted_at`, so it is followed by R2. C1's miss returns the whole row, so it needs no read.

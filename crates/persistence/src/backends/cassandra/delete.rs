@@ -43,7 +43,10 @@
 //! **Stored SearchParameters** (D9). A delete of a `SearchParameter` is
 //! recorded in the in-process overlay (`forget_stored_search_parameter`),
 //! unless a later version already superseded it: after a delete marker the
-//! only later version is a revive, which restores the definition.
+//! only later version is a revive, which restores the definition. When the
+//! delete cannot say what it wrote, or finds the parameter already deleted
+//! (in its pre-read, or because its C3 missed on another writer's marker),
+//! the overlay follows the stored row instead (ADR-aacruzgon-0068).
 //!
 //! `delete_versioned` is its own compare-and-swap: the trait default reads,
 //! compares and then calls `delete`, which is not atomic (#1404).
@@ -210,43 +213,96 @@ impl CassandraBackend {
         };
         let mut request = self.cas_request(expect.operation(), key);
         let mut retries_left = expect.miss_retries();
-        loop {
-            // Step 0.
-            let row = pre_read().await?;
-            if let Some(applied) = self
-                .check_earlier_attempts(&mut request, row.as_ref())
-                .await?
-            {
-                self.deleted(tenant_id, resource_type, id, &applied);
-                return Ok(());
-            }
-            let row = deletable(row.as_ref(), expect, resource_type, id)?;
-            let expected = row.version_id;
-
-            // Steps 2 to 6.
-            let plan = CasPlan::delete(PreviousVersion::from_row(row)?);
-            match self.run_cas(&mut request, plan).await? {
-                CasOutcome::Applied(applied) => {
+        let result: StorageResult<()> = async {
+            loop {
+                // Step 0. After an unknown outcome, R1's error answers as R2's
+                // does (ADR-aacruzgon-0067).
+                let row = request.after_unknown(pre_read().await, "pre-read")?;
+                if let Some(applied) = self
+                    .check_earlier_attempts(&mut request, row.as_ref())
+                    .await?
+                {
                     self.deleted(tenant_id, resource_type, id, &applied);
                     return Ok(());
                 }
-                CasOutcome::Missed(miss) => {
-                    match after_miss(miss, retries_left > 0, resource_type, id, expected) {
-                        AfterMiss::Retry => {
-                            retries_left -= 1;
-                            request.note_miss_retry();
-                        }
-                        AfterMiss::Fail(error) => {
-                            if matches!(miss, CasMiss::VersionMoved { .. })
-                                && expect.miss_retries() > 0
-                            {
-                                request.note_miss_budget_exhausted();
+                // A SearchParameter already deleted, by an earlier request
+                // whose outcome this instance never learned or by another
+                // instance: the overlay catches up before the NotFound
+                // (ADR-aacruzgon-0068).
+                if resource_type == "SearchParameter"
+                    && row.as_ref().is_some_and(ResourceRow::is_deleted)
+                {
+                    self.follow_stored_search_parameter(tenant_id, id, row.as_ref());
+                }
+                let row = deletable(row.as_ref(), expect, resource_type, id)?;
+                let expected = row.version_id;
+
+                // Steps 2 to 6.
+                let previous = request.after_unknown(PreviousVersion::from_row(row), "pre-read")?;
+                let plan = CasPlan::delete(previous);
+                match self.run_cas(&mut request, plan).await? {
+                    CasOutcome::Applied(applied) => {
+                        self.deleted(tenant_id, resource_type, id, &applied);
+                        return Ok(());
+                    }
+                    CasOutcome::Missed(miss) => {
+                        match after_miss(miss, retries_left > 0, resource_type, id, expected) {
+                            AfterMiss::Retry => {
+                                retries_left -= 1;
+                                request.note_miss_retry();
                             }
-                            return Err(error);
+                            AfterMiss::Fail(error) => {
+                                if matches!(miss, CasMiss::VersionMoved { .. })
+                                    && expect.miss_retries() > 0
+                                {
+                                    request.note_miss_budget_exhausted();
+                                }
+                                // Another writer's marker made C3 miss: the
+                                // overlay catches up with it (ADR-aacruzgon-0068).
+                                // After an unknown outcome the serial read at the
+                                // end of the call does that instead.
+                                if resource_type == "SearchParameter"
+                                    && miss == CasMiss::Deleted
+                                    && !request.had_unknown_outcome()
+                                {
+                                    self.catch_up_with_a_deleted_miss(tenant_id, id).await;
+                                }
+                                return Err(error);
+                            }
                         }
                     }
                 }
             }
+        }
+        .await;
+        self.settle_overlay_after_unknown(&request, &result).await;
+        result
+    }
+
+    /// A SearchParameter delete whose C3 missed with `deleted_at > 0`:
+    /// another writer deleted it between this call's R1 and its C3, and the
+    /// overlay records that removal now, not at the TTL refresh
+    /// (ADR-aacruzgon-0068). One R1 at `LOCAL_QUORUM` reads the marker's
+    /// `last_updated`: the miss came from a Paxos round on this partition
+    /// that read the marker as committed, and Paxos v2's prepare first
+    /// brings a quorum up to the latest commit (`PaxosPrepare.java:852-857`),
+    /// so a quorum read sees it, or a newer version, which the overlay
+    /// follows as well. A removal already held is not recorded again
+    /// ([`CassandraBackend::follow_stored_search_parameter`]). A failed read
+    /// is logged and changes nothing; the call's `NotFound` is unchanged.
+    async fn catch_up_with_a_deleted_miss(&self, tenant_id: &str, id: &str) {
+        match self
+            .read_resource_row(tenant_id, "SearchParameter", id)
+            .await
+        {
+            Ok(row) => self.follow_stored_search_parameter(tenant_id, id, row.as_ref()),
+            Err(error) => tracing::warn!(
+                tenant_id,
+                id,
+                error = %error,
+                "a SearchParameter delete met another writer's delete and could not read \
+                 its marker; the overlay keeps its entry until the next refresh or write of it"
+            ),
         }
     }
 
@@ -1563,5 +1619,336 @@ mod node_tests {
             (held, expression_of(&backend, &tenant, &url).as_deref()),
             (1, Some("Patient.birthDate"))
         );
+    }
+
+    /// Fresh `test-` tenants for the hardening tests (ADR-aacruzgon-0020).
+    fn hardening_tenant(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-s3-hardening-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    /// A tenant holding the stored SearchParameter `s` for its own `url`, in
+    /// force with `Patient.gender`.
+    async fn tenant_with_parameter(
+        backend: &CassandraBackend,
+        case: &str,
+    ) -> (TenantContext, String) {
+        let tenant = hardening_tenant(case);
+        let url = format!(
+            "http://example.org/SearchParameter/{}",
+            tenant.tenant_id().as_str()
+        );
+        backend
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter("s", &url, "Patient.gender"),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .expect("create");
+        assert_eq!(
+            expression_of(backend, &tenant, &url).as_deref(),
+            Some("Patient.gender")
+        );
+        (tenant, url)
+    }
+
+    /// ADR-aacruzgon-0068. A SearchParameter delete whose C3 applied but
+    /// whose outcome R2 could not read answers 503; one serial read of the
+    /// row then shows the marker, so the parameter is out of force at once,
+    /// not at the TTL refresh.
+    #[tokio::test]
+    async fn an_undecided_searchparameter_delete_that_applied_leaves_the_overlay() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (tenant, url) = tenant_with_parameter(&backend, "sp-undecided-delete").await;
+        backend
+            .session
+            .inject_fault(StatementKind::Cas, C3_ONLY, Fault::ApplyThenTimeOut);
+        backend.session.inject_fault(
+            StatementKind::SerialRead,
+            "FROM resources",
+            Fault::FailWithUnavailable,
+        );
+        let result = backend.delete(&tenant, "SearchParameter", "s").await;
+        assert!(
+            matches!(
+                result,
+                Err(StorageError::Backend(BackendError::Unavailable { .. }))
+            ),
+            "{result:?}"
+        );
+        assert!(
+            !backend
+                .exists(&tenant, "SearchParameter", "s")
+                .await
+                .unwrap()
+        );
+        assert_eq!(expression_of(&backend, &tenant, &url), None);
+    }
+
+    /// The same undecided delete, where C3 did not apply: the row read back
+    /// is live, so the parameter stays in force, as it must.
+    #[tokio::test]
+    async fn an_undecided_searchparameter_delete_that_did_not_apply_stays_in_force() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (tenant, url) = tenant_with_parameter(&backend, "sp-undecided-kept").await;
+        backend
+            .session
+            .inject_fault(StatementKind::Cas, C3_ONLY, Fault::TimeOutWithoutApplying);
+        backend.session.inject_fault(
+            StatementKind::SerialRead,
+            "FROM resources",
+            Fault::FailWithUnavailable,
+        );
+        let result = backend.delete(&tenant, "SearchParameter", "s").await;
+        assert!(
+            matches!(result, Err(StorageError::Backend(_))),
+            "{result:?}"
+        );
+        assert!(
+            backend
+                .exists(&tenant, "SearchParameter", "s")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.gender")
+        );
+    }
+
+    /// When that serial read fails too, the overlay cannot know, and keeps
+    /// the parameter; the client's retried DELETE finds the marker in its
+    /// pre-read, answers `NotFound` (REST 204), and takes it out of force.
+    #[tokio::test]
+    async fn a_retried_searchparameter_delete_catches_the_overlay_up() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (tenant, url) = tenant_with_parameter(&backend, "sp-retried-delete").await;
+        backend
+            .session
+            .inject_fault(StatementKind::Cas, C3_ONLY, Fault::ApplyThenTimeOut);
+        for _ in 0..2 {
+            backend.session.inject_fault(
+                StatementKind::SerialRead,
+                "FROM resources",
+                Fault::FailWithUnavailable,
+            );
+        }
+        let result = backend.delete(&tenant, "SearchParameter", "s").await;
+        assert!(
+            matches!(result, Err(StorageError::Backend(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.gender"),
+            "neither read could say, so the overlay is unchanged"
+        );
+        let retry = backend.delete(&tenant, "SearchParameter", "s").await;
+        assert!(
+            matches!(
+                retry,
+                Err(StorageError::Resource(ResourceError::NotFound { .. }))
+            ),
+            "{retry:?}"
+        );
+        assert_eq!(expression_of(&backend, &tenant, &url), None);
+    }
+
+    /// Another instance deleted the parameter: this one's DELETE finds the
+    /// marker in its pre-read and takes it out of force here too, before the
+    /// refresh would.
+    #[tokio::test]
+    async fn a_delete_of_a_parameter_another_instance_deleted_catches_up() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (tenant, url) = tenant_with_parameter(&backend, "sp-other-instance").await;
+        let other = self::backend().await.expect("connect");
+        other
+            .delete(&tenant, "SearchParameter", "s")
+            .await
+            .expect("the other instance's delete");
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.gender"),
+            "this instance has not heard of it"
+        );
+        let here = backend.delete(&tenant, "SearchParameter", "s").await;
+        assert!(
+            matches!(
+                here,
+                Err(StorageError::Resource(ResourceError::NotFound { .. }))
+            ),
+            "{here:?}"
+        );
+        assert_eq!(expression_of(&backend, &tenant, &url), None);
+    }
+
+    /// An update that deactivates the parameter (status `retired`), whose C2
+    /// applied but whose outcome R2 could not read: the row read back holds
+    /// the retired body, so the parameter is out of force at once.
+    #[tokio::test]
+    async fn an_undecided_deactivating_update_leaves_the_overlay() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (tenant, url) = tenant_with_parameter(&backend, "sp-undecided-update").await;
+        let current = backend
+            .read(&tenant, "SearchParameter", "s")
+            .await
+            .unwrap()
+            .expect("stored");
+        let mut retired = search_parameter("s", &url, "Patient.gender");
+        retired["status"] = Json::from("retired");
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "SET version_id = ?, data = ?",
+            Fault::ApplyThenTimeOut,
+        );
+        backend.session.inject_fault(
+            StatementKind::SerialRead,
+            "FROM resources",
+            Fault::FailWithUnavailable,
+        );
+        let result = backend.update(&tenant, &current, retired).await;
+        assert!(
+            matches!(result, Err(StorageError::Backend(_))),
+            "{result:?}"
+        );
+        let stored = backend
+            .read(&tenant, "SearchParameter", "s")
+            .await
+            .unwrap()
+            .expect("stored");
+        assert_eq!(stored.version_id(), "2", "the update applied");
+        assert_eq!(expression_of(&backend, &tenant, &url), None);
+    }
+
+    /// A plain delete's C3 times out without applying, R2 shows another
+    /// request's update, and the delete takes its retry; that turn's R1 row
+    /// has an `index_keys` that does not decode, so no plan can be built. The first
+    /// attempt's outcome was unknown, so the request answers 503, not the
+    /// plain table's 500 (ADR-aacruzgon-0067).
+    #[tokio::test]
+    async fn a_later_turns_undecodable_pre_read_after_an_unknown_outcome_is_503() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = hardening_tenant("later-r1-undecodable");
+        let t = tenant.tenant_id().as_str();
+        create(&backend, &tenant, "p").await;
+        backend
+            .session
+            .inject_fault(StatementKind::Cas, C3_ONLY, Fault::TimeOutWithoutApplying);
+        let backend = &backend;
+        let mut turn = 0;
+        let result = backend
+            .delete_turns(t, "Patient", "p", Expect::Current, move || {
+                turn += 1;
+                let first = turn == 1;
+                async move {
+                    if !first {
+                        // `index_keys` undecodable on the row the turn reads.
+                        backend
+                            .session
+                            .rows(
+                                "UPDATE resources SET index_keys = 0xff \
+                                 WHERE tenant_id = ? AND resource_type = ? AND id = ? \
+                                 IF version_id = 2",
+                                vec![Value::from(t), Value::from("Patient"), Value::from("p")],
+                                StatementKind::Cas,
+                            )
+                            .await
+                            .expect("an undecodable index_keys");
+                    }
+                    let row = backend.read_resource_row(t, "Patient", "p").await;
+                    if first {
+                        another_update(backend, t).await;
+                    }
+                    row
+                }
+            })
+            .await;
+        eprintln!("[e2 case=later-r1-undecodable result={result:?}]");
+        assert_eq!(r1(backend, t).await.map(|r| r.version_id), Some(2));
+        assert!(
+            matches!(
+                result,
+                Err(StorageError::Backend(BackendError::Unavailable { .. }))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// ADR-aacruzgon-0068, the in-gap case: another instance deletes the
+    /// parameter between this delete's pre-read (live) and its C3, which
+    /// then misses with `deleted_at > 0`. The call answers `NotFound`
+    /// (REST 204), with no unknown outcome, and the overlay drops the
+    /// parameter at once. For `delete` and for `delete_versioned`.
+    #[tokio::test]
+    async fn a_searchparameter_deleted_in_the_gap_by_another_instance_leaves_the_overlay() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let other = self::backend().await.expect("connect");
+        for (case, expect) in [
+            ("sp-in-gap-delete", Expect::Current),
+            ("sp-in-gap-versioned", Expect::Version("1")),
+        ] {
+            let (tenant, url) = tenant_with_parameter(&backend, case).await;
+            let t = tenant.tenant_id().as_str();
+            let (backend_ref, other_ref, tenant_ref) = (&backend, &other, &tenant);
+            let result = backend
+                .delete_turns(t, "SearchParameter", "s", expect, move || async move {
+                    let row = backend_ref
+                        .read_resource_row(t, "SearchParameter", "s")
+                        .await;
+                    if row
+                        .as_ref()
+                        .is_ok_and(|r| r.as_ref().is_some_and(|r| !r.is_deleted()))
+                    {
+                        other_ref
+                            .delete(tenant_ref, "SearchParameter", "s")
+                            .await
+                            .expect("the other instance's delete");
+                    }
+                    row
+                })
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(StorageError::Resource(ResourceError::NotFound { .. }))
+                ),
+                "{case}: {result:?}"
+            );
+            assert!(
+                !backend
+                    .exists(&tenant, "SearchParameter", "s")
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(expression_of(&backend, &tenant, &url), None, "{case}");
+        }
     }
 }

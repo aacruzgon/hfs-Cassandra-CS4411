@@ -658,17 +658,24 @@ jobs:
             | tee "$RUNNER_TEMP/ci-report/logs/persistence-lib-tests.log"
 
       # Milestone A (roadmap Step 2, item 2.7): the real hfs binary on this
-      # node, POST /Patient then GET /Patient/{id}. Built above.
+      # node, POST /Patient then GET /Patient/{id}. Built above. Like every
+      # --exact step below, it must run its one test: --exact on a name that
+      # matches nothing passes with 0 tests, so a renamed test fails the step
+      # instead of turning it, and the steps it gates, green. The result is
+      # grepped from a process substitution, as in the Step 3 REST step.
       - name: Milestone A round trip through hfs against this node
         id: round-trip
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
+          log="$RUNNER_TEMP/ci-report/logs/milestone-a-round-trip.log"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-hfs --no-default-features --features R4,cassandra \
               --test cassandra_milestone_a -- --exact milestone_a_create_then_read_through_rest \
               --show-output 2>&1 \
-            | tee "$RUNNER_TEMP/ci-report/logs/milestone-a-round-trip.log"
+            | tee "$log"
+          grep -Eq '^test result: ok\. 1 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$log") \
+            || { echo "::error title=Milestone A round trip::milestone_a_create_then_read_through_rest did not run exactly once"; exit 1; }
 
       # Roadmap Step 3 through REST (Step 3 plan D24): PUT, PATCH, DELETE,
       # HEAD, revive, a batch and /metadata through the real hfs binary on this
@@ -718,10 +725,13 @@ jobs:
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
           dir="$RUNNER_TEMP/ci-report/boot-time"
+          log="$RUNNER_TEMP/ci-report/logs/boot-time.log"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" HFS_TEST_BOOT_REPORT="$dir" \
             cargo test -p helios-hfs --no-default-features --features R4,cassandra \
               --test cassandra_milestone_a -- --exact boot_time_report --nocapture 2>&1 \
-            | tee "$RUNNER_TEMP/ci-report/logs/boot-time.log"
+            | tee "$log"
+          grep -Eq '^test result: ok\. 1 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$log") \
+            || { echo "::error title=Boot-time report::boot_time_report did not run exactly once"; exit 1; }
           python3 .github/scripts/ci-report.py add boot-time \
             "Boot time and conformance seed (roadmap item 2.6)" \
             --markdown "$dir/boot-time.md" --json "$dir/boot-time.json"
@@ -748,12 +758,23 @@ jobs:
           dir="$RUNNER_TEMP/ci-report/inputs/latency"
           export HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" HFS_TEST_LATENCY_REPORT="$dir"
           status=0
+          # A test that ran and failed fails the step through cargo's exit
+          # code; only a cargo run that passed is checked for its one test,
+          # so the annotation names only a test that did not run.
+          ran_once() {
+            grep -Eq '^test result: ok\. 1 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$1") \
+              || { echo "::error title=Latency report::$2 did not run exactly once"; status=1; }
+          }
+          rc=0
           cargo test -p helios-persistence --features cassandra --test cassandra_tests \
             -- --exact latency_report::cassandra_latency_report --nocapture 2>&1 \
-            | tee "$logs/latency-backend.log" || status=1
+            | tee "$logs/latency-backend.log" || rc=$?
+          if [ "$rc" -ne 0 ]; then status=1; else ran_once "$logs/latency-backend.log" latency_report::cassandra_latency_report; fi
+          rc=0
           cargo test -p helios-hfs --no-default-features --features R4,cassandra \
             --test cassandra_milestone_a -- --exact rest_latency_report --nocapture 2>&1 \
-            | tee "$logs/latency-rest.log" || status=1
+            | tee "$logs/latency-rest.log" || rc=$?
+          if [ "$rc" -ne 0 ]; then status=1; else ran_once "$logs/latency-rest.log" rest_latency_report; fi
           python3 .github/scripts/ci-report.py add latency-backend \
             "Latency: CassandraBackend per operation (smoke trend)" \
             --markdown "$dir/cassandra-latency.md" --json "$dir/cassandra-latency.json"
@@ -832,12 +853,15 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
+          log="$RUNNER_TEMP/ci-report/logs/readiness.log"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
           HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER=hfs-cassandra-ci-cassandra-1 \
             cargo test -p helios-hfs --no-default-features --features R4,cassandra \
               --test cassandra_milestone_a -- --exact readiness_reports_down_while_cassandra_is_stopped \
               --nocapture 2>&1 \
-            | tee "$RUNNER_TEMP/ci-report/logs/readiness.log"
+            | tee "$log"
+          grep -Eq '^test result: ok\. 1 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$log") \
+            || { echo "::error title=Milestone A readiness::readiness_reports_down_while_cassandra_is_stopped did not run exactly once"; exit 1; }
 
       # Written after the last test step, whatever its result: the test counts
       # and skips of every test step, and the readiness test's recovery times.

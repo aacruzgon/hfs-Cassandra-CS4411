@@ -80,10 +80,13 @@ reviews:
 
   abort_on_close: true
 
-  # A public repository with fewer than 10 stars has its reviews triggered
-  # by hand ("@coderabbitai review", or Trigger review in the status
-  # comment; https://docs.coderabbit.ai/management/plans#rate-limits). These
-  # settings take full effect once that no longer applies.
+  # CodeRabbit's docs say a public repository with fewer than 10 stars has
+  # its reviews triggered by hand
+  # (https://docs.coderabbit.ai/management/plans#rate-limits). This one
+  # has 2, yet CodeRabbit reviewed PR #61 three times on 2026-11-08 with no
+  # request (reviews on ff8a6e974, cf97f766d and 86a9a2605), and tried on
+  # PRs #58 and #63 until the rate limit stopped it. So these settings
+  # apply now.
   auto_review:
     enabled: true
     # Drafts are reviewed only once they leave draft (fork rule: open a PR as

@@ -76,7 +76,7 @@ jobs:
       # command that fails the Cassandra job. Here because fmt is the cheapest
       # job and needs no node. A new script's tests are added here by module name.
       - name: Test the CI report script
-        run: PYTHONPATH=.github/scripts python3 -m unittest -v test_ci_report test_cassandra_coverage_rest_summary
+        run: PYTHONPATH=.github/scripts python3 -m unittest -v test_ci_report test_cassandra_coverage_rest_summary test_fhir_versions_report
 
       # The CI half of the dependency rule (check a dependency's newer
       # releases before working around its bug): each chosen crate's locked

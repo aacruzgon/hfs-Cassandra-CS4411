@@ -1,0 +1,570 @@
+name: FHIR versions (report only)
+
+# The Cassandra backend beyond R4: does it compile with R5 or R6 as its only
+# FHIR version, and do its tests pass when they run as R4, R4B, R5 and R6?
+# The tests choose their version with HFS_TEST_FHIR_VERSION (ADR-aacruzgon-0065).
+#
+# Report only. None of these jobs is a required check, and none will be: R4
+# stays the required gate, through the required jobs in r4b-compile-check.yml
+# and fmt-clippy-cassandra.yml (ADR-aacruzgon-0019, 0021). A job here still
+# goes red when its build or its tests fail, or, in the test job, when its
+# report finds a version that did not really run, so a broken version shows,
+# but nothing waits on it. Each report step is if: always() and
+# continue-on-error: true, as in the other two workflows (ADR-aacruzgon-0045).
+#
+# Runs on the team's self-hosted runners with the fork guard on every job
+# (ADR-aacruzgon-0018): the two checks are light jobs, on either runner; the
+# test job builds every FHIR version at once, so it is heavy, on sam-7900x
+# only (ADR-aacruzgon-0023). Each job reports the size of its target directory
+# and where its time went (.github/scripts/ci-report.py), in the run's summary
+# page and in its artifact ci-report-<job>.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Each job's last report reads its own step timings from the Actions API
+  # (.github/scripts/job-step-timings.py). Read-only, like contents.
+  actions: read
+
+# One run per ref; a newer push supersedes the run in flight.
+concurrency:
+  group: fhir-versions-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # As in r4b-compile-check.yml: pinned by environment, which rustup ranks
+  # above any directory override left on the runner.
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # R5 as the only version the backend's own crate enables, not R5 with R4:
+  # a build with every version on has every #[cfg(feature = …)] arm, so it
+  # cannot catch a match or a function that only compiles because the R4 arm
+  # is there, or a missing catch-all arm. A cassandra,R5 build also has a
+  # mismatch worth checking: helios-audit's R5 feature turns on its R4B, so
+  # helios-fhir has R4B (FhirVersion::R4B exists) while helios-persistence's
+  # own R4B feature is off, and any match on FhirVersion there needs an arm
+  # for a version its cfgs say is absent.
+  r5-check:
+    name: cargo check (cassandra, R5)
+    # Fork guard (ADR-aacruzgon-0018). It only keeps this unmodified workflow
+    # from running a fork's code; approval is what keeps forks off the runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra-light]
+    timeout-minutes: 30
+    env:
+      # The commit and build profile the CI reports name (ci-report.py
+      # context): on a pull request, its head, not the merge commit
+      # GITHUB_SHA names.
+      CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      CI_REPORT_PROFILE: dev (cargo check only)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Keep the job token out of .git/config, where build scripts and
+          # proc-macros run by cargo could read it.
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+
+      # The same bounded, persistent target directory as r4b-compile-check.yml
+      # (ADR-sam-michaels-0002), its own: R5 and R4B builds share no
+      # generated-model artifacts, so sharing would only thrash both.
+      - name: Reset the target dir if it is stale or over its cap
+        env:
+          TARGET_DIR: ${{ runner.workspace }}/target/fhir-versions-r5
+          CAP_GB: 10
+        run: |
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
+          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
+          reset=no reason=
+          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+            if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
+            reset=yes
+            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          # The tag cargo writes only into a target dir it creates itself; see
+          # cassandra-coverage.yml's reset step.
+          printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+            '# This file is a cache directory tag created by cargo.' \
+            '# For information about cache directory tags see https://bford.info/cachedir/' \
+            > "$TARGET_DIR/CACHEDIR.TAG"
+          echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+          # For the build-size report (.github/scripts/build-size-report.py).
+          {
+            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_RESET=$reset"
+            echo "TARGET_DIR_RESET_REASON=$reason"
+            echo "TARGET_DIR_CAP_GB=$CAP_GB"
+          } >> "$GITHUB_ENV"
+
+      # Wrapped in ci-report.py build: the wall time, the runner cgroup's
+      # memory peaks and OOM kills, and cargo's --timings chart, which does
+      # not change what is checked. It exits with cargo's status.
+      - name: cargo check -p helios-persistence --no-default-features --features cassandra,R5
+        run: |
+          python3 .github/scripts/ci-report.py build build-r5-check "Build: cargo check (cassandra, R5)" -- \
+            cargo check -p helios-persistence --no-default-features --features cassandra,R5 --timings
+
+      # The persistent target directory before and after this job, and
+      # whether the reset step reset it and why
+      # (.github/scripts/build-size-report.py). Report only.
+      - name: Report the target directory's size
+        if: always()
+        continue-on-error: true
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/build-size"
+          python3 .github/scripts/build-size-report.py "$out"
+          python3 .github/scripts/ci-report.py add build-size "Target directory size" \
+            --markdown "$out/build-size.md" --json "$out/build-size.json"
+
+      # Where this job's time went (.github/scripts/job-step-timings.py), read
+      # from the Actions API with this job's token. Report only.
+      - name: Report where this job's time went
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
+          python3 .github/scripts/job-step-timings.py "cargo check (cassandra, R5)" "$out"
+          python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
+            --markdown "$out/step-timings.md" --json "$out/step-timings.json"
+
+      # Every report section of this job, as JSON and Markdown, plus the raw
+      # outputs they were read from. Report only.
+      - name: Upload the CI report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-r5-check
+          path: ${{ runner.temp }}/ci-report
+          if-no-files-found: warn
+          overwrite: true
+
+  # R6 as the only version, for the same reasons as r5-check (helios-audit's
+  # R6 feature turns on its R4B too). helios-fhir/skip-r6-download builds R6
+  # from the specs in the repository instead of downloading them.
+  r6-check:
+    name: cargo check (cassandra, R6)
+    # Fork guard (ADR-aacruzgon-0018).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra-light]
+    timeout-minutes: 30
+    env:
+      CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      CI_REPORT_PROFILE: dev (cargo check only)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+
+      # As in r5-check, its own directory.
+      - name: Reset the target dir if it is stale or over its cap
+        env:
+          TARGET_DIR: ${{ runner.workspace }}/target/fhir-versions-r6
+          CAP_GB: 10
+        run: |
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
+          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
+          reset=no reason=
+          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+            if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
+            reset=yes
+            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          # The tag cargo writes only into a target dir it creates itself; see
+          # cassandra-coverage.yml's reset step.
+          printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+            '# This file is a cache directory tag created by cargo.' \
+            '# For information about cache directory tags see https://bford.info/cachedir/' \
+            > "$TARGET_DIR/CACHEDIR.TAG"
+          echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+          # For the build-size report (.github/scripts/build-size-report.py).
+          {
+            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_RESET=$reset"
+            echo "TARGET_DIR_RESET_REASON=$reason"
+            echo "TARGET_DIR_CAP_GB=$CAP_GB"
+          } >> "$GITHUB_ENV"
+
+      # Wrapped in ci-report.py build, as in r5-check; it exits with cargo's
+      # status.
+      - name: cargo check -p helios-persistence --no-default-features --features cassandra,R6,helios-fhir/skip-r6-download
+        run: |
+          python3 .github/scripts/ci-report.py build build-r6-check "Build: cargo check (cassandra, R6)" -- \
+            cargo check -p helios-persistence --no-default-features \
+              --features cassandra,R6,helios-fhir/skip-r6-download --timings
+
+      # Report only.
+      - name: Report the target directory's size
+        if: always()
+        continue-on-error: true
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/build-size"
+          python3 .github/scripts/build-size-report.py "$out"
+          python3 .github/scripts/ci-report.py add build-size "Target directory size" \
+            --markdown "$out/build-size.md" --json "$out/build-size.json"
+
+      # Report only.
+      - name: Report where this job's time went
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
+          python3 .github/scripts/job-step-timings.py "cargo check (cassandra, R6)" "$out"
+          python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
+            --markdown "$out/step-timings.md" --json "$out/step-timings.json"
+
+      # Report only.
+      - name: Upload the CI report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-r6-check
+          path: ${{ runner.temp }}/ci-report
+          if-no-files-found: warn
+          overwrite: true
+
+  # The backend's Cassandra tests, once per FHIR version, from two builds with
+  # all four on, one per test crate because their feature sets differ, never
+  # one per version: the persistence tests choose their version from
+  # HFS_TEST_FHIR_VERSION (each binary prints the
+  # `fhir-versions: HFS_TEST_FHIR_VERSION=… -> …` line once), and the hfs
+  # tests pass it on to the hfs they start. The same tests the required job
+  # `Cassandra schema (single node)` runs as R4, except the readiness test,
+  # which stops its node, and the report-only boot, latency and audit steps.
+  # On its own node, as that job is on its own (ADR-aacruzgon-0020).
+  all-versions:
+    name: Cassandra tests (all FHIR versions)
+    # Fork guard (ADR-aacruzgon-0018).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Every FHIR version's generated models in each build: heavy, sam-7900x
+    # only (ADR-aacruzgon-0023).
+    runs-on: [self-hosted, hfs-cassandra-heavy]
+    timeout-minutes: 60
+    env:
+      COMPOSE_FILE: docker/cassandra/docker-compose.yml
+      # Not the developers' default 59042 (ADR-sam-michaels-0001). It is also
+      # cassandra-coverage.yml's port, which is safe because sam-7900x, the
+      # only heavy runner, is one runner instance and runs one job at a time.
+      # Every compose command below names this job's own project,
+      # hfs-cassandra-fhir-versions, so down -v can only ever remove this
+      # job's containers and volume.
+      CASSANDRA_HOST_PORT: 59242
+      # No incremental cache in the persistent target dir below: it would grow
+      # with every commit until the size cap wipes the whole directory.
+      CARGO_INCREMENTAL: 0
+      # The two feature sets every cargo command below uses, so the test runs
+      # reuse exactly what the build step built.
+      PERSISTENCE_FEATURES: cassandra,sqlite,R4,R4B,R5,R6,helios-fhir/skip-r6-download
+      HFS_FEATURES: R4,R4B,R5,R6,cassandra,sqlite,helios-fhir/skip-r6-download
+      CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
+      CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+
+      # The same bounded, persistent target directory (ADR-sam-michaels-0002),
+      # with a larger cap: four versions' generated models, built twice (the
+      # persistence and the hfs feature sets differ), plus the test binaries.
+      - name: Reset the target dir if it is stale or over its cap
+        env:
+          TARGET_DIR: ${{ runner.workspace }}/target/fhir-versions-all
+          CAP_GB: 25
+        run: |
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
+          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
+          reset=no reason=
+          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+            if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
+            reset=yes
+            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          # The tag cargo writes only into a target dir it creates itself; see
+          # cassandra-coverage.yml's reset step.
+          printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+            '# This file is a cache directory tag created by cargo.' \
+            '# For information about cache directory tags see https://bford.info/cachedir/' \
+            > "$TARGET_DIR/CACHEDIR.TAG"
+          echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+          # For the build-size report (.github/scripts/build-size-report.py).
+          {
+            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_RESET=$reset"
+            echo "TARGET_DIR_RESET_REASON=$reason"
+            echo "TARGET_DIR_CAP_GB=$CAP_GB"
+          } >> "$GITHUB_ENV"
+
+      # Built before Cassandra starts, so the build's memory peak and the
+      # 3 GiB container never overlap, as in the required Cassandra job. Each
+      # build runs under ci-report.py build (wall time, the runner cgroup's
+      # memory peaks, OOM kills, cargo's --timings chart; it exits with
+      # cargo's status). --timings does not change the build, so the test
+      # step below rebuilds nothing. nice: sam-7900x is also Sam's desktop.
+      - name: Build the persistence and hfs Cassandra tests with every FHIR version, and report the memory peak
+        id: build
+        run: |
+          python3 .github/scripts/ci-report.py build build-persistence-all-versions \
+            "Build: helios-persistence Cassandra tests (R4, R4B, R5, R6)" -- \
+            nice -n 10 cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
+              --lib --test cassandra_tests --test backend_capability_contract --no-run --timings
+          python3 .github/scripts/ci-report.py build build-hfs-all-versions \
+            "Build: hfs (R4, R4B, R5, R6, cassandra) and the Milestone A test" -- \
+            nice -n 10 cargo test -p helios-hfs --no-default-features --features "$HFS_FEATURES" \
+              --test cassandra_milestone_a --no-run --timings
+
+      # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
+      - name: Remove leftovers of an earlier run
+        run: docker compose -p hfs-cassandra-fhir-versions down -v --remove-orphans
+
+      # First boot takes about 60 s; the healthcheck allows a 90 s start
+      # period and then 12 retries 10 s apart. Timed with ci-report.py timed,
+      # which exits with the command's status.
+      - name: Start Cassandra and wait for its healthcheck
+        run: |
+          python3 .github/scripts/ci-report.py timed node-start "Start and healthcheck (compose up --wait)" -- \
+            docker compose -p hfs-cassandra-fhir-versions up -d --wait --wait-timeout 240
+
+      # The context every later report section carries, now with the node's
+      # Cassandra version. Report only.
+      - name: Report the context
+        continue-on-error: true
+        run: python3 .github/scripts/ci-report.py context --cassandra-container hfs-cassandra-fhir-versions-cassandra-1
+
+      # The schema the tests expect. Whether it matches the design is the
+      # required job's check, not repeated here.
+      - name: Apply keyspace-single-node.cql, then schema.cql
+        run: |
+          python3 .github/scripts/ci-report.py timed node-start "Apply keyspace-single-node.cql" -- \
+            cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
+              -f docs/Cassandra/schema/keyspace-single-node.cql
+          python3 .github/scripts/ci-report.py timed node-start "Apply schema.cql (ten tables)" -- \
+            cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
+              -k helios -f docs/Cassandra/schema/schema.cql
+
+      # For each version, the three suites, each against this node and each
+      # into its own log, $RUNNER_TEMP/ci-report/logs/fhir-<version>-<suite>.log,
+      # which ends with `exit=<status>` for the report below:
+      #   lib    the backend's unit tests (--lib backends::cassandra); its
+      #          restart_tests skip without HFS_TEST_CASSANDRA_RESTART_*,
+      #          which this job never sets
+      #   tests  tests/cassandra_tests.rs and backend_capability_contract.rs;
+      #          --no-fail-fast, so a failure in the first binary does not
+      #          keep the second from running
+      #   rest   the Milestone A round trip and the Step 3 CRUD test through
+      #          hfs, and the_startup_check_matches_the_whole_version, the
+      #          unit test of the check on hfs's startup line, which no other
+      #          job runs; never readiness_reports_down_while_cassandra_is_stopped,
+      #          which stops a node. It must run exactly its three tests:
+      #          --exact on names that match nothing passes with 0 tests, so,
+      #          as in the required job's --exact steps, a renamed test fails
+      #          the run instead of turning it green
+      # All twelve run whatever the earlier ones did: the step records each
+      # exit status and fails at the end if any was not 0. Already built, so
+      # nothing here compiles.
+      - name: Cassandra tests as R4, R4B, R5 and R6 against this node
+        id: tests
+        timeout-minutes: 30
+        run: |
+          set +e
+          logs="$RUNNER_TEMP/ci-report/logs"
+          mkdir -p "$logs"
+          export HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT"
+          failed=()
+          run_suite() {
+            local version=$1 suite=$2
+            shift 2
+            local log="$logs/fhir-$version-$suite.log"
+            echo "::group::$version $suite"
+            echo "\$ HFS_TEST_FHIR_VERSION=$version $*" > "$log"
+            HFS_TEST_FHIR_VERSION="$version" "$@" 2>&1 | tee -a "$log"
+            local status=${PIPESTATUS[0]}
+            if [ "$suite" = rest ] && [ "$status" -eq 0 ] \
+              && ! grep -Eq '^test result: ok\. 3 passed;' <(sed 's/\x1b\[[0-9;]*m//g' "$log"); then
+              echo "::error title=FHIR versions::$version rest did not run exactly its three tests"
+              status=1
+            fi
+            echo "exit=$status" | tee -a "$log"
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then failed+=("$version $suite (exit $status)"); fi
+          }
+          for version in R4 R4B R5 R6; do
+            run_suite "$version" lib \
+              cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
+                --lib -- backends::cassandra --nocapture
+            run_suite "$version" tests \
+              cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
+                --test cassandra_tests --test backend_capability_contract --no-fail-fast -- --nocapture
+            run_suite "$version" rest \
+              cargo test -p helios-hfs --no-default-features --features "$HFS_FEATURES" \
+                --test cassandra_milestone_a -- \
+                --exact milestone_a_create_then_read_through_rest step3_crud_through_rest \
+                the_startup_check_matches_the_whole_version --nocapture
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            for run in "${failed[@]}"; do
+              echo "::error title=FHIR versions::$run failed"
+            done
+            exit 1
+          fi
+
+      # One row per version and suite: passed, failed and ignored, the exit
+      # status, and whether the persistence tests' selector line names the
+      # version the step set (.github/scripts/fhir-versions-report.py). Then
+      # ci-report.py's own test table over the same logs, which lists every
+      # live test that printed a skip. Written whatever the test step's
+      # result. Report only.
+      - name: Report the tests per FHIR version
+        if: always()
+        continue-on-error: true
+        run: |
+          logs="$RUNNER_TEMP/ci-report/logs"
+          out="$RUNNER_TEMP/ci-report/inputs/fhir-versions"
+          python3 -I .github/scripts/fhir-versions-report.py "$logs" "$out"
+          python3 .github/scripts/ci-report.py add fhir-versions "Cassandra tests per FHIR version" \
+            --markdown "$out/fhir-versions.md" --json "$out/fhir-versions.json"
+          set --
+          for version in R4 R4B R5 R6; do
+            for suite in lib tests rest; do set -- "$@" "$logs/fhir-$version-$suite.log"; done
+          done
+          python3 .github/scripts/ci-report.py tests tests "Tests (all FHIR versions)" "$@"
+
+      # The gate on what that report found. The test step fails on a failed or
+      # cut-off run, but only the report reads the selector lines and each
+      # suite's counts: without this step, a version whose selector did not
+      # apply, which really tests the build's default version, or a --lib
+      # filter that matches nothing, would leave the job green. A report that
+      # cannot be read confirms nothing, so it fails too. No if: it runs only
+      # when the test step passed (a failed one has already failed the job),
+      # and the if: always() reports after it still upload.
+      - name: Fail unless every version really ran its tests
+        run: |
+          python3 -I - "$RUNNER_TEMP/ci-report/inputs/fhir-versions/fhir-versions.json" <<'PY'
+          import json
+          import sys
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as report_file:
+                  report = json.load(report_file)
+          except (OSError, ValueError) as error:
+              print(f"::error title=FHIR versions::the report cannot be read, so no version is confirmed: {error}")
+              sys.exit(1)
+          if report.get("all_ok") is not True:
+              runs, ok = report.get("runs", 0), report.get("ok", 0)
+              problems = "; ".join(report.get("warnings", []))
+              print(f"::error title=FHIR versions::{runs - ok} of {runs} runs not ok: {problems}")
+              sys.exit(1)
+          print(f"{report['ok']} of {report['runs']} runs ok")
+          PY
+
+      - name: Cassandra logs
+        if: failure()
+        run: docker compose -p hfs-cassandra-fhir-versions logs --tail 200
+
+      # down -v is safe here only because -p names this job's own project.
+      - name: Stop Cassandra and remove this job's volume
+        if: always()
+        run: docker compose -p hfs-cassandra-fhir-versions down -v --remove-orphans
+
+      # The target directory before and after, whether the reset step reset
+      # it, and the size of every binary the build step made: its two cargo
+      # commands again with --message-format=json, a no-op that lists the
+      # executables it already built (.github/scripts/build-size-report.py).
+      # Report only.
+      - name: Report the target directory's and the binaries' sizes
+        if: always()
+        continue-on-error: true
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/build-size"
+          mkdir -p "$out"
+          set --
+          if [ "$BUILD_OUTCOME" = success ]; then
+            # A failure here only loses the binary sizes, not the section.
+            cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
+              --lib --test cassandra_tests --test backend_capability_contract --no-run \
+              --message-format=json > "$out/persistence-artifacts.json" || true
+            cargo test -p helios-hfs --no-default-features --features "$HFS_FEATURES" \
+              --test cassandra_milestone_a --no-run --message-format=json > "$out/hfs-artifacts.json" || true
+            set -- "@$out/persistence-artifacts.json" "@$out/hfs-artifacts.json"
+          fi
+          python3 .github/scripts/build-size-report.py "$out" "$@"
+          python3 .github/scripts/ci-report.py add build-size "Target directory and binary sizes" \
+            --markdown "$out/build-size.md" --json "$out/build-size.json"
+
+      # Where this job's time went (.github/scripts/job-step-timings.py).
+      # Report only.
+      - name: Report where this job's time went
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
+          python3 .github/scripts/job-step-timings.py "Cassandra tests (all FHIR versions)" "$out"
+          python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
+            --markdown "$out/step-timings.md" --json "$out/step-timings.json"
+
+      # Every report section of this job, as JSON and Markdown, plus the raw
+      # outputs they were read from, the twelve test logs included. Report
+      # only.
+      - name: Upload the CI report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-fhir-versions
+          path: ${{ runner.temp }}/ci-report
+          if-no-files-found: warn
+          overwrite: true

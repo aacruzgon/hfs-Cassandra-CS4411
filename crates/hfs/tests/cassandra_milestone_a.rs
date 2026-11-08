@@ -704,6 +704,12 @@ async fn update_through_rest(rest: &Rest<'_>, suffix: &str) {
     // R4 #update: "200 OK HTTP status code if the resource was updated …
     // with a Last-Modified header, and an ETag header which contains the new
     // versionId". No Location on a 200 (R4: "If the resource was created").
+    // The two `U-8` rows assert R4's `Location` rule under every FHIR version,
+    // because the shared REST layer answers that way, although R5's and R6's
+    // `#update` (https://hl7.org/fhir/R5/http.html#update) puts a `Location`
+    // on every successful update and their `#upsert`
+    // (https://hl7.org/fhir/R5/http.html#upsert) makes a created resource's
+    // `Location` the URL of the PUT.
     let updated = rest.put(&path, &patient(&id, "Two"), &[]).await;
     spec("U-7:put-existing", 200, updated.code(), hfs);
     spec("U-7:etag", "W/\"2\"", updated.header(ETAG), hfs);

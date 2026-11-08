@@ -11541,8 +11541,13 @@ mod tests {
                 &tenant,
                 vec![
                     instance_delete("Patient/rolled-back"),
-                    // Deleting an id that does not exist fails the whole Bundle.
-                    instance_delete("Patient/never-existed"),
+                    // An `ifMatch` no resource can satisfy fails the whole
+                    // Bundle. (A plain delete of an id that does not exist no
+                    // longer does: it is a `204` no-op, #2523.)
+                    BundleEntry {
+                        if_match: Some("W/\"1\"".to_string()),
+                        ..instance_delete("Patient/never-existed")
+                    },
                 ],
                 FhirVersion::default(),
             )

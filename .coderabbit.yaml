@@ -83,10 +83,14 @@ reviews:
   # CodeRabbit's docs say a public repository with fewer than 10 stars has
   # its reviews triggered by hand
   # (https://docs.coderabbit.ai/management/plans#rate-limits). This one
-  # has 2, yet CodeRabbit reviewed PR #61 three times on 2026-11-08 with no
-  # request (reviews on ff8a6e974, cf97f766d and 86a9a2605), and tried on
-  # PR #58, also unasked, until the rate limit stopped it. So these
-  # settings apply now.
+  # has 2, yet CodeRabbit reviewed PR #61 three times on the evening of
+  # 2026-11-07, Toronto time (2026-11-08 UTC), with no "@coderabbitai"
+  # comment (reviews on ff8a6e974, cf97f766d and 86a9a2605). It also tried
+  # PRs #58 and #63 unasked, each as it left draft, until the rate limit
+  # stopped it: #63 left draft at 01:36:16 UTC, and its status comment said
+  # "Review limit reached" nine seconds later, an hour before the first
+  # "@coderabbitai review" on it (02:37:46 UTC). So these settings apply
+  # now.
   auto_review:
     enabled: true
     # Drafts are reviewed only once they leave draft (fork rule: open a PR as

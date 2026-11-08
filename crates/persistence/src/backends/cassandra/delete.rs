@@ -254,6 +254,16 @@ impl CassandraBackend {
                                 {
                                     request.note_miss_budget_exhausted();
                                 }
+                                // Another writer's marker made C3 miss: the
+                                // overlay catches up with it (ADR-aacruzgon-0068).
+                                // After an unknown outcome the serial read at the
+                                // end of the call does that instead.
+                                if resource_type == "SearchParameter"
+                                    && miss == CasMiss::Deleted
+                                    && !request.had_unknown_outcome()
+                                {
+                                    self.catch_up_with_a_deleted_miss(tenant_id, id).await;
+                                }
                                 return Err(error);
                             }
                         }
@@ -264,6 +274,33 @@ impl CassandraBackend {
         .await;
         self.settle_overlay_after_unknown(&request, &result).await;
         result
+    }
+
+    /// A SearchParameter delete whose C3 missed with `deleted_at > 0`:
+    /// another writer deleted it between this call's R1 and its C3, and the
+    /// overlay records that removal now, not at the TTL refresh
+    /// (ADR-aacruzgon-0068). One R1 at `LOCAL_QUORUM` reads the marker's
+    /// `last_updated`: the miss came from a Paxos round on this partition
+    /// that read the marker as committed, and Paxos v2's prepare first
+    /// brings a quorum up to the latest commit (`PaxosPrepare.java:852-857`),
+    /// so a quorum read sees it, or a newer version, which the overlay
+    /// follows as well. A removal already held is not recorded again
+    /// ([`CassandraBackend::follow_stored_search_parameter`]). A failed read
+    /// is logged and changes nothing; the call's `NotFound` is unchanged.
+    async fn catch_up_with_a_deleted_miss(&self, tenant_id: &str, id: &str) {
+        match self
+            .read_resource_row(tenant_id, "SearchParameter", id)
+            .await
+        {
+            Ok(row) => self.follow_stored_search_parameter(tenant_id, id, row.as_ref()),
+            Err(error) => tracing::warn!(
+                tenant_id,
+                id,
+                error = %error,
+                "a SearchParameter delete met another writer's delete and could not read \
+                 its marker; the overlay keeps its entry until the next refresh or write of it"
+            ),
+        }
     }
 
     /// After a delete applied: a stored SearchParameter leaves the overlay
@@ -1857,5 +1894,58 @@ mod node_tests {
             ),
             "{result:?}"
         );
+    }
+
+    /// ADR-aacruzgon-0068, the in-gap case: another instance deletes the
+    /// parameter between this delete's pre-read (live) and its C3, which
+    /// then misses with `deleted_at > 0`. The call answers `NotFound`
+    /// (REST 204), with no unknown outcome, and the overlay drops the
+    /// parameter at once. For `delete` and for `delete_versioned`.
+    #[tokio::test]
+    async fn a_searchparameter_deleted_in_the_gap_by_another_instance_leaves_the_overlay() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let other = self::backend().await.expect("connect");
+        for (case, expect) in [
+            ("sp-in-gap-delete", Expect::Current),
+            ("sp-in-gap-versioned", Expect::Version("1")),
+        ] {
+            let (tenant, url) = tenant_with_parameter(&backend, case).await;
+            let t = tenant.tenant_id().as_str();
+            let (backend_ref, other_ref, tenant_ref) = (&backend, &other, &tenant);
+            let result = backend
+                .delete_turns(t, "SearchParameter", "s", expect, move || async move {
+                    let row = backend_ref
+                        .read_resource_row(t, "SearchParameter", "s")
+                        .await;
+                    if row
+                        .as_ref()
+                        .is_ok_and(|r| r.as_ref().is_some_and(|r| !r.is_deleted()))
+                    {
+                        other_ref
+                            .delete(tenant_ref, "SearchParameter", "s")
+                            .await
+                            .expect("the other instance's delete");
+                    }
+                    row
+                })
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(StorageError::Resource(ResourceError::NotFound { .. }))
+                ),
+                "{case}: {result:?}"
+            );
+            assert!(
+                !backend
+                    .exists(&tenant, "SearchParameter", "s")
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(expression_of(&backend, &tenant, &url), None, "{case}");
+        }
     }
 }

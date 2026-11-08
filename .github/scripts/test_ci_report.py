@@ -204,9 +204,9 @@ FAILED_WITH_OPEN_MESSAGE = [
 # A failed statement whose query itself ends open stays unverifiable. A query
 # holding "password" that fails to parse or to prepare is logged cut after it
 # (QueryEvents.maybeObfuscatePassword, 5.0.9: the statement is still null).
-# The first, a syntax error, was recorded on a 5.0.9 node; the second, a
-# validation failure, is built from the 5.0.9 source (the message is cut too,
-# by AuditLogManager.obfuscatePasswordInformation).
+# Both were recorded on a 5.0.9 node, byte for byte: the first a syntax
+# error, the second a validation failure (the message is cut too, by
+# AuditLogManager.obfuscatePasswordInformation).
 FAILED_WITH_OPEN_QUERY = [
     "INSERT INTO resources_by_type (tenant_id) VALUES ('my password *******; Syntax Exception. Obscured for security reasons.",
     "SELECT * FROM resources WHERE tenant_id = 't' AND resource_type = 'P' AND id = 'i' AND version_id = 'my password *******; "

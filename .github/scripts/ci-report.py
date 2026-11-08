@@ -1023,9 +1023,10 @@ def audit_records(text: str) -> list[dict]:
       after `= :`, in a select list, in `IN (`, after `USING`, in a column
       list, in ALTER and in a WITH map. The first line alone is not: in a
       select list a map or UDT literal may hold column names, so
-      `SELECT (map<text, text>){Type: audit} FROM s` parses (5.0.9 answers
-      it with an undefined-column error, not a syntax error). What fails is
-      `LogMessage` after `audit` with no comma.
+      `SELECT (map<text, text>){Type: audit} FROM s` parses, and runs when
+      `s` has columns `type` and `audit` (on another table 5.0.9 answers an
+      undefined-column error). What fails is `LogMessage` after `audit` with
+      no comma.
 
     Lines are split on "\n" only, with a trailing "\r" dropped (a CRLF dump);
     a bare "\r" stays in the text."""

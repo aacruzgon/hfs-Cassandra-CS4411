@@ -1,0 +1,791 @@
+---
+# yamllint disable-line rule:line-length
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit configuration for the Cassandra fork of the Helios FHIR server
+# (aacruzgon/hfs-Cassandra-CS4411). Upstream (HeliosSoftware/hfs) has no
+# CodeRabbit file, so this one is fork-only.
+#
+# What it is for: CodeRabbit reviews every pull request here for free, under
+# a rate limit, so it should review against this repository's own rules and
+# spend its reviews on the files that matter. The rules come from CLAUDE.md,
+# the ADR log (docs/Cassandra/ADR-aacruzgon/), the design
+# (docs/Cassandra/cassandra-discussion.md) and the roadmap
+# (docs/Cassandra/development-roadmap.md); each instruction below names its
+# source so a reviewer can check it.
+#
+# Reference: https://docs.coderabbit.ai/reference/configuration
+# Schema:    https://coderabbit.ai/integrations/schema.v2.json
+
+language: en-US
+
+# At most 250 characters (schema: tone_instructions.maxLength).
+tone_instructions: >-
+  Plain words, short sentences. No praise, no filler, no emoji. Give every
+  finding its evidence: file:line, the rule or ADR it breaks, and an input
+  that fails. Say when a claim is inferred, not checked.
+
+early_access: false
+
+reviews:
+  # chill, not assertive. assertive posts nitpicks as inline threads; chill
+  # puts them in a collapsed section of the review summary
+  # (https://docs.coderabbit.ai/guides/custom-reports). Every CodeRabbit
+  # thread here is fixed or answered and resolved before merge, and each fix
+  # push is another review event against the limit
+  # (https://docs.coderabbit.ai/management/rate-limits). The depth comes from
+  # path_instructions and the code guidelines below, not from the profile.
+  profile: chill
+
+  # No approvals and no "request changes" from the bot: a merge here needs the
+  # five required checks and a human (ADR-aacruzgon-0019, 0021).
+  # request_changes_workflow is a deprecated alias of auto_approvals.enabled.
+  auto_approvals:
+    enabled: false
+
+  # The summary goes in the walkthrough comment, never in the PR description:
+  # the description is the author's, written when the PR leaves draft.
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  high_level_summary_instructions: >-
+    Three to six bullets: what changed and why, in plain words. Name each ADR
+    the PR adds or cites (ADR-<user>-NNNN). No marketing words.
+
+  # Walkthrough: kept, collapsed, and limited to what a reviewer uses.
+  collapse_walkthrough: true
+  changed_files_summary: true
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  assess_linked_issues: true
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  auto_apply_labels: false
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+
+  # Status and review info stay on: they say when a review was skipped or
+  # rate limited, and which configuration file was applied.
+  review_status: true
+  review_info: true
+  review_details: false
+
+  # Noise off.
+  poem: false
+  in_progress_fortune: false
+
+  # Kept: the team's Claude Code workers fix review comments, and this
+  # section is written for them.
+  enable_prompt_for_ai_agents: true
+
+  abort_on_close: true
+
+  # CodeRabbit's docs say a public repository with fewer than 10 stars has
+  # its reviews triggered by hand
+  # (https://docs.coderabbit.ai/management/plans#rate-limits). This one
+  # has 2, yet CodeRabbit reviewed PR #61 three times on the evening of
+  # 2026-11-07, Toronto time (2026-11-08 UTC), with no "@coderabbitai"
+  # comment (reviews on ff8a6e974, cf97f766d and 86a9a2605). It also tried
+  # PRs #58 and #63 unasked, each as it left draft, until the rate limit
+  # stopped it: #63 left draft at 01:36:16 UTC, and its status comment said
+  # "Review limit reached" nine seconds later, an hour before the first
+  # "@coderabbitai review" on it (02:37:46 UTC). So these settings apply
+  # now.
+  auto_review:
+    enabled: true
+    # Drafts are reviewed only once they leave draft (fork rule: open a PR as
+    # a draft on first push, and review it when it is undrafted). Marking a
+    # draft ready triggers the first review
+    # (https://docs.coderabbit.ai/management/rate-limits).
+    drafts: false
+    # Only pull requests into main: the default branch is always reviewed,
+    # and this list (unanchored regexes) adds others
+    # (https://docs.coderabbit.ai/configuration/auto-review). A stacked PR
+    # into another branch waits until it targets main, as CI does.
+    base_branches: []
+    # Each push is re-reviewed, and each such review counts against the
+    # limit (https://docs.coderabbit.ai/management/rate-limits). Automatic
+    # reviews pause after two reviewed commits, not the default five: PRs
+    # #58 and #63 got no review at all ("Review limit reached"), and the
+    # docs suggest 1 or 2 for that case
+    # (https://docs.coderabbit.ai/configuration/auto-review). After the
+    # pause, push the fixes together and ask for the next pass with
+    # "@coderabbitai review".
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 2
+    # The Sunday upstream sync (sync/upstream-YYYY-MM-DD) merges hundreds of
+    # upstream files; its titles start "chore(sync)". Run
+    # "@coderabbitai review" on it by hand when wanted.
+    ignore_title_keywords:
+      - "chore(sync)"
+    # Bot authors (Dependabot) are already skipped by CodeRabbit
+    # ("Review skipped: Bot user detected" on PRs #30, #31, #34).
+    ignore_usernames: []
+
+  # Generated code, spec downloads, vendored assets, lockfiles and large
+  # fixtures: none is written by hand here, and each would use the review's
+  # file budget (100 to 300 files for OSS, counted after these filters;
+  # https://docs.coderabbit.ai/management/plans#rate-limits). Exclusions
+  # only: one include pattern would turn the list into an allowlist
+  # (https://docs.coderabbit.ai/configuration/path-instructions#path-filters).
+  # Every pattern matches at least one tracked file. The lockfiles are also
+  # in CodeRabbit's default exclusions, and are listed so the intent is
+  # explicit here.
+  path_filters:
+    # FHIR models generated by helios-fhir-gen (header: "generated type
+    # definitions" / "Generated by cargo run -p helios-fhir-gen").
+    - "!crates/fhir/src/r4.rs"
+    - "!crates/fhir/src/r4b.rs"
+    - "!crates/fhir/src/r5.rs"
+    - "!crates/fhir/src/r6.rs"
+    - "!crates/fhir/src/compartment_expressions/r*.rs"
+    - "!crates/fhir/src/implied_code_systems/r*.rs"
+    # FHIR specification downloads (R4, R4B, R5, R6) and spec test data:
+    # about 3,600 R6 files alone.
+    - "!crates/fhir-gen/resources/**"
+    - "!crates/fhir/tests/data/**"
+    - "!data/search-parameters-*.json"
+    # Vendored front-end assets (pinned htmx, the CodeMirror bundle).
+    - "!crates/ui/assets/htmx.min.js"
+    - "!crates/ui/assets/vendor/**"
+    # Lockfiles.
+    - "!**/Cargo.lock"
+    - "!**/package-lock.json"
+    - "!**/pnpm-lock.yaml"
+    - "!**/uv.lock"
+    # Large fixtures and terminology archives.
+    - "!crates/hfs/tests/inferno/*.json"
+    - "!crates/fhir-validator/tests/fixtures/**"
+    - "!crates/hts/terminology-data/**"
+    # Disabled workflows, kept for reference: upstream's, and the fork's own
+    # cassandra-integration.yml. GitHub loads none of them
+    # (.github/disabled-workflows/README.md).
+    - "!.github/disabled-workflows/*.yml"
+
+  path_instructions:
+    # ---- Every Rust file ---------------------------------------------------
+    - path: "**/*.rs"
+      instructions: |
+        Rules from CLAUDE.md ("Important Notes"):
+        - Code may assume at least one FHIR version feature (R4, R4B, R5, R6)
+          is on. Flag a new cfg ladder or fallback for "no version enabled".
+        - FhirVersion::default() exists only with the R4 feature; code that
+          calls it assumes R4 is on (CLAUDE.md, "FHIR version feature
+          assumption"). Outside what the R4B-only CI check builds, it and
+          FhirVersion::R4 arms behind #[cfg(feature = "R4")] are allowed.
+          That check builds helios-persistence without R4: its library, and
+          the test files of the cassandra_tests and
+          backend_capability_contract targets. The rules for those files are
+          in their own instructions below.
+        - Minimum Rust is 1.91.1, edition 2024 (rust-version in the root
+          Cargo.toml). Flag a std or language feature stabilised after 1.91.
+        - Clippy runs with -D warnings on all targets and all features in CI;
+          flag what it would reject.
+        - A doc comment or comment must say what the code does now. Flag one
+          that the change made untrue, and a stale "not yet", "stub" or
+          step/status claim.
+
+    # ---- The Cassandra backend ---------------------------------------------
+    - path: "crates/persistence/src/backends/cassandra/**"
+      instructions: |
+        The fork's own backend. Check each change against the design
+        (docs/Cassandra/cassandra-discussion.md), the schema rules at the top
+        of docs/Cassandra/schema/schema.cql, the walkthrough
+        (docs/Cassandra/schema/walkthrough.md, section 3.1) and these ADRs in
+        docs/Cassandra/ADR-aacruzgon/.
+
+        FHIR versions (roadmap section 1, "Nothing is R4-specific";
+        ADR-aacruzgon-0039, 0065): this code also builds in the R4B-only
+        CI check, without R4.
+        - Flag FhirVersion::default(), which exists only with the R4
+          feature; use FhirVersion::default_enabled() or the config's
+          fhir_version.
+        - Flag a FhirVersion::R4 literal that is not one arm of a
+          #[cfg(feature = "R4")] match over the versions.
+
+        Tenant first (CLAUDE.md, "Tenant-First Design"):
+        - Every operation takes the TenantContext first, and every statement
+          binds tenant_id in its partition key. Flag a query that can read or
+          write another tenant's row.
+
+        One write engine (ADR-aacruzgon-0050):
+        - Every compare-and-swap on resources (C1 to C4) goes through the one
+          engine in write.rs. Flag a CAS built or executed anywhere else, and
+          a plain (non-IF) write to resources.
+        - The decision after an unknown outcome is decide() in write.rs; the
+          miss mapping is a pure function of the returned columns.
+
+        Consistency and retries (session.rs; ADR-aacruzgon-0024, 0032):
+        - Every statement runs through CassandraSession::execute, with its
+          consistency from StatementKind: Read and Write LOCAL_QUORUM,
+          SerialRead LOCAL_SERIAL, Cas LOCAL_QUORUM commit with LOCAL_SERIAL
+          serial consistency. Never SERIAL, never ONE, never a driver default.
+        - A CAS is non-idempotent and uses FallthroughRetryPolicy: the driver
+          never re-sends it. No speculative execution anywhere.
+        - Plain writes are idempotent through a fixed USING TIMESTAMP.
+
+        Unknown CAS outcomes (ADR-aacruzgon-0034, 0035, 0051, 0055):
+        - Only errors that prove the CAS did not run are mapped directly.
+          Every other error after the CAS was sent, every WriteTimeout
+          whatever its write_type (SIMPLE included), Server and Overloaded go
+          to the serial read R2.
+        - Every attempt's write_id is kept for the whole request, and a later
+          look at the row is matched against every earlier unknown attempt.
+        - A missing or undecodable write_id decides nothing; it is never
+          "another writer".
+        - An R2 or R3 error is mapped by map_lookup_error (504 for a timeout,
+          503 otherwise), never by classify_cas_failure.
+        - After an applied CAS, the version row (V1 or V2) and the index
+          delta are tried up to 3 times in all (POST_CAS_WRITE_TRIES in
+          write.rs); when the tries run out the write still succeeds,
+          leaving the intent row for the sweeper (G23). The intent delete
+          (I2) is best effort and never retried: a failure leaves the
+          intent for the sweeper. A 5xx after an applied CAS would make a
+          client's retry write twice.
+        - No CAS retry after Unavailable (ADR-aacruzgon-0050).
+
+        Deletes (schema.cql header; ADR-aacruzgon-0027, 0058):
+        - Never a CQL DELETE, TRUNCATE or DROP on resources or
+          resource_versions: deletes are soft (deleted_at > 0), and 0 means
+          live. Never a bound null or null literal. CI's CQL audit check and
+          the write.rs unit test no_statement_deletes_from_or_writes_null_*
+          enforce this; flag anything that would trip them.
+
+        Schema (ADR-aacruzgon-0028):
+        - A new or changed table, key, column type or table option needs a
+          new sign-off from every member. Flag CQL that assumes a column or
+          key schema.cql does not define.
+
+        Errors: a 503 or 504 message is sent to the client verbatim, so it
+        must not name a host or include driver detail (ADR-aacruzgon-0055).
+
+        The `cfg(test)` fault seam (session.rs) must stay test-only, with no
+        Cargo feature.
+
+    # ---- The CRUD suite copy -----------------------------------------------
+    - path: "crates/persistence/tests/cassandra/crud.rs"
+      instructions: |
+        An adapted copy of upstream's tests/crud/ (ADR-aacruzgon-0057).
+        - Test names and bodies stay as upstream's. The only allowed changes
+          are the ones the module header lists (the backend, fresh tenants,
+          test_read_system_tenant's id, the two #306 tests,
+          FhirVersion::default_enabled()). Flag any other difference, and a
+          new difference the header does not list.
+        - The parity test crud::parity::crud_copy_matches_upstream must keep
+          passing: every upstream test copied or on EXCLUDED with a reason,
+          every extra test on ADDITIONS with a reason, no #[ignore], and
+          UPSTREAM_CONTENT's hashes updated only together with the copy.
+        - The cassandra_strict_* tests pin Cassandra's one answer; do not
+          relax them to accept two answers.
+
+    - path: "crates/persistence/tests/crud/**"
+      instructions: |
+        Upstream's CRUD suite. crates/persistence/tests/cassandra/crud.rs is
+        an adapted copy whose parity test hashes these files
+        (ADR-aacruzgon-0057). A change here needs the same change in the copy
+        and the hash in UPSTREAM_CONTENT updated in the same PR, or the
+        parity test fails.
+
+    # ---- The other Cassandra tests -----------------------------------------
+    - path: "crates/persistence/tests/\
+        {cassandra/**,cassandra_tests.rs,common/cassandra*.rs}"
+      instructions: |
+        Cassandra test rules (ADR-aacruzgon-0020, 0029, 0038):
+        - Every test writes under its own fresh tenant or ids
+          (unique_tenant, unique_tenant_id, unique_id) and never cleans up.
+          Flag a fixed tenant, a DROP or TRUNCATE, or an assumption that the
+          node is empty: tests share one node.
+        - Without HFS_TEST_CASSANDRA_URL a test skips or starts its own
+          container; it never runs DDL against the shared node.
+        - Test tenants start with "test-" (CI report R4 reads only those).
+          These files also build in the R4B-only CI check (the instruction
+          below).
+
+    # ---- The Cassandra tests through hfs -----------------------------------
+    - path: "crates/hfs/tests/cassandra_milestone_a.rs"
+      instructions: |
+        The Cassandra tests that run the real hfs binary: the Milestone A
+        round trip, Step 3 through REST, the readiness, boot-time and
+        latency tests. The Cassandra test rules apply (ADR-aacruzgon-0020,
+        0029, 0038):
+        - Each run writes under its own fresh tenant (HFS_DEFAULT_TENANT,
+          prefix "test-": CI report R4 reads only those). Flag a fixed
+          tenant, a DROP or TRUNCATE, or an assumption that the node is
+          empty: tests share one node.
+        - On the HFS_TEST_CASSANDRA_URL node, whose schema is already
+          applied, a test never runs DDL. Only a container of the test's
+          own gets the schema from the harness (ADR-aacruzgon-0027, P6).
+        - The readiness test stops its node, so it never stops the
+          HFS_TEST_CASSANDRA_URL node unless
+          HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER names that node's
+          container, and never the shared docker/cassandra node
+          (hfs-cassandra-cassandra-1).
+        This file builds with R4 (the Cassandra job's --features
+        R4,cassandra) and not in the R4B-only check, so the R4B rules below
+        do not apply to it.
+
+    # ---- What the R4B-only check builds ------------------------------------
+    # r4b-compile-check.yml runs cargo check -p helios-persistence
+    # --no-default-features --features cassandra,R4B twice: for the library,
+    # and for --test cassandra_tests --test backend_capability_contract. The
+    # two globs below are what those builds compile, read from cargo's
+    # dep-info files: the library under crates/persistence/src, less what
+    # another feature or test gates, and 17 test files.
+    - path: "crates/persistence/src/**"
+      instructions: |
+        The R4B-only CI check (r4b-compile-check.yml; ADR-aacruzgon-0019,
+        0039) compiles this library without R4, with only the cassandra
+        feature: every item that no sqlite, postgres, mongodb,
+        elasticsearch, s3, advisor or test cfg gates. src/advisor/main.rs is
+        not built either: it is the config-advisor bin, which needs the
+        advisor feature (required-features in Cargo.toml). In that code
+        (CLAUDE.md, "FHIR version feature assumption"):
+        - Flag FhirVersion::default(), which exists only with the R4
+          feature, unless the item is behind #[cfg(feature = "R4")]. Use
+          FhirVersion::default_enabled() instead.
+        - Flag a FhirVersion::R4 literal that is not behind
+          #[cfg(feature = "R4")].
+        Code under #[cfg(test)], doc comments, and modules gated on another
+        backend's feature are not built there and may use both. The
+        Cassandra backend's own rule is stricter (its instruction above).
+
+    - path: "crates/persistence/tests/{cassandra/**,cassandra_tests.rs,\
+        backend_capability_contract.rs,common/{capabilities,cassandra,\
+        cassandra_testable,container_cleanup,fixtures,harness,seeding}.rs,\
+        multitenancy/tenant_{existence,id_fidelity}_suite.rs,\
+        search/versioned_write_race_suite.rs}"
+      instructions: |
+        These files are the test targets of the R4B-only CI check
+        (r4b-compile-check.yml: --test cassandra_tests --test
+        backend_capability_contract; ADR-aacruzgon-0039, 0065), built
+        without R4. cassandra_tests.rs pulls in the shared harness files and
+        the three shared suites in this glob through #[path] and mod items.
+        - Flag FhirVersion::default(), which exists only with the R4
+          feature; use FhirVersion::default_enabled().
+        - Flag a FhirVersion::R4 literal that is not behind
+          #[cfg(feature = "R4")].
+        - A new #[path] or mod item in cassandra_tests.rs adds a file to
+          this build, and this instruction's glob in .coderabbit.yaml should
+          then name it.
+
+    # ---- Upstream files the fork changes -----------------------------------
+    - path: "{crates,book,utils,docker}/**"
+      instructions: |
+        Most of this tree is upstream's (HeliosSoftware/hfs). The fork's own
+        code is crates/persistence/src/backends/cassandra/, the Cassandra
+        test files (crates/persistence/tests/cassandra/,
+        tests/cassandra_tests.rs, tests/common/cassandra*.rs,
+        crates/hfs/tests/cassandra_milestone_a.rs), docker/cassandra/ and
+        docker/postgres/ (the benchmark baseline).
+        For any other file (roadmap section 1, "Upstream-shaped from day
+        one"):
+        - The change must be the smallest that does the job, with no
+          unrelated edits or reformatting, so it can go upstream.
+        - The file must be listed in section 8, "Upstream touch list", of
+          docs/Cassandra/development-roadmap.md, with what changed. Flag a
+          change to an unlisted upstream file, and say which line to add.
+        - The shared files have one owner (roadmap section 1):
+          backends/mod.rs, lib.rs, the persistence, rest and hfs Cargo.toml
+          files, crates/rest/src/config.rs and crates/hfs/src/main.rs.
+        - Fixes carried ahead of upstream (HeliosSoftware/hfs#2518, #2529,
+          #2530) are -x cherry-picks; flag an edit that makes them diverge
+          from upstream's commit (ADR-aacruzgon-0049, 0052, 0056).
+
+    # ---- ADR logs ----------------------------------------------------------
+    - path: "docs/Cassandra/ADR-*/**"
+      instructions: |
+        Decision records. Rules: CLAUDE.md, "Decision records (ADR)", and the
+        rules and template at the top of each ADR-<user>.md.
+        - Append-only. An entry already on main may gain only a change to
+          its Status line (for example "superseded by ADR-<user>-NNNN") or
+          an added, dated note: "*Update YYYY-MM-DD:*" or
+          "*Corrected YYYY-MM-DD:*", as in ADR-aacruzgon-0005, 0018 and
+          0019. Anything larger is a new entry. Flag any deletion or
+          rewording of a merged entry's existing text.
+        - Numbers are counted across the whole log, not per folder. Flag a
+          new entry whose number is already used by an entry on main, or is
+          used twice in the PR. Do not flag a gap: a lower number may be held
+          by another open PR (ADR-aacruzgon-0065 was on PR #63 while PR #62
+          added 0066). The file is YYYY-MM-DD/NNNN-<short-slug>.md under the
+          day it was worked on.
+        - Every template field is present and filled: Date, Status, Context,
+          Decision, Alternatives considered, Consequences, AI involvement,
+          Links. AI involvement says what the assistant proposed, what the
+          human changed, and what was verified and how.
+        - The index row in ADR-<user>.md links the file and matches its
+          number, date, title and status.
+        - A decision that changes cassandra-discussion.md or
+          development-roadmap.md changes them in the same commit.
+        - Each person edits only their own log (ADR-<their GitHub
+          username>/). A disagreement is a new entry in the disagreeing
+          person's log.
+        - Every cited ADR, file:line, commit and PR must exist and say what
+          the entry claims. Check them.
+
+    # ---- Schema --------------------------------------------------------------
+    - path: "docs/Cassandra/schema/**"
+      instructions: |
+        Signed off by ADR-aacruzgon-0028 at 67f9e0532.
+        - Never change a table, key, column type or table option without a
+          new sign-off entry from every member.
+        - A signed-off comment or sentence may be reworded, or a note added,
+          only when the change cites its ADR (schema.cql: "comment changes
+          since cite their ADR"; for example 2da7bd598, ADR-aacruzgon-0061).
+          Flag a rewording that cites none.
+        - expected-schema.txt must still match schema.cql.
+        - The statement rules at the top of schema.cql bind the backend; a
+          note that changes their meaning is a schema change.
+
+    # ---- Design and roadmap --------------------------------------------------
+    - path: "docs/Cassandra/{cassandra-discussion,development-roadmap}.md"
+      instructions: |
+        The design and the roadmap record what was decided; the ADRs record
+        why. A change here that records a decision needs its ADR in the same
+        commit (CLAUDE.md). Flag a change that contradicts an accepted ADR
+        without one, a progress row marked done without its evidence (run,
+        PR or commit), and a file:line or commit that does not exist.
+        Section 8 must list every upstream file the fork changes under
+        crates/, book/, utils/ and docker/, as the upstream-files
+        instruction above says. The root files CLAUDE.md, AGENTS.md and
+        README.md are deliberately not on that list (ADR-aacruzgon-0069):
+        do not flag their absence.
+
+    # ---- Workflows -----------------------------------------------------------
+    - path: ".github/workflows/**"
+      instructions: |
+        CI rules (CLAUDE.md "Commits and CI"; ADR-aacruzgon-0018, 0019, 0021,
+        0022, 0023, 0045, 0058):
+        - Every job on a self-hosted runner has the fork guard:
+          if: github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        - No pull_request_target and no workflow_run trigger.
+        - Every uses: is pinned to a full 40-character commit SHA with its
+          version in a comment, e.g. "@<sha> # v7.0.2". A tag or branch fails
+          the job before it starts.
+        - runs-on is [self-hosted, hfs-cassandra-light] or
+          [self-hosted, hfs-cassandra-heavy] (a job that may need more than
+          about 9 GB, such as the clippy pair, is heavy). Never the bare
+          hfs-cassandra label in a new job.
+        - No paths: or paths-ignore: filter on r4b-compile-check.yml or
+          fmt-clippy-cassandra.yml: their jobs are required checks, and a
+          skipped workflow never reports.
+        - The five required checks are matched by job name: cargo check
+          (cassandra, R4B), cargo fmt --check, cargo clippy (helios-fhir),
+          cargo clippy (workspace), Cassandra schema (single node). Flag a
+          change to any of those name: values; it must go with a ruleset
+          change.
+        - A run: block that pipes a command into tee starts with
+          set -o pipefail, or the command's failure is lost. Do not end a
+          pipeline under pipefail with grep -q or head after tee: the early
+          exit kills tee with SIGPIPE (141). Write to a file, then grep it.
+        - A report step never fails the job: continue-on-error: true, and its
+          script exits 0 (ADR-aacruzgon-0045). The exceptions are checks: the
+          CQL audit check, the boot-time and latency steps (0045, 0046,
+          0058); flag a continue-on-error added to one of them.
+        - Checkouts set persist-credentials: false; permissions stay
+          contents: read unless a job needs more.
+        - Never [skip ci] anywhere, documentation commits included.
+
+    # ---- CI scripts ----------------------------------------------------------
+    - path: ".github/scripts/*.py"
+      instructions: |
+        CI report scripts (ADR-aacruzgon-0045, 0046, 0048, 0058, 0059).
+        - Python 3, standard library only (the runners install nothing
+          else).
+        - A report never fails the job: on a parse error it warns and exits
+          0. The exception is ci-report.py cql-audit --check, which must fail
+          closed: an empty or missing log, a log with no DML in helios, an
+          unreadable record, a DELETE, TRUNCATE or DROP on resources or
+          resource_versions, or a failed native batch is exit 1
+          (ADR-aacruzgon-0058, 0066). Flag
+          any path where it would pass on input it could not read.
+        - A change to a report or the audit rules comes with a test in
+          test_ci_report.py (stdlib unittest, run in the cargo fmt --check
+          job), using real auditlogviewer output for audit cases.
+
+    # ---- Skills --------------------------------------------------------------
+    - path: "{.claude,.agents}/skills/**"
+      instructions: |
+        .agents/skills is a byte-for-byte mirror of .claude/skills
+        (CLAUDE.md, "Project Skills"; checked with
+        diff -r .agents/skills .claude/skills). Flag a change to a file in
+        one tree without the identical change to the same path in the other.
+
+  # Commit messages: CodeRabbit's docs do not say that a review or a
+  # pre-merge check reads commit messages (custom checks see "relevant git
+  # history", undefined;
+  # https://docs.coderabbit.ai/pr-reviews/custom-checks).
+  # So the commit rules (no AI attribution, no [skip ci], one concern per
+  # commit) are checked on the PR title and description only, and the
+  # commits themselves stay the author's and the audit's job.
+  pre_merge_checks:
+    # Warning only: a merge is blocked by the five required checks and a
+    # human, never by CodeRabbit (anything that blocks is Alan's call).
+    # "error" would block only with auto_approvals on, which is off
+    # (https://docs.coderabbit.ai/pr-reviews/pre-merge-checks).
+    docstrings:
+      # Rust doc coverage is not a rule here, and the check counts test
+      # functions too.
+      mode: "off"
+    title:
+      mode: warning
+      requirements: >-
+        Conventional commit form: type(scope): summary, where type is feat,
+        fix, test, docs, ci, chore, refactor, perf or build, and the scope
+        names the area (cassandra, sync, deps, ...). Lower case after the
+        colon, no trailing period, under about 100 characters.
+    description:
+      mode: warning
+    issue_assessment:
+      mode: warning
+    custom_checks:
+      - name: "No AI attribution"
+        mode: warning
+        instructions: >-
+          Fail if the PR title or description contains a Co-Authored-By
+          trailer naming Claude or another AI assistant, a Claude-Session
+          trailer, a "Generated with Claude Code" (or similar) footer, or a
+          link to an AI session. Pass otherwise. Mentions of Claude Code as a
+          tool inside ADR text or docs are not attribution.
+      - name: "No [skip ci]"
+        mode: warning
+        instructions: >-
+          Fail if the PR title or description contains [skip ci],
+          [ci skip], [no ci], [skip actions] or [actions skip]: GitHub then
+          runs no workflow and the five required checks never report
+          (CLAUDE.md "Commits and CI"). Pass otherwise. Text that quotes the
+          rule, such as "never put [skip ci]", in a changed docs file is
+          not a violation.
+      - name: "ADR rules"
+        mode: warning
+        instructions: >-
+          Only if the PR adds or changes a file under docs/Cassandra/ADR-*/
+          (otherwise pass). Fail if a new entry leaves a template field
+          (Date, Status, Context, Decision, Alternatives considered,
+          Consequences, AI involvement, Links) missing or empty; if its
+          number is already used by another entry in that log on main, or
+          twice in the PR (a gap is not a failure: another open PR may hold
+          the lower number); if it has no
+          matching row in that log's index; or if the PR deletes or rewords
+          existing text of an entry that is already on main. A changed
+          Status line and an added, dated "*Update YYYY-MM-DD:*" or
+          "*Corrected YYYY-MM-DD:*" note are not failures. Pass otherwise.
+
+  tools:
+    # GitHub Actions: the fork's six workflows. .github/actionlint.yaml
+    # declares every self-hosted label they use. actionlint finds that file
+    # by itself (1.7.12, run from the root or from .github/workflows), but
+    # CodeRabbit's docs say only that it runs actionlint "with its default
+    # configuration" (https://docs.coderabbit.ai/tools/actionlint), so
+    # whether CodeRabbit reads it is unconfirmed. Without it, actionlint
+    # reports "label ... is unknown" for each runs-on line. zizmor checks
+    # the security rules that ADR-aacruzgon-0018 and 0022 set.
+    actionlint:
+      enabled: true
+    zizmor:
+      enabled: true
+    # Shell in workflows' run: blocks and the scripts under .github/scripts
+    # and docker/.
+    shellcheck:
+      enabled: true
+    # Python: the CI report scripts (stdlib, unittest).
+    ruff:
+      enabled: true
+    pylint:
+      enabled: false
+    flake8:
+      enabled: false
+    # Markdown is most of the fork's writing (ADRs, design, roadmap).
+    markdownlint:
+      enabled: true
+    # YAML: workflows, docker compose, this file.
+    yamllint:
+      enabled: true
+    # Rust. CodeRabbit skips Clippy when a workflow already runs it, as
+    # fmt-clippy-cassandra.yml does (https://docs.coderabbit.ai/tools/clippy);
+    # left on for the day that changes.
+    clippy:
+      enabled: true
+    ast-grep:
+      enabled: true
+    # Secrets: a public repository on runners that hold tokens.
+    gitleaks:
+      enabled: true
+    trufflehog:
+      enabled: true
+    # Known-vulnerability scan of the lockfiles (Cargo.lock).
+    osvScanner:
+      enabled: true
+    # Security scan of changed SKILL.md files (.claude/skills, .agents/skills).
+    skillspector:
+      enabled: true
+    # FHIR examples and fixtures are full of made-up names and identifiers,
+    # which a PII detector would flag on every one.
+    presidio:
+      enabled: false
+    # Semgrep and OpenGrep have no rules checked in here; ast-grep's
+    # essential rules cover the general patterns.
+    semgrep:
+      enabled: false
+    opengrep:
+      enabled: false
+    # The Dockerfile. Hadolint reads only Dockerfile, *.dockerfile and
+    # Dockerfile.* (https://docs.coderabbit.ai/tools/hadolint); the
+    # docker/ compose files are checked by yamllint.
+    hadolint:
+      enabled: true
+    # Off: hadolint covers the Dockerfile, and gitleaks and trufflehog the
+    # secrets; there is no Terraform or Kubernetes here for its IaC rules.
+    trivy:
+      enabled: false
+    # The CQL and SQL files are Cassandra and PostgreSQL scripts that
+    # sqlfluff's dialects misread; the schema is signed off.
+    sqlfluff:
+      enabled: false
+    squawk:
+      enabled: false
+    # Prose style checking would flag the ADRs' house style on every line.
+    languagetool:
+      enabled: false
+    vale:
+      enabled: false
+    # CI status: CodeRabbit reads the PR's check results.
+    github-checks:
+      enabled: true
+    # Languages and formats this fork does not change: off, so no time is
+    # spent on them.
+    biome:
+      enabled: false
+    eslint:
+      enabled: false
+    oxc:
+      enabled: false
+    htmlhint:
+      enabled: false
+    stylelint:
+      enabled: false
+    reactDoctor:
+      enabled: false
+    swiftlint:
+      enabled: false
+    phpstan:
+      enabled: false
+    phpmd:
+      enabled: false
+    phpcs:
+      enabled: false
+    golangci-lint:
+      enabled: false
+    detekt:
+      enabled: false
+    fbinfer:
+      enabled: false
+    fortitudeLint:
+      enabled: false
+    rubocop:
+      enabled: false
+    brakeman:
+      enabled: false
+    buf:
+      enabled: false
+    regal:
+      enabled: false
+    pmd:
+      enabled: false
+    clang:
+      enabled: false
+    cppcheck:
+      enabled: false
+    verilator:
+      enabled: false
+    circleci:
+      enabled: false
+    checkov:
+      enabled: false
+    tflint:
+      enabled: false
+    prismaLint:
+      enabled: false
+    shopifyThemeCheck:
+      enabled: false
+    luacheck:
+      enabled: false
+    dotenvLint:
+      enabled: false
+    checkmake:
+      enabled: false
+    oasdiff:
+      enabled: false
+    blinter:
+      enabled: false
+    smartyLint:
+      enabled: false
+    emberTemplateLint:
+      enabled: false
+    psscriptanalyzer:
+      enabled: false
+
+  # Finishing touches write code or commits as the bot. Every commit here is
+  # signed, carries no AI attribution and is audited before its PR leaves
+  # draft, so every one this file can turn off is off.
+  #
+  # One path is left that no setting turns off: Autofix (formerly
+  # Autopilot), which keeps fixing findings and failing CI and resolves
+  # merge conflicts. It starts from the Autofix checkbox in CodeRabbit's
+  # walkthrough comment, from "@coderabbitai autofix", or from a request to
+  # finish the PR such as "@coderabbitai take this PR to completion". Its
+  # commits are not signed by the member who asked for them, and they carry
+  # "Co-authored-by: coderabbitai[bot]" or are made with CodeRabbit's own
+  # installation credentials, which Autofix on an existing PR can use
+  # (https://docs.coderabbit.ai/code/deliver-changes). The schema has no key
+  # for it, so the rule is in CLAUDE.md and AGENTS.md ("Commits and CI"):
+  # never start it.
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+
+chat:
+  art: false
+  auto_reply: true
+
+knowledge_base:
+  # CodeRabbit reads **/CLAUDE.md and **/AGENTS.md by default, and the root
+  # files govern the whole tree; .claude/skills SKILL.md files are read as
+  # agent skills. These entries add to the defaults. A guideline file
+  # governs only its own directory unless applyTo maps it elsewhere
+  # (https://docs.coderabbit.ai/knowledge-base/code-guidelines). Guideline
+  # files go here, never in path_instructions, which would review them as
+  # code instead.
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      # The ADR rules and template govern every member's log.
+      - files: "docs/Cassandra/ADR-aacruzgon/ADR-aacruzgon.md"
+        applyTo: "docs/Cassandra/ADR-*/**"
+      # The design governs the backend, its tests, and the Cassandra docs.
+      - files: "docs/Cassandra/cassandra-discussion.md"
+        applyTo: "crates/persistence/src/backends/cassandra/**,\
+          crates/persistence/tests/cassandra/**,docs/Cassandra/**"
+      # The schema's statement rules govern the backend's CQL.
+      - files: "docs/Cassandra/schema/README.md"
+        applyTo: "crates/persistence/src/backends/cassandra/**"
+  # Public repository: "auto" already means this repository only; set
+  # explicitly.
+  learnings:
+    scope: local
+  issues:
+    scope: local
+  pull_requests:
+    scope: local
+  web_search:
+    enabled: true

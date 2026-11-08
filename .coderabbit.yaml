@@ -444,7 +444,11 @@ reviews:
         commit (CLAUDE.md). Flag a change that contradicts an accepted ADR
         without one, a progress row marked done without its evidence (run,
         PR or commit), and a file:line or commit that does not exist.
-        Section 8 must list every upstream file the fork changes.
+        Section 8 must list every upstream file the fork changes under
+        crates/, book/, utils/ and docker/, as the upstream-files
+        instruction above says. The root files CLAUDE.md, AGENTS.md and
+        README.md are deliberately not on that list (ADR-aacruzgon-0069):
+        do not flag their absence.
 
     # ---- Workflows -----------------------------------------------------------
     - path: ".github/workflows/**"

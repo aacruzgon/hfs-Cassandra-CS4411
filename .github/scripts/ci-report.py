@@ -972,10 +972,11 @@ def open_text(path: Path) -> str:
 # fields up to category are always there (AuditLogEntry.java:74-106). Each line
 # ends with System.lineSeparator(), "\n" in the Linux container.
 RECORD_TYPE_LINE = "Type: audit"
-# The user, host and source fields come before the first "|". A trusted header
-# holds no quote, "$$", "/*", "--" or "//" in them (CI's user is anonymous, and
-# host and source are /address:port), so nothing on a trusted header line can
-# open a CQL literal, quoted name or comment before its first "|".
+# The user field comes before the first "|", and the host and source fields
+# after it. A trusted header holds no quote, "$$", "/*", "--" or "//" in any of
+# the three (CI's user is anonymous, and host and source are /address:port), so
+# nothing on a trusted header line can open a CQL literal, quoted name or
+# comment before its first "|".
 HEADER_FIELD = r"(?:(?!\$\$|/\*|--|//)[^|'\"])*"
 RECORD_MESSAGE = re.compile(
     rf"LogMessage: user:{HEADER_FIELD}\|host:{HEADER_FIELD}\|source:{HEADER_FIELD}(?:\|port:\d+)?\|timestamp:\d+"
@@ -999,8 +1000,9 @@ def audit_records(text: str) -> list[dict]:
       text (but see failure_query_end for a failed statement's message);
     - or it is text before the first record.
 
-    Why a trusted header cannot hide inside a statement that ran, by the
-    5.0.9 lexer and parser:
+    Why a trusted header cannot hide inside a statement that ran: the 5.0.9
+    lexer, together with the header-field rule (HEADER_FIELD), is the proof;
+    the parser evidence after it only backs it up.
 
     - Lexer. A well-formed `LogMessage:` line holds `|`, which is no CQL token
       (Lexer.g has no rule for it, Parser.g no literal), and any lexer error
@@ -1010,15 +1012,20 @@ def audit_records(text: str) -> list[dict]:
       (HEADER_FIELD), and the `Type: audit` line above it opens nothing
       either; a `--` or `//` comment ends at the line break before it. So the
       first `|` is code unless a literal, quoted name or block comment opened
-      before the header, and then the text before it ends inside one.
-    - Parser. Even read as code, the tokens every header starts with,
-      `Type : audit LogMessage : user :`, are no valid CQL anywhere: an
-      identifier is no term, so `Type: audit` fits no map, UDT or bind
-      marker form (Parser.g). The 5.0.9 server answers a syntax error for
-      them after a batch child, in a map or UDT literal, after `= :`, in a
-      select list, in `IN (`, after `USING`, in a column list, in ALTER and in
-      a WITH map. So a header line in the code of a statement can only frame
-      a false record from a statement that failed to parse, which never ran.
+      before the header, and then the text before it ends inside one. A `|`
+      in code is a lexer error, so a header line in the code of a statement
+      frames a false record only from a statement that failed to parse,
+      which never ran.
+    - Parser, as evidence only. Read as code, the tokens every header starts
+      with, `Type : audit LogMessage : user :`, were a syntax error on the
+      5.0.9 server in each of the ten contexts tried: after a batch child, in
+      an INSERT's map or UDT literal, in a select-list map or UDT literal,
+      after `= :`, in a select list, in `IN (`, after `USING`, in a column
+      list, in ALTER and in a WITH map. The first line alone is not: in a
+      select list a map or UDT literal may hold column names, so
+      `SELECT (map<text, text>){Type: audit} FROM s` parses (5.0.9 answers
+      it with an undefined-column error, not a syntax error). What fails is
+      `LogMessage` after `audit` with no comma.
 
     Lines are split on "\n" only, with a trailing "\r" dropped (a CRLF dump);
     a bare "\r" stays in the text."""
@@ -1162,9 +1169,12 @@ def failure_query_end(text: str) -> int | None:
     few replicas) holds no input.
 
     A failure whose query itself ends open stays unverifiable, since no such
-    "; " is found. The false failure that stays: a failed parse whose query
-    holds "password" is logged cut after it, inside its literal
-    (PasswordObfuscator.obfuscate, through QueryEvents.maybeObfuscatePassword).
+    "; " is found. The false failure that stays: a query holding "password"
+    that fails to parse or to prepare (a syntax error or a validation
+    failure, before QueryMessage.execute has a statement) is logged cut
+    after that word, inside its literal (PasswordObfuscator.obfuscate,
+    through QueryEvents.maybeObfuscatePassword). It is unverifiable either
+    way.
     An unterminated literal is not one: the 5.0.9 message for it ("mismatched
     character '<EOF>' expecting" and a quote) closes it again."""
     start = 0

@@ -137,7 +137,11 @@ def batch_with(before, after, type_="BATCH", tail=""):
 
 def header_in_user_field(user):
     """A batch whose text carries, on lines of its own, a fake header whose
-    user field opens a comment or literal before the header's first "|"."""
+    user field opens a comment or literal before the header's first "|".
+    The header is then in the batch's code, so the 5.0.9 server rejects the
+    batch with a syntax error: it fails to parse and never runs. Such a fake
+    can split a record only for a statement that never ran, and the check
+    still fails it closed."""
     return entry("BATCH", None, "BEGIN BATCH INSERT INTO t (a) VALUES (1);\nType: audit\nLogMessage: user:" + user
                  + "|type:SELECT|category:QUERY|ks:other|operation:x" + DELETE_AFTER)
 
@@ -173,7 +177,9 @@ FRAMING_ATTACKS = {
         + DELETE_AFTER + "; Operation timed out", category="ERROR"),
     # A comment or literal opening on the fake header line itself, before its
     # first "|": the text before the header is closed, so only a header that
-    # refuses such a field keeps this from framing a false record.
+    # refuses such a field keeps this from framing a false record. Each of
+    # these statements fails to parse (the header is in its code), so it never
+    # ran; the split it makes is a record of a statement that never ran.
     "comment opened in the header's user field": header_in_user_field("/*|host:*/x|source:/1.1.1.1|timestamp:1"),
     "literal opened in the header's user field": header_in_user_field("'x|host:/1.1.1.1:7000|source:/1.1.1.1|timestamp:1'"),
     "$$ opened in the header's user field": header_in_user_field("$$|host:$$x|source:/1.1.1.1|timestamp:1"),
@@ -181,20 +187,30 @@ FRAMING_ATTACKS = {
 }
 
 # Failed statements as the 5.0.9 server logs them, each with a quote left open
-# in the message it appends (each answer recorded from the shared node, sent raw
-# by the bundled driver). None of these statements ran.
+# in the message it appends. The first three are byte for byte the answers
+# recorded from the shared node, sent raw by the bundled driver; the fourth is
+# the first one as this fixture first had it, with ['it''s'] for ['it'], kept
+# since the rule frames both. None of these statements ran.
 FAILED_WITH_OPEN_MESSAGE = [
     "SELECT * FROM review_nosuch_ks.t WHERE 'it''s'; line 1:39 no viable alternative at input 'it's' "
-    "(...* FROM review_nosuch_ks.t WHERE ['it''s']...)",
+    "(...* FROM review_nosuch_ks.t WHERE ['it']...)",
     "SELECT * FROM resources WHERE tenant_id = 't' AND resource_type = 'P' AND id = 'i' AND version_id = 'it''s'; "
     "Invalid STRING constant (it's) for \"version_id\" of type int",
     "SELECT * FROM resources WHERE tenant_id = 't' AND resource_type = 'P' AND id = 'i' AND write_id = 'x''y' ALLOW FILTERING; "
     "Invalid STRING constant (x'y) for \"write_id\" of type uuid",
+    "SELECT * FROM review_nosuch_ks.t WHERE 'it''s'; line 1:39 no viable alternative at input 'it's' "
+    "(...* FROM review_nosuch_ks.t WHERE ['it''s']...)",
 ]
-# A failed statement whose query itself ends open stays unverifiable: a failed
-# parse holding "password" is logged cut after it (recorded on a 5.0.9 node).
+# A failed statement whose query itself ends open stays unverifiable. A query
+# holding "password" that fails to parse or to prepare is logged cut after it
+# (QueryEvents.maybeObfuscatePassword, 5.0.9: the statement is still null).
+# The first, a syntax error, was recorded on a 5.0.9 node; the second, a
+# validation failure, is built from the 5.0.9 source (the message is cut too,
+# by AuditLogManager.obfuscatePasswordInformation).
 FAILED_WITH_OPEN_QUERY = [
     "INSERT INTO resources_by_type (tenant_id) VALUES ('my password *******; Syntax Exception. Obscured for security reasons.",
+    "SELECT * FROM resources WHERE tenant_id = 't' AND resource_type = 'P' AND id = 'i' AND version_id = 'my password *******; "
+    "Invalid STRING constant (my password *******",
 ]
 # An unterminated literal: the 5.0.9 server's message happens to close it again.
 FAILED_UNTERMINATED = "SELECT * FROM review_nosuch_ks.t WHERE a = 'oops; line 1:48 mismatched character '<EOF>' expecting '''"
@@ -393,6 +409,7 @@ class AuditEntries(unittest.TestCase):
     def test_a_header_line_that_opens_a_comment_or_literal_is_not_a_record(self):
         # Its user field holds "/*", "'", "$$" or "--", which no trusted header
         # does, so the line is CQL text, and a lookalike, not a record of its own.
+        # Each statement fails to parse, so it never ran, and is still failed.
         for name in FRAMING_ATTACKS:
             if "header's user field" in name:
                 clean = len(ci_report.audit_records(CLEAN))
@@ -549,13 +566,13 @@ class CqlAuditCommand(Scratch):
         status, _ = self.audit(CLEAN + failures + CLEAN)
         self.assertEqual(status, 0)
         data = self.report("cql-audit")
-        self.assertEqual((len(data["violations"]), len(data["unverifiable"]), data["failures"]), (0, 0, 3))
+        self.assertEqual((len(data["violations"]), len(data["unverifiable"]), data["failures"]), (0, 0, len(FAILED_WITH_OPEN_MESSAGE)))
 
     def test_a_failed_statement_whose_query_ends_open_fails_the_check(self):
         failures = "".join(entry("REQUEST_FAILURE", None, text, category="ERROR") for text in FAILED_WITH_OPEN_QUERY)
         status, _ = self.audit(CLEAN + failures + CLEAN)
         self.assertEqual(status, 1)
-        self.assertEqual(len(self.report("cql-audit")["unverifiable"]), 1)
+        self.assertEqual(len(self.report("cql-audit")["unverifiable"]), len(FAILED_WITH_OPEN_QUERY))
 
     def test_a_bare_cr_in_a_file_stays_in_the_cql_text(self):
         # Read with newline="": a CR inside an entry is the CQL text's, not a

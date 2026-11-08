@@ -336,7 +336,9 @@ reviews:
         The R4B-only CI check (r4b-compile-check.yml; ADR-aacruzgon-0019,
         0039) compiles this library without R4, with only the cassandra
         feature: every item that no sqlite, postgres, mongodb,
-        elasticsearch, s3, advisor or test cfg gates. In that code
+        elasticsearch, s3 or test cfg gates. src/advisor/main.rs is not
+        built either: it is the config-advisor bin, which needs the advisor
+        feature (required-features in Cargo.toml). In that code
         (CLAUDE.md, "FHIR version feature assumption"):
         - Flag FhirVersion::default(), which exists only with the R4
           feature, unless the item is behind #[cfg(feature = "R4")]. Use
@@ -727,8 +729,10 @@ reviews:
   # Autopilot), which keeps fixing findings and failing CI and resolves
   # merge conflicts. It starts from the Autofix checkbox in CodeRabbit's
   # walkthrough comment, from "@coderabbitai autofix", or from a request to
-  # finish the PR such as "@coderabbitai take this PR to completion", and
-  # its commits carry "Co-authored-by: coderabbitai[bot]"
+  # finish the PR such as "@coderabbitai take this PR to completion". Its
+  # commits are not signed by their author, and they carry
+  # "Co-authored-by: coderabbitai[bot]" or are made with CodeRabbit's own
+  # installation credentials, which Autofix on an existing PR can use
   # (https://docs.coderabbit.ai/code/deliver-changes). The schema has no key
   # for it, so the rule is in CLAUDE.md and AGENTS.md ("Commits and CI"):
   # never start it.

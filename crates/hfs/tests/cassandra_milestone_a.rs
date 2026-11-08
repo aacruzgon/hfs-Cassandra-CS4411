@@ -1331,6 +1331,15 @@ async fn metadata_through_rest(rest: &Rest<'_>) {
     spec("B-1:batch", true, system.contains(&"batch"), hfs);
 }
 
+/// Whether `output` names `version` as a whole `fhir_version=` value, so
+/// that `R4` is not satisfied by `fhir_version=R4B`.
+fn reports_fhir_version(output: &str, version: &str) -> bool {
+    let token = format!("fhir_version={version}");
+    output
+        .match_indices(&token)
+        .any(|(at, _)| !output[at + token.len()..].starts_with(|c: char| c.is_ascii_alphanumeric()))
+}
+
 /// Fails unless a read's `Content-Type` names the FHIR version the test
 /// selected, as `fhirVersion=5.0`. `hfs` takes that parameter from the stored
 /// resource, so a backend that stored another version fails here, where the
@@ -1450,11 +1459,11 @@ impl Hfs {
             {
                 // The version reached hfs: its startup line names it.
                 if let Some(version) = test_fhir_version() {
-                    let expected = format!("fhir_version={version:?}");
+                    let output = self.output();
                     assert!(
-                        self.output().contains(&expected),
-                        "hfs does not report {expected}; output:\n{}",
-                        self.output()
+                        reports_fhir_version(&output, version.as_str()),
+                        "hfs does not report fhir_version={}; output:\n{output}",
+                        version.as_str()
                     );
                 }
                 return;
@@ -2484,6 +2493,15 @@ async fn rest_latency_report() {
     std::fs::write(&md_path, &md).unwrap_or_else(|e| panic!("write {}: {e}", md_path.display()));
     eprintln!("{md}");
     eprintln!("Wrote {} and {}", json_path.display(), md_path.display());
+}
+
+#[test]
+fn the_startup_check_matches_the_whole_version() {
+    assert!(reports_fhir_version("a fhir_version=R4 b", "R4"));
+    assert!(reports_fhir_version("a fhir_version=R4", "R4"));
+    assert!(reports_fhir_version("a fhir_version=R4B b", "R4B"));
+    assert!(!reports_fhir_version("a fhir_version=R4B b", "R4"));
+    assert!(!reports_fhir_version("no version here", "R4"));
 }
 
 #[test]

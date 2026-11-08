@@ -2004,6 +2004,35 @@ mod tests {
         // Can be raised after the proposal was accepted.
         unknown(server(ErrorType::Server), false);
         unknown(server(ErrorType::Overloaded), false);
+        // Paxos v2 raises only write-type errors for a CAS (`Paxos.java:551-567`),
+        // and a read timeout comes only from the v1 path; but none of these
+        // proves the CAS was not executed, and taking one as "not applied"
+        // would skip the serial read for a write that may have applied.
+        unknown(
+            server(ErrorType::ReadTimeout(
+                cdrs_tokio::frame::message_error::ReadTimeoutError::new(
+                    Consistency::LocalSerial,
+                    0,
+                    1,
+                    false,
+                ),
+            )),
+            true,
+        );
+        unknown(
+            server(ErrorType::ReadFailure(
+                cdrs_tokio::frame::message_error::ReadFailureError::new(
+                    Consistency::LocalSerial,
+                    0,
+                    1,
+                    FailureInfo::NumFailures(1),
+                    false,
+                ),
+            )),
+            false,
+        );
+        unknown(server(ErrorType::Truncate), false);
+        unknown(server(ErrorType::CdcWriteFailure), false);
         for not_sent in [
             DriverError::Deadline {
                 after: Duration::from_secs(10),
@@ -2024,6 +2053,16 @@ mod tests {
             )),
             server(ErrorType::IsBootstrapping),
             server(ErrorType::Invalid),
+            server(ErrorType::Syntax),
+            server(ErrorType::Unauthorized),
+            server(ErrorType::Config),
+            server(ErrorType::Authentication),
+            server(ErrorType::Protocol),
+            server(ErrorType::Unprepared(
+                cdrs_tokio::frame::message_error::UnpreparedError::new(
+                    cdrs_tokio::types::CBytesShort::new(vec![1]),
+                ),
+            )),
         ] {
             assert!(
                 matches!(classify_cas_failure(not_sent), CasFailure::NotApplied(_)),

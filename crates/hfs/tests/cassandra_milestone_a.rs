@@ -150,12 +150,16 @@ const FHIR_VERSION_VAR: &str = "HFS_TEST_FHIR_VERSION";
 /// `None` when [`FHIR_VERSION_VAR`] is unset: `hfs` then picks its own
 /// default, exactly as before the variable existed. A set value this build
 /// cannot parse, or a version it does not enable, panics, so a typo never
-/// quietly runs R4. Decided once and printed once.
+/// quietly runs R4. Decided once and printed once on stderr, which
+/// `cargo test` shows with `--nocapture` or `--show-output`.
 fn test_fhir_version() -> Option<helios_fhir::FhirVersion> {
     static CHOSEN: std::sync::OnceLock<Option<helios_fhir::FhirVersion>> =
         std::sync::OnceLock::new();
     *CHOSEN.get_or_init(|| {
-        let value = std::env::var(FHIR_VERSION_VAR).ok()?;
+        // Lossy: a value that is not UTF-8 keeps a U+FFFD, which no version
+        // parses, so it panics like any other bad value.
+        let value = std::env::var_os(FHIR_VERSION_VAR)?;
+        let value = value.to_string_lossy();
         let version = helios_fhir::FhirVersion::from_storage(value.trim()).unwrap_or_else(|| {
             let enabled: Vec<&str> = helios_fhir::FhirVersion::enabled_versions()
                 .iter()
@@ -421,6 +425,7 @@ async fn round_trip(hfs: &Hfs) {
         .await
         .expect("GET /Patient/{id}");
     assert_eq!(read.status(), StatusCode::OK, "GET /Patient/{id}");
+    assert_serves_test_version(&header(&read, CONTENT_TYPE), hfs);
     assert_eq!(header(&read, ETAG), "W/\"1\"", "ETag of the read");
     // R4 http.html#read: the server SHOULD return `Last-Modified`; it is
     // `meta.lastUpdated` at HTTP-date (second) precision.
@@ -687,6 +692,7 @@ async fn update_through_rest(rest: &Rest<'_>, suffix: &str) {
         hfs,
     );
     spec("CC-2:etag", "W/\"1\"", created.header(ETAG), hfs);
+    assert_serves_test_version(&rest.get(&path).await.header(CONTENT_TYPE), hfs);
     // R4 #prefer: with no `Prefer`, the server may return the resource, but
     // never an OperationOutcome; Helios returns the resource.
     spec(
@@ -699,6 +705,12 @@ async fn update_through_rest(rest: &Rest<'_>, suffix: &str) {
     // R4 #update: "200 OK HTTP status code if the resource was updated …
     // with a Last-Modified header, and an ETag header which contains the new
     // versionId". No Location on a 200 (R4: "If the resource was created").
+    // The two `U-8` rows assert R4's `Location` rule under every FHIR version,
+    // because the shared REST layer answers that way, although R5's and R6's
+    // `#update` (https://hl7.org/fhir/R5/http.html#update) puts a `Location`
+    // on every successful update and their `#upsert`
+    // (https://hl7.org/fhir/R5/http.html#upsert) makes a created resource's
+    // `Location` the URL of the PUT.
     let updated = rest.put(&path, &patient(&id, "Two"), &[]).await;
     spec("U-7:put-existing", 200, updated.code(), hfs);
     spec("U-7:etag", "W/\"2\"", updated.header(ETAG), hfs);
@@ -1326,6 +1338,31 @@ async fn metadata_through_rest(rest: &Rest<'_>) {
     spec("B-1:batch", true, system.contains(&"batch"), hfs);
 }
 
+/// Whether `output` names `version` as a whole `fhir_version=` value, so
+/// that `R4` is not satisfied by `fhir_version=R4B`.
+fn reports_fhir_version(output: &str, version: &str) -> bool {
+    let token = format!("fhir_version={version}");
+    output
+        .match_indices(&token)
+        .any(|(at, _)| !output[at + token.len()..].starts_with(|c: char| c.is_ascii_alphanumeric()))
+}
+
+/// Fails unless a read's `Content-Type` names the FHIR version the test
+/// selected, as `fhirVersion=5.0`. `hfs` takes that parameter from the stored
+/// resource, so a backend that stored another version fails here, where the
+/// startup line shows only what `hfs` was told. With [`FHIR_VERSION_VAR`]
+/// unset there is no version to compare with.
+fn assert_serves_test_version(content_type: &str, hfs: &Hfs) {
+    if let Some(version) = test_fhir_version() {
+        let expected = format!("fhirVersion={}", version.as_mime_param());
+        assert!(
+            content_type.split(';').any(|part| part.trim() == expected),
+            "a read's Content-Type {content_type:?} does not name {expected}; hfs output:\n{}",
+            hfs.output()
+        );
+    }
+}
+
 fn header(response: &reqwest::Response, name: reqwest::header::HeaderName) -> String {
     response
         .headers()
@@ -1429,11 +1466,11 @@ impl Hfs {
             {
                 // The version reached hfs: its startup line names it.
                 if let Some(version) = test_fhir_version() {
-                    let expected = format!("fhir_version={version:?}");
+                    let output = self.output();
                     assert!(
-                        self.output().contains(&expected),
-                        "hfs does not report {expected}; output:\n{}",
-                        self.output()
+                        reports_fhir_version(&output, version.as_str()),
+                        "hfs does not report fhir_version={}; output:\n{output}",
+                        version.as_str()
                     );
                 }
                 return;
@@ -2463,6 +2500,15 @@ async fn rest_latency_report() {
     std::fs::write(&md_path, &md).unwrap_or_else(|e| panic!("write {}: {e}", md_path.display()));
     eprintln!("{md}");
     eprintln!("Wrote {} and {}", json_path.display(), md_path.display());
+}
+
+#[test]
+fn the_startup_check_matches_the_whole_version() {
+    assert!(reports_fhir_version("a fhir_version=R4 b", "R4"));
+    assert!(reports_fhir_version("a fhir_version=R4", "R4"));
+    assert!(reports_fhir_version("a fhir_version=R4B b", "R4B"));
+    assert!(!reports_fhir_version("a fhir_version=R4B b", "R4"));
+    assert!(!reports_fhir_version("no version here", "R4"));
 }
 
 #[test]

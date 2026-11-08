@@ -24,11 +24,15 @@ pub(crate) const TEST_FHIR_VERSION_VAR: &str = "HFS_TEST_FHIR_VERSION";
 
 /// The FHIR version the tests create, expect and load the registry for,
 /// decided once per test binary. When the variable is set, the choice is
-/// printed once, so every log names the version it ran.
+/// printed once on stderr, which `cargo test` shows with `--nocapture` or
+/// `--show-output`.
 pub(crate) fn test_fhir_version() -> FhirVersion {
     static CHOSEN: OnceLock<FhirVersion> = OnceLock::new();
-    *CHOSEN.get_or_init(|| match std::env::var(TEST_FHIR_VERSION_VAR) {
-        Ok(value) => {
+    *CHOSEN.get_or_init(|| match std::env::var_os(TEST_FHIR_VERSION_VAR) {
+        Some(value) => {
+            // Lossy: a value that is not UTF-8 keeps a U+FFFD, which no
+            // version parses, so it panics like any other bad value.
+            let value = value.to_string_lossy();
             let version =
                 parse_test_fhir_version(&value).unwrap_or_else(|message| panic!("{message}"));
             eprintln!(
@@ -37,7 +41,7 @@ pub(crate) fn test_fhir_version() -> FhirVersion {
             );
             version
         }
-        Err(_) => FhirVersion::default_enabled(),
+        None => FhirVersion::default_enabled(),
     })
 }
 
@@ -92,7 +96,7 @@ mod tests {
 
     #[test]
     fn a_value_that_is_no_enabled_version_is_refused() {
-        for value in ["R7", "4.1", "", "default"] {
+        for value in ["R7", "4.1", "", "default", "\u{fffd}"] {
             let message = parse_test_fhir_version(value).unwrap_err();
             assert!(message.contains(TEST_FHIR_VERSION_VAR), "{message}");
             assert!(message.contains("enabled:"), "{message}");

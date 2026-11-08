@@ -420,7 +420,7 @@ mod node_tests {
 
     fn tenant_context(case: &str) -> TenantContext {
         TenantContext::new(
-            TenantId::new(format!("s3-delete-{case}-{}", Uuid::new_v4().simple())),
+            TenantId::new(format!("test-delete-{case}-{}", Uuid::new_v4().simple())),
             TenantPermissions::full_access(),
         )
     }

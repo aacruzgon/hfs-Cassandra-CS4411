@@ -915,11 +915,24 @@ PROTECTED_TABLES = ("resources", "resource_versions")
 # miss (AuditLogManager.java, 5.0.9): a CQL-text batch, logged as one
 # scope-less BATCH entry holding every child; and a failed statement, whose
 # type becomes REQUEST_FAILURE and whose scope is dropped when it was not
-# prepared. It is not tied to the start of a statement, so a string literal or
-# comment naming such a DELETE would also match: a false failure, never a
-# missed one.
+# prepared. It runs on cql_code(text), so comments and string literals are
+# neither a hiding place nor a match. A quoted identifier may hold a `;`, and
+# a quoted name may follow FROM with no space; both parse on 5.0.9. It is not
+# tied to the start of a statement, and folds case even in quoted names (a
+# quoted "Resources" is another table): a false failure, never a missed one.
 DELETE_TEXT = re.compile(
-    r'\bDELETE\b[^;]*?\bFROM\s+(?:"?\w+"?\s*\.\s*)?"?(resources|resource_versions)"?(?![\w"])',
+    r'\bDELETE\b(?:"(?:[^"]|"")*"|[^;"])*?\bFROM(?:\s+|(?="))'
+    r'(?:"?(?P<ks>\w+)"?\s*\.\s*)?"?(?P<table>resources|resource_versions)"?(?![\w"])',
+    re.IGNORECASE | re.DOTALL,
+)
+# A TRUNCATE or DROP TABLE of a protected table in the CQL text, for rule (b'):
+# a failed, unprepared one has no scope (queryFailure, 5.0.9), and a TRUNCATE
+# that timed out may still have applied on a replica. COLUMNFAMILY is TABLE's
+# synonym in both statements (Lexer.g K_COLUMNFAMILY; Parser.g
+# truncateStatement and dropTableStatement, 5.0.9).
+WIPE_TEXT = re.compile(
+    r'\b(?P<verb>TRUNCATE(?:\s+(?:TABLE|COLUMNFAMILY))?|DROP\s+(?:TABLE|COLUMNFAMILY)(?:\s+IF\s+EXISTS)?)(?:\s+|(?="))'
+    r'(?:"?(?P<ks>\w+)"?\s*\.\s*)?"?(?P<table>resources|resource_versions)"?(?![\w"])',
     re.IGNORECASE | re.DOTALL,
 )
 # Things the schema says must never exist (schema/README.md), that the audit
@@ -941,33 +954,118 @@ FAILED_BATCH = re.compile(r"^BATCH of \d+ statements\b")
 
 
 def open_text(path: Path) -> str:
+    """The file's text with its line ends as written (newline=""): a bare CR
+    inside an entry's CQL text stays a CR, as the CQL lexer saw it, instead of
+    becoming a line break that audit_records would read as one."""
     if path.suffix == ".gz":
         import gzip
 
-        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as source:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace", newline="") as source:
             return source.read()
-    return path.read_text(errors="replace")
+    with open(path, encoding="utf-8", errors="replace", newline="") as source:
+        return source.read()
+
+
+# The record header auditlogviewer prints (tools/AuditLogViewer.java,
+# DisplayRecord.readMarshallable, 5.0.9): a line "Type: audit" (any other type
+# makes it throw), then "LogMessage: " and AuditLogEntry.getLogString(), whose
+# fields up to category are always there (AuditLogEntry.java:74-106). Each line
+# ends with System.lineSeparator(), "\n" in the Linux container.
+RECORD_TYPE_LINE = "Type: audit"
+# The user field comes before the first "|", and the host and source fields
+# after it. A trusted header holds no quote, "$$", "/*", "--" or "//" in any of
+# the three (CI's user is anonymous, and host and source are /address:port), so
+# nothing on a trusted header line can open a CQL literal, quoted name or
+# comment before its first "|".
+HEADER_FIELD = r"(?:(?!\$\$|/\*|--|//)[^|'\"])*"
+RECORD_MESSAGE = re.compile(
+    rf"LogMessage: user:{HEADER_FIELD}\|host:{HEADER_FIELD}\|source:{HEADER_FIELD}(?:\|port:\d+)?\|timestamp:\d+"
+    r"\|type:[A-Z_]+\|category:[A-Z]+(?:\||$)")
+HEADER_LOOKALIKE = ("Type: ", "LogMessage: ")
 
 
 def audit_records(text: str) -> list[dict]:
-    """`auditlogviewer` output: each record is a `Type: <type>` line, then
-    `LogMessage: <entry>` (tools/AuditLogViewer.java). An entry's CQL text may
-    span lines, so a record runs to the next `Type: ` line."""
-    messages, current = [], None
-    for line in text.splitlines():
-        if line.startswith("Type: "):
-            if current is not None:
-                messages.append(current)
-            current = None
-        elif line.startswith("LogMessage: "):
-            if current is not None:
-                messages.append(current)
-            current = line[len("LogMessage: "):]
-        elif current is not None:
-            current += "\n" + line
-    if current is not None:
-        messages.append(current)
-    return [audit_entry(message) for message in messages]
+    """`auditlogviewer` output: each record is a `Type: audit` line, then
+    `LogMessage: <entry>`, and an entry's CQL text may span lines. The CQL text
+    is free text, so a line in it may look like a header: the framing fails
+    closed instead of trusting one. A record starts only at a `Type: audit`
+    line followed by a well-formed `LogMessage:` line, and a record is marked
+    unverifiable (its `framing` field, see audit_unverifiable) when:
+
+    - its CQL text holds a line starting `Type: ` or `LogMessage: ` that is
+      not such a pair (the old parser split the record there and dropped the
+      rest, a DELETE after it included);
+    - its CQL text ends inside a string literal, quoted name or block comment
+      while another record follows, so that next header may be part of its
+      text (but see failure_query_end for a failed statement's message);
+    - or it is text before the first record.
+
+    Why a trusted header cannot hide inside a statement that ran: the 5.0.9
+    lexer, together with the header-field rule (HEADER_FIELD), is the proof;
+    the parser evidence after it only backs it up.
+
+    - Lexer. A well-formed `LogMessage:` line holds `|`, which is no CQL token
+      (Lexer.g has no rule for it, Parser.g no literal), and any lexer error
+      rejects the statement (CQLFragmentParser.parseAnyUnhandled collects it
+      and throwFirstSyntaxError throws). Before its first `|` a trusted line
+      holds only `LogMessage: user:` and a user field that opens nothing
+      (HEADER_FIELD), and the `Type: audit` line above it opens nothing
+      either; a `--` or `//` comment ends at the line break before it. So the
+      first `|` is code unless a literal, quoted name or block comment opened
+      before the header, and then the text before it ends inside one. A `|`
+      in code is a lexer error, so a header line in the code of a statement
+      frames a false record only from a statement that failed to parse,
+      which never ran.
+    - Parser, as evidence only. Read as code, the tokens every header starts
+      with, `Type : audit LogMessage : user :`, were a syntax error on the
+      5.0.9 server in each of the ten contexts tried: after a batch child, in
+      an INSERT's map or UDT literal, in a select-list map or UDT literal,
+      after `= :`, in a select list, in `IN (`, after `USING`, in a column
+      list, in ALTER and in a WITH map. The first line alone is not: in a
+      select list a map or UDT literal may hold column names, so
+      `SELECT (map<text, text>){Type: audit} FROM s` parses, and runs when
+      `s` has text columns `type` and `audit` (on a table without them 5.0.9
+      answers an undefined-column error). What fails is `LogMessage` after
+      `audit` with no comma.
+
+    Lines are split on "\n" only, with a trailing "\r" dropped (a CRLF dump);
+    a bare "\r" stays in the text."""
+    lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()
+    records, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        if line == RECORD_TYPE_LINE and i + 1 < len(lines) and RECORD_MESSAGE.match(lines[i + 1]):
+            records.append({"lines": [lines[i + 1][len("LogMessage: "):]], "framing": None})
+            i += 2
+            continue
+        if not records:
+            records.append({"lines": [line], "framing": "text before the first record", "loose": True})
+        else:
+            records[-1]["lines"].append(line)
+            if line.startswith(HEADER_LOOKALIKE) and records[-1]["framing"] is None:
+                records[-1]["framing"] = ("a line in its CQL text starts like a record header "
+                                          f"({line[:40]!r}), so where the record ends is ambiguous")
+        i += 1
+    entries = []
+    for k, record in enumerate(records):
+        message = "\n".join(record["lines"])
+        if record.get("loose"):
+            entry = {"type": None, "category": None, "ks": None, "scope": None, "batch": None, "operation": message}
+        else:
+            entry = audit_entry(message)
+        framing = record["framing"]
+        if framing is None and k + 1 < len(records):
+            unclosed = cql_scan(entry["operation"] or "")[1]
+            if unclosed and entry["type"] == "REQUEST_FAILURE" and failure_query_end(entry["operation"]) is not None:
+                unclosed = None  # the open quote is in the server's message, after the query
+            if unclosed:
+                framing = (f"its CQL text ends inside {unclosed}, so the record header after it "
+                           "may be part of that text")
+        entry["framing"] = framing
+        entries.append(entry)
+    return entries
 
 
 def audit_entry(message: str) -> dict:
@@ -997,24 +1095,136 @@ def in_keyspace(entry: dict, keyspace: str) -> bool:
 
 
 def audit_unverifiable(entry: dict, keyspace: str) -> str | None:
-    """Why an entry hides statements the check cannot see, or None."""
-    if (in_keyspace(entry, keyspace) and entry["type"] == "REQUEST_FAILURE"
+    """Why an entry hides statements the check cannot see, or None. Whatever
+    its keyspace: batchFailure logs the session's (AuditLogEntry.Builder(state),
+    5.0.9), not its statements', so a failed batch from a session on another
+    keyspace may hold DELETEs on ours just the same. The node logs no system
+    keyspace, so in CI every such entry is from a test's own session."""
+    if (entry["type"] == "REQUEST_FAILURE"
             and FAILED_BATCH.match(entry["operation"] or "")):
         return "a failed native-protocol batch, whose statements the audit log does not record"
+    if entry.get("framing"):
+        return f"a record that cannot be framed unambiguously: {entry['framing']}"
     return None
+
+
+def cql_scan(text: str) -> tuple[str, str | None]:
+    """`text` with its comments (`/* */`, and `--` or `//` to the end of the
+    line, which a CR or an LF ends) blanked to a space and its string literals
+    (`'…'` with `''` escapes, `$$…$$`) emptied, keeping quoted identifiers, as
+    the 5.0.9 lexer reads them (Lexer.g STRING_LITERAL, QUOTED_NAME, COMMENT,
+    MULTILINE_COMMENT); and what the text ends inside, if anything: a string
+    literal, a quoted name or a block comment left open."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] in "'\"":
+            quote, j = text[i], i + 1
+            while j < n and not (text[j] == quote and text[j + 1:j + 2] != quote):
+                j += 2 if text[j] == quote else 1
+            if j >= n:
+                return "".join(out), "a string literal" if quote == "'" else "a quoted name"
+            out.append(quote * 2 if quote == "'" else text[i:j + 1])
+            i = j + 1
+        elif text.startswith("$$", i):
+            j = text.find("$$", i + 2)
+            if j < 0:
+                return "".join(out), "a $$ string literal"
+            out.append("$$$$")
+            i = j + 2
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                return "".join(out), "a /* comment"
+            out.append(" ")
+            i = j + 2
+        elif text.startswith(("--", "//"), i):
+            ends = [k for k in (text.find("\n", i), text.find("\r", i)) if k >= 0]
+            out.append(" ")
+            i = min(ends) if ends else n
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out), None
+
+
+# What may follow a top-level ";" in a statement that ran: another batch child,
+# or the batch's APPLY (Parser.g batchStatement; a lone statement takes only
+# ";"* and EOF after it).
+BATCH_CONTINUATION = {"INSERT", "UPDATE", "DELETE", "APPLY", "BEGIN"}
+
+
+def failure_query_end(text: str) -> int | None:
+    """Where a failed statement's query ends in its entry's text, or None.
+
+    A failure's text is the query, "; " and the server's message
+    (AuditLogEntry.Builder.appendToOperation, 5.0.9). The message can leave a
+    quote open: "no viable alternative at input 'it's'" (a literal token's
+    text is unescaped), "Invalid STRING constant (it's) for ...". This finds a
+    "; " that is code (not in a literal, quoted name or comment: cql_scan of
+    the text up to the word after it is closed and still ends with it),
+    followed by a word no statement that ran could continue with. After a
+    top-level ";" a statement that ran holds only another batch child or
+    APPLY, so that "; " is where the query ended, and an open quote after it
+    is in the message. The message echoes input only for a statement that
+    failed before it ran, and an execution failure's message (a timeout, too
+    few replicas) holds no input.
+
+    A failure whose query itself ends open stays unverifiable, since no such
+    "; " is found. The false failure that stays: a query holding "password"
+    that fails to parse or to prepare (a syntax error or a validation
+    failure, before QueryMessage.execute has a statement) is logged cut
+    after that word, inside its literal (PasswordObfuscator.obfuscate,
+    through QueryEvents.maybeObfuscatePassword). It is unverifiable either
+    way.
+    An unterminated literal is not one: the 5.0.9 message for it ("mismatched
+    character '<EOF>' expecting" and a quote) closes it again."""
+    start = 0
+    while (p := text.find("; ", start)) >= 0:
+        start = p + 1
+        word = re.match(r"[A-Za-z]+\b", text[p + 2:])
+        if not word or word.group().upper() in BATCH_CONTINUATION:
+            continue
+        code, unclosed = cql_scan(text[:p + 2 + len(word.group())])
+        if unclosed is None and code.endswith("; " + word.group()):
+            return p
+    return None
+
+
+def cql_code(text: str) -> str:
+    """`text` as the text rules see it: cql_scan's blanked text, with an
+    unterminated literal or comment blanked to the end."""
+    return cql_scan(text)[0]
+
+
+def protected_statements(text: str):
+    """Each (statement, keyspace or None, table) in `text` that deletes from or
+    wipes a protected table: rule (b)'s DELETE, and rule (b')'s TRUNCATE or
+    DROP TABLE by its text."""
+    code = cql_code(text)
+    for match in DELETE_TEXT.finditer(code):
+        yield "DELETE FROM", match.group("ks"), match.group("table")
+    for match in WIPE_TEXT.finditer(code):
+        yield " ".join(match.group("verb").upper().split()), match.group("ks"), match.group("table")
 
 
 def audit_violation(entry: dict, keyspace: str) -> str | None:
     """Why an entry is a CQL DELETE against a protected table, or None."""
     if not in_keyspace(entry, keyspace):
+        # A failed unprepared statement logs its session's keyspace, not the
+        # one its text names (AuditLogManager.queryFailure, 5.0.9). So from a
+        # session using another keyspace, rule (b) still applies when the text
+        # names ours, qualified (ADR-aacruzgon-0058's known limit, closed).
+        for statement, ks, table in protected_statements(entry["operation"] or ""):
+            if (ks or "").lower() == keyspace.lower():
+                return (f"a {statement} {keyspace}.{table} in the CQL text of a {entry['type']} "
+                        f"entry logged under ks:{entry['ks']}")
         return None
     if entry["type"] == "DELETE" and entry["scope"] in PROTECTED_TABLES:
         return f"type:DELETE with scope:{entry['scope']}"
     if entry["type"] in TABLE_WIPES and entry["scope"] in PROTECTED_TABLES:
         return f"type:{entry['type']} with scope:{entry['scope']}"
-    match = DELETE_TEXT.search(entry["operation"] or "")
-    if match:
-        return f"a DELETE FROM {match.group(1)} in the CQL text of a {entry['type']} entry"
+    for statement, _, table in protected_statements(entry["operation"] or ""):
+        return f"a {statement} {table} in the CQL text of a {entry['type']} entry"
     return None
 
 

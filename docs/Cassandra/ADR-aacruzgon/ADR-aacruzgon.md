@@ -102,7 +102,7 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0055](2026-11-06/0055-r2-r3-errors-503.md) | 2026-11-06 | After an unknown CAS outcome, an R2 or R3 error is 504 for a timeout and 503 for anything else | accepted |
 | [0056](2026-11-06/0056-backport-upstream-2530.md) | 2026-11-06 | A batch `ifMatch` PUT or DELETE is pinned to the version its gate checked, through upstream's fix (HeliosSoftware/hfs#2530) carried as a `-x` cherry-pick | accepted |
 | [0057](2026-11-06/0057-crud-suite-adapted-copy.md) | 2026-11-06 | Upstream's CRUD suite runs on Cassandra as an adapted copy, with a parity test and four Cassandra-strict tests | accepted |
-| [0058](2026-11-06/0058-cql-audit-check.md) | 2026-11-06 | The node's CQL audit log proves that no CQL `DELETE` reaches `resources` or `resource_versions`, as a check in the required Cassandra job | accepted |
+| [0058](2026-11-06/0058-cql-audit-check.md) | 2026-11-06 | The node's CQL audit log proves that no CQL `DELETE` reaches `resources` or `resource_versions`, as a check in the required Cassandra job | accepted; matching rules and known limits amended by [0066](2026-11-07/0066-cql-audit-check-after-pr62.md) |
 | [0059](2026-11-06/0059-step3-ci-reports.md) | 2026-11-06 | Step 3's CI reports: latency per operation, CAS outcomes, statements, intent rows, tombstones, DML and the HL7 rows | accepted |
 | [0060](2026-11-06/0060-step3-scope.md) | 2026-11-06 | Step 3's scope: vread, list_versions and delete_with_match come forward from Step 4, PATCH is in, the multitenancy suites split, and four contradictions are realigned; Steps 4 to 8 left to the group (**X**) | accepted |
 | [0061](2026-11-06/0061-update-v3-from-r1.md) | 2026-11-06 | Plain `update` builds its rewrite of row N from its own pre-read, so every rewrite carries a `write_id` | accepted |
@@ -110,3 +110,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0063](2026-11-07/0063-create-or-update-loop.md) | 2026-11-07 | `create_or_update` is a four-turn loop that checks the id first and each branch's permission after its pre-read, and answers 409 after four definite misses | accepted |
 | [0064](2026-11-06/0064-spec-tensions-accepted.md) | 2026-11-06 | The places where Step 3 departs from, or sits uneasily with, the FHIR specification, accepted on purpose | accepted |
 | [0065](2026-11-07/0065-fhir-versions-tested.md) | 2026-11-07 | The Cassandra backend is tested on R4, R4B, R5 and R6, with R4 as the required gate | accepted |
+| [0066](2026-11-07/0066-cql-audit-check-after-pr62.md) | 2026-11-07 | The CQL audit check after PR #62: each rule also reads the CQL text, across keyspaces, and the audit dump is read fail-closed | accepted |

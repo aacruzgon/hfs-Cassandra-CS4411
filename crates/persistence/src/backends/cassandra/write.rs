@@ -170,11 +170,9 @@ const DELETE_RESOURCES_BY_TYPE: &str = "DELETE FROM resources_by_type USING TIME
 pub(crate) const UNKNOWN_OUTCOME_RERUNS: usize = 2;
 /// Retries of `create_or_update` after a definite miss, so 4 turns in all
 /// (ADR-aacruzgon-0024; walkthrough 3.5).
-#[allow(dead_code)] // L3's loop.
 pub(crate) const UPSERT_MISS_RETRIES: usize = 3;
 /// Retries of a plain `delete` after a definite miss on a live row (G25;
 /// walkthrough 3.4). `delete_versioned` never retries.
-#[allow(dead_code)] // L2b's delete.
 pub(crate) const PLAIN_DELETE_MISS_RETRIES: usize = 1;
 /// Tries of each plain write after the CAS applied (steps 4 and 5).
 const POST_CAS_WRITE_TRIES: u32 = 3;
@@ -527,7 +525,6 @@ impl PreviousVersion {
     /// Version `N` from an R1 row. The stored `index_keys` must decode: it is
     /// never left unset, and a key set that cannot be read would leave rows
     /// nobody deletes.
-    #[allow(dead_code)] // L2 and L3 build their plans from R1.
     pub(crate) fn from_row(row: &ResourceRow) -> StorageResult<Self> {
         let keys_blob = row
             .index_keys
@@ -585,7 +582,6 @@ impl CasPlan {
     }
 
     /// C2: update the live version `previous` with `body`.
-    #[allow(dead_code)] // L2a's update and L3's branch b.
     pub(crate) fn update(
         previous: PreviousVersion,
         body: Json,
@@ -603,7 +599,6 @@ impl CasPlan {
     }
 
     /// C3: delete the live version `previous`; `K(N+1)` is empty.
-    #[allow(dead_code)] // L2b's delete and delete_versioned.
     pub(crate) fn delete(previous: PreviousVersion) -> Self {
         let fhir_version = previous.fhir_version;
         Self::new(
@@ -616,7 +611,6 @@ impl CasPlan {
     }
 
     /// C4: revive the delete marker `previous` with `body`.
-    #[allow(dead_code)] // L3's branch c.
     pub(crate) fn revive(
         previous: PreviousVersion,
         body: Json,
@@ -652,7 +646,6 @@ impl CasPlan {
     }
 
     /// Which CAS this plan runs.
-    #[allow(dead_code)] // L2 and L3 read it back from `Applied::plan`.
     pub(crate) fn kind(&self) -> CasKind {
         self.kind
     }
@@ -674,7 +667,6 @@ impl CasPlan {
     }
 
     /// The resource's FHIR version.
-    #[allow(dead_code)] // L2 and L3 build their `StoredResource` from it.
     pub(crate) fn fhir_version(&self) -> FhirVersion {
         self.fhir_version
     }
@@ -907,14 +899,14 @@ pub(crate) struct CasRequest<'a> {
 
 impl CasRequest<'_> {
     /// The partition this request writes.
-    #[allow(dead_code)] // L2's and L3's pre-reads.
     pub(crate) fn key(&self) -> RowKey<'_> {
         self.key
     }
 
     /// How many attempts this request has begun: each sent its CAS, unless
-    /// its V3 or I1 failed first and ended the request.
-    #[allow(dead_code)] // L3's loop.
+    /// its V3 or I1 failed first and ended the request. Only the engine's
+    /// tests read it; the operations bound their own turns.
+    #[cfg(test)]
     pub(crate) fn attempts(&self) -> usize {
         self.attempts.len()
     }
@@ -926,13 +918,11 @@ impl CasRequest<'_> {
     }
 
     /// Counts a retry the operation takes after a definite miss.
-    #[allow(dead_code)] // L2b's delete and L3's loop.
     pub(crate) fn note_miss_retry(&self) {
         self.stats.miss_retry();
     }
 
     /// Counts a request whose definite-miss budget ran out.
-    #[allow(dead_code)] // L2b's delete and L3's loop.
     pub(crate) fn note_miss_budget_exhausted(&self) {
         self.stats.miss_budget_exhausted();
     }
@@ -953,13 +943,13 @@ impl CasRequest<'_> {
 
 /// A write that applied.
 #[derive(Debug)]
-#[allow(dead_code)] // `create` reads `last_updated` and `plan`; L2 and L3 the rest.
 pub(crate) struct Applied {
     /// The version it created.
     pub(crate) version_id: i32,
     /// Its `last_updated`, `lu(V)`.
     pub(crate) last_updated: DateTime<Utc>,
     /// The `write_id` of the attempt that applied.
+    #[allow(dead_code)] // No operation returns it; the engine's tests check it against row V.
     pub(crate) write_id: Uuid,
     /// A later version already superseded it, so steps 4 and 5 were skipped
     /// and the intent row is left for the sweeper.
@@ -967,6 +957,8 @@ pub(crate) struct Applied {
     /// Steps 4 and 5 all succeeded and the intent row was deleted. `false`
     /// leaves the intent row for the sweeper (G23); the write still
     /// succeeded.
+    #[allow(dead_code)]
+    // No operation reports it (`cas_stats` counts it); the engine's tests check it.
     pub(crate) post_cas_complete: bool,
     /// The plan of the attempt that applied, whose values the operation
     /// returns.
@@ -1397,7 +1389,6 @@ impl CassandraBackend {
     /// earlier attempts, applied late. `Some` is that attempt's success, with
     /// steps 4 to 6 already run with its values and intent; `None` means act
     /// on the row as usual. Costs nothing unless an outcome was unknown.
-    #[allow(dead_code)] // L2 and L3's loops call it after each R1.
     pub(crate) async fn check_earlier_attempts(
         &self,
         request: &mut CasRequest<'_>,
@@ -2829,12 +2820,12 @@ mod node_tests {
     }
 
     fn tenant(case: &str) -> String {
-        format!("s2-resolve-{case}-{}", Uuid::new_v4().simple())
+        format!("test-resolve-{case}-{}", Uuid::new_v4().simple())
     }
 
     fn tenant_context(case: &str) -> TenantContext {
         TenantContext::new(
-            TenantId::new(format!("s3-engine-{case}-{}", Uuid::new_v4().simple())),
+            TenantId::new(format!("test-engine-{case}-{}", Uuid::new_v4().simple())),
             TenantPermissions::full_access(),
         )
     }
@@ -3589,7 +3580,7 @@ mod node_tests {
             return;
         };
         let key = RowKey {
-            tenant_id: "s3-engine-undecidable",
+            tenant_id: "test-engine-undecidable",
             resource_type: "Patient",
             id: "p",
         };

@@ -223,8 +223,9 @@ impl CapabilityMatrix {
         // seven of that row, which the golden list in `tests/backend_capability_contract.rs`
         // gains as each step lands (`SharedSchema` at Step 2, ADR-aacruzgon-0037), plus
         // `ReverseChaining` (◐, below). Each becomes `Implemented` when the roadmap step
-        // that serves it lands (Steps 2 to 6d), as the README's ○ becomes ✓ at Step 8:
-        // `SharedSchema` at Step 2, `Crud` and `OptimisticLocking` at Step 3.
+        // that serves it lands (Steps 2 to 6d): `SharedSchema` at Step 2, `Crud` and
+        // `OptimisticLocking` at Step 3. The persistence README's Cassandra column is
+        // kept by hand and is not read from here (roadmap item 8.10).
         // URI search has no variant; `BasicSearch` covers token. Everything else is
         // out of scope or ✗, so `NotPlanned`, including every variant listed here
         // explicitly, since `support_level` answers `Planned` for a missing one.

@@ -1,7 +1,6 @@
 -- Helios Cassandra backend: table definitions.
--- Agreed by the team; sign-offs being recorded against 67f9e0532 (roadmap
--- item 1.4): Alan's is in (ADR-aacruzgon-0028), the other four members' are
--- pending. A change to a table, key, column type or table option needs new
+-- Signed off by Alan (ADR-aacruzgon-0028); four sign-offs pending, recorded
+-- against 67f9e0532 (roadmap item 1.4). A change to a table, key, column type or table option needs new
 -- sign-offs; comment changes since cite their ADR.
 --
 -- The design document fixes the keys and clustering; this file states what

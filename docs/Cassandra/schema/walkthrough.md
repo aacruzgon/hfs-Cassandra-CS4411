@@ -1,6 +1,6 @@
 # Paper walk-through of the schema
 
-**Status: agreed by the team with the schema; sign-offs being recorded against `67f9e0532` (roadmap item 1.4): Alan's is in (ADR-aacruzgon-0028), the other four members' are pending, and item 1.2 is done when they are.** Since then it has been kept in step with the code, each change through the ADR it names (the schema README lists them). Where it had to pick something the design leaves open, it points to the gap list at the end (G1, G2, …).
+**Status: signed off by Alan with the schema (ADR-aacruzgon-0028); four sign-offs pending, recorded against `67f9e0532` (roadmap item 1.4), and item 1.2 is done when they are in.** Since then it has been kept in step with the code, each change through the ADR it names (the schema README lists them). Where it had to pick something the design leaves open, it points to the gap list at the end (G1, G2, …).
 
 This walks every in-scope operation through the ten tables, statement by statement. It follows the design in [`cassandra-discussion.md`](../cassandra-discussion.md) ("Proposed Cassandra data model" and "Consistency, failure handling and rejection"), the Step 1 checklist of [`development-roadmap.md`](../development-roadmap.md), and [`spike-findings.md`](../spike-findings.md). The tables are in [`schema.cql`](schema.cql); the directory overview is [`README.md`](README.md).
 

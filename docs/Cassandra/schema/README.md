@@ -1,6 +1,6 @@
 # Cassandra schema: draft for the schema session
 
-**Status: agreed by the team; sign-offs being recorded against `67f9e0532` (PR #33's merge), roadmap item 1.4.** Signed off so far: Alan (ADR-aacruzgon-0028). Each member records their sign-off, or objection, in their own ADR log against that commit; items 1.1 to 1.4 are done when all five are in. A later change to a table, key, column type or table option needs new sign-offs.
+**Status: signed off by Alan (ADR-aacruzgon-0028); four sign-offs pending, recorded against `67f9e0532` (PR #33's merge), roadmap item 1.4.** Each member records their sign-off, or objection, in their own ADR log against that commit; items 1.1 to 1.4 are done when all five are in. A later change to a table, key, column type or table option needs new sign-offs.
 
 **"The schema session"** in these files means the two team design sessions that roadmap Step 1 plans for week 1 (13 to 18 October), led by the owner of the shared files (**W**). The team decides there. Each member then records their sign-off, or objection, in their own ADR log (item 1.4). Rows 1.1 to 1.3 are marked done only after that.
 

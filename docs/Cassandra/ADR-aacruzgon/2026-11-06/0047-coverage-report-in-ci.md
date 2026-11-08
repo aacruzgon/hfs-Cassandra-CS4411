@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0047: A Cassandra coverage report in CI, in its own workflow, not required and with no threshold
 
 - **Date:** 2026-11-06
-- **Status:** accepted (written after Alan approved the other Step 2 records; he approved it on 2026-11-06)
+- **Status:** accepted (written after Alan approved the other Step 2 records; he approved it on 2026-11-06); amended by ADR-aacruzgon-0070
 - **Context:**
     - Alan asked for every report CI can build, so that the work from Step 2 on is measured, not estimated. Two other pull requests already add reports, mostly to the required job `Cassandra schema (single node)`, through the helper `.github/scripts/ci-report.py`:
         - PR #46 (ADR-aacruzgon-0045): boot and seed, build memory, tests and skips, readiness, node statistics;

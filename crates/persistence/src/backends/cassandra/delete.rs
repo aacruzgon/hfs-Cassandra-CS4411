@@ -43,7 +43,10 @@
 //! **Stored SearchParameters** (D9). A delete of a `SearchParameter` is
 //! recorded in the in-process overlay (`forget_stored_search_parameter`),
 //! unless a later version already superseded it: after a delete marker the
-//! only later version is a revive, which restores the definition.
+//! only later version is a revive, which restores the definition. When the
+//! delete cannot say what it wrote, or finds the parameter already deleted
+//! (in its pre-read, or because its C3 missed on another writer's marker),
+//! the overlay follows the stored row instead (ADR-aacruzgon-0068).
 //!
 //! `delete_versioned` is its own compare-and-swap: the trait default reads,
 //! compares and then calls `delete`, which is not atomic (#1404).

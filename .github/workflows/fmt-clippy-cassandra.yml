@@ -208,6 +208,12 @@ jobs:
             rm -rf "$TARGET_DIR"
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          # The tag cargo writes only into a target dir it creates itself; see
+          # cassandra-coverage.yml's reset step.
+          printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+            '# This file is a cache directory tag created by cargo.' \
+            '# For information about cache directory tags see https://bford.info/cachedir/' \
+            > "$TARGET_DIR/CACHEDIR.TAG"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
@@ -326,6 +332,12 @@ jobs:
             rm -rf "$TARGET_DIR"
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          # The tag cargo writes only into a target dir it creates itself; see
+          # cassandra-coverage.yml's reset step.
+          printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+            '# This file is a cache directory tag created by cargo.' \
+            '# For information about cache directory tags see https://bford.info/cachedir/' \
+            > "$TARGET_DIR/CACHEDIR.TAG"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
@@ -460,6 +472,12 @@ jobs:
             rm -rf "$TARGET_DIR"
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          # The tag cargo writes only into a target dir it creates itself; see
+          # cassandra-coverage.yml's reset step.
+          printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+            '# This file is a cache directory tag created by cargo.' \
+            '# For information about cache directory tags see https://bford.info/cachedir/' \
+            > "$TARGET_DIR/CACHEDIR.TAG"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {

@@ -164,61 +164,77 @@ impl CassandraBackend {
         // the answer takes the new version's `last_updated`, as `read` would.
         let mut created_at: Option<DateTime<Utc>> = None;
         let mut last_miss = (CasMiss::VersionMoved { current: None }, 0);
-
-        for turn in 0..=UPSERT_MISS_RETRIES {
-            if turn > 0 {
-                request.note_miss_retry();
-            }
-            let row = self.read_resource_row(tenant_id, resource_type, id).await?;
-            if let Some(row) = &row {
-                created_at = row.created_at;
-            }
-            if let Some(applied) = self
-                .check_earlier_attempts(&mut request, row.as_ref())
-                .await?
-            {
-                return self.upserted(tenant, resource_type, id, applied, created_at);
-            }
-
-            let branch = Branch::of(row.as_ref());
-            tenant.check_permission(branch.operation(), resource_type)?;
-            check_search_parameter_code(resource_type, &resource)?;
-            seam.before_cas(turn).await;
-
-            let body = resource.clone();
-            let (outcome, expected) = match (branch, &row) {
-                (Branch::Update, Some(row)) => (
-                    self.update_attempt(&mut request, row, body).await?,
-                    row.version_id,
-                ),
-                (Branch::Revive, Some(row)) => {
-                    let previous = PreviousVersion::from_row(row)?;
-                    let (body, data) =
-                        normalized_body("create_or_update", resource_type, id, body)?;
-                    let plan =
-                        CasPlan::revive(previous, body, data, vec![IndexKey::ResourcesByType]);
-                    (self.run_cas(&mut request, plan).await?, row.version_id)
+        let result = async {
+            for turn in 0..=UPSERT_MISS_RETRIES {
+                if turn > 0 {
+                    request.note_miss_retry();
                 }
-                // Branch a, the only one `Branch::of` picks for no row.
-                _ => {
-                    let (body, data) =
-                        normalized_body("create_or_update", resource_type, id, body)?;
-                    let plan =
-                        CasPlan::create(body, data, fhir_version, vec![IndexKey::ResourcesByType]);
-                    (self.run_cas(&mut request, plan).await?, 0)
+                // After an unknown outcome, R1's error answers as R2's does
+                // (ADR-aacruzgon-0067).
+                let row = request.after_unknown(
+                    self.read_resource_row(tenant_id, resource_type, id).await,
+                    "pre-read",
+                )?;
+                if let Some(row) = &row {
+                    created_at = row.created_at;
                 }
-            };
-            match outcome {
-                CasOutcome::Applied(applied) => {
+                if let Some(applied) = self
+                    .check_earlier_attempts(&mut request, row.as_ref())
+                    .await?
+                {
                     return self.upserted(tenant, resource_type, id, applied, created_at);
                 }
-                CasOutcome::Missed(miss) => last_miss = (miss, expected),
-            }
-        }
 
-        request.note_miss_budget_exhausted();
-        let (miss, expected) = last_miss;
-        Err(budget_exhausted(miss, resource_type, id, expected))
+                let branch = Branch::of(row.as_ref());
+                tenant.check_permission(branch.operation(), resource_type)?;
+                check_search_parameter_code(resource_type, &resource)?;
+                seam.before_cas(turn).await;
+
+                let body = resource.clone();
+                let (outcome, expected) = match (branch, &row) {
+                    (Branch::Update, Some(row)) => (
+                        self.update_attempt(&mut request, row, body).await?,
+                        row.version_id,
+                    ),
+                    (Branch::Revive, Some(row)) => {
+                        let previous =
+                            request.after_unknown(PreviousVersion::from_row(row), "pre-read")?;
+                        let (body, data) =
+                            normalized_body("create_or_update", resource_type, id, body)?;
+                        let plan =
+                            CasPlan::revive(previous, body, data, vec![IndexKey::ResourcesByType]);
+                        (self.run_cas(&mut request, plan).await?, row.version_id)
+                    }
+                    // Branch a, the only one `Branch::of` picks for no row.
+                    _ => {
+                        let (body, data) =
+                            normalized_body("create_or_update", resource_type, id, body)?;
+                        let plan = CasPlan::create(
+                            body,
+                            data,
+                            fhir_version,
+                            vec![IndexKey::ResourcesByType],
+                        );
+                        (self.run_cas(&mut request, plan).await?, 0)
+                    }
+                };
+                match outcome {
+                    CasOutcome::Applied(applied) => {
+                        return self.upserted(tenant, resource_type, id, applied, created_at);
+                    }
+                    CasOutcome::Missed(miss) => last_miss = (miss, expected),
+                }
+            }
+
+            request.note_miss_budget_exhausted();
+            let (miss, expected) = last_miss;
+            Err(budget_exhausted(miss, resource_type, id, expected))
+        }
+        .await;
+        // An undecided SearchParameter write: the overlay follows the row
+        // (ADR-aacruzgon-0068).
+        self.settle_overlay_after_unknown(&request, &result).await;
+        result
     }
 
     /// The answer for the attempt that applied, from its own plan (it may be
@@ -358,8 +374,8 @@ mod node_tests {
     use crate::backends::cassandra::index_keys;
     use crate::backends::cassandra::session::{Fault, StatementKind};
     use crate::backends::cassandra::write::{
-        INSERT_VERSION, REVIVE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, next_last_updated,
-        write_ts_of,
+        INSERT_VERSION, REVIVE_RESOURCE_IF_VERSION, SOFT_DELETE_RESOURCE_IF_VERSION,
+        UPDATE_RESOURCE_IF_VERSION, next_last_updated, write_ts_of,
     };
     use crate::core::{ResourceStorage, SearchProvider};
     use crate::error::{ConcurrencyError, TenantError, ValidationError};
@@ -402,7 +418,7 @@ mod node_tests {
 
     fn tenant_with(case: &str, permissions: TenantPermissions) -> TenantContext {
         TenantContext::new(
-            TenantId::new(format!("s3-upsert-{case}-{}", Uuid::new_v4().simple())),
+            TenantId::new(format!("test-upsert-{case}-{}", Uuid::new_v4().simple())),
             permissions,
         )
     }
@@ -468,7 +484,7 @@ mod node_tests {
         }
     }
 
-    /// Deletes `Patient/p` through the engine's C3, as L2b's `delete` will.
+    /// Deletes `Patient/p` through the engine's C3, as `delete` does.
     async fn delete(backend: &CassandraBackend, tenant: &TenantContext) {
         let row = current_row(backend, tenant).await;
         let mut request = backend.cas_request("delete", key(tenant));
@@ -1371,7 +1387,7 @@ mod node_tests {
             .unwrap();
         assert_eq!(expression_of(&backend, &tenant, url), None);
 
-        // Delete it (as L2b will, with its overlay removal), then revive it
+        // Delete it (as `delete` does, with its overlay removal), then revive it
         // active.
         let row = backend
             .read_resource_row(tenant.tenant_id().as_str(), "SearchParameter", "sp")
@@ -1416,6 +1432,200 @@ mod node_tests {
         assert_eq!(
             expression_of(&fresh, &tenant, url).as_deref(),
             Some("Patient.name")
+        );
+    }
+
+    /// Fresh `test-` tenants for the hardening tests (ADR-aacruzgon-0020).
+    fn hardening_tenant(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-s3-hardening-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    /// Another request's C3 of `Patient/p` from version `from`, outside the
+    /// engine, held back by the fault seam until just before the next
+    /// statement of kind `before`.
+    async fn another_delete_late(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        from: i32,
+        before: StatementKind,
+    ) {
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "deleted_at = ?, last_updated",
+            Fault::ApplyLate { before },
+        );
+        let lu = next_last_updated(Utc::now(), None)
+            + chrono::Duration::milliseconds(50 * i64::from(from));
+        let values = vec![
+            Value::from(from + 1),
+            Value::from(lu),
+            Value::from(lu),
+            Value::from(write_ts_of(lu)),
+            Value::from(Uuid::new_v4()),
+            Value::from(tenant.tenant_id().as_str()),
+            Value::from("Patient"),
+            Value::from("p"),
+            Value::from(from),
+        ];
+        let sent = backend
+            .session
+            .rows(SOFT_DELETE_RESOURCE_IF_VERSION, values, StatementKind::Cas)
+            .await;
+        assert!(
+            sent.is_err(),
+            "the seam answers the held-back CAS with a timeout"
+        );
+    }
+
+    /// Writes an `index_keys` that does not decode on `Patient/p` at
+    /// `version`, held back until just before the next read (R1): the next
+    /// turn's row then cannot become a plan.
+    async fn undecodable_keys_before_the_next_read(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        version: i32,
+    ) {
+        let cql = "UPDATE resources SET index_keys = 0xff \
+                   WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "index_keys = 0xff",
+            Fault::ApplyLate {
+                before: StatementKind::Read,
+            },
+        );
+        let sent = backend
+            .session
+            .rows(
+                cql,
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                    Value::from(version),
+                ],
+                StatementKind::Cas,
+            )
+            .await;
+        assert!(sent.is_err(), "held back");
+    }
+
+    /// ADR-aacruzgon-0067, on `update_attempt`'s decoding of R1's row. Turn
+    /// 0's C2 times out without applying, and another request's update lands
+    /// before R2, so the turn misses and the loop takes turn 1. That turn's
+    /// R1 reads a live row whose `index_keys` does not decode, so no C2 can
+    /// be planned. Turn 0's outcome was unknown, so the request answers 503,
+    /// not the plain table's 500.
+    #[tokio::test]
+    async fn a_later_turns_undecodable_live_row_after_an_unknown_outcome_is_503() {
+        let backend = backend_or_skip!();
+        let tenant = hardening_tenant("upsert-undecodable-live");
+        put(&backend, &tenant, patient("One")).await.unwrap();
+        another_writer_late(
+            &backend,
+            &tenant,
+            UPDATE_RESOURCE_IF_VERSION,
+            1,
+            Uuid::new_v4(),
+            StatementKind::SerialRead,
+        )
+        .await;
+        backend
+            .session
+            .inject_fault(StatementKind::Cas, C2, Fault::TimeOutWithoutApplying);
+        let (backend_ref, tenant_ref) = (&backend, &tenant);
+        let step = move |turn: usize| -> BoxFuture<'_, ()> {
+            async move {
+                if turn == 0 {
+                    undecodable_keys_before_the_next_read(backend_ref, tenant_ref, 2).await;
+                }
+            }
+            .boxed()
+        };
+        let result = put_with(&backend, &tenant, patient("Two"), &step).await;
+        eprintln!("[e2 case=upsert-undecodable-live result={result:?}]");
+        let row = backend
+            .session
+            .rows(
+                "SELECT version_id, deleted_at FROM resources \
+                 WHERE tenant_id = ? AND resource_type = ? AND id = ?",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .unwrap();
+        let version: i32 = row[0].get_r_by_name("version_id").unwrap();
+        assert_eq!(version, 2, "the other request's update");
+        assert!(
+            matches!(
+                result,
+                Err(StorageError::Backend(BackendError::Unavailable { .. }))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The same, on the revive branch's decoding: turn 0's C2 times out
+    /// without applying, and another request's delete lands before R2, so
+    /// turn 0 misses (deleted in the gap) and turn 1's R1 reads the marker,
+    /// whose `index_keys` does not decode. 503, not 500.
+    #[tokio::test]
+    async fn a_later_turns_undecodable_marker_after_an_unknown_outcome_is_503() {
+        let backend = backend_or_skip!();
+        let tenant = hardening_tenant("upsert-undecodable-marker");
+        put(&backend, &tenant, patient("One")).await.unwrap();
+        another_delete_late(&backend, &tenant, 1, StatementKind::SerialRead).await;
+        backend
+            .session
+            .inject_fault(StatementKind::Cas, C2, Fault::TimeOutWithoutApplying);
+        let (backend_ref, tenant_ref) = (&backend, &tenant);
+        let step = move |turn: usize| -> BoxFuture<'_, ()> {
+            async move {
+                if turn == 0 {
+                    undecodable_keys_before_the_next_read(backend_ref, tenant_ref, 2).await;
+                }
+            }
+            .boxed()
+        };
+        let result = put_with(&backend, &tenant, patient("Two"), &step).await;
+        eprintln!("[e2 case=upsert-undecodable-marker result={result:?}]");
+        let row = backend
+            .session
+            .rows(
+                "SELECT version_id, deleted_at FROM resources \
+                 WHERE tenant_id = ? AND resource_type = ? AND id = ?",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .unwrap();
+        let version: i32 = row[0].get_r_by_name("version_id").unwrap();
+        let deleted: Option<DateTime<Utc>> = row[0].get_by_name("deleted_at").unwrap();
+        assert_eq!(version, 2, "the other request's delete");
+        assert!(
+            deleted.is_some_and(|at| at.timestamp_millis() > 0),
+            "a marker"
+        );
+        assert!(
+            matches!(
+                result,
+                Err(StorageError::Backend(BackendError::Unavailable { .. }))
+            ),
+            "{result:?}"
         );
     }
 }

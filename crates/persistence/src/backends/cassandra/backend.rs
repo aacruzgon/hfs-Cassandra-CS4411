@@ -29,7 +29,7 @@ use crate::search::{
 const HEALTH_CHECK: &str = "SELECT release_version FROM system.local";
 
 /// Every SearchParameter id a tenant has stored, from its `resources_by_type`
-/// partition, which `create` writes in Step 2 (write.rs, X1).
+/// partition, which every write keeps up to date (write.rs, X1).
 const SELECT_STORED_SEARCH_PARAMETER_IDS: &str =
     "SELECT id FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?";
 
@@ -273,9 +273,9 @@ where
 /// Built with [`CassandraBackend::connect`]. It implements the twelve traits
 /// the server needs (`helios_rest::create_app`'s bound), plus [`Backend`] and
 /// [`SearchCapabilityProvider`](crate::core::SearchCapabilityProvider). The
-/// module docs say which methods are real; the rest return
-/// [`BackendError::UnsupportedCapability`], which the REST layer answers with
-/// 501.
+/// module docs say which methods are real, which refuse with
+/// [`BackendError::UnsupportedCapability`] (501 through REST), and which keep
+/// their trait defaults.
 pub struct CassandraBackend {
     pub(super) config: CassandraConfig,
     pub(super) session: Arc<CassandraSession>,
@@ -408,8 +408,8 @@ impl CassandraBackend {
     ///
     /// From Step 3 that is `SharedSchema`, the one placement (one keyspace,
     /// with the tenant in every partition key), plus `Crud` (create, read,
-    /// update and delete; every write a compare-and-swap, the delete soft) and
-    /// `OptimisticLocking` (`If-Match` through `update`'s and
+    /// update and delete; every write to `resources` a compare-and-swap, the
+    /// delete soft) and `OptimisticLocking` (`If-Match` through `update`'s and
     /// `delete_versioned`'s compare-and-swap). A capability must never be
     /// declared for behaviour that is planned or stubbed (`core/backend.rs`),
     /// so each other one is added here, and to the golden list in
@@ -743,6 +743,89 @@ impl CassandraBackend {
         deleted_at: chrono::DateTime<chrono::Utc>,
     ) {
         self.remove_stored_search_parameter(tenant_id, id, deleted_at);
+    }
+
+    /// Makes `id`'s entry in `tenant_id`'s overlay follow `row`, the
+    /// stored SearchParameter as read (ADR-aacruzgon-0068), with the same
+    /// rules a write that knows what it wrote uses: a delete marker is a
+    /// removal at its `last_updated`, as `delete` records it; a live row is
+    /// put in or removed by its body, as `update` records it; no row changes
+    /// nothing. A removal this overlay already holds, at or after the
+    /// marker, with no older definition of `id` left, is not recorded again,
+    /// so a repeated `delete` of a deleted SearchParameter does not drop the
+    /// tenant's registry each time.
+    pub(super) fn follow_stored_search_parameter(
+        &self,
+        tenant_id: &str,
+        id: &str,
+        row: Option<&super::read::ResourceRow>,
+    ) {
+        let Some(row) = row else {
+            return;
+        };
+        if row.is_deleted() {
+            let recorded = self
+                .stored_by_tenant
+                .read()
+                .get(tenant_id)
+                .is_some_and(|overlay| {
+                    overlay
+                        .removals
+                        .iter()
+                        .any(|r| r.id == id && r.at >= row.last_updated)
+                        && !overlay
+                            .defs
+                            .iter()
+                            .any(|d| d.id() == id && d.last_updated() <= row.last_updated)
+                });
+            if !recorded {
+                self.forget_stored_search_parameter(tenant_id, id, row.last_updated);
+            }
+            return;
+        }
+        let Some(body) = row
+            .data
+            .as_deref()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        else {
+            return;
+        };
+        self.replace_stored_search_parameter(tenant_id, id, &body, row.last_updated);
+    }
+
+    /// After a SearchParameter write that answered an error once one of its
+    /// attempts' outcome was unknown (`undecidable`, ADR-aacruzgon-0055 or
+    /// 0067): the write may or may not be stored, so it could record nothing
+    /// in the overlay, and a delete or deactivation that did apply would stay
+    /// in force here until the TTL refresh. One serial read of the row tells
+    /// which, and the overlay follows it ([`Self::follow_stored_search_parameter`],
+    /// ADR-aacruzgon-0068). A failed read is logged and changes nothing: the
+    /// refresh, or a later write of the same id, settles it then.
+    pub(super) async fn settle_overlay_after_unknown<T>(
+        &self,
+        request: &super::write::CasRequest<'_>,
+        result: &StorageResult<T>,
+    ) {
+        let key = request.key();
+        if key.resource_type != "SearchParameter"
+            || result.is_ok()
+            || !request.had_unknown_outcome()
+        {
+            return;
+        }
+        match self
+            .serial_read_resource_row(key.tenant_id, key.resource_type, key.id)
+            .await
+        {
+            Ok(row) => self.follow_stored_search_parameter(key.tenant_id, key.id, row.as_ref()),
+            Err(error) => tracing::warn!(
+                tenant_id = key.tenant_id,
+                id = %key.id,
+                error = %error,
+                "a SearchParameter write's outcome is unknown and its row could not be read \
+                 back; the overlay keeps its entry until the next refresh or write of it"
+            ),
+        }
     }
 
     /// The overlay definition of a stored SearchParameter `resource`, or
@@ -1181,13 +1264,15 @@ mod restart_tests {
         assert!(status.success(), "docker {args:?}: {status}");
     }
 
-    async fn read_one(backend: &CassandraBackend) -> Result<usize, String> {
+    /// Reads one absent row under `tenant`, a `test-restart-<uuid>` tenant of
+    /// the run's own (ADR-aacruzgon-0029); it writes nothing.
+    async fn read_one(backend: &CassandraBackend, tenant: &str) -> Result<usize, String> {
         backend
             .session
             .rows(
                 "SELECT id FROM resources WHERE tenant_id = ? AND resource_type = ? AND id = ?",
                 vec![
-                    Value::from("s2-restart"),
+                    Value::from(tenant),
                     Value::from("Patient"),
                     Value::from("p1"),
                 ],
@@ -1247,8 +1332,9 @@ mod restart_tests {
         .await
         .unwrap_or_else(|e| panic!("connect to {url}: {e}"));
 
+        let tenant = format!("test-restart-{}", uuid::Uuid::new_v4().simple());
         backend.health_check().await.expect("health_check before");
-        assert_eq!(read_one(&backend).await, Ok(0), "read before");
+        assert_eq!(read_one(&backend, &tenant).await, Ok(0), "read before");
         backend.check_schema().await.expect("schema check before");
         let prepared_before = backend.session.prepared_count();
         assert!(prepared_before >= 3, "{prepared_before} prepared");
@@ -1260,7 +1346,10 @@ mod restart_tests {
             .await
             .expect_err("health_check while down");
         eprintln!("down: health_check failed {down_after:?} after the stop: {failed}");
-        assert!(read_one(&backend).await.is_err(), "a read while down");
+        assert!(
+            read_one(&backend, &tenant).await.is_err(),
+            "a read while down"
+        );
 
         docker(&["start", &container]);
         // The readiness budget of the Milestone A test (`UP_TIMEOUT`).
@@ -1278,7 +1367,11 @@ mod restart_tests {
             backend.health_check().await.unwrap_or_else(|e| {
                 panic!("health_check {:?} after recovery: {e}", started.elapsed())
             });
-            assert_eq!(read_one(&backend).await, Ok(0), "read after recovery");
+            assert_eq!(
+                read_one(&backend, &tenant).await,
+                Ok(0),
+                "read after recovery"
+            );
             checks += 1;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -1603,7 +1696,7 @@ mod node_tests {
         let tenants: Vec<crate::tenant::TenantContext> = (0..4)
             .map(|n| {
                 crate::tenant::TenantContext::new(
-                    crate::tenant::TenantId::new(format!("s2-paging-{run}-{n}")),
+                    crate::tenant::TenantId::new(format!("test-paging-{n}-{run}")),
                     crate::tenant::TenantPermissions::full_access(),
                 )
             })
@@ -1649,7 +1742,9 @@ mod node_tests {
         // checked on the 5.0.9 node). This test never removes its own.
         let ours = |set: BTreeSet<(String, String)>| -> BTreeSet<(String, String)> {
             set.into_iter()
-                .filter(|(tenant, _)| tenant.starts_with(&format!("s2-paging-{run}-")))
+                .filter(|(tenant, _)| {
+                    tenant.starts_with("test-paging-") && tenant.ends_with(&format!("-{run}"))
+                })
                 .collect()
         };
         let (whole, paged) = (ours(keys(&whole)), ours(keys(&paged)));

@@ -35,9 +35,17 @@
 //! **Failure handling** (design, "When the LWT outcome is unknown";
 //! ADR-aacruzgon-0024, 0026, 0034, 0035, 0050, 0051; walkthrough 3.1):
 //!
-//! - V3 or I1 fails: its error (503 or 504); this attempt changed nothing
-//!   (V3 only rewrites row `N` at an older timestamp). An earlier attempt
-//!   whose outcome was unknown is left for the sweeper.
+//! - V3 or I1 fails: its error, by the table for plain statements; this
+//!   attempt changed nothing (V3 only rewrites row `N` at an older
+//!   timestamp). Once an earlier attempt's outcome was unknown, that attempt
+//!   may have applied, so the error answers as R2's does, 504 for a timeout
+//!   and 503 for anything else, and the earlier attempt is left for the
+//!   sweeper (ADR-aacruzgon-0067). So does a later turn's R1, the decoding
+//!   of its row included ([`CasRequest::after_unknown`]).
+//! - The CAS is refused before it runs (the errors [`classify_cas_failure`]
+//!   takes as not applied): its error, by the table for plain statements,
+//!   with no retry (ADR-aacruzgon-0050); after an earlier attempt's unknown
+//!   outcome, as R2's error, 504 or 503 (ADR-aacruzgon-0067).
 //! - The CAS answers not applied: a definite miss. The attempt's intent row
 //!   is deleted, and the miss is mapped from the returned columns
 //!   ([`CasMiss::of`]): `[applied]` alone is "no row", `deleted_at > 0` is
@@ -49,10 +57,13 @@
 //!   then [`decide`](CassandraBackend::decide) against every `write_id` the
 //!   request has used. "Unchanged" re-runs the attempt, with a fresh
 //!   `write_id`, `last_updated` and intent, after a 5 to 25 ms pause, at most
-//!   [`UNKNOWN_OUTCOME_RERUNS`] times per request. R2's and R3's own errors
-//!   are never classified as a CAS (ADR-aacruzgon-0050): a timeout is 504,
-//!   and every other error is 503, since the write may have applied
-//!   ([`map_lookup_error`]; D3 sub-decision 4, ADR-aacruzgon-0055).
+//!   [`UNKNOWN_OUTCOME_RERUNS`] times per request. "Another writer" is a
+//!   definite miss, mapped from R2's row as the CAS's own miss would be: a
+//!   deleted row is "deleted", so a delete in the gap is `NotFound` on both
+//!   paths. R2's and R3's own errors are never classified as a CAS
+//!   (ADR-aacruzgon-0050): a timeout is 504, and every other error is 503,
+//!   since the write may have applied ([`map_lookup_error`]; D3
+//!   sub-decision 4, ADR-aacruzgon-0055).
 //! - **An earlier attempt may apply late** (ADR-aacruzgon-0051). Once any
 //!   attempt's outcome was unknown, every later look at the row is first
 //!   matched against it: a definite miss (C1's returned row, or an R2 after
@@ -170,11 +181,9 @@ const DELETE_RESOURCES_BY_TYPE: &str = "DELETE FROM resources_by_type USING TIME
 pub(crate) const UNKNOWN_OUTCOME_RERUNS: usize = 2;
 /// Retries of `create_or_update` after a definite miss, so 4 turns in all
 /// (ADR-aacruzgon-0024; walkthrough 3.5).
-#[allow(dead_code)] // L3's loop.
 pub(crate) const UPSERT_MISS_RETRIES: usize = 3;
 /// Retries of a plain `delete` after a definite miss on a live row (G25;
 /// walkthrough 3.4). `delete_versioned` never retries.
-#[allow(dead_code)] // L2b's delete.
 pub(crate) const PLAIN_DELETE_MISS_RETRIES: usize = 1;
 /// Tries of each plain write after the CAS applied (steps 4 and 5).
 const POST_CAS_WRITE_TRIES: u32 = 3;
@@ -527,7 +536,6 @@ impl PreviousVersion {
     /// Version `N` from an R1 row. The stored `index_keys` must decode: it is
     /// never left unset, and a key set that cannot be read would leave rows
     /// nobody deletes.
-    #[allow(dead_code)] // L2 and L3 build their plans from R1.
     pub(crate) fn from_row(row: &ResourceRow) -> StorageResult<Self> {
         let keys_blob = row
             .index_keys
@@ -585,7 +593,6 @@ impl CasPlan {
     }
 
     /// C2: update the live version `previous` with `body`.
-    #[allow(dead_code)] // L2a's update and L3's branch b.
     pub(crate) fn update(
         previous: PreviousVersion,
         body: Json,
@@ -603,7 +610,6 @@ impl CasPlan {
     }
 
     /// C3: delete the live version `previous`; `K(N+1)` is empty.
-    #[allow(dead_code)] // L2b's delete and delete_versioned.
     pub(crate) fn delete(previous: PreviousVersion) -> Self {
         let fhir_version = previous.fhir_version;
         Self::new(
@@ -616,7 +622,6 @@ impl CasPlan {
     }
 
     /// C4: revive the delete marker `previous` with `body`.
-    #[allow(dead_code)] // L3's branch c.
     pub(crate) fn revive(
         previous: PreviousVersion,
         body: Json,
@@ -652,7 +657,6 @@ impl CasPlan {
     }
 
     /// Which CAS this plan runs.
-    #[allow(dead_code)] // L2 and L3 read it back from `Applied::plan`.
     pub(crate) fn kind(&self) -> CasKind {
         self.kind
     }
@@ -674,7 +678,6 @@ impl CasPlan {
     }
 
     /// The resource's FHIR version.
-    #[allow(dead_code)] // L2 and L3 build their `StoredResource` from it.
     pub(crate) fn fhir_version(&self) -> FhirVersion {
         self.fhir_version
     }
@@ -907,14 +910,14 @@ pub(crate) struct CasRequest<'a> {
 
 impl CasRequest<'_> {
     /// The partition this request writes.
-    #[allow(dead_code)] // L2's and L3's pre-reads.
     pub(crate) fn key(&self) -> RowKey<'_> {
         self.key
     }
 
     /// How many attempts this request has begun: each sent its CAS, unless
-    /// its V3 or I1 failed first and ended the request.
-    #[allow(dead_code)] // L3's loop.
+    /// its V3 or I1 failed first and ended the request. Only the engine's
+    /// tests read it; the operations bound their own turns.
+    #[cfg(test)]
     pub(crate) fn attempts(&self) -> usize {
         self.attempts.len()
     }
@@ -925,14 +928,43 @@ impl CasRequest<'_> {
         self.attempts.iter().any(|a| a.unknown.is_some())
     }
 
+    /// A statement's error, by the table for plain statements, until an
+    /// attempt's outcome was unknown; from then on the write may have
+    /// applied, so it answers as R2's error does: 504 for a timeout, 503 for
+    /// anything else ([`may_have_applied`], ADR-aacruzgon-0067).
+    fn statement_error(&self, error: &DriverError, operation: &str) -> StorageError {
+        let mapped = map_driver_error(error, operation);
+        StorageError::Backend(if self.had_unknown_outcome() {
+            may_have_applied(mapped, operation)
+        } else {
+            mapped
+        })
+    }
+
+    /// The result of a statement the operation sends between its turns, its
+    /// next pre-read (R1): unchanged until an attempt's outcome was unknown;
+    /// from then on a backend error answers as R2's does
+    /// (ADR-aacruzgon-0067). Its other errors (a permission, a validation)
+    /// are the request's own, so they are kept.
+    pub(crate) fn after_unknown<T>(
+        &self,
+        result: StorageResult<T>,
+        operation: &str,
+    ) -> StorageResult<T> {
+        match result {
+            Err(StorageError::Backend(mapped)) if self.had_unknown_outcome() => {
+                Err(StorageError::Backend(may_have_applied(mapped, operation)))
+            }
+            other => other,
+        }
+    }
+
     /// Counts a retry the operation takes after a definite miss.
-    #[allow(dead_code)] // L2b's delete and L3's loop.
     pub(crate) fn note_miss_retry(&self) {
         self.stats.miss_retry();
     }
 
     /// Counts a request whose definite-miss budget ran out.
-    #[allow(dead_code)] // L2b's delete and L3's loop.
     pub(crate) fn note_miss_budget_exhausted(&self) {
         self.stats.miss_budget_exhausted();
     }
@@ -953,13 +985,13 @@ impl CasRequest<'_> {
 
 /// A write that applied.
 #[derive(Debug)]
-#[allow(dead_code)] // `create` reads `last_updated` and `plan`; L2 and L3 the rest.
 pub(crate) struct Applied {
     /// The version it created.
     pub(crate) version_id: i32,
     /// Its `last_updated`, `lu(V)`.
     pub(crate) last_updated: DateTime<Utc>,
     /// The `write_id` of the attempt that applied.
+    #[allow(dead_code)] // No operation returns it; the engine's tests check it against row V.
     pub(crate) write_id: Uuid,
     /// A later version already superseded it, so steps 4 and 5 were skipped
     /// and the intent row is left for the sweeper.
@@ -967,6 +999,8 @@ pub(crate) struct Applied {
     /// Steps 4 and 5 all succeeded and the intent row was deleted. `false`
     /// leaves the intent row for the sweeper (G23); the write still
     /// succeeded.
+    #[allow(dead_code)]
+    // No operation reports it (`cas_stats` counts it); the engine's tests check it.
     pub(crate) post_cas_complete: bool,
     /// The plan of the attempt that applied, whose values the operation
     /// returns.
@@ -1004,12 +1038,7 @@ impl CasMiss {
         let Some(row) = row.filter(|row| row.contains_column("version_id")) else {
             return CasMiss::NoRow;
         };
-        let deleted = row.contains_column("deleted_at")
-            && IntoRustByName::<DateTime<Utc>>::get_by_name(row, "deleted_at")
-                .ok()
-                .flatten()
-                .is_some_and(|at| at.timestamp_millis() > 0);
-        if deleted {
+        if row_is_deleted(row) {
             return CasMiss::Deleted;
         }
         CasMiss::VersionMoved {
@@ -1050,6 +1079,16 @@ impl CasMiss {
     }
 }
 
+/// `deleted_at > 0` in a row that returned the column: every reader that
+/// decides "deleted" tests that (G39).
+fn row_is_deleted(row: &Row) -> bool {
+    row.contains_column("deleted_at")
+        && IntoRustByName::<DateTime<Utc>>::get_by_name(row, "deleted_at")
+            .ok()
+            .flatten()
+            .is_some_and(|at| at.timestamp_millis() > 0)
+}
+
 /// What one plan's attempts came to.
 #[derive(Debug)]
 pub(crate) enum CasOutcome {
@@ -1078,11 +1117,14 @@ pub(crate) enum Decision {
 }
 
 /// The two cells a decision reads, `None` when missing or undecodable
-/// (which then decides nothing).
+/// (which then decides nothing), and whether the row is deleted, which only
+/// maps a miss that another writer's version caused: deleted in the gap is
+/// `NotFound`, as a definite miss of C2 or C3 is ([`CasMiss::of`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CurrentRow {
     pub(crate) version_id: Option<i32>,
     pub(crate) write_id: Option<Uuid>,
+    pub(crate) deleted: bool,
 }
 
 impl CurrentRow {
@@ -1094,6 +1136,7 @@ impl CurrentRow {
             write_id: IntoRustByName::<Uuid>::get_by_name(row, "write_id")
                 .ok()
                 .flatten(),
+            deleted: row_is_deleted(row),
         }
     }
 }
@@ -1103,6 +1146,7 @@ impl From<&ResourceRow> for CurrentRow {
         Self {
             version_id: Some(row.version_id),
             write_id: row.write_id,
+            deleted: row.is_deleted(),
         }
     }
 }
@@ -1162,6 +1206,22 @@ fn by_write_id(
     }
 }
 
+/// The miss an unknown outcome is once R2 shows another writer's version:
+/// mapped from the row R2 read, as a definite miss of the CAS would be from
+/// its condition columns (step 3). So another request's delete in the gap
+/// is `NotFound` (404) whether our CAS missed outright or its outcome was
+/// unknown (walkthrough 3.3 and 3.4, G9), and only a live version is
+/// `VersionConflict` (409).
+fn another_writers_miss(kind: CasKind, row: Option<CurrentRow>, target: i32) -> CasMiss {
+    match row {
+        _ if kind == CasKind::Create => CasMiss::Exists,
+        Some(row) if row.deleted => CasMiss::Deleted,
+        row => CasMiss::VersionMoved {
+            current: row.and_then(|r| r.version_id).or(Some(target)),
+        },
+    }
+}
+
 /// A random pause of 5 to 25 ms before a re-run (ADR-aacruzgon-0024).
 fn rerun_pause() -> Duration {
     let random = Uuid::new_v4().as_u128() as u64;
@@ -1185,18 +1245,46 @@ fn already_exists(resource_type: &str, id: &str) -> StorageError {
 /// The client-facing message names no host; [`map_driver_error`] logs the
 /// driver's detail.
 fn map_lookup_error(error: &DriverError, operation: &str) -> StorageError {
-    StorageError::Backend(match map_driver_error(error, operation) {
-        mapped @ (BackendError::Timeout { .. }
-        | BackendError::Unavailable { .. }
-        | BackendError::ConnectionFailed { .. }) => mapped,
-        _ => BackendError::Unavailable {
-            backend_name: BACKEND_NAME.to_string(),
-            message: format!(
+    StorageError::Backend(unavailable_unless_timeout(
+        map_driver_error(error, operation),
+        || {
+            format!(
                 "the write's outcome could not be read back ({operation} failed); \
                  it may have been stored"
-            ),
+            )
         },
+    ))
+}
+
+/// The rule of [`map_lookup_error`] for any statement a request sends once
+/// an earlier attempt's outcome was unknown (ADR-aacruzgon-0067): that
+/// attempt may have applied, so a 500 of the plain table is 503.
+fn may_have_applied(mapped: BackendError, operation: &str) -> BackendError {
+    unavailable_unless_timeout(mapped, || {
+        format!(
+            "{operation} failed after an earlier attempt's outcome was unknown; \
+             the write may have been stored"
+        )
     })
+}
+
+/// An error already mapped by the table for plain statements: a timeout
+/// (504), an unavailable node or a lost connection (503) is kept, and
+/// anything else is `Unavailable` (503) with `message`, which names no host
+/// (REST sends it to the client verbatim).
+fn unavailable_unless_timeout(
+    mapped: BackendError,
+    message: impl FnOnce() -> String,
+) -> BackendError {
+    match mapped {
+        BackendError::Timeout { .. }
+        | BackendError::Unavailable { .. }
+        | BackendError::ConnectionFailed { .. } => mapped,
+        _ => BackendError::Unavailable {
+            backend_name: BACKEND_NAME.to_string(),
+            message: message(),
+        },
+    }
 }
 
 /// ADR-aacruzgon-0053: refuses, before anything is written, a write whose CAS would carry
@@ -1277,9 +1365,7 @@ impl CassandraBackend {
                 self.session
                     .execute(cql, values, StatementKind::Write)
                     .await
-                    .map_err(|error| {
-                        StorageError::Backend(map_driver_error(&error, "previous version row"))
-                    })?;
+                    .map_err(|error| request.statement_error(&error, "previous version row"))?;
             }
             self.write_intent(
                 &attempt.intent,
@@ -1287,7 +1373,8 @@ impl CassandraBackend {
                 attempt.write_id,
                 plan.target_version(),
             )
-            .await?;
+            .await
+            .map_err(|error| request.statement_error(&error, "intent row"))?;
 
             // Step 3.
             request.stats.attempt();
@@ -1335,9 +1422,11 @@ impl CassandraBackend {
                 CasFailure::NotApplied(error) => {
                     // Nothing was decided; the intent is harmless and the
                     // sweeper deletes it. No retry, `Unavailable` included
-                    // (ADR-aacruzgon-0050).
+                    // (ADR-aacruzgon-0050). After an earlier attempt's
+                    // unknown outcome, that attempt may have applied, so the
+                    // error answers as R2's does (ADR-aacruzgon-0067).
                     request.stats.not_applied();
-                    return Err(StorageError::Backend(map_driver_error(&error, operation)));
+                    return Err(request.statement_error(&error, operation));
                 }
                 CasFailure::Unknown { timed_out, error } => (timed_out, error),
             };
@@ -1377,13 +1466,7 @@ impl CassandraBackend {
                     if let Some(applied) = self.late_attempt(request, row, Some(target)).await? {
                         return Ok(CasOutcome::Applied(applied));
                     }
-                    let miss = if plan.kind == CasKind::Create {
-                        CasMiss::Exists
-                    } else {
-                        CasMiss::VersionMoved {
-                            current: row.and_then(|r| r.version_id).or(Some(target)),
-                        }
-                    };
+                    let miss = another_writers_miss(plan.kind, row, target);
                     request.stats.miss(miss.counter());
                     return Ok(CasOutcome::Missed(miss));
                 }
@@ -1397,7 +1480,6 @@ impl CassandraBackend {
     /// earlier attempts, applied late. `Some` is that attempt's success, with
     /// steps 4 to 6 already run with its values and intent; `None` means act
     /// on the row as usual. Costs nothing unless an outcome was unknown.
-    #[allow(dead_code)] // L2 and L3's loops call it after each R1.
     pub(crate) async fn check_earlier_attempts(
         &self,
         request: &mut CasRequest<'_>,
@@ -1581,7 +1663,7 @@ impl CassandraBackend {
         key: &RowKey<'_>,
         write_id: Uuid,
         version_id: i32,
-    ) -> StorageResult<()> {
+    ) -> Result<(), DriverError> {
         self.session
             .execute(
                 INSERT_INTENT,
@@ -1599,7 +1681,6 @@ impl CassandraBackend {
             )
             .await
             .map(|_| ())
-            .map_err(|error| StorageError::Backend(map_driver_error(&error, "intent row")))
     }
 
     /// I2, best effort: a failure leaves the intent for the sweeper.
@@ -1778,10 +1859,15 @@ impl CassandraBackend {
         );
 
         let mut request = self.cas_request("create", key);
-        let applied = match self.run_cas(&mut request, plan).await? {
-            CasOutcome::Applied(applied) => applied,
-            CasOutcome::Missed(miss) => return Err(miss.into_error(resource_type, &id, 0)),
+        let outcome = match self.run_cas(&mut request, plan).await {
+            Ok(CasOutcome::Applied(applied)) => Ok(applied),
+            Ok(CasOutcome::Missed(miss)) => Err(miss.into_error(resource_type, &id, 0)),
+            Err(error) => Err(error),
         };
+        // An undecided SearchParameter create: the overlay follows the row
+        // (ADR-aacruzgon-0068).
+        self.settle_overlay_after_unknown(&request, &outcome).await;
+        let applied = outcome?;
 
         let resource = applied.plan.body().cloned().unwrap_or(Json::Null);
         if resource_type == "SearchParameter" {
@@ -2004,6 +2090,35 @@ mod tests {
         // Can be raised after the proposal was accepted.
         unknown(server(ErrorType::Server), false);
         unknown(server(ErrorType::Overloaded), false);
+        // Paxos v2 raises only write-type errors for a CAS (`Paxos.java:551-567`),
+        // and a read timeout comes only from the v1 path; but none of these
+        // proves the CAS was not executed, and taking one as "not applied"
+        // would skip the serial read for a write that may have applied.
+        unknown(
+            server(ErrorType::ReadTimeout(
+                cdrs_tokio::frame::message_error::ReadTimeoutError::new(
+                    Consistency::LocalSerial,
+                    0,
+                    1,
+                    false,
+                ),
+            )),
+            true,
+        );
+        unknown(
+            server(ErrorType::ReadFailure(
+                cdrs_tokio::frame::message_error::ReadFailureError::new(
+                    Consistency::LocalSerial,
+                    0,
+                    1,
+                    FailureInfo::NumFailures(1),
+                    false,
+                ),
+            )),
+            false,
+        );
+        unknown(server(ErrorType::Truncate), false);
+        unknown(server(ErrorType::CdcWriteFailure), false);
         for not_sent in [
             DriverError::Deadline {
                 after: Duration::from_secs(10),
@@ -2024,6 +2139,16 @@ mod tests {
             )),
             server(ErrorType::IsBootstrapping),
             server(ErrorType::Invalid),
+            server(ErrorType::Syntax),
+            server(ErrorType::Unauthorized),
+            server(ErrorType::Config),
+            server(ErrorType::Authentication),
+            server(ErrorType::Protocol),
+            server(ErrorType::Unprepared(
+                cdrs_tokio::frame::message_error::UnpreparedError::new(
+                    cdrs_tokio::types::CBytesShort::new(vec![1]),
+                ),
+            )),
         ] {
             assert!(
                 matches!(classify_cas_failure(not_sent), CasFailure::NotApplied(_)),
@@ -2444,6 +2569,119 @@ mod tests {
         ));
     }
 
+    /// ADR-aacruzgon-0067: until an attempt's outcome is unknown, a
+    /// statement's error is the plain table's, 500 included; from then on a
+    /// timeout stays 504, and everything else is 503. A non-backend error of
+    /// the request (here a permission) is kept as it is.
+    #[test]
+    fn after_an_unknown_outcome_no_statement_error_is_500() {
+        let key = RowKey {
+            tenant_id: "t",
+            resource_type: "Patient",
+            id: "p",
+        };
+        let mut request = CasRequest {
+            operation: "update",
+            key,
+            attempts: Vec::new(),
+            reruns: 0,
+            stats: Arc::new(CasCounters::default()),
+        };
+        let server_error = server(ErrorType::Server);
+        assert!(matches!(
+            request.statement_error(&server_error, "intent row"),
+            StorageError::Backend(BackendError::Internal { .. })
+        ));
+        let internal = || {
+            Err::<(), _>(StorageError::Backend(map_driver_error(
+                &server_error,
+                "pre-read",
+            )))
+        };
+        assert!(matches!(
+            request.after_unknown(internal(), "pre-read"),
+            Err(StorageError::Backend(BackendError::Internal { .. }))
+        ));
+
+        let mut attempt = Attempt {
+            write_id: Uuid::new_v4(),
+            last_updated: Utc::now(),
+            intent: IntentKey::new("t", "p", Utc::now()),
+            plan: Arc::new(CasPlan::create(
+                Json::Null,
+                "{}".to_string(),
+                FhirVersion::default_enabled(),
+                vec![IndexKey::ResourcesByType],
+            )),
+            unknown: None,
+            settled: false,
+        };
+        attempt.unknown = Some(true);
+        request.attempts.push(attempt);
+        for error in [server(ErrorType::Server), server(ErrorType::Invalid)] {
+            assert!(
+                matches!(
+                    request.statement_error(&error, "intent row"),
+                    StorageError::Backend(BackendError::Unavailable { .. })
+                ),
+                "{error:?}"
+            );
+        }
+        assert!(matches!(
+            request.statement_error(&server(write_timeout(WriteType::Simple)), "intent row"),
+            StorageError::Backend(BackendError::Timeout { .. })
+        ));
+        assert!(matches!(
+            request.after_unknown(internal(), "pre-read"),
+            Err(StorageError::Backend(BackendError::Unavailable { .. }))
+        ));
+        let denied = Err::<(), _>(StorageError::Tenant(
+            crate::error::TenantError::OperationNotPermitted {
+                tenant_id: crate::tenant::TenantId::new("t"),
+                operation: "delete".to_string(),
+            },
+        ));
+        assert!(matches!(
+            request.after_unknown(denied, "pre-read"),
+            Err(StorageError::Tenant(_))
+        ));
+    }
+
+    /// "Another writer" after an unknown outcome maps from R2's row as a
+    /// definite miss maps from the CAS's columns: deleted is `Deleted`
+    /// (`NotFound`), a live version `VersionMoved`, and a create `Exists`.
+    #[test]
+    fn another_writers_miss_maps_from_the_row_as_a_definite_miss_does() {
+        let row = |version_id, deleted| {
+            Some(CurrentRow {
+                version_id,
+                write_id: Some(Uuid::new_v4()),
+                deleted,
+            })
+        };
+        for kind in [CasKind::Update, CasKind::Delete, CasKind::Revive] {
+            assert_eq!(
+                another_writers_miss(kind, row(Some(2), true), 2),
+                CasMiss::Deleted,
+                "{kind:?}: deleted in the gap"
+            );
+            assert_eq!(
+                another_writers_miss(kind, row(Some(5), false), 2),
+                CasMiss::VersionMoved { current: Some(5) },
+                "{kind:?}"
+            );
+            assert_eq!(
+                another_writers_miss(kind, row(None, false), 2),
+                CasMiss::VersionMoved { current: Some(2) },
+                "{kind:?}: an undecodable version is the target's"
+            );
+        }
+        assert_eq!(
+            another_writers_miss(CasKind::Create, row(Some(1), true), 1),
+            CasMiss::Exists
+        );
+    }
+
     /// `decide(V)` from the row (walkthrough 3.1's table), for `V = 1`
     /// (create, `N = 0`) and `V = 4` (`N = 3`).
     #[test]
@@ -2454,6 +2692,7 @@ mod tests {
             Some(CurrentRow {
                 version_id: version,
                 write_id,
+                deleted: false,
             })
         };
         for (target, expected) in [(1, 0), (4, 3)] {
@@ -2829,12 +3068,12 @@ mod node_tests {
     }
 
     fn tenant(case: &str) -> String {
-        format!("s2-resolve-{case}-{}", Uuid::new_v4().simple())
+        format!("test-resolve-{case}-{}", Uuid::new_v4().simple())
     }
 
     fn tenant_context(case: &str) -> TenantContext {
         TenantContext::new(
-            TenantId::new(format!("s3-engine-{case}-{}", Uuid::new_v4().simple())),
+            TenantId::new(format!("test-engine-{case}-{}", Uuid::new_v4().simple())),
             TenantPermissions::full_access(),
         )
     }
@@ -3589,13 +3828,14 @@ mod node_tests {
             return;
         };
         let key = RowKey {
-            tenant_id: "s3-engine-undecidable",
+            tenant_id: "test-engine-undecidable",
             resource_type: "Patient",
             id: "p",
         };
         let row = Some(CurrentRow {
             version_id: Some(1),
             write_id: None,
+            deleted: false,
         });
         for (timed_out, want_timeout) in [(false, false), (true, true)] {
             let mut request = backend.cas_request("create", key);
@@ -3696,5 +3936,344 @@ mod node_tests {
                 }
             );
         }
+    }
+
+    /// Fresh `test-` tenants for the hardening tests (ADR-aacruzgon-0020).
+    fn hardening_tenant(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-s3-hardening-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    /// Another request's C3 of the current version, sent now but held back
+    /// by the fault seam until just before the next statement of `before`:
+    /// a delete that lands in a chosen gap of the request that follows.
+    async fn hold_back_delete(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        before: StatementKind,
+    ) {
+        let row = current(backend, tenant).await;
+        let plan = CasPlan::delete(PreviousVersion::from_row(&row).unwrap());
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "deleted_at = ?, last_updated",
+            Fault::ApplyLate { before },
+        );
+        let lu = next_last_updated(Utc::now(), Some(row.last_updated));
+        let held = backend
+            .session
+            .rows(
+                SOFT_DELETE_RESOURCE_IF_VERSION,
+                plan.cas_values(&key_of(tenant), Uuid::new_v4(), lu),
+                StatementKind::Cas,
+            )
+            .await;
+        assert!(held.is_err(), "the other request's delete is held back");
+    }
+
+    /// Another request deletes v1 between our pre-read and our CAS's
+    /// decision. That is `NotFound` (404) on every path, as walkthrough 3.3
+    /// and 3.4 and the design's step 3 say ("deleted in the gap", G9):
+    /// (a) and (c) when our C2 or C3 misses outright, and (b) and (d) when
+    /// its outcome was unknown and R2 shows the delete. In every case the
+    /// row ends deleted at v2, by the other request.
+    #[tokio::test]
+    async fn a_delete_in_the_gap_is_not_found_whether_or_not_our_outcome_was_unknown() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let version = FhirVersion::default_enabled();
+        let not_found = |r: &StorageResult<StoredResource>| {
+            matches!(
+                r,
+                Err(StorageError::Resource(ResourceError::NotFound { .. }))
+            )
+        };
+        let not_found_unit = |r: &StorageResult<()>| {
+            matches!(
+                r,
+                Err(StorageError::Resource(ResourceError::NotFound { .. }))
+            )
+        };
+
+        // (a) update: the delete lands just before our C2, which misses.
+        let tenant = hardening_tenant("gap-update-c2");
+        let stored = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        hold_back_delete(&backend, &tenant, StatementKind::Cas).await;
+        let a = backend.update(&tenant, &stored, patient()).await;
+        let row = current(&backend, &tenant).await;
+        assert!(row.is_deleted() && row.version_id == 2, "(a) row {row:?}");
+        assert!(not_found(&a), "(a) a definite miss: {a:?}");
+
+        // (b) update: our C2 times out without applying, and the same delete
+        // lands before R2.
+        let tenant = hardening_tenant("gap-update-r2");
+        let stored = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        hold_back_delete(&backend, &tenant, StatementKind::SerialRead).await;
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "SET version_id = ?, data = ?",
+            Fault::TimeOutWithoutApplying,
+        );
+        let before = backend.cas_stats();
+        let b = backend.update(&tenant, &stored, patient()).await;
+        let stats = backend.cas_stats().since(&before);
+        let row = current(&backend, &tenant).await;
+        assert!(row.is_deleted() && row.version_id == 2, "(b) row {row:?}");
+        eprintln!("[gap case=update-r2 result={b:?} stats={stats}]");
+        assert!(not_found(&b), "(b) after an unknown outcome: {b:?}");
+
+        // (c) delete_versioned: the delete lands just before our C3.
+        let tenant = hardening_tenant("gap-delete-c3");
+        backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        hold_back_delete(&backend, &tenant, StatementKind::Cas).await;
+        let c = backend.delete_versioned(&tenant, "Patient", "p", "1").await;
+        assert!(not_found_unit(&c), "(c) a definite miss: {c:?}");
+
+        // (d) delete_versioned: our C3 times out without applying, and the
+        // same delete lands before R2.
+        let tenant = hardening_tenant("gap-delete-r2");
+        backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        hold_back_delete(&backend, &tenant, StatementKind::SerialRead).await;
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "deleted_at = ?, last_updated",
+            Fault::TimeOutWithoutApplying,
+        );
+        let d = backend.delete_versioned(&tenant, "Patient", "p", "1").await;
+        let row = current(&backend, &tenant).await;
+        assert!(row.is_deleted() && row.version_id == 2, "(d) row {row:?}");
+        assert!(not_found_unit(&d), "(d) after an unknown outcome: {d:?}");
+    }
+
+    /// After an unknown outcome, the write may be stored: an error of any
+    /// later statement must answer 503 or 504, never 500 (ADR-aacruzgon-0067).
+    fn is_503_or_504<T: std::fmt::Debug>(result: &StorageResult<T>) -> bool {
+        matches!(
+            result,
+            Err(StorageError::Backend(
+                BackendError::Unavailable { .. } | BackendError::Timeout { .. }
+            ))
+        )
+    }
+
+    /// Attempt 1's C1 is reported as timed out and applies late, after R2
+    /// said "no row"; the re-run's I1 then fails with a node-side `Server`
+    /// error. The resource is stored, by attempt 1, so the request answers
+    /// 503, not the plain table's 500.
+    #[tokio::test]
+    async fn a_reruns_intent_error_after_an_unknown_outcome_is_503() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = hardening_tenant("rerun-i1");
+        let intent = "INSERT INTO pending_index_writes";
+        backend
+            .session
+            .inject_fault(StatementKind::Write, intent, Fault::PassThrough);
+        backend
+            .session
+            .inject_fault(StatementKind::Write, intent, Fault::FailWithServerError);
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "INSERT INTO resources",
+            Fault::ApplyLate {
+                before: StatementKind::Write,
+            },
+        );
+        let before = backend.cas_stats();
+        let result = backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                FhirVersion::default_enabled(),
+            )
+            .await;
+        let stats = backend.cas_stats().since(&before);
+        let row = backend
+            .read_resource_row(tenant.tenant_id().as_str(), "Patient", "p")
+            .await
+            .unwrap();
+        eprintln!("[e2 case=rerun-i1 result={result:?} stats={stats}]");
+        assert_eq!(stats.reruns, 1, "{stats}");
+        assert_eq!(row.map(|r| r.version_id), Some(1), "attempt 1 stored it");
+        assert!(is_503_or_504(&result), "{result:?}");
+    }
+
+    /// An update's C2 times out without applying, R2 shows the row
+    /// unchanged, and the re-run's V3 fails with a `Server` error. Attempt 1
+    /// may still apply (it did not here), so the request answers 503.
+    #[tokio::test]
+    async fn a_reruns_previous_version_row_error_after_an_unknown_outcome_is_503() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = hardening_tenant("rerun-v3");
+        let stored = backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .unwrap();
+        let v3 = "INSERT INTO resource_versions";
+        backend
+            .session
+            .inject_fault(StatementKind::Write, v3, Fault::PassThrough);
+        backend
+            .session
+            .inject_fault(StatementKind::Write, v3, Fault::FailWithServerError);
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "SET version_id = ?, data = ?",
+            Fault::TimeOutWithoutApplying,
+        );
+        let before = backend.cas_stats();
+        let result = backend.update(&tenant, &stored, patient()).await;
+        let stats = backend.cas_stats().since(&before);
+        eprintln!("[e2 case=rerun-v3 result={result:?} stats={stats}]");
+        assert_eq!(stats.reruns, 1, "{stats}");
+        assert_eq!(current(&backend, &tenant).await.version_id, 1);
+        assert!(is_503_or_504(&result), "{result:?}");
+    }
+
+    /// A plain delete's C3 times out without applying, and R2 shows another
+    /// request's update in the gap, so the delete takes its retry; that
+    /// turn's R1 fails with a `Server` error. The first attempt's outcome was
+    /// unknown, so the request answers 503.
+    #[tokio::test]
+    async fn a_later_turns_pre_read_error_after_an_unknown_outcome_is_503() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = hardening_tenant("later-r1");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .unwrap();
+        // Another request's C2 of v1, held back until just before our R2.
+        let row = current(&backend, &tenant).await;
+        let (body, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let plan = CasPlan::update(
+            PreviousVersion::from_row(&row).unwrap(),
+            body,
+            data,
+            vec![IndexKey::ResourcesByType],
+        );
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "SET version_id = ?, data = ?",
+            Fault::ApplyLate {
+                before: StatementKind::SerialRead,
+            },
+        );
+        let lu = next_last_updated(Utc::now(), Some(row.last_updated));
+        let held = backend
+            .session
+            .rows(
+                plan.kind.cql(),
+                plan.cas_values(&key_of(&tenant), Uuid::new_v4(), lu),
+                StatementKind::Cas,
+            )
+            .await;
+        assert!(held.is_err(), "the other request's update is held back");
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "deleted_at = ?, last_updated",
+            Fault::TimeOutWithoutApplying,
+        );
+        let r1 = "SELECT version_id, data, last_updated";
+        backend
+            .session
+            .inject_fault(StatementKind::Read, r1, Fault::PassThrough);
+        backend
+            .session
+            .inject_fault(StatementKind::Read, r1, Fault::FailWithServerError);
+        let before = backend.cas_stats();
+        let result = backend.delete(&tenant, "Patient", "p").await;
+        let stats = backend.cas_stats().since(&before);
+        eprintln!("[e2 case=later-r1 result={result:?} stats={stats}]");
+        assert_eq!(stats.miss_retries, 1, "the delete took its retry: {stats}");
+        assert_eq!(current(&backend, &tenant).await.version_id, 2);
+        assert!(is_503_or_504(&result), "{result:?}");
+    }
+
+    /// Attempt 1's C1 is reported as timed out and applies late, after R2
+    /// said "no row"; the re-run's own C1 is then refused before it runs,
+    /// with a node-side `Protocol` error, which the engine takes as not
+    /// applied. The resource is stored, by attempt 1, so the request answers
+    /// 503, not the plain table's 500 (ADR-aacruzgon-0067).
+    #[tokio::test]
+    async fn a_reruns_cas_refused_before_it_runs_after_an_unknown_outcome_is_503() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = hardening_tenant("rerun-cas-refused");
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "INSERT INTO resources",
+            Fault::ApplyLate {
+                before: StatementKind::Cas,
+            },
+        );
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "INSERT INTO resources",
+            Fault::FailWithProtocolError,
+        );
+        let before = backend.cas_stats();
+        let result = backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                FhirVersion::default_enabled(),
+            )
+            .await;
+        let stats = backend.cas_stats().since(&before);
+        let row = backend
+            .read_resource_row(tenant.tenant_id().as_str(), "Patient", "p")
+            .await
+            .unwrap();
+        eprintln!("[e2 case=rerun-cas-refused result={result:?} stats={stats}]");
+        assert_eq!((stats.reruns, stats.not_applied), (1, 1), "{stats}");
+        assert_eq!(row.map(|r| r.version_id), Some(1), "attempt 1 stored it");
+        assert!(
+            matches!(
+                result,
+                Err(StorageError::Backend(BackendError::Unavailable { .. }))
+            ),
+            "{result:?}"
+        );
     }
 }

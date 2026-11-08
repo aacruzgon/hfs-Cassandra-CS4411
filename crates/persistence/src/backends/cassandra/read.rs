@@ -2,8 +2,10 @@
 //!
 //! **`read`** (`docs/Cassandra/schema/walkthrough.md` 4.1): R1 at
 //! `LOCAL_QUORUM` on `resources (T, P, id)`. No row is `Ok(None)` (404); a
-//! row with `deleted_at > 0` is `ResourceError::Gone` (410; REST answers 404
-//! when `HFS_RETURN_GONE` is false); otherwise the row is built with
+//! row with `deleted_at > 0` is `ResourceError::Gone`, which REST always
+//! answers with 410 (`crates/rest/src/error.rs`, `From<ResourceError>`;
+//! `HFS_RETURN_GONE` is read only by `vread`, `handlers/vread.rs`); otherwise
+//! the row is built with
 //! `StoredResource::from_storage`, with `deleted_at` 0 passed as `None`
 //! (walkthrough section 2, "`deleted_at` and its readers"; G39). The version
 //! id is the `int` column as a numeric string, so the ETag is `W/"1"`,
@@ -154,7 +156,6 @@ impl ResourceRow {
     }
 
     /// Whether the row is a delete marker (`deleted_at > 0`).
-    #[allow(dead_code)] // L2's and L3's branch choice.
     pub(crate) fn is_deleted(&self) -> bool {
         self.deleted_at.is_some()
     }
@@ -162,7 +163,7 @@ impl ResourceRow {
     /// `K(N)`, decoded from the stored `index_keys`. An unset or undecodable
     /// key set is an error: it is never left unset, and guessing it would
     /// leave index rows nobody deletes (G22).
-    #[allow(dead_code)] // L2's and L3's key sets.
+    #[allow(dead_code)] // Read by tests; the writes decode `K(N)` in `PreviousVersion::from_row`.
     pub(crate) fn keys(&self) -> StorageResult<Vec<IndexKey>> {
         let blob = self
             .index_keys
@@ -240,7 +241,6 @@ impl CassandraBackend {
     /// returned, with [`ResourceRow::deleted_at`] set; deciding what that
     /// means is the caller's. Its failure is mapped as a plain read's (504
     /// timed out, 503 failed).
-    #[allow(dead_code)] // The pre-read of L2's and L3's writes.
     pub(crate) async fn read_resource_row(
         &self,
         tenant_id: &str,
@@ -260,6 +260,37 @@ impl CassandraBackend {
             )
             .await
             .map_err(|error| StorageError::Backend(map_driver_error(&error, "pre-read")))?;
+        rows.first().map(ResourceRow::decode).transpose()
+    }
+
+    /// R1's statement at `LOCAL_SERIAL`, which first completes a proposal
+    /// the replicas already accepted, so it reads at least what a plain read
+    /// would (ADR-aacruzgon-0068: the overlay follows the row after a
+    /// SearchParameter write whose outcome could not be decided). A proposal
+    /// its coordinator is still running can still apply after it
+    /// (ADR-aacruzgon-0034). Its error is the table for plain statements';
+    /// the caller only logs it.
+    pub(crate) async fn serial_read_resource_row(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<ResourceRow>> {
+        let rows = self
+            .session
+            .rows(
+                SELECT_RESOURCE,
+                vec![
+                    Value::from(tenant_id),
+                    Value::from(resource_type),
+                    Value::from(id),
+                ],
+                StatementKind::SerialRead,
+            )
+            .await
+            .map_err(|error| {
+                StorageError::Backend(map_driver_error(&error, "overlay serial read"))
+            })?;
         rows.first().map(ResourceRow::decode).transpose()
     }
 

@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0058: The node's CQL audit log proves that no CQL `DELETE` reaches `resources` or `resource_versions`, as a check in the required Cassandra job
 
 - **Date:** 2026-11-06
-- **Status:** accepted (Alan chose D6 of the Step 3 plan on 2026-11-06 and approved this entry on 2026-11-07).
+- **Status:** accepted (Alan chose D6 of the Step 3 plan on 2026-11-06 and approved this entry on 2026-11-07); amended by ADR-aacruzgon-0066
 - **Context:**
     - **The exit criterion.** Roadmap Step 3's exit criterion and row 3.4 said "`cqlsh` shows no CQL `DELETE` was ever issued against `resources`". That cannot be done literally: Cassandra keeps no table of past statements (Step 3 plan, D6).
     - **The design forbids such a DELETE.**

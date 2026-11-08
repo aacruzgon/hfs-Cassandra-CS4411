@@ -492,8 +492,12 @@ would keep the document of a dropped `contained[]` entry). When the run complete
 lists the resource ids each writer indexed and deletes the entries of those the source no longer
 holds (re-checking right before deleting); `orphansRemoved` in the status counts them. A run that
 crashes, is cancelled or fails is therefore left with the old index plus the pages already
-rebuilt: searchable, at worst holding stale rows for deleted resources. A writer that cannot list
-its index skips the sweep with a warning. A run named by resource ids deletes the entries of the
+rebuilt: searchable, at worst holding stale rows for deleted resources. That holds for the page in
+flight too on MongoDB: a page snapshots the ids of the rows it replaces, inserts the new rows and
+only then deletes the snapshotted ids (#2424), so a stop in between leaves each resource with its
+old rows, its new rows or both, never none. Two generations of rows search as one, and the next
+write of the page removes the surplus. A writer that cannot list its index skips the sweep with a
+warning. A run named by resource ids deletes the entries of the
 named ids that the source lacks as it goes. Transient source read errors are retried (3 attempts)
 before the run fails.
 
@@ -679,6 +683,8 @@ SQLite handles CRUD, versioning, history, and transactions. Elasticsearch handle
 
 **Prerequisites:** A running Elasticsearch 8.x instance.
 
+**Upgrading from a build before #2394.** The Elasticsearch mapping gains `search_params.reference.reference_target` (schema version 3), added to existing indices at startup. Documents indexed before that have no such field, so references stored as absolute URLs (`http(s)://host/fhir/Patient/p1`) are not found by `Type/id` searches or by `_revinclude` until you run `POST /$reindex`. Relative references are unaffected, nothing is lost, and the startup log warns once per affected index. Run `$reindex` once after upgrading.
+
 ```bash
 # Build with Elasticsearch support
 cargo build --bin hfs --features sqlite,elasticsearch --release
@@ -822,6 +828,8 @@ PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarant
 - Multi-tenant support (shared schema via a `tenant_id` discriminator column)
 
 **Prerequisites:** Running PostgreSQL (14+) and Elasticsearch 8.x instances.
+
+**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with PostgreSQL and Elasticsearch support
@@ -1699,6 +1707,8 @@ MongoDB remains the canonical write/read store while Elasticsearch owns delegate
 
 **Prerequisites:** Running MongoDB and Elasticsearch 8.x instances.
 
+**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+
 ```bash
 # Build with MongoDB and Elasticsearch support
 cargo build --bin hfs --features mongodb,elasticsearch --release
@@ -1738,6 +1748,8 @@ S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (inge
 - Tenant isolation (`PrefixPerTenant` or `BucketPerTenant`)
 
 **Prerequisites:** An AWS S3 bucket (or S3-compatible service) and a running Elasticsearch 8.x instance.
+
+**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with S3 and Elasticsearch support

@@ -3,7 +3,9 @@
 HFS keeps two kinds of index on the `search_index` collection.
 
 - **Inline** indexes (`idx_search_composite`, `idx_search_resource`, `idx_search_composite_slot_probe`) are created at every boot before the server serves. The slot probe index is partial and includes only composite rows.
-- **Generation 4** is the current generation: nine partial value indexes (`idx_search_date_v3` and eight named `idx_search_*_v2`), built by HFS **after** boot in one `createIndexes` command that scans the collection once, plus contained rows living in their own collection since generation 3 (see "Contained rows" below) rather than a partial index on `search_index`. MongoDB 4.2 and later do not block reads or writes during the value-index build. When every generation-2 value index is ready, HFS drops the nine generation-1 value indexes (`idx_search_string`, `idx_search_token`, ...); once the contained-row move is also done, HFS records `search_indexes.generation: 4` in the `schema_version` document.
+- **Generation 6** is the current generation. It is generation 5 plus one partial index, `idx_search_composite_tuple_qty`, over the `tuple_code` of token+quantity composite rows; see [Token+quantity composites (generation 6)](#tokenquantity-composites-generation-6). It is built in the same background `createIndexes` as the others.
+- **Generation 5** (the base of generation 6) is generation 4 plus one partial index, `idx_search_reference_target_v2` on `(tenant_id, resource_type, param_name, value_reference_target, resource_id)`, which holds only rows that carry `value_reference_target` (absolute `http(s)` references, #2394). It is built in the same background `createIndexes` as the others; see "Reference normalization (generation 5)" below.
+- **Generation 4** (the base of generation 5) is nine partial value indexes (`idx_search_date_v3` and eight named `idx_search_*_v2`), built by HFS **after** boot in one `createIndexes` command that scans the collection once, plus contained rows living in their own collection since generation 3 (see "Contained rows" below) rather than a partial index on `search_index`. MongoDB 4.2 and later do not block reads or writes during the value-index build. When every generation-2 value index is ready, HFS drops the nine generation-1 value indexes (`idx_search_string`, `idx_search_token`, ...); once the contained-row move is also done, HFS records `search_indexes.generation: 4` in the `schema_version` document.
 
 Why: a generation-1 value index carried one entry for every row of the collection, even rows that had no value of that type, and no value index carried `resource_id`, so every search fetched one document per matching key. Generation-2 indexes are partial (one entry per row that has the value) and end in `resource_id`, so a value-filtered scan is covered. Issues #1059 and #1084 have the measurements.
 
@@ -48,12 +50,20 @@ Rows extracted from a resource's `contained` entries live in their own collectio
 
 On the first boot of a generation-3 binary HFS moves any contained rows still in `search_index` into the new collection, in pages of 1,000, in every `HFS_MONGODB_INDEX_BUILD` mode (it is a correctness fix, not an index build), records `search_indexes.contained_rows_moved: true`, and then drops the old partial `idx_search_contained` from `search_index` under the usual mode rules (in `off` mode it warns and names the `dropIndex` command). Most deployments have no contained rows, so the move is one empty find. On a deployment that has contained resources and takes writes during boot, run that first generation-3 boot with `HFS_MONGODB_INDEX_BUILD=inline`, or run `$reindex` afterwards: a container updated while the background move is paging can get its pre-update contained rows re-inserted.
 
+## Reference normalization (generation 5)
+
+Since #2394 (schema version 17) `search_index.value_reference` is written without a `/_history/N` suffix, and an absolute `http(s)://<base>/Type/id[/_history/N]` reference also gets `value_reference_target: "Type/id"`. Relative references add no field, so the new partial index grows only with the number of absolute references. `_revinclude` matches with exact `$in` on `value_reference` and `value_reference_target`, and bare-id reference filters (`subject=p1`) use the same two fields, with no regex. A plain `Type/id` filter (`subject=Patient/p1`) stays an exact match on `value_reference` and does not reach absolute URLs; the other backends do match them.
+
+The `SearchIndexBuilder` rewrites existing rows of `search_index` and `search_index_contained` at start, after the contained-row move and in every `HFS_MONGODB_INDEX_BUILD` mode. It walks `_id` in pages, resumes from `search_indexes.reference_normalize_last_id`, and sets `search_indexes.references_normalized` at the end. It is idempotent. Readers use the exact form only when the marker is set and `idx_search_reference_target_v2` is built; before that, and with `HFS_MONGODB_INDEX_BUILD=off` (which does not build the index), they keep the regex arms, so results are complete throughout.
+
+To rerun the backfill, use `reference-normalize-rollback.mongosh.js`; see [Crossed 17](schema-version.md#crossed-17-reference-normalization).
+
 ## Search offloaded to Elasticsearch (`mongodb-elasticsearch`)
 
 When MongoDB runs with search offloaded to Elasticsearch, every search goes to Elasticsearch and `search_index` and `search_index_contained` stay empty (offloaded writes only `$unset` the `missing_params` fields). Nothing reads the indexes below, so in this mode HFS neither builds them nor requires them:
 
 - the inline `search_index` indexes (`idx_search_composite`, `idx_search_resource`, `idx_search_composite_slot_probe`) and the `search_index_contained` indexes, which are not created at boot;
-- the nine generation-4 value indexes, because `SearchIndexBuilder` does not run (it reports `Skipped`, in every `HFS_MONGODB_INDEX_BUILD` mode);
+- the eleven generation-6 value indexes, because `SearchIndexBuilder` does not run (it reports `Skipped`, in every `HFS_MONGODB_INDEX_BUILD` mode);
 - `idx_resources_missing_params` and `idx_resources_missing_params_fp`, because `MissingIndexBuilder` does not run, as with `HFS_MONGODB_MISSING_METADATA=false`.
 
 Readiness requires only the `resources` indexes (`idx_resources_identity`, `idx_resources_type_scan`). A node whose `search_index` indexes are missing or dropped stays ready. The standalone MongoDB backend is unchanged: it still builds and requires all of them, because `:missing` and standard search read them.
@@ -66,6 +76,7 @@ HFS does not drop indexes that already exist, so a deployment moved to this mode
     db.resources.dropIndex("idx_resources_missing_params_fp")
 
 `dropIndexes()` with no argument drops every index on the collection except `_id`; the two collections are empty in this mode. If you only want the missing-params saving, drop the last two and leave the others. `dropIndex` fails with "index not found" for an index that was never built; that is safe to ignore. If you later switch the database back to the standalone backend, the next boot recreates the inline indexes and rebuilds the rest, and you must run `$reindex` because the search rows were never written.
+
 
 ## Downgrading
 
@@ -81,9 +92,17 @@ A binary from before generation 3 reads contained matches from `search_index` on
 
 That script also resets the `schema_version` generation record, so rolling forward again re-runs the contained-row move instead of skipping it.
 
+A binary from before generation 5 needs no script: it ignores `idx_search_reference_target_v2` and `value_reference_target`, and still matches exact `Type/id` references on normalized rows. For rows it writes afterwards, see [Crossed 17](schema-version.md#crossed-17-reference-normalization).
+
 A binary from before generation 4 needs no script: it sees `idx_search_date_v2` missing and rebuilds it in the background like any other missing generation-2 index, and ignores `idx_search_date_v3`.
 
-All four scripts are generated from `crates/persistence/src/backends/mongodb/search_index_catalog.rs`; a unit test fails if they drift.
+A binary from before generation 6 runs without a script: it ignores `idx_search_composite_tuple_qty` and `tuple_code`, and records its own generation, 5 (or 4 before #2394), at boot, after which no instance of the newer build trusts the token+quantity markers. It writes composite rows without `tuple_code`, so the tuple path stops for every tenant; see [Rollback and restore](#rollback-and-restore). To leave nothing of generation 6 behind (the index still costs space, and the markers stay until the newer build boots again), run, with `HFS_MONGODB_DATABASE` exported:
+
+    mongosh "$HFS_MONGODB_URL" --file crates/persistence/mongodb/composite-tuple-rollback.mongosh.js
+
+It deletes the `composite_tuple_code_v2` markers first, then drops `idx_search_composite_tuple_qty`, then lowers a recorded generation 6 to 5. It leaves `tuple_code` on the rows: an older build ignores it, and the newer build rebuilds the index and takes the tuple path again only after the activating `$reindex`.
+
+The first four scripts are generated from `crates/persistence/src/backends/mongodb/search_index_catalog.rs`; a unit test fails if they drift. `composite-tuple-rollback.mongosh.js` is hand-written; a unit test checks that the index and marker names it uses match the code.
 
 ## How `$reindex` walks a type (#1403)
 
@@ -397,3 +416,54 @@ For SQL and MongoDB, after every writer runs the slot-writing version, send `POS
 Use the tenant-wide route even when the repeated-type parameter belongs to `Observation`. A contained Observation is indexed under its container's resource type, so `POST /Observation/$reindex` does not rebuild its rows when the container is another type. Keep older writers from writing to that tenant during and after the rebuild; they would create rows without slots again.
 
 An arity mismatch — a value with fewer or more `$`-separated parts than the parameter declares (e.g. `code-value-quantity=8302-2`, one part for a two-component parameter) — is a 400 (`InvalidComposite`) on every backend, naming the received and expected part counts (#1236).
+
+## Token+quantity composites (generation 6)
+
+A token+quantity composite (`code-value-quantity`, `combo-code-value-quantity`, `component-code-value-quantity`) normally discovers candidates through one component and pair-checks the other within the same `composite_group` (see [Composite parameters](#composite-parameters)). Generation 6 lets `code=X AND value>N` be one covered range scan instead:
+
+- When HFS writes the rows of a two-component composite, the quantity row of each group also carries `tuple_code`, an array with every code form of the group's token rows: `c:<code>` for the code alone, and `s<byte length of system>:<system>|<code>` for each system and code pair. The length prefix keeps a `|` inside a system or code from making two different pairs collide. A group whose token rows have no code (a `CodeableConcept` with only `text`) gets no `tuple_code`.
+- `idx_search_composite_tuple_qty` is `{ tenant_id, resource_type, param_name, tuple_code, value_quantity_value, resource_id }`, partial on `tuple_code` existing. The builder creates it in the background with the other value indexes.
+
+The `tuple_code` format changed during development: the first form joined system and code with a bare `|`, and its markers used the id `<tenant>|composite_tuple_code`. No release wrote it. HFS never reads those markers, so a database written by such a build uses pair validation until `$reindex` rewrites its rows in the current form.
+
+### Turning the tuple path on: `$reindex` per tenant
+
+Rows written before generation 6, or by an older instance, have no `tuple_code` and would silently drop out of a tuple scan. The planner therefore uses the index only for a tenant, or a tenant and resource type, that a completed `$reindex` marked complete. The markers are documents in the `search_layout` collection, `_id` `<tenant>|composite_tuple_code_v2` or `<tenant>|<type>|composite_tuple_code_v2`. A new database and a new tenant have none, so they use pair validation (correct, slower) until their first `$reindex`.
+
+A run writes a marker only when it finishes with no error, and only when it rebuilt every resource of its types:
+
+| Run | Marker |
+|---|---|
+| `POST /$reindex`, with or without `clearExisting` | tenant |
+| `POST /{type}/$reindex` | that type |
+| `idStart` / `idEnd`, `clearOnly`, `metadataOnly`, a run limited to some search parameters or resources | none |
+| A run that is cancelled, fails, or skips a resource it could not read or index | none |
+
+Before writing the marker, HFS checks each type in scope for a quantity row of a token+quantity composite without `tuple_code` whose group has a coded token row. If it finds one (an older instance wrote it while the run went on), it writes no marker for that type, or no tenant marker, and logs a `warn`. The check reads each composite quantity row of the scope once. It sees only rows written before it reads them: a row an older instance writes after that is the case [Deployment order](#deployment-order) rules out.
+
+After writing the markers, HFS reads `resources` once for the tenant. If the tenant has no resource left, a tenant purge ran during the run (on any instance), and HFS removes the markers it just wrote, so a tenant id reused later does not start out marked. A tenant that was empty when the run ended gets no marker either; that only means pair validation until its next `$reindex`.
+
+The planner also needs the recorded generation to be 6 or more, the value indexes ready, one composite value, no modifier, a token part that is a code or `system|code`, and a quantity prefix other than `ne`. Any other search keeps pair validation. Markers are cached per instance for 30 seconds.
+
+To check a tenant, in `mongosh` against the HFS database:
+
+```javascript
+db.schema_version.findOne({ _id: "schema_version" }).search_indexes.generation  // 6
+db.search_layout.find({ tenant_id: "<tenant>" })
+```
+
+### Deployment order
+
+1. Deploy the new binary to every instance.
+2. Wait until `search_indexes.generation` reads 6 (the background build is done).
+3. Make sure no instance of an older binary is running against the database.
+4. Run `$reindex` for each tenant, or `POST /Observation/$reindex` (and the other types with token+quantity composites).
+
+A `$reindex` that completes before step 2 is done normally loses its markers: when HFS records generation 6 over generation 5 (or lower) it first deletes every marker (see [Rollback and restore](#rollback-and-restore)), so run it again after step 2.
+
+An older instance that is still running writes rows without `tuple_code`. It records its generation only when it boots, so HFS cannot see it. If it writes after a tenant was marked, those rows are missing from tuple-path searches of that tenant until the next `$reindex`. Do not run the activating `$reindex` while one is alive.
+
+### Rollback and restore
+
+- **Rollback.** An older binary records its own generation at boot: 5 for a build with #2394 and without this one, 4 before #2394. Every instance of this binary stops trusting the markers within 30 seconds, and searches fall back to pair validation. When this binary records generation 6 again, it first deletes every marker; if it cannot delete them, it records nothing and the markers stay untrusted. After the return, run the activating `$reindex` again, in the order above. To leave generation 6 for good (or before handing the database to a generation-5 build), run `composite-tuple-rollback.mongosh.js`; see [Downgrading](#downgrading).
+- **Restore.** A `mongorestore` into a database whose tenants are marked, or any tool that writes `search_index` directly, leaves rows without `tuple_code` behind a marker. After a restore, delete the markers and reindex: `db.search_layout.deleteMany({ layout: "composite_tuple_code_v2" })`, then `$reindex` per tenant. A tenant purge deletes that tenant's markers, including one written by a `$reindex` of that tenant that finishes after the purge.

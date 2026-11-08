@@ -39,7 +39,7 @@ use crate::search::reindex::{
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchParameter, SearchPrefix,
-    SearchQuery, StoredResource,
+    SearchQuery, StoredResource, absolute_reference_target, strip_reference_version,
 };
 
 use super::MongoBackend;
@@ -3737,6 +3737,8 @@ impl ResourceStorage for MongoBackend {
             .or_query_error("purge delete (secondary_sync_failures)")?;
         // SQL query terminology relations are tenant-keyed documents (#2185).
         self.purge_tenant_sof_terminology(id).await?;
+        // The tenant's `tuple_code` completeness markers (`search_layout`).
+        self.purge_composite_tuple_markers(&db, id).await?;
         // Per-user settings are keyed by user, not tenant, so the deletes above
         // do not reach them — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313).
@@ -5208,7 +5210,7 @@ impl MongoBackend {
             .extract_with_missing(resource, resource_type)
         {
             Ok(extraction) => {
-                let own = extraction
+                let mut own = extraction
                     .values
                     .iter()
                     .filter_map(|value| {
@@ -5220,6 +5222,16 @@ impl MongoBackend {
                         )
                     })
                     .collect::<Vec<_>>();
+                // The quantity row of a token+quantity composite group carries
+                // its group's codes (`idx_search_composite_tuple_qty`). Only
+                // two-component composites: no longer one is read that way.
+                let pairs: HashSet<&str> = extraction
+                    .values
+                    .iter()
+                    .filter(|value| value.composite_arity == Some(2))
+                    .map(|value| value.param_name.as_str())
+                    .collect();
+                super::composite_search::stamp_tuple_codes(&mut own, |param| pairs.contains(param));
                 // A parameter whose values all failed to build a row (an
                 // unparseable date, a Period end that is not a date) is as
                 // absent as one that extracted nothing: without this it would
@@ -5591,7 +5603,13 @@ impl MongoBackend {
             IndexValue::Reference {
                 reference, display, ..
             } => {
-                doc.insert("value_reference", reference.clone());
+                // Stored without the `/_history/<vid>` suffix, and absolute
+                // URLs also carry their `Type/id` in a side field, so readers
+                // match with exact `$in` and no regex arms (#2394).
+                doc.insert("value_reference", strip_reference_version(reference));
+                if let Some(target) = absolute_reference_target(reference) {
+                    doc.insert("value_reference_target", target);
+                }
                 if let Some(d) = display {
                     doc.insert("value_reference_display", d.clone());
                 }
@@ -10136,6 +10154,22 @@ impl ReindexTarget for MongoBackend {
         Ok(result.deleted_count + contained_result.deleted_count)
     }
 
+    async fn reindex_run_completed(
+        &self,
+        tenant: &TenantContext,
+        coverage: crate::search::ReindexCoverage<'_>,
+    ) {
+        if self.is_search_offloaded() {
+            return;
+        }
+        if let Err(error) = self
+            .record_composite_tuple_codes_complete(tenant.tenant_id().as_str(), coverage)
+            .await
+        {
+            tracing::warn!(%error, "could not record the tuple_code marker");
+        }
+    }
+
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
@@ -10192,13 +10226,25 @@ impl ReindexTarget for MongoBackend {
         Ok(result.deleted_count + contained_result.deleted_count)
     }
 
-    /// Rebuilds a whole page in one `delete_many` plus one (possibly chunked)
-    /// `insert_many`, instead of the default's two `delete_many` plus one
+    /// Rebuilds a whole page in one row snapshot, one (possibly chunked)
+    /// `insert_many` and one (possibly chunked) delete of the replaced rows by
+    /// `_id`, instead of the default's two `delete_many` plus one
     /// `insert_many` PER RESOURCE — `delete_search_entries` above, then
     /// `write_search_entries` -> `index_resource`'s own delete-then-insert
     /// (#1064). For a 100-resource page that was 300 sequential round trips;
-    /// this is two (three only if a page mixes resource types, which no
-    /// production caller does — see the precondition below).
+    /// this is a handful per collection (more only if a page mixes resource
+    /// types, which no production caller does — see the precondition below).
+    ///
+    /// The page's old rows are deleted after its new rows are in, never before
+    /// (#2424): the snapshot records the ids of the rows the page's resources
+    /// hold, the inserts add the new generation, and the delete removes exactly
+    /// the snapshotted ids. A stop at any point (a crash, a dropped future, a
+    /// failed command) leaves each resource with its old rows, its new rows or
+    /// both, and a search in between still finds it. Searches group the rows
+    /// of a resource by resource id, so two generations of rows return the
+    /// resource once; the next write of the page (a re-run snapshots both
+    /// generations) or of the resource removes the surplus. A resource whose
+    /// new rows did not all land keeps its old rows.
     ///
     /// Building every resource's documents through
     /// [`Self::search_index_documents_checked`] keeps a rebuild and the CRUD
@@ -10220,22 +10266,22 @@ impl ReindexTarget for MongoBackend {
     ///
     /// Precondition: `resources` must hold each `(resource_type, id)` at most
     /// once; unlike Elasticsearch's `_id`-keyed upsert, a repeated id here
-    /// would double-insert, because the delete for the whole page runs once
-    /// per run, up front. The production caller, `fetch_resources_page`, guarantees
+    /// would double-insert, because the snapshot of the rows to replace is
+    /// taken once per run, up front. The production caller, `fetch_resources_page`, guarantees
     /// it: an id-phase page walks the unique `idx_resources_identity` in key
     /// order, and a catch-up page is de-duplicated by id (keeping the newest
     /// version) before it is returned (#1403). The same resource in two
     /// different calls is expected — a catch-up round rewrites what the id
     /// phase wrote.
     ///
-    /// A transient driver failure of the delete, the snapshot, an insert or
+    /// A transient driver failure of the snapshot, an insert, the delete or
     /// the verification is first retried by running the whole page again from
-    /// its delete (`write_page_with_retry`, #2290): the saved insert batch is
+    /// its snapshot (`write_page_with_retry`, #2290): the saved insert batch is
     /// never resent, so the rows a failed run landed are removed by the next
-    /// run's delete rather than duplicated.
+    /// run's delete, with the old rows, rather than duplicated.
     ///
     /// A page-level failure that survives that — getting the database handle,
-    /// the grouped delete, or an insert error the driver does not attribute to
+    /// the snapshot, the delete of the old rows, or an insert error the driver does not attribute to
     /// a specific document — reports the same `Err` for every resource in the page,
     /// because the failure cannot be attributed to individual documents
     /// (mirroring SQLite's BEGIN/COMMIT fan-out and Elasticsearch's
@@ -10247,11 +10293,13 @@ impl ReindexTarget for MongoBackend {
     ///
     /// A page of `REINDEX_SUBBATCH_FIRST` resources or fewer, and every page
     /// on a current-thread runtime, always runs through the serial writer:
-    /// one delete phase, then one insert phase (own rows, then contained
+    /// one snapshot phase, then one insert phase (own rows, then contained
     /// rows, each chunked into `SEARCH_INDEX_INSERT_CHUNK`-sized `insert_many`
-    /// commands). The delete completes fully before the insert phase starts,
-    /// but a chunked insert can still leave some rows behind even when it
-    /// goes on to fail: an earlier chunk that already committed keeps its
+    /// commands), then the delete of the old rows. The snapshot completes
+    /// fully before the insert phase starts and the delete only after it
+    /// ends, and a chunked insert can still leave some new rows behind even
+    /// when it goes on to fail (alongside the old rows, which are then not
+    /// deleted): an earlier chunk that already committed keeps its
     /// rows, and the chunk that actually errored may keep some, all, or none
     /// of its own — an unordered `insert_many` failure (for example a
     /// write-concern error reported after the documents were written, or a
@@ -15510,5 +15558,82 @@ mod unknown_commit_tests {
         let ceiling = Duration::from_millis(i32::MAX as u64);
         assert_eq!(settle_read_max_time(i32::MAX as u64), ceiling);
         assert_eq!(settle_read_max_time(u64::MAX), ceiling);
+    }
+}
+
+#[cfg(test)]
+mod reference_document_tests {
+    use super::*;
+
+    fn reference_document(reference: &str, contained: bool) -> Document {
+        let backend = MongoBackend::new(super::super::backend::MongoBackendConfig::default())
+            .expect("backend without a connection");
+        let extracted = ExtractedValue::new(
+            "subject",
+            "http://hl7.org/fhir/SearchParameter/clinical-subject",
+            crate::types::SearchParamType::Reference,
+            IndexValue::reference(reference),
+        );
+        if contained {
+            backend
+                .build_contained_index_document(
+                    "t1",
+                    "Observation",
+                    "o1",
+                    "Patient",
+                    "c1",
+                    &extracted,
+                )
+                .expect("contained document")
+        } else {
+            backend
+                .build_search_index_document("t1", "Observation", "o1", &extracted)
+                .expect("document")
+        }
+    }
+
+    #[test]
+    fn relative_reference_is_stored_as_is_without_a_target() {
+        let doc = reference_document("Patient/p1", false);
+        assert_eq!(doc.get_str("value_reference"), Ok("Patient/p1"));
+        assert!(!doc.contains_key("value_reference_target"));
+    }
+
+    #[test]
+    fn versioned_reference_loses_its_version() {
+        let doc = reference_document("Patient/p1/_history/3", false);
+        assert_eq!(doc.get_str("value_reference"), Ok("Patient/p1"));
+        assert!(!doc.contains_key("value_reference_target"));
+    }
+
+    #[test]
+    fn absolute_reference_keeps_its_url_and_gains_a_target() {
+        let doc = reference_document("http://example.org/fhir/Patient/p1", false);
+        assert_eq!(
+            doc.get_str("value_reference"),
+            Ok("http://example.org/fhir/Patient/p1")
+        );
+        assert_eq!(doc.get_str("value_reference_target"), Ok("Patient/p1"));
+    }
+
+    #[test]
+    fn absolute_versioned_reference_is_stripped_and_gains_a_target() {
+        let doc = reference_document("https://ehr.example.com/r4/Patient/p1/_history/2", false);
+        assert_eq!(
+            doc.get_str("value_reference"),
+            Ok("https://ehr.example.com/r4/Patient/p1")
+        );
+        assert_eq!(doc.get_str("value_reference_target"), Ok("Patient/p1"));
+    }
+
+    #[test]
+    fn contained_documents_normalize_references_too() {
+        let doc = reference_document("https://ehr.example.com/r4/Patient/p1/_history/2", true);
+        assert_eq!(doc.get_str("contained_local_id"), Ok("c1"));
+        assert_eq!(
+            doc.get_str("value_reference"),
+            Ok("https://ehr.example.com/r4/Patient/p1")
+        );
+        assert_eq!(doc.get_str("value_reference_target"), Ok("Patient/p1"));
     }
 }

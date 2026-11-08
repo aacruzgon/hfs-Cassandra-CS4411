@@ -227,10 +227,13 @@ reviews:
           "another writer".
         - An R2 or R3 error is mapped by map_lookup_error (504 for a timeout,
           503 otherwise), never by classify_cas_failure.
-        - Failures after an applied CAS (version row, index delta, intent
-          delete) are retried 3 times and then the write still succeeds,
-          leaving the intent row for the sweeper (G23). A 5xx there would make
-          a client's retry write twice.
+        - After an applied CAS, the version row (V1 or V2) and the index
+          delta are tried up to 3 times in all (POST_CAS_WRITE_TRIES in
+          write.rs); when the tries run out the write still succeeds,
+          leaving the intent row for the sweeper (G23). The intent delete
+          (I2) is best effort and never retried: a failure leaves the
+          intent for the sweeper. A 5xx after an applied CAS would make a
+          client's retry write twice.
         - No CAS retry after Unavailable (ADR-aacruzgon-0050).
 
         Deletes (schema.cql header; ADR-aacruzgon-0027, 0058):

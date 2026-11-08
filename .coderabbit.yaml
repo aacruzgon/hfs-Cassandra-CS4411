@@ -614,7 +614,17 @@ reviews:
 
   # Finishing touches write code or commits as the bot. Every commit here is
   # signed, carries no AI attribution and is audited before its PR leaves
-  # draft, so none of them is offered.
+  # draft, so every one this file can turn off is off.
+  #
+  # One path is left that no setting turns off: Autofix (formerly
+  # Autopilot), which keeps fixing findings and failing CI and resolves
+  # merge conflicts. It starts from the Autofix checkbox in CodeRabbit's
+  # walkthrough comment, from "@coderabbitai autofix", or from a request to
+  # finish the PR such as "@coderabbitai take this PR to completion", and
+  # its commits carry "Co-authored-by: coderabbitai[bot]"
+  # (https://docs.coderabbit.ai/code/deliver-changes). The schema has no key
+  # for it, so the rule is in CLAUDE.md and AGENTS.md ("Commits and CI"):
+  # never start it.
   finishing_touches:
     docstrings:
       enabled: false

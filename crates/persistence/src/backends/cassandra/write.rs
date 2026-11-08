@@ -49,10 +49,13 @@
 //!   then [`decide`](CassandraBackend::decide) against every `write_id` the
 //!   request has used. "Unchanged" re-runs the attempt, with a fresh
 //!   `write_id`, `last_updated` and intent, after a 5 to 25 ms pause, at most
-//!   [`UNKNOWN_OUTCOME_RERUNS`] times per request. R2's and R3's own errors
-//!   are never classified as a CAS (ADR-aacruzgon-0050): a timeout is 504,
-//!   and every other error is 503, since the write may have applied
-//!   ([`map_lookup_error`]; D3 sub-decision 4, ADR-aacruzgon-0055).
+//!   [`UNKNOWN_OUTCOME_RERUNS`] times per request. "Another writer" is a
+//!   definite miss, mapped from R2's row as the CAS's own miss would be: a
+//!   deleted row is "deleted", so a delete in the gap is `NotFound` on both
+//!   paths. R2's and R3's own errors are never classified as a CAS
+//!   (ADR-aacruzgon-0050): a timeout is 504, and every other error is 503,
+//!   since the write may have applied ([`map_lookup_error`]; D3
+//!   sub-decision 4, ADR-aacruzgon-0055).
 //! - **An earlier attempt may apply late** (ADR-aacruzgon-0051). Once any
 //!   attempt's outcome was unknown, every later look at the row is first
 //!   matched against it: a definite miss (C1's returned row, or an R2 after
@@ -1004,12 +1007,7 @@ impl CasMiss {
         let Some(row) = row.filter(|row| row.contains_column("version_id")) else {
             return CasMiss::NoRow;
         };
-        let deleted = row.contains_column("deleted_at")
-            && IntoRustByName::<DateTime<Utc>>::get_by_name(row, "deleted_at")
-                .ok()
-                .flatten()
-                .is_some_and(|at| at.timestamp_millis() > 0);
-        if deleted {
+        if row_is_deleted(row) {
             return CasMiss::Deleted;
         }
         CasMiss::VersionMoved {
@@ -1050,6 +1048,16 @@ impl CasMiss {
     }
 }
 
+/// `deleted_at > 0` in a row that returned the column: every reader that
+/// decides "deleted" tests that (G39).
+fn row_is_deleted(row: &Row) -> bool {
+    row.contains_column("deleted_at")
+        && IntoRustByName::<DateTime<Utc>>::get_by_name(row, "deleted_at")
+            .ok()
+            .flatten()
+            .is_some_and(|at| at.timestamp_millis() > 0)
+}
+
 /// What one plan's attempts came to.
 #[derive(Debug)]
 pub(crate) enum CasOutcome {
@@ -1078,11 +1086,14 @@ pub(crate) enum Decision {
 }
 
 /// The two cells a decision reads, `None` when missing or undecodable
-/// (which then decides nothing).
+/// (which then decides nothing), and whether the row is deleted, which only
+/// maps a miss that another writer's version caused: deleted in the gap is
+/// `NotFound`, as a definite miss of C2 or C3 is ([`CasMiss::of`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CurrentRow {
     pub(crate) version_id: Option<i32>,
     pub(crate) write_id: Option<Uuid>,
+    pub(crate) deleted: bool,
 }
 
 impl CurrentRow {
@@ -1094,6 +1105,7 @@ impl CurrentRow {
             write_id: IntoRustByName::<Uuid>::get_by_name(row, "write_id")
                 .ok()
                 .flatten(),
+            deleted: row_is_deleted(row),
         }
     }
 }
@@ -1103,6 +1115,7 @@ impl From<&ResourceRow> for CurrentRow {
         Self {
             version_id: Some(row.version_id),
             write_id: row.write_id,
+            deleted: row.is_deleted(),
         }
     }
 }
@@ -1159,6 +1172,22 @@ fn by_write_id(
             None => Decision::AnotherWriter,
         },
         None => Decision::Undecidable,
+    }
+}
+
+/// The miss an unknown outcome is once R2 shows another writer's version:
+/// mapped from the row R2 read, as a definite miss of the CAS would be from
+/// its condition columns (step 3). So another request's delete in the gap
+/// is `NotFound` (404) whether our CAS missed outright or its outcome was
+/// unknown (walkthrough 3.3 and 3.4, G9), and only a live version is
+/// `VersionConflict` (409).
+fn another_writers_miss(kind: CasKind, row: Option<CurrentRow>, target: i32) -> CasMiss {
+    match row {
+        _ if kind == CasKind::Create => CasMiss::Exists,
+        Some(row) if row.deleted => CasMiss::Deleted,
+        row => CasMiss::VersionMoved {
+            current: row.and_then(|r| r.version_id).or(Some(target)),
+        },
     }
 }
 
@@ -1377,13 +1406,7 @@ impl CassandraBackend {
                     if let Some(applied) = self.late_attempt(request, row, Some(target)).await? {
                         return Ok(CasOutcome::Applied(applied));
                     }
-                    let miss = if plan.kind == CasKind::Create {
-                        CasMiss::Exists
-                    } else {
-                        CasMiss::VersionMoved {
-                            current: row.and_then(|r| r.version_id).or(Some(target)),
-                        }
-                    };
+                    let miss = another_writers_miss(plan.kind, row, target);
                     request.stats.miss(miss.counter());
                     return Ok(CasOutcome::Missed(miss));
                 }
@@ -2483,6 +2506,41 @@ mod tests {
         ));
     }
 
+    /// "Another writer" after an unknown outcome maps from R2's row as a
+    /// definite miss maps from the CAS's columns: deleted is `Deleted`
+    /// (`NotFound`), a live version `VersionMoved`, and a create `Exists`.
+    #[test]
+    fn another_writers_miss_maps_from_the_row_as_a_definite_miss_does() {
+        let row = |version_id, deleted| {
+            Some(CurrentRow {
+                version_id,
+                write_id: Some(Uuid::new_v4()),
+                deleted,
+            })
+        };
+        for kind in [CasKind::Update, CasKind::Delete, CasKind::Revive] {
+            assert_eq!(
+                another_writers_miss(kind, row(Some(2), true), 2),
+                CasMiss::Deleted,
+                "{kind:?}: deleted in the gap"
+            );
+            assert_eq!(
+                another_writers_miss(kind, row(Some(5), false), 2),
+                CasMiss::VersionMoved { current: Some(5) },
+                "{kind:?}"
+            );
+            assert_eq!(
+                another_writers_miss(kind, row(None, false), 2),
+                CasMiss::VersionMoved { current: Some(2) },
+                "{kind:?}: an undecodable version is the target's"
+            );
+        }
+        assert_eq!(
+            another_writers_miss(CasKind::Create, row(Some(1), true), 1),
+            CasMiss::Exists
+        );
+    }
+
     /// `decide(V)` from the row (walkthrough 3.1's table), for `V = 1`
     /// (create, `N = 0`) and `V = 4` (`N = 3`).
     #[test]
@@ -2493,6 +2551,7 @@ mod tests {
             Some(CurrentRow {
                 version_id: version,
                 write_id,
+                deleted: false,
             })
         };
         for (target, expected) in [(1, 0), (4, 3)] {
@@ -3635,6 +3694,7 @@ mod node_tests {
         let row = Some(CurrentRow {
             version_id: Some(1),
             write_id: None,
+            deleted: false,
         });
         for (timed_out, want_timeout) in [(false, false), (true, true)] {
             let mut request = backend.cas_request("create", key);
@@ -3735,5 +3795,131 @@ mod node_tests {
                 }
             );
         }
+    }
+
+    /// Fresh `test-` tenants for the hardening tests (ADR-aacruzgon-0020).
+    fn hardening_tenant(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-s3-hardening-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    /// Another request's C3 of the current version, sent now but held back
+    /// by the fault seam until just before the next statement of `before`:
+    /// a delete that lands in a chosen gap of the request that follows.
+    async fn hold_back_delete(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        before: StatementKind,
+    ) {
+        let row = current(backend, tenant).await;
+        let plan = CasPlan::delete(PreviousVersion::from_row(&row).unwrap());
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "deleted_at = ?, last_updated",
+            Fault::ApplyLate { before },
+        );
+        let lu = next_last_updated(Utc::now(), Some(row.last_updated));
+        let held = backend
+            .session
+            .rows(
+                SOFT_DELETE_RESOURCE_IF_VERSION,
+                plan.cas_values(&key_of(tenant), Uuid::new_v4(), lu),
+                StatementKind::Cas,
+            )
+            .await;
+        assert!(held.is_err(), "the other request's delete is held back");
+    }
+
+    /// Another request deletes v1 between our pre-read and our CAS's
+    /// decision. That is `NotFound` (404) on every path, as walkthrough 3.3
+    /// and 3.4 and the design's step 3 say ("deleted in the gap", G9):
+    /// (a) and (c) when our C2 or C3 misses outright, and (b) and (d) when
+    /// its outcome was unknown and R2 shows the delete. In every case the
+    /// row ends deleted at v2, by the other request.
+    #[tokio::test]
+    async fn a_delete_in_the_gap_is_not_found_whether_or_not_our_outcome_was_unknown() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let version = FhirVersion::default_enabled();
+        let not_found = |r: &StorageResult<StoredResource>| {
+            matches!(
+                r,
+                Err(StorageError::Resource(ResourceError::NotFound { .. }))
+            )
+        };
+        let not_found_unit = |r: &StorageResult<()>| {
+            matches!(
+                r,
+                Err(StorageError::Resource(ResourceError::NotFound { .. }))
+            )
+        };
+
+        // (a) update: the delete lands just before our C2, which misses.
+        let tenant = hardening_tenant("gap-update-c2");
+        let stored = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        hold_back_delete(&backend, &tenant, StatementKind::Cas).await;
+        let a = backend.update(&tenant, &stored, patient()).await;
+        let row = current(&backend, &tenant).await;
+        assert!(row.is_deleted() && row.version_id == 2, "(a) row {row:?}");
+        assert!(not_found(&a), "(a) a definite miss: {a:?}");
+
+        // (b) update: our C2 times out without applying, and the same delete
+        // lands before R2.
+        let tenant = hardening_tenant("gap-update-r2");
+        let stored = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        hold_back_delete(&backend, &tenant, StatementKind::SerialRead).await;
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "SET version_id = ?, data = ?",
+            Fault::TimeOutWithoutApplying,
+        );
+        let before = backend.cas_stats();
+        let b = backend.update(&tenant, &stored, patient()).await;
+        let stats = backend.cas_stats().since(&before);
+        let row = current(&backend, &tenant).await;
+        assert!(row.is_deleted() && row.version_id == 2, "(b) row {row:?}");
+        eprintln!("[gap case=update-r2 result={b:?} stats={stats}]");
+        assert!(not_found(&b), "(b) after an unknown outcome: {b:?}");
+
+        // (c) delete_versioned: the delete lands just before our C3.
+        let tenant = hardening_tenant("gap-delete-c3");
+        backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        hold_back_delete(&backend, &tenant, StatementKind::Cas).await;
+        let c = backend.delete_versioned(&tenant, "Patient", "p", "1").await;
+        assert!(not_found_unit(&c), "(c) a definite miss: {c:?}");
+
+        // (d) delete_versioned: our C3 times out without applying, and the
+        // same delete lands before R2.
+        let tenant = hardening_tenant("gap-delete-r2");
+        backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        hold_back_delete(&backend, &tenant, StatementKind::SerialRead).await;
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "deleted_at = ?, last_updated",
+            Fault::TimeOutWithoutApplying,
+        );
+        let d = backend.delete_versioned(&tenant, "Patient", "p", "1").await;
+        let row = current(&backend, &tenant).await;
+        assert!(row.is_deleted() && row.version_id == 2, "(d) row {row:?}");
+        assert!(not_found_unit(&d), "(d) after an unknown outcome: {d:?}");
     }
 }

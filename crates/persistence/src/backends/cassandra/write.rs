@@ -40,8 +40,12 @@
 //!   timestamp). Once an earlier attempt's outcome was unknown, that attempt
 //!   may have applied, so the error answers as R2's does, 504 for a timeout
 //!   and 503 for anything else, and the earlier attempt is left for the
-//!   sweeper (ADR-aacruzgon-0067). So does a later turn's R1
-//!   ([`CasRequest::after_unknown`]).
+//!   sweeper (ADR-aacruzgon-0067). So does a later turn's R1, the decoding
+//!   of its row included ([`CasRequest::after_unknown`]).
+//! - The CAS is refused before it runs (the errors [`classify_cas_failure`]
+//!   takes as not applied): its error, by the table for plain statements,
+//!   with no retry (ADR-aacruzgon-0050); after an earlier attempt's unknown
+//!   outcome, as R2's error, 504 or 503 (ADR-aacruzgon-0067).
 //! - The CAS answers not applied: a definite miss. The attempt's intent row
 //!   is deleted, and the miss is mapped from the returned columns
 //!   ([`CasMiss::of`]): `[applied]` alone is "no row", `deleted_at > 0` is
@@ -1426,9 +1430,11 @@ impl CassandraBackend {
                 CasFailure::NotApplied(error) => {
                     // Nothing was decided; the intent is harmless and the
                     // sweeper deletes it. No retry, `Unavailable` included
-                    // (ADR-aacruzgon-0050).
+                    // (ADR-aacruzgon-0050). After an earlier attempt's
+                    // unknown outcome, that attempt may have applied, so the
+                    // error answers as R2's does (ADR-aacruzgon-0067).
                     request.stats.not_applied();
-                    return Err(StorageError::Backend(map_driver_error(&error, operation)));
+                    return Err(request.statement_error(&error, operation));
                 }
                 CasFailure::Unknown { timed_out, error } => (timed_out, error),
             };
@@ -4228,5 +4234,55 @@ mod node_tests {
         assert_eq!(stats.miss_retries, 1, "the delete took its retry: {stats}");
         assert_eq!(current(&backend, &tenant).await.version_id, 2);
         assert!(is_503_or_504(&result), "{result:?}");
+    }
+
+    /// Attempt 1's C1 is reported as timed out and applies late, after R2
+    /// said "no row"; the re-run's own C1 is then refused before it runs,
+    /// with a node-side `Protocol` error, which the engine takes as not
+    /// applied. The resource is stored, by attempt 1, so the request answers
+    /// 503, not the plain table's 500 (ADR-aacruzgon-0067).
+    #[tokio::test]
+    async fn a_reruns_cas_refused_before_it_runs_after_an_unknown_outcome_is_503() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = hardening_tenant("rerun-cas-refused");
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "INSERT INTO resources",
+            Fault::ApplyLate {
+                before: StatementKind::Cas,
+            },
+        );
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            "INSERT INTO resources",
+            Fault::FailWithProtocolError,
+        );
+        let before = backend.cas_stats();
+        let result = backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                FhirVersion::default_enabled(),
+            )
+            .await;
+        let stats = backend.cas_stats().since(&before);
+        let row = backend
+            .read_resource_row(tenant.tenant_id().as_str(), "Patient", "p")
+            .await
+            .unwrap();
+        eprintln!("[e2 case=rerun-cas-refused result={result:?} stats={stats}]");
+        assert_eq!((stats.reruns, stats.not_applied), (1, 1), "{stats}");
+        assert_eq!(row.map(|r| r.version_id), Some(1), "attempt 1 stored it");
+        assert!(
+            matches!(
+                result,
+                Err(StorageError::Backend(BackendError::Unavailable { .. }))
+            ),
+            "{result:?}"
+        );
     }
 }

@@ -197,7 +197,8 @@ impl CassandraBackend {
                         row.version_id,
                     ),
                     (Branch::Revive, Some(row)) => {
-                        let previous = PreviousVersion::from_row(row)?;
+                        let previous =
+                            request.after_unknown(PreviousVersion::from_row(row), "pre-read")?;
                         let (body, data) =
                             normalized_body("create_or_update", resource_type, id, body)?;
                         let plan =

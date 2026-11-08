@@ -235,7 +235,8 @@ impl CassandraBackend {
                 let expected = row.version_id;
 
                 // Steps 2 to 6.
-                let plan = CasPlan::delete(PreviousVersion::from_row(row)?);
+                let previous = request.after_unknown(PreviousVersion::from_row(row), "pre-read")?;
+                let plan = CasPlan::delete(previous);
                 match self.run_cas(&mut request, plan).await? {
                     CasOutcome::Applied(applied) => {
                         self.deleted(tenant_id, resource_type, id, &applied);
@@ -1799,5 +1800,62 @@ mod node_tests {
             .expect("stored");
         assert_eq!(stored.version_id(), "2", "the update applied");
         assert_eq!(expression_of(&backend, &tenant, &url), None);
+    }
+
+    /// A plain delete's C3 times out without applying, R2 shows another
+    /// request's update, and the delete takes its retry; that turn's R1 row
+    /// has an `index_keys` that does not decode, so no plan can be built. The first
+    /// attempt's outcome was unknown, so the request answers 503, not the
+    /// plain table's 500 (ADR-aacruzgon-0067).
+    #[tokio::test]
+    async fn a_later_turns_undecodable_pre_read_after_an_unknown_outcome_is_503() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = hardening_tenant("later-r1-undecodable");
+        let t = tenant.tenant_id().as_str();
+        create(&backend, &tenant, "p").await;
+        backend
+            .session
+            .inject_fault(StatementKind::Cas, C3_ONLY, Fault::TimeOutWithoutApplying);
+        let backend = &backend;
+        let mut turn = 0;
+        let result = backend
+            .delete_turns(t, "Patient", "p", Expect::Current, move || {
+                turn += 1;
+                let first = turn == 1;
+                async move {
+                    if !first {
+                        // `index_keys` undecodable on the row the turn reads.
+                        backend
+                            .session
+                            .rows(
+                                "UPDATE resources SET index_keys = 0xff \
+                                 WHERE tenant_id = ? AND resource_type = ? AND id = ? \
+                                 IF version_id = 2",
+                                vec![Value::from(t), Value::from("Patient"), Value::from("p")],
+                                StatementKind::Cas,
+                            )
+                            .await
+                            .expect("an undecodable index_keys");
+                    }
+                    let row = backend.read_resource_row(t, "Patient", "p").await;
+                    if first {
+                        another_update(backend, t).await;
+                    }
+                    row
+                }
+            })
+            .await;
+        eprintln!("[e2 case=later-r1-undecodable result={result:?}]");
+        assert_eq!(r1(backend, t).await.map(|r| r.version_id), Some(2));
+        assert!(
+            matches!(
+                result,
+                Err(StorageError::Backend(BackendError::Unavailable { .. }))
+            ),
+            "{result:?}"
+        );
     }
 }

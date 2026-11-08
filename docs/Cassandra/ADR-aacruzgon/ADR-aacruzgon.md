@@ -109,4 +109,5 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0062](2026-11-06/0062-overlay-on-update-delete-revive.md) | 2026-11-06 | Stored SearchParameters stay current in the overlay on update, delete and revive, with removals ordered by `last_updated` | accepted |
 | [0063](2026-11-07/0063-create-or-update-loop.md) | 2026-11-07 | `create_or_update` is a four-turn loop that checks the id first and each branch's permission after its pre-read, and answers 409 after four definite misses | accepted |
 | [0064](2026-11-06/0064-spec-tensions-accepted.md) | 2026-11-06 | The places where Step 3 departs from, or sits uneasily with, the FHIR specification, accepted on purpose | accepted |
+| [0065](2026-11-07/0065-fhir-versions-tested.md) | 2026-11-07 | The Cassandra backend is tested on R4, R4B, R5 and R6, with R4 as the required gate | accepted |
 | [0066](2026-11-07/0066-cql-audit-check-after-pr62.md) | 2026-11-07 | The CQL audit check after PR #62: each rule also reads the CQL text, across keyspaces, and the audit dump is read fail-closed | accepted |

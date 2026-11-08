@@ -122,19 +122,42 @@ jobs:
           tail -n 50 "$RUNNER_TEMP/check.log" > "$RUNNER_TEMP/check-tail.txt"
           echo "code=$code" >> "$GITHUB_OUTPUT"
 
+      # 0.4's second command since PR #63: the two Cassandra test targets in
+      # the same R4B-only build (r4b-compile-check.yml). They compile three
+      # upstream suites and upstream's tests/common/ harness, so an upstream
+      # edit there that assumes R4 fails the required check on the weekly
+      # sync branch; this finds it the night it lands. Only after the library
+      # check passed, since it would fail the same way. The tail is kept only
+      # on failure, for the issue.
+      - name: cargo check the Cassandra test targets (cassandra, R4B)
+        id: check-tests
+        if: steps.merge.outputs.result == 'clean' && steps.check.outputs.code == '0'
+        run: |
+          set +e
+          cargo check -p helios-persistence --no-default-features --features cassandra,R4B \
+            --test cassandra_tests --test backend_capability_contract 2>&1 \
+            | tee "$RUNNER_TEMP/check-tests.log"
+          code=${PIPESTATUS[0]}
+          if [ "$code" != 0 ]; then
+            tail -n 50 "$RUNNER_TEMP/check-tests.log" > "$RUNNER_TEMP/check-tests-tail.txt"
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
       - name: Decide
         id: verdict
         env:
           MERGE_RESULT: ${{ steps.merge.outputs.result }}
           CHECK_CODE: ${{ steps.check.outputs.code }}
+          TESTS_CODE: ${{ steps.check-tests.outputs.code }}
           TEST_REPORT: ${{ inputs.test_report }}
         run: |
           if [ "$MERGE_RESULT" = conflict ]; then failed="merge"
           elif [ "$CHECK_CODE" != 0 ]; then failed="cargo check"
+          elif [ "$TESTS_CODE" != 0 ]; then failed="cargo check of the Cassandra test targets"
           elif [ "$TEST_REPORT" = true ]; then failed="none (test_report run)"
           else failed=""
           fi
-          echo "merge: $MERGE_RESULT; check exit code: ${CHECK_CODE:-not run}; test_report: ${TEST_REPORT:-false}"
+          echo "merge: $MERGE_RESULT; check exit code: ${CHECK_CODE:-not run}; test targets exit code: ${TESTS_CODE:-not run}; test_report: ${TEST_REPORT:-false}"
           if [ -n "$failed" ]; then echo "drift=true"; else echo "drift=false"; fi >> "$GITHUB_OUTPUT"
           echo "failed_step=$failed" >> "$GITHUB_OUTPUT"
 
@@ -148,6 +171,9 @@ jobs:
           OURS: ${{ steps.fetch.outputs.ours }}
           UPSTREAM: ${{ steps.fetch.outputs.upstream }}
           FAILED_STEP: ${{ steps.verdict.outputs.failed_step }}
+          # Set and non-zero only when the test targets ran and failed: they
+          # run only after a clean merge and a passing library check.
+          TESTS_CODE: ${{ steps.check-tests.outputs.code }}
         run: |
           gh --version | head -n 1
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
@@ -165,6 +191,16 @@ jobs:
             elif [ -f "$RUNNER_TEMP/conflicts.txt" ]; then
               echo "The merge failed without conflicted files. Last 50 lines of its output:"
               echo; echo '~~~~'; tail -n 50 "$RUNNER_TEMP/merge.log"; echo '~~~~'
+            # Chosen by the exit code, not by which log has text, so a failure
+            # of the test targets never shows the library check's passing log.
+            elif [ -n "$TESTS_CODE" ] && [ "$TESTS_CODE" != 0 ]; then
+              cmd="cargo check -p helios-persistence --no-default-features --features cassandra,R4B --test cassandra_tests --test backend_capability_contract"
+              if [ -s "$RUNNER_TEMP/check-tests-tail.txt" ]; then
+                echo "Last 50 lines of \`$cmd\`:"
+                echo; echo '~~~~'; cat "$RUNNER_TEMP/check-tests-tail.txt"; echo '~~~~'
+              else
+                echo "\`$cmd\` exited with $TESTS_CODE and printed nothing; see the run's log."
+              fi
             elif [ -s "$RUNNER_TEMP/check-tail.txt" ]; then
               echo "Last 50 lines of \`cargo check -p helios-persistence --no-default-features --features cassandra,R4B\`:"
               echo; echo '~~~~'; cat "$RUNNER_TEMP/check-tail.txt"; echo '~~~~'
@@ -190,7 +226,7 @@ jobs:
             --jq '.[] | select(.pull_request == null and .title == "upstream drift") | .number' | head -n 1)
           if [ -z "$issue" ]; then echo "No open upstream drift issue."; exit 0; fi
           gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body \
-            "Passing again on $(date -u +%F): upstream \`${UPSTREAM:0:9}\` merges cleanly and the check passes. $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            "Passing again on $(date -u +%F): upstream \`${UPSTREAM:0:9}\` merges cleanly and both checks pass: the library and the Cassandra test targets, in the cassandra,R4B build. $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           gh issue close "$issue" --repo "$GITHUB_REPOSITORY"
 
       # The checkout is reused by the next job on this runner; leave no merge

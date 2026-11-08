@@ -1,0 +1,170 @@
+# ADR-aacruzgon-0069: A `.coderabbit.yaml` that reviews against the fork's own rules, on the chill profile, with every pre-merge check at warning
+
+- **Date:** 2026-11-07
+- **Status:** accepted (Alan approved it on 2026-11-08)
+- **Context:** CodeRabbit reviews every pull request on this public fork for free, under a rate limit.
+    - **What it did without a file.** Its runs said "No configuration file from this repository applied", "Review profile: CHILL", "Plan: Advanced" (PR #61's summary comment). Its comments on PR #61 were valid but shallow: it did not know the repository's rules (the write engine's invariants, the ADR log's rules, the CI rules).
+    - **The limit is real here.**
+        - PR #61's status comment carried "Review limit reached … You've used all free OSS reviews for now", and PRs #58 and #63 got no review at all.
+        - OSS limits are 1 to 10 reviews per developer per hour, set by star count, and 100 to 300 files per review, counted after path filters (https://docs.coderabbit.ai/management/plans#rate-limits).
+        - Every push, `@coderabbitai review`, rebase and draft-to-ready is one review event (https://docs.coderabbit.ai/management/rate-limits).
+    - **Automatic reviews already run, despite fewer than 10 stars.**
+        - The docs say "For public repositories with less than 10 stars, CodeRabbit requires reviews to be triggered manually" (https://docs.coderabbit.ai/management/plans#rate-limits), and the fork has 2 stars.
+        - Yet CodeRabbit reviewed PR #61 three times on the evening of 2026-11-07 (2026-11-08 00:22 to 01:58 UTC; on `ff8a6e974`, `cf97f766d` and `86a9a2605`) with no `@coderabbitai` comment from anyone.
+        - It also tried PRs #58 and #63 unasked, each as it left draft, until the rate limit stopped it. #58 left draft at 08:43:53 on 2026-11-07, and its status comment showed "Review limit reached" at 08:44:17. #63 left draft at 20:36:16 on 2026-11-07, and its status comment showed the limit nine seconds later (the comment's edit history, through GitHub's GraphQL `userContentEdits`).
+        - Alan asked for #63's review by hand afterwards: `@coderabbitai review` at 21:37:46 and `@coderabbitai full review` at 21:51:29.
+        - So the file's settings apply now.
+    - **Which branch's file applies.** "The configuration present in the feature branch under review will be automatically detected and used by CodeRabbit for that review" (https://docs.coderabbit.ai/getting-started/yaml-configuration). So a PR from a branch of this repository is reviewed with the file on its own head, and PR #65 is reviewed with its own file.
+    - **CodeRabbit can commit as a bot.** Its finishing touches and its Autofix mode commit to the PR branch. Under the user's own authorization, Autofix's commits carry "Co-authored-by: coderabbitai[bot]"; "Autofix enabled on an existing pull request can run with the CodeRabbit installation's credentials instead" (https://docs.coderabbit.ai/code/deliver-changes, "Who pushes, and who wrote it"). Either way they are not signed by the member who asked for them. Every commit here is signed by its author and carries no AI attribution (`CLAUDE.md`).
+    - **Upstream has none.** `upstream/main` (`1e6bb3013`) has no `.coderabbit.yaml` or `.coderabbit.yml`, so the file is fork-only and starts from nothing.
+    - **Why it is a decision.** The choices here are between workable settings: the review profile, which PRs are reviewed, what is filtered out, and whether CodeRabbit can block a merge or commit. The file is also a new CI-adjacent dependency on an outside service.
+- **Decision:**
+    - **The file** is `.coderabbit.yaml` at the repository root, on PR #65, validated against https://coderabbit.ai/integrations/schema.v2.json.
+    - **Profile `chill`** (Alan's choice, as the coderabbit-config worker recommended). `assertive` posts nitpicks as inline threads; `chill` puts them in a collapsed section of the review summary (https://docs.coderabbit.ai/guides/custom-reports). Every CodeRabbit thread here is fixed or answered and resolved before merge, and each fix push is another review event. The depth comes from `path_instructions` and the code guidelines instead.
+    - **Path instructions** for fifteen areas, each naming the rule it checks and its source:
+        - **All Rust:** FHIR version features, MSRV 1.91.1, clippy, true comments. Outside what the R4B-only check builds, `FhirVersion::default()` and cfg-gated `FhirVersion::R4` arms are allowed (`CLAUDE.md`, "FHIR version feature assumption": code that relies on `FhirVersion::default()` assumes R4).
+        - **The Cassandra backend:**
+            - FHIR versions: no `FhirVersion::default()`, and no `FhirVersion::R4` literal outside a `#[cfg(feature = "R4")]` arm (roadmap section 1; ADR-aacruzgon-0039, 0065);
+            - tenant first, and one CAS engine;
+            - consistency levels and retries;
+            - unknown outcomes. After an applied CAS, V1/V2 and the index delta get 3 tries in all, and the intent delete is best effort;
+            - no CQL `DELETE` on `resources` or `resource_versions`;
+            - the schema sign-off, and client-visible error text.
+
+          Sources: ADR-aacruzgon-0024, 0027, 0028, 0032, 0034, 0035, 0050, 0051, 0055, 0058.
+        - **The CRUD copy and upstream's `tests/crud/`** (0057).
+        - **The other Cassandra tests** (0020, 0029, 0038): fresh `test-` tenants, and no DDL on the shared node.
+        - **The hfs Cassandra tests,** `crates/hfs/tests/cassandra_milestone_a.rs`: the same tenant and node rules, plus never stopping the shared node. It builds with R4, so the R4B rules don't apply to it.
+        - **What the R4B-only check builds** (0019, 0039, 0065), from cargo's dep-info files for the two `cargo check` commands in `r4b-compile-check.yml`:
+            - the persistence library, `crates/persistence/src/**`: flag `FhirVersion::default()` unless the item is behind `#[cfg(feature = "R4")]`, and an ungated `FhirVersion::R4` literal. Code gated on another backend's feature, on `advisor` or on `test` is not built there, nor is `src/advisor/main.rs`, the `config-advisor` bin, which needs the `advisor` feature.
+            - the 17 files of the `cassandra_tests` and `backend_capability_contract` targets, by a glob that matches exactly those files: `tests/cassandra/*`, `cassandra_tests.rs`, `backend_capability_contract.rs`, seven `tests/common/` files, and the three shared suites. Flag `FhirVersion::default()` and an ungated `FhirVersion::R4` literal.
+        - **Upstream files and the section 8 touch list,** for `crates/`, `book/`, `utils/` and `docker/`. The root files (`CLAUDE.md`, `AGENTS.md`, `README.md`) stay out of that rule (Alan's choice, as the orchestrator recommended).
+        - **The ADR logs:**
+            - A merged entry may gain a Status-line change or a dated `*Update YYYY-MM-DD:*` or `*Corrected YYYY-MM-DD:*` note, as 0005, 0018 and 0019 do. Any deletion or rewording of its text is flagged (Alan's choice, as the orchestrator recommended). In Steps 1–3 we keep to Status-only changes ourselves (Alan's choice, the same day).
+            - A number already used on `main`, or twice in the PR, is flagged. A gap left by another open PR is not.
+        - **The schema:** a signed-off comment may be reworded, or a note added, only when the change cites its ADR, as `schema.cql:4` allows and `2da7bd598` did (Alan's choice, as the orchestrator recommended). Tables, keys, column types and options need a new sign-off from every member.
+        - **The design and the roadmap.**
+        - **The workflows** (0018, 0019, 0021, 0022, 0023, 0045, 0058).
+        - **The CI scripts** (0045, 0058, 0066).
+        - **The skills mirror.**
+    - **Code guidelines.**
+        - `CLAUDE.md` and `AGENTS.md` are read by default.
+        - Added: `ADR-aacruzgon.md`, applied to `docs/Cassandra/ADR-*/**`; the design, applied to the backend, its tests and `docs/Cassandra/**`; and the schema README, applied to the backend.
+        - A guideline file otherwise governs only its own directory (https://docs.coderabbit.ai/knowledge-base/code-guidelines).
+    - **Path filters** exclude:
+        - the generated FHIR models, the spec downloads and spec test data, and `data/search-parameters-*.json`;
+        - the vendored htmx and CodeMirror bundle, and the lockfiles;
+        - the Inferno and validator fixtures, and the terminology archives;
+        - `.github/disabled-workflows/*.yml` (upstream's, and the fork's own `cassandra-integration.yml`).
+
+      Exclusions only, since one include pattern turns the list into an allowlist.
+    - **Which PRs:**
+        - Drafts are not reviewed (`drafts: false`), and only PRs into `main` are.
+        - Incremental review is on, **pausing after two reviewed commits** instead of the default five (Alan's choice, as the audit recommended). The docs suggest 1 or 2 for a repository that hits the limit (https://docs.coderabbit.ai/configuration/auto-review). After the pause, the fixes are pushed together and the next pass is asked for with `@coderabbitai review`.
+        - Titles containing `chore(sync)`, the Sunday upstream sync, are skipped (Alan's choice, as the coderabbit-config worker recommended).
+    - **Every pre-merge check is at `warning`** (Alan's choice, as the coderabbit-config worker recommended): title (conventional-commit form), description, linked issues, and three custom checks on the PR title and description (no AI attribution, no `[skip ci]`, the ADR rules). Docstring coverage stays `off`.
+    - **So nothing CodeRabbit says blocks a merge.** The file also keeps `auto_approvals.enabled: false` (the replacement for the deprecated `request_changes_workflow`), and `error` would block only with automatic approvals on (https://docs.coderabbit.ai/pr-reviews/pre-merge-checks).
+    - **Commit messages are not checked by CodeRabbit.** Its docs do not say that a review or a pre-merge check reads them; the custom checks look at the PR title and description only.
+    - **No bot commits.**
+        - Every finishing touch the schema can turn off is off: docstrings, unit tests, simplify, fix comments, fix CI, resolve merge conflicts.
+        - Autofix (formerly Autopilot) has no key in the schema. It starts from the Autofix checkbox in CodeRabbit's comment, from `@coderabbitai autofix`, or from a request to finish the PR.
+        - So `CLAUDE.md` and `AGENTS.md` ("Commits and CI") gain one line, the same in both (Alan's choice, as the audit recommended): "**Never start CodeRabbit's Autofix.** Do not tick the Autofix box in a CodeRabbit comment, do not post `@coderabbitai autofix` or its alias `@coderabbitai autopilot`, and never ask CodeRabbit to commit or to finish a pull request: its commits are not signed by the member who asked for them, and they carry a `Co-authored-by: coderabbitai[bot]` trailer or are made with CodeRabbit's own installation credentials. No `.coderabbit.yaml` setting turns Autofix off (see its `finishing_touches` comment)."
+        - The docs show the co-author trailer under the user's own authorization, and the installation's credentials as the other case for Autofix on an existing pull request (https://docs.coderabbit.ai/code/deliver-changes, "Who pushes, and who wrote it"), and `autopilot` as another spelling of the command (https://docs.coderabbit.ai/reference/review-commands, "autofix"). They say nothing about signing, and not who the author is when Autofix runs with the installation's credentials, so the line claims only that the member who asked for the commits did not sign them. The `.coderabbit.yaml` `finishing_touches` comment says the same.
+    - **Dropped:** a CodeRabbit rule that flagged a reason attributed to a named person in an ADR (Alan's choice, as the orchestrator recommended). It stays our own drafting rule.
+    - **Tools.**
+        - **On:** actionlint, zizmor, shellcheck, ruff, markdownlint, yamllint, clippy (skipped by CodeRabbit while a workflow runs clippy, https://docs.coderabbit.ai/tools/clippy), ast-grep, gitleaks (Betterleaks), trufflehog, osv-scanner, skillspector, hadolint (the Dockerfile only) and github-checks.
+        - **Off:**
+            - pylint and flake8 (ruff covers them);
+            - sqlfluff and squawk (Cassandra CQL and the signed-off schema);
+            - languagetool and vale (prose style on the ADRs' house style);
+            - presidio (made-up identifiers in FHIR fixtures);
+            - semgrep and opengrep (no rules here);
+            - trivy (hadolint and the secret scanners cover it);
+            - every tool for a language the fork does not write.
+        - **actionlint and the runner labels.** `.github/actionlint.yaml` declares every self-hosted label the workflows use. Whether CodeRabbit's actionlint reads it is unconfirmed: its docs say "with its default configuration".
+    - **Noise off:** poem, in-progress fortune, chat art, sequence diagrams, effort estimate, related issues and PRs, suggested labels and reviewers. The summary goes in the walkthrough comment, never the PR description.
+- **Alternatives considered:**
+    - **No file** (today): shallow comments, and the limit spent on generated files and lockfiles.
+    - **`assertive`:** more comments, minor rule breaks included, but every nitpick becomes a thread to resolve and usually a push, and each push is a review. It is kept as the option if `chill` proves to drop rule breaks that matter.
+    - **`quiet`:** only the most important comments inline, which is too little for doc-heavy PRs where precision is the point.
+    - **Pre-merge checks at `error` with `auto_approvals` on:** CodeRabbit would request changes and could block a merge. Not chosen: a merge here needs the five required checks and a human (ADR-aacruzgon-0019, 0021), and a rate-limited or wrong bot should not hold a PR.
+    - **The default pause of five reviewed commits:** not chosen. PRs #58 and #63 already went without a review, and five pushes can spend a whole allowance on one PR.
+    - **Reviewing the Sunday sync PR:** hundreds of upstream files, past the per-review file budget, for code the fork did not write. `@coderabbitai review` stays available by hand.
+    - **The R4-only rules for every Rust file:** not chosen. `CLAUDE.md` allows `FhirVersion::default()` and cfg-gated R4 arms outside the code the R4B-only check builds. The workspace's `crates/*/src` has 600 such calls in 68 files and 417 literals in 78, so the rule would flag correct upstream code.
+    - **The R4-only rules for the backend and its Cassandra tests only** (the first fix, `9867e733e`): not kept. The R4B-only check also builds the rest of the persistence library, the shared `tests/common/` harness, the three shared suites and `backend_capability_contract.rs`, which is where PR #60's `FhirVersion::default()` calls went. The workspace rule would have called them allowed there.
+    - **Schema comments changed only by added notes:** not chosen. `schema.cql:4` already allows a cited rewording, and `2da7bd598` used it.
+    - **The upstream touch-list rule for the root files too:** not chosen.
+    - **`ignore_usernames: ["dependabot[bot]"]`:** unnecessary. CodeRabbit already skips bot authors ("Review skipped: Bot user detected" on PRs #30, #31 and #34).
+    - **Listing `CLAUDE.md` in `path_instructions`:** CodeRabbit's docs warn this reviews the file as code instead of using it as a guideline, and the defaults already read it.
+    - **Adding `.markdownlint-cli2.yaml` or `.yamllint.yaml`:** not now. CodeRabbit supplies profile defaults when none exists, and MD013 (line length) is among its always-ignored rules (https://docs.coderabbit.ai/tools/markdownlint). A config file would be another fork-only file to keep.
+- **Consequences:**
+    - **Easier:** reviews that check the fork's own rules and cite them; the file budget spent on hand-written files; no bot-blocked merges.
+    - **Harder:**
+        - The path instructions repeat rules from `CLAUDE.md` and the ADRs, so a rule that changes must change here too. Each instruction names its source to make that findable.
+        - Autofix can't be turned off in the file, so keeping bot commits out rests on the `CLAUDE.md`/`AGENTS.md` line.
+        - After two reviewed commits, the next review is asked for by hand.
+    - **To revisit:**
+        - after a few reviews on Step 4 and 5 PRs, whether `chill` drops rule breaks that matter (then `assertive`);
+        - whether the two-commit pause leaves late fixes unreviewed;
+        - whether CodeRabbit's actionlint reports the self-hosted labels as unknown on the first PR that changes a `runs-on` line;
+        - whether the glob list still matches the tree after an upstream sync.
+    - **Records:** `.coderabbit.yaml` is fork-only. In this entry's commit, roadmap section 8's "CI workflow" bullet (`development-roadmap.md:672`) gains, between "(ADR-aacruzgon-0047)" and the line's final period: "; CodeRabbit's review configuration `.coderabbit.yaml`, new, with every pre-merge check at `warning` (ADR-aacruzgon-0069)". The bullet then ends "… the coverage workflow `cassandra-coverage.yml`, not required (ADR-aacruzgon-0047); CodeRabbit's review configuration `.coderabbit.yaml`, new, with every pre-merge check at `warning` (ADR-aacruzgon-0069)."
+- **AI involvement:** Claude Code (Opus 5.5), as three Rex workers, with a fourth Claude Code session as the orchestrator that briefed them and put the open questions to Alan.
+    - **`coderabbit-config`** wrote the file, with one `general-purpose` subagent that fetched and summarised CodeRabbit's documentation.
+    - **`pr63-delta`** audited PR #65 independently and then made the fixes.
+    - **`pr62-delta`** audited those fixes (the delta audit), and then fixed its own findings: the R4B scope, #63's unasked attempt, the Autofix line's wording, and the hfs Cassandra test instruction.
+    - **`pr63-delta`** audited pr62-delta's fixes in turn, and then fixed its findings: the Autofix line's trailer claim, the `advisor` wording, and this entry's attributions.
+    - **`pr62-delta`** audited that fix (`810b9f51a`), and then fixed its own findings in `656f7eef5`: `advisor` back among the cfg gates, since `src/advisor/server.rs` is built and has items gated on it, and "not signed by the member who asked for them".
+    - **Proposed by the assistant:**
+        - the whole file: `chill` over `assertive`, the path-filter list, the first twelve path instructions, the guideline mappings, the tool list, warning-only pre-merge checks and skipping the sync PR;
+        - from the audit: scoping the R4 rules, the pause at two, the number rule, the Autofix comment and the `CLAUDE.md`/`AGENTS.md` line. The audit left the ADR notes, the schema rewording, the root files and the attribution rule as open questions with no recommendation of its own;
+        - from the orchestrator: a recommendation on each of those four questions;
+        - from the delta audits: the R4B scope read from cargo's dep-info, the hfs test instruction, the Autofix line's "not signed by the member who asked for them", `autopilot` and the two authorship cases, and the `advisor` wording;
+        - this entry.
+    - **Changed by the human:** on 2026-11-07 Alan approved nine recommendations, each as recommended.
+        - From the coderabbit-config worker's recommendations:
+            - keep `chill`;
+            - keep every pre-merge check at `warning`;
+            - keep skipping the sync PRs.
+        - From the PR #65 audit's recommendations:
+            - pause after two reviewed commits;
+            - add the Autofix line to `CLAUDE.md` and `AGENTS.md`.
+        - From the orchestrator's recommendations, on questions the audit left open:
+            - let merged ADR entries take a Status change or a dated `*Update …:*` or `*Corrected …:*` note, and flag any deletion or rewording; in Steps 1–3 we keep to Status-only changes ourselves;
+            - allow a signed-off schema comment's rewording only when it cites its ADR;
+            - keep the root files out of the touch-list rule;
+            - drop the attribution rule from CodeRabbit; it stays our own drafting rule.
+        - He approved this entry on 2026-11-08.
+    - **Verified, and how:**
+        - **The schema.** Python `jsonschema` (Draft 2020-12) against `schema.v2.json`, fetched 2026-11-07 and unchanged at the re-check, finds 0 errors. A strict key walk finds that all 241 keys are defined by the schema, none deprecated, and all 59 of its tools are set. `check-jsonschema` 0.39.0 was also used on the first version.
+        - **`yamllint -s`** 1.38.0 with its default configuration: clean.
+        - **Globs.** Every one of the 42 globs (19 `path_filters`, 15 `path_instructions`, 3 code-guideline files and 5 `applyTo` patterns) matches at least one tracked file under `minimatch` 10, the matcher CodeRabbit's docs name (https://docs.coderabbit.ai/configuration/path-instructions). The only fork-changed files excluded are the lockfiles and the disabled workflows. No large generated file is left in.
+        - **The R4B scope.** The two `cargo check` commands of `r4b-compile-check.yml` were run, and the files they compile were read from cargo's dep-info files: 114 library files, and 17 test files. The R4B test instruction's glob matches exactly those 17. The delta audit re-ran both commands at `a253b83b1` with the same result, and the 17 also match the `#[path]` and `mod` items of `cassandra_tests.rs`.
+        - **CodeRabbit behaviour.** Each behaviour cited in the file was re-read on docs.coderabbit.ai on 2026-11-07: head-branch config, the 10-star rule, guideline scoping and defaults, `path_filters` semantics, the profile's nitpick placement, the clippy skip, Autofix and its co-author trailer, the pause advice and hadolint's file types.
+        - **Repository history,** through the GitHub API:
+            - the star count;
+            - PR #61's three reviews, with no `@coderabbitai` comment;
+            - PRs #58's and #63's rate-limited attempts as each left draft, from their timelines and the edit history of CodeRabbit's status comments, before any request;
+            - PR #63's two later manual requests;
+            - the Autofix checkbox in PR #61's CodeRabbit comment;
+            - Dependabot's skipped reviews.
+        - **Code facts in the instructions,** checked against `main` at `29c8de3e6`:
+            - `POST_CAS_WRITE_TRIES`, and I2 as best effort;
+            - `classify_cas_failure`, `map_lookup_error` and `decide`;
+            - the `StatementKind` consistencies;
+            - the CRUD copy's parity items;
+            - the `test-` tenant prefix;
+            - the five required job names, and the CI scripts' standard-library imports.
+        - **actionlint** 1.7.12 finds `.github/actionlint.yaml` by itself, and without it reports 9 unknown-label errors on the six workflows.
+        - **zizmor** 1.32.0 in its regular persona reports one finding, `artipacked` at `coverage.yml:31`.
+        - **Not verified:** how CodeRabbit behaves on a real review with this file. No review was spent to test it; PR #65's own review, once it leaves draft, is the first.
+- **Links:**
+    - PR #65 (`cassandra/coderabbit-config`):
+        - the file: `861c8a732`, `2b4b09ea0`;
+        - the audit fixes and Alan's decisions: `755aea1af`, `9867e733e`, `32ed7e361`, `c50a64106`, `f557fe42d`, `27baa86d9`, `28d95e01c`, `fb6ce0546`, `a4f22f4b6`, `2e359e884`, `1563c54bf`;
+        - the `CLAUDE.md`/`AGENTS.md` line: `9f173a997`, reworded by `76b47097a`, `810b9f51a` and `656f7eef5`;
+        - the delta audits' fixes: `a9b1fcaeb` (the R4B scope), `e31d56536` (#58 and #63 tried unasked), `76b47097a` (the Autofix line), `a253b83b1` (the hfs Cassandra tests), `810b9f51a` (the Autofix line's authorship cases, and the `advisor` wording), `656f7eef5` (`advisor` back among the cfg gates, and "not signed by the member who asked for them").
+        - the merge of `main` before this entry: `818de1c4f`;
+        - this entry's commit, with its index row and the roadmap section 8 line.
+    - `.coderabbit.yaml`; roadmap section 8; `CLAUDE.md` and `AGENTS.md`, "Commits and CI" and "Decision records (ADR)".
+    - ADR-aacruzgon-0018, 0019, 0020, 0021, 0022, 0023, 0027, 0028, 0029, 0034, 0035, 0038, 0039, 0045, 0050, 0051, 0055, 0057, 0058, 0065, 0066.

@@ -113,3 +113,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0066](2026-11-07/0066-cql-audit-check-after-pr62.md) | 2026-11-07 | The CQL audit check after PR #62: each rule also reads the CQL text, across keyspaces, and the audit dump is read fail-closed | accepted |
 | [0067](2026-11-07/0067-errors-after-unknown-outcome-503.md) | 2026-11-07 | After an unknown CAS outcome, every later statement's error is 504 for a timeout and 503 for anything else | accepted |
 | [0068](2026-11-07/0068-overlay-follows-undecided-writes.md) | 2026-11-07 | A SearchParameter write whose outcome could not be decided reads its row back, and the overlay follows it | accepted |
+| [0069](2026-11-07/0069-coderabbit-config.md) | 2026-11-07 | A `.coderabbit.yaml` that reviews against the fork's own rules, on the chill profile, with every pre-merge check at warning | accepted |

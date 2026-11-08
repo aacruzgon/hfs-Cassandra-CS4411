@@ -421,6 +421,7 @@ async fn round_trip(hfs: &Hfs) {
         .await
         .expect("GET /Patient/{id}");
     assert_eq!(read.status(), StatusCode::OK, "GET /Patient/{id}");
+    assert_serves_test_version(&header(&read, CONTENT_TYPE), hfs);
     assert_eq!(header(&read, ETAG), "W/\"1\"", "ETag of the read");
     // R4 http.html#read: the server SHOULD return `Last-Modified`; it is
     // `meta.lastUpdated` at HTTP-date (second) precision.
@@ -687,6 +688,7 @@ async fn update_through_rest(rest: &Rest<'_>, suffix: &str) {
         hfs,
     );
     spec("CC-2:etag", "W/\"1\"", created.header(ETAG), hfs);
+    assert_serves_test_version(&rest.get(&path).await.header(CONTENT_TYPE), hfs);
     // R4 #prefer: with no `Prefer`, the server may return the resource, but
     // never an OperationOutcome; Helios returns the resource.
     spec(
@@ -1324,6 +1326,22 @@ async fn metadata_through_rest(rest: &Rest<'_>) {
         hfs,
     );
     spec("B-1:batch", true, system.contains(&"batch"), hfs);
+}
+
+/// Fails unless a read's `Content-Type` names the FHIR version the test
+/// selected, as `fhirVersion=5.0`. `hfs` takes that parameter from the stored
+/// resource, so a backend that stored another version fails here, where the
+/// startup line shows only what `hfs` was told. With [`FHIR_VERSION_VAR`]
+/// unset there is no version to compare with.
+fn assert_serves_test_version(content_type: &str, hfs: &Hfs) {
+    if let Some(version) = test_fhir_version() {
+        let expected = format!("fhirVersion={}", version.as_mime_param());
+        assert!(
+            content_type.split(';').any(|part| part.trim() == expected),
+            "a read's Content-Type {content_type:?} does not name {expected}; hfs output:\n{}",
+            hfs.output()
+        );
+    }
 }
 
 fn header(response: &reqwest::Response, name: reqwest::header::HeaderName) -> String {

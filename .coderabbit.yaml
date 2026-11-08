@@ -324,11 +324,12 @@ reviews:
       instructions: |
         Decision records. Rules: CLAUDE.md, "Decision records (ADR)", and the
         rules and template at the top of each ADR-<user>.md.
-        - Append-only. An accepted entry already on main is not rewritten:
-          its Status changes (for example "superseded by
-          ADR-<user>-NNNN"), and a correction is a new entry or a dated
-          "*Update YYYY-MM-DD:*" note. Flag any other edit to a merged
-          entry.
+        - Append-only. An entry already on main may gain only a change to
+          its Status line (for example "superseded by ADR-<user>-NNNN") or
+          an added, dated note: "*Update YYYY-MM-DD:*" or
+          "*Corrected YYYY-MM-DD:*", as in ADR-aacruzgon-0005, 0018 and
+          0019. Anything larger is a new entry. Flag any deletion or
+          rewording of a merged entry's existing text.
         - Numbers are counted across the whole log, not per folder. Flag a
           new entry whose number is already used by an entry on main, or is
           used twice in the PR. Do not flag a gap: a lower number may be held
@@ -489,9 +490,10 @@ reviews:
           number is already used by another entry in that log on main, or
           twice in the PR (a gap is not a failure: another open PR may hold
           the lower number); if it has no
-          matching row in that log's index; or if the PR edits more than the
-          Status line of an entry that is already on main, other than a
-          dated Update note. Pass otherwise.
+          matching row in that log's index; or if the PR deletes or rewords
+          existing text of an entry that is already on main. A changed
+          Status line and an added, dated "*Update YYYY-MM-DD:*" or
+          "*Corrected YYYY-MM-DD:*" note are not failures. Pass otherwise.
 
   tools:
     # GitHub Actions: the fork's six workflows. actionlint reads

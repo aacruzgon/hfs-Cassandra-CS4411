@@ -366,7 +366,7 @@ class Demo:
             self.report.flush()
 
     def section(self, name: str, run: Callable[[], None]) -> None:
-        """Runs one section. Sections share nothing, so one failing costs only itself."""
+        """Runs one section. Each makes its own resources, so one failing costs only itself."""
         self.section_name = name
         print(f"\n=== {name} ===")
         try:
@@ -825,6 +825,7 @@ def search(demo: Demo) -> None:
         )
 
     demo.pages("token system|code", q("Patient", identifier=token, _count=2), tenant, ids, 2)
+    # No run marker: in tenant A, only this section's patients have a gender.
     found(
         "token code only (gender=male)",
         DOC_SEARCH,

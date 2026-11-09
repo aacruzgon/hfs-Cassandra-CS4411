@@ -1,0 +1,142 @@
+# Three-node Apache Cassandra cluster on one host, for the failure tests and
+# anything else that needs RF 3 (docs/Cassandra/development-roadmap.md, item
+# 0.3). See "Three-node cluster" in README.md in this directory.
+#
+#     docker compose -f docker/cassandra/docker-compose.cluster.yml up -d --wait
+#
+# On a 32 GB machine, and for every benchmark that goes in the report, add the
+# 2G-heap override:
+#
+#     docker compose -f docker/cassandra/docker-compose.cluster.yml \
+#                    -f docker/cassandra/docker-compose.cluster.heap2g.yml up -d --wait
+#
+# Always use this file through -f, never -p hfs-cassandra: the project name
+# below keeps it away from the single node's containers and volume.
+#
+# Recorded configuration (keep in step with README.md):
+#
+#   Image            The same image and digest as docker-compose.yml, with the
+#                    same entrypoint.sh, so cassandra_latest.yaml and
+#                    paxos_variant v2 (asserted at boot) are the same too.
+#   Topology         Three nodes, one DC "helios-dc1", racks "helios-rack1",
+#                    "helios-rack2", "helios-rack3", cluster "helios".
+#                    GossipingPropertyFileSnitch. The DC name is the one the
+#                    keyspace's NetworkTopologyStrategy map uses
+#                    (keyspace-three-node.cql). Racks cannot be changed once a
+#                    node has data: renaming means down -v.
+#   Seeds            cassandra-1 and cassandra-2. Compose starts cassandra-1,
+#                    waits until CQL answers, then cassandra-2, then
+#                    cassandra-3. Two seeds so that one node stopped always
+#                    leaves a seed to contact.
+#   Heap             MAX_HEAP_SIZE=768M (G1, so -Xms = -Xmx)
+#   Direct memory    MAX_DIRECT_MEMORY_SIZE=384M (half the heap; otherwise
+#                    cassandra-env.sh sizes it from the host's RAM)
+#   GC threads       2 parallel / 2 concurrent, matching the CPU limit
+#   CPU limit        2 CPUs per node, 6 in all
+#   Memory limit     2.5 GiB per node, 7.5 GiB in all, swap disabled
+#   Host ports       127.0.0.1:59342, 59343 and 59344, one per node
+#                    (CASSANDRA_CLUSTER_HOST_PORT_1 to _3 override). Not 59042
+#                    (developers), 59142 (the required CI job) or 59242
+#                    (coverage and FHIR versions).
+#   Network          Fixed addresses, ${CASSANDRA_CLUSTER_SUBNET_PREFIX}.11 to
+#                    .13 (default 172.29.59), so a node keeps its address over
+#                    a restart and a network reconnect.
+#   Unchanged        Everything else, as in docker-compose.yml: concurrent_compactors
+#                    8 (above the CPU limit, as shipped), num_tokens 16,
+#                    max_hint_window 3h, commitlog_sync periodic 10000ms.
+#
+# OrbStack or Docker Desktop must be allowed more memory than the limits add
+# up to, on top of anything else it runs.
+
+name: hfs-cassandra-cluster
+
+x-cassandra-environment: &cassandra-environment
+  CASSANDRA_CLUSTER_NAME: helios
+  CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+  CASSANDRA_DC: helios-dc1
+  CASSANDRA_SEEDS: ${CASSANDRA_CLUSTER_SUBNET_PREFIX:-172.29.59}.11,${CASSANDRA_CLUSTER_SUBNET_PREFIX:-172.29.59}.12
+  MAX_HEAP_SIZE: 768M
+  MAX_DIRECT_MEMORY_SIZE: 384M
+  JVM_EXTRA_OPTS: -XX:ParallelGCThreads=2 -XX:ConcGCThreads=2
+
+x-cassandra-node: &cassandra-node
+  image: cassandra:5.0.9-trixie@sha256:618a493bcf1f817ea2f07288a46fa76fb2d9c4dfd5a04c28227336405782889c
+  # Run through sh so a checkout without the executable bit (Windows) works.
+  entrypoint: ["sh", "/usr/local/bin/hfs-entrypoint.sh"]
+  command: ["cassandra", "-f"]
+  cpus: 2
+  mem_limit: 2560m
+  memswap_limit: 2560m
+  # Long enough for a drain on SIGTERM. The default 10 s can end in SIGKILL.
+  stop_grace_period: 60s
+  healthcheck:
+    # Ready means CQL answers, which a joining node only does once it has
+    # joined the ring, so this is also what makes the start order safe.
+    test: ["CMD-SHELL", "cqlsh -e 'SELECT release_version FROM system.local' > /dev/null 2>&1"]
+    interval: 10s
+    timeout: 10s
+    retries: 18
+    start_period: 120s
+
+services:
+  cassandra-1:
+    <<: *cassandra-node
+    hostname: cassandra-1
+    environment:
+      <<: *cassandra-environment
+      CASSANDRA_RACK: helios-rack1
+    ports:
+      - "127.0.0.1:${CASSANDRA_CLUSTER_HOST_PORT_1:-59342}:9042"
+    networks:
+      cluster:
+        ipv4_address: ${CASSANDRA_CLUSTER_SUBNET_PREFIX:-172.29.59}.11
+    volumes:
+      - ./entrypoint.sh:/usr/local/bin/hfs-entrypoint.sh:ro
+      - cassandra-1-data:/var/lib/cassandra
+
+  cassandra-2:
+    <<: *cassandra-node
+    hostname: cassandra-2
+    environment:
+      <<: *cassandra-environment
+      CASSANDRA_RACK: helios-rack2
+    ports:
+      - "127.0.0.1:${CASSANDRA_CLUSTER_HOST_PORT_2:-59343}:9042"
+    networks:
+      cluster:
+        ipv4_address: ${CASSANDRA_CLUSTER_SUBNET_PREFIX:-172.29.59}.12
+    volumes:
+      - ./entrypoint.sh:/usr/local/bin/hfs-entrypoint.sh:ro
+      - cassandra-2-data:/var/lib/cassandra
+    depends_on:
+      cassandra-1:
+        condition: service_healthy
+
+  cassandra-3:
+    <<: *cassandra-node
+    hostname: cassandra-3
+    environment:
+      <<: *cassandra-environment
+      CASSANDRA_RACK: helios-rack3
+    ports:
+      - "127.0.0.1:${CASSANDRA_CLUSTER_HOST_PORT_3:-59344}:9042"
+    networks:
+      cluster:
+        ipv4_address: ${CASSANDRA_CLUSTER_SUBNET_PREFIX:-172.29.59}.13
+    volumes:
+      - ./entrypoint.sh:/usr/local/bin/hfs-entrypoint.sh:ro
+      - cassandra-3-data:/var/lib/cassandra
+    depends_on:
+      cassandra-2:
+        condition: service_healthy
+
+networks:
+  cluster:
+    ipam:
+      config:
+        - subnet: ${CASSANDRA_CLUSTER_SUBNET_PREFIX:-172.29.59}.0/24
+
+volumes:
+  cassandra-1-data:
+  cassandra-2-data:
+  cassandra-3-data:

@@ -1,0 +1,26 @@
+# Override for the 32 GB machines and for every benchmark run in the report
+# (development-roadmap.md, section 1 "Machines"). Use together with
+# docker-compose.cluster.yml; only the values below change. The per-node
+# values are those of the single node's docker-compose.heap2g.yml.
+#
+#   Heap             MAX_HEAP_SIZE=2G
+#   Direct memory    MAX_DIRECT_MEMORY_SIZE=1G (half the heap)
+#   GC threads       4 parallel / 4 concurrent, matching the CPU limit
+#   CPU limit        4 CPUs per node, 12 in all
+#   Memory limit     5 GiB per node, 15 GiB in all, swap disabled
+
+x-cassandra-environment: &cassandra-environment
+  MAX_HEAP_SIZE: 2G
+  MAX_DIRECT_MEMORY_SIZE: 1G
+  JVM_EXTRA_OPTS: -XX:ParallelGCThreads=4 -XX:ConcGCThreads=4
+
+x-cassandra-limits: &cassandra-limits
+  environment: *cassandra-environment
+  cpus: 4
+  mem_limit: 5g
+  memswap_limit: 5g
+
+services:
+  cassandra-1: *cassandra-limits
+  cassandra-2: *cassandra-limits
+  cassandra-3: *cassandra-limits

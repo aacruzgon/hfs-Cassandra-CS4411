@@ -49,7 +49,8 @@
 #                    max_hint_window 3h, commitlog_sync periodic 10000ms.
 #
 # OrbStack or Docker Desktop must be allowed more memory than the limits add
-# up to, on top of anything else it runs.
+# up to, on top of anything else it runs. A boot that does not fit can OOM-kill
+# another container in the VM, the single node included (README.md, "Run").
 
 name: hfs-cassandra-cluster
 

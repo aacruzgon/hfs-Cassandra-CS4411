@@ -113,13 +113,23 @@ truth.
 Three Cassandra nodes on one host, for the failure tests and anything else
 that needs RF 3 (`docs/Cassandra/development-roadmap.md`, item 0.3 and section
 6). It is its own Compose project, `hfs-cassandra-cluster`, with its own
-containers, network and volumes, so it never touches the single node above or
-the CI projects.
+containers, network and volumes, so its Compose commands never act on the
+single node above or the CI projects. It does share the memory of Docker's VM
+with them.
 
 ## Run
 
+**Check the memory first.** The default limits add up to 7.5 GiB, and the three
+nodes use about 4 GiB even at idle (1.31 to 1.35 GiB each). That comes on top
+of every other container in the VM, and a boot that does not fit can take one
+of them down: on 2026-11-09, on an 8.8 GiB OrbStack VM with about 3.7 GiB free,
+the single node above was OOM-killed while this cluster booted beside it. Add
+up the limits of what is running (`docker stats --no-stream`) before you start.
+If 7.5 GiB more does not fit in the VM, wait, or stop your own single node
+first.
+
 ```bash
-# 16 and 18 GB laptops (768M heap, 7.5 GiB in all)
+# Functional checks on 16 and 18 GB laptops (768M heap, 7.5 GiB in all)
 docker compose -f docker/cassandra/docker-compose.cluster.yml up -d --wait
 
 # 32 GB machines, and every benchmark that goes in the report (2G heap, 15 GiB in all)

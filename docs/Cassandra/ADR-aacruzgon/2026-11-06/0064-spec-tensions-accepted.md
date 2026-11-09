@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0064: The places where Step 3 departs from, or sits uneasily with, the FHIR specification, accepted on purpose
 
 - **Date:** 2026-11-06
-- **Status:** accepted
+- **Status:** accepted; amended by ADR-aacruzgon-0074, which adds the transaction 501 to the accepted departures
 - **Context:**
     - The Step 3 plan's HL7 matrix (90 rows, quotes checked verbatim) left a handful of rows where Cassandra, or the shared REST layer it sits under, does not do exactly what the spec says. Its checklist item 9 asks for each to be recorded, so that a reviewer finds the reason rather than a bug. The plan listed them as §9 #6.
     - **What changed since the plan** (re-checked against layer L4 `b7a7f7be8`, merged as `main` `9c8c8f4f3`):

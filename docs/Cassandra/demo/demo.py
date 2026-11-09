@@ -62,6 +62,11 @@ DOC_CONFLICT = f"{HTTP}#concurrency (412 and no update); {DISCUSSION}, Optimisti
 DOC_BATCH = f"{HTTP}#transaction (200, a status per entry); {DISCUSSION}, Batch"
 DOC_SEARCH = f"{SEARCH}; {ROADMAP}, Step 8 Spec"
 DOC_PAGING = f"{HTTP}#paging; {WALKTHROUGH} 5.10"
+DOC_NEXT_LINK = (
+    f"{SEARCH}, 'repeat the original _count parameter in its returned page links'; "
+    f"{COVERAGE} section 5, malformed cursor row (the parameter is _cursor)"
+)
+DOC_UNKNOWN_PARAM = f"{SEARCH}#errors; {COVERAGE} section 6, 'Unknown parameter'"
 DOC_COMBINING = f"{SEARCH}#combining"
 DOC_URI = f"{SEARCH}; {WALKTHROUGH} 5.3; {COVERAGE} section 4"
 DOC_EXACT_TOKEN = (
@@ -175,6 +180,10 @@ class Demo:
     def __init__(self, base_url: str, backend: str, timeout: float, report_path: Optional[str]):
         self.base_url = base_url.rstrip("/")
         parsed = urllib.parse.urlsplit(self.base_url)
+        try:
+            parsed.port  # raises ValueError for a port that is not a number
+        except ValueError:
+            raise ValueError(f"--base-url has a bad port, got {base_url!r}") from None
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError(f"--base-url must be an http(s) URL, got {base_url!r}")
         self.parsed = parsed
@@ -234,6 +243,8 @@ class Demo:
         try:
             parsed_body = json.loads(raw) if raw else None
         except ValueError:
+            parsed_body = None
+        if not isinstance(parsed_body, dict):
             parsed_body = None
         headers_read = {name.lower(): value for name, value in response.getheaders()}
         return Answer(response.status, headers_read, parsed_body, elapsed)
@@ -373,10 +384,14 @@ class Demo:
             link = answer.link("next")
             if link is None:
                 break
+            link_query = urllib.parse.parse_qs(urllib.parse.urlsplit(link).query)
             self.assertion(
                 f"{name}, next link of page {page}",
-                DOC_PAGING,
-                [contains("next link", link, "_cursor="), contains("next link", link, f"_count={per_page}")],
+                DOC_NEXT_LINK,
+                [
+                    None if "_cursor" in link_query else f"next link has no _cursor: {link!r}",
+                    equal("next link _count", link_query.get("_count"), [str(per_page)]),
+                ],
             )
             target = self.next_target(link, name, page)
             if target is None:
@@ -474,7 +489,7 @@ def crud(demo: Demo) -> None:
         body=demo.patient("Original", identifier=[demo.identifier("crud")]),
         then=lambda a: [
             equal("ETag", a.header("etag"), 'W/"1"'),
-            contains("Location", a.header("location"), "/_history/1"),
+            contains("Location", a.header("location"), f"Patient/{(a.body or {}).get('id')}/_history/1"),
             equal("meta.versionId", version(a), "1"),
         ],
         required=True,
@@ -611,6 +626,33 @@ def batch(demo: Demo) -> None:
         ],
     )
     demo.step(
+        "the batch PUT created its patient",
+        200,
+        DOC_READ,
+        "GET",
+        f"Patient/{new}",
+        tenant,
+        then=lambda a: [equal("family", family(a), "BatchNew")],
+    )
+    demo.step(
+        "the batch PUT updated its patient",
+        200,
+        DOC_READ,
+        "GET",
+        f"Patient/{existing}",
+        tenant,
+        then=lambda a: [equal("family", family(a), "BatchUpdated")],
+    )
+    demo.step(
+        "the batch DELETE removed its patient",
+        410,
+        DOC_GONE,
+        "GET",
+        f"Patient/{doomed}",
+        tenant,
+        then=lambda a: [outcome(a)],
+    )
+    demo.step(
         "the stale entry changed nothing",
         200,
         DOC_CONFLICT,
@@ -636,9 +678,10 @@ def batch(demo: Demo) -> None:
         Differs(
             postgres=f"{HTTP}#transaction (200, transaction-response)",
             cassandra=(
-                f"{HTTP}#transaction; {DISCUSSION}, 'Transaction bundles' and BundleProvider; "
-                f"{ROADMAP}, Step 8 Inferno group 4; crates/rest/src/handlers/batch.rs, "
-                "AtomicityUnsupported is 501 not-supported"
+                f"{COVERAGE} section 6, 'Transaction Bundle' (501, not-supported, before any "
+                "entry is applied); crates/rest/src/handlers/batch.rs, AtomicityUnsupported. "
+                f"Departs from {HTTP}#transaction, where a server without transactions SHOULD "
+                "answer 400"
             ),
         ),
         "POST",
@@ -759,6 +802,25 @@ def search(demo: Demo) -> None:
         matches([2, 4]),
     )
 
+    demo.step(
+        "an unknown parameter is ignored by default",
+        200,
+        DOC_UNKNOWN_PARAM,
+        "GET",
+        q("Patient", identifier=token, foo="bar"),
+        tenant,
+        then=lambda a: [same_ids("matches", a.entry_ids(), ids)],
+    )
+    demo.step(
+        "an unknown parameter is refused with handling=strict",
+        400,
+        DOC_UNKNOWN_PARAM,
+        "GET",
+        q("Patient", identifier=token, foo="bar"),
+        tenant,
+        headers={"Prefer": "handling=strict"},
+        then=lambda a: [outcome(a)],
+    )
     demo.step(
         ":exact on a token parameter is rejected",
         400,
@@ -959,7 +1021,7 @@ def main() -> int:
 
     try:
         demo = Demo(args.base_url, args.backend, args.timeout, args.report)
-    except ValueError as error:
+    except (ValueError, OSError) as error:
         print(error, file=sys.stderr)
         return 2
     print(f"run {demo.run_id}  backend {demo.backend}  url {demo.base_url}")

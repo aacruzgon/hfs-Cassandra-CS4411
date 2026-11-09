@@ -67,7 +67,7 @@ Two steps have a different documented answer on each backend. The script states 
 
 | Step | PostgreSQL | Cassandra | Why |
 | --- | --- | --- | --- |
-| transaction bundle | 200, `transaction-response` | 501, `not-supported` | Cassandra has no atomic transaction across partitions, so `BundleProvider` refuses it: `cassandra-discussion.md`, "Transaction bundles"; `crates/rest/src/handlers/batch.rs`, `AtomicityUnsupported`. |
+| transaction bundle | 200, `transaction-response` | 501, `not-supported` | Cassandra has no atomic transaction across partitions, so the REST layer refuses the bundle before applying any entry: `schema/coverage.md` section 6, "Transaction Bundle"; `crates/rest/src/handlers/batch.rs`, `AtomicityUnsupported`. R4 says a server without transactions SHOULD answer 400 ([http.html#transaction](https://hl7.org/fhir/R4/http.html#transaction)); HFS answers 501, and the script checks what HFS documents. |
 | `Patient?family:exact=Smith` | 200, whole-string match | 400 | R4 defines `:exact` for string parameters only. PostgreSQL implements it. Cassandra has no string search, so its type check refuses the parameter: `schema/coverage.md` section 6. |
 
 `:exact` on a token parameter (`Patient?gender:exact=female`) is a 400 on both, from the REST layer, before any backend runs.

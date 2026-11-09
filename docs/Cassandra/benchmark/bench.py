@@ -390,8 +390,9 @@ class Cassandra(Backend):
 
     def prepare(self) -> None:
         schema = REPO / "docs" / "Cassandra" / "schema"
-        for name in ("keyspace-single-node.cql", "schema.cql"):
-            command = ["docker", "exec", "-i", self.container_id(), "cqlsh"]
+        # schema.cql names no keyspace: it is applied inside the one created first.
+        for name, arguments in (("keyspace-single-node.cql", []), ("schema.cql", ["-k", "helios"])):
+            command = ["docker", "exec", "-i", self.container_id(), "cqlsh", *arguments]
             run_cmd(command, stdin_path=schema / name, timeout=300)
 
     def hfs_env(self) -> Dict[str, str]:
@@ -408,7 +409,7 @@ class Cassandra(Backend):
         started = time.monotonic()
         while True:
             text = self.exec_("nodetool", "compactionstats").stdout
-            match = re.search(r"pending tasks:\s*(\d+)", text)
+            match = re.search(r"pending tasks\D+(\d+)", text)
             pending = int(match.group(1)) if match else -1
             if pending == 0:
                 return {"pending_compactions": 0, "seconds_waited": time.monotonic() - started}
@@ -506,7 +507,7 @@ class Postgres(Backend):
 
 
 class Hfs:
-    def __init__(self, binary: Path, port: int, log_path: Path, data_dir: Path, backend_env: Dict[str, str]):
+    def __init__(self, binary: Path, port: int, log_path: Path, backend_env: Dict[str, str]):
         env = dict(os.environ)
         env.update(backend_env)
         env.update(
@@ -514,15 +515,20 @@ class Hfs:
                 "HFS_SERVER_HOST": "127.0.0.1",
                 "HFS_SERVER_PORT": str(port),
                 "HFS_LOG_LEVEL": "warn",
-                "HFS_DATA_DIR": str(data_dir),
+                "HFS_BASE_URL": f"http://127.0.0.1:{port}",
+                # The spec bundles, without which HFS seeds no SearchParameters.
+                "HFS_DATA_DIR": str(REPO / "data"),
             }
         )
-        data_dir.mkdir(parents=True, exist_ok=True)
         self.base = f"http://127.0.0.1:{port}"
         self.log_path = log_path
         self.log_file = log_path.open("w", encoding="utf-8")
         self.process = subprocess.Popen([str(binary)], env=env, stdout=self.log_file, stderr=subprocess.STDOUT)
-        self._wait_ready()
+        try:
+            self._wait_ready()
+        except Failure:
+            self.stop()
+            raise
 
     def _wait_ready(self, timeout: float = 300) -> None:
         deadline = time.monotonic() + timeout
@@ -532,11 +538,20 @@ class Hfs:
             try:
                 with urllib.request.urlopen(f"{self.base}/metadata", timeout=10) as response:
                     if response.status == 200:
+                        self._check_seeded()
                         return
             except (urllib.error.URLError, OSError):
                 pass
             time.sleep(0.5)
         raise Failure(f"hfs not ready after {timeout} s: {self.tail()}")
+
+    def _check_seeded(self) -> None:
+        # Without the spec bundles HFS answers searches without indexing
+        # anything, which would invalidate every number silently.
+        log_text = self.log_path.read_text(encoding="utf-8")
+        for phrase in ("Could not load spec SearchParameters", "no spec bundle loaded"):
+            if phrase in log_text:
+                raise Failure(f"hfs started without its spec bundles ({phrase}): check HFS_DATA_DIR")
 
     def tail(self) -> str:
         try:
@@ -555,13 +570,15 @@ class Hfs:
         self.log_file.close()
 
 
-def http_status(url: str, timeout: float = 60) -> Tuple[int, str]:
+def search_once(url: str, timeout: float = 60) -> Tuple[int, str, Optional[int]]:
+    """GET a search; return its status, the start of its body, and how many entries it matched."""
     request = urllib.request.Request(url, headers={"Accept": "application/fhir+json"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.status, response.read(600).decode("utf-8", "replace")
+            body = response.read()
+            return response.status, body[:600].decode("utf-8", "replace"), len(json.loads(body).get("entry", []))
     except urllib.error.HTTPError as error:
-        return error.code, error.read(600).decode("utf-8", "replace")
+        return error.code, error.read(600).decode("utf-8", "replace"), None
 
 
 # --- datasets --------------------------------------------------------------------
@@ -707,13 +724,17 @@ def environment_record(args: argparse.Namespace, backend: Backend) -> dict:
     ).stdout.strip()
     k6 = run_cmd([str(args.k6), "version"], check=False).stdout.strip()
     profile = args.build_profile or ("release" if "release" in str(args.hfs_bin) else "unknown")
+    version = run_cmd([str(args.hfs_bin), "--version"], check=False).stdout.strip()
+    # The binary's own commit, since the checkout may have moved after the build.
+    built = re.search(r"\(git ([0-9a-f]+)\)", version)
     return {
         "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "hfs_commit": git_value("rev-parse", "HEAD"),
+        "hfs_commit": built.group(1) if built else git_value("rev-parse", "HEAD"),
+        "harness_commit": git_value("rev-parse", "HEAD"),
         "hfs_tree_dirty": bool(git_value("status", "--porcelain", "--", "crates")),
         "hfs_build_profile": profile,
         "hfs_binary": str(args.hfs_bin),
-        "hfs_version": run_cmd([str(args.hfs_bin), "--version"], check=False).stdout.strip(),
+        "hfs_version": version,
         "k6": k6,
         "machine": machine_record(),
         "docker": docker,
@@ -912,9 +933,9 @@ def write_run(run_dir: Path, record: dict) -> None:
     (run_dir / "run.json").write_text(json.dumps(record, indent=1, sort_keys=True), encoding="utf-8")
 
 
-def probe_status(hfs: Hfs, op: str, dataset: Dataset) -> Tuple[int, str]:
+def search_probe(hfs: Hfs, op: str, dataset: Dataset) -> Tuple[int, str, Optional[int]]:
     queries = json.loads(dataset.search_file.read_text(encoding="utf-8"))[op]
-    return http_status(f"{hfs.base}/{queries[0]}")
+    return search_once(f"{hfs.base}/{queries[0]}")
 
 
 def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: str, vus: int,
@@ -949,7 +970,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
             hfs = None
         started = time.monotonic()
         backend.reset()
-        hfs = Hfs(args.hfs_bin, args.hfs_port, run_dir / "hfs.log", run_dir / "hfs-data", backend.hfs_env())
+        hfs = Hfs(args.hfs_bin, args.hfs_port, run_dir / "hfs.log", backend.hfs_env())
         return {"reset_and_boot_s": time.monotonic() - started}
 
     for number in range(1, args.runs + 1):
@@ -965,7 +986,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                 log(f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: reset")
                 timing.update(bring_up(run_dir))
                 if op in SEARCH_OPS:
-                    code, body = probe_status(hfs, op, dataset)
+                    code, body, _ = search_probe(hfs, op, dataset)
                     if not 200 <= code < 300:
                         status = "not_implemented" if code == 501 else "refused"
                         log(f"{backend.label} {op}: the server answered {code}; recorded, no load run")
@@ -973,6 +994,12 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                         write_run(run_dir, record)
                         break
                 timing["load"] = load_dataset(hfs.base, dataset)
+                if op in SEARCH_OPS:
+                    # A query that matches nothing would measure an empty answer.
+                    code, _, entries = search_probe(hfs, op, dataset)
+                    timing["first_query_entries"] = entries
+                    if entries == 0:
+                        log(f"warning: {op}'s first query matched nothing (HTTP {code})")
                 timing["settle_after_load"] = backend.settle(flush=True)
                 warm_up(args, hfs, op, vus, args.mode, rate, dataset, run_dir)
                 timing["settle_after_warmup"] = backend.settle(flush=False)

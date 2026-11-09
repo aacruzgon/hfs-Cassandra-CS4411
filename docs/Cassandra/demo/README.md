@@ -4,7 +4,7 @@
 
 It covers create, read, vread, an update with an `If-Match` conflict, a batch bundle, a transaction bundle, token, date and URI searches with paging through `next` links, a rejected `:exact`, a delete followed by 410, and isolation between two tenants.
 
-The script does not start anything. Start the database and HFS first, then run it. Run the commands below as a shell script, not in an interactive shell, because the port check ends with `exit`.
+The script does not start anything. Start the database and HFS first, then run it. Run the commands below as a shell script, not in an interactive shell, because they use `exit`. They stop HFS and exit with the script's status under both `bash` and `bash -e`.
 
 ## Against PostgreSQL
 
@@ -25,8 +25,10 @@ HFS_SERVER_PORT=58080 HFS_BASE_URL=http://127.0.0.1:58080 \
 ./target/debug/hfs > target/demo-hfs.log 2>&1 &
 HFS_PID=$!
 
-python3 docs/Cassandra/demo/demo.py --backend postgres --wait 120 --server-log target/demo-hfs.log
-kill "$HFS_PID"
+status=0
+python3 docs/Cassandra/demo/demo.py --backend postgres --wait 120 --server-log target/demo-hfs.log || status=$?
+kill "$HFS_PID" || status=1
+exit "$status"
 ```
 
 ## Against Cassandra
@@ -49,8 +51,10 @@ HFS_SERVER_PORT=58080 HFS_BASE_URL=http://127.0.0.1:58080 \
 ./target/debug/hfs > target/demo-hfs.log 2>&1 &
 HFS_PID=$!
 
-python3 docs/Cassandra/demo/demo.py --backend cassandra --wait 120 --server-log target/demo-hfs.log
-kill "$HFS_PID"
+status=0
+python3 docs/Cassandra/demo/demo.py --backend cassandra --wait 120 --server-log target/demo-hfs.log || status=$?
+kill "$HFS_PID" || status=1
+exit "$status"
 ```
 
 Search and paging are later roadmap steps (6 and 6a to 6d), so until they land the search steps fail on Cassandra. Row 8.6 is the first point at which the whole script has to pass there.
@@ -81,7 +85,7 @@ The log says what HFS was started with, not who answers on the port. HFS writes 
 Two checks cover the second gap, and neither is the script's:
 
 - **Before starting HFS, refuse a port that is not free,** as the commands above do. Only curl's exit 7, connection refused, counts as free. A server that stalls past curl's 2 s timeout is still there, so any other failure refuses too. Otherwise an old HFS answers while the new one is still starting, and the script can finish with every step passed and `"backend_confirmed": true` before the new one tries to bind.
-- **Once the script ends, check that the HFS you started is still running.** An HFS that cannot bind its port writes that same line and then exits 1, while whatever holds the port keeps answering. `kill "$HFS_PID"` in the commands above fails in that case; a CI job must fail on it.
+- **Once the script ends, check that the HFS you started is still running.** An HFS that cannot bind its port writes that same line and then exits 1, while whatever holds the port keeps answering. `kill "$HFS_PID"` in the commands above fails in that case, and they exit 1; a CI job must fail on it.
 
 Row 8.6's job needs all four: the refusal of a port that is not free, a new log file for each run, `--server-log` with `"backend_confirmed": true` in the summary, and the process check. Only the database shows directly which backend stored a run. The report's summary has the `run_id`, and the run's tenants are `demo-<run id>-a` and `-b`, so the job may also count that run's rows there.
 

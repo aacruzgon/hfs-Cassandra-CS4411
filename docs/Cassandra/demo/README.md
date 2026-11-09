@@ -82,7 +82,7 @@ Port 58080 is used by nothing in `.github/workflows/` or `docker/`.
 
 The log says what HFS was started with, not who answers on the port. HFS writes that line before it connects to its database and before it binds, so `backend_confirmed` means only that the log matches this run.
 
-Two checks cover the second gap. The script makes neither today: it does not compare the log with anything the server reports, such as `started_at` from `GET /health`.
+Two checks narrow the second gap, and the caller makes both: the script does not compare the log with anything the server reports.
 
 - **Before starting HFS, refuse a port that is not free,** as the commands above do. Only curl's exit 7, connection refused, counts as free. A server that stalls past curl's 2 s timeout is still there, so any other failure refuses too. Otherwise an old HFS answers while the new one is still starting, and the script can finish with every step passed and `"backend_confirmed": true` before the new one tries to bind.
 - **Once the script ends, check that the HFS you started is still running.** An HFS that cannot bind its port writes that same line and then exits 1, while whatever holds the port keeps answering. `kill "$HFS_PID"` in the commands above fails in that case, and they exit 1; a CI job must fail on it.
@@ -97,7 +97,7 @@ Row 8.6's job needs all five, and a run passes only with all five:
 4. the process check;
 5. the row count: the backend holds this run's rows.
 
-The first four narrow the gap without closing it: a server that starts listening just after the refusal still passes them. Only the database shows which backend stored a run. The script talks only to the URL it is given, so the job does this count itself.
+The first four narrow the gap without closing it: a server that starts listening just after the refusal can still pass them. Only the database shows which backend stored a run. The script talks only to the URL it is given, so the job does this count itself.
 
 Add `--report target/demo-report.jsonl` to the script's command and put this between the `kill` and the `exit`. It counts only when the script passed, so a failed run keeps its exit status.
 

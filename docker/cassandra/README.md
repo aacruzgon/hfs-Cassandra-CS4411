@@ -265,9 +265,14 @@ c exec cassandra-3 nodetool repair
 
 On a cluster started with the 2G override, `c` names only the default file, so
 this `up` would bring the node back at 2 CPUs, a 768M heap and 2.5 GiB. Name the
-override before the replace file, here and in the recreate command below:
-`c -f docker/cassandra/docker-compose.cluster.heap2g.yml -f /tmp/replace.yml up
--d --no-deps --wait cassandra-3`.
+override before the replace file. The replace file sets all of `JVM_EXTRA_OPTS`,
+so also set both GC options in it to 4, or the node runs 2 GC threads on 4 CPUs:
+
+```bash
+c -f docker/cassandra/docker-compose.cluster.heap2g.yml -f /tmp/replace.yml up -d --no-deps --wait cassandra-3
+# The seed route's recreate step, below, has no replace file but needs the override:
+c -f docker/cassandra/docker-compose.cluster.heap2g.yml up -d --no-deps --wait cassandra-2
+```
 
 `cassandra-1` and `cassandra-2` are seeds, and a seed never bootstraps. With the
 same steps, a replacement seed exits with code 3 (`Replacing a node without

@@ -88,7 +88,7 @@
 
 
 -- Current version of every resource, and the compare-and-swap target for
--- every write. Point reads only: read, exists, _id, and the tag check.
+-- every write. Point reads only: read, exists, _id, and the tag check; plus the SearchParameter reload's fallback when tombstones stop a read of resources_by_type (ADR-aacruzgon-0075).
 --
 -- index_keys (ADR-aacruzgon-0027, walkthrough G22) is K(V) of the current
 -- version V, written by the CAS that created V. It is the same blob as

@@ -43,7 +43,7 @@
 //! messages are logged by REST and never sent.
 
 use cdrs_tokio::error::Error as CdrsError;
-use cdrs_tokio::frame::message_error::ErrorType;
+use cdrs_tokio::frame::message_error::{ErrorType, FailureInfo};
 
 use super::session::DriverError;
 use crate::error::{BackendError, StorageError};
@@ -57,6 +57,32 @@ pub(crate) fn unsupported(capability: &str) -> StorageError {
         backend_name: BACKEND_NAME.to_string(),
         capability: capability.to_string(),
     })
+}
+
+/// `READ_TOO_MANY_TOMBSTONES` in a `ReadFailure`'s reason map: the node's
+/// `RequestFailureReason` (`cassandra-5.0.9`, `READ_TOO_MANY_TOMBSTONES (1)`),
+/// which native protocol v5 sends per replica.
+const READ_TOO_MANY_TOMBSTONES: i16 = 1;
+
+/// Whether a replica refused this read for reading more than
+/// `tombstone_failure_threshold` tombstones (`ReadCommand.java:590-602` in
+/// `cassandra-5.0.9`). A single replica is enough: its read cannot succeed
+/// until the tombstones become purgeable.
+pub(crate) fn is_too_many_tombstones(error: &DriverError) -> bool {
+    let DriverError::Driver(error) = error else {
+        return false;
+    };
+    let CdrsError::Server { body, .. } = error.as_ref() else {
+        return false;
+    };
+    let ErrorType::ReadFailure(failure) = &body.ty else {
+        return false;
+    };
+    matches!(
+        &failure.failure_info,
+        FailureInfo::ReasonMap(reasons)
+            if reasons.values().any(|reason| *reason == READ_TOO_MANY_TOMBSTONES)
+    )
 }
 
 /// Maps a failed statement to a [`BackendError`]. `operation` names what was
@@ -201,8 +227,8 @@ pub(super) mod tests {
     use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::frame::Version;
     use cdrs_tokio::frame::message_error::{
-        CasWriteUnknownError, ErrorBody, FailureInfo, UnavailableError, WriteFailureError,
-        WriteTimeoutError, WriteType,
+        CasWriteUnknownError, ErrorBody, FailureInfo, ReadFailureError, UnavailableError,
+        WriteFailureError, WriteTimeoutError, WriteType,
     };
     use std::io::Cursor;
     use std::net::SocketAddr;
@@ -213,6 +239,44 @@ pub(super) mod tests {
             body: ErrorBody::new("node said no", ty),
             addr: "192.168.147.2:9042".parse::<SocketAddr>().unwrap(),
         })
+    }
+
+    fn read_failure(failure_info: FailureInfo) -> DriverError {
+        server(ErrorType::ReadFailure(ReadFailureError::new(
+            Consistency::LocalQuorum,
+            0,
+            1,
+            failure_info,
+            false,
+        )))
+    }
+
+    fn reasons(codes: &[i16]) -> FailureInfo {
+        FailureInfo::ReasonMap(
+            codes
+                .iter()
+                .enumerate()
+                .map(|(n, code)| (std::net::IpAddr::from([10, 0, 0, n as u8 + 1]), *code))
+                .collect(),
+        )
+    }
+
+    /// `TIMEOUT (2)`, `READ_SIZE (4)` and the rest are not this failure, and
+    /// protocol v4's bare count names no reason at all.
+    #[test]
+    fn only_the_tombstone_reason_counts_as_too_many_tombstones() {
+        assert!(is_too_many_tombstones(&read_failure(reasons(&[1]))));
+        assert!(
+            is_too_many_tombstones(&read_failure(reasons(&[2, 1]))),
+            "one replica of a quorum is enough"
+        );
+        assert!(!is_too_many_tombstones(&read_failure(reasons(&[0, 2, 4]))));
+        assert!(!is_too_many_tombstones(&read_failure(
+            FailureInfo::NumFailures(1)
+        )));
+        assert!(!is_too_many_tombstones(&server(write_failure(
+            WriteType::Simple
+        ))));
     }
 
     fn write_timeout(write_type: WriteType) -> ErrorType {

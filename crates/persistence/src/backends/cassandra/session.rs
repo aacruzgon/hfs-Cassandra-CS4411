@@ -294,7 +294,20 @@ impl CassandraSession {
     /// fail as `fault` says (tests only).
     #[cfg(test)]
     pub(crate) fn inject_fault(&self, kind: StatementKind, cql_contains: &str, fault: Fault) {
-        self.faults.inject(kind, cql_contains, fault);
+        self.faults.inject(kind, cql_contains, fault, false);
+    }
+
+    /// [`Self::inject_fault`], for the first page of a paged read
+    /// ([`Self::rows_paged`]). Only a fault injected this way reaches a paged
+    /// statement, so the others keep the statements they have always matched.
+    #[cfg(test)]
+    pub(crate) fn inject_fault_on_first_page(
+        &self,
+        kind: StatementKind,
+        cql_contains: &str,
+        fault: Fault,
+    ) {
+        self.faults.inject(kind, cql_contains, fault, true);
     }
 
     /// The prepared form of `cql`, preparing it on first use within
@@ -337,8 +350,14 @@ impl CassandraSession {
     ) -> Result<Envelope, DriverError> {
         self.counts.count(kind);
         #[cfg(test)]
-        if paging.is_none() {
-            if let Some(result) = self.faults.intercept(self, cql, &values, kind).await {
+        {
+            let first_page = paging.as_ref().is_some_and(|paging| paging.state.is_none());
+            if (paging.is_none() || first_page)
+                && let Some(result) = self
+                    .faults
+                    .intercept(self, cql, &values, kind, first_page)
+                    .await
+            {
                 return result;
             }
         }
@@ -413,6 +432,20 @@ impl CassandraSession {
         kind: StatementKind,
         page_size: i32,
     ) -> Result<Vec<Row>, DriverError> {
+        self.rows_paged_keeping(cql, values, kind, page_size, |_| true)
+            .await
+    }
+
+    /// [`Self::rows_paged_by`], keeping only the rows `keep` accepts, page by
+    /// page, so a scan of many rows holds only those it needs.
+    pub(crate) async fn rows_paged_keeping(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        kind: StatementKind,
+        page_size: i32,
+        keep: impl Fn(&Row) -> bool,
+    ) -> Result<Vec<Row>, DriverError> {
         let mut all = Vec::new();
         let mut state = None;
         loop {
@@ -427,7 +460,12 @@ impl CassandraSession {
             let next = body
                 .as_rows_metadata()
                 .and_then(|metadata| metadata.paging_state.clone());
-            all.extend(body.into_rows().unwrap_or_default());
+            all.extend(
+                body.into_rows()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|row| keep(row)),
+            );
             match next {
                 Some(next) => state = Some(next),
                 None => return Ok(all),
@@ -543,6 +581,9 @@ pub(crate) enum Fault {
     /// Fail with a node-side `Server` error without executing: what the
     /// table for plain statements maps to 500 (ADR-aacruzgon-0067).
     FailWithServerError,
+    /// Fail with a `ReadFailure` carrying `READ_TOO_MANY_TOMBSTONES` without
+    /// executing: what a replica sends past `tombstone_failure_threshold`.
+    FailWithTooManyTombstones,
     /// Send the statement as usual. It only uses up its match, so that a
     /// fault queued after it lands on a later statement of the same text.
     PassThrough,
@@ -555,8 +596,8 @@ pub(crate) enum Fault {
 #[cfg(test)]
 mod faults {
     use cdrs_tokio::frame::message_error::{
-        ErrorBody, ErrorType, FailureInfo, UnavailableError, WriteFailureError, WriteTimeoutError,
-        WriteType,
+        ErrorBody, ErrorType, FailureInfo, ReadFailureError, UnavailableError, WriteFailureError,
+        WriteTimeoutError, WriteType,
     };
     use parking_lot::Mutex;
 
@@ -566,6 +607,7 @@ mod faults {
         kind: StatementKind,
         cql_contains: String,
         fault: Fault,
+        first_page: bool,
     }
 
     struct Deferred {
@@ -582,24 +624,35 @@ mod faults {
     }
 
     impl Faults {
-        pub(super) fn inject(&self, kind: StatementKind, cql_contains: &str, fault: Fault) {
+        pub(super) fn inject(
+            &self,
+            kind: StatementKind,
+            cql_contains: &str,
+            fault: Fault,
+            first_page: bool,
+        ) {
             self.pending.lock().push(Pending {
                 kind,
                 cql_contains: cql_contains.to_string(),
                 fault,
+                first_page,
             });
         }
 
-        /// Runs any late apply due before a statement of `kind`, then the
-        /// fault for this statement, if one matches. `None` sends it as usual.
+        /// Runs any late apply due before a statement of `kind` (never before
+        /// a paged read's first page), then the fault for this statement, if
+        /// one matches. `None` sends it as usual.
         pub(super) async fn intercept(
             &self,
             session: &CassandraSession,
             cql: &str,
             values: &[Value],
             kind: StatementKind,
+            first_page: bool,
         ) -> Option<Result<Envelope, DriverError>> {
-            let due: Vec<Deferred> = {
+            let due: Vec<Deferred> = if first_page {
+                Vec::new()
+            } else {
                 let mut deferred = self.deferred.lock();
                 let (due, keep) = deferred.drain(..).partition(|d| d.before == kind);
                 *deferred = keep;
@@ -613,9 +666,9 @@ mod faults {
             }
             let fault = {
                 let mut pending = self.pending.lock();
-                let at = pending
-                    .iter()
-                    .position(|p| p.kind == kind && cql.contains(&p.cql_contains))?;
+                let at = pending.iter().position(|p| {
+                    p.kind == kind && p.first_page == first_page && cql.contains(&p.cql_contains)
+                })?;
                 pending.remove(at).fault
             };
             match fault {
@@ -632,6 +685,9 @@ mod faults {
                 }),
                 Fault::FailWithWriteFailure => return Some(Err(server_error(write_failure()))),
                 Fault::FailWithUnavailable => return Some(Err(server_error(unavailable()))),
+                Fault::FailWithTooManyTombstones => {
+                    return Some(Err(server_error(too_many_tombstones())));
+                }
                 Fault::FailWithServerError => return Some(Err(server_error(ErrorType::Server))),
                 Fault::FailWithProtocolError => {
                     return Some(Err(server_error(ErrorType::Protocol)));
@@ -667,6 +723,19 @@ mod faults {
 
     fn unavailable() -> ErrorType {
         ErrorType::Unavailable(UnavailableError::new(Consistency::LocalSerial, 1, 0))
+    }
+
+    fn too_many_tombstones() -> ErrorType {
+        ErrorType::ReadFailure(ReadFailureError::new(
+            Consistency::LocalQuorum,
+            0,
+            1,
+            FailureInfo::ReasonMap(std::collections::HashMap::from([(
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                1,
+            )])),
+            false,
+        ))
     }
 }
 

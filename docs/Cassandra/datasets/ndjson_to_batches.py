@@ -44,7 +44,7 @@ def entry_for(line: str, number: int) -> str:
         kind, resource_id = resource["resourceType"], resource["id"]
     except (ValueError, KeyError, TypeError) as error:
         raise Failure(f"line {number}: not a FHIR resource: {error}")
-    if UUID.fullmatch(resource_id) is None:
+    if not isinstance(resource_id, str) or UUID.fullmatch(resource_id) is None:
         raise Failure(f"line {number}: id {resource_id} is not a UUID")
     # R4 Bundle.entry.fullUrl "SHALL have a value" except on a POST, and
     # urn:uuid is absolute. The line goes in as it is, so a decimal such as
@@ -63,9 +63,22 @@ def write_bundle(out_dir: Path, sequence: int, entries: List[str]) -> None:
 
 
 def convert(source: Path, out_dir: Path, max_entries: int, max_bytes: int) -> dict:
+    if not source.is_file():
+        raise Failure(f"{source} is not a file")
     out_dir.mkdir(parents=True, exist_ok=True)
     if any(out_dir.iterdir()):
         raise Failure(f"{out_dir} is not empty; old Bundles would be loaded too")
+    try:
+        return write_bundles(source, out_dir, max_entries, max_bytes)
+    except (Failure, OSError):
+        # The directory was empty, so every Bundle here is this run's. Leaving
+        # them would load part of a file that was found to be bad.
+        for partial in out_dir.glob("batch-*.json"):
+            partial.unlink()
+        raise
+
+
+def write_bundles(source: Path, out_dir: Path, max_entries: int, max_bytes: int) -> dict:
     # The text around the entries. Each entry below counts one comma, which
     # is one more than a Bundle has, hence the - 1.
     envelope = len(BUNDLE_START) + len(BUNDLE_END) - 1

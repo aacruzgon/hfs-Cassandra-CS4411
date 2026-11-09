@@ -8,7 +8,7 @@ One Synthea run with every input fixed, then Patient and Observation only, as
 sorted NDJSON, cut to exactly 10,000 and 100,000 resources. See README.md next
 to this file. It needs Python 3.9 or later, Java 17 or later, and nothing else.
 
-The inputs below are the whole recipe. Three of them are easy to miss, and
+The inputs below are the whole recipe. Four of them are easy to miss, and
 each one changes the data if it is left out:
 
   -e        Without it Synthea simulates up to the current time, so the same
@@ -17,6 +17,10 @@ each one changes the data if it is left out:
             Synthea renders dates in the JVM's zone, so `effectiveDateTime`
             and even `birthDate` change with the machine's time zone.
   the jar   `master-branch-latest` moves; v4.0.0's digest does not.
+  exporter.use_uuid_filenames
+            By default a file name holds the patient's name. In a POSIX locale
+            Java cannot encode a non-ASCII name as a path, so that patient's
+            file is lost and Synthea still exits 0.
 
 Whole Bundles are not reproducible: resource types other than Patient and
 Observation differ between runs, even at the same thread count. That is why
@@ -77,8 +81,8 @@ JVM_PROPERTIES = (
 )
 
 # Each is the default in this jar, except the two hospital and practitioner
-# lines, which skip files the filter never reads. They are stated so the
-# manifest records them.
+# lines, which skip files the filter never reads, and use_uuid_filenames, which
+# keeps patient names out of paths. They are stated so the manifest records them.
 SYNTHEA_CONFIG = {
     "exporter.years_of_history": "10",
     "exporter.fhir.export": "true",
@@ -89,6 +93,7 @@ SYNTHEA_CONFIG = {
     "exporter.hospital.fhir.export": "false",
     "exporter.practitioner.fhir.export": "false",
     "exporter.metadata.export": "true",
+    "exporter.use_uuid_filenames": "true",
 }
 
 SIZES = (10_000, 100_000)
@@ -102,10 +107,12 @@ DROPPED_PATIENT_EXTENSIONS = (
     "http://synthetichealth.github.io/synthea/quality-adjusted-life-years",
 )
 
-# Synthea names a patient's Bundle `<names>_<Patient.id>.json`.
+# With exporter.use_uuid_filenames, a patient's Bundle is `<Patient.id>.json`.
 PATIENT_FILE = re.compile(
-    r"_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$"
+    r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$"
 )
+# Synthea's own count of what it generated, near the end of its output.
+RECORDS_LINE = re.compile(r"^Records: total=(\d+), alive=(\d+), dead=(\d+)$", re.MULTILINE)
 URN_UUID = "urn:uuid:"
 DOWNLOAD_ATTEMPTS = 6
 HERE = Path(__file__).resolve().parent
@@ -235,7 +242,23 @@ def run_synthea(jar: Path, work_dir: Path, threads: int) -> Path:
         tail = log.read_text(errors="replace")[-2000:]
         raise Failure(f"Synthea exited {finished.returncode}:\n{tail}")
     print(f"Synthea took {time.monotonic() - started:.0f} s", file=sys.stderr)
+    check_complete(output, log.read_text(errors="replace"))
     return output
+
+
+def check_complete(output: Path, log: str) -> None:
+    """Refuse a run that lost patients: Synthea exits 0 when an export fails."""
+    records = RECORDS_LINE.findall(log)
+    if len(records) != 1:
+        raise Failure(f"expected one `Records:` line from Synthea, found {len(records)}")
+    total, alive, _ = (int(count) for count in records[0])
+    written = sum(1 for _ in (output / "fhir").iterdir())
+    if alive != POPULATION or written != total:
+        cause = next((line for line in log.splitlines() if "Exception" in line), "none logged")
+        raise Failure(
+            f"Synthea lost patients: {alive} alive of {POPULATION} asked for, "
+            f"{written} files for {total} records. First exception: {cause}"
+        )
 
 
 def metadata_version(output: Path) -> str:

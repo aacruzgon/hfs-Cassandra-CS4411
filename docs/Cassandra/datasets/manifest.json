@@ -591,6 +591,7 @@
       "exporter.hospital.fhir.export": "false",
       "exporter.metadata.export": "true",
       "exporter.practitioner.fhir.export": "false",
+      "exporter.use_uuid_filenames": "true",
       "exporter.years_of_history": "10"
     },
     "end_date": "20260101",

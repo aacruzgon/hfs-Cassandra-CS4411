@@ -61,6 +61,7 @@ The inputs are constants at the top of `generate_datasets.py` and are all record
 | `-r`, `-e` | 20260101 | `-r` does not set the end of the simulation. Without `-e`, Synthea simulates up to the moment it runs, and the same command on a later date gives different patients. |
 | `-p` | 400 | 469 patient records with 246,995 Patient and Observation resources, comfortably more than 100,000. |
 | `user.timezone` | UTC | Synthea writes dates in the JVM's zone, so `effectiveDateTime` and even `birthDate` change with the machine's zone. |
+| `exporter.use_uuid_filenames` | true | By default a file name holds the patient's name. In a POSIX locale Java cannot encode a non-ASCII name as a path, so that patient's file is lost and Synthea still exits 0. The script also compares Synthea's own count of records with the files it wrote, and stops if any are missing. |
 | thread pool | 4 | Recorded for the record. The checksums do not depend on it, and `--verify --threads N` lets you check that. |
 
 The other Synthea settings, listed in `manifest.json`, are stated so that the record is complete.

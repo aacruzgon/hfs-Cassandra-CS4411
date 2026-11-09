@@ -664,8 +664,8 @@ async fn batch_delete_with_if_match_on_a_resource_deleted_after_the_check_is_not
 }
 
 /// A satisfied `ifMatch` with nobody racing still answers what it answered
-/// before #2527: `200`, the versioned `location` `Type/id/_history/vid` that
-/// every batch update answers since #2517, the new version's `etag`.
+/// before #2527: `200`, the versioned `location` (#2517), the new version's
+/// `etag`.
 #[tokio::test]
 async fn batch_put_with_a_satisfied_if_match_still_updates() {
     let (server, _primary) = server();

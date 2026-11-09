@@ -1024,13 +1024,15 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                         write_run(run_dir, record)
                         break
                 timing["load"] = load_dataset(hfs.base, dataset)
-                if op in SEARCH_OPS:
-                    # A query that matches nothing would measure an empty answer.
-                    code, _, entries = search_probe(hfs, op, dataset)
-                    timing["first_query_entries"] = entries
-                    if entries == 0:
-                        log(f"warning: {op}'s first query matched nothing (HTTP {code})")
                 timing["settle_after_load"] = backend.settle(flush=True)
+                if op in SEARCH_OPS:
+                    # After the settle, once PostgreSQL has statistics. A query
+                    # that matches nothing would measure an empty answer.
+                    code, _, entries = search_probe(hfs, op, dataset)
+                    timing["first_query_status"] = code
+                    timing["first_query_entries"] = entries
+                    if not entries:
+                        log(f"warning: {op}'s first query answered {code} with {entries} entries")
                 warm_up(args, hfs, op, vus, args.mode, rate, dataset, run_dir)
                 timing["settle_after_warmup"] = backend.settle(flush=False)
             backend_settings = backend.settings()

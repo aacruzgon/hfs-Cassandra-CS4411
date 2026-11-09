@@ -38,8 +38,9 @@ class Failure(Exception):
     """The input cannot be converted; the message says why."""
 
 
-def entry_for(line: str, number: int) -> str:
+def entry_for(raw: bytes, number: int) -> str:
     try:
+        line = raw.decode("utf-8")
         resource = json.loads(line)
         kind, resource_id = resource["resourceType"], resource["id"]
     except (ValueError, KeyError, TypeError) as error:
@@ -85,9 +86,10 @@ def write_bundles(source: Path, out_dir: Path, max_entries: int, max_bytes: int)
     sequence, total = 0, 0
     entries: List[str] = []
     size = envelope
-    with source.open(encoding="utf-8", newline="\n") as stream:
-        for number, line in enumerate(stream, start=1):
-            entry = entry_for(line, number)
+    # Bytes, so a line that is not UTF-8 is reported like any other bad line.
+    with source.open("rb") as stream:
+        for number, raw in enumerate(stream, start=1):
+            entry = entry_for(raw, number)
             cost = len(entry.encode("utf-8")) + 1
             if cost + envelope > max_bytes:
                 raise Failure(f"line {number}: one entry is over {max_bytes} bytes")

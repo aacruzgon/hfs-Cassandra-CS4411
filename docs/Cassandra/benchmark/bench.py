@@ -80,8 +80,9 @@ FORBIDDEN_PORTS = {59042, 55432}
 
 CALIBRATION_FRACTION = 0.8
 
-# A host is quiet when both hold. Measured on the idle Mac; see README "Host load".
-QUIET_LOAD_PER_CPU = 0.75
+# A host is quiet when other processes use at most this much CPU in total.
+# Measured on the idle Mac; see README "Host load". The load average is
+# recorded but not used: it still holds the harness's own previous run.
 QUIET_FOREIGN_CPU_PCT = 200.0
 HOST_PROCESS_MIN_PCT = 5.0
 BATCH_WORKERS = 4
@@ -334,7 +335,7 @@ def foreign_processes(processes: Dict[int, Tuple[int, float, str]], root_pid: in
 
 
 def host_is_quiet(record: dict) -> bool:
-    return record["load_1m"] <= QUIET_LOAD_PER_CPU * record["cpus"] and record["foreign_cpu_pct"] <= QUIET_FOREIGN_CPU_PCT
+    return record["foreign_cpu_pct"] <= QUIET_FOREIGN_CPU_PCT
 
 
 def host_load() -> dict:
@@ -1764,9 +1765,23 @@ def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume
                      for r in records if r.get("status") in ("failed", "no_success")]
     lines += ["", "## Failed or refused", ""] + (failures or ["None."])
     lines += ["", "## What is left", ""]
-    lines += [f"Continue with:\n\n```bash\n{resume_command}\n```"] if left_any else ["Nothing: every part is complete."]
+    lines += [f"Continue, from the directory this run was started in, with:\n\n```bash\n{resume_command}\n```"] if left_any else ["Nothing: every part is complete."]
     lines += ["", f"Results are under `{out_root}`: `matrix/`, `calibration/` and `lwt-steady/`, each with `runs.csv` and `summary.csv`."]
     (out_root / "morning-summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def resume_arguments(argv: Sequence[str]) -> List[str]:
+    """The options a run was started with, without those the resume command sets itself."""
+    kept: List[str] = []
+    skip_next = False
+    for word in argv:
+        if skip_next:
+            skip_next = False
+        elif word in ("--hours", "--out"):
+            skip_next = True
+        elif word != "--resume" and not word.startswith(("--hours=", "--out=")):
+            kept.append(word)
+    return kept
 
 
 def cmd_overnight(args: argparse.Namespace) -> int:
@@ -1797,10 +1812,8 @@ def cmd_overnight(args: argparse.Namespace) -> int:
     run_seconds: Dict[Tuple[str, int], float] = {}
     rates_path = out_root / "rates-laptop-dry-run.json"
     resume_command = shlex.join(
-        ["python3", str(Path(__file__).resolve()), "overnight", "--resume", "--out", str(out_root),
-         "--hours", "8", "--dataset-dir", str(args.dataset_dir.resolve()), "--k6", str(args.k6),
-         "--hfs-bin", str(args.hfs_bin.resolve()), "--sha256sums", str(args.sha256sums.resolve()),
-         "--batches-tool", str(args.batches_tool.resolve())])
+        ["python3", str(Path(__file__).resolve()), "overnight", "--resume", "--out", str(out_root), "--hours", "8",
+         *resume_arguments(sys.argv[2:])])
 
     def save_state() -> None:
         state_path.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")

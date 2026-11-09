@@ -180,10 +180,16 @@ class HostLoadTests(unittest.TestCase):
         self.assertEqual(foreign[0]["command"], "rustc")
 
     def test_quiet(self):
-        quiet = {"load_1m": bench.QUIET_LOAD_PER_CPU * 8, "cpus": 8, "foreign_cpu_pct": bench.QUIET_FOREIGN_CPU_PCT}
+        # A high load average alone is the harness's own previous run.
+        quiet = {"load_1m": 40.0, "cpus": 8, "foreign_cpu_pct": bench.QUIET_FOREIGN_CPU_PCT}
         self.assertTrue(bench.host_is_quiet(quiet))
-        self.assertFalse(bench.host_is_quiet(dict(quiet, load_1m=bench.QUIET_LOAD_PER_CPU * 8 + 1)))
         self.assertFalse(bench.host_is_quiet(dict(quiet, foreign_cpu_pct=bench.QUIET_FOREIGN_CPU_PCT + 1)))
+
+
+class ResumeArgumentsTests(unittest.TestCase):
+    def test_keeps_options_and_drops_what_the_resume_sets(self):
+        argv = ["--hours", "8", "--runs", "1", "--out=/x", "--resume", "--dataset-dir", "d", "--out", "/y"]
+        self.assertEqual(bench.resume_arguments(argv), ["--runs", "1", "--dataset-dir", "d"])
 
 
 class OvernightCountsTests(unittest.TestCase):

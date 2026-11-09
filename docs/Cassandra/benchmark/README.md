@@ -23,7 +23,7 @@ Before each of the three measured runs, in this order (roadmap Step 8):
 
 `--no-reset` keeps one data set across the three runs. Use it only for the LWT steady-state case below; it is the setting under which ADR-aacruzgon-0001 saw its decline.
 
-**Host load.** Before each run the harness records the host's 1, 5 and 15 minute load average, its CPU count, the processes above 5% CPU from `ps` without its own, and the sum of the running containers' memory limits (`host` in `run.json`). A host is quiet when the 1 minute load is at most 0.75 per CPU and the other processes use at most 200% CPU together. The idle Mac (18 GB, 11 cores, with a desktop session) read a median load of 3.9 and 95% CPU over 4 minutes, most of it WindowServer, with a maximum of 7.3 and 511%; a compile uses 700% or more. If the host isn't quiet, it waits up to `--host-wait-cap` seconds (default 120), then runs and records `host_busy`, which `runs.csv` and `summary.csv` carry. On Linux `ps` reports a process's lifetime CPU, so a brief spike there may not show.
+**Host load.** Before each run the harness records the host's 1, 5 and 15 minute load average, its CPU count, the processes above 5% CPU from `ps` without its own, and the sum of the running containers' memory limits (`host` in `run.json`). A host is quiet when the other processes use at most 200% CPU together. The idle Mac (18 GB, 11 cores, with a desktop session) read a median of 95% over 4 minutes, most of it WindowServer, and a compile uses 700% or more. The load average is recorded but doesn't decide: after a run it still holds the harness's own work (12.5 at 92% other-process CPU, measured). If the host isn't quiet, it waits up to `--host-wait-cap` seconds (default 120), then runs and records `host_busy`, which `runs.csv` and `summary.csv` carry. On Linux `ps` reports a process's lifetime CPU, so a brief spike there may not show.
 
 **Reset by snapshot (`--reset snapshot`).** Instead of reloading through HFS for every run, the harness loads each size once, settles it, stops the database and keeps a copy of the data volume, then restores that copy before each run. It is the same on both backends and needs no database command, and it is the state of a settled load, so HFS is never started on a node with tombstones (bug #74). `bench.py snapshot-check` measures it against a reload and proves it exact (row counts and checksums of every table, markers written by a dirty run gone).
 
@@ -123,7 +123,9 @@ The defaults are three runs, 120 s measured, 60 s warm-up, the 5 GiB profile, bo
 | Cassandra | 108 once Step 6 lands; until then 54, with the 18 search cells recorded as 501 | 8 h (5 h before Step 6) |
 | LWT steady state, both backends | 3 runs of 600 s, one load | 1 h |
 
-Per run, on top of 60 s of warm-up and 120 s measured: PostgreSQL 40 s of reset and settle at 10,000 resources and 3 to 6 minutes at 100,000, where loading dominates; Cassandra about 70 s of reset and boot, and 45 s of load at 100,000. Add `--resume` to continue a part that stopped, and split the parts over several nights if the machine's window needs it.
+With `--reset snapshot`, the same matrix takes about 17 hours (about 14 until Step 6's searches), since a reset is then 10 to 25 s (measured on a laptop, see "Reset by snapshot").
+
+Per run with reloading, on top of 60 s of warm-up and 120 s measured: PostgreSQL 40 s of reset and settle at 10,000 resources and 3 to 6 minutes at 100,000, where loading dominates; Cassandra about 70 s of reset and boot, and 45 s of load at 100,000. Add `--resume` to continue a part that stopped, and split the parts over several nights if the machine's window needs it.
 
 ## An overnight dry run on a laptop
 
@@ -143,7 +145,7 @@ Before starting it checks the datasets against `SHA256SUMS`, the release `hfs`, 
 4. PostgreSQL `off`, create and update.
 5. LWT steady state, on each backend (three no-reset runs of `--lwt-duration`).
 
-Results go to `~/hfs-bench/<date>/` (`--out` to change it) and nothing is committed. **In the morning,** read `morning-summary.md`: what ran, how long each part took, failed and busy-host runs, and the exact `--resume` command for what's left. Snapshots stay in Docker until the matrix completes.
+Until `docs/Cassandra/datasets/` is in your checkout, add `--sha256sums` and `--batches-tool` to point at copies of those two files. Results go to `~/hfs-bench/<date>/` (`--out` to change it) and nothing is committed. **In the morning,** read `morning-summary.md`: what ran, how long each part took, failed and busy-host runs, and the exact `--resume` command for what's left. Snapshots stay in Docker until the matrix completes.
 
 ## Reading a smoke run
 

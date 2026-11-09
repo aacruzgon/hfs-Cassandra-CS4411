@@ -49,7 +49,7 @@ The Apache docs recommend UCS "for new workloads". They say tiered (`T`) setting
 
 | Table | Workload | Draft | What would change it |
 | --- | --- | --- | --- |
-| `resources` | One row per partition, overwritten on every version, read by full key | `T4`: bloom filters work well for single-row point reads | Point-read p95 above budget |
+| `resources` | One row per partition, overwritten on every version, read by full key, and scanned by partition key only when tombstones stop the SearchParameter reload's reads (ADR-aacruzgon-0075) | `T4`: bloom filters work well for single-row point reads | Point-read p95 above budget |
 | `resource_versions` | Append-only per partition | `T4` | Nothing expected |
 | Six index tables, `resources_by_type` | Delete plus insert on every write; slice reads through tombstones | `T4` | Tombstones per read over 1,000 (the section 7 trigger): try `L4`, which merges overlapping SSTables sooner (an inference; the docs do not compare the two for tombstones) |
 | `pending_index_writes` | Insert, then delete within seconds; 24 h TTL; read by time slice | `T4` | Tombstones per sweeper read above a few hundred. The docs recommend TimeWindowCompactionStrategy for TTL data, but these rows are deleted explicitly, long before they expire |

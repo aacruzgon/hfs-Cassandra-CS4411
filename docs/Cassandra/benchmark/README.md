@@ -19,7 +19,8 @@ Before each of the three measured runs, in this order (roadmap Step 8):
 4. **Load,** when building the snapshot or with `--reset reload`: the dataset goes through batch Bundles of `PUT` entries (`docs/Cassandra/datasets/ndjson_to_batches.py`, cached under the output directory) and each entry's status is checked, since a batch answers 200 even when an entry fails.
 5. **Settle,** before the snapshot is taken, or after each reload. Cassandra: `nodetool flush`, then wait for `pending tasks: 0`. PostgreSQL: `CHECKPOINT` and `VACUUM (ANALYZE)`, its counterpart.
 6. **JIT warm-up:** the same operation on the same schedule for `--warmup` seconds (60 by default), results thrown away. Then wait again for pending compactions to reach zero, so that compaction from the warm-up does not run into the measurement.
-7. **Measure** with `constant-arrival-rate`: `--duration` seconds (120 by default) at the calibrated rate, at most `concurrency` virtual users. Memory is sampled every 2 s throughout.
+7. **Mark the window.** `pg_stat_statements` is reset and the `nodetool` readings are taken (`*-before.txt`), so the load and the warm-up are out of the figures collected after the run.
+8. **Measure** with `constant-arrival-rate`: `--duration` seconds (120 by default) at the calibrated rate, at most `concurrency` virtual users. Memory is sampled every 2 s throughout.
 
 `--no-reset` keeps one data set across the three runs. Use it only for the LWT steady-state case below; it is the setting under which ADR-aacruzgon-0001 saw its decline.
 
@@ -66,6 +67,7 @@ summary.csv                     one row per cell, over its runs
     db-settings.json            nodetool version/info/status and the config, or pg_settings
     proxyhistograms.txt, tablestats.txt, compactionstats.txt, gcstats.txt
     pg_stat_statements.txt, pg_stat_database.txt
+    <name>-before.txt           the same readings just before the measured window
     k6.log, hfs.log
 ```
 

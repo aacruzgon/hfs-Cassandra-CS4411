@@ -630,6 +630,9 @@ class Backend:
     def collect(self, out_dir: Path) -> None:
         raise NotImplementedError
 
+    def before_measure(self, out_dir: Path) -> None:
+        """Mark the start of the measured window, so collect() reads the window and not the load."""
+
 
 class Cassandra(Backend):
     name = "cassandra"
@@ -724,6 +727,17 @@ class Cassandra(Backend):
             result = self.exec_(*command, check=False)
             (out_dir / f"{name}.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
 
+    def before_measure(self, out_dir: Path) -> None:
+        # nodetool's counters run from the node's start: this reading is what to
+        # take away from the one after the run. gcstats restarts on being read.
+        for name, command in (
+            ("proxyhistograms", ["nodetool", "proxyhistograms"]),
+            ("tablestats", ["nodetool", "tablestats", "helios"]),
+            ("gcstats", ["nodetool", "gcstats"]),
+        ):
+            result = self.exec_(*command, check=False)
+            (out_dir / f"{name}-before.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
+
 
 class Postgres(Backend):
     name = "postgres"
@@ -787,6 +801,15 @@ class Postgres(Backend):
                 f"SELECT name, current_setting(name) FROM pg_settings WHERE name IN ({quoted}) ORDER BY name;"
             )
         }
+
+    def before_measure(self, out_dir: Path) -> None:
+        # The statements of the load and the warm-up go; the database's own
+        # counters are kept, for autovacuum's sake, and read before and after.
+        reset = self.exec_("psql", "-U", "helios", "-d", "helios", "-At", "-c", "SELECT pg_stat_statements_reset();", check=False)
+        if reset.returncode != 0:
+            log(f"warning: pg_stat_statements_reset failed: {reset.stderr[-200:]}")
+        result = self.exec_("psql", "-U", "helios", "-d", "helios", "-c", "SELECT * FROM pg_stat_database WHERE datname = 'helios';", check=False)
+        (out_dir / "pg_stat_database-before.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
 
     def collect(self, out_dir: Path) -> None:
         queries = {
@@ -1500,6 +1523,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                 record.update(host_fields(timing.get("host")))
                 backend_settings = backend.settings()
                 (run_dir / "db-settings.json").write_text(json.dumps(backend_settings, indent=1), encoding="utf-8")
+                backend.before_measure(run_dir)
                 log(f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: measure ({args.mode}, rate {rate}, {args.duration} s)")
                 metrics = measure(args, backend, hfs, op, vus, args.mode, rate, args.duration, dataset, run_dir)
                 backend.collect(run_dir)

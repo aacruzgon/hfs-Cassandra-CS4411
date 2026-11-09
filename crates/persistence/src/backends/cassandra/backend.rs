@@ -699,8 +699,9 @@ impl CassandraBackend {
     /// **Except when that row was not written.** `create` also notes a
     /// SearchParameter whose index row failed (it only warns, and the intent
     /// row is left for the sweeper) or was skipped because a later version
-    /// exists. The scan cannot list it, so a reload drops it from the overlay
-    /// until the sweeper (Step 5) writes the row.
+    /// exists. The id read cannot list it, so a reload drops it from the
+    /// overlay until the sweeper (Step 5) writes the row. Only a reload that
+    /// fell back to the keys of `resources` lists it, and keeps it.
     ///
     /// # Errors
     ///

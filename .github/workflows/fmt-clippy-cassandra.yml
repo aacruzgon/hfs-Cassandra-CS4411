@@ -647,9 +647,10 @@ jobs:
       # key delta, the binds, the no-DELETE source scan) and the live ones in
       # write.rs and backend.rs, against this node. backend.rs's restart_tests
       # skip: they need a node of their own (HFS_TEST_CASSANDRA_RESTART_*),
-      # and must never stop this one. tombstone_limit_tests writes 101,000
-      # tombstones (a few seconds) in a keyspace of its own and drops it, so
-      # it is opted in on this job's node and no shared one (issue #74).
+      # and must never stop this one. Each of tombstone_limit_tests' two tests
+      # writes 101,000 tombstones (a few seconds) in a keyspace of its own and
+      # drops it, so they are opted in on this job's node and no shared one
+      # (issues #74 and #79).
       # Already built above.
       - name: cargo test --lib backends::cassandra against this node
         run: |

@@ -194,8 +194,9 @@ that are expected today:
   fail some of the time with a backend `Timeout` from a `LOCAL_SERIAL` read:
   `CAS operation timed out: received 0 of 2 required responses`. Cassandra 5.0.9
   raises it when a competing proposal supersedes the read's Paxos round, and
-  raising the CPU limit from 2 to 4 per node did not change the rate. The
-  version history stayed consistent in every failure seen.
+  raising the CPU limit from 2 to 4 per node did not change the rate. These
+  tests stop at that assertion, so a failing run does not check the version
+  history; the runs that pass do.
 
 ## Failure procedures
 

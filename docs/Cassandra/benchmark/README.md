@@ -81,7 +81,7 @@ summary.csv                     one row per cell, over its runs
 
 **Steady state.** `bins.csv` has one row per 10 s for every run. `steady_change_pct` compares the first and last third of its full bins; a negative value is a decline. On an open-loop run below capacity the rate holds by construction, and the decline shows only as latency and drops. To see a decline in throughput, use the case in the next section.
 
-**Peak container memory.** `memory.peak` counts page cache and reads the limit on any database that has read that much, so it is recorded but is not the headline. `mem_peak_used_mib` is `memory.current` less `inactive_file`, which is what `docker stats` shows, and `mem_peak_anon_mib` is the anonymous memory alone. `oom_killed` is recorded for each run.
+**Peak container memory.** `memory.peak` counts page cache and reads the limit on any database that has read that much, so it is recorded but is not the headline. `mem_peak_used_mib` is `memory.current` less `inactive_file`, which is what `docker stats` shows, and `mem_peak_anon_mib` is the anonymous memory alone. `oom_killed` is recorded for each run. **The reset method sits beside every memory figure** (`reset` in both CSVs, and they never average together): a restored database starts cold, so it reads low (PostgreSQL at 100,000: 360 MiB used after a restore against 960 after a reload, with the same latency). **ADR-aacruzgon-0002's memory confirmation uses `--reset reload`.** Samples are 2 s apart, so a spike shorter than that can be missed; `memory.peak` still has it, page cache included.
 
 ## Running the full matrix
 

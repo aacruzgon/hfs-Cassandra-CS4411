@@ -1618,23 +1618,23 @@ RUN_FIELDS = [
     "status", "latency_reading", "duration_s", "completed", "offered", "drop_pct", "throughput_rps", "ok_rps",
     "p50_ms", "p95_ms", "p99_ms", "p50_ok_ms", "p95_ok_ms", "p99_ok_ms",
     "max_ms", "s2xx", "s409", "s412", "s4xx_other", "s501", "s5xx_other", "s_other", "statuses",
-    "dropped_iterations", "saturated", "steady_change_pct", "mem_peak_used_mib", "mem_peak_anon_mib",
+    "dropped_iterations", "saturated", "steady_change_pct", "reset", "mem_peak_used_mib", "mem_peak_anon_mib",
     "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib", "k6_peak_rss_mib", "oom_killed",
     "synchronous_commit", "hfs_commit", "hfs_build_profile", "dataset_file", "dataset_sha256",
-    "dataset_verified", "memory_samples_missed", "reset", "host_busy", "host_load_1m", "host_foreign_cpu_pct",
+    "dataset_verified", "memory_samples_missed", "host_busy", "host_load_1m", "host_foreign_cpu_pct",
     "host_docker_limits_gib", "failure",
 ]
 
 SUMMARY_KEY = [
     "label", "backend", "profile", "size", "op", "concurrency", "mode", "target_rate", "synchronous_commit",
-    "dataset_file", "dataset_sha256", "dataset_verified",
+    "dataset_file", "dataset_sha256", "dataset_verified", "reset",
 ]
 
-SUMMARY_FIELDS = SUMMARY_KEY + [
+SUMMARY_FIELDS = [field for field in SUMMARY_KEY if field != "reset"] + [
     "cell_status", "latency_reading", "saturated_runs", "runs_ok", "runs_recorded", "throughput_rps_mean", "throughput_rps_min",
     "throughput_rps_max", "throughput_cv_pct", "ok_rps_mean", "drop_pct_mean", "p50_ms_mean", "p50_cv_pct",
     "p95_ms_mean", "p95_cv_pct", "p99_ms_mean", "p50_ok_ms_mean", "p95_ok_ms_mean", "p99_ok_ms_mean", "s2xx", "s409", "s412", "s4xx_other", "s501",
-    "s5xx_other", "s_other", "dropped_iterations", "steady_change_pct_mean", "mem_peak_used_mib",
+    "s5xx_other", "s_other", "dropped_iterations", "steady_change_pct_mean", "reset", "mem_peak_used_mib",
     "mem_peak_anon_mib", "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib",
     "k6_peak_rss_mib", "oom_killed", "host_busy_runs",
 ]

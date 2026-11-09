@@ -43,7 +43,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -88,6 +88,10 @@ HOST_PROCESS_MIN_PCT = 5.0
 BATCH_WORKERS = 4
 SAMPLE_SECONDS = 2.0
 SETTLE_TIMEOUT_SECONDS = 1800
+# Beyond a run's measured seconds: k6's graceful stop, the reduction of its CSV, the collection.
+RUN_OVERHEAD_SECONDS = 30
+# Before the first run of a no-reset cell: the restore, the boot, a settle.
+NO_RESET_START_SECONDS = 180
 
 
 class Failure(Exception):
@@ -1201,22 +1205,39 @@ def search_probe(hfs: Hfs, op: str, dataset: Dataset) -> Tuple[int, str, Optiona
     return search_once(f"{hfs.base}/{queries[0]}")
 
 
-def out_of_budget(args: argparse.Namespace, backend: Backend, dataset: "Dataset") -> bool:
-    """True when the next run might not finish before the overnight deadline."""
+def timing_key(args: argparse.Namespace, backend: Backend, dataset: "Dataset") -> Tuple:
+    """Runs of one key take alike: a short open-loop run says nothing about a long no-reset one."""
+    return (backend.label, dataset.size, args.mode, bool(args.no_reset), args.duration, args.warmup)
+
+
+def seconds_needed(args: argparse.Namespace, backend: Backend, dataset: "Dataset", runs_left: int, fresh: bool) -> float:
+    """How long the next run needs. A fresh no-reset cell has to fit every run it has left."""
+    per_run = args.duration + RUN_OVERHEAD_SECONDS
+    if args.no_reset:
+        return runs_left * per_run + (args.warmup + NO_RESET_START_SECONDS if fresh else 0)
+    # Until a run of this kind has been timed, assume the slow case: a load.
+    guess = args.warmup + per_run + (600 if dataset.size >= 100000 else 180)
+    return args.run_seconds.get(timing_key(args, backend, dataset), guess)
+
+
+def out_of_budget(args: argparse.Namespace, backend: Backend, dataset: "Dataset", runs_left: int = 1,
+                  fresh: bool = True) -> Optional[str]:
+    """Why the next run must not start before the overnight deadline, or None if it fits."""
     deadline = getattr(args, "deadline", None)
     if deadline is None:
-        return False
-    # Until a run of this backend and size has been timed, assume the slow case: a load.
-    guess = args.warmup + args.duration + (600 if dataset.size >= 100000 else 180)
-    if args.no_reset:
-        guess = args.runs * args.duration + args.warmup + 180
-    estimate = args.run_seconds.get((backend.label, dataset.size), guess)
-    return time.monotonic() + estimate > deadline
+        return None
+    needed = seconds_needed(args, backend, dataset, runs_left, fresh)
+    left = deadline - time.monotonic()
+    if needed > left:
+        return f"it needs about {needed:.0f} s and {max(left, 0):.0f} s are left before the deadline"
+    return None
 
 
 def note_run_seconds(args: argparse.Namespace, backend: Backend, dataset: "Dataset", seconds: float) -> None:
+    """Keep the longest run of its kind: the next run of that kind may be as slow."""
     if getattr(args, "deadline", None) is not None:
-        args.run_seconds[(backend.label, dataset.size)] = seconds
+        key = timing_key(args, backend, dataset)
+        args.run_seconds[key] = max(args.run_seconds.get(key, 0.0), seconds)
 
 
 def host_fields(host: Optional[dict]) -> dict:
@@ -1316,9 +1337,12 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         if already_done(number):
             continue
         fresh = number == 1 or not args.no_reset
-        if fresh and out_of_budget(args, backend, dataset):
+        runs_left = sum(1 for later in range(number, args.runs + 1) if not already_done(later))
+        refusal = out_of_budget(args, backend, dataset, runs_left, fresh)
+        if refusal:
             args.budget_stopped = True
-            log(f"stopping before {cell_id(dataset.size, op, vus)} run {number}: the time budget would run out")
+            args.budget_stop_reason = f"{backend.label} {cell_id(dataset.size, op, vus)} run {number} was not started: {refusal}"
+            log(f"stopping: {args.budget_stop_reason}")
             break
         run_started = time.monotonic()
         try:
@@ -1373,6 +1397,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
             )
         except BudgetExhausted as exhausted:
             args.budget_stopped = True
+            args.budget_stop_reason = f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: {exhausted}"
             log(f"stopping before {cell_id(dataset.size, op, vus)} run {number}: {exhausted}")
             # Nothing was measured, so nothing is recorded and --resume runs it.
             if not any(run_dir.iterdir()):
@@ -1383,7 +1408,10 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
             ok = False
             log(f"FAILED {cell_id(dataset.size, op, vus)} run {number}: {failure}")
         write_run(run_dir, record)
-        note_run_seconds(args, backend, dataset, time.monotonic() - run_started)
+        if record["status"] == "ok":
+            # A snapshot is built once; later runs of this kind don't pay for it again.
+            built = timing.get("snapshot_build", {}).get("seconds", 0.0)
+            note_run_seconds(args, backend, dataset, time.monotonic() - run_started - built)
         if not ok and args.no_reset:
             break
     if hfs is not None:
@@ -1745,9 +1773,15 @@ def part_counts(records: List[dict], part: dict) -> dict:
 
 
 def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume_command: str) -> None:
+    finished = datetime.now(timezone.utc)
+    budget_end = datetime.fromisoformat(state["budget_end_utc"])
+    against_budget = round((finished - budget_end).total_seconds() / 60)
     lines = [f"# Overnight dry run, {out_root.name}", "", f"**{LAPTOP_BANNER}**", "",
-             f"Started {state['started_utc']}, finished {datetime.now(timezone.utc).isoformat(timespec='seconds')}, "
-             f"budget {state['hours']} h, stopped by: {state['stopped_by']}.", "",
+             f"Started {state['started_utc']}, finished {finished.isoformat(timespec='seconds')}. "
+             f"Budget {state['hours']} h, ending {state['budget_end_utc']}: "
+             + (f"finished {against_budget} min after the end of the budget." if against_budget > 0
+                else f"finished {-against_budget} min before the end of the budget."),
+             "", f"Stopped by: {state['stopped_by']}.", "",
              "| Part | Status | Took | Runs ok | Declined cells | Failed | Busy host | Left |",
              "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
     failures: List[str] = []
@@ -1801,6 +1835,7 @@ def cmd_overnight(args: argparse.Namespace) -> int:
     out_root.mkdir(parents=True, exist_ok=True)
     args.out = out_root
     state_path = out_root / "overnight-state.json"
+    budget_stop_reason: Optional[str] = None
     if state_path.exists() and not args.resume:
         raise Failure(f"{out_root} already holds an overnight run: pass --resume to continue it, or another --out")
     parts = overnight_parts(args)
@@ -1808,7 +1843,9 @@ def cmd_overnight(args: argparse.Namespace) -> int:
     (out_root / "NOT-FOR-REPORT.txt").write_text(LAPTOP_BANNER + "\n", encoding="utf-8")
 
     state = json.loads(state_path.read_text(encoding="utf-8")) if args.resume and state_path.exists() else {"parts": {}}
-    state.update(started_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"), hours=args.hours, stopped_by="running")
+    started_at = datetime.now(timezone.utc)
+    state.update(started_utc=started_at.isoformat(timespec="seconds"), hours=args.hours, stopped_by="running",
+                 budget_end_utc=(started_at + timedelta(hours=args.hours)).isoformat(timespec="seconds"))
     deadline = time.monotonic() + args.hours * 3600 - BUDGET_MARGIN_SECONDS
     run_seconds: Dict[Tuple[str, int], float] = {}
     rates_path = out_root / "rates-laptop-dry-run.json"
@@ -1853,6 +1890,7 @@ def cmd_overnight(args: argparse.Namespace) -> int:
             plan.deadline = deadline
             plan.run_seconds = run_seconds
             plan.budget_stopped = False
+            plan.budget_stop_reason = None
             started = time.monotonic()
             try:
                 if part["kind"] == "calibrate":
@@ -1871,6 +1909,7 @@ def cmd_overnight(args: argparse.Namespace) -> int:
             if plan.budget_stopped:
                 entry["status"] = "stopped at the budget"
                 budget_stopped = True
+                budget_stop_reason = plan.budget_stop_reason
             else:
                 entry["status"] = "complete" if ok else "complete with failures"
                 any_failed = any_failed or not ok
@@ -1882,7 +1921,9 @@ def cmd_overnight(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         stop_reason = "a signal"
     finally:
-        state["stopped_by"] = stop_reason or ("the time budget" if budget_stopped else "an incomplete calibration" if calibration_incomplete else "finishing every part")
+        state["stopped_by"] = stop_reason or (
+            f"the time budget: {budget_stop_reason}" if budget_stopped
+            else "an incomplete calibration" if calibration_incomplete else "finishing every part")
         save_state()
         write_morning_summary(out_root, state, parts, resume_command)
         log(f"wrote {out_root / 'morning-summary.md'}")

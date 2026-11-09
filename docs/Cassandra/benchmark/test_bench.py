@@ -269,5 +269,52 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(queries["uri"], ["Observation?_profile=http%3A%2F%2Fexample.org%2Fp&_count=20"])
 
 
+class BudgetTests(unittest.TestCase):
+    """Overnight never starts a run that can't finish before the deadline."""
+
+    @staticmethod
+    def plan(left_seconds, **overrides):
+        values = dict(deadline=time.monotonic() + left_seconds, warmup=60, duration=120, no_reset=False,
+                      runs=3, mode="open", run_seconds={})
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    @staticmethod
+    def parts():
+        args = argparse.Namespace(project=None, db_port=None, profile="3g", baseline="on")
+        return bench.Cassandra(args), argparse.Namespace(size=10000, sha256="a" * 64)
+
+    def test_lwt_is_not_started_on_the_timing_of_a_short_open_loop_run(self):
+        backend, dataset = self.parts()
+        lwt = self.plan(600, mode="closed", no_reset=True, duration=600, warmup=60)
+        # The earlier part of the same backend and size timed a run of about a minute.
+        open_loop = self.plan(600)
+        bench.note_run_seconds(open_loop, backend, dataset, 60.0)
+        lwt.run_seconds = open_loop.run_seconds
+        self.assertIn("needs about 2130 s", bench.out_of_budget(lwt, backend, dataset, runs_left=3, fresh=True))
+
+    def test_lwt_starts_when_all_three_runs_fit(self):
+        backend, dataset = self.parts()
+        lwt = self.plan(2200, mode="closed", no_reset=True, duration=600, warmup=60)
+        self.assertIsNone(bench.out_of_budget(lwt, backend, dataset, runs_left=3, fresh=True))
+
+    def test_a_later_no_reset_run_is_checked_too(self):
+        backend, dataset = self.parts()
+        lwt = self.plan(300, mode="closed", no_reset=True, duration=600, warmup=60)
+        self.assertIsNotNone(bench.out_of_budget(lwt, backend, dataset, runs_left=1, fresh=False))
+
+    def test_the_slowest_timed_run_of_a_kind_is_the_estimate(self):
+        backend, dataset = self.parts()
+        plan = self.plan(150)
+        bench.note_run_seconds(plan, backend, dataset, 200.0)
+        bench.note_run_seconds(plan, backend, dataset, 100.0)
+        self.assertIsNotNone(bench.out_of_budget(plan, backend, dataset))
+        self.assertIsNone(bench.out_of_budget(self.plan(250, run_seconds=plan.run_seconds), backend, dataset))
+
+    def test_no_deadline_means_no_limit(self):
+        backend, dataset = self.parts()
+        self.assertIsNone(bench.out_of_budget(argparse.Namespace(), backend, dataset))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

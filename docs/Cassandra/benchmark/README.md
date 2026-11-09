@@ -88,12 +88,12 @@ On the designated 32 GB machine (roadmap section 1, ADR-aacruzgon-0002). Laptop 
 cargo build --release -p helios-hfs --features cassandra,postgres
 
 # Pin k6 and verify its checksum. Prints the path of the binary.
-python3 docs/Cassandra/benchmark/bench.py fetch-k6 --dest ~/bench-tools
-K6=~/bench-tools/k6-v2.3.0-macos-arm64/k6   # or k6-v2.3.0-linux-amd64
+python3 docs/Cassandra/benchmark/bench.py fetch-k6 --dest ~/hfs-bench/tools
+K6=~/hfs-bench/tools/k6-v2.3.0-macos-arm64/k6   # or k6-v2.3.0-linux-amd64
 
 # The datasets, from row 0.7 (docs/Cassandra/datasets/README.md).
-python3 docs/Cassandra/datasets/generate_datasets.py --out-dir ~/bench-data
-OUT=~/bench-out DATA=~/bench-data
+python3 docs/Cassandra/datasets/generate_datasets.py --out-dir ~/hfs-bench/datasets
+OUT=~/hfs-bench/report DATA=~/hfs-bench/datasets
 
 # 1. Calibrate on PostgreSQL. Writes docs/Cassandra/benchmark/rates.json: commit it.
 python3 docs/Cassandra/benchmark/bench.py calibrate --k6 $K6 --dataset-dir $DATA --out $OUT/calibration
@@ -129,23 +129,37 @@ Per run with reloading, on top of 60 s of warm-up and 120 s measured: PostgreSQL
 
 ## An overnight dry run on a laptop
 
-`bench.py overnight` runs the matrix unattended within a time budget. **These are laptop numbers, for timings and bugs, and never go in the report** (ADR-aacruzgon-0002): every run is labelled `laptop-dry-run`, and the output folder holds `NOT-FOR-REPORT.txt`.
-
-Keep the Mac on mains power with the lid open, or closed only with an external display. `caffeinate -dimsu` keeps it awake (`-d` keeps the display on too; it's harmless, and dimming the screen by hand does not stop the run). The harness uses the 3 GiB profile, the only one that fits an 8.8 GiB Docker VM, and counts the shared dev node's 3 GiB without touching it.
+**Two blocks, from the root of a checkout that has `docs/Cassandra/datasets/` (PR #75).** The first takes about 15 minutes, 8 of them the build. Run it any time before bed:
 
 ```bash
-python3 docs/Cassandra/benchmark/bench.py overnight --hours 8 --dataset-dir ~/hfs-bench/datasets --k6 $K6
+cargo build --release -p helios-hfs --features cassandra,postgres
+python3 docs/Cassandra/benchmark/bench.py fetch-k6 --dest ~/hfs-bench/tools
+python3 docs/Cassandra/datasets/generate_datasets.py --out-dir ~/hfs-bench/datasets
 ```
 
-Before starting it checks the datasets against `SHA256SUMS`, the release `hfs`, the pinned k6 and the Docker budget, and refuses if any fails. It runs these parts in order, one run at a time, stopping before the budget runs out:
+The second, at bedtime, on mains power with the lid open (or closed only with an external display):
 
-1. Calibration (PostgreSQL, closed-loop, written to `rates-laptop-dry-run.json` in the output folder, never to `rates.json`).
+```bash
+python3 docs/Cassandra/benchmark/bench.py overnight --hours 8 --dataset-dir ~/hfs-bench/datasets --k6 ~/hfs-bench/tools/k6-v2.3.0-macos-arm64/k6
+```
+
+`bench.py overnight` runs the matrix unattended within a time budget. **These are laptop numbers, for timings and bugs, and never go in the report** (ADR-aacruzgon-0002): every run is labelled `laptop-dry-run`, and the output folder holds `NOT-FOR-REPORT.txt`.
+
+`caffeinate -dimsu -w <pid>` keeps the Mac awake while the run lasts (`-d` keeps the display on too; it's harmless, and dimming the screen by hand does not stop the run). The harness uses the 3 GiB profile, the only one that fits an 8.8 GiB Docker VM, and counts the shared dev node's 3 GiB without touching it.
+
+Before starting it checks the datasets against `SHA256SUMS`, the release `hfs`, the pinned k6, the Docker budget and that the HFS port is free, and refuses if any fails. It runs these parts in order, one run at a time. It starts a run only if that run can finish inside the budget, and a steady-state part only if all its runs can:
+
+1. Calibration (PostgreSQL, closed-loop, 60 s per cell, written to `rates-laptop-dry-run.json` in the output folder, never to `rates.json`).
 2. PostgreSQL `on` at 10,000, then at 100,000.
 3. Cassandra at 10,000, then at 100,000.
 4. PostgreSQL `off`, create and update.
-5. LWT steady state, on each backend (three no-reset runs of `--lwt-duration`).
+5. LWT steady state, on each backend (three no-reset runs of `--lwt-duration`, 600 s by default).
 
-Until `docs/Cassandra/datasets/` is in your checkout, add `--sha256sums` and `--batches-tool` to point at copies of those two files. Results go to `~/hfs-bench/<date>/` (`--out` to change it) and nothing is committed. **In the morning,** read `morning-summary.md`: what ran, how long each part took, failed and busy-host runs, and the exact `--resume` command for what's left. Snapshots stay in Docker until the matrix completes.
+Results go to `~/hfs-bench/<date>/` (`--out` to change it) and nothing is committed.
+
+**To stop it:** Ctrl-C, `kill <pid>`, or closing the terminal. Each stops HFS and k6, takes the database container down, saves the state and writes the morning summary; continue with the summary's `--resume` command. `--resume` refuses to start while something else holds the HFS port, and names it. The progress is also in `overnight.log` in the output folder.
+
+**In the morning,** read `morning-summary.md`: what ran, how long each part took, when and why it stopped against the budget, failed, busy-host and saturated runs, and the exact `--resume` command for what's left. Snapshots stay in Docker until the matrix completes.
 
 ## Reading a smoke run
 

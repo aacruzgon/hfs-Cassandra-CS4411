@@ -48,8 +48,15 @@ const SELECT_TENANT_TYPES: &str = "SELECT DISTINCT tenant_id, resource_type FROM
 /// (`schema.cql`, walkthrough G39), so nothing can stop it the same way. It
 /// also lists a tenant whose SearchParameters are all deleted, soft-deleted
 /// rows included, so the reload reads that tenant's partition and finds
-/// nothing live. That per-tenant read has no fallback: over 100,000 tombstones
-/// at the head of one tenant's `SearchParameter` partition still fail it.
+/// nothing live.
+///
+/// That per-tenant read ([`SELECT_STORED_SEARCH_PARAMETER_IDS`]) has no
+/// fallback, and it is not a `DISTINCT`: it reads the whole partition, so every
+/// tombstone there counts, those of updates as much as those of deletes, until
+/// `gc_grace_seconds` has passed. Past 100,000 in one page it fails, and the
+/// startup load stops for every tenant, whether or not this scan ran: 101,120
+/// updates of 32 SearchParameters in one tenant, written in 32 s with no
+/// delete, stopped the restart on a 5.0.9 node.
 const SELECT_RESOURCE_KEYS: &str = "SELECT DISTINCT tenant_id, resource_type, id FROM resources";
 
 /// How many SearchParameter reads a reload runs at once.

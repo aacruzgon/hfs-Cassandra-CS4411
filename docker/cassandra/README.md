@@ -198,9 +198,10 @@ HFS_TEST_CASSANDRA_URL=127.0.0.1:59342 \
 These tests were written for one node, and on three a few fail for reasons
 that are expected today:
 
-- `node_runs_the_docker_cassandra_configuration` always fails. It asserts that
-  the driver sees one node (`one node, no peers`), and on the cluster it sees
-  three.
+- `node_runs_the_docker_cassandra_configuration` always fails. It fails at the
+  rack assertion (`cassandra_tests.rs:185`) if the query reaches another node,
+  and otherwise at `one node, no peers` (`:214`), because on the cluster the
+  driver sees three nodes.
 - The concurrent-write tests fail some of the time with a backend `Timeout`
   (504) from a `LOCAL_SERIAL` read: `CAS operation timed out: received 0 of 2
   required responses`. They are the tests in `step3_suites`
@@ -208,8 +209,8 @@ that are expected today:
   `create_read::cassandra_concurrent_creates_of_one_id_make_exactly_one_resource`.
   Cassandra 5.0.9 raises the error when a competing proposal supersedes the
   read's Paxos round. Raising the CPU limit from 2 to 4 per node did not change
-  the rate in the one test tried, on a host busy with other builds (9 and 12 of
-  20 runs failed at 4 CPUs, 11 of 20 at 2). The answer can reach the writer that
+  the rate in the one test tried, on a host at load 14 to 18 (9 and 12 of 20
+  runs failed at 4 CPUs, 11 of 20 at 2). The answer can reach the writer that
   won: seven of eight concurrent creates got `AlreadyExists` and the eighth got
   the 504. These tests panic on the outcomes, before any version-history check,
   so a failing run does not check the history; the runs that pass do.

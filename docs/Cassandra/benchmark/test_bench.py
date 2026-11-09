@@ -200,6 +200,22 @@ class DockerBudgetWaitTests(unittest.TestCase):
                 backend._wait_for_budget()
 
 
+class ResetDefaultTests(unittest.TestCase):
+    COMMANDS = (
+        ["run", "--backend", "postgres", "--dataset-dir", "d", "--out", "o"],
+        ["calibrate", "--dataset-dir", "d", "--out", "o"],
+        ["overnight", "--dataset-dir", "d", "--hours", "1"],
+    )
+
+    def test_snapshot_is_the_default_for_every_matrix_command(self):
+        for command in self.COMMANDS:
+            self.assertEqual(bench.build_parser().parse_args(command).reset, "snapshot", command[0])
+
+    def test_reload_stays_available(self):
+        for command in self.COMMANDS:
+            self.assertEqual(bench.build_parser().parse_args(command + ["--reset", "reload"]).reset, "reload", command[0])
+
+
 class ResumeArgumentsTests(unittest.TestCase):
     def test_keeps_options_and_drops_what_the_resume_sets(self):
         argv = ["--hours", "8", "--runs", "1", "--out=/x", "--resume", "--dataset-dir", "d", "--out", "/y"]

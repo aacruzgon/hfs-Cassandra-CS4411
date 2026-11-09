@@ -13,11 +13,11 @@ The harness of roadmap row 0.6 (`docs/Cassandra/development-roadmap.md`): open-l
 
 Before each of the three measured runs, in this order (roadmap Step 8):
 
-1. **Reset.** `docker compose down -v`, then `up -d --wait`, using `docker/cassandra/` or `docker/postgres/` unchanged, under the harness's own Compose project (`hfsbench-cassandra`, `hfsbench-postgres`) and ports (59542, 55632). On Cassandra it applies `docs/Cassandra/schema/` next. The harness refuses the shared `hfs-cassandra`/`hfs-postgres` projects and ports 59042 and 55432.
+1. **Reset.** Restore the snapshot of the loaded, settled database (the default, see "Reset by snapshot"). Building that snapshot, once per size, and `--reset reload`, every run, do `docker compose down -v`, then `up -d --wait`, using `docker/cassandra/` or `docker/postgres/` unchanged, under the harness's own Compose project (`hfsbench-cassandra`, `hfsbench-postgres`) and ports (59542, 55632). On Cassandra it applies `docs/Cassandra/schema/` next. The harness refuses the shared `hfs-cassandra`/`hfs-postgres` projects and ports 59042 and 55432.
 2. **Start HFS** on the freshly reset database. HFS is never restarted on a Cassandra node that has seen load (bug #74); a reset comes first.
 3. **Probe,** for the search operations only. A 501 (Cassandra until Step 6) or other refusal is written to `run.json` with `status: not_implemented` or `refused`, and the cell is skipped. It is not a failure.
-4. **Load** the dataset through batch Bundles of `PUT` entries (`docs/Cassandra/datasets/ndjson_to_batches.py`, cached under the output directory) and check each entry's status, since a batch answers 200 even when an entry fails.
-5. **Settle.** Cassandra: `nodetool flush`, then wait for `pending tasks: 0`. PostgreSQL: `CHECKPOINT` and `VACUUM (ANALYZE)`, its counterpart.
+4. **Load,** when building the snapshot or with `--reset reload`: the dataset goes through batch Bundles of `PUT` entries (`docs/Cassandra/datasets/ndjson_to_batches.py`, cached under the output directory) and each entry's status is checked, since a batch answers 200 even when an entry fails.
+5. **Settle,** before the snapshot is taken, or after each reload. Cassandra: `nodetool flush`, then wait for `pending tasks: 0`. PostgreSQL: `CHECKPOINT` and `VACUUM (ANALYZE)`, its counterpart.
 6. **JIT warm-up:** the same operation on the same schedule for `--warmup` seconds (60 by default), results thrown away. Then wait again for pending compactions to reach zero, so that compaction from the warm-up does not run into the measurement.
 7. **Measure** with `constant-arrival-rate`: `--duration` seconds (120 by default) at the calibrated rate, at most `concurrency` virtual users. Memory is sampled every 2 s throughout.
 
@@ -25,7 +25,7 @@ Before each of the three measured runs, in this order (roadmap Step 8):
 
 **Host load.** Before each run the harness records the host's 1, 5 and 15 minute load average, its CPU count, the processes above 5% CPU from `ps` without its own, and the sum of the running containers' memory limits (`host` in `run.json`). A host is quiet when the other processes use at most 200% CPU together. The idle Mac (18 GB, 11 cores, with a desktop session) read a median of 95% over 4 minutes, most of it WindowServer, and a compile uses 700% or more. The load average is recorded but doesn't decide: after a run it still holds the harness's own work (12.5 at 92% other-process CPU, measured). If the host isn't quiet, it waits up to `--host-wait-cap` seconds (default 120), then runs and records `host_busy`, which `runs.csv` and `summary.csv` carry. On Linux `ps` reports a process's lifetime CPU, so a brief spike there may not show.
 
-**Reset by snapshot (`--reset snapshot`).** Instead of reloading through HFS for every run, the harness loads each size once, settles it, stops the database and keeps a copy of the data volume, then restores that copy before each run. It is the same on both backends and needs no database command, and it is the state of a settled load, so HFS is never started on a node with tombstones (bug #74). `bench.py snapshot-check` measures it against a reload and proves it exact (row counts and checksums of every table, markers written by a dirty run gone).
+**Reset by snapshot (the default; `--reset reload` reloads every run).** Step 8's "load before each run" is read as "the loaded state before each run". Instead of reloading through HFS for every run, the harness loads each size once, settles it, stops the database and keeps a copy of the data volume, then restores that copy before each run. It is the same on both backends and needs no database command, and it is the state of a settled load, so HFS is never started on a node with tombstones (bug #74). `bench.py snapshot-check` measures it against a reload and proves it exact (row counts and checksums of every table, markers written by a dirty run gone).
 
 | 100,000 resources, laptop, 3 GiB | Reload | Restore |
 | --- | ---: | ---: |
@@ -113,17 +113,17 @@ The defaults are three runs, 120 s measured, 60 s warm-up, the 5 GiB profile, bo
 
 **On a shared machine** add `--docker-budget-gib N` to wait until the sum of the running containers' memory limits plus this leg's fits. On the 18 GB Macs, use `--profile 3g` and never report those numbers.
 
-**Roughly how long.** About 27 hours in total, on the timings below, which were measured on a laptop and are an upper estimate for a 32 GB desktop:
+**Roughly how long.** About 17 hours in total (about 14 until Step 6's searches), on timings measured on a laptop:
 
 | Part | Runs | Roughly |
 | --- | --- | --- |
-| Calibration | 36 cells, 1 run, 60 s each | 3 h |
-| PostgreSQL `on` | 108 | 11 h |
-| PostgreSQL `off`, create and update only | 36 | 4 h |
-| Cassandra | 108 once Step 6 lands; until then 54, with the 18 search cells recorded as 501 | 8 h (5 h before Step 6) |
-| LWT steady state, both backends | 3 runs of 600 s, one load | 1 h |
+| Calibration | 36 cells, 1 run, 60 s each | 1.4 h |
+| PostgreSQL `on` | 108 | 6 h |
+| PostgreSQL `off`, create and update only | 36 | 2 h |
+| Cassandra | 108 once Step 6 lands; until then 54, with the 18 search cells recorded as 501 | 6.3 h (3.3 h before Step 6) |
+| LWT steady state, both backends | 3 runs of 600 s, one load | 1.1 h |
 
-With `--reset snapshot`, the same matrix takes about 17 hours (about 14 until Step 6's searches), since a reset is then 10 to 25 s (measured on a laptop, see "Reset by snapshot").
+A restore and boot takes about 10 s on PostgreSQL and 21 s on Cassandra. With `--reset reload` the matrix takes about 27 hours.
 
 Per run with reloading, on top of 60 s of warm-up and 120 s measured: PostgreSQL 40 s of reset and settle at 10,000 resources and 3 to 6 minutes at 100,000, where loading dominates; Cassandra about 70 s of reset and boot, and 45 s of load at 100,000. Add `--resume` to continue a part that stopped, and split the parts over several nights if the machine's window needs it.
 

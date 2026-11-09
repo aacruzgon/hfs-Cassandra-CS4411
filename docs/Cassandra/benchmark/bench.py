@@ -1582,8 +1582,9 @@ def add_run_arguments(parser: argparse.ArgumentParser, out_required: bool = True
     parser.add_argument("--batches-tool", type=Path, default=HERE.parent / "datasets" / "ndjson_to_batches.py")
     parser.add_argument("--sha256sums", type=Path, default=HERE.parent / "datasets" / "SHA256SUMS",
                         help="the published checksums every dataset must match (default: %(default)s)")
-    parser.add_argument("--reset", choices=("reload", "snapshot"), default="reload",
-                        help="reset by reloading through HFS, or by restoring a copy of the loaded volume")
+    parser.add_argument("--reset", choices=("snapshot", "reload"), default="snapshot",
+                        help="snapshot restores a copy of the loaded, settled volume before each run; "
+                             "reload loads through HFS every run (default: %(default)s)")
     parser.add_argument("--host-wait-cap", type=float, default=120, help="seconds to wait for a quiet host before each run, then record it busy (default: %(default)s)")
     parser.add_argument("--bin-seconds", type=int, default=10, help="width of the time bins (default: %(default)s)")
     parser.add_argument("--build-profile", help="recorded HFS build profile (default: from the binary's path)")
@@ -2038,7 +2039,7 @@ def cmd_fetch_k6(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: List[str]) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -2075,7 +2076,7 @@ def main(argv: List[str]) -> int:
     overnight_parser.add_argument("--runs", type=int, default=3)
     overnight_parser.add_argument("--resume", action="store_true", help="continue the overnight run in --out")
     overnight_parser.add_argument("--lwt-duration", type=int, default=600, help="seconds of each LWT steady-state run (default: %(default)s)")
-    overnight_parser.set_defaults(handler=cmd_overnight, docker_budget_gib=8.3, backend="postgres", baseline="on", reset="snapshot")
+    overnight_parser.set_defaults(handler=cmd_overnight, docker_budget_gib=8.3, backend="postgres", baseline="on")
 
     summarize_parser = commands.add_parser("summarize", help="rewrite runs.csv and summary.csv from the run records")
     summarize_parser.add_argument("out", type=Path)
@@ -2085,7 +2086,11 @@ def main(argv: List[str]) -> int:
     fetch_parser.add_argument("--dest", type=Path, required=True)
     fetch_parser.set_defaults(handler=cmd_fetch_k6)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: List[str]) -> int:
+    args = build_parser().parse_args(argv)
     try:
         return args.handler(args)
     except Failure as failure:

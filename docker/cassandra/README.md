@@ -231,6 +231,8 @@ nodes.
 c stop cassandra-3
 c exec cassandra-1 nodetool status                 # DN for the stopped node
 c start cassandra-3
+# c start returns before the node listens; nodetool is refused for about 20 s
+until [ "$(docker inspect --format '{{.State.Health.Status}}' hfs-cassandra-cluster-cassandra-3-1)" = healthy ]; do sleep 2; done
 c exec cassandra-3 nodetool status                 # back to UN
 c exec cassandra-3 nodetool repair                 # at once, within 3 h of the stop
 ```

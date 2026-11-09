@@ -2065,7 +2065,8 @@ mod node_tests {
 /// no other test's scan and no later `hfs` boot on the node reads them. A test
 /// that fails leaves that keyspace behind. They write that many tombstones, so
 /// they never run by accident on a shared node;
-/// they are skipped unless this is set:
+/// they are skipped unless this is set, and fail if it names the shared dev
+/// node's port:
 ///
 /// - `HFS_TEST_CASSANDRA_TOMBSTONE_URL`: the node's `host:port`.
 ///
@@ -2089,6 +2090,22 @@ mod tombstone_limit_tests {
     /// How many of those writes may fail: still over the limit.
     const MAY_FAIL: usize = 999;
 
+    /// The host port of the shared development node (`docker/cassandra`'s
+    /// default), which these tests must never write to.
+    const SHARED_DEV_NODE_PORT: &str = "59042";
+
+    fn is_shared_dev_node(url: &str) -> bool {
+        url.trim().rsplit(':').next() == Some(SHARED_DEV_NODE_PORT)
+    }
+
+    #[test]
+    fn the_shared_dev_node_is_refused() {
+        assert!(is_shared_dev_node("127.0.0.1:59042"));
+        assert!(is_shared_dev_node(" localhost:59042 "));
+        assert!(!is_shared_dev_node("127.0.0.1:59142"));
+        assert!(!is_shared_dev_node("127.0.0.1"));
+    }
+
     /// A keyspace of the test's own, holding the columns the reads under test
     /// use; the backend is only asked for tenants and ids, so it needs no
     /// other table.
@@ -2104,6 +2121,11 @@ mod tombstone_limit_tests {
                 eprintln!("skipping: {URL} is not set");
                 return None;
             };
+            assert!(
+                !is_shared_dev_node(&url),
+                "{URL} is {url}, the shared dev node: these tests write {TOMBSTONES} tombstones \
+                 each, so give them a node of their own"
+            );
             let config = |keyspace: Option<&str>| {
                 let mut config = CassandraConfig {
                     contact_points: vec![url.clone()],

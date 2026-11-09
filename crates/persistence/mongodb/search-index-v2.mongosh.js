@@ -92,12 +92,43 @@ db.runCommand({
         "tenant_id": 1,
         "resource_type": 1,
         "param_name": 1,
+        "tuple_code": 1,
+        "value_quantity_value": 1,
+        "resource_id": 1
+      },
+      "name": "idx_search_composite_tuple_qty",
+      "partialFilterExpression": {
+        "tuple_code": {
+          "$exists": true
+        }
+      }
+    },
+    {
+      "key": {
+        "tenant_id": 1,
+        "resource_type": 1,
+        "param_name": 1,
         "value_reference": 1,
         "resource_id": 1
       },
       "name": "idx_search_reference_v2",
       "partialFilterExpression": {
         "value_reference": {
+          "$exists": true
+        }
+      }
+    },
+    {
+      "key": {
+        "tenant_id": 1,
+        "resource_type": 1,
+        "param_name": 1,
+        "value_reference_target": 1,
+        "resource_id": 1
+      },
+      "name": "idx_search_reference_target_v2",
+      "partialFilterExpression": {
+        "value_reference_target": {
           "$exists": true
         }
       }

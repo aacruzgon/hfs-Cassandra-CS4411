@@ -2244,30 +2244,15 @@ mod es_integration {
         .await;
     }
 
-    /// #2296: `_revinclude` runs one reference search per resource, which does
-    /// not match absolute references; reported, not fixed, in this change.
+    /// #2296 / #2394: `_revinclude` matches relative and absolute reference
+    /// forms alike; no divergence from the shared expectation remains.
     #[tokio::test]
     async fn es_revinclude_matches_every_reference_form() {
-        use super::revinclude_reference_forms_suite::Divergence;
-
         let backend = create_backend().await;
         super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
             &backend,
             "revinclude-forms-2296",
-            &[
-                Divergence {
-                    id: "prov-abs",
-                    included: false,
-                },
-                Divergence {
-                    id: "prov-abs-ver",
-                    included: false,
-                },
-                Divergence {
-                    id: "prov-dot-abs",
-                    included: false,
-                },
-            ],
+            &[],
         )
         .await;
     }
@@ -2316,28 +2301,6 @@ mod es_integration {
                 Divergence {
                     label: "Observation?code:below=http://loinc.org|1234-5",
                     expect: Expect::Ids(&["ob-pat"]),
-                },
-                // `:[type]` filters on the indexed `resource_type`, which a versioned
-                // reference does not carry, and a bare id also matches an absolute URL.
-                Divergence {
-                    label: "Observation?subject:Patient=p1",
-                    expect: Expect::Ids(&["ob-abs", "ob-pat"]),
-                },
-                Divergence {
-                    label: "Observation?subject:Patient=Patient/p1",
-                    expect: Expect::Ids(&["ob-pat"]),
-                },
-                Divergence {
-                    label: "Observation?subject:Patient=Patient/p1/_history/2",
-                    expect: Expect::Ids(&["ob-pat"]),
-                },
-                Divergence {
-                    label: "Observation?subject:Patient=p1,nobody",
-                    expect: Expect::Ids(&["ob-abs", "ob-pat"]),
-                },
-                Divergence {
-                    label: "Observation?subject:Patient=p1&code=9999-9",
-                    expect: Expect::Ids(&["ob-abs"]),
                 },
                 // `:identifier` looks for token rows under the reference parameter's own
                 // name, which nothing writes: it never matches.

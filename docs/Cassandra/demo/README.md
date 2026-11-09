@@ -12,8 +12,10 @@ The script does not start anything. Start the database and HFS first, then run i
 docker compose -f docker/postgres/docker-compose.yml up -d --wait
 cargo build -p helios-hfs --bin hfs --features postgres
 
-if curl -s -m 2 -o /dev/null http://127.0.0.1:58080/metadata; then
-  echo "something already answers on port 58080: stop it first" >&2
+rc=0
+curl -s -m 2 -o /dev/null http://127.0.0.1:58080/metadata || rc=$?
+if [ "$rc" -ne 7 ]; then
+  echo "port 58080 is not free (curl exit $rc): stop what holds it first" >&2
   exit 1
 fi
 
@@ -34,8 +36,10 @@ Apply the schema once, as `docs/Cassandra/schema/README.md` says; HFS only check
 ```bash
 cargo build -p helios-hfs --bin hfs --features cassandra
 
-if curl -s -m 2 -o /dev/null http://127.0.0.1:58080/metadata; then
-  echo "something already answers on port 58080: stop it first" >&2
+rc=0
+curl -s -m 2 -o /dev/null http://127.0.0.1:58080/metadata || rc=$?
+if [ "$rc" -ne 7 ]; then
+  echo "port 58080 is not free (curl exit $rc): stop what holds it first" >&2
   exit 1
 fi
 
@@ -76,10 +80,10 @@ The log says what HFS was started with, not who answers on the port. HFS writes 
 
 Two checks cover the second gap, and neither is the script's:
 
-- **Before starting HFS, refuse a port that already answers,** as the commands above do. Otherwise an old HFS answers while the new one is still starting, and the script can finish with every step passed and `"backend_confirmed": true` before the new one tries to bind.
+- **Before starting HFS, refuse a port that is not free,** as the commands above do. Only curl's exit 7, connection refused, counts as free. A server that stalls past curl's 2 s timeout is still there, so any other failure refuses too. Otherwise an old HFS answers while the new one is still starting, and the script can finish with every step passed and `"backend_confirmed": true` before the new one tries to bind.
 - **Once the script ends, check that the HFS you started is still running.** An HFS that cannot bind its port writes that same line and then exits 1, while whatever holds the port keeps answering. `kill "$HFS_PID"` in the commands above fails in that case; a CI job must fail on it.
 
-Row 8.6's job needs all four: the refusal of a port that already answers, a new log file for each run, `--server-log` with `"backend_confirmed": true` in the summary, and the process check. Only the database shows directly which backend stored a run. The report's summary has the `run_id`, and the run's tenants are `demo-<run id>-a` and `-b`, so the job may also count that run's rows there.
+Row 8.6's job needs all four: the refusal of a port that is not free, a new log file for each run, `--server-log` with `"backend_confirmed": true` in the summary, and the process check. Only the database shows directly which backend stored a run. The report's summary has the `run_id`, and the run's tenants are `demo-<run id>-a` and `-b`, so the job may also count that run's rows there.
 
 ## Output
 

@@ -11,7 +11,7 @@ The repository holds the recipe and the checksums, not the data:
 | `manifest.json` | The recorded inputs: Synthea's release, version and modules, the seeds, the population, each file's checksum and its counts. |
 | `SHA256SUMS` | The two checksums, for `shasum -a 256 -c`. |
 
-The NDJSON itself is 10 MB and 104 MB, and is published as a release asset.
+The NDJSON itself is 10 MB and 104 MB, and is published as assets of the release [`benchmark-datasets-2026-11-09`](https://github.com/aacruzgon/hfs-Cassandra-CS4411/releases/tag/benchmark-datasets-2026-11-09).
 
 ## Regenerate or verify
 
@@ -30,6 +30,25 @@ A run takes about a minute, peaks at about 2.2 GB of memory, and writes 1.6 GB o
 The exit status is 0 on success, 1 when `--verify` finds a difference, and 2 when the run could not be done.
 
 If the jar download fails, fetch it with `gh release download v4.0.0 --repo synthetichealth/synthea --pattern synthea-with-dependencies.jar` and pass it with `--jar`. The checksum is enforced either way.
+
+## Publish the release
+
+Regenerate from `main`, check the files against the committed checksums, and attach them to the release:
+
+```bash
+python3 docs/Cassandra/datasets/generate_datasets.py --verify --out-dir "$HOME/hfs-datasets"
+(cd "$HOME/hfs-datasets" && shasum -a 256 -c "$OLDPWD/docs/Cassandra/datasets/SHA256SUMS")
+gh release create benchmark-datasets-2026-11-09 \
+  --repo aacruzgon/hfs-Cassandra-CS4411 --target main \
+  --title "Benchmark datasets, Synthea v4.0.0 (row 0.7)" \
+  --notes "Patient and Observation only, 10,000 and 100,000 resources. Recipe and checksums: docs/Cassandra/datasets/." \
+  "$HOME/hfs-datasets/patient-observation-10000.ndjson" \
+  "$HOME/hfs-datasets/patient-observation-100000.ndjson" \
+  "$HOME/hfs-datasets/manifest.json" \
+  "$HOME/hfs-datasets/SHA256SUMS"
+```
+
+This creates `https://github.com/aacruzgon/hfs-Cassandra-CS4411/releases/tag/benchmark-datasets-2026-11-09`.
 
 ## What is fixed, and why
 

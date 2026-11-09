@@ -2300,6 +2300,11 @@ mod tombstone_limit_tests {
         keyspace
             .insert("test-tombstone-other", "SearchParameter", "foreign", None)
             .await;
+        // Another type of the same tenant: the scan must not keep it, or it
+        // would hold, and point-read, every resource the tenant has.
+        keyspace
+            .insert(tenant, "Patient", "not-a-search-parameter", None)
+            .await;
         keyspace.write_tombstones(tenant, "SearchParameter").await;
         assert!(
             !keyspace.refuses(SELECT_TENANT_TYPES, Vec::new()).await,

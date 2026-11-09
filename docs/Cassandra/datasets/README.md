@@ -36,8 +36,8 @@ If the jar download fails, fetch it with `gh release download v4.0.0 --repo synt
 Regenerate from `main`, check the files against the committed checksums, and attach them to the release:
 
 ```bash
-python3 docs/Cassandra/datasets/generate_datasets.py --verify --out-dir "$HOME/hfs-datasets"
-(cd "$HOME/hfs-datasets" && shasum -a 256 -c "$OLDPWD/docs/Cassandra/datasets/SHA256SUMS")
+python3 docs/Cassandra/datasets/generate_datasets.py --verify --out-dir "$HOME/hfs-datasets" &&
+(cd "$HOME/hfs-datasets" && shasum -a 256 -c "$OLDPWD/docs/Cassandra/datasets/SHA256SUMS") &&
 gh release create benchmark-datasets-2026-11-09 \
   --repo aacruzgon/hfs-Cassandra-CS4411 --target main \
   --title "Benchmark datasets, Synthea v4.0.0 (row 0.7)" \
@@ -48,7 +48,7 @@ gh release create benchmark-datasets-2026-11-09 \
   "$HOME/hfs-datasets/SHA256SUMS"
 ```
 
-This creates `https://github.com/aacruzgon/hfs-Cassandra-CS4411/releases/tag/benchmark-datasets-2026-11-09`.
+The `&&`s stop at the first failure, so a `MISMATCH` or a failed checksum never reaches `gh release create`. Paste it as one command. This creates `https://github.com/aacruzgon/hfs-Cassandra-CS4411/releases/tag/benchmark-datasets-2026-11-09`.
 
 ## What is fixed, and why
 

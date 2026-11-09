@@ -87,7 +87,38 @@ Two checks cover the second gap, and neither is the script's:
 - **Before starting HFS, refuse a port that is not free,** as the commands above do. Only curl's exit 7, connection refused, counts as free. A server that stalls past curl's 2 s timeout is still there, so any other failure refuses too. Otherwise an old HFS answers while the new one is still starting, and the script can finish with every step passed and `"backend_confirmed": true` before the new one tries to bind.
 - **Once the script ends, check that the HFS you started is still running.** An HFS that cannot bind its port writes that same line and then exits 1, while whatever holds the port keeps answering. `kill "$HFS_PID"` in the commands above fails in that case, and they exit 1; a CI job must fail on it.
 
-Row 8.6's job needs all four: the refusal of a port that is not free, a new log file for each run, `--server-log` with `"backend_confirmed": true` in the summary, and the process check. Only the database shows directly which backend stored a run. The report's summary has the `run_id`, and the run's tenants are `demo-<run id>-a` and `-b`, so the job may also count that run's rows there.
+### What row 8.6's job must check
+
+Row 8.6's job needs all five, and a run passes only with all five:
+
+1. the refusal of a port that is not free;
+2. a new log file for each run;
+3. `--server-log`, with `"backend_confirmed": true` in the summary;
+4. the process check;
+5. the row count: the backend holds this run's rows.
+
+The first four narrow the gap without closing it: a server that starts listening just after the refusal still passes them. Only the database shows which backend stored a run. The script talks only to the URL it is given, so the job does this count itself.
+
+Add `--report target/demo-report.jsonl` to the script's command and put this between the `kill` and the `exit`:
+
+```bash
+run_id=$(python3 -c '
+import json, sys
+summary = [json.loads(line) for line in open(sys.argv[1])][-1]
+assert summary["summary"] and summary["backend_confirmed"]
+print(summary["run_id"])
+' target/demo-report.jsonl)
+rows=$(docker compose -f docker/postgres/docker-compose.yml exec -T postgres \
+  psql -U helios -d helios -Atc "SELECT count(*) FROM resources WHERE tenant_id LIKE 'demo-$run_id-%'")
+if [ "$rows" != 16 ]; then
+  echo "PostgreSQL holds $rows rows for this run, expected 16" >&2
+  status=1
+fi
+```
+
+A run leaves 16 rows on PostgreSQL: 15 in tenant `demo-<run id>-a` and 1 in `demo-<run id>-b`, deleted resources included, because HFS keeps their rows. If a section changes what it creates, change the 16 here.
+
+On Cassandra the count applies once Step 8 runs it, which is when the script first has to pass there. The job counts the same two tenants, with `SELECT count(*) FROM helios.resources WHERE tenant_id = 'demo-<run id>-a' ALLOW FILTERING;` and the same for `-b`. A run on 2026-11-09 left 15 there, 14 and 1: PostgreSQL's 16 less the transaction's entry, which Cassandra refuses. Step 8 sets the number it requires.
 
 ## Output
 

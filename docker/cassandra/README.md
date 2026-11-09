@@ -198,15 +198,25 @@ HFS_TEST_CASSANDRA_URL=127.0.0.1:59342 \
 These tests were written for one node, and on three a few fail for reasons
 that are expected today:
 
-- `node_runs_the_docker_cassandra_configuration` asserts rack `helios-rack1`,
-  and the query can land on another node.
-- The concurrent-write tests in `step3_suites` (`versioned_write_race_suite.rs`)
-  fail some of the time with a backend `Timeout` from a `LOCAL_SERIAL` read:
-  `CAS operation timed out: received 0 of 2 required responses`. Cassandra 5.0.9
-  raises it when a competing proposal supersedes the read's Paxos round, and
-  raising the CPU limit from 2 to 4 per node did not change the rate. These
-  tests stop at that assertion, so a failing run does not check the version
-  history; the runs that pass do.
+- `node_runs_the_docker_cassandra_configuration` always fails. It asserts that
+  the driver sees one node (`one node, no peers`), and on the cluster it sees
+  three.
+- The concurrent-write tests fail some of the time with a backend `Timeout`
+  (504) from a `LOCAL_SERIAL` read: `CAS operation timed out: received 0 of 2
+  required responses`. They are the tests in `step3_suites`
+  (`versioned_write_race_suite.rs`) and
+  `create_read::cassandra_concurrent_creates_of_one_id_make_exactly_one_resource`.
+  Cassandra 5.0.9 raises the error when a competing proposal supersedes the
+  read's Paxos round, and raising the CPU limit from 2 to 4 per node did not
+  change the rate. The answer can reach the writer that won: seven of eight
+  concurrent creates got `AlreadyExists` and the eighth got the 504. These tests
+  panic on the outcomes, before any version-history check, so a failing run does
+  not check the history; the runs that pass do.
+
+On RF 3 this 504 is an accepted answer. Item 8.3 checks the invariants instead
+(no history gap, one winner per version, no lost write), and the race suites
+need a cluster-aware outcome check, which also verifies the history, before
+Step 8.
 
 ## Failure procedures
 

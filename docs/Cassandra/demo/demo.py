@@ -707,13 +707,14 @@ def batch(demo: Demo) -> None:
         then=lambda a: [equal("ETag", a.header("etag"), 'W/"2"'), equal("family", family(a), "Bumped")],
     )
 
+    in_transaction = f"batch-transaction-{run}"
     transaction = {
         "resourceType": "Bundle",
         "type": "transaction",
         "entry": [
             {
-                "resource": demo.patient("InTransaction"),
-                "request": {"method": "POST", "url": "Patient"},
+                "resource": demo.patient("InTransaction", id=in_transaction),
+                "request": {"method": "PUT", "url": f"Patient/{in_transaction}"},
             }
         ],
     }
@@ -740,6 +741,20 @@ def batch(demo: Demo) -> None:
             ]
             if demo.backend == "postgres"
             else [outcome(a), equal("issue code", ((a.body or {}).get("issue") or [{}])[0].get("code"), "not-supported")]
+        ),
+    )
+    demo.step(
+        "the transaction's entry is there only if the transaction was accepted",
+        Differs(postgres=200, cassandra=404),
+        Differs(
+            postgres=f"{HTTP}#transaction (SHALL accept all actions, or reject all); {DOC_READ}",
+            cassandra=f"{COVERAGE} section 6, 'Transaction Bundle' (before any entry is applied); {HTTP}#read (404)",
+        ),
+        "GET",
+        f"Patient/{in_transaction}",
+        tenant,
+        then=lambda a: (
+            [equal("family", family(a), "InTransaction")] if demo.backend == "postgres" else [outcome(a)]
         ),
     )
 

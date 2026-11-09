@@ -153,6 +153,11 @@ def outcome(answer: Answer) -> Check:
     return equal("body resourceType", (answer.body or {}).get("resourceType"), "OperationOutcome")
 
 
+def searchset(answer: Answer) -> Check:
+    """An empty result only means something if the answer really is a search result."""
+    return equal("Bundle.type", (answer.body or {}).get("type"), "searchset")
+
+
 def version(answer: Answer) -> object:
     return (answer.body or {}).get("meta", {}).get("versionId")
 
@@ -910,7 +915,7 @@ def delete(demo: Demo) -> None:
         "GET",
         q("Patient", identifier=token),
         tenant,
-        then=lambda a: [same_ids("matches", a.entry_ids(), [])],
+        then=lambda a: [searchset(a), same_ids("matches", a.entry_ids(), [])],
     )
     demo.step("deleting it again is a no-op", 204, DOC_DELETE, "DELETE", path, tenant)
 
@@ -950,7 +955,7 @@ def isolation(demo: Demo) -> None:
         "GET",
         q("Patient", identifier=token),
         b,
-        then=lambda r: [same_ids("matches", r.entry_ids(), [])],
+        then=lambda r: [searchset(r), same_ids("matches", r.entry_ids(), [])],
     )
     demo.step(
         "tenant A can find it by search",

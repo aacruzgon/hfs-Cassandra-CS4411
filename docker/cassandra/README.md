@@ -207,11 +207,12 @@ that are expected today:
   (`versioned_write_race_suite.rs`) and
   `create_read::cassandra_concurrent_creates_of_one_id_make_exactly_one_resource`.
   Cassandra 5.0.9 raises the error when a competing proposal supersedes the
-  read's Paxos round, and raising the CPU limit from 2 to 4 per node did not
-  change the rate. The answer can reach the writer that won: seven of eight
-  concurrent creates got `AlreadyExists` and the eighth got the 504. These tests
-  panic on the outcomes, before any version-history check, so a failing run does
-  not check the history; the runs that pass do.
+  read's Paxos round. Raising the CPU limit from 2 to 4 per node did not change
+  the rate in the one test tried, on a host busy with other builds (9 and 12 of
+  20 runs failed at 4 CPUs, 11 of 20 at 2). The answer can reach the writer that
+  won: seven of eight concurrent creates got `AlreadyExists` and the eighth got
+  the 504. These tests panic on the outcomes, before any version-history check,
+  so a failing run does not check the history; the runs that pass do.
 
 On RF 3 this 504 is an accepted answer. Item 8.3 checks the invariants instead
 (no history gap, one winner per version, no lost write), and the race suites

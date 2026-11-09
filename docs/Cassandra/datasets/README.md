@@ -44,11 +44,11 @@ The inputs are constants at the top of `generate_datasets.py` and are all record
 | `user.timezone` | UTC | Synthea writes dates in the JVM's zone, so `effectiveDateTime` and even `birthDate` change with the machine's zone. |
 | thread pool | 4 | Recorded for the record. The checksums do not depend on it, and `--verify --threads N` lets you check that. |
 
-Other configuration, listed in `manifest.json`, is stated so that a changed Synthea default cannot move the data.
+The other Synthea settings, listed in `manifest.json`, are stated so that the record is complete.
 
 The checksums cover the filtered NDJSON, not Synthea's output. Whole Bundles differ between runs, even at one thread count, in resource types other than Patient and Observation.
 
-The filter also removes Synthea's two quality-of-life extensions from Patient (`disability-adjusted-life-years` and `quality-adjusted-life-years`). They hold 16-digit results of `Math.exp` and `Math.pow`, whose last digit differs between x86-64 and arm64, and they were the only values that differed. With them gone, the checksums were the same on arm64 and x86-64 (in a Rosetta container), on Java 17 and 21, on macOS and Linux. No real x86-64 machine has run it yet.
+The filter also removes Synthea's two quality-of-life extensions from Patient (`disability-adjusted-life-years` and `quality-adjusted-life-years`). They hold 16-digit results of `Math.exp` and `Math.pow`, whose last digit differs between x86-64 and arm64, and they were the only values that differed. With them gone, the checksums were the same on arm64 and x86-64 (in a container under Rosetta), on Java 17 and 21, on macOS and Linux. No real x86-64 machine has run it yet.
 
 ## What the files contain
 
@@ -56,7 +56,7 @@ Each line is one resource: UTF-8, sorted keys, no spaces, `\n` line endings, and
 
 Patients are in `Patient.id` order, each followed by its Observations in `id` order. Each file stops at its exact size, which cuts the last patient's Observations, and the 10,000 file is a byte prefix of the 100,000 file.
 
-`Observation.encounter` points at Encounters that are not in the dataset, because the filter keeps only Patient and Observation. Both backends accept these references and store them unchanged; see below.
+`Observation.encounter` points at Encounters that are not in the dataset, because the filter keeps only Patient and Observation. Both backends accept these references and store them unchanged, and a read of such an Encounter answers 404. On PostgreSQL, a search by that reference value still matches.
 
 ## Loading
 

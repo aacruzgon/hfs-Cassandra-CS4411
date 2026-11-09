@@ -76,9 +76,9 @@ JVM_PROPERTIES = (
     "-Dfile.encoding=UTF-8",
 )
 
-# Each is Synthea's default today, except the two hospital and practitioner
+# Each is the default in this jar, except the two hospital and practitioner
 # lines, which skip files the filter never reads. They are stated so the
-# manifest records them and a change of default cannot move the data.
+# manifest records them.
 SYNTHEA_CONFIG = {
     "exporter.years_of_history": "10",
     "exporter.fhir.export": "true",
@@ -136,8 +136,11 @@ def download(url: str, destination: Path) -> None:
                 url, headers={"User-Agent": "hfs-benchmark-datasets"}
             )
             with urllib.request.urlopen(request, timeout=120) as response:
+                length = response.headers.get("Content-Length")
                 with partial.open("wb") as out:
                     shutil.copyfileobj(response, out, 1 << 20)
+            if length is not None and partial.stat().st_size != int(length):
+                raise OSError(f"short read: {partial.stat().st_size} of {length}")
             partial.replace(destination)
             return
         except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
@@ -318,11 +321,15 @@ def resources_of_patient(patient_id: str, path: Path) -> List[dict]:
         (r for r in kept if r["resourceType"] == "Observation"),
         key=lambda r: r["id"],
     )
-    patients[0]["extension"] = [
+    extensions = [
         extension
         for extension in patients[0].get("extension", [])
         if extension.get("url") not in DROPPED_PATIENT_EXTENSIONS
     ]
+    if extensions:
+        patients[0]["extension"] = extensions
+    else:
+        patients[0].pop("extension", None)
     ordered = patients + observations
     for resource in ordered:
         resolve_references(resource, full_urls, f"{path.name} {resource['id']}")
@@ -389,27 +396,36 @@ def write_datasets(fhir_dir: Path, out_dir: Path) -> Dict[str, dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
     sizes = sorted(SIZES)
     paths = {size: out_dir / f"patient-observation-{size}.ndjson" for size in sizes}
-    streams = {size: paths[size].open("wb") for size in sizes}
+    # Written under another name, so a failed run cannot leave a partial file
+    # that looks like a dataset.
+    partials = {size: paths[size].with_name(f"{paths[size].name}.part") for size in sizes}
     stats = {size: DatasetStats() for size in sizes}
-    try:
-        for index, resource in enumerate(stream_resources(fhir_dir, sizes[-1])):
-            line = canonical_line(resource)
-            for size in sizes:
-                if index < size:
-                    streams[size].write(line)
-                    stats[size].add(resource)
-    finally:
-        for stream in streams.values():
-            stream.close()
     records = {}
-    for size in sizes:
-        record = stats[size].as_record()
-        if record["resources"] != size:
-            raise Failure(f"{paths[size]} has {record['resources']} resources")
-        record["file"] = paths[size].name
-        record["bytes"] = paths[size].stat().st_size
-        record["sha256"] = sha256_of(paths[size])
-        records[str(size)] = record
+    try:
+        streams = {size: partials[size].open("wb") for size in sizes}
+        try:
+            for index, resource in enumerate(stream_resources(fhir_dir, sizes[-1])):
+                line = canonical_line(resource)
+                for size in sizes:
+                    if index < size:
+                        streams[size].write(line)
+                        stats[size].add(resource)
+        finally:
+            for stream in streams.values():
+                stream.close()
+        for size in sizes:
+            record = stats[size].as_record()
+            if record["resources"] != size:
+                raise Failure(f"{paths[size]} has {record['resources']} resources")
+            record["file"] = paths[size].name
+            record["bytes"] = partials[size].stat().st_size
+            record["sha256"] = sha256_of(partials[size])
+            records[str(size)] = record
+        for size in sizes:
+            partials[size].replace(paths[size])
+    finally:
+        for partial in partials.values():
+            partial.unlink(missing_ok=True)
     return records
 
 
@@ -476,19 +492,20 @@ def differences(expected: object, actual: object, path: str = "") -> List[str]:
     return []
 
 
+def sums_text(manifest: dict) -> str:
+    return "".join(
+        f"{record['sha256']}  {record['file']}\n"
+        for _, record in sorted(manifest["datasets"].items(), key=lambda i: int(i[0]))
+    )
+
+
 def write_outputs(out_dir: Path, manifest: dict) -> None:
     text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     (out_dir / "manifest.json").write_text(text, encoding="utf-8")
-    lines = [
-        f"{record['sha256']}  {record['file']}\n"
-        for _, record in sorted(manifest["datasets"].items(), key=lambda i: int(i[0]))
-    ]
-    (out_dir / "SHA256SUMS").write_text("".join(lines), encoding="ascii")
+    (out_dir / "SHA256SUMS").write_text(sums_text(manifest), encoding="ascii")
 
 
 def generate(args: argparse.Namespace, out_dir: Path, jar: Path) -> dict:
-    if args.work_dir is not None:
-        Path(args.work_dir).mkdir(parents=True, exist_ok=True)
     work_dir = Path(tempfile.mkdtemp(prefix="synthea-", dir=args.work_dir))
     try:
         output = run_synthea(jar, work_dir, args.threads)
@@ -516,6 +533,9 @@ def verify(args: argparse.Namespace, jar: Path) -> int:
         if temporary is not None:
             shutil.rmtree(temporary, ignore_errors=True)
     found = differences(comparable(expected), comparable(actual))
+    committed_sums = COMMITTED_MANIFEST.with_name("SHA256SUMS")
+    if not committed_sums.is_file() or committed_sums.read_text() != sums_text(actual):
+        found.append(f"{committed_sums.name}: does not match this run's checksums")
     if found:
         print(f"MISMATCH: {len(found)} difference(s) from {COMMITTED_MANIFEST}:")
         for line in found:
@@ -570,6 +590,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         parser.error("--out-dir is required unless --verify is given")
     if args.threads < 1:
         parser.error("--threads must be at least 1")
+    # Synthea runs in its own directory, so every path it is given is absolute.
+    if args.jar is not None:
+        args.jar = args.jar.resolve()
+    if args.work_dir is not None:
+        args.work_dir = str(Path(args.work_dir).resolve())
+        Path(args.work_dir).mkdir(parents=True, exist_ok=True)
     return args
 
 
@@ -592,6 +618,6 @@ def main(argv: List[str]) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
-    except (Failure, OSError) as failure:
-        print(f"error: {failure}", file=sys.stderr)
+    except (Failure, OSError, ValueError, KeyError, TypeError) as failure:
+        print(f"error: {failure!r}", file=sys.stderr)
         sys.exit(2)

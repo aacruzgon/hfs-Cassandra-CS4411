@@ -17,6 +17,7 @@ Exit status: 0 on success, 2 when the input is unusable.
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import List
@@ -27,6 +28,10 @@ DEFAULT_ENTRIES = 500
 
 # Well under `HFS_MAX_BODY_SIZE` (128 MiB), which also holds a body in memory.
 DEFAULT_MAX_BYTES = 32 * 1024 * 1024
+
+BUNDLE_START = '{"entry":['
+BUNDLE_END = '],"resourceType":"Bundle","type":"batch"}\n'
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 class Failure(Exception):
@@ -39,13 +44,21 @@ def entry_for(line: str, number: int) -> str:
         kind, resource_id = resource["resourceType"], resource["id"]
     except (ValueError, KeyError, TypeError) as error:
         raise Failure(f"line {number}: not a FHIR resource: {error}")
-    # The line goes in as it is, so a decimal such as 704.20 keeps its text.
+    if UUID.fullmatch(resource_id) is None:
+        raise Failure(f"line {number}: id {resource_id} is not a UUID")
+    # R4 Bundle.entry.fullUrl "SHALL have a value" except on a POST, and
+    # urn:uuid is absolute. The line goes in as it is, so a decimal such as
+    # 704.20 keeps its text.
     request = json.dumps({"method": "PUT", "url": f"{kind}/{resource_id}"})
-    return '{"request":' + request + ',"resource":' + line.rstrip("\n") + "}"
+    return (
+        f'{{"fullUrl":"urn:uuid:{resource_id}","request":{request},"resource":'
+        + line.rstrip("\n")
+        + "}"
+    )
 
 
 def write_bundle(out_dir: Path, sequence: int, entries: List[str]) -> None:
-    body = '{"entry":[' + ",".join(entries) + '],"resourceType":"Bundle","type":"batch"}\n'
+    body = BUNDLE_START + ",".join(entries) + BUNDLE_END
     (out_dir / f"batch-{sequence:06d}.json").write_text(body, encoding="utf-8")
 
 
@@ -53,8 +66,9 @@ def convert(source: Path, out_dir: Path, max_entries: int, max_bytes: int) -> di
     out_dir.mkdir(parents=True, exist_ok=True)
     if any(out_dir.iterdir()):
         raise Failure(f"{out_dir} is not empty; old Bundles would be loaded too")
-    # The fixed text around the entries, and one comma per entry.
-    envelope = 50
+    # The text around the entries. Each entry below counts one comma, which
+    # is one more than a Bundle has, hence the - 1.
+    envelope = len(BUNDLE_START) + len(BUNDLE_END) - 1
     sequence, total = 0, 0
     entries: List[str] = []
     size = envelope

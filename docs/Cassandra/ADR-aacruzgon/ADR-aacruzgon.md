@@ -117,3 +117,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0070](2026-11-07/0070-coverage-cachedir-tag.md) | 2026-11-07 | The persistent target dirs carry cargo's `CACHEDIR.TAG`, so `cargo llvm-cov clean` really cleans the coverage dir; the coverage report also runs `step3_crud_through_rest` and gets a `crates/rest` section | accepted |
 | [0071](2026-11-08/0071-fhir-versions-ci-gate.md) | 2026-11-08 | The all-versions job fails unless every version really ran its tests; the required fmt job runs the report's tests; the job's target-dir caps and its two builds are recorded | accepted |
 | [0072](2026-11-09/0072-three-node-cluster.md) | 2026-11-09 | The three-node Compose cluster: RF 3 without touching the schema, two profiles, topology, and what RF 3 accepts | accepted |
+| [0073](2026-11-09/0073-benchmark-datasets.md) | 2026-11-09 | Benchmark datasets come from our own Synthea run, checksummed as filtered NDJSON | accepted |

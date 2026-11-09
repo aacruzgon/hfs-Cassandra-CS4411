@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""Generate the benchmark datasets of roadmap row 0.7, or check they regenerate.
+
+    python3 docs/Cassandra/datasets/generate_datasets.py --out-dir /some/big/disk/d
+    python3 docs/Cassandra/datasets/generate_datasets.py --verify
+
+One Synthea run with every input fixed, then Patient and Observation only, as
+sorted NDJSON, cut to exactly 10,000 and 100,000 resources. See README.md next
+to this file. It needs Python 3.9 or later, Java 17 or later, and nothing else.
+
+The inputs below are the whole recipe. Four of them are easy to miss, and
+each one changes the data if it is left out:
+
+  -e        Without it Synthea simulates up to the current time, so the same
+            command run on a later date produces different patients.
+  user.timezone
+            Synthea renders dates in the JVM's zone, so `effectiveDateTime`
+            and even `birthDate` change with the machine's time zone.
+  the jar   `master-branch-latest` moves; v4.0.0's digest does not.
+  exporter.use_uuid_filenames
+            By default a file name holds the patient's name. In a POSIX locale
+            Java cannot encode a non-ASCII name as a path, so that patient's
+            file is lost and Synthea still exits 0.
+
+Whole Bundles are not reproducible: resource types other than Patient and
+Observation differ between runs, even at the same thread count. That is why
+the checksums cover the filtered NDJSON and not Synthea's output.
+
+The two Synthea quality-of-life extensions on Patient are removed for the same
+reason: they carry 16-digit results of Math.exp and Math.pow, whose last digit
+differs between x86-64 and arm64. See DROPPED_PATIENT_EXTENSIONS.
+
+Exit status: 0 on success, 1 when the result differs from the committed
+manifest.json or SHA256SUMS (plain generation still writes its files), 2 when
+the run could not be done (no Java, a jar that fails its checksum, Synthea
+failing).
+"""
+
+import argparse
+import hashlib
+import http.client
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from collections import Counter
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional, Set, Tuple
+
+RELEASE_TAG = "v4.0.0"
+JAR_NAME = "synthea-with-dependencies.jar"
+JAR_URL = (
+    "https://github.com/synthetichealth/synthea/releases/download/"
+    f"{RELEASE_TAG}/{JAR_NAME}"
+)
+JAR_SHA256 = "ed43c20ad40ba5c3bc724503a5af032715fe3c491620b766148e7c2361e6ecc1"
+
+SEED = 20261108
+CLINICIAN_SEED = 20261108
+REFERENCE_DATE = "20260101"
+END_DATE = "20260101"
+POPULATION = 400
+STATE = "Massachusetts"
+THREADS = 4
+
+# Peak resident memory at 400 people is up to about 2.5 GB with this heap. The
+# heap has no effect on the data, so a lower one is safe to try.
+MAX_HEAP = "3g"
+
+JVM_PROPERTIES = (
+    "-Duser.timezone=UTC",
+    "-Duser.language=en",
+    "-Duser.country=US",
+    "-Dfile.encoding=UTF-8",
+)
+
+# Each is the default in this jar, except the two hospital and practitioner
+# lines, which skip files the filter never reads, and use_uuid_filenames, which
+# keeps patient names out of paths. They are stated so the manifest records them.
+SYNTHEA_CONFIG = {
+    "exporter.years_of_history": "10",
+    "exporter.fhir.export": "true",
+    "exporter.fhir.transaction_bundle": "true",
+    "exporter.fhir.bulk_data": "false",
+    "exporter.fhir.use_us_core_ig": "true",
+    "exporter.fhir.us_core_version": "6.1.0",
+    "exporter.hospital.fhir.export": "false",
+    "exporter.practitioner.fhir.export": "false",
+    "exporter.metadata.export": "true",
+    "exporter.use_uuid_filenames": "true",
+}
+
+SIZES = (10_000, 100_000)
+KEPT_TYPES = ("Patient", "Observation")
+
+# The only elements in these two types that differ between x86-64 and arm64
+# (measured: 24 of the 100,000 lines, each in one of these). No search
+# parameter covers them, and Observations are identical on both.
+DROPPED_PATIENT_EXTENSIONS = (
+    "http://synthetichealth.github.io/synthea/disability-adjusted-life-years",
+    "http://synthetichealth.github.io/synthea/quality-adjusted-life-years",
+)
+
+# With exporter.use_uuid_filenames, a patient's Bundle is `<Patient.id>.json`.
+PATIENT_FILE = re.compile(
+    r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$"
+)
+# Synthea's own count of what it generated, near the end of its output.
+RECORDS_LINE = re.compile(r"^Records: total=(\d+), alive=(\d+), dead=(\d+)$", re.MULTILINE)
+URN_UUID = "urn:uuid:"
+DOWNLOAD_ATTEMPTS = 6
+HERE = Path(__file__).resolve().parent
+COMMITTED_MANIFEST = HERE / "manifest.json"
+COMMITTED_SUMS = HERE / "SHA256SUMS"
+# Fields that describe one run and are not compared by --verify.
+UNCOMPARED_SETTINGS = ("threads",)
+
+
+class Failure(Exception):
+    """The run could not be done; the message says why."""
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def download(url: str, destination: Path) -> None:
+    """Fetch url to destination, retrying the transient failures GitHub gives."""
+    partial = destination.with_suffix(".part")
+    last_error = None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "hfs-benchmark-datasets"}
+            )
+            with urllib.request.urlopen(request, timeout=120) as response:
+                length = response.headers.get("Content-Length")
+                with partial.open("wb") as out:
+                    shutil.copyfileobj(response, out, 1 << 20)
+            if length is not None and partial.stat().st_size != int(length):
+                raise OSError(f"short read: {partial.stat().st_size} of {length}")
+            partial.replace(destination)
+            return
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+            last_error = error
+            print(f"download attempt {attempt} failed: {error}", file=sys.stderr)
+            if attempt < DOWNLOAD_ATTEMPTS:
+                time.sleep(2**attempt)
+    partial.unlink(missing_ok=True)
+    raise Failure(
+        f"could not download {url}: {last_error}. Fetch the jar another way "
+        f"(gh release download {RELEASE_TAG} --repo synthetichealth/synthea "
+        f"--pattern {JAR_NAME}) and pass it with --jar."
+    )
+
+
+def obtain_jar(supplied: Optional[Path], cache_dir: Path) -> Path:
+    """Return a jar whose SHA-256 is JAR_SHA256, or refuse."""
+    if supplied is not None:
+        if not supplied.is_file():
+            raise Failure(f"--jar {supplied} is not a file")
+        actual = sha256_of(supplied)
+        if actual != JAR_SHA256:
+            raise Failure(
+                f"refusing {supplied}: SHA-256 {actual}, expected {JAR_SHA256}"
+            )
+        return supplied
+    jar = cache_dir / RELEASE_TAG / JAR_NAME
+    if jar.is_file() and sha256_of(jar) == JAR_SHA256:
+        return jar
+    jar.parent.mkdir(parents=True, exist_ok=True)
+    print(f"downloading {JAR_URL}", file=sys.stderr)
+    download(JAR_URL, jar)
+    actual = sha256_of(jar)
+    if actual != JAR_SHA256:
+        jar.unlink()
+        raise Failure(
+            f"refusing the downloaded {JAR_NAME}: SHA-256 {actual}, "
+            f"expected {JAR_SHA256}"
+        )
+    return jar
+
+
+def java_version() -> str:
+    java = shutil.which("java")
+    if java is None:
+        raise Failure("java is not on PATH; Synthea needs Java 17 or later")
+    result = subprocess.run(
+        [java, "-XshowSettings:properties", "-version"],
+        capture_output=True,
+        text=True,
+    )
+    found = re.search(r"java\.runtime\.version = (\S+)", result.stderr)
+    return found.group(1) if found else "unknown"
+
+
+def module_list(jar: Path) -> List[str]:
+    """Every built-in generic module and submodule the jar carries."""
+    with zipfile.ZipFile(jar) as archive:
+        names = [
+            name
+            for name in archive.namelist()
+            if name.startswith("modules/") and name.endswith(".json")
+        ]
+    return sorted(names)
+
+
+def list_sha256(names: List[str]) -> str:
+    return hashlib.sha256("".join(f"{n}\n" for n in names).encode()).hexdigest()
+
+
+def run_synthea(jar: Path, work_dir: Path, threads: int) -> Path:
+    """Run Synthea in an empty directory; return its output directory."""
+    output = work_dir / "output"
+    command = ["java", f"-Xmx{MAX_HEAP}", *JVM_PROPERTIES, "-jar", str(jar)]
+    command += ["-s", str(SEED), "-cs", str(CLINICIAN_SEED)]
+    command += ["-r", REFERENCE_DATE, "-e", END_DATE]
+    command += ["-p", str(POPULATION)]
+    command += [f"--generate.thread_pool_size={threads}"]
+    command += [f"--exporter.baseDirectory={output}/"]
+    command += [f"--{key}={value}" for key, value in sorted(SYNTHEA_CONFIG.items())]
+    command += [STATE]
+    log = work_dir / "synthea.log"
+    print(f"running Synthea, {POPULATION} people, {threads} threads", file=sys.stderr)
+    started = time.monotonic()
+    run_dir = work_dir / "cwd"
+    run_dir.mkdir()
+    with log.open("wb") as stream:
+        finished = subprocess.run(
+            command, cwd=run_dir, stdout=stream, stderr=subprocess.STDOUT
+        )
+    if finished.returncode != 0:
+        tail = log.read_text(errors="replace")[-2000:]
+        raise Failure(f"Synthea exited {finished.returncode}:\n{tail}")
+    print(f"Synthea took {time.monotonic() - started:.0f} s", file=sys.stderr)
+    check_complete(output, log.read_text(errors="replace"))
+    return output
+
+
+def check_complete(output: Path, log: str) -> None:
+    """Refuse a run that lost patients: Synthea exits 0 when an export fails."""
+    records = RECORDS_LINE.findall(log)
+    if len(records) != 1:
+        raise Failure(f"expected one `Records:` line from Synthea, found {len(records)}")
+    total, alive, _ = (int(count) for count in records[0])
+    written = sum(1 for _ in (output / "fhir").iterdir())
+    if alive != POPULATION or written != total:
+        cause = next((line for line in log.splitlines() if "Exception" in line), "none logged")
+        raise Failure(
+            f"Synthea lost patients: {alive} alive of {POPULATION} asked for, "
+            f"{written} files for {total} records. First exception: {cause}"
+        )
+
+
+def metadata_version(output: Path) -> str:
+    files = sorted((output / "metadata").glob("*.json"))
+    if len(files) != 1:
+        raise Failure(f"expected one Synthea metadata file, found {len(files)}")
+    return json.loads(files[0].read_text())["version"].strip()
+
+
+def resolve_references(node: object, full_urls: Dict[str, str], where: str) -> None:
+    """Turn each urn:uuid reference into Type/id, in place.
+
+    Only an object's `reference` field is touched, as
+    crates/hfs/tests/inferno/to_batch.jq does. A reference the Bundle cannot
+    resolve, or a conditional one, stops the run: a batch cannot carry either.
+    """
+    if isinstance(node, dict):
+        reference = node.get("reference")
+        if isinstance(reference, str):
+            if reference.startswith(URN_UUID):
+                if reference not in full_urls:
+                    raise Failure(f"{where}: unresolved reference {reference}")
+                node["reference"] = full_urls[reference]
+            else:
+                raise Failure(f"{where}: unexpected reference {reference}")
+        for value in node.values():
+            resolve_references(value, full_urls, where)
+    elif isinstance(node, list):
+        for value in node:
+            resolve_references(value, full_urls, where)
+
+
+class Decimal(str):
+    """A decimal kept as Synthea wrote it: 704.20 must not become 704.2."""
+
+
+def encode(value: object) -> str:
+    """Compact JSON with sorted keys and each decimal's original text."""
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        items = sorted(value.items())
+        return "{" + ",".join(f"{encode(k)}:{encode(v)}" for k, v in items) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(encode(item) for item in value) + "]"
+    return json.dumps(value, ensure_ascii=False)
+
+
+def canonical_line(resource: dict) -> bytes:
+    return encode(resource).encode("utf-8") + b"\n"
+
+
+def patient_files(fhir_dir: Path) -> List[Tuple[str, Path]]:
+    """Every patient Bundle as (Patient.id, path), sorted by Patient.id."""
+    found = []
+    for path in fhir_dir.iterdir():
+        match = PATIENT_FILE.search(path.name)
+        if match is None:
+            raise Failure(f"not a patient Bundle: {path.name}")
+        found.append((match.group(1), path))
+    return sorted(found)
+
+
+def resources_of_patient(patient_id: str, path: Path) -> List[dict]:
+    """The Patient, then its Observations sorted by id, references resolved."""
+    with path.open(encoding="utf-8") as stream:
+        bundle = json.load(stream, parse_float=Decimal)
+    if bundle.get("type") != "transaction":
+        raise Failure(f"{path.name}: expected a transaction Bundle")
+    full_urls = {}
+    for entry in bundle["entry"]:
+        resource = entry["resource"]
+        full_urls[entry["fullUrl"]] = f"{resource['resourceType']}/{resource['id']}"
+    kept = [
+        entry["resource"]
+        for entry in bundle["entry"]
+        if entry["resource"]["resourceType"] in KEPT_TYPES
+    ]
+    patients = [r for r in kept if r["resourceType"] == "Patient"]
+    if len(patients) != 1 or patients[0]["id"] != patient_id:
+        raise Failure(f"{path.name}: expected exactly Patient/{patient_id}")
+    observations = sorted(
+        (r for r in kept if r["resourceType"] == "Observation"),
+        key=lambda r: r["id"],
+    )
+    extensions = [
+        extension
+        for extension in patients[0].get("extension", [])
+        if extension.get("url") not in DROPPED_PATIENT_EXTENSIONS
+    ]
+    if extensions:
+        patients[0]["extension"] = extensions
+    else:
+        patients[0].pop("extension", None)
+    ordered = patients + observations
+    for resource in ordered:
+        resolve_references(resource, full_urls, f"{path.name} {resource['id']}")
+    return ordered
+
+
+def stream_resources(fhir_dir: Path, limit: int) -> Iterator[dict]:
+    """Patients in id order, each followed by its Observations, up to limit."""
+    emitted = 0
+    for patient_id, path in patient_files(fhir_dir):
+        for resource in resources_of_patient(patient_id, path):
+            yield resource
+            emitted += 1
+            if emitted == limit:
+                return
+    raise Failure(f"population {POPULATION} yields only {emitted} resources")
+
+
+def references_in(node: object, path: str) -> Iterator[Tuple[str, str]]:
+    """Each `reference` under node, as (element path, reference)."""
+    if isinstance(node, dict):
+        reference = node.get("reference")
+        if isinstance(reference, str):
+            yield path, reference
+        for key, value in node.items():
+            yield from references_in(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for value in node:
+            yield from references_in(value, path)
+
+
+class DatasetStats:
+    """What one dataset holds, and where its references point."""
+
+    def __init__(self) -> None:
+        self.counts: Counter = Counter()
+        self.keys: Set[str] = set()
+        self.references: List[Tuple[str, str]] = []
+
+    def add(self, resource: dict) -> None:
+        kind = resource["resourceType"]
+        key = f"{kind}/{resource['id']}"
+        if key in self.keys:
+            raise Failure(f"duplicate resource {key}")
+        self.keys.add(key)
+        self.counts[kind] += 1
+        self.references.extend(references_in(resource, kind))
+
+    def as_record(self) -> dict:
+        targets: Counter = Counter()
+        for field, reference in self.references:
+            state = "loaded" if reference in self.keys else "not_loaded"
+            targets[f"{field}->{reference.split('/')[0]}:{state}"] += 1
+        return {
+            "resources": sum(self.counts.values()),
+            "patients": self.counts["Patient"],
+            "observations": self.counts["Observation"],
+            "references": dict(sorted(targets.items())),
+        }
+
+
+def write_datasets(fhir_dir: Path, out_dir: Path) -> Dict[str, dict]:
+    """Write one file per size; each smaller file is a prefix of the larger."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sizes = sorted(SIZES)
+    paths = {size: out_dir / f"patient-observation-{size}.ndjson" for size in sizes}
+    # Written under another name, so a failed run cannot leave a partial file
+    # that looks like a dataset.
+    partials = {size: paths[size].with_name(f"{paths[size].name}.part") for size in sizes}
+    stats = {size: DatasetStats() for size in sizes}
+    records = {}
+    try:
+        streams = {size: partials[size].open("wb") for size in sizes}
+        try:
+            for index, resource in enumerate(stream_resources(fhir_dir, sizes[-1])):
+                line = canonical_line(resource)
+                for size in sizes:
+                    if index < size:
+                        streams[size].write(line)
+                        stats[size].add(resource)
+        finally:
+            for stream in streams.values():
+                stream.close()
+        for size in sizes:
+            record = stats[size].as_record()
+            if record["resources"] != size:
+                raise Failure(f"{paths[size]} has {record['resources']} resources")
+            record["file"] = paths[size].name
+            record["bytes"] = partials[size].stat().st_size
+            record["sha256"] = sha256_of(partials[size])
+            records[str(size)] = record
+        for size in sizes:
+            partials[size].replace(paths[size])
+    finally:
+        for partial in partials.values():
+            partial.unlink(missing_ok=True)
+    return records
+
+
+def build_manifest(jar: Path, output: Path, threads: int, datasets: dict) -> dict:
+    modules = module_list(jar)
+    return {
+        "synthea": {
+            "release_tag": RELEASE_TAG,
+            "jar": JAR_NAME,
+            "jar_url": JAR_URL,
+            "jar_sha256": JAR_SHA256,
+            "metadata_version": metadata_version(output),
+        },
+        "settings": {
+            "seed": SEED,
+            "clinician_seed": CLINICIAN_SEED,
+            "reference_date": REFERENCE_DATE,
+            "end_date": END_DATE,
+            "population": POPULATION,
+            "state": STATE,
+            "threads": threads,
+            "jvm_properties": list(JVM_PROPERTIES),
+            "config": SYNTHEA_CONFIG,
+        },
+        "modules": {
+            "count": len(modules),
+            "sha256_of_list": list_sha256(modules),
+            "list": modules,
+        },
+        "filter": {
+            "resource_types": list(KEPT_TYPES),
+            "dropped_patient_extensions": list(DROPPED_PATIENT_EXTENSIONS),
+            "order": "Patient.id; each Patient, then its Observations by id",
+            "format": "NDJSON, UTF-8, sorted keys, no spaces, LF line endings, "
+            "decimals as Synthea wrote them",
+            "cut": "the stream stops at each size, cutting the last patient's "
+            "Observations; each smaller file is a prefix of the larger",
+        },
+        "datasets": datasets,
+    }
+
+
+def comparable(manifest: dict) -> dict:
+    copied = json.loads(json.dumps(manifest))
+    for field in UNCOMPARED_SETTINGS:
+        copied["settings"].pop(field, None)
+    return copied
+
+
+def differences(expected: object, actual: object, path: str = "") -> List[str]:
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        found = []
+        for key in sorted(set(expected) | set(actual)):
+            where = f"{path}.{key}" if path else key
+            if key not in expected:
+                found.append(f"{where}: only in this run: {actual[key]!r}")
+            elif key not in actual:
+                found.append(f"{where}: only in the manifest: {expected[key]!r}")
+            else:
+                found += differences(expected[key], actual[key], where)
+        return found
+    if expected != actual:
+        return [f"{path}: manifest {expected!r}, this run {actual!r}"]
+    return []
+
+
+def sums_text(manifest: dict) -> str:
+    return "".join(
+        f"{record['sha256']}  {record['file']}\n"
+        for _, record in sorted(manifest["datasets"].items(), key=lambda i: int(i[0]))
+    )
+
+
+def write_outputs(out_dir: Path, manifest: dict) -> None:
+    text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    (out_dir / "manifest.json").write_text(text, encoding="utf-8")
+    (out_dir / "SHA256SUMS").write_text(sums_text(manifest), encoding="ascii")
+
+
+def generate(args: argparse.Namespace, out_dir: Path, jar: Path) -> dict:
+    work_dir = Path(tempfile.mkdtemp(prefix="synthea-", dir=args.work_dir))
+    try:
+        output = run_synthea(jar, work_dir, args.threads)
+        datasets = write_datasets(output / "fhir", out_dir)
+        manifest = build_manifest(jar, output, args.threads, datasets)
+    finally:
+        if args.keep_raw:
+            print(f"Synthea output kept in {work_dir}", file=sys.stderr)
+        else:
+            shutil.rmtree(work_dir, ignore_errors=True)
+    write_outputs(out_dir, manifest)
+    return manifest
+
+
+def read_record() -> Tuple[dict, Optional[str]]:
+    """The committed manifest and checksums, read before anything is written."""
+    if not COMMITTED_MANIFEST.is_file():
+        raise Failure(f"no committed manifest at {COMMITTED_MANIFEST}")
+    sums = COMMITTED_SUMS.read_text() if COMMITTED_SUMS.is_file() else None
+    return json.loads(COMMITTED_MANIFEST.read_text(encoding="utf-8")), sums
+
+
+def differences_from_record(record: Tuple[dict, Optional[str]], actual: dict) -> List[str]:
+    expected, committed_sums = record
+    found = differences(comparable(expected), comparable(actual))
+    if committed_sums != sums_text(actual):
+        found.append(f"{COMMITTED_SUMS.name}: does not match this run's checksums")
+    return found
+
+
+def verify(args: argparse.Namespace, jar: Path) -> int:
+    record = read_record()
+    temporary = None
+    if args.out_dir is None:
+        temporary = tempfile.mkdtemp(prefix="datasets-verify-", dir=args.work_dir)
+    try:
+        actual = generate(args, Path(args.out_dir or temporary), jar)
+    finally:
+        if temporary is not None:
+            shutil.rmtree(temporary, ignore_errors=True)
+    found = differences_from_record(record, actual)
+    if found:
+        print(f"MISMATCH: {len(found)} difference(s) from {COMMITTED_MANIFEST}:")
+        for line in found:
+            print(f"  {line}")
+        return 1
+    for size, record in sorted(actual["datasets"].items(), key=lambda i: int(i[0])):
+        print(f"ok {size}: {record['resources']} resources, sha256 {record['sha256']}")
+    print(f"regenerated to the recorded checksums ({COMMITTED_MANIFEST.name})")
+    return 0
+
+
+def generate_only(args: argparse.Namespace, jar: Path) -> int:
+    """Write the datasets, then say plainly whether they are the recorded ones."""
+    record = read_record()
+    manifest = generate(args, Path(args.out_dir), jar)
+    for size, entry in sorted(manifest["datasets"].items(), key=lambda i: int(i[0])):
+        print(f"{entry['file']}: {entry['resources']} resources, {entry['sha256']}")
+    found = differences_from_record(record, manifest)
+    if found:
+        print(f"DIFFERS FROM THE RECORD: {len(found)} difference(s) from {COMMITTED_MANIFEST}:")
+        for line in found:
+            print(f"  {line}")
+        print(
+            f"The files in {args.out_dir} are not the recorded datasets. If the "
+            "recipe changed on purpose, copy manifest.json and SHA256SUMS from "
+            "there over the committed ones."
+        )
+        return 1
+    print(f"these are the recorded checksums ({COMMITTED_MANIFEST.name})")
+    return 0
+
+
+def is_committed_dir(path: Path) -> bool:
+    # samefile and not a comparison of resolved paths: on a case-insensitive
+    # disk, as on macOS, resolve() keeps the case it was given.
+    return path.exists() and path.samefile(HERE)
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate or verify the Synthea benchmark datasets (row 0.7)."
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="regenerate and compare with the committed manifest.json",
+    )
+    parser.add_argument(
+        "--out-dir",
+        help="where the NDJSON goes; required unless --verify (several GB free "
+        "are needed while Synthea runs, about 100 MB after it)",
+    )
+    parser.add_argument(
+        "--work-dir",
+        help="where Synthea's raw output goes while it runs (default: the "
+        "system's temporary directory)",
+    )
+    parser.add_argument("--jar", type=Path, help="a jar already downloaded")
+    parser.add_argument(
+        "--jar-cache",
+        type=Path,
+        default=Path.home() / ".cache" / "hfs-benchmark-datasets",
+        help="where a downloaded jar is kept (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=THREADS,
+        help="Synthea's thread pool (default: %(default)s); the checksums do "
+        "not depend on it, and --verify accepts another value to show that",
+    )
+    parser.add_argument(
+        "--keep-raw",
+        action="store_true",
+        help="keep Synthea's raw output instead of deleting it",
+    )
+    args = parser.parse_args(argv)
+    if not args.verify and args.out_dir is None:
+        parser.error("--out-dir is required unless --verify is given")
+    if args.threads < 1:
+        parser.error("--threads must be at least 1")
+    if args.out_dir is not None and is_committed_dir(Path(args.out_dir)):
+        parser.error(
+            "--out-dir must not be the directory of the committed manifest.json "
+            "and SHA256SUMS; write elsewhere"
+        )
+    # Synthea runs in its own directory, so every path it is given is absolute.
+    if args.jar is not None:
+        args.jar = args.jar.resolve()
+    args.jar_cache = args.jar_cache.resolve()
+    if args.work_dir is not None:
+        args.work_dir = str(Path(args.work_dir).resolve())
+        Path(args.work_dir).mkdir(parents=True, exist_ok=True)
+    return args
+
+
+def stop_on_signal(signum: int, _frame: object) -> None:
+    """Turn a signal into a Failure, so Synthea is killed and its output removed."""
+    signal.signal(signum, signal.SIG_IGN)
+    raise Failure(f"stopped by signal {signum}")
+
+
+def handle_signals() -> None:
+    signal.signal(signal.SIGTERM, stop_on_signal)
+    signal.signal(signal.SIGINT, stop_on_signal)
+    # A closed terminal. Windows has no SIGHUP, and under nohup it is ignored
+    # on purpose, so it stays ignored there.
+    hangup = getattr(signal, "SIGHUP", None)
+    if hangup is not None and signal.getsignal(hangup) != signal.SIG_IGN:
+        signal.signal(hangup, stop_on_signal)
+
+
+def main(argv: List[str]) -> int:
+    args = parse_args(argv)
+    handle_signals()
+    print(
+        f"java {java_version()}, python {platform.python_version()}, "
+        f"{platform.system()} {platform.machine()}",
+        file=sys.stderr,
+    )
+    jar = obtain_jar(args.jar, args.jar_cache)
+    if args.verify:
+        return verify(args, jar)
+    return generate_only(args, jar)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (Failure, OSError) as failure:
+        print(f"error: {failure}", file=sys.stderr)
+        sys.exit(2)
+    except (ValueError, KeyError, TypeError) as failure:
+        print(
+            f"error: unexpected Synthea output: {type(failure).__name__}: {failure}",
+            file=sys.stderr,
+        )
+        sys.exit(2)

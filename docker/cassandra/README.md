@@ -279,8 +279,16 @@ docker exec $NODE nodetool repair
 ```
 
 Pass `--ip`, or the node comes back with another address. On the isolated node
-a `LOCAL_QUORUM` statement first fails with **`WriteTimeout`** (2 s each, code
-1100), for about the 20 s the failure detector takes to convict its peers, and
-only then with **`Unavailable`** (code 1000). A write that timed out can still
-take effect: it was applied on the isolated node's own replica and came back
-after the reconnect. The other two nodes keep serving throughout.
+a statement first fails with **`WriteTimeout`** (code 1100), for as long as the
+failure detector takes to convict its peers, and only then with
+**`Unavailable`** (code 1000):
+
+| Statement on the isolated node | `WriteTimeout` | Then `Unavailable` |
+| --- | --- | --- |
+| Plain write at `LOCAL_QUORUM` | 2 s each (`write_request_timeout`), for about 20 s | At once |
+| LWT at `LOCAL_SERIAL` | 1 s each (`cas_contention_timeout`), for about 18 s | At once |
+
+A plain write that timed out can still take effect: it was applied on the
+isolated node's own replica and came back after the reconnect. An LWT that timed
+out has an unknown outcome too; the two checked after the reconnect had not
+applied. The other two nodes keep serving throughout.

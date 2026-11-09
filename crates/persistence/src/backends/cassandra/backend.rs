@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use cdrs_tokio::types::IntoRustByName;
+use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
 use futures::stream::{self, StreamExt};
 use parking_lot::RwLock;
@@ -42,21 +43,15 @@ const SELECT_STORED_SEARCH_PARAMETER_IDS: &str =
 /// because a key range cannot restrict half of a composite partition key.
 const SELECT_TENANT_TYPES: &str = "SELECT DISTINCT tenant_id, resource_type FROM resources_by_type";
 
-/// Every partition key of `resources`, read only when [`SELECT_TENANT_TYPES`]
-/// is refused for reading too many tombstones. It has one row per resource, so
-/// it costs far more than that scan, but `resources` never holds a tombstone
-/// (`schema.cql`, walkthrough G39), so nothing can stop it the same way. It
-/// also lists a tenant whose SearchParameters are all deleted, soft-deleted
-/// rows included, so the reload reads that tenant's partition and finds
-/// nothing live.
-///
-/// That per-tenant read ([`SELECT_STORED_SEARCH_PARAMETER_IDS`]) has no
-/// fallback, and it is not a `DISTINCT`: it reads the whole partition, so every
-/// tombstone there counts, those of updates as much as those of deletes, until
-/// `gc_grace_seconds` has passed. Past 100,000 in one page it fails, and the
-/// startup load stops for every tenant, whether or not this scan ran: 101,120
-/// updates of 32 SearchParameters in one tenant, written in 32 s with no
-/// delete, stopped the restart on a 5.0.9 node.
+/// Every partition key of `resources`, read only when a read of
+/// `resources_by_type` is refused for reading too many tombstones: the scan of
+/// [`SELECT_TENANT_TYPES`] (issue #74) or a tenant's
+/// [`SELECT_STORED_SEARCH_PARAMETER_IDS`] (issue #79), which reads the whole
+/// partition, so updates count as much as deletes. It has one row per
+/// resource, so it costs far more than either, but `resources` never holds a
+/// tombstone (`schema.cql`, walkthrough G39), so nothing can stop it the same
+/// way. It also lists soft-deleted SearchParameters, and so a tenant whose
+/// SearchParameters are all deleted; the point reads of the reload drop them.
 const SELECT_RESOURCE_KEYS: &str = "SELECT DISTINCT tenant_id, resource_type, id FROM resources";
 
 /// How many SearchParameter reads a reload runs at once.
@@ -560,20 +555,7 @@ impl CassandraBackend {
                      tombstone_failure_threshold allows; listing tenants from the keys of \
                      resources instead, which costs one row per resource"
                 );
-                self.session
-                    .rows_paged_keeping(
-                        SELECT_RESOURCE_KEYS,
-                        Vec::new(),
-                        StatementKind::Read,
-                        PAGE_SIZE,
-                        |row| {
-                            // One row per resource: only SearchParameter's
-                            // are kept. An unreadable row is kept, so the
-                            // loop below reports it.
-                            row.get_r_by_name("resource_type")
-                                .map_or(true, |t: String| t == "SearchParameter")
-                        },
-                    )
+                self.search_parameter_resource_keys(None)
                     .await
                     .map_err(|error| map_error(&error))?
             }
@@ -595,6 +577,92 @@ impl CassandraBackend {
             }
         }
         Ok(tenants)
+    }
+
+    /// The `resources` keys of every stored SearchParameter, or of
+    /// `tenant_id`'s only: the fallback when tombstones refuse a read of
+    /// `resources_by_type` ([`SELECT_RESOURCE_KEYS`]). One row per resource is
+    /// scanned, and only these rows are held, page by page. An unreadable row
+    /// is kept, so the caller reports it.
+    async fn search_parameter_resource_keys(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<Row>, DriverError> {
+        self.session
+            .rows_paged_keeping(
+                SELECT_RESOURCE_KEYS,
+                Vec::new(),
+                StatementKind::Read,
+                PAGE_SIZE,
+                |row| {
+                    let is = |name: &str, wanted: &str| {
+                        row.get_r_by_name(name)
+                            .map_or(true, |value: String| value == wanted)
+                    };
+                    is("resource_type", "SearchParameter")
+                        && tenant_id.is_none_or(|tenant| is("tenant_id", tenant))
+                },
+            )
+            .await
+    }
+
+    /// The id of every SearchParameter `tenant_id` has stored, from its
+    /// `resources_by_type` partition.
+    ///
+    /// That read covers the whole partition, so every tombstone in it counts
+    /// until `gc_grace_seconds` has passed, those of updates as much as those
+    /// of deletes (101,120 updates of 32 SearchParameters refused it on a
+    /// 5.0.9 node). When a replica refuses it for that, the ids come from
+    /// [`Self::search_parameter_resource_keys`] instead (issue #79), soft-deleted
+    /// ones included: the caller's point reads drop those.
+    ///
+    /// # Errors
+    ///
+    /// The mapped driver error of any page. Any failure other than
+    /// `READ_TOO_MANY_TOMBSTONES` is not retried, and a failed fallback is an
+    /// error as well.
+    async fn stored_search_parameter_ids(
+        &self,
+        tenant_id: &str,
+    ) -> StorageResult<BTreeSet<String>> {
+        let map_error = |error: &DriverError| {
+            StorageError::Backend(map_driver_error(error, "stored SearchParameters"))
+        };
+        let rows = match self
+            .session
+            .rows_paged(
+                SELECT_STORED_SEARCH_PARAMETER_IDS,
+                vec![Value::from(tenant_id), Value::from("SearchParameter")],
+                StatementKind::Read,
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) if is_too_many_tombstones(&error) => {
+                tracing::warn!(
+                    tenant_id,
+                    "the read of this tenant's SearchParameter ids read more tombstones than \
+                     tombstone_failure_threshold allows; taking them from the keys of resources \
+                     instead, which costs one row per resource"
+                );
+                self.search_parameter_resource_keys(Some(tenant_id))
+                    .await
+                    .map_err(|error| map_error(&error))?
+            }
+            Err(error) => return Err(map_error(&error)),
+        };
+        let mut ids = BTreeSet::new();
+        for row in &rows {
+            let id: String = row.get_r_by_name("id").map_err(|error| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: BACKEND_NAME.to_string(),
+                    message: format!("stored SearchParameters: id: {error}"),
+                    source: None,
+                })
+            })?;
+            ids.insert(id);
+        }
+        Ok(ids)
     }
 
     /// Reads `tenant_id`'s stored, `active` SearchParameters from Cassandra
@@ -643,28 +711,7 @@ impl CassandraBackend {
         use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
         let since = self.note_seq.load(Ordering::SeqCst);
-        let rows = self
-            .session
-            .rows_paged(
-                SELECT_STORED_SEARCH_PARAMETER_IDS,
-                vec![Value::from(tenant_id), Value::from("SearchParameter")],
-                StatementKind::Read,
-            )
-            .await
-            .map_err(|error| {
-                StorageError::Backend(map_driver_error(&error, "stored SearchParameters"))
-            })?;
-        let mut ids = BTreeSet::new();
-        for row in &rows {
-            let id: String = row.get_r_by_name("id").map_err(|error| {
-                StorageError::Backend(BackendError::Internal {
-                    backend_name: BACKEND_NAME.to_string(),
-                    message: format!("stored SearchParameters: id: {error}"),
-                    source: None,
-                })
-            })?;
-            ids.insert(id);
-        }
+        let ids = self.stored_search_parameter_ids(tenant_id).await?;
 
         let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
         let loader = SearchParameterLoader::new(self.config.fhir_version);
@@ -1915,14 +1962,110 @@ mod node_tests {
         );
         assert!(backend.stored_search_parameter_tenants().await.is_err());
     }
+
+    /// A refused id read (issue #79) takes the tenant's ids from `resources`:
+    /// its own SearchParameter keys only, of which the point reads keep the
+    /// live one. One injected fault, so it writes no tombstones.
+    #[tokio::test]
+    async fn too_many_tombstones_take_a_tenants_ids_from_resources() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        let (tenant, other) = (tenant_context("ids"), tenant_context("ids-other"));
+        let create = |tenant, code| {
+            crate::core::ResourceStorage::create(
+                &backend,
+                tenant,
+                "SearchParameter",
+                search_parameter(code),
+                version,
+            )
+        };
+        let live = create(&tenant, "a").await.expect("create");
+        let gone = create(&tenant, "b").await.expect("create");
+        crate::core::ResourceStorage::delete(&backend, &tenant, "SearchParameter", gone.id())
+            .await
+            .expect("delete");
+        create(&other, "c").await.expect("create");
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let keys: BTreeSet<String> = backend
+            .search_parameter_resource_keys(Some(tenant_id))
+            .await
+            .expect("the fallback scan answers")
+            .iter()
+            .map(|row| row.get_r_by_name("id").expect("id"))
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([live.id().to_string(), gone.id().to_string()]),
+            "this tenant's keys, the soft-deleted one included, and no other tenant's"
+        );
+
+        backend.session.inject_fault_on_first_page(
+            StatementKind::Read,
+            SELECT_STORED_SEARCH_PARAMETER_IDS,
+            Fault::FailWithTooManyTombstones,
+        );
+        let loaded = backend
+            .load_stored_search_parameters(tenant_id)
+            .await
+            .expect("the load survives the refused id read");
+        assert_eq!(loaded, 1, "the deleted one is dropped by its point read");
+    }
+
+    /// Only the tombstone failure falls back on the id read too, and a
+    /// fallback that fails is an error (ADR-aacruzgon-0041).
+    #[tokio::test]
+    async fn any_other_id_read_failure_still_stops_the_load() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("ids-failure");
+        let tenant_id = tenant.tenant_id().as_str();
+        backend.session.inject_fault_on_first_page(
+            StatementKind::Read,
+            SELECT_STORED_SEARCH_PARAMETER_IDS,
+            Fault::FailWithUnavailable,
+        );
+        // Armed before the first read. If `Unavailable` wrongly fell back,
+        // that read would use up this fault and the second read below, which
+        // does fall back, would succeed.
+        backend.session.inject_fault_on_first_page(
+            StatementKind::Read,
+            SELECT_RESOURCE_KEYS,
+            Fault::FailWithUnavailable,
+        );
+        assert!(
+            backend
+                .load_stored_search_parameters(tenant_id)
+                .await
+                .is_err()
+        );
+
+        backend.session.inject_fault_on_first_page(
+            StatementKind::Read,
+            SELECT_STORED_SEARCH_PARAMETER_IDS,
+            Fault::FailWithTooManyTombstones,
+        );
+        assert!(
+            backend
+                .load_stored_search_parameters(tenant_id)
+                .await
+                .is_err()
+        );
+    }
 }
 
-/// Issue #74 against the real `tombstone_failure_threshold`: 101,000 row
-/// tombstones in one partition, in a keyspace of the test's own, so no other
-/// test's scan and no later `hfs` boot on the node reads them. A test that
-/// fails leaves that keyspace behind. It writes that many tombstones, so it
-/// never runs by accident on a shared node;
-/// it is skipped unless this is set:
+/// Issues #74 and #79 against the real `tombstone_failure_threshold`: 101,000 row
+/// tombstones in one partition, per test, in a keyspace of the test's own, so
+/// no other test's scan and no later `hfs` boot on the node reads them. A test
+/// that fails leaves that keyspace behind. They write that many tombstones, so
+/// they never run by accident on a shared node;
+/// they are skipped unless this is set:
 ///
 /// - `HFS_TEST_CASSANDRA_TOMBSTONE_URL`: the node's `host:port`.
 ///
@@ -1946,129 +2089,238 @@ mod tombstone_limit_tests {
     /// How many of those writes may fail: still over the limit.
     const MAY_FAIL: usize = 999;
 
-    #[tokio::test]
-    async fn a_partition_over_the_limit_does_not_stop_the_tenant_scan() {
-        let Some(url) = std::env::var(URL).ok().filter(|url| !url.trim().is_empty()) else {
-            eprintln!("skipping: {URL} is not set");
-            return;
-        };
-        let config = |keyspace: Option<&str>| {
-            let mut config = CassandraConfig {
-                contact_points: vec![url.clone()],
-                ..crate::backends::cassandra::test_support::test_config()
-            };
-            if let Some(keyspace) = keyspace {
-                config.keyspace = keyspace.to_string();
-            }
-            config
-        };
-        let admin = CassandraBackend::connect(config(None))
-            .await
-            .expect("connect");
-        let run = uuid::Uuid::new_v4().simple().to_string();
-        let keyspace = format!("test_tombstones_{run}");
-        let ddl = |cql: String| {
-            let session = &admin.session;
-            async move {
-                session
-                    .rows(&cql, Vec::new(), StatementKind::Write)
-                    .await
-                    .unwrap_or_else(|error| panic!("{cql}: {error:?}"));
-            }
-        };
-        ddl(format!(
-            "CREATE KEYSPACE {keyspace} WITH replication = \
-             {{'class': 'NetworkTopologyStrategy', 'helios-dc1': 1}}"
-        ))
-        .await;
-        // The columns the two scans read; the backend under test is only
-        // asked for the tenant list, so it needs no other table.
-        ddl(format!(
-            "CREATE TABLE {keyspace}.resources_by_type (tenant_id text, resource_type text, \
-             last_updated timestamp, id text, PRIMARY KEY ((tenant_id, resource_type), \
-             last_updated, id)) WITH CLUSTERING ORDER BY (last_updated DESC, id DESC)"
-        ))
-        .await;
-        ddl(format!(
-            "CREATE TABLE {keyspace}.resources (tenant_id text, resource_type text, id text, \
-             PRIMARY KEY ((tenant_id, resource_type, id)))"
-        ))
-        .await;
+    /// A keyspace of the test's own, holding the columns the reads under test
+    /// use; the backend is only asked for tenants and ids, so it needs no
+    /// other table.
+    struct TestKeyspace {
+        admin: CassandraBackend,
+        backend: CassandraBackend,
+        name: String,
+    }
 
-        let backend = CassandraBackend::connect(config(Some(&keyspace)))
-            .await
-            .expect("connect to the test's keyspace");
-        let tenant = "test-tombstone-limit";
-        for cql in [
-            "INSERT INTO resources_by_type (tenant_id, resource_type, last_updated, id) \
-             VALUES (?, ?, 1000, 'sp')",
-            "INSERT INTO resources (tenant_id, resource_type, id) VALUES (?, ?, 'sp')",
-        ] {
-            backend
-                .session
+    impl TestKeyspace {
+        async fn create() -> Option<Self> {
+            let Some(url) = std::env::var(URL).ok().filter(|url| !url.trim().is_empty()) else {
+                eprintln!("skipping: {URL} is not set");
+                return None;
+            };
+            let config = |keyspace: Option<&str>| {
+                let mut config = CassandraConfig {
+                    contact_points: vec![url.clone()],
+                    ..crate::backends::cassandra::test_support::test_config()
+                };
+                if let Some(keyspace) = keyspace {
+                    config.keyspace = keyspace.to_string();
+                }
+                config
+            };
+            let admin = CassandraBackend::connect(config(None))
+                .await
+                .expect("connect");
+            let name = format!("test_tombstones_{}", uuid::Uuid::new_v4().simple());
+            let ddl = |cql: String| {
+                let session = &admin.session;
+                async move {
+                    session
+                        .rows(&cql, Vec::new(), StatementKind::Write)
+                        .await
+                        .unwrap_or_else(|error| panic!("{cql}: {error:?}"));
+                }
+            };
+            ddl(format!(
+                "CREATE KEYSPACE {name} WITH replication = \
+                 {{'class': 'NetworkTopologyStrategy', 'helios-dc1': 1}}"
+            ))
+            .await;
+            ddl(format!(
+                "CREATE TABLE {name}.resources_by_type (tenant_id text, resource_type text, \
+                 last_updated timestamp, id text, PRIMARY KEY ((tenant_id, resource_type), \
+                 last_updated, id)) WITH CLUSTERING ORDER BY (last_updated DESC, id DESC)"
+            ))
+            .await;
+            ddl(format!(
+                "CREATE TABLE {name}.resources (tenant_id text, resource_type text, id text, \
+                 PRIMARY KEY ((tenant_id, resource_type, id)))"
+            ))
+            .await;
+            let backend = CassandraBackend::connect(config(Some(&name)))
+                .await
+                .expect("connect to the test's keyspace");
+            Some(Self {
+                admin,
+                backend,
+                name,
+            })
+        }
+
+        /// A `resources` row, and its `resources_by_type` row when
+        /// `last_updated` is given.
+        async fn insert(
+            &self,
+            tenant: &str,
+            resource_type: &str,
+            id: &str,
+            last_updated: Option<i64>,
+        ) {
+            let session = &self.backend.session;
+            session
                 .rows(
-                    cql,
-                    vec![Value::from(tenant), Value::from("SearchParameter")],
+                    "INSERT INTO resources (tenant_id, resource_type, id) VALUES (?, ?, ?)",
+                    vec![
+                        Value::from(tenant),
+                        Value::from(resource_type),
+                        Value::from(id),
+                    ],
                     StatementKind::Write,
                 )
                 .await
-                .expect("insert the SearchParameter's row");
+                .expect("insert the resources row");
+            if let Some(last_updated) = last_updated {
+                session
+                    .rows(
+                        "INSERT INTO resources_by_type \
+                         (tenant_id, resource_type, last_updated, id) VALUES (?, ?, ?, ?)",
+                        vec![
+                            Value::from(tenant),
+                            Value::from(resource_type),
+                            Value::from(last_updated),
+                            Value::from(id),
+                        ],
+                        StatementKind::Write,
+                    )
+                    .await
+                    .expect("insert the resources_by_type row");
+            }
         }
 
-        // Row tombstones, as `write.rs`'s X1 delete writes them, in a
-        // partition with no live row, as a type whose every resource was
-        // deleted is, so a read counts all of them.
-        let delete = "DELETE FROM resources_by_type WHERE tenant_id = ? AND resource_type = ? \
-                      AND last_updated = ? AND id = ?";
-        let started = std::time::Instant::now();
-        let failed = stream::iter(0..TOMBSTONES)
-            .map(|n| {
-                let session = &backend.session;
-                async move {
-                    session
-                        .rows(
-                            delete,
-                            vec![
-                                Value::from(tenant),
-                                Value::from("Encounter"),
-                                Value::from(2_000_000_000_000_i64 - n as i64),
-                                Value::from(format!("t{n}")),
-                            ],
-                            StatementKind::Write,
-                        )
-                        .await
-                        .is_err()
+        /// Row tombstones, as `write.rs`'s X1 delete writes them, at
+        /// `last_updated` values below 2,000,000,000,000.
+        async fn write_tombstones(&self, tenant: &str, resource_type: &str) {
+            let delete = "DELETE FROM resources_by_type WHERE tenant_id = ? \
+                          AND resource_type = ? AND last_updated = ? AND id = ?";
+            let started = std::time::Instant::now();
+            let failed = stream::iter(0..TOMBSTONES)
+                .map(|n| {
+                    let session = &self.backend.session;
+                    async move {
+                        session
+                            .rows(
+                                delete,
+                                vec![
+                                    Value::from(tenant),
+                                    Value::from(resource_type),
+                                    Value::from(2_000_000_000_000_i64 - n as i64),
+                                    Value::from(format!("t{n}")),
+                                ],
+                                StatementKind::Write,
+                            )
+                            .await
+                            .is_err()
+                    }
+                })
+                .buffer_unordered(64)
+                .filter(|failed| std::future::ready(*failed))
+                .count()
+                .await;
+            assert!(failed <= MAY_FAIL, "{failed} tombstones were not written");
+            eprintln!("{TOMBSTONES} tombstones in {:?}", started.elapsed());
+        }
+
+        /// Whether the node refuses `cql` for its tombstones: the check that
+        /// makes each test not vacuous.
+        async fn refuses(&self, cql: &str, values: Vec<Value>) -> bool {
+            match self
+                .backend
+                .session
+                .rows_paged(cql, values, StatementKind::Read)
+                .await
+            {
+                Err(error) => {
+                    assert!(
+                        is_too_many_tombstones(&error),
+                        "{cql} failed some other way: {error:?}"
+                    );
+                    true
                 }
-            })
-            .buffer_unordered(64)
-            .filter(|failed| std::future::ready(*failed))
-            .count()
-            .await;
-        assert!(failed <= MAY_FAIL, "{failed} tombstones were not written");
-        eprintln!("{TOMBSTONES} tombstones in {:?}", started.elapsed());
-
-        // Not vacuous: the scan the node used to refuse is still refused.
-        match backend
-            .session
-            .rows_paged(SELECT_TENANT_TYPES, Vec::new(), StatementKind::Read)
-            .await
-        {
-            Err(error) => assert!(
-                is_too_many_tombstones(&error),
-                "the partition-key scan failed some other way: {error:?}"
-            ),
-            Ok(rows) => panic!(
-                "the partition-key scan passed with {} rows, so the node's limit is not 100,000",
-                rows.len()
-            ),
+                Ok(_) => false,
+            }
         }
 
-        let tenants = backend
+        async fn remove(self) {
+            self.admin
+                .session
+                .rows(
+                    &format!("DROP KEYSPACE {}", self.name),
+                    Vec::new(),
+                    StatementKind::Write,
+                )
+                .await
+                .expect("drop the test's keyspace");
+        }
+    }
+
+    /// Issue #74's shape: a partition with no live row, as a type whose every
+    /// resource was deleted is, so the tenant scan counts all its tombstones.
+    #[tokio::test]
+    async fn a_partition_over_the_limit_does_not_stop_the_tenant_scan() {
+        let Some(keyspace) = TestKeyspace::create().await else {
+            return;
+        };
+        let tenant = "test-tombstone-limit";
+        keyspace
+            .insert(tenant, "SearchParameter", "sp", Some(1000))
+            .await;
+        keyspace.write_tombstones(tenant, "Encounter").await;
+        assert!(
+            keyspace.refuses(SELECT_TENANT_TYPES, Vec::new()).await,
+            "the partition-key scan passed, so the node's limit is not 100,000"
+        );
+
+        let tenants = keyspace
+            .backend
             .stored_search_parameter_tenants()
             .await
             .expect("the tenant list survives the tombstones");
         assert_eq!(tenants.into_iter().collect::<Vec<_>>(), [tenant]);
+        keyspace.remove().await;
+    }
 
-        ddl(format!("DROP KEYSPACE {keyspace}")).await;
+    /// Issue #79's shape: a live row at the head of the tenant's
+    /// SearchParameter partition and the tombstones behind it, as updates
+    /// leave them, so the tenant scan passes and only the id read is refused.
+    #[tokio::test]
+    async fn updates_over_the_limit_do_not_stop_a_tenants_id_read() {
+        let Some(keyspace) = TestKeyspace::create().await else {
+            return;
+        };
+        let tenant = "test-tombstone-updates";
+        keyspace
+            .insert(tenant, "SearchParameter", "sp", Some(3_000_000_000_000))
+            .await;
+        keyspace
+            .insert("test-tombstone-other", "SearchParameter", "foreign", None)
+            .await;
+        keyspace.write_tombstones(tenant, "SearchParameter").await;
+        assert!(
+            !keyspace.refuses(SELECT_TENANT_TYPES, Vec::new()).await,
+            "the live row at the head should stop the tenant scan there"
+        );
+        assert!(
+            keyspace
+                .refuses(
+                    SELECT_STORED_SEARCH_PARAMETER_IDS,
+                    vec![Value::from(tenant), Value::from("SearchParameter")],
+                )
+                .await,
+            "the id read passed, so the node's limit is not 100,000"
+        );
+
+        let ids = keyspace
+            .backend
+            .stored_search_parameter_ids(tenant)
+            .await
+            .expect("the id read survives the tombstones");
+        assert_eq!(ids.into_iter().collect::<Vec<_>>(), ["sp"]);
+        keyspace.remove().await;
     }
 }

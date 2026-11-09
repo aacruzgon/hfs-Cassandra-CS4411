@@ -432,6 +432,20 @@ impl CassandraSession {
         kind: StatementKind,
         page_size: i32,
     ) -> Result<Vec<Row>, DriverError> {
+        self.rows_paged_keeping(cql, values, kind, page_size, |_| true)
+            .await
+    }
+
+    /// [`Self::rows_paged_by`], keeping only the rows `keep` accepts, page by
+    /// page, so a scan of many rows holds only those it needs.
+    pub(crate) async fn rows_paged_keeping(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        kind: StatementKind,
+        page_size: i32,
+        keep: impl Fn(&Row) -> bool,
+    ) -> Result<Vec<Row>, DriverError> {
         let mut all = Vec::new();
         let mut state = None;
         loop {
@@ -446,7 +460,12 @@ impl CassandraSession {
             let next = body
                 .as_rows_metadata()
                 .and_then(|metadata| metadata.paging_state.clone());
-            all.extend(body.into_rows().unwrap_or_default());
+            all.extend(
+                body.into_rows()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|row| keep(row)),
+            );
             match next {
                 Some(next) => state = Some(next),
                 None => return Ok(all),

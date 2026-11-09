@@ -16,7 +16,7 @@ use parking_lot::RwLock;
 use super::config::CassandraConfig;
 use super::errors::{BACKEND_NAME, is_too_many_tombstones, map_driver_error};
 use super::schema;
-use super::session::{CassandraSession, DriverError, StatementCounts, StatementKind};
+use super::session::{CassandraSession, DriverError, PAGE_SIZE, StatementCounts, StatementKind};
 use super::stats::{CasCounters, CasStats};
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
@@ -47,7 +47,9 @@ const SELECT_TENANT_TYPES: &str = "SELECT DISTINCT tenant_id, resource_type FROM
 /// it costs far more than that scan, but `resources` never holds a tombstone
 /// (`schema.cql`, walkthrough G39), so nothing can stop it the same way. It
 /// also lists a tenant whose SearchParameters are all deleted, soft-deleted
-/// rows included, which only makes the reload read an empty partition.
+/// rows included, so the reload reads that tenant's partition and finds
+/// nothing live. That per-tenant read has no fallback: over 100,000 tombstones
+/// at the head of one tenant's `SearchParameter` partition still fail it.
 const SELECT_RESOURCE_KEYS: &str = "SELECT DISTINCT tenant_id, resource_type, id FROM resources";
 
 /// How many SearchParameter reads a reload runs at once.
@@ -552,7 +554,19 @@ impl CassandraBackend {
                      resources instead, which costs one row per resource"
                 );
                 self.session
-                    .rows_paged(SELECT_RESOURCE_KEYS, Vec::new(), StatementKind::Read)
+                    .rows_paged_keeping(
+                        SELECT_RESOURCE_KEYS,
+                        Vec::new(),
+                        StatementKind::Read,
+                        PAGE_SIZE,
+                        |row| {
+                            // One row per resource: only SearchParameter's
+                            // are kept. An unreadable row is kept, so the
+                            // loop below reports it.
+                            row.get_r_by_name("resource_type")
+                                .map_or(true, |t: String| t == "SearchParameter")
+                        },
+                    )
                     .await
                     .map_err(|error| map_error(&error))?
             }
@@ -1896,10 +1910,11 @@ mod node_tests {
     }
 }
 
-/// Issue #74 against the real `tombstone_failure_threshold`: 100,001 row
-/// tombstones at the head of one partition, in a keyspace of the test's own,
-/// so no other test's scan and no later `hfs` boot on the node reads them. It
-/// writes 100,001 tombstones, so it never runs by accident on a shared node;
+/// Issue #74 against the real `tombstone_failure_threshold`: 101,000 row
+/// tombstones in one partition, in a keyspace of the test's own, so no other
+/// test's scan and no later `hfs` boot on the node reads them. A test that
+/// fails leaves that keyspace behind. It writes that many tombstones, so it
+/// never runs by accident on a shared node;
 /// it is skipped unless this is set:
 ///
 /// - `HFS_TEST_CASSANDRA_TOMBSTONE_URL`: the node's `host:port`.
@@ -1915,8 +1930,14 @@ mod tombstone_limit_tests {
 
     const URL: &str = "HFS_TEST_CASSANDRA_TOMBSTONE_URL";
 
-    /// One more than the node's default `tombstone_failure_threshold`.
-    const TOMBSTONES: usize = 100_001;
+    /// Tombstones to write: more than the node's default
+    /// `tombstone_failure_threshold` by a margin, so that a few writes lost
+    /// to a busy node (this runs beside the other tests) cannot fail the test.
+    /// The check that the scan is refused shows the limit was still passed.
+    const TOMBSTONES: usize = 101_000;
+
+    /// How many of those writes may fail: still over the limit.
+    const MAY_FAIL: usize = 999;
 
     #[tokio::test]
     async fn a_partition_over_the_limit_does_not_stop_the_tenant_scan() {
@@ -1987,8 +2008,9 @@ mod tombstone_limit_tests {
                 .expect("insert the SearchParameter's row");
         }
 
-        // Row tombstones, as `write.rs`'s X1 delete writes them, newer than
-        // the partition's one live row, so a read reaches them first.
+        // Row tombstones, as `write.rs`'s X1 delete writes them, in a
+        // partition with no live row, as a type whose every resource was
+        // deleted is, so a read counts all of them.
         let delete = "DELETE FROM resources_by_type WHERE tenant_id = ? AND resource_type = ? \
                       AND last_updated = ? AND id = ?";
         let started = std::time::Instant::now();
@@ -2015,7 +2037,7 @@ mod tombstone_limit_tests {
             .filter(|failed| std::future::ready(*failed))
             .count()
             .await;
-        assert_eq!(failed, 0, "every tombstone was written");
+        assert!(failed <= MAY_FAIL, "{failed} tombstones were not written");
         eprintln!("{TOMBSTONES} tombstones in {:?}", started.elapsed());
 
         // Not vacuous: the scan the node used to refuse is still refused.

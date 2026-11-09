@@ -30,8 +30,10 @@ The two Synthea quality-of-life extensions on Patient are removed for the same
 reason: they carry 16-digit results of Math.exp and Math.pow, whose last digit
 differs between x86-64 and arm64. See DROPPED_PATIENT_EXTENSIONS.
 
-Exit status: 0 on success, 1 when --verify finds a difference, 2 when the run
-could not be done (no Java, a jar that fails its checksum, Synthea failing).
+Exit status: 0 on success, 1 when the result differs from the committed
+manifest.json or SHA256SUMS (plain generation still writes its files), 2 when
+the run could not be done (no Java, a jar that fails its checksum, Synthea
+failing).
 """
 
 import argparse
@@ -117,6 +119,7 @@ URN_UUID = "urn:uuid:"
 DOWNLOAD_ATTEMPTS = 6
 HERE = Path(__file__).resolve().parent
 COMMITTED_MANIFEST = HERE / "manifest.json"
+COMMITTED_SUMS = HERE / "SHA256SUMS"
 # Fields that describe one run and are not compared by --verify.
 UNCOMPARED_SETTINGS = ("threads",)
 
@@ -543,10 +546,24 @@ def generate(args: argparse.Namespace, out_dir: Path, jar: Path) -> dict:
     return manifest
 
 
-def verify(args: argparse.Namespace, jar: Path) -> int:
+def read_record() -> Tuple[dict, Optional[str]]:
+    """The committed manifest and checksums, read before anything is written."""
     if not COMMITTED_MANIFEST.is_file():
         raise Failure(f"no committed manifest at {COMMITTED_MANIFEST}")
-    expected = json.loads(COMMITTED_MANIFEST.read_text(encoding="utf-8"))
+    sums = COMMITTED_SUMS.read_text() if COMMITTED_SUMS.is_file() else None
+    return json.loads(COMMITTED_MANIFEST.read_text(encoding="utf-8")), sums
+
+
+def differences_from_record(record: Tuple[dict, Optional[str]], actual: dict) -> List[str]:
+    expected, committed_sums = record
+    found = differences(comparable(expected), comparable(actual))
+    if committed_sums != sums_text(actual):
+        found.append(f"{COMMITTED_SUMS.name}: does not match this run's checksums")
+    return found
+
+
+def verify(args: argparse.Namespace, jar: Path) -> int:
+    record = read_record()
     temporary = None
     if args.out_dir is None:
         temporary = tempfile.mkdtemp(prefix="datasets-verify-", dir=args.work_dir)
@@ -555,10 +572,7 @@ def verify(args: argparse.Namespace, jar: Path) -> int:
     finally:
         if temporary is not None:
             shutil.rmtree(temporary, ignore_errors=True)
-    found = differences(comparable(expected), comparable(actual))
-    committed_sums = COMMITTED_MANIFEST.with_name("SHA256SUMS")
-    if not committed_sums.is_file() or committed_sums.read_text() != sums_text(actual):
-        found.append(f"{committed_sums.name}: does not match this run's checksums")
+    found = differences_from_record(record, actual)
     if found:
         print(f"MISMATCH: {len(found)} difference(s) from {COMMITTED_MANIFEST}:")
         for line in found:
@@ -567,6 +581,27 @@ def verify(args: argparse.Namespace, jar: Path) -> int:
     for size, record in sorted(actual["datasets"].items(), key=lambda i: int(i[0])):
         print(f"ok {size}: {record['resources']} resources, sha256 {record['sha256']}")
     print(f"regenerated to the recorded checksums ({COMMITTED_MANIFEST.name})")
+    return 0
+
+
+def generate_only(args: argparse.Namespace, jar: Path) -> int:
+    """Write the datasets, then say plainly whether they are the recorded ones."""
+    record = read_record()
+    manifest = generate(args, Path(args.out_dir), jar)
+    for size, entry in sorted(manifest["datasets"].items(), key=lambda i: int(i[0])):
+        print(f"{entry['file']}: {entry['resources']} resources, {entry['sha256']}")
+    found = differences_from_record(record, manifest)
+    if found:
+        print(f"DIFFERS FROM THE RECORD: {len(found)} difference(s) from {COMMITTED_MANIFEST}:")
+        for line in found:
+            print(f"  {line}")
+        print(
+            f"The files in {args.out_dir} are not the recorded datasets. If the "
+            "recipe changed on purpose, copy manifest.json and SHA256SUMS from "
+            "there over the committed ones."
+        )
+        return 1
+    print(f"these are the recorded checksums ({COMMITTED_MANIFEST.name})")
     return 0
 
 
@@ -632,10 +667,7 @@ def main(argv: List[str]) -> int:
     jar = obtain_jar(args.jar, args.jar_cache)
     if args.verify:
         return verify(args, jar)
-    manifest = generate(args, Path(args.out_dir), jar)
-    for size, record in sorted(manifest["datasets"].items(), key=lambda i: int(i[0])):
-        print(f"{record['file']}: {record['resources']} resources, {record['sha256']}")
-    return 0
+    return generate_only(args, jar)
 
 
 if __name__ == "__main__":

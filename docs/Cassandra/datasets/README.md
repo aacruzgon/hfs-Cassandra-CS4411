@@ -27,7 +27,7 @@ python3 docs/Cassandra/datasets/generate_datasets.py --verify
 
 A run takes about a minute, peaks at about 2.2 GB of memory, and writes 1.6 GB of Synthea output to the temporary directory (or `--work-dir`), which it deletes unless you pass `--keep-raw`.
 
-The exit status is 0 on success, 1 when `--verify` finds a difference, and 2 when the run could not be done.
+Both commands compare their result with the committed `manifest.json` and `SHA256SUMS`. The exit status is 0 on success, 1 when the result differs (plain generation still writes its files, and says they are not the recorded datasets), and 2 when the run could not be done.
 
 If the jar download fails, fetch it with `gh release download v4.0.0 --repo synthetichealth/synthea --pattern synthea-with-dependencies.jar` and pass it with `--jar`. The checksum is enforced either way.
 

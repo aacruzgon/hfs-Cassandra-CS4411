@@ -1029,6 +1029,7 @@ def main() -> int:
 
     if args.wait > 0 and not wait_for_server(demo, args.wait):
         return 2
+    demo.started = time.monotonic()  # the summary's seconds exclude the wait
 
     sections = [
         ("capabilities", capabilities),

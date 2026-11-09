@@ -373,6 +373,11 @@ class Demo:
             link = answer.link("next")
             if link is None:
                 break
+            self.assertion(
+                f"{name}, next link of page {page}",
+                DOC_PAGING,
+                [contains("next link", link, "_cursor="), contains("next link", link, f"_count={per_page}")],
+            )
             target = self.next_target(link, name, page)
             if target is None:
                 return

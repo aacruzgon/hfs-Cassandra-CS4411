@@ -102,8 +102,37 @@ class BudgetExhausted(Exception):
     """The overnight time budget ran out while waiting; not a failure of the run."""
 
 
+# Where overnight also keeps its log, so a closed terminal doesn't lose it.
+LOG_SINK = None
+
+
 def log(message: str) -> None:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+    try:
+        print(line, flush=True)
+    except OSError:  # The terminal has gone away.
+        pass
+    if LOG_SINK is not None:
+        LOG_SINK.write(line + "\n")
+        LOG_SINK.flush()
+
+
+def detach_output() -> None:
+    """Point stdout and stderr at nothing, once the terminal behind them has closed."""
+    null = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(null, 1)
+    os.dup2(null, 2)
+    os.close(null)
+
+
+def stop_process(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
 
 
 def run_cmd(
@@ -427,6 +456,7 @@ class Backend:
 
     def reset(self, before_start=None) -> None:
         self.compose("down", "-v", "--remove-orphans", timeout=300)
+        self._remove_data_volume()
         self._wait_for_budget()
         if before_start:
             before_start()
@@ -435,6 +465,11 @@ class Backend:
 
     def stop(self) -> None:
         self.compose("down", "-v", "--remove-orphans", check=False, timeout=300)
+        self._remove_data_volume()
+
+    def _remove_data_volume(self) -> None:
+        # `down -v` skips a volume no container uses: one a restore created before a stop.
+        run_cmd(["docker", "volume", "rm", "-f", self.data_volume], check=False)
 
     # Snapshots: a copy of the data volume taken with the database stopped, so
     # a restore is the same on both backends and needs no database command.
@@ -452,12 +487,18 @@ class Backend:
         return self.compose("config", "--images").stdout.split()[0]
 
     def _copy_volume(self, source: str, destination: str) -> None:
-        run_cmd(
-            ["docker", "run", "--rm", "--network", "none", "--entrypoint", "sh",
-             "-v", f"{source}:/from:ro", "-v", f"{destination}:/to", self._image(),
-             "-c", "find /to -mindepth 1 -delete && cp -a /from/. /to/"],
-            timeout=1800,
-        )
+        name = f"{self.project}-volume-copy"
+        try:
+            run_cmd(
+                ["docker", "run", "--rm", "--name", name, "--network", "none", "--entrypoint", "sh",
+                 "-v", f"{source}:/from:ro", "-v", f"{destination}:/to", self._image(),
+                 "-c", "find /to -mindepth 1 -delete && cp -a /from/. /to/"],
+                timeout=1800,
+            )
+        except BaseException:
+            # Killing `docker run` leaves its container copying, and holding both volumes.
+            run_cmd(["docker", "rm", "-f", name], check=False)
+            raise
 
     def quiesce(self) -> None:
         self.compose("stop", "-t", "120", timeout=300)
@@ -711,7 +752,7 @@ class Hfs:
         self.process = subprocess.Popen([str(binary)], env=env, stdout=self.log_file, stderr=subprocess.STDOUT)
         try:
             self._wait_ready()
-        except Failure:
+        except BaseException:  # A signal too: nothing else knows about this process yet.
             self.stop()
             raise
 
@@ -745,13 +786,7 @@ class Hfs:
             return ""
 
     def stop(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=10)
+        stop_process(self.process)
         self.log_file.close()
 
 
@@ -924,8 +959,12 @@ def load_dataset(base: str, dataset: Dataset) -> dict:
     started = time.monotonic()
     totals: collections.Counter = collections.Counter()
     with ThreadPoolExecutor(max_workers=BATCH_WORKERS) as pool:
-        for counts in pool.map(lambda path: post_batch(base, path), files):
-            totals.update(counts)
+        try:
+            for counts in pool.map(lambda path: post_batch(base, path), files):
+                totals.update(counts)
+        except BaseException:  # A signal: don't send the batches still queued.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
     failed = sum(v for k, v in totals.items() if not k.startswith("2"))
     loaded = sum(totals.values())
     seconds = time.monotonic() - started
@@ -1131,6 +1170,10 @@ def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: 
             process.kill()
             process.wait(timeout=30)
             raise Failure(f"k6 still running {seconds + 900} s after its start; killed")
+        except BaseException:  # A signal: k6 must not outlive the harness.
+            stop_process(process)
+            k6_csv.unlink(missing_ok=True)
+            raise
         finally:
             sampler.stop()
     if code != 0:
@@ -1330,100 +1373,127 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         timing["reset_and_boot_s"] = time.monotonic() - started
         return timing
 
-    for number in range(1, args.runs + 1):
-        run_dir = cell_dir / f"run{number}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        record = dict(base_record, run=number, status="failed")
-        if already_done(number):
-            continue
-        fresh = number == 1 or not args.no_reset
-        runs_left = sum(1 for later in range(number, args.runs + 1) if not already_done(later))
-        refusal = out_of_budget(args, backend, dataset, runs_left, fresh)
-        if refusal:
-            args.budget_stopped = True
-            args.budget_stop_reason = f"{backend.label} {cell_id(dataset.size, op, vus)} run {number} was not started: {refusal}"
-            log(f"stopping: {args.budget_stop_reason}")
-            break
-        run_started = time.monotonic()
-        try:
-            timing: dict = {}
-            if fresh:
-                dataset.check_before_load()
-                log(f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: reset")
-                timing.update(bring_up(run_dir))
-                if op in SEARCH_OPS:
-                    code, body, _ = search_probe(hfs, op, dataset)
-                    if code >= 500 and code != 501:
-                        raise Failure(f"search probe answered {code}: {body}")
-                    if not 200 <= code < 300:
-                        status = "not_implemented" if code == 501 else "refused"
-                        log(f"{backend.label} {op}: the server answered {code}; recorded, no load run")
-                        record.update(status=status, probe_status=code, probe_body=body, completed=0, statuses=f"{code}:1")
-                        write_run(run_dir, record)
-                        break
-                if args.reset == "snapshot":
-                    # The snapshot was taken flushed and settled; its statistics are in it.
-                    check_restored(hfs, dataset)
-                    timing["settle_after_load"] = backend.settle(flush=False)
+    try:
+        for number in range(1, args.runs + 1):
+            run_dir = cell_dir / f"run{number}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            record = dict(base_record, run=number, status="failed")
+            if already_done(number):
+                continue
+            fresh = number == 1 or not args.no_reset
+            runs_left = sum(1 for later in range(number, args.runs + 1) if not already_done(later))
+            refusal = out_of_budget(args, backend, dataset, runs_left, fresh)
+            if refusal:
+                args.budget_stopped = True
+                args.budget_stop_reason = f"{backend.label} {cell_id(dataset.size, op, vus)} run {number} was not started: {refusal}"
+                log(f"stopping: {args.budget_stop_reason}")
+                break
+            run_started = time.monotonic()
+            try:
+                timing: dict = {}
+                if fresh:
+                    dataset.check_before_load()
+                    log(f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: reset")
+                    timing.update(bring_up(run_dir))
+                    if op in SEARCH_OPS:
+                        code, body, _ = search_probe(hfs, op, dataset)
+                        if code >= 500 and code != 501:
+                            raise Failure(f"search probe answered {code}: {body}")
+                        if not 200 <= code < 300:
+                            status = "not_implemented" if code == 501 else "refused"
+                            log(f"{backend.label} {op}: the server answered {code}; recorded, no load run")
+                            record.update(status=status, probe_status=code, probe_body=body, completed=0, statuses=f"{code}:1")
+                            write_run(run_dir, record)
+                            break
+                    if args.reset == "snapshot":
+                        # The snapshot was taken flushed and settled; its statistics are in it.
+                        check_restored(hfs, dataset)
+                        timing["settle_after_load"] = backend.settle(flush=False)
+                    else:
+                        timing["load"] = load_dataset(hfs.base, dataset)
+                        timing["settle_after_load"] = backend.settle(flush=True)
+                    if op in SEARCH_OPS:
+                        # After the settle, once PostgreSQL has statistics. A query
+                        # that matches nothing would measure an empty answer.
+                        code, _, entries = search_probe(hfs, op, dataset)
+                        timing["first_query_status"] = code
+                        timing["first_query_entries"] = entries
+                        if not entries:
+                            log(f"warning: {op}'s first query answered {code} with {entries} entries")
+                    warm_up(args, hfs, op, vus, args.mode, rate, dataset, run_dir)
+                    timing["settle_after_warmup"] = backend.settle(flush=False)
                 else:
-                    timing["load"] = load_dataset(hfs.base, dataset)
-                    timing["settle_after_load"] = backend.settle(flush=True)
-                if op in SEARCH_OPS:
-                    # After the settle, once PostgreSQL has statistics. A query
-                    # that matches nothing would measure an empty answer.
-                    code, _, entries = search_probe(hfs, op, dataset)
-                    timing["first_query_status"] = code
-                    timing["first_query_entries"] = entries
-                    if not entries:
-                        log(f"warning: {op}'s first query answered {code} with {entries} entries")
-                warm_up(args, hfs, op, vus, args.mode, rate, dataset, run_dir)
-                timing["settle_after_warmup"] = backend.settle(flush=False)
-            else:
-                timing["host"] = wait_for_quiet_host(0)
-            record.update(host_fields(timing.get("host")))
-            backend_settings = backend.settings()
-            (run_dir / "db-settings.json").write_text(json.dumps(backend_settings, indent=1), encoding="utf-8")
-            log(f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: measure ({args.mode}, rate {rate}, {args.duration} s)")
-            metrics = measure(args, backend, hfs, op, vus, args.mode, rate, args.duration, dataset, run_dir)
-            backend.collect(run_dir)
-            environment["container"] = metrics["container"]
-            # Nothing succeeded: the setup is broken, not merely slow.
-            measured = metrics["s2xx"] > 0
-            ok = ok and measured
-            record.update(metrics, status="ok" if measured else "no_success", timing=timing, no_reset=bool(args.no_reset))
-            log(
-                f"  completed {metrics['completed']} ok_rps {metrics['ok_rps']:.1f} "
-                f"p50 {metrics['p50_ms']:.2f} p95 {metrics['p95_ms']:.2f} dropped {metrics['dropped_iterations']}"
-            )
-        except BudgetExhausted as exhausted:
-            args.budget_stopped = True
-            args.budget_stop_reason = f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: {exhausted}"
-            log(f"stopping before {cell_id(dataset.size, op, vus)} run {number}: {exhausted}")
-            # Nothing was measured, so nothing is recorded and --resume runs it.
-            if not any(run_dir.iterdir()):
-                run_dir.rmdir()
-            break
-        except (Failure, subprocess.SubprocessError, OSError, ValueError, KeyError) as failure:
-            record["failure"] = str(failure)
-            ok = False
-            log(f"FAILED {cell_id(dataset.size, op, vus)} run {number}: {failure}")
-        write_run(run_dir, record)
-        if record["status"] == "ok":
-            # A snapshot is built once; later runs of this kind don't pay for it again.
-            built = timing.get("snapshot_build", {}).get("seconds", 0.0)
-            note_run_seconds(args, backend, dataset, time.monotonic() - run_started - built)
-        if not ok and args.no_reset:
-            break
-    if hfs is not None:
-        hfs.stop()
+                    timing["host"] = wait_for_quiet_host(0)
+                record.update(host_fields(timing.get("host")))
+                backend_settings = backend.settings()
+                (run_dir / "db-settings.json").write_text(json.dumps(backend_settings, indent=1), encoding="utf-8")
+                log(f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: measure ({args.mode}, rate {rate}, {args.duration} s)")
+                metrics = measure(args, backend, hfs, op, vus, args.mode, rate, args.duration, dataset, run_dir)
+                backend.collect(run_dir)
+                environment["container"] = metrics["container"]
+                # Nothing succeeded: the setup is broken, not merely slow.
+                measured = metrics["s2xx"] > 0
+                ok = ok and measured
+                record.update(metrics, status="ok" if measured else "no_success", timing=timing, no_reset=bool(args.no_reset))
+                log(
+                    f"  completed {metrics['completed']} ok_rps {metrics['ok_rps']:.1f} "
+                    f"p50 {metrics['p50_ms']:.2f} p95 {metrics['p95_ms']:.2f} dropped {metrics['dropped_iterations']}"
+                )
+            except BudgetExhausted as exhausted:
+                args.budget_stopped = True
+                args.budget_stop_reason = f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: {exhausted}"
+                log(f"stopping before {cell_id(dataset.size, op, vus)} run {number}: {exhausted}")
+                # Nothing was measured, so nothing is recorded and --resume runs it.
+                if not any(run_dir.iterdir()):
+                    run_dir.rmdir()
+                break
+            except (Failure, subprocess.SubprocessError, OSError, ValueError, KeyError) as failure:
+                record["failure"] = str(failure)
+                ok = False
+                log(f"FAILED {cell_id(dataset.size, op, vus)} run {number}: {failure}")
+            write_run(run_dir, record)
+            if record["status"] == "ok":
+                # A snapshot is built once; later runs of this kind don't pay for it again.
+                built = timing.get("snapshot_build", {}).get("seconds", 0.0)
+                note_run_seconds(args, backend, dataset, time.monotonic() - run_started - built)
+            if not ok and args.no_reset:
+                break
+    finally:
+        # On a signal too: an HFS left behind would hold the port against --resume.
+        if hfs is not None:
+            hfs.stop()
     (cell_dir / "environment.json").write_text(json.dumps(environment, indent=1, sort_keys=True), encoding="utf-8")
     return ok
+
+
+def port_holder(port: int) -> Optional[str]:
+    """What listens on a local port, or None if nothing does."""
+    with socket.socket() as probe:
+        probe.settimeout(1)
+        if probe.connect_ex(("127.0.0.1", port)) != 0:
+            return None
+    try:
+        pids = run_cmd(["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"], check=False).stdout.split()
+    except OSError:
+        return "an unknown process (lsof is not installed)"
+    if not pids:
+        return "an unknown process"
+    command = run_cmd(["ps", "-o", "comm=", "-p", pids[0]], check=False).stdout.strip()
+    return f"process {pids[0]} ({command})"
+
+
+def require_free_port(port: int) -> None:
+    holder = port_holder(port)
+    if holder:
+        raise Failure(f"port {port} is held by {holder}, so HFS can't start: stop it, "
+                      "perhaps an HFS left by an interrupted run, or choose another --hfs-port")
 
 
 def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
     if args.backend == "postgres" and args.baseline not in ("on", "off"):
         raise Failure("--baseline is on or off")
     backend: Backend = Cassandra(args) if args.backend == "cassandra" else Postgres(args)
+    require_free_port(args.hfs_port)
     out_root = args.out.resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     prepared = out_root / "prepared"
@@ -1716,6 +1786,7 @@ def overnight_parts(args: argparse.Namespace) -> List[dict]:
 
 
 def overnight_preflight(args: argparse.Namespace, parts: List[dict]) -> None:
+    require_free_port(args.hfs_port)
     for size in sorted({size for part in parts for size in part["sizes"]}):
         verify_dataset(args.dataset_dir.resolve() / f"patient-observation-{size}.ndjson", args.sha256sums.resolve())
     log("preflight: datasets match the published checksums")
@@ -1820,14 +1891,24 @@ def resume_arguments(argv: Sequence[str]) -> List[str]:
 
 
 def cmd_overnight(args: argparse.Namespace) -> int:
-    if platform.system() == "Darwin" and not os.environ.get("HFSBENCH_CAFFEINATED"):
-        env = dict(os.environ, HFSBENCH_CAFFEINATED="1")
-        return subprocess.call(["caffeinate", "-dimsu", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], env=env)
+    global LOG_SINK
+    # Each raises KeyboardInterrupt, so a stop runs the same cleanup as a finish
+    # (a backgrounded process otherwise ignores SIGINT). A closed terminal is a
+    # SIGHUP; `nohup` has already asked for that to be ignored, so it stays so.
+    stopping: List[signal.Signals] = []
 
-    # Both raise KeyboardInterrupt, so a stop runs the same cleanup as a finish
-    # (a backgrounded process otherwise ignores SIGINT).
-    signal.signal(signal.SIGINT, signal.default_int_handler)
-    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    def on_signal(number: int, _frame) -> None:
+        if stopping:
+            return  # The cleanup is under way; let it finish.
+        stopping.append(signal.Signals(number))
+        if number == signal.SIGHUP:
+            detach_output()
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, on_signal)
     args.profile = "3g"
     if args.resume and args.out is None:
         raise Failure("--resume needs --out, the directory named in the morning summary")
@@ -1841,6 +1922,11 @@ def cmd_overnight(args: argparse.Namespace) -> int:
     parts = overnight_parts(args)
     overnight_preflight(args, parts)
     (out_root / "NOT-FOR-REPORT.txt").write_text(LAPTOP_BANNER + "\n", encoding="utf-8")
+    LOG_SINK = (out_root / "overnight.log").open("a", encoding="utf-8")
+    if platform.system() == "Darwin":
+        # Held until this process exits, so one process is all there is to stop.
+        subprocess.Popen(["caffeinate", "-dimsu", "-w", str(os.getpid())],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     state = json.loads(state_path.read_text(encoding="utf-8")) if args.resume and state_path.exists() else {"parts": {}}
     started_at = datetime.now(timezone.utc)
@@ -1854,7 +1940,10 @@ def cmd_overnight(args: argparse.Namespace) -> int:
          *resume_arguments(sys.argv[2:])])
 
     def save_state() -> None:
-        state_path.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
+        # Whole or not at all: a signal can arrive during the write.
+        scratch = state_path.with_suffix(".tmp")
+        scratch.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
+        scratch.replace(state_path)
 
     any_failed = False
     budget_stopped = False
@@ -1905,6 +1994,10 @@ def cmd_overnight(args: argparse.Namespace) -> int:
                 ok = False
                 entry["error"] = str(failure)
                 log(f"part {part['name']}: {failure}")
+            except KeyboardInterrupt:
+                entry["seconds"] = entry.get("seconds", 0.0) + time.monotonic() - started
+                entry["status"] = f"interrupted by {stopping[0].name}" if stopping else "interrupted"
+                raise
             entry["seconds"] = entry.get("seconds", 0.0) + time.monotonic() - started
             if plan.budget_stopped:
                 entry["status"] = "stopped at the budget"
@@ -1919,7 +2012,8 @@ def cmd_overnight(args: argparse.Namespace) -> int:
                 calibration_incomplete = True
                 break
     except KeyboardInterrupt:
-        stop_reason = "a signal"
+        stop_reason = stopping[0].name if stopping else "an interrupt"
+        log(f"stopped by {stop_reason}; the cleanup has run")
     finally:
         state["stopped_by"] = stop_reason or (
             f"the time budget: {budget_stop_reason}" if budget_stopped
@@ -1927,6 +2021,8 @@ def cmd_overnight(args: argparse.Namespace) -> int:
         save_state()
         write_morning_summary(out_root, state, parts, resume_command)
         log(f"wrote {out_root / 'morning-summary.md'}")
+    if stopping:
+        return 128 + int(stopping[0])
     if all(state["parts"].get(part["name"], {}).get("status") == "complete" for part in parts):
         for backend in (Cassandra(args), Postgres(args)):
             backend.drop_snapshots()
@@ -2137,6 +2233,8 @@ def main(argv: List[str]) -> int:
     except Failure as failure:
         print(f"error: {failure}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":

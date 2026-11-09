@@ -503,8 +503,9 @@ def startup_fields(path: str) -> Dict[str, str]:
 def confirm_backend(demo: Demo) -> None:
     """Compares this run with what HFS's log says it was started with.
 
-    HFS writes that line before it binds its port, so this cannot show who answers
-    there. The caller refuses a port that already answers: see the README.
+    HFS writes that line before it binds its port, so this comparison does not show
+    who answers there. The caller refuses a port that is not free and counts the
+    run's rows: see the README.
     """
     try:
         fields = startup_fields(demo.server_log)

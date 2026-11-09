@@ -34,6 +34,9 @@
 #   GC threads       2 parallel / 2 concurrent, matching the CPU limit
 #   CPU limit        2 CPUs per node, 6 in all
 #   Memory limit     2.5 GiB per node, 7.5 GiB in all, swap disabled
+#                    (indicative, Apple-silicon laptop under OrbStack: 1.31 GiB
+#                    per node at idle, memory.peak 1.47 GiB over the failure
+#                    procedures and the backend tests, no OOM kill)
 #   Host ports       127.0.0.1:59342, 59343 and 59344, one per node
 #                    (CASSANDRA_CLUSTER_HOST_PORT_1 to _3 override). Not 59042
 #                    (developers), 59142 (the required CI job) or 59242

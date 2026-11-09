@@ -4,13 +4,18 @@
 
 It covers create, read, vread, an update with an `If-Match` conflict, a batch bundle, a transaction bundle, token, date and URI searches with paging through `next` links, a rejected `:exact`, a delete followed by 410, and isolation between two tenants.
 
-The script does not start anything. Start the database and HFS first, then run it.
+The script does not start anything. Start the database and HFS first, then run it. Run the commands below as a shell script, not in an interactive shell, because the port check ends with `exit`.
 
 ## Against PostgreSQL
 
 ```bash
 docker compose -f docker/postgres/docker-compose.yml up -d --wait
 cargo build -p helios-hfs --bin hfs --features postgres
+
+if curl -s -m 2 -o /dev/null http://127.0.0.1:58080/metadata; then
+  echo "something already answers on port 58080: stop it first" >&2
+  exit 1
+fi
 
 HFS_STORAGE_BACKEND=postgres \
 HFS_DATABASE_URL=postgresql://helios:helios@127.0.0.1:55432/helios \
@@ -28,6 +33,11 @@ Apply the schema once, as `docs/Cassandra/schema/README.md` says; HFS only check
 
 ```bash
 cargo build -p helios-hfs --bin hfs --features cassandra
+
+if curl -s -m 2 -o /dev/null http://127.0.0.1:58080/metadata; then
+  echo "something already answers on port 58080: stop it first" >&2
+  exit 1
+fi
 
 HFS_STORAGE_BACKEND=cassandra \
 HFS_CASSANDRA_CONTACT_POINTS=127.0.0.1:59042 \
@@ -50,7 +60,7 @@ Search and paging are later roadmap steps (6 and 6a to 6d), so until they land t
 | `--wait SECONDS` | Retry `GET /metadata` for this long before starting. Default: no wait. |
 | `--timeout SECONDS` | One request's timeout. Default 60. |
 | `--report FILE` | Also write JSON Lines: one object per step, then a summary object with `"summary": true`. |
-| `--server-log FILE` | HFS's log. Adds a step that confirms from it which backend and URL the server runs. |
+| `--server-log FILE` | HFS's log. Adds a step that checks the backend, URL and port it says HFS was started with. |
 
 Set `HFS_BASE_URL` to the same URL as `--base-url`. HFS builds `next` links from it, and the script fails a paging step whose link points anywhere else, because it promises to talk only to the URL it was given.
 
@@ -60,11 +70,16 @@ Port 58080 is used by nothing in `.github/workflows/` or `docker/`.
 
 `--backend` only chooses which answers to expect. `/metadata` and `/health` do not name the storage backend, so a SQLite HFS passes every step of `--backend postgres`, and an HFS left running on the port answers in place of the one you meant to start.
 
-`--server-log` closes the first gap. It reads the last `Starting Helios FHIR Server` line of HFS's log, which HFS writes at `info`, the default level, and adds a step that requires `storage_backend` to equal `--backend` and `public_base_url` to equal `--base-url`. The report's summary then has `"backend_confirmed": true`. Without the option it is `false`, and the run says so.
+`--server-log` covers the first gap as far as a log can. It reads the last `Starting Helios FHIR Server` line of HFS's log, which HFS writes at `info`, the default level, and adds a step that requires `storage_backend` to equal `--backend`, `public_base_url` to equal `--base-url`, and `port` to equal the port in `--base-url`. The report's summary then has `"backend_confirmed": true`. Without the option it is `false`, and the run says so. Because the ports must match, the option is for a server the script reaches directly: through a proxy on another port, the step fails and says so.
 
-For the second gap, check that the HFS you started is still running once the script ends. An HFS that cannot bind its port writes that same line and then exits 1, while whatever holds the port keeps answering. `kill "$HFS_PID"` in the commands above fails in that case; a CI job must fail on it.
+The log says what HFS was started with, not who answers on the port. HFS writes that line before it connects to its database and before it binds, so `backend_confirmed` means only that the log matches this run.
 
-Row 8.6's job needs all three: a new log file for each run, `--server-log` with `"backend_confirmed": true` in the summary, and the process check.
+Two checks cover the second gap, and neither is the script's:
+
+- **Before starting HFS, refuse a port that already answers,** as the commands above do. Otherwise an old HFS answers while the new one is still starting, and the script can finish with every step passed and `"backend_confirmed": true` before the new one tries to bind.
+- **Once the script ends, check that the HFS you started is still running.** An HFS that cannot bind its port writes that same line and then exits 1, while whatever holds the port keeps answering. `kill "$HFS_PID"` in the commands above fails in that case; a CI job must fail on it.
+
+Row 8.6's job needs all four: the refusal of a port that already answers, a new log file for each run, `--server-log` with `"backend_confirmed": true` in the summary, and the process check. Only the database shows directly which backend stored a run. The report's summary has the `run_id`, and the run's tenants are `demo-<run id>-a` and `-b`, so the job may also count that run's rows there.
 
 ## Output
 

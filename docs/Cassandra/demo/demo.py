@@ -18,7 +18,9 @@ answers (see `Differs`), and the run checks the one for --backend. Nothing is
 ever accepted as "either".
 
 --backend chooses the answers to expect. It does not verify which backend the
-server runs: the HTTP API does not say. --server-log does, from HFS's own log.
+server runs: the HTTP API does not say. --server-log compares this run with what
+HFS's own log says it was started with, which does not show who answers on the
+port: see "Confirming the backend" in README.md.
 
 Every run uses new tenant names and new resource values, so it depends on
 nothing an earlier run left, and two runs never clash. The script talks only
@@ -499,17 +501,23 @@ def startup_fields(path: str) -> Dict[str, str]:
 
 
 def confirm_backend(demo: Demo) -> None:
-    """The one check that the server really is the backend this run expects."""
+    """Compares this run with what HFS's log says it was started with.
+
+    HFS writes that line before it binds its port, so this cannot show who answers
+    there. The caller refuses a port that already answers: see the README.
+    """
     try:
         fields = startup_fields(demo.server_log)
     except OSError as error:
         problems: List[Check] = [f"cannot read --server-log: {error}"]
     else:
+        url_port = demo.parsed.port or (443 if demo.parsed.scheme == "https" else 80)
         problems = [
             equal("storage_backend in the log", fields.get("storage_backend"), demo.backend),
             equal("public_base_url in the log", fields.get("public_base_url", "").rstrip("/"), demo.base_url),
+            equal("port in the log", fields.get("port"), str(url_port)),
         ]
-    demo.assertion("the server's log names this backend and URL", DOC_SERVER_LOG, problems)
+    demo.assertion("the server's log names this backend, URL and port", DOC_SERVER_LOG, problems)
     demo.backend_confirmed = not any(problems)
 
 
@@ -1086,7 +1094,7 @@ def main() -> int:
     parser.add_argument("--wait", type=float, default=0.0, metavar="SECONDS", help="retry GET /metadata for this long before starting (default: no wait)")
     parser.add_argument("--timeout", type=float, default=60.0, metavar="SECONDS", help="one request's timeout (default: %(default)s)")
     parser.add_argument("--report", metavar="FILE", help="also write one JSON object per step, then a summary, to FILE")
-    parser.add_argument("--server-log", metavar="FILE", help="HFS's log; adds a step that confirms from it which backend and URL the server runs")
+    parser.add_argument("--server-log", metavar="FILE", help="HFS's log; adds a step that checks the backend, URL and port it says HFS was started with")
     args = parser.parse_args()
 
     try:

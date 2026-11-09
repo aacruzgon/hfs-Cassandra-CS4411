@@ -242,9 +242,9 @@ The operations rules are in section 6 of the roadmap: a node down longer than
 replacement is repaired once it has bootstrapped.
 
 **Replacing a node.** Use `cassandra-3` when the test lets you choose. It is the
-only node that is not a seed, and the only one replaced so far. Put the flag in
-an override file outside the repository, here `/tmp/replace.yml`, and keep the
-GC settings of the profile in use:
+only node that is not a seed, so it needs no extra step. Put the flag in an
+override file outside the repository, here `/tmp/replace.yml`, and keep the GC
+settings of the profile in use:
 
 ```yaml
 services:
@@ -269,8 +269,13 @@ take it off its own seed list for that first boot by also setting
 `CASSANDRA_SEEDS` in the override to the other seed alone, for `cassandra-2`
 `172.29.59.11`, with that seed up. The node then bootstraps. Afterwards, recreate
 it from the normal file (`c up -d --no-deps --wait cassandra-2`), where the
-replace flag is gone and the node, already bootstrapped, keeps its data. This
-seed route follows from the source and has not been run on this cluster.
+replace flag is gone and the node, already bootstrapped, keeps its data.
+
+This seed route was run on 2026-11-09, once on each seed, at a 512M heap, 256M
+of direct memory and 1700 MiB per node, with 300 rows at RF 3. `cassandra-2`
+was healthy in 65 s, and `cassandra-1` in 76 s on the volume a refused first
+attempt had left. Each held the rows before any repair, and kept them when
+recreated from the normal file and repaired.
 
 Do not use `-Dcassandra.allow_unsafe_replace=true`, which the error message
 offers. It lets the seed join on the dead node's tokens with no data and no

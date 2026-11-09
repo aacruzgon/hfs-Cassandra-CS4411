@@ -107,3 +107,218 @@ Expected: `paxos_variant` `v2`, `paxos_state_purging` `legacy`, `5.0.9`,
 in use (`offheap_objects`, `NONE`). There is no `nodetool` command for the
 Paxos variant; the `system_views.settings` virtual table is the source of
 truth.
+
+# Three-node cluster
+
+Three Cassandra nodes on one host, for the failure tests and anything else
+that needs RF 3 (`docs/Cassandra/development-roadmap.md`, item 0.3 and section
+6). It is its own Compose project, `hfs-cassandra-cluster`, with its own
+containers, network and volumes, so its Compose commands never act on the
+single node above or the CI projects. It does share the memory of Docker's VM
+with them.
+
+## Run
+
+**Check the memory first.** The default limits add up to 7.5 GiB, and the three
+nodes use about 4 GiB even at idle (1.31 to 1.35 GiB each). That comes on top
+of every other container in the VM, and a boot that does not fit can take one
+of them down: on 2026-11-09, on an 8.8 GiB OrbStack VM with about 3.7 GiB free,
+the single node above was OOM-killed while this cluster booted beside it. Add
+up the limits of what is running (`docker stats --no-stream`) before you start.
+If 7.5 GiB more does not fit in the VM, wait, or stop your own single node
+first.
+
+```bash
+# Functional checks on 16 and 18 GB laptops (768M heap, 7.5 GiB in all)
+docker compose -f docker/cassandra/docker-compose.cluster.yml up -d --wait
+
+# 32 GB machines, and every benchmark that goes in the report (2G heap, 15 GiB in all)
+docker compose -f docker/cassandra/docker-compose.cluster.yml \
+               -f docker/cassandra/docker-compose.cluster.heap2g.yml up -d --wait
+```
+
+Compose starts `cassandra-1`, waits until it answers CQL, then `cassandra-2`,
+then `cassandra-3`; a first boot takes 3.5 to 4 minutes. Check the ring, then
+create the keyspace at RF 3 and apply the tables:
+
+```bash
+c() { docker compose -f docker/cassandra/docker-compose.cluster.yml "$@"; }
+c exec cassandra-1 nodetool status                 # three UN, racks 1 to 3
+c cp docker/cassandra/keyspace-three-node.cql cassandra-1:/tmp/
+c cp docs/Cassandra/schema/schema.cql cassandra-1:/tmp/
+c exec cassandra-1 cqlsh -f /tmp/keyspace-three-node.cql
+c exec cassandra-1 cqlsh -k helios -f /tmp/schema.cql
+c exec cassandra-1 nodetool status helios          # Owns 100.0% on each node
+```
+
+Do not apply `keyspace-single-node.cql` here: it creates the keyspace at RF 1,
+and its `system_traces` step is for one node only.
+
+Every `docker compose` command for this cluster must name this file, so that
+it acts on this project alone. `c down` keeps the data; `c down -v` removes
+this project's three volumes and nothing else.
+
+Clients on the host use all three published ports as contact points:
+
+```bash
+HFS_CASSANDRA_CONTACT_POINTS=127.0.0.1:59342,127.0.0.1:59343,127.0.0.1:59344
+```
+
+`cdrs-tokio` finds the other nodes from whichever it connects to, and addresses
+them by their container addresses (`172.29.59.11` to `.13`). OrbStack and
+Docker on Linux route those from the host. Docker Desktop for Mac and Windows
+does not, so a client on the host there reaches only the node it connected
+through; run it in a container on the cluster's network instead.
+
+## Recorded configuration
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| Image, entrypoint | The same as the single node's | The same `cassandra_latest.yaml`, `paxos_variant: v2` asserted at boot, and every other setting in the table above. |
+| Topology | One DC `helios-dc1`; racks `helios-rack1`, `helios-rack2`, `helios-rack3`; cluster `helios`; `GossipingPropertyFileSnitch` | One rack per node, so `NetworkTopologyStrategy` puts one replica in each and `batchlog_endpoint_strategy: dynamic_remote` has a remote rack to choose (ADR-aacruzgon-0003 left this open). A rack cannot be changed once the node has data, so changing one means `down -v`. |
+| Seeds | `cassandra-1`, `cassandra-2` | One node stopped still leaves a seed. A seed never bootstraps, so replacing one takes an extra step ("Replacing a node" below). |
+| Start order | One at a time, each waiting for the previous node's CQL healthcheck | A node answers CQL only after it has joined the ring. |
+| Replication | `'helios-dc1': 3`, in `keyspace-three-node.cql` | The signed-off `schema.cql` has no replication setting; the keyspace is created first and is kept out of that file on purpose (ADR-aacruzgon-0008). |
+| Heap | `MAX_HEAP_SIZE` 768M, or 2G with the override | |
+| Direct memory | 384M, or 1G with the override | Half the heap, as on the single node. |
+| GC threads | 2 parallel and 2 concurrent, or 4 with the override | Matches the CPU limit. |
+| CPU limit | 2 per node (6 in all), or 4 per node with the override | |
+| Memory limit | 2.5 GiB per node (7.5 GiB in all), or 5 GiB per node with the override; swap disabled | Indicative, Apple-silicon laptop under OrbStack, 768M heap, a 2 GiB limit for the check: 1.31 GiB per node at idle; `memory.peak` 1.47 GiB over the failure procedures and the backend tests; no OOM kill. The 2.5 GiB default then booted from clean and peaked at 1.42 GiB. No sustained load was measured, and the 2G override has not been booted. |
+| Host ports | `127.0.0.1:59342`, `59343`, `59344` (`CASSANDRA_CLUSTER_HOST_PORT_1` to `_3` override) | Not 59042 (developers), 59142 (the required CI job) or 59242 (coverage and FHIR versions). |
+| Network | Fixed addresses `172.29.59.11` to `.13` (`CASSANDRA_CLUSTER_SUBNET_PREFIX` overrides `172.29.59`) | A node keeps its address over a restart and a reconnect, and the seed list can name addresses. |
+| `stop_grace_period` | 60 s | Long enough for a drain on `SIGTERM`. |
+
+## Backend tests against the cluster
+
+```bash
+HFS_TEST_CASSANDRA_URL=127.0.0.1:59342 \
+  cargo test -p helios-persistence --features cassandra --test cassandra_tests
+```
+
+These tests were written for one node, and on three a few fail for reasons
+that are expected today:
+
+- `node_runs_the_docker_cassandra_configuration` always fails. It fails at the
+  rack assertion (`cassandra_tests.rs:185`) if the query reaches another node,
+  and otherwise at `one node, no peers` (`:214`), because on the cluster the
+  driver sees three nodes.
+- The concurrent-write tests fail some of the time with a backend `Timeout`
+  (504) from a `LOCAL_SERIAL` read: `CAS operation timed out: received 0 of 2
+  required responses`. They are the tests in `step3_suites`
+  (`versioned_write_race_suite.rs`) and
+  `create_read::cassandra_concurrent_creates_of_one_id_make_exactly_one_resource`.
+  Cassandra 5.0.9 raises the error when a competing proposal supersedes the
+  read's Paxos round. Raising the CPU limit from 2 to 4 per node did not change
+  the rate in the one test tried, on a host at load 14 to 18 (9 and 12 of 20
+  runs failed at 4 CPUs, 11 of 20 at 2). The answer can reach the writer that
+  won: seven of eight concurrent creates got `AlreadyExists` and the eighth got
+  the 504. These tests panic on the outcomes, before any version-history check,
+  so a failing run does not check the history; the runs that pass do.
+
+On RF 3 this 504 is an accepted answer. Item 8.3 checks the invariants instead
+(no history gap, one winner per version, no lost write), and the race suites
+need a cluster-aware outcome check, which also verifies the history, before
+Step 8.
+
+## Failure procedures
+
+Run these only on this project. The commands use the `c` function from "Run".
+Container names are `hfs-cassandra-cluster-cassandra-N-1`.
+
+**One node down, for less than `max_hint_window` (3 h).** `LOCAL_QUORUM` reads
+and writes and LWTs at `LOCAL_SERIAL` carry on, from either of the other two
+nodes.
+
+```bash
+c stop cassandra-3
+c exec cassandra-1 nodetool status                 # DN for the stopped node
+c start cassandra-3
+# c start returns before the node listens; nodetool is refused for about 20 s
+until [ "$(docker inspect --format '{{.State.Health.Status}}' hfs-cassandra-cluster-cassandra-3-1)" = healthy ]; do sleep 2; done
+c exec cassandra-3 nodetool status                 # back to UN
+c exec cassandra-3 nodetool repair                 # at once, within 3 h of the stop
+```
+
+The operations rules are in section 6 of the roadmap: a node down longer than
+3 h is replaced (`replace_address_first_boot`), never restarted, and the
+replacement is repaired once it has bootstrapped.
+
+**Replacing a node.** Use `cassandra-3` when the test lets you choose. It is the
+only node that is not a seed, so it needs no extra step. Put the flag in an
+override file outside the repository, here `/tmp/replace.yml`, and keep the GC
+settings of the profile in use:
+
+```yaml
+services:
+  cassandra-3:
+    environment:
+      JVM_EXTRA_OPTS: -XX:ParallelGCThreads=2 -XX:ConcGCThreads=2 -Dcassandra.replace_address_first_boot=172.29.59.13
+```
+
+```bash
+c stop cassandra-3
+docker rm -f hfs-cassandra-cluster-cassandra-3-1
+docker volume rm hfs-cassandra-cluster_cassandra-3-data
+c exec cassandra-1 nodetool status                 # DN for the replaced node
+c -f /tmp/replace.yml up -d --no-deps --wait cassandra-3
+c exec cassandra-3 nodetool repair
+```
+
+On a cluster started with the 2G override, `c` names only the default file, so
+this `up` would bring the node back at 2 CPUs, a 768M heap and 2.5 GiB. Name the
+override before the replace file. The replace file sets all of `JVM_EXTRA_OPTS`,
+so also set both GC options in it to 4, or the node runs 2 GC threads on 4 CPUs:
+
+```bash
+c -f docker/cassandra/docker-compose.cluster.heap2g.yml -f /tmp/replace.yml up -d --no-deps --wait cassandra-3
+# The seed route's recreate step, below, has no replace file but needs the override:
+c -f docker/cassandra/docker-compose.cluster.heap2g.yml up -d --no-deps --wait cassandra-2
+```
+
+`cassandra-1` and `cassandra-2` are seeds, and a seed never bootstraps. With the
+same steps, a replacement seed exits with code 3 (`Replacing a node without
+bootstrapping risks invalidating consistency guarantees ...`). To replace one,
+take it off its own seed list for that first boot by also setting
+`CASSANDRA_SEEDS` in the override to the other seed alone, for `cassandra-2`
+`172.29.59.11`, with that seed up. The node then bootstraps. Afterwards, recreate
+it from the normal file (`c up -d --no-deps --wait cassandra-2`), where the
+replace flag is gone and the node, already bootstrapped, keeps its data.
+
+This seed route was run on 2026-11-09, once on each seed, at a 512M heap, 256M
+of direct memory and 1700 MiB per node, with 300 rows at RF 3. `cassandra-2`
+was healthy in 65 s, and `cassandra-1` in 76 s on the volume a refused first
+attempt had left. Each held the rows before any repair, and kept them when
+recreated from the normal file and repaired.
+
+Do not use `-Dcassandra.allow_unsafe_replace=true`, which the error message
+offers. It lets the seed join on the dead node's tokens with no data and no
+streaming, so it answers reads for ranges it does not hold until a repair ends.
+Section 6 requires a replacement that bootstraps from the others.
+
+**Coordinator isolated.** `docker network disconnect` takes the node off the
+cluster network, and off its published host port too, so run the client inside
+the container.
+
+```bash
+NODE=hfs-cassandra-cluster-cassandra-1-1
+docker network disconnect hfs-cassandra-cluster_cluster $NODE
+docker exec $NODE cqlsh -e "CONSISTENCY LOCAL_QUORUM; INSERT INTO ..."   # fails
+docker network connect --ip 172.29.59.11 hfs-cassandra-cluster_cluster $NODE
+docker exec $NODE nodetool status                   # all UN within seconds
+docker exec $NODE nodetool repair
+```
+
+Pass `--ip`, or the node comes back with another address. On the isolated node
+a statement first fails with **`WriteTimeout`** (code 1100), for as long as the
+failure detector takes to convict its peers, and only then with
+**`Unavailable`** (code 1000):
+
+| Statement on the isolated node | `WriteTimeout` | Then `Unavailable` |
+| --- | --- | --- |
+| Plain write at `LOCAL_QUORUM` | 2 s each (`write_request_timeout`), for about 20 s | At once |
+| LWT at `LOCAL_SERIAL` | 1 s each (`cas_contention_timeout`), for about 18 s | At once |
+
+A plain write that timed out can still take effect: it was applied on the
+isolated node's own replica and came back after the reconnect. An LWT that timed
+out has an unknown outcome too; the two checked after the reconnect had not
+applied. The other two nodes keep serving throughout.

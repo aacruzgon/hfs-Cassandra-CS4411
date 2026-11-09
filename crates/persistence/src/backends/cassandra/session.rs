@@ -352,14 +352,13 @@ impl CassandraSession {
         #[cfg(test)]
         {
             let first_page = paging.as_ref().is_some_and(|paging| paging.state.is_none());
-            if paging.is_none() || first_page {
-                if let Some(result) = self
+            if (paging.is_none() || first_page)
+                && let Some(result) = self
                     .faults
                     .intercept(self, cql, &values, kind, first_page)
                     .await
-                {
-                    return result;
-                }
+            {
+                return result;
             }
         }
         self.send(cql, values, kind, paging).await

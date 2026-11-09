@@ -2,7 +2,7 @@ name: Benchmark datasets (report only)
 
 # Do the benchmark datasets of roadmap row 0.7 regenerate to their committed
 # checksums on a real x86-64 CPU? Runs docs/Cassandra/datasets/generate_datasets.py
-# --verify, about a minute of Synthea and 2.3 GB of memory.
+# --verify, about a minute of Synthea and up to about 2.5 GB of memory.
 #
 # Report only. This job is not a required check, and it will not become one. It
 # goes red when --verify finds a difference or cannot run, so a mismatch shows,

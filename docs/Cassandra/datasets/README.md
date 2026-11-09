@@ -25,7 +25,7 @@ python3 docs/Cassandra/datasets/generate_datasets.py --out-dir /tmp/datasets
 python3 docs/Cassandra/datasets/generate_datasets.py --verify
 ```
 
-A run takes about a minute, peaks at about 2.2 GB of memory, and writes 1.6 GB of Synthea output to the temporary directory (or `--work-dir`), which it deletes unless you pass `--keep-raw`.
+A run takes about a minute, peaks at up to about 2.5 GB of memory, and writes 1.6 GB of Synthea output to the temporary directory (or `--work-dir`), which it deletes unless you pass `--keep-raw`.
 
 Both commands compare their result with the committed `manifest.json` and `SHA256SUMS`. The exit status is 0 on success, 1 when the result differs (plain generation still writes its files, and says they are not the recorded datasets), and 2 when the run could not be done.
 
@@ -83,9 +83,11 @@ Patients are in `Patient.id` order, each followed by its Observations in `id` or
 The load phase uses batch Bundles of `PUT` entries, so the dataset's ids survive and loading twice overwrites rather than duplicates. The benchmark's create operation measures `POST` of single resources instead.
 
 ```bash
-python3 docs/Cassandra/datasets/ndjson_to_batches.py patient-observation-10000.ndjson /tmp/batches
+python3 docs/Cassandra/datasets/ndjson_to_batches.py /tmp/datasets/patient-observation-10000.ndjson /tmp/batches
 ```
 
 The default is 500 entries per Bundle. HFS sets no limit on entries per Bundle. What bounds a Bundle is `HFS_MAX_BODY_SIZE` (128 MiB) and `HFS_REQUEST_TIMEOUT` (30 s, covering the whole Bundle), and both backends run at most 8 entries of a batch at once, so a larger Bundle saves only HTTP round trips. A resource here is about 1 KB, so 500 entries is about 0.5 MB. Measured with a debug build of HFS on a laptop: about 0.7 s per Bundle on Cassandra (10,000 resources) and about 1 s on PostgreSQL (10,000 and 100,000).
+
+A Bundle that runs past the timeout answers 408 with some of its entries already written: one Bundle of all 100,000 stopped at 30.8 s with 11,832 resources stored on PostgreSQL. Loading it again is safe, because the entries are `PUT`s.
 
 A batch answers 200 even when entries fail. Whatever posts these Bundles has to check `entry[].response.status`.

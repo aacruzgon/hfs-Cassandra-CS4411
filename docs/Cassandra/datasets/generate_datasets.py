@@ -72,8 +72,8 @@ POPULATION = 400
 STATE = "Massachusetts"
 THREADS = 4
 
-# Peak resident memory at 400 people is about 2.1 GB with the JVM's default
-# heap. The heap has no effect on the data, so a lower one is safe to try.
+# Peak resident memory at 400 people is up to about 2.5 GB with this heap. The
+# heap has no effect on the data, so a lower one is safe to try.
 MAX_HEAP = "3g"
 
 JVM_PROPERTIES = (

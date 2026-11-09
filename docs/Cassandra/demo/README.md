@@ -99,20 +99,26 @@ Row 8.6's job needs all five, and a run passes only with all five:
 
 The first four narrow the gap without closing it: a server that starts listening just after the refusal still passes them. Only the database shows which backend stored a run. The script talks only to the URL it is given, so the job does this count itself.
 
-Add `--report target/demo-report.jsonl` to the script's command and put this between the `kill` and the `exit`:
+Add `--report target/demo-report.jsonl` to the script's command and put this between the `kill` and the `exit`. It counts only when the script passed, so a failed run keeps its exit status.
 
 ```bash
-run_id=$(python3 -c '
+if [ "$status" -eq 0 ]; then
+  if run_id=$(python3 -c '
 import json, sys
 summary = [json.loads(line) for line in open(sys.argv[1])][-1]
 assert summary["summary"] and summary["backend_confirmed"]
 print(summary["run_id"])
-' target/demo-report.jsonl)
-rows=$(docker compose -f docker/postgres/docker-compose.yml exec -T postgres \
-  psql -U helios -d helios -Atc "SELECT count(*) FROM resources WHERE tenant_id LIKE 'demo-$run_id-%'")
-if [ "$rows" != 16 ]; then
-  echo "PostgreSQL holds $rows rows for this run, expected 16" >&2
-  status=1
+' target/demo-report.jsonl); then
+    rows=$(docker compose -f docker/postgres/docker-compose.yml exec -T postgres \
+      psql -U helios -d helios -Atc "SELECT count(*) FROM resources WHERE tenant_id LIKE 'demo-$run_id-%'")
+    if [ "$rows" != 16 ]; then
+      echo "PostgreSQL holds $rows rows for this run, expected 16" >&2
+      status=1
+    fi
+  else
+    echo "the report's summary does not have backend_confirmed true" >&2
+    status=1
+  fi
 fi
 ```
 

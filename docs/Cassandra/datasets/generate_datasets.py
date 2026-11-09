@@ -606,6 +606,12 @@ def generate_only(args: argparse.Namespace, jar: Path) -> int:
     return 0
 
 
+def is_committed_dir(path: Path) -> bool:
+    # samefile and not a comparison of resolved paths: on a case-insensitive
+    # disk, as on macOS, resolve() keeps the case it was given.
+    return path.exists() and path.samefile(HERE)
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate or verify the Synthea benchmark datasets (row 0.7)."
@@ -649,7 +655,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         parser.error("--out-dir is required unless --verify is given")
     if args.threads < 1:
         parser.error("--threads must be at least 1")
-    if args.out_dir is not None and Path(args.out_dir).resolve() == HERE:
+    if args.out_dir is not None and is_committed_dir(Path(args.out_dir)):
         parser.error(
             "--out-dir must not be the directory of the committed manifest.json "
             "and SHA256SUMS; write elsewhere"
@@ -670,10 +676,19 @@ def stop_on_signal(signum: int, _frame: object) -> None:
     raise Failure(f"stopped by signal {signum}")
 
 
-def main(argv: List[str]) -> int:
-    args = parse_args(argv)
+def handle_signals() -> None:
     signal.signal(signal.SIGTERM, stop_on_signal)
     signal.signal(signal.SIGINT, stop_on_signal)
+    # A closed terminal. Windows has no SIGHUP, and under nohup it is ignored
+    # on purpose, so it stays ignored there.
+    hangup = getattr(signal, "SIGHUP", None)
+    if hangup is not None and signal.getsignal(hangup) != signal.SIG_IGN:
+        signal.signal(hangup, stop_on_signal)
+
+
+def main(argv: List[str]) -> int:
+    args = parse_args(argv)
+    handle_signals()
     print(
         f"java {java_version()}, python {platform.python_version()}, "
         f"{platform.system()} {platform.machine()}",
@@ -692,5 +707,8 @@ if __name__ == "__main__":
         print(f"error: {failure}", file=sys.stderr)
         sys.exit(2)
     except (ValueError, KeyError, TypeError) as failure:
-        print(f"error: unexpected Synthea output: {failure!r}", file=sys.stderr)
+        print(
+            f"error: unexpected Synthea output: {type(failure).__name__}: {failure}",
+            file=sys.stderr,
+        )
         sys.exit(2)

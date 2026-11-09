@@ -85,6 +85,11 @@ CALIBRATION_FRACTION = 0.8
 # recorded but not used: it still holds the harness's own previous run.
 QUIET_FOREIGN_CPU_PCT = 200.0
 HOST_PROCESS_MIN_PCT = 5.0
+# The process that is the Docker VM, on hosts where containers run inside one.
+DOCKER_VM_PROCESSES = (
+    "OrbStack Helper", "com.docker.virtualization", "com.docker.krun", "com.docker.hyperkit",
+    "com.apple.Virtualization.VirtualMachine", "qemu-system-", "limactl", "vmmem",
+)
 BATCH_WORKERS = 4
 SAMPLE_SECONDS = 2.0
 SETTLE_TIMEOUT_SECONDS = 1800
@@ -327,14 +332,33 @@ def parse_size(text: str) -> float:
 
 
 def docker_limits_gib(docker_stats_lines: Iterable[str]) -> float:
-    """Sum the memory limits from `docker stats --format '{{.Name}}\\t{{.MemUsage}}'`."""
+    """Sum the memory limits from `docker stats --format '{{.Name}}\\t{{.MemUsage}}...'`."""
     total = 0.0
     for line in docker_stats_lines:
-        if "\t" not in line or "/" not in line:
+        fields = line.split("\t")
+        if len(fields) < 2 or "/" not in fields[1]:
             continue
-        limit = line.split("\t", 1)[1].split("/", 1)[1]
-        total += parse_size(limit)
+        try:
+            total += parse_size(fields[1].split("/", 1)[1])
+        except ValueError:  # `-- / --`: a container that is starting has no figures yet.
+            continue
     return total / 1024**3
+
+
+def other_containers_cpu(docker_stats_lines: Iterable[str], project: str) -> List[dict]:
+    """The CPU of the containers that aren't this harness's, from `docker stats`."""
+    others = []
+    for line in docker_stats_lines:
+        fields = line.split("\t")
+        if len(fields) < 3 or fields[0].startswith(f"{project}-"):
+            continue
+        try:
+            cpu = float(fields[2].rstrip("%"))
+        except ValueError:
+            continue
+        if cpu >= HOST_PROCESS_MIN_PCT:
+            others.append({"pid": None, "cpu_pct": cpu, "command": f"container {fields[0]}"})
+    return others
 
 
 # --- the host -------------------------------------------------------------------
@@ -349,9 +373,18 @@ def parse_ps(text: str) -> Dict[int, Tuple[int, float, str]]:
     return processes
 
 
-def foreign_processes(processes: Dict[int, Tuple[int, float, str]], root_pid: int) -> List[dict]:
-    """Processes above the reporting threshold, without this process and its descendants."""
-    own = {root_pid}
+def is_docker_vm(command: str) -> bool:
+    return any(name in command for name in DOCKER_VM_PROCESSES)
+
+
+def foreign_processes(processes: Dict[int, Tuple[int, float, str]], root_pid: int,
+                      own_roots: Iterable[int] = ()) -> List[dict]:
+    """Processes above the reporting threshold, without the harness's own and the Docker VM.
+
+    On macOS and Windows the database runs inside the VM, so the VM's process
+    is the harness's own load. Other containers are counted from `docker stats`.
+    """
+    own = {root_pid, *own_roots}
     grew = True
     while grew:
         grew = False
@@ -362,7 +395,7 @@ def foreign_processes(processes: Dict[int, Tuple[int, float, str]], root_pid: in
     return sorted(
         ({"pid": pid, "cpu_pct": cpu, "command": command[-60:]}
          for pid, (_, cpu, command) in processes.items()
-         if pid not in own and cpu >= HOST_PROCESS_MIN_PCT),
+         if pid not in own and cpu >= HOST_PROCESS_MIN_PCT and not is_docker_vm(command)),
         key=lambda item: -item["cpu_pct"],
     )
 
@@ -371,12 +404,28 @@ def host_is_quiet(record: dict) -> bool:
     return record["foreign_cpu_pct"] <= QUIET_FOREIGN_CPU_PCT
 
 
-def host_load() -> dict:
+def own_database_pid(backend: "Backend") -> List[int]:
+    """On Linux the database's processes are the host's, and need naming as the harness's own."""
+    if platform.system() != "Linux":
+        return []
+    try:
+        container = backend.container_id()
+        pid = run_cmd(["docker", "inspect", "--format", "{{.State.Pid}}", container], check=False).stdout.strip()
+    except (Failure, OSError, subprocess.SubprocessError):
+        return []
+    return [int(pid)] if pid.isdigit() and int(pid) > 0 else []
+
+
+def host_load(backend: "Backend") -> dict:
     """The host's load, as `ps` and the kernel see it, without the harness's own processes."""
     load_1m, load_5m, load_15m = os.getloadavg()
     processes = parse_ps(run_cmd(["ps", "-A", "-o", "pid=,ppid=,pcpu=,comm="], check=False).stdout)
-    foreign = foreign_processes(processes, os.getpid())
-    stats = run_cmd(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}"], check=False)
+    foreign = foreign_processes(processes, os.getpid(), own_database_pid(backend))
+    stats = run_cmd(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"], check=False)
+    if stats.returncode == 0 and platform.system() != "Linux":
+        # Inside the VM, which `ps` no longer counts. On Linux `ps` already sees them.
+        foreign = sorted(foreign + other_containers_cpu(stats.stdout.splitlines(), backend.project),
+                         key=lambda item: -item["cpu_pct"])
     return {
         "load_1m": load_1m, "load_5m": load_5m, "load_15m": load_15m,
         "cpus": os.cpu_count(),
@@ -386,12 +435,12 @@ def host_load() -> dict:
     }
 
 
-def wait_for_quiet_host(cap_seconds: float) -> dict:
+def wait_for_quiet_host(cap_seconds: float, backend: "Backend") -> dict:
     """Wait, up to the cap, for a quiet host; return the last reading, marked busy if it never came."""
     started = time.monotonic()
     warned = False
     while True:
-        record = host_load()
+        record = host_load(backend)
         quiet = host_is_quiet(record)
         waited = time.monotonic() - started
         if quiet or waited >= cap_seconds:
@@ -478,7 +527,8 @@ class Backend:
         return f"{self.project}_{self.volume_key}"
 
     def snapshot_volume(self, dataset: "Dataset", hfs_commit: str) -> str:
-        return f"{self.project}_snapshot-{dataset.size}-{dataset.sha256[:12]}-{hfs_commit[:12]}"
+        # The backend is named: `--project` gives both backends one project.
+        return f"{self.project}_snapshot-{self.name}-{dataset.size}-{dataset.sha256[:12]}-{hfs_commit[:12]}"
 
     def has_snapshot(self, volume: str) -> bool:
         return run_cmd(["docker", "volume", "inspect", volume], check=False).returncode == 0
@@ -1358,7 +1408,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         timing: dict = {}
 
         def before_start() -> None:
-            timing["host"] = wait_for_quiet_host(args.host_wait_cap)
+            timing["host"] = wait_for_quiet_host(args.host_wait_cap, backend)
 
         started = time.monotonic()
         if args.reset == "snapshot":
@@ -1423,7 +1473,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                     warm_up(args, hfs, op, vus, args.mode, rate, dataset, run_dir)
                     timing["settle_after_warmup"] = backend.settle(flush=False)
                 else:
-                    timing["host"] = wait_for_quiet_host(0)
+                    timing["host"] = wait_for_quiet_host(0, backend)
                 record.update(host_fields(timing.get("host")))
                 backend_settings = backend.settings()
                 (run_dir / "db-settings.json").write_text(json.dumps(backend_settings, indent=1), encoding="utf-8")

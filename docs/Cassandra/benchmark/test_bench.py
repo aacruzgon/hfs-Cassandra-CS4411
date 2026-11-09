@@ -8,6 +8,7 @@ import argparse
 import csv
 import gzip
 import json
+import socket
 import subprocess
 import tempfile
 import time
@@ -314,6 +315,43 @@ class BudgetTests(unittest.TestCase):
     def test_no_deadline_means_no_limit(self):
         backend, dataset = self.parts()
         self.assertIsNone(bench.out_of_budget(argparse.Namespace(), backend, dataset))
+
+
+class HostLoadVmTests(unittest.TestCase):
+    PS = {1: (0, 250.0, "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper"),
+          2: (0, 30.0, "/System/Library/WindowServer"), 3: (0, 90.0, "/usr/bin/rustc")}
+
+    def test_the_docker_vm_is_not_foreign(self):
+        names = [item["command"] for item in bench.foreign_processes(self.PS, 99)]
+        self.assertEqual(names, ["/usr/bin/rustc", "/System/Library/WindowServer"])
+
+    def test_own_database_on_linux_is_not_foreign(self):
+        processes = {10: (1, 300.0, "java"), 11: (10, 50.0, "java"), 12: (1, 80.0, "rustc")}
+        self.assertEqual([i["command"] for i in bench.foreign_processes(processes, 99, [10])], ["rustc"])
+
+    def test_other_containers_count_and_our_own_do_not(self):
+        lines = ["hfsbench-cassandra-cassandra-1\t1GiB / 3GiB\t280.5%", "someone-else-1\t1GiB / 3GiB\t120%", "idle-1\t0B / 1GiB\t0.1%"]
+        self.assertEqual([i["cpu_pct"] for i in bench.other_containers_cpu(lines, "hfsbench-cassandra")], [120.0])
+
+
+class SnapshotNameTests(unittest.TestCase):
+    def test_two_backends_in_one_project_get_two_names(self):
+        args = argparse.Namespace(project="mine", db_port=None, profile="3g", baseline="on")
+        dataset = argparse.Namespace(size=10000, sha256="a" * 64)
+        self.assertNotEqual(bench.Postgres(args).snapshot_volume(dataset, "b" * 40),
+                            bench.Cassandra(args).snapshot_volume(dataset, "b" * 40))
+
+
+class PortTests(unittest.TestCase):
+    def test_a_held_port_is_refused_and_a_free_one_is_not(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            with self.assertRaises(bench.Failure) as refused:
+                bench.require_free_port(port)
+            self.assertIn(f"port {port} is held", str(refused.exception))
+        bench.require_free_port(port)
 
 
 if __name__ == "__main__":

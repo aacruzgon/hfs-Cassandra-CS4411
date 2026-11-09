@@ -2863,7 +2863,11 @@ pub mod strict {
     /// but not `created`. Here a resource at version N = 2 is deleted (the
     /// marker is N+1) and revived: `created` is true, the version is N+2, the
     /// body is the revive's, `created_at` and the FHIR version are the
-    /// original's, and the resource reads and counts again.
+    /// original's, and the resource reads and counts again. On the way there
+    /// it pins two answers no copied test pins since upstream removed
+    /// `conditional_tests.rs`: the create branch stores the body it was sent,
+    /// and a field an update leaves out is absent, not `null`
+    /// (`update_tests::test_update_remove_fields` accepts either).
     #[tokio::test]
     async fn cassandra_strict_revive_is_created_at_n_plus_2() {
         let backend = cassandra_backend!("cassandra_strict_revive_is_created_at_n_plus_2");
@@ -2874,12 +2878,15 @@ pub mod strict {
                 &tenant,
                 "Patient",
                 &id,
-                json!({"resourceType": "Patient", "id": id, "name": [{"family": "One"}]}),
+                json!({
+                    "resourceType": "Patient", "id": id, "name": [{"family": "One"}], "active": true
+                }),
                 crate::cassandra_node::test_fhir_version(),
             )
             .await
             .unwrap();
         assert!(created);
+        assert_eq!(v1.content()["name"][0]["family"], "One");
         let v2 = backend
             .update(
                 &tenant,
@@ -2889,6 +2896,7 @@ pub mod strict {
             .await
             .unwrap();
         assert_eq!(v2.version_id(), "2");
+        assert!(v2.content().get("active").is_none(), "absent, not null");
         backend.delete(&tenant, "Patient", &id).await.unwrap();
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
 

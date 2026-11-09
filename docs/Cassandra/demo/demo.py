@@ -372,6 +372,13 @@ class Demo:
             run()
         except SectionFailed as stop:
             self.assertion("section stopped", "-", [f"the rest was not run: {stop}"])
+        except (AttributeError, IndexError, KeyError, TypeError) as error:
+            # A JSON object whose fields have the wrong shape: this section fails, the run goes on.
+            self.assertion(
+                "section stopped",
+                "-",
+                [f"the rest was not run: a response has the wrong shape: {type(error).__name__}: {error}"],
+            )
 
     # ---- Paging ---------------------------------------------------------
 

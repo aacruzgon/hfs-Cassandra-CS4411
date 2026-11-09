@@ -176,7 +176,7 @@ through; run it in a container on the cluster's network instead.
 | --- | --- | --- |
 | Image, entrypoint | The same as the single node's | The same `cassandra_latest.yaml`, `paxos_variant: v2` asserted at boot, and every other setting in the table above. |
 | Topology | One DC `helios-dc1`; racks `helios-rack1`, `helios-rack2`, `helios-rack3`; cluster `helios`; `GossipingPropertyFileSnitch` | One rack per node, so `NetworkTopologyStrategy` puts one replica in each and `batchlog_endpoint_strategy: dynamic_remote` has a remote rack to choose (ADR-aacruzgon-0003 left this open). A rack cannot be changed once the node has data, so changing one means `down -v`. |
-| Seeds | `cassandra-1`, `cassandra-2` | One node stopped still leaves a seed. |
+| Seeds | `cassandra-1`, `cassandra-2` | One node stopped still leaves a seed. A seed never bootstraps, so replacing one takes an extra step ("Replacing a node" below). |
 | Start order | One at a time, each waiting for the previous node's CQL healthcheck | A node answers CQL only after it has joined the ring. |
 | Replication | `'helios-dc1': 3`, in `keyspace-three-node.cql` | The signed-off `schema.cql` has no replication setting; the keyspace is created first and is kept out of that file on purpose (ADR-aacruzgon-0008). |
 | Heap | `MAX_HEAP_SIZE` 768M, or 2G with the override | |
@@ -228,6 +228,42 @@ c exec cassandra-3 nodetool repair                 # at once, within 3 h of the 
 The operations rules are in section 6 of the roadmap: a node down longer than
 3 h is replaced (`replace_address_first_boot`), never restarted, and the
 replacement is repaired once it has bootstrapped.
+
+**Replacing a node.** Use `cassandra-3` when the test lets you choose. It is the
+only node that is not a seed, and the only one replaced so far. Put the flag in
+an override file outside the repository, here `/tmp/replace.yml`, and keep the
+GC settings of the profile in use:
+
+```yaml
+services:
+  cassandra-3:
+    environment:
+      JVM_EXTRA_OPTS: -XX:ParallelGCThreads=2 -XX:ConcGCThreads=2 -Dcassandra.replace_address_first_boot=172.29.59.13
+```
+
+```bash
+c stop cassandra-3
+docker rm -f hfs-cassandra-cluster-cassandra-3-1
+docker volume rm hfs-cassandra-cluster_cassandra-3-data
+c exec cassandra-1 nodetool status                 # DN for the replaced node
+c -f /tmp/replace.yml up -d --no-deps --wait cassandra-3
+c exec cassandra-3 nodetool repair
+```
+
+`cassandra-1` and `cassandra-2` are seeds, and a seed never bootstraps. With the
+same steps, a replacement seed exits with code 3 (`Replacing a node without
+bootstrapping risks invalidating consistency guarantees ...`). To replace one,
+take it off its own seed list for that first boot by also setting
+`CASSANDRA_SEEDS` in the override to the other seed alone, for `cassandra-2`
+`172.29.59.11`, with that seed up. The node then bootstraps. Afterwards, recreate
+it from the normal file (`c up -d --no-deps --wait cassandra-2`), where the
+replace flag is gone and the node, already bootstrapped, keeps its data. This
+seed route follows from the source and has not been run on this cluster.
+
+Do not use `-Dcassandra.allow_unsafe_replace=true`, which the error message
+offers. It lets the seed join on the dead node's tokens with no data and no
+streaming, so it answers reads for ranges it does not hold until a repair ends.
+Section 6 requires a replacement that bootstraps from the others.
 
 **Coordinator isolated.** `docker network disconnect` takes the node off the
 cluster network, and off its published host port too, so run the client inside

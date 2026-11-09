@@ -27,7 +27,8 @@
 #   Seeds            cassandra-1 and cassandra-2. Compose starts cassandra-1,
 #                    waits until CQL answers, then cassandra-2, then
 #                    cassandra-3. Two seeds so that one node stopped always
-#                    leaves a seed to contact.
+#                    leaves a seed to contact. A seed never bootstraps, so
+#                    replacing one needs the extra step in README.md.
 #   Heap             MAX_HEAP_SIZE=768M (G1, so -Xms = -Xmx)
 #   Direct memory    MAX_DIRECT_MEMORY_SIZE=384M (half the heap; otherwise
 #                    cassandra-env.sh sizes it from the host's RAM)

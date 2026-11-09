@@ -1,0 +1,239 @@
+name: Benchmark datasets (report only)
+
+# Do the benchmark datasets of roadmap row 0.7 regenerate to their committed
+# checksums on a real x86-64 CPU? Runs docs/Cassandra/datasets/generate_datasets.py
+# --verify, about a minute of Synthea and 2.3 GB of memory.
+#
+# Report only. This job is not a required check, and it will not become one. It
+# goes red when --verify finds a difference or cannot run, so a mismatch shows,
+# but nothing waits on it. A paths: filter is allowed here because the ban on
+# them covers only the two workflows with required jobs; it keeps this run off
+# unrelated pull requests.
+#
+# Runs on the team's self-hosted runners with the fork guard
+# (ADR-aacruzgon-0018). It is a light job, on either runner
+# (ADR-aacruzgon-0023). The report step is if: always() and
+# continue-on-error: true, as in the other workflows (ADR-aacruzgon-0045).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/Cassandra/datasets/**'
+      - '.github/workflows/benchmark-datasets.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/Cassandra/datasets/**'
+      - '.github/workflows/benchmark-datasets.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref; a newer push supersedes the run in flight.
+concurrency:
+  group: benchmark-datasets-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Benchmark datasets --verify (x86-64)
+    # Fork guard (ADR-aacruzgon-0018). It only keeps this unmodified workflow
+    # from running a fork's code; approval is what keeps forks off the runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra-light]
+    timeout-minutes: 20
+    env:
+      # The commit and build profile the CI report names (ci-report.py
+      # context): on a pull request, its head, not the merge commit GITHUB_SHA
+      # names.
+      CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      CI_REPORT_PROFILE: none (no Rust build)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The point of this job. Both runners are x86-64 today; a runner of any
+      # other architecture must not pass as evidence for this one.
+      - name: Refuse any architecture but x86-64
+        run: |
+          arch=$(uname -m)
+          if [ "$arch" != x86_64 ]; then
+            echo "::error::this job checks x86-64, and this runner is $arch"
+            exit 1
+          fi
+
+      # acruzdebian has no Java, and the script needs Java and the runner's
+      # Python side by side, so a JRE on the runner is simpler than a container
+      # image, which would have to carry Python as well. 21.0.13 is the version
+      # the arm64 and Rosetta containers ran, so a difference here points at the
+      # CPU and not at a newer Java. It stays in the runner's tool cache.
+      - name: Install Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-package: jre
+          java-version: '21.0.13'
+
+      # --work-dir under the job's temporary directory: the raw output is
+      # 1.6 GB, and /tmp is a tmpfs on acruzdebian. The script checks the jar's
+      # SHA-256 and already retries a 504 from GitHub, up to six attempts. A
+      # cached jar is checked on every run too. Wrapped in ci-report.py build
+      # for the wall time and the memory peak; it exits with the script's
+      # status: 1 for a difference, 2 for a run that could not be done.
+      - name: Regenerate the datasets and compare
+        id: verify
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-report/inputs/datasets"
+          python3 .github/scripts/ci-report.py build datasets-verify "Regenerate and compare" -- \
+            python3 docs/Cassandra/datasets/generate_datasets.py --verify \
+              --out-dir "$RUNNER_TEMP/datasets/out" \
+              --work-dir "$RUNNER_TEMP/datasets/work" \
+              --jar-cache "$RUNNER_TOOL_CACHE/hfs-benchmark-datasets" \
+            2>&1 | tee "$RUNNER_TEMP/ci-report/inputs/datasets/verify.log"
+
+      # What ran it, and each file's expected and actual SHA-256, hashed here
+      # rather than taken from the script. Report only.
+      - name: Report the machine and the checksums
+        if: always()
+        continue-on-error: true
+        env:
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/datasets"
+          mkdir -p "$out"
+          python3 - "$out" <<'REPORT'
+          import hashlib
+          import json
+          import os
+          import platform
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          out = Path(sys.argv[1])
+          temp = Path(os.environ["RUNNER_TEMP"])
+          manifest = json.loads(Path("docs/Cassandra/datasets/manifest.json").read_text())
+
+
+          def java_properties():
+              try:
+                  text = subprocess.run(
+                      ["java", "-XshowSettings:properties", "-version"],
+                      capture_output=True, text=True,
+                  ).stderr
+              except OSError as error:
+                  return {"error": repr(error)}
+              return dict(re.findall(r"^\s+(java\.\S+) = (.*)$", text, re.MULTILINE))
+
+
+          def sha256_of(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(1 << 20), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+
+          cpu = next(
+              (line.split(":", 1)[1].strip()
+               for line in Path("/proc/cpuinfo").read_text().splitlines()
+               if line.startswith("model name")),
+              None,
+          )
+          java = java_properties()
+          try:
+              run = json.loads((temp / "ci-report/datasets-verify.json").read_text())["data"]
+          except (OSError, ValueError, KeyError):
+              run = {}
+
+          files = []
+          for size, record in sorted(manifest["datasets"].items(), key=lambda i: int(i[0])):
+              path = temp / "datasets/out" / record["file"]
+              actual = sha256_of(path) if path.is_file() else None
+              files.append({
+                  "file": record["file"],
+                  "expected": record["sha256"],
+                  "actual": actual,
+                  "same": actual == record["sha256"],
+              })
+
+          data = {
+              "outcome": os.environ.get("VERIFY_OUTCOME"),
+              "machine": platform.machine(),
+              "cpu": cpu,
+              "runner": os.environ.get("RUNNER_NAME"),
+              "python": platform.python_version(),
+              "java_vendor": java.get("java.vendor"),
+              "java_version": java.get("java.runtime.version"),
+              "elapsed_s": run.get("wall_s"),
+              "peak_anon_mib": run.get("peak_anon_mib"),
+              "files": files,
+          }
+          (out / "report.json").write_text(json.dumps(data, indent=2))
+
+          lines = [
+              f"**`--verify`: {data['outcome']}**", "",
+              "| | |", "| --- | --- |",
+              f"| `uname -m` | `{data['machine']}` |",
+              f"| CPU | {data['cpu']} |",
+              f"| Runner | `{data['runner']}` |",
+              f"| Java | {data['java_vendor']}, `{data['java_version']}` |",
+              f"| Python | `{data['python']}` |",
+              f"| Elapsed | {data['elapsed_s']} s |",
+              f"| Peak anon memory of the runner's cgroup | {data['peak_anon_mib']} MiB |",
+              "",
+              "| File | Expected SHA-256 | Actual SHA-256 | Same |",
+              "| --- | --- | --- | --- |",
+          ]
+          for item in files:
+              lines.append(
+                  f"| `{item['file']}` | `{item['expected']}` | `{item['actual']}` "
+                  f"| {'yes' if item['same'] else 'NO'} |"
+              )
+          log = out / "verify.log"
+          mismatch = log.read_text().splitlines() if log.is_file() else []
+          found = [i for i, line in enumerate(mismatch) if line.startswith("MISMATCH")]
+          if found:
+              lines += ["", "```text", *mismatch[found[0]:found[0] + 40], "```"]
+          (out / "report.md").write_text("\n".join(lines) + "\n")
+          REPORT
+          python3 .github/scripts/ci-report.py context
+          python3 .github/scripts/ci-report.py add datasets "Benchmark datasets on x86-64" \
+            --markdown "$out/report.md" --json "$out/report.json"
+
+      # Report only.
+      - name: Upload the CI report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-benchmark-datasets
+          path: ${{ runner.temp }}/ci-report
+          if-no-files-found: warn
+          overwrite: true
+
+      # Only when the script ran and failed: the regenerated files are what a
+      # line-by-line diff against another machine's needs, and this job is
+      # about to delete them. About 115 MB.
+      - name: Upload the regenerated files for a diff
+        if: failure() && steps.verify.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: regenerated-datasets
+          path: ${{ runner.temp }}/datasets/out
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+
+      # The script deletes the raw output itself, except when the job is
+      # cancelled or times out under it.
+      - name: Delete the regenerated data
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/datasets"

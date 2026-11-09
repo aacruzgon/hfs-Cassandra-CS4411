@@ -48,7 +48,7 @@ The other Synthea settings, listed in `manifest.json`, are stated so that the re
 
 The checksums cover the filtered NDJSON, not Synthea's output. Whole Bundles differ between runs, even at one thread count, in resource types other than Patient and Observation.
 
-The filter also removes Synthea's two quality-of-life extensions from Patient (`disability-adjusted-life-years` and `quality-adjusted-life-years`). They hold 16-digit results of `Math.exp` and `Math.pow`, whose last digit differs between x86-64 and arm64, and they were the only values that differed. With them gone, the checksums were the same on arm64 and x86-64 (in a container under Rosetta), on Java 17 and 21, on macOS and Linux. No real x86-64 machine has run it yet.
+The filter also removes Synthea's two quality-of-life extensions from Patient (`disability-adjusted-life-years` and `quality-adjusted-life-years`). They hold 16-digit results of `Math.exp` and `Math.pow`, whose last digit differs between x86-64 and arm64, and they were the only values that differed. With them gone, the checksums were the same on arm64 and x86-64 (in a container under Rosetta), on Java 17 and 21, on macOS and Linux. On real x86-64 CPUs, the report-only workflow `.github/workflows/benchmark-datasets.yml` runs `--verify` on the self-hosted runners whenever these files change.
 
 ## What the files contain
 

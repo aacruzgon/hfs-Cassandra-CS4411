@@ -4700,8 +4700,9 @@ async fn start_cassandra(
     // that changes the patient compartment must apply from a tenant's first
     // request after a restart, as PostgreSQL's and MongoDB's startup reloads
     // make it, also with the refresh off (TTL 0). The tenants come from a
-    // scan of `resources_by_type`'s partition keys; Cassandra keeps no table
-    // of tenants. A failed load stops startup, as PostgreSQL's does.
+    // scan of `resources_by_type`'s partition keys, or of `resources`'s when
+    // tombstones stop that one; Cassandra keeps no table of tenants. A failed
+    // load stops startup, as PostgreSQL's does.
     let started = std::time::Instant::now();
     let reload = backend
         .load_all_stored_search_parameters()

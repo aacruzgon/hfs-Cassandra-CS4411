@@ -14,7 +14,7 @@ use futures::stream::{self, StreamExt};
 use parking_lot::RwLock;
 
 use super::config::CassandraConfig;
-use super::errors::{BACKEND_NAME, map_driver_error};
+use super::errors::{BACKEND_NAME, is_too_many_tombstones, map_driver_error};
 use super::schema;
 use super::session::{CassandraSession, DriverError, StatementCounts, StatementKind};
 use super::stats::{CasCounters, CasStats};
@@ -41,6 +41,14 @@ const SELECT_STORED_SEARCH_PARAMETER_IDS: &str =
 /// (`DataLimits.DISTINCT_NONE`). The `resource_type` filter is applied here,
 /// because a key range cannot restrict half of a composite partition key.
 const SELECT_TENANT_TYPES: &str = "SELECT DISTINCT tenant_id, resource_type FROM resources_by_type";
+
+/// Every partition key of `resources`, read only when [`SELECT_TENANT_TYPES`]
+/// is refused for reading too many tombstones. It has one row per resource, so
+/// it costs far more than that scan, but `resources` never holds a tombstone
+/// (`schema.cql`, walkthrough G39), so nothing can stop it the same way. It
+/// also lists a tenant whose SearchParameters are all deleted, soft-deleted
+/// rows included, which only makes the reload read an empty partition.
+const SELECT_RESOURCE_KEYS: &str = "SELECT DISTINCT tenant_id, resource_type, id FROM resources";
 
 /// How many SearchParameter reads a reload runs at once.
 const STORED_SEARCH_PARAMETER_READS: usize = 16;
@@ -464,7 +472,8 @@ impl CassandraBackend {
     ///
     /// Cassandra keeps no table of tenants (design, "Tenant registry"), so
     /// the tenants come from [`Self::stored_search_parameter_tenants`], a
-    /// paged scan of `resources_by_type`'s partition keys.
+    /// paged scan of `resources_by_type`'s partition keys, or of `resources`'s
+    /// when too many tombstones stop that one.
     ///
     /// Then it drops every cached per-tenant registry.
     ///
@@ -512,17 +521,43 @@ impl CassandraBackend {
     /// from a paged scan of the table's partition keys (one row per tenant
     /// and type that has a resource).
     ///
+    /// **Past the tombstone limit.** `DISTINCT` reads each partition up to
+    /// its first live row, and clustering is newest first, so deleted rows at
+    /// the head of a partition are read and counted, per page and per replica
+    /// (`ReadCommand.java:590-602` in `cassandra-5.0.9`), and no page size
+    /// avoids a single partition over `tombstone_failure_threshold`. Until
+    /// those tombstones are purgeable (`gc_grace_seconds`, 3 h on this table;
+    /// no compaction is needed, `ReadCommand.java:460-461`) the node refuses
+    /// the scan, so this falls back to [`SELECT_RESOURCE_KEYS`] (issue #74).
+    ///
     /// # Errors
     ///
-    /// The mapped driver error of any page.
+    /// The mapped driver error of any page. Any failure other than
+    /// `READ_TOO_MANY_TOMBSTONES` is not retried, and a failed fallback is an
+    /// error as well.
     pub async fn stored_search_parameter_tenants(&self) -> StorageResult<BTreeSet<String>> {
-        let rows = self
+        let map_error = |error: &DriverError| {
+            StorageError::Backend(map_driver_error(error, "SearchParameter tenants"))
+        };
+        let rows = match self
             .session
             .rows_paged(SELECT_TENANT_TYPES, Vec::new(), StatementKind::Read)
             .await
-            .map_err(|error| {
-                StorageError::Backend(map_driver_error(&error, "SearchParameter tenants"))
-            })?;
+        {
+            Ok(rows) => rows,
+            Err(error) if is_too_many_tombstones(&error) => {
+                tracing::warn!(
+                    "the partition-key scan of resources_by_type read more tombstones than \
+                     tombstone_failure_threshold allows; listing tenants from the keys of \
+                     resources instead, which costs one row per resource"
+                );
+                self.session
+                    .rows_paged(SELECT_RESOURCE_KEYS, Vec::new(), StatementKind::Read)
+                    .await
+                    .map_err(|error| map_error(&error))?
+            }
+            Err(error) => return Err(map_error(&error)),
+        };
         let mut tenants = BTreeSet::new();
         for row in &rows {
             let column = |name: &str| -> StorageResult<String> {
@@ -1646,6 +1681,7 @@ mod reload_rules {
 #[cfg(test)]
 mod node_tests {
     use super::*;
+    use crate::backends::cassandra::session::Fault;
     use std::collections::BTreeSet;
 
     async fn backend() -> Option<CassandraBackend> {
@@ -1752,5 +1788,258 @@ mod node_tests {
                 )));
             }
         }
+    }
+
+    fn tenant_context(case: &str) -> crate::tenant::TenantContext {
+        crate::tenant::TenantContext::new(
+            crate::tenant::TenantId::new(format!(
+                "test-tombstone-{case}-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            crate::tenant::TenantPermissions::full_access(),
+        )
+    }
+
+    fn search_parameter(code: &str) -> serde_json::Value {
+        serde_json::json!({
+            "resourceType": "SearchParameter",
+            "url": format!("http://example.org/SearchParameter/{code}"),
+            "name": code,
+            "status": "active",
+            "description": "A tenant-scan test",
+            "code": code,
+            "base": ["Patient"],
+            "type": "token",
+            "expression": "Patient.active",
+        })
+    }
+
+    /// A refused scan (issue #74) lists the tenants from `resources`: a
+    /// tenant with a SearchParameter, and one whose SearchParameter is
+    /// deleted, since a soft delete leaves its row, but no tenant without
+    /// one. One injected fault, so it writes no tombstones.
+    #[tokio::test]
+    async fn too_many_tombstones_list_the_tenants_from_resources() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        let (with, deleted, without) = (
+            tenant_context("with"),
+            tenant_context("deleted"),
+            tenant_context("without"),
+        );
+        let create = |tenant, resource_type, body| {
+            crate::core::ResourceStorage::create(&backend, tenant, resource_type, body, version)
+        };
+        create(&with, "SearchParameter", search_parameter("a"))
+            .await
+            .expect("create");
+        let gone = create(&deleted, "SearchParameter", search_parameter("b"))
+            .await
+            .expect("create");
+        crate::core::ResourceStorage::delete(&backend, &deleted, "SearchParameter", gone.id())
+            .await
+            .expect("delete");
+        create(
+            &without,
+            "Patient",
+            serde_json::json!({ "resourceType": "Patient" }),
+        )
+        .await
+        .expect("create");
+
+        backend.session.inject_fault_on_first_page(
+            StatementKind::Read,
+            SELECT_TENANT_TYPES,
+            Fault::FailWithTooManyTombstones,
+        );
+        let tenants = backend
+            .stored_search_parameter_tenants()
+            .await
+            .expect("the fallback scan answers");
+        assert!(tenants.contains(with.tenant_id().as_str()));
+        assert!(tenants.contains(deleted.tenant_id().as_str()));
+        assert!(!tenants.contains(without.tenant_id().as_str()));
+    }
+
+    /// Only the tombstone failure falls back, and a fallback that fails is
+    /// an error too: startup must still stop then (ADR-aacruzgon-0041).
+    #[tokio::test]
+    async fn any_other_scan_failure_still_stops_the_load() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        backend.session.inject_fault_on_first_page(
+            StatementKind::Read,
+            SELECT_TENANT_TYPES,
+            Fault::FailWithUnavailable,
+        );
+        // Armed before the first scan. If `Unavailable` wrongly fell back,
+        // that scan would use up this fault and the second scan below, which
+        // does fall back, would succeed.
+        backend.session.inject_fault_on_first_page(
+            StatementKind::Read,
+            SELECT_RESOURCE_KEYS,
+            Fault::FailWithUnavailable,
+        );
+        assert!(backend.stored_search_parameter_tenants().await.is_err());
+
+        backend.session.inject_fault_on_first_page(
+            StatementKind::Read,
+            SELECT_TENANT_TYPES,
+            Fault::FailWithTooManyTombstones,
+        );
+        assert!(backend.stored_search_parameter_tenants().await.is_err());
+    }
+}
+
+/// Issue #74 against the real `tombstone_failure_threshold`: 100,001 row
+/// tombstones at the head of one partition, in a keyspace of the test's own,
+/// so no other test's scan and no later `hfs` boot on the node reads them. It
+/// writes 100,001 tombstones, so it never runs by accident on a shared node;
+/// it is skipped unless this is set:
+///
+/// - `HFS_TEST_CASSANDRA_TOMBSTONE_URL`: the node's `host:port`.
+///
+/// ```text
+/// HFS_TEST_CASSANDRA_TOMBSTONE_URL=127.0.0.1:59142 \
+///     cargo test -p helios-persistence --features cassandra --lib \
+///     backends::cassandra::backend::tombstone_limit_tests -- --nocapture
+/// ```
+#[cfg(test)]
+mod tombstone_limit_tests {
+    use super::*;
+
+    const URL: &str = "HFS_TEST_CASSANDRA_TOMBSTONE_URL";
+
+    /// One more than the node's default `tombstone_failure_threshold`.
+    const TOMBSTONES: usize = 100_001;
+
+    #[tokio::test]
+    async fn a_partition_over_the_limit_does_not_stop_the_tenant_scan() {
+        let Some(url) = std::env::var(URL).ok().filter(|url| !url.trim().is_empty()) else {
+            eprintln!("skipping: {URL} is not set");
+            return;
+        };
+        let config = |keyspace: Option<&str>| {
+            let mut config = CassandraConfig {
+                contact_points: vec![url.clone()],
+                ..crate::backends::cassandra::test_support::test_config()
+            };
+            if let Some(keyspace) = keyspace {
+                config.keyspace = keyspace.to_string();
+            }
+            config
+        };
+        let admin = CassandraBackend::connect(config(None))
+            .await
+            .expect("connect");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let keyspace = format!("test_tombstones_{run}");
+        let ddl = |cql: String| {
+            let session = &admin.session;
+            async move {
+                session
+                    .rows(&cql, Vec::new(), StatementKind::Write)
+                    .await
+                    .unwrap_or_else(|error| panic!("{cql}: {error:?}"));
+            }
+        };
+        ddl(format!(
+            "CREATE KEYSPACE {keyspace} WITH replication = \
+             {{'class': 'NetworkTopologyStrategy', 'helios-dc1': 1}}"
+        ))
+        .await;
+        // The columns the two scans read; the backend under test is only
+        // asked for the tenant list, so it needs no other table.
+        ddl(format!(
+            "CREATE TABLE {keyspace}.resources_by_type (tenant_id text, resource_type text, \
+             last_updated timestamp, id text, PRIMARY KEY ((tenant_id, resource_type), \
+             last_updated, id)) WITH CLUSTERING ORDER BY (last_updated DESC, id DESC)"
+        ))
+        .await;
+        ddl(format!(
+            "CREATE TABLE {keyspace}.resources (tenant_id text, resource_type text, id text, \
+             PRIMARY KEY ((tenant_id, resource_type, id)))"
+        ))
+        .await;
+
+        let backend = CassandraBackend::connect(config(Some(&keyspace)))
+            .await
+            .expect("connect to the test's keyspace");
+        let tenant = "test-tombstone-limit";
+        for cql in [
+            "INSERT INTO resources_by_type (tenant_id, resource_type, last_updated, id) \
+             VALUES (?, ?, 1000, 'sp')",
+            "INSERT INTO resources (tenant_id, resource_type, id) VALUES (?, ?, 'sp')",
+        ] {
+            backend
+                .session
+                .rows(
+                    cql,
+                    vec![Value::from(tenant), Value::from("SearchParameter")],
+                    StatementKind::Write,
+                )
+                .await
+                .expect("insert the SearchParameter's row");
+        }
+
+        // Row tombstones, as `write.rs`'s X1 delete writes them, newer than
+        // the partition's one live row, so a read reaches them first.
+        let delete = "DELETE FROM resources_by_type WHERE tenant_id = ? AND resource_type = ? \
+                      AND last_updated = ? AND id = ?";
+        let started = std::time::Instant::now();
+        let failed = stream::iter(0..TOMBSTONES)
+            .map(|n| {
+                let session = &backend.session;
+                async move {
+                    session
+                        .rows(
+                            delete,
+                            vec![
+                                Value::from(tenant),
+                                Value::from("Encounter"),
+                                Value::from(2_000_000_000_000_i64 - n as i64),
+                                Value::from(format!("t{n}")),
+                            ],
+                            StatementKind::Write,
+                        )
+                        .await
+                        .is_err()
+                }
+            })
+            .buffer_unordered(64)
+            .filter(|failed| std::future::ready(*failed))
+            .count()
+            .await;
+        assert_eq!(failed, 0, "every tombstone was written");
+        eprintln!("{TOMBSTONES} tombstones in {:?}", started.elapsed());
+
+        // Not vacuous: the scan the node used to refuse is still refused.
+        match backend
+            .session
+            .rows_paged(SELECT_TENANT_TYPES, Vec::new(), StatementKind::Read)
+            .await
+        {
+            Err(error) => assert!(
+                is_too_many_tombstones(&error),
+                "the partition-key scan failed some other way: {error:?}"
+            ),
+            Ok(rows) => panic!(
+                "the partition-key scan passed with {} rows, so the node's limit is not 100,000",
+                rows.len()
+            ),
+        }
+
+        let tenants = backend
+            .stored_search_parameter_tenants()
+            .await
+            .expect("the tenant list survives the tombstones");
+        assert_eq!(tenants.into_iter().collect::<Vec<_>>(), [tenant]);
+
+        ddl(format!("DROP KEYSPACE {keyspace}")).await;
     }
 }

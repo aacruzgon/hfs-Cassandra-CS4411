@@ -17,6 +17,9 @@ the two backends are documented to answer differently, the step states both
 answers (see `Differs`), and the run checks the one for --backend. Nothing is
 ever accepted as "either".
 
+--backend chooses the answers to expect. It does not verify which backend the
+server runs: the HTTP API does not say. --server-log does, from HFS's own log.
+
 Every run uses new tenant names and new resource values, so it depends on
 nothing an earlier run left, and two runs never clash. The script talks only
 to the URL it is given. It needs Python 3.9 or later and nothing else.
@@ -29,6 +32,7 @@ import argparse
 import datetime
 import http.client
 import json
+import re
 import secrets
 import sys
 import time
@@ -79,6 +83,9 @@ DOC_GONE = f"{HTTP}#delete (410 on later reads); {WALKTHROUGH} 4.1"
 DOC_VREAD_GONE = f"{HTTP}#vread (410 on a deleted version); {WALKTHROUGH} 4.2"
 DOC_SEARCH_DELETED = f"{HTTP}#delete (no longer found through search)"
 DOC_ISOLATION = f"CLAUDE.md, Tenant-First Design; {HTTP}#read (404)"
+DOC_SERVER_LOG = "crates/hfs/src/main.rs, 'Starting Helios FHIR Server'; docs/Cassandra/demo/README.md, Confirming the backend"
+
+STARTUP_LINE = "Starting Helios FHIR Server"
 
 
 @dataclass(frozen=True)
@@ -182,7 +189,14 @@ def new_id(created: Answer) -> str:
 class Demo:
     """Sends the requests, checks the answers and keeps the results."""
 
-    def __init__(self, base_url: str, backend: str, timeout: float, report_path: Optional[str]):
+    def __init__(
+        self,
+        base_url: str,
+        backend: str,
+        timeout: float,
+        report_path: Optional[str],
+        server_log: Optional[str] = None,
+    ):
         self.base_url = base_url.rstrip("/")
         parsed = urllib.parse.urlsplit(self.base_url)
         try:
@@ -203,6 +217,8 @@ class Demo:
         self.tenant_b = f"demo-{self.run_id}-b"
         self.system = f"urn:demo:{self.run_id}"
         self.report = open(report_path, "w", encoding="utf-8") if report_path else None
+        self.server_log = server_log
+        self.backend_confirmed = False
         self.section_name = ""
         self.seq = 0
         self.failed = 0
@@ -467,7 +483,31 @@ def q(path: str, **params: str) -> str:
 # ---- The sections, in the order the roadmap names them ------------------
 
 
+def startup_fields(path: str) -> Dict[str, str]:
+    """The key=value fields of the last startup line in HFS's log, or {} if it has none."""
+    with open(path, encoding="utf-8", errors="replace") as log:
+        lines = [line for line in log if STARTUP_LINE in line]
+    return dict(re.findall(r"(\w+)=(\S+)", lines[-1])) if lines else {}
+
+
+def confirm_backend(demo: Demo) -> None:
+    """The one check that the server really is the backend this run expects."""
+    try:
+        fields = startup_fields(demo.server_log)
+    except OSError as error:
+        problems: List[Check] = [f"cannot read --server-log: {error}"]
+    else:
+        problems = [
+            equal("storage_backend in the log", fields.get("storage_backend"), demo.backend),
+            equal("public_base_url in the log", fields.get("public_base_url", "").rstrip("/"), demo.base_url),
+        ]
+    demo.assertion("the server's log names this backend and URL", DOC_SERVER_LOG, problems)
+    demo.backend_confirmed = not any(problems)
+
+
 def capabilities(demo: Demo) -> None:
+    if demo.server_log:
+        confirm_backend(demo)
     demo.step(
         "the server answers",
         200,
@@ -1022,10 +1062,11 @@ def main() -> int:
     parser.add_argument("--wait", type=float, default=0.0, metavar="SECONDS", help="retry GET /metadata for this long before starting (default: no wait)")
     parser.add_argument("--timeout", type=float, default=60.0, metavar="SECONDS", help="one request's timeout (default: %(default)s)")
     parser.add_argument("--report", metavar="FILE", help="also write one JSON object per step, then a summary, to FILE")
+    parser.add_argument("--server-log", metavar="FILE", help="HFS's log; adds a step that confirms from it which backend and URL the server runs")
     args = parser.parse_args()
 
     try:
-        demo = Demo(args.base_url, args.backend, args.timeout, args.report)
+        demo = Demo(args.base_url, args.backend, args.timeout, args.report, args.server_log)
     except (ValueError, OSError) as error:
         print(error, file=sys.stderr)
         return 2
@@ -1049,12 +1090,15 @@ def main() -> int:
 
     passed = demo.seq - demo.failed
     elapsed = time.monotonic() - demo.started
+    if not demo.backend_confirmed:
+        print(f"\nthe server's backend was not confirmed: --backend {demo.backend} only chose the answers to expect")
     print(f"\n{demo.seq} steps, {passed} passed, {demo.failed} failed, {elapsed:.1f} s  (run {demo.run_id}, {demo.backend})")
     if demo.report:
         summary = {
             "summary": True,
             "run_id": demo.run_id,
             "backend": demo.backend,
+            "backend_confirmed": demo.backend_confirmed,
             "base_url": demo.base_url,
             "steps": demo.seq,
             "passed": passed,

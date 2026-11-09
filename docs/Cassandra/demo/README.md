@@ -15,9 +15,11 @@ cargo build -p helios-hfs --bin hfs --features postgres
 HFS_STORAGE_BACKEND=postgres \
 HFS_DATABASE_URL=postgresql://helios:helios@127.0.0.1:55432/helios \
 HFS_SERVER_PORT=58080 HFS_BASE_URL=http://127.0.0.1:58080 \
-./target/debug/hfs &
+./target/debug/hfs > target/demo-hfs.log 2>&1 &
+HFS_PID=$!
 
-python3 docs/Cassandra/demo/demo.py --backend postgres --wait 120
+python3 docs/Cassandra/demo/demo.py --backend postgres --wait 120 --server-log target/demo-hfs.log
+kill "$HFS_PID"
 ```
 
 ## Against Cassandra
@@ -30,9 +32,11 @@ cargo build -p helios-hfs --bin hfs --features cassandra
 HFS_STORAGE_BACKEND=cassandra \
 HFS_CASSANDRA_CONTACT_POINTS=127.0.0.1:59042 \
 HFS_SERVER_PORT=58080 HFS_BASE_URL=http://127.0.0.1:58080 \
-./target/debug/hfs &
+./target/debug/hfs > target/demo-hfs.log 2>&1 &
+HFS_PID=$!
 
-python3 docs/Cassandra/demo/demo.py --backend cassandra --wait 120
+python3 docs/Cassandra/demo/demo.py --backend cassandra --wait 120 --server-log target/demo-hfs.log
+kill "$HFS_PID"
 ```
 
 Search and paging are later roadmap steps (6 and 6a to 6d), so until they land the search steps fail on Cassandra. Row 8.6 is the first point at which the whole script has to pass there.
@@ -41,15 +45,26 @@ Search and paging are later roadmap steps (6 and 6a to 6d), so until they land t
 
 | Option | Meaning |
 | --- | --- |
-| `--backend postgres\|cassandra` | Required. Which backend's documented answers to expect. |
+| `--backend postgres\|cassandra` | Required. Which backend's documented answers to expect. It does not verify the server: see "Confirming the backend". |
 | `--base-url URL` | The HFS URL. Default `http://127.0.0.1:58080`. |
 | `--wait SECONDS` | Retry `GET /metadata` for this long before starting. Default: no wait. |
 | `--timeout SECONDS` | One request's timeout. Default 60. |
 | `--report FILE` | Also write JSON Lines: one object per step, then a summary object with `"summary": true`. |
+| `--server-log FILE` | HFS's log. Adds a step that confirms from it which backend and URL the server runs. |
 
 Set `HFS_BASE_URL` to the same URL as `--base-url`. HFS builds `next` links from it, and the script fails a paging step whose link points anywhere else, because it promises to talk only to the URL it was given.
 
 Port 58080 is used by nothing in `.github/workflows/` or `docker/`.
+
+## Confirming the backend
+
+`--backend` only chooses which answers to expect. `/metadata` and `/health` do not name the storage backend, so a SQLite HFS passes every step of `--backend postgres`, and an HFS left running on the port answers in place of the one you meant to start.
+
+`--server-log` closes the first gap. It reads the last `Starting Helios FHIR Server` line of HFS's log, which HFS writes at `info`, the default level, and adds a step that requires `storage_backend` to equal `--backend` and `public_base_url` to equal `--base-url`. The report's summary then has `"backend_confirmed": true`. Without the option it is `false`, and the run says so.
+
+For the second gap, check that the HFS you started is still running once the script ends. An HFS that cannot bind its port writes that same line and then exits 1, while whatever holds the port keeps answering. `kill "$HFS_PID"` in the commands above fails in that case; a CI job must fail on it.
+
+Row 8.6's job needs all three: a new log file for each run, `--server-log` with `"backend_confirmed": true` in the summary, and the process check.
 
 ## Output
 

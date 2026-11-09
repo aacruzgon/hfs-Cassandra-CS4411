@@ -74,6 +74,8 @@ OPS = ("create", "read", "update", "token", "date", "uri")
 EXTRA_OPS = ("hotkey",)
 SEARCH_OPS = ("token", "date", "uri")
 
+SNAPSHOT_MARKER = ".hfsbench-snapshot-complete"
+
 # Refused outright: these are the shared development containers.
 FORBIDDEN_PROJECTS = {"hfs-cassandra", "hfs-postgres"}
 FORBIDDEN_PORTS = {59042, 55432}
@@ -554,18 +556,23 @@ class Backend:
         return f"{self.project}_snapshot-{self.name}-{dataset.size}-{dataset.sha256[:12]}-{hfs_commit[:12]}"
 
     def has_snapshot(self, volume: str) -> bool:
-        return run_cmd(["docker", "volume", "inspect", volume], check=False).returncode == 0
+        """True only for a finished copy: the marker is written after the copy succeeds."""
+        if run_cmd(["docker", "volume", "inspect", volume], check=False).returncode != 0:
+            return False
+        probe = ["docker", "run", "--rm", "--network", "none", "--entrypoint", "sh", "-v", f"{volume}:/s:ro",
+                 self._image(), "-c", f"test -f /s/{SNAPSHOT_MARKER}"]
+        return run_cmd(probe, check=False, timeout=120).returncode == 0
 
     def _image(self) -> str:
         return self.compose("config", "--images").stdout.split()[0]
 
-    def _copy_volume(self, source: str, destination: str) -> None:
+    def _copy_volume(self, source: str, destination: str, finish: str) -> None:
         name = f"{self.project}-volume-copy"
         try:
             run_cmd(
                 ["docker", "run", "--rm", "--name", name, "--network", "none", "--entrypoint", "sh",
                  "-v", f"{source}:/from:ro", "-v", f"{destination}:/to", self._image(),
-                 "-c", "find /to -mindepth 1 -delete && cp -a /from/. /to/"],
+                 "-c", f"find /to -mindepth 1 -delete && cp -a /from/. /to/ && {finish}"],
                 timeout=1800,
             )
         except BaseException:
@@ -579,19 +586,22 @@ class Backend:
     def save_snapshot(self, volume: str) -> None:
         self.quiesce()
         run_cmd(["docker", "volume", "create", "--label", f"hfsbench.project={self.project}", volume])
-        self._copy_volume(self.data_volume, volume)
+        self._copy_volume(self.data_volume, volume, f"touch /to/{SNAPSHOT_MARKER}")
 
     def restore_snapshot(self, volume: str, before_start=None) -> None:
         self.quiesce()
         self._wait_for_budget()
         if before_start:
             before_start()
-        self._copy_volume(volume, self.data_volume)
+        self._copy_volume(volume, self.data_volume, f"rm -f /to/{SNAPSHOT_MARKER}")
         self.compose("up", "-d", "--wait", "--remove-orphans")
 
-    def drop_snapshots(self) -> None:
-        listed = run_cmd(["docker", "volume", "ls", "-q", "--filter", f"label=hfsbench.project={self.project}"], check=False)
-        for volume in listed.stdout.split():
+    def drop_snapshots(self, volumes: Optional[Sequence[str]] = None) -> None:
+        """Remove the named snapshots, or every snapshot of this project."""
+        if volumes is None:
+            listed = run_cmd(["docker", "volume", "ls", "-q", "--filter", f"label=hfsbench.project={self.project}"], check=False)
+            volumes = listed.stdout.split()
+        for volume in volumes:
             run_cmd(["docker", "volume", "rm", "-f", volume], check=False)
 
     def _wait_for_budget(self) -> None:
@@ -1012,13 +1022,30 @@ class Dataset:
         self.ids_file = self.root / "ids.txt"
         self.search_file = self.root / "search.json"
         self.batches = self.root / "batches"
-        if not self.ids_file.is_file():
-            self.root.mkdir(parents=True, exist_ok=True)
+        self.manifest = self.root / "derived.sha256"
+        self.tool_sha256 = sha256_file(batches_tool)
+        if not self._derived_intact():
+            if self.root.exists():
+                log(f"rebuilding {self.root}: it is partial, or not what this dataset and tool produce")
+                shutil.rmtree(self.root)
+            self.root.mkdir(parents=True)
             ids, queries = build_search_params(self.path)
             self.ids_file.write_text("\n".join(ids) + "\n", encoding="utf-8")
             self.search_file.write_text(json.dumps(queries, indent=1), encoding="utf-8")
-        if not self.batches.is_dir():
             run_cmd([sys.executable, str(batches_tool), str(self.path), str(self.batches)])
+            self.manifest.write_text(self._derived_digest() + "\n", encoding="utf-8")
+
+    def _derived_digest(self) -> str:
+        digest = hashlib.sha256(self.tool_sha256.encode())
+        for path in [self.ids_file, self.search_file, *sorted(self.batches.glob("batch-*.json"))]:
+            digest.update(path.name.encode())
+            digest.update(sha256_file(path).encode())
+        return digest.hexdigest()
+
+    def _derived_intact(self) -> bool:
+        if not (self.manifest.is_file() and self.ids_file.is_file() and self.search_file.is_file()):
+            return False
+        return self.manifest.read_text(encoding="utf-8").strip() == self._derived_digest()
 
     def _current_sha256(self) -> str:
         if self.verified:
@@ -1032,6 +1059,8 @@ class Dataset:
         current = self._current_sha256()
         if current != self.sha256:
             raise Failure(f"refusing dataset {self.path}: expected sha256 {self.sha256}, actual {current}")
+        if not self._derived_intact():
+            raise Failure(f"refusing the files derived from {self.path}: {self.root} changed after it was built")
 
 
 def post_batch(base: str, path: Path) -> collections.Counter:
@@ -1461,6 +1490,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
             volume = backend.snapshot_volume(dataset, environment["hfs_commit"])
             if not backend.has_snapshot(volume):
                 timing["snapshot_build"] = build_snapshot(args, backend, dataset, volume, run_dir)
+                args.built_snapshots.append(volume)
                 started = time.monotonic()
             backend.restore_snapshot(volume, before_start)
         else:
@@ -1581,6 +1611,11 @@ def port_holder(port: int) -> Optional[str]:
     return f"process {pids[0]} ({command})"
 
 
+def require_tool(path: Path, what: str) -> None:
+    if shutil.which(str(path)) is None:
+        raise Failure(f"no {what} at {path}")
+
+
 def require_free_port(port: int) -> None:
     holder = port_holder(port)
     if holder:
@@ -1593,11 +1628,14 @@ def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
         raise Failure("--baseline is on or off")
     backend: Backend = Cassandra(args) if args.backend == "cassandra" else Postgres(args)
     require_free_port(args.hfs_port)
+    require_tool(args.k6, "k6 (see fetch-k6 and --k6)")
+    require_tool(args.hfs_bin, "hfs binary (see --hfs-bin)")
     out_root = args.out.resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     prepared = out_root / "prepared"
     rates = load_rates(args.rates) if args.rates else {}
     ops = expand_ops(args.ops)
+    args.built_snapshots = []
     # Every rate is looked up before anything starts, so a gap can't stop a long matrix halfway.
     planned = {(size, op, vus): pick_rate(args, rates, size, op, vus)
                for size in args.sizes for op in ops for vus in args.concurrency}
@@ -1628,7 +1666,8 @@ def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
     finally:
         backend.stop()
         if args.reset == "snapshot" and not getattr(args, "keep_snapshots", False):
-            backend.drop_snapshots()
+            # Only what this command built: an overnight's snapshots outlive a `run` beside them.
+            backend.drop_snapshots(args.built_snapshots)
         environment_path.write_text(json.dumps(environment, indent=1, sort_keys=True), encoding="utf-8")
         summarize(out_root)
     return out_root, all_ok
@@ -1862,6 +1901,7 @@ LAPTOP_BANNER = (
     "bugs. ADR-aacruzgon-0002: laptop numbers never go in the report."
 )
 OVERNIGHT_LABEL = "laptop-dry-run"
+CALIBRATION_SECONDS = 60  # What `calibrate` measures per cell by default.
 BUDGET_MARGIN_SECONDS = 120
 
 
@@ -1873,6 +1913,7 @@ def overnight_parts(args: argparse.Namespace) -> List[dict]:
     sizes = args.sizes
     parts: List[dict] = [{"name": "calibration", "kind": "calibrate", "backend": "postgres", "sizes": sizes,
                           "ops": ops, "concurrency": conc, "runs": 1, "out": "calibration",
+                          "duration": min(args.duration, CALIBRATION_SECONDS),
                           "label": f"{OVERNIGHT_LABEL}-calibration"}]
     for size in sizes:
         parts.append({"name": f"postgres-on-{size}", "kind": "run", "backend": "postgres", "baseline": "on",
@@ -1906,6 +1947,7 @@ def overnight_preflight(args: argparse.Namespace, parts: List[dict]) -> None:
     if version.returncode != 0:
         raise Failure(f"{args.hfs_bin} --version failed: {version.stderr[-300:]}")
     log(f"preflight: {version.stdout.strip()}, release build")
+    require_tool(args.k6, "k6 (see fetch-k6 and --k6)")
     k6 = run_cmd([str(args.k6), "version"], check=False)
     if f"v{K6_VERSION}" not in k6.stdout:
         raise Failure(f"k6 is not the pinned v{K6_VERSION}: {k6.stdout.strip() or k6.stderr.strip()}; see fetch-k6")
@@ -2304,7 +2346,7 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate_parser = commands.add_parser("calibrate", help="measure PostgreSQL capacity closed-loop and write the 80% rates")
     add_run_arguments(calibrate_parser)
     calibrate_parser.add_argument("--rates-out", type=Path, default=HERE / "rates.json")
-    calibrate_parser.set_defaults(handler=cmd_calibrate, duration=60)
+    calibrate_parser.set_defaults(handler=cmd_calibrate, duration=CALIBRATION_SECONDS)
 
     check_parser = commands.add_parser("snapshot-check", help="measure reload against snapshot restore, and that a restore is exact")
     add_run_arguments(check_parser)

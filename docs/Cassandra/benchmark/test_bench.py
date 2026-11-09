@@ -386,5 +386,38 @@ class ReadingTests(unittest.TestCase):
         self.assertEqual(self.analyse(rows)["latency_reading"], "saturated")
 
 
+class MinorTests(unittest.TestCase):
+    def test_a_starting_container_does_not_break_the_limit_sum(self):
+        self.assertAlmostEqual(bench.docker_limits_gib(["x\t-- / --", "y\t1GiB / 3GiB"]), 3.0)
+
+    def test_a_missing_tool_is_a_clear_failure(self):
+        with self.assertRaises(bench.Failure):
+            bench.require_tool(Path("/nonexistent/k6"), "k6")
+
+    def dataset(self, root, tool):
+        lines = '{"resourceType":"Patient","id":"a"}\n'
+        folder = root / "d"
+        folder.mkdir(exist_ok=True)
+        path = folder / "patient-observation-1.ndjson"
+        path.write_text(lines, encoding="utf-8")
+        sums = root / "SHA256SUMS"
+        sums.write_text(f"{bench.sha256_file(path)}  {path.name}\n", encoding="utf-8")
+        return bench.Dataset(1, folder, root / "prepared", tool, sums)
+
+    def test_tampered_or_partial_derived_files_are_rebuilt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            tool = root / "tool.py"
+            tool.write_text("import pathlib,sys\np=pathlib.Path(sys.argv[2]);p.mkdir();(p/'batch-000001.json').write_text('{}')\n", encoding="utf-8")
+            first = self.dataset(root, tool)
+            batch = first.batches / "batch-000001.json"
+            batch.write_text('{"tampered":true}', encoding="utf-8")
+            with self.assertRaises(bench.Failure):
+                first.check_before_load()
+            second = self.dataset(root, tool)
+            self.assertEqual(batch.read_text(encoding="utf-8"), "{}")
+            second.check_before_load()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

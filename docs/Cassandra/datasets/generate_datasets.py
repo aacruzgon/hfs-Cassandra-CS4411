@@ -22,6 +22,10 @@ Whole Bundles are not reproducible: resource types other than Patient and
 Observation differ between runs, even at the same thread count. That is why
 the checksums cover the filtered NDJSON and not Synthea's output.
 
+The two Synthea quality-of-life extensions on Patient are removed for the same
+reason: they carry 16-digit results of Math.exp and Math.pow, whose last digit
+differs between x86-64 and arm64. See DROPPED_PATIENT_EXTENSIONS.
+
 Exit status: 0 on success, 1 when --verify finds a difference, 2 when the run
 could not be done (no Java, a jar that fails its checksum, Synthea failing).
 """
@@ -89,6 +93,14 @@ SYNTHEA_CONFIG = {
 
 SIZES = (10_000, 100_000)
 KEPT_TYPES = ("Patient", "Observation")
+
+# The only elements in these two types that differ between x86-64 and arm64
+# (measured: 24 of the 100,000 lines, each in one of these). No search
+# parameter covers them, and Observations are identical on both.
+DROPPED_PATIENT_EXTENSIONS = (
+    "http://synthetichealth.github.io/synthea/disability-adjusted-life-years",
+    "http://synthetichealth.github.io/synthea/quality-adjusted-life-years",
+)
 
 # Synthea names a patient's Bundle `<names>_<Patient.id>.json`.
 PATIENT_FILE = re.compile(
@@ -306,6 +318,11 @@ def resources_of_patient(patient_id: str, path: Path) -> List[dict]:
         (r for r in kept if r["resourceType"] == "Observation"),
         key=lambda r: r["id"],
     )
+    patients[0]["extension"] = [
+        extension
+        for extension in patients[0].get("extension", [])
+        if extension.get("url") not in DROPPED_PATIENT_EXTENSIONS
+    ]
     ordered = patients + observations
     for resource in ordered:
         resolve_references(resource, full_urls, f"{path.name} {resource['id']}")
@@ -424,6 +441,7 @@ def build_manifest(jar: Path, output: Path, threads: int, datasets: dict) -> dic
         },
         "filter": {
             "resource_types": list(KEPT_TYPES),
+            "dropped_patient_extensions": list(DROPPED_PATIENT_EXTENSIONS),
             "order": "Patient.id; each Patient, then its Observations by id",
             "format": "NDJSON, UTF-8, sorted keys, no spaces, LF line endings, "
             "decimals as Synthea wrote them",

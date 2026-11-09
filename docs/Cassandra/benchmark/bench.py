@@ -28,7 +28,9 @@ import math
 import os
 import platform
 import re
+import shlex
 import shutil
+import signal
 import socket
 import statistics
 import subprocess
@@ -77,6 +79,11 @@ FORBIDDEN_PROJECTS = {"hfs-cassandra", "hfs-postgres"}
 FORBIDDEN_PORTS = {59042, 55432}
 
 CALIBRATION_FRACTION = 0.8
+
+# A host is quiet when both hold. Measured on the idle Mac; see README "Host load".
+QUIET_LOAD_PER_CPU = 0.75
+QUIET_FOREIGN_CPU_PCT = 200.0
+HOST_PROCESS_MIN_PCT = 5.0
 BATCH_WORKERS = 4
 SAMPLE_SECONDS = 2.0
 SETTLE_TIMEOUT_SECONDS = 1800
@@ -84,6 +91,10 @@ SETTLE_TIMEOUT_SECONDS = 1800
 
 class Failure(Exception):
     """A run could not be completed; the message says why."""
+
+
+class BudgetExhausted(Exception):
+    """The overnight time budget ran out while waiting; not a failure of the run."""
 
 
 def log(message: str) -> None:
@@ -292,6 +303,74 @@ def docker_limits_gib(docker_stats_lines: Iterable[str]) -> float:
     return total / 1024**3
 
 
+# --- the host -------------------------------------------------------------------
+
+
+def parse_ps(text: str) -> Dict[int, Tuple[int, float, str]]:
+    processes: Dict[int, Tuple[int, float, str]] = {}
+    for line in text.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) == 4:
+            processes[int(fields[0])] = (int(fields[1]), float(fields[2]), fields[3].strip())
+    return processes
+
+
+def foreign_processes(processes: Dict[int, Tuple[int, float, str]], root_pid: int) -> List[dict]:
+    """Processes above the reporting threshold, without this process and its descendants."""
+    own = {root_pid}
+    grew = True
+    while grew:
+        grew = False
+        for pid, (parent, _, _) in processes.items():
+            if parent in own and pid not in own:
+                own.add(pid)
+                grew = True
+    return sorted(
+        ({"pid": pid, "cpu_pct": cpu, "command": command[-60:]}
+         for pid, (_, cpu, command) in processes.items()
+         if pid not in own and cpu >= HOST_PROCESS_MIN_PCT),
+        key=lambda item: -item["cpu_pct"],
+    )
+
+
+def host_is_quiet(record: dict) -> bool:
+    return record["load_1m"] <= QUIET_LOAD_PER_CPU * record["cpus"] and record["foreign_cpu_pct"] <= QUIET_FOREIGN_CPU_PCT
+
+
+def host_load() -> dict:
+    """The host's load, as `ps` and the kernel see it, without the harness's own processes."""
+    load_1m, load_5m, load_15m = os.getloadavg()
+    processes = parse_ps(run_cmd(["ps", "-A", "-o", "pid=,ppid=,pcpu=,comm="], check=False).stdout)
+    foreign = foreign_processes(processes, os.getpid())
+    stats = run_cmd(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}"], check=False)
+    return {
+        "load_1m": load_1m, "load_5m": load_5m, "load_15m": load_15m,
+        "cpus": os.cpu_count(),
+        "foreign_cpu_pct": sum(item["cpu_pct"] for item in foreign),
+        "processes_above_5pct": foreign,
+        "docker_limits_gib": docker_limits_gib(stats.stdout.splitlines()) if stats.returncode == 0 else None,
+    }
+
+
+def wait_for_quiet_host(cap_seconds: float) -> dict:
+    """Wait, up to the cap, for a quiet host; return the last reading, marked busy if it never came."""
+    started = time.monotonic()
+    warned = False
+    while True:
+        record = host_load()
+        quiet = host_is_quiet(record)
+        waited = time.monotonic() - started
+        if quiet or waited >= cap_seconds:
+            record.update(busy=not quiet, waited_s=round(waited, 1))
+            if not quiet:
+                log(f"warning: busy host, recorded: load {record['load_1m']:.1f}, foreign CPU {record['foreign_cpu_pct']:.0f}%")
+            return record
+        if not warned:
+            log(f"host not quiet (load {record['load_1m']:.1f}, foreign CPU {record['foreign_cpu_pct']:.0f}%); waiting up to {cap_seconds:.0f} s")
+            warned = True
+        time.sleep(10)
+
+
 # --- the database containers ---------------------------------------------------
 
 
@@ -301,6 +380,7 @@ class Backend:
     name = ""
     service = ""
     compose_dir = ""
+    volume_key = ""
     port_var = ""
     default_port = 0
 
@@ -340,14 +420,60 @@ class Backend:
     def container_id(self) -> str:
         return self.compose("ps", "-q", self.service).stdout.strip()
 
-    def reset(self) -> None:
+    def reset(self, before_start=None) -> None:
         self.compose("down", "-v", "--remove-orphans", timeout=300)
         self._wait_for_budget()
+        if before_start:
+            before_start()
         self.compose("up", "-d", "--wait", "--remove-orphans")
         self.prepare()
 
     def stop(self) -> None:
         self.compose("down", "-v", "--remove-orphans", check=False, timeout=300)
+
+    # Snapshots: a copy of the data volume taken with the database stopped, so
+    # a restore is the same on both backends and needs no database command.
+    @property
+    def data_volume(self) -> str:
+        return f"{self.project}_{self.volume_key}"
+
+    def snapshot_volume(self, dataset: "Dataset", hfs_commit: str) -> str:
+        return f"{self.project}_snapshot-{dataset.size}-{dataset.sha256[:12]}-{hfs_commit[:12]}"
+
+    def has_snapshot(self, volume: str) -> bool:
+        return run_cmd(["docker", "volume", "inspect", volume], check=False).returncode == 0
+
+    def _image(self) -> str:
+        return self.compose("config", "--images").stdout.split()[0]
+
+    def _copy_volume(self, source: str, destination: str) -> None:
+        run_cmd(
+            ["docker", "run", "--rm", "--network", "none", "--entrypoint", "sh",
+             "-v", f"{source}:/from:ro", "-v", f"{destination}:/to", self._image(),
+             "-c", "find /to -mindepth 1 -delete && cp -a /from/. /to/"],
+            timeout=1800,
+        )
+
+    def quiesce(self) -> None:
+        self.compose("stop", "-t", "120", timeout=300)
+
+    def save_snapshot(self, volume: str) -> None:
+        self.quiesce()
+        run_cmd(["docker", "volume", "create", "--label", f"hfsbench.project={self.project}", volume])
+        self._copy_volume(self.data_volume, volume)
+
+    def restore_snapshot(self, volume: str, before_start=None) -> None:
+        self.quiesce()
+        self._wait_for_budget()
+        if before_start:
+            before_start()
+        self._copy_volume(volume, self.data_volume)
+        self.compose("up", "-d", "--wait", "--remove-orphans")
+
+    def drop_snapshots(self) -> None:
+        listed = run_cmd(["docker", "volume", "ls", "-q", "--filter", f"label=hfsbench.project={self.project}"], check=False)
+        for volume in listed.stdout.split():
+            run_cmd(["docker", "volume", "rm", "-f", volume], check=False)
 
     def _wait_for_budget(self) -> None:
         budget = self.args.docker_budget_gib
@@ -360,8 +486,15 @@ class Backend:
             used = docker_limits_gib(lines)
             if used + self.limit_gib <= budget:
                 return
-            log(f"docker budget: {used:.1f} + {self.limit_gib} GiB exceeds {budget}; waiting 180 s")
-            time.sleep(180)
+            deadline = getattr(self.args, "deadline", None)
+            wait = 180
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BudgetExhausted("the Docker budget stayed full until the time budget ran out")
+                wait = min(wait, max(1, remaining))
+            log(f"docker budget: {used:.1f} + {self.limit_gib} GiB exceeds {budget}; waiting {wait:.0f} s")
+            time.sleep(wait)
 
     def prepare(self) -> None:
         """Whatever the database needs before HFS starts."""
@@ -382,6 +515,7 @@ class Backend:
 class Cassandra(Backend):
     name = "cassandra"
     service = "cassandra"
+    volume_key = "cassandra-data"
     port_var = "CASSANDRA_HOST_PORT"
     default_port = 59542
 
@@ -421,6 +555,30 @@ class Cassandra(Backend):
                 raise Failure(f"pending compactions still {pending} after {SETTLE_TIMEOUT_SECONDS} s")
             time.sleep(2)
 
+    def quiesce(self) -> None:
+        # Drained, so the copy holds no commit log to replay. A node that is
+        # already stopped (the second call in a restore) has nothing to drain.
+        self.exec_("nodetool", "drain", check=False, timeout=300)
+        super().quiesce()
+
+    def state_digest(self) -> dict:
+        names = self.exec_(
+            "cqlsh", "-e", "SELECT table_name FROM system_schema.tables WHERE keyspace_name='helios';"
+        ).stdout
+        tables = [line.strip() for line in names.splitlines()[3:] if line.strip() and not line.strip().startswith("(")]
+        digest: dict = {"tables": {}}
+        for table in tables:
+            exported = self.exec_(
+                "cqlsh", "--request-timeout=900", "-e", f"COPY helios.{table} TO STDOUT WITH HEADER=false;",
+                timeout=1800,
+            ).stdout
+            rows = sorted(line for line in exported.splitlines() if line and not line.startswith(("Using ", "Starting ", "Processed", "Rate ")))
+            digest["tables"][table] = {
+                "rows": len(rows),
+                "sha256": hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest(),
+            }
+        return digest
+
     def settings(self) -> dict:
         wanted = (
             "paxos_variant", "paxos_state_purging", "commitlog_sync", "commitlog_sync_period",
@@ -451,6 +609,7 @@ class Cassandra(Backend):
 class Postgres(Backend):
     name = "postgres"
     service = "postgres"
+    volume_key = "postgres-data"
     port_var = "PG_HOST_PORT"
     default_port = 55632
 
@@ -476,6 +635,19 @@ class Postgres(Backend):
 
     def psql(self, sql: str) -> str:
         return self.exec_("psql", "-U", "helios", "-d", "helios", "-At", "-c", sql).stdout
+
+    def state_digest(self) -> dict:
+        tables = self.psql(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY 1;"
+        ).split()
+        digest: dict = {"tables": {}}
+        for table in tables:
+            row = self.psql(
+                f"SELECT count(*), md5(coalesce(string_agg(h, '' ORDER BY h), '')) FROM (SELECT md5(t::text) AS h FROM {table} t) s;"
+            ).strip()
+            rows, checksum = row.split("|")
+            digest["tables"][table] = {"rows": int(rows), "md5": checksum}
+        return digest
 
     def settle(self, flush: bool) -> dict:
         # PostgreSQL's counterpart of a flush and of compaction reaching zero.
@@ -576,6 +748,24 @@ class Hfs:
                 self.process.kill()
                 self.process.wait(timeout=10)
         self.log_file.close()
+
+
+def fetch(url: str, method: str = "GET", body: Optional[bytes] = None, timeout: float = 60) -> Tuple[int, str, Optional[dict]]:
+    """One FHIR request: the status, the start of the body, and the parsed body if it is JSON."""
+    headers = {"Accept": "application/fhir+json", "Content-Type": "application/fhir+json"}
+    request = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            status = response.status
+    except urllib.error.HTTPError as error:
+        raw = error.read()
+        status = error.code
+    try:
+        parsed = json.loads(raw) if raw else None
+    except ValueError:
+        parsed = None
+    return status, raw[:600].decode("utf-8", "replace"), parsed
 
 
 def search_once(url: str, timeout: float = 60) -> Tuple[int, str, Optional[int]]:
@@ -1010,6 +1200,56 @@ def search_probe(hfs: Hfs, op: str, dataset: Dataset) -> Tuple[int, str, Optiona
     return search_once(f"{hfs.base}/{queries[0]}")
 
 
+def out_of_budget(args: argparse.Namespace, backend: Backend, dataset: "Dataset") -> bool:
+    """True when the next run might not finish before the overnight deadline."""
+    deadline = getattr(args, "deadline", None)
+    if deadline is None:
+        return False
+    # Until a run of this backend and size has been timed, assume the slow case: a load.
+    guess = args.warmup + args.duration + (600 if dataset.size >= 100000 else 180)
+    if args.no_reset:
+        guess = args.runs * args.duration + args.warmup + 180
+    estimate = args.run_seconds.get((backend.label, dataset.size), guess)
+    return time.monotonic() + estimate > deadline
+
+
+def note_run_seconds(args: argparse.Namespace, backend: Backend, dataset: "Dataset", seconds: float) -> None:
+    if getattr(args, "deadline", None) is not None:
+        args.run_seconds[(backend.label, dataset.size)] = seconds
+
+
+def host_fields(host: Optional[dict]) -> dict:
+    if not host:
+        return {}
+    return {
+        "host": host, "host_busy": host["busy"], "host_load_1m": host["load_1m"],
+        "host_foreign_cpu_pct": host["foreign_cpu_pct"], "host_docker_limits_gib": host["docker_limits_gib"],
+    }
+
+
+def build_snapshot(args: argparse.Namespace, backend: Backend, dataset: "Dataset", volume: str, run_dir: Path) -> dict:
+    """Load the dataset through HFS once, settle it, and keep a copy of the volume."""
+    log(f"{backend.label} {dataset.size}: building the snapshot")
+    started = time.monotonic()
+    backend.reset()
+    hfs = Hfs(args.hfs_bin, args.hfs_port, run_dir / "hfs-snapshot-build.log", backend.hfs_env())
+    try:
+        load = load_dataset(hfs.base, dataset)
+        settle = backend.settle(flush=True)
+    finally:
+        hfs.stop()
+    backend.save_snapshot(volume)
+    return {"seconds": time.monotonic() - started, "load": load, "settle": settle}
+
+
+def check_restored(hfs: Hfs, dataset: "Dataset") -> None:
+    """One read of the dataset, since a restore has no load to check entry by entry."""
+    first = dataset.ids_file.read_text(encoding="utf-8").split("\n", 1)[0]
+    status, _, _ = fetch(f"{hfs.base}/{first}")
+    if status != 200:
+        raise Failure(f"the restored database answered {status} for {first}")
+
+
 def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: str, vus: int,
              rate: int, out_root: Path, environment: dict) -> bool:
     """Run every run of one (size, operation, concurrency). Returns False if any failed."""
@@ -1019,7 +1259,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         "size": dataset.size, "op": op, "concurrency": vus, "mode": args.mode,
         "target_rate": rate, "duration_s": args.duration, "warmup_s": args.warmup,
         "dataset_file": dataset.path.name, "dataset_sha256": dataset.sha256,
-        "dataset_verified": dataset.verified, "synchronous_commit": backend.baseline if backend.name == "postgres" else None,
+        "dataset_verified": dataset.verified, "reset": args.reset, "synchronous_commit": backend.baseline if backend.name == "postgres" else None,
         "hfs_commit": environment["hfs_commit"], "hfs_build_profile": environment["hfs_build_profile"],
     }
 
@@ -1038,6 +1278,10 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         log(f"skip {cell_id(dataset.size, op, vus)}: already recorded")
         return True
 
+    if args.no_reset and args.resume and cell_dir.exists():
+        # One data set across its runs: a partial cell can only start over.
+        shutil.rmtree(cell_dir)
+
     hfs: Optional[Hfs] = None
     ok = True
 
@@ -1046,10 +1290,23 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         if hfs is not None:
             hfs.stop()
             hfs = None
+        timing: dict = {}
+
+        def before_start() -> None:
+            timing["host"] = wait_for_quiet_host(args.host_wait_cap)
+
         started = time.monotonic()
-        backend.reset()
+        if args.reset == "snapshot":
+            volume = backend.snapshot_volume(dataset, environment["hfs_commit"])
+            if not backend.has_snapshot(volume):
+                timing["snapshot_build"] = build_snapshot(args, backend, dataset, volume, run_dir)
+                started = time.monotonic()
+            backend.restore_snapshot(volume, before_start)
+        else:
+            backend.reset(before_start)
         hfs = Hfs(args.hfs_bin, args.hfs_port, run_dir / "hfs.log", backend.hfs_env())
-        return {"reset_and_boot_s": time.monotonic() - started}
+        timing["reset_and_boot_s"] = time.monotonic() - started
+        return timing
 
     for number in range(1, args.runs + 1):
         run_dir = cell_dir / f"run{number}"
@@ -1058,6 +1315,11 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         if already_done(number):
             continue
         fresh = number == 1 or not args.no_reset
+        if fresh and out_of_budget(args, backend, dataset):
+            args.budget_stopped = True
+            log(f"stopping before {cell_id(dataset.size, op, vus)} run {number}: the time budget would run out")
+            break
+        run_started = time.monotonic()
         try:
             timing: dict = {}
             if fresh:
@@ -1074,8 +1336,13 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                         record.update(status=status, probe_status=code, probe_body=body, completed=0, statuses=f"{code}:1")
                         write_run(run_dir, record)
                         break
-                timing["load"] = load_dataset(hfs.base, dataset)
-                timing["settle_after_load"] = backend.settle(flush=True)
+                if args.reset == "snapshot":
+                    # The snapshot was taken flushed and settled; its statistics are in it.
+                    check_restored(hfs, dataset)
+                    timing["settle_after_load"] = backend.settle(flush=False)
+                else:
+                    timing["load"] = load_dataset(hfs.base, dataset)
+                    timing["settle_after_load"] = backend.settle(flush=True)
                 if op in SEARCH_OPS:
                     # After the settle, once PostgreSQL has statistics. A query
                     # that matches nothing would measure an empty answer.
@@ -1086,6 +1353,9 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                         log(f"warning: {op}'s first query answered {code} with {entries} entries")
                 warm_up(args, hfs, op, vus, args.mode, rate, dataset, run_dir)
                 timing["settle_after_warmup"] = backend.settle(flush=False)
+            else:
+                timing["host"] = wait_for_quiet_host(0)
+            record.update(host_fields(timing.get("host")))
             backend_settings = backend.settings()
             (run_dir / "db-settings.json").write_text(json.dumps(backend_settings, indent=1), encoding="utf-8")
             log(f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: measure ({args.mode}, rate {rate}, {args.duration} s)")
@@ -1100,11 +1370,19 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                 f"  completed {metrics['completed']} ok_rps {metrics['ok_rps']:.1f} "
                 f"p50 {metrics['p50_ms']:.2f} p95 {metrics['p95_ms']:.2f} dropped {metrics['dropped_iterations']}"
             )
+        except BudgetExhausted as exhausted:
+            args.budget_stopped = True
+            log(f"stopping before {cell_id(dataset.size, op, vus)} run {number}: {exhausted}")
+            # Nothing was measured, so nothing is recorded and --resume runs it.
+            if not any(run_dir.iterdir()):
+                run_dir.rmdir()
+            break
         except (Failure, subprocess.SubprocessError, OSError, ValueError, KeyError) as failure:
             record["failure"] = str(failure)
             ok = False
             log(f"FAILED {cell_id(dataset.size, op, vus)} run {number}: {failure}")
         write_run(run_dir, record)
+        note_run_seconds(args, backend, dataset, time.monotonic() - run_started)
         if not ok and args.no_reset:
             break
     if hfs is not None:
@@ -1145,10 +1423,14 @@ def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
             dataset = datasets[size]
             for op in ops:
                 for vus in args.concurrency:
+                    if getattr(args, "budget_stopped", False):
+                        break
                     if not run_cell(args, backend, dataset, op, vus, planned[(size, op, vus)], out_root, environment):
                         all_ok = False
     finally:
         backend.stop()
+        if args.reset == "snapshot" and not getattr(args, "keep_snapshots", False):
+            backend.drop_snapshots()
         environment_path.write_text(json.dumps(environment, indent=1, sort_keys=True), encoding="utf-8")
         summarize(out_root)
     return out_root, all_ok
@@ -1164,7 +1446,8 @@ RUN_FIELDS = [
     "dropped_iterations", "steady_change_pct", "mem_peak_used_mib", "mem_peak_anon_mib",
     "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib", "k6_peak_rss_mib", "oom_killed",
     "synchronous_commit", "hfs_commit", "hfs_build_profile", "dataset_file", "dataset_sha256",
-    "dataset_verified", "memory_samples_missed", "failure",
+    "dataset_verified", "memory_samples_missed", "reset", "host_busy", "host_load_1m", "host_foreign_cpu_pct",
+    "host_docker_limits_gib", "failure",
 ]
 
 SUMMARY_KEY = [
@@ -1178,7 +1461,7 @@ SUMMARY_FIELDS = SUMMARY_KEY + [
     "p95_ms_mean", "p95_cv_pct", "p99_ms_mean", "s2xx", "s409", "s412", "s4xx_other", "s501",
     "s5xx_other", "s_other", "dropped_iterations", "steady_change_pct_mean", "mem_peak_used_mib",
     "mem_peak_anon_mib", "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib",
-    "k6_peak_rss_mib", "oom_killed",
+    "k6_peak_rss_mib", "oom_killed", "host_busy_runs",
 ]
 
 
@@ -1258,6 +1541,7 @@ def summarize(out_root: Path) -> None:
                 hfs_peak_rss_mib=largest("hfs_peak_rss_mib"),
                 k6_peak_rss_mib=largest("k6_peak_rss_mib"),
                 oom_killed=any(m.get("oom_killed") for m in ok),
+                host_busy_runs=sum(1 for m in members if m.get("host_busy")),
             )
             writer.writerow([fmt(row.get(field)) for field in SUMMARY_FIELDS])
     log(f"wrote {out_root / 'runs.csv'} and {out_root / 'summary.csv'}")
@@ -1280,11 +1564,11 @@ def int_list(text: str) -> List[int]:
     return [int(part) for part in text.split(",") if part.strip()]
 
 
-def add_run_arguments(parser: argparse.ArgumentParser) -> None:
+def add_run_arguments(parser: argparse.ArgumentParser, out_required: bool = True) -> None:
     parser.add_argument("--dataset-dir", type=Path, required=True, help="holds patient-observation-<size>.ndjson")
     parser.add_argument("--hfs-bin", type=Path, default=REPO / "target" / "release" / "hfs")
     parser.add_argument("--k6", type=Path, default=Path("k6"), help="the pinned k6, see fetch-k6")
-    parser.add_argument("--out", type=Path, required=True, help="directory for results; created if missing")
+    parser.add_argument("--out", type=Path, required=out_required, help="directory for results; created if missing")
     parser.add_argument("--sizes", type=int_list, default=[10000, 100000])
     parser.add_argument("--ops", default="all", help="comma list of %s, or all" % (",".join(OPS + EXTRA_OPS),))
     parser.add_argument("--concurrency", type=int_list, default=[1, 8, 32])
@@ -1297,6 +1581,9 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batches-tool", type=Path, default=HERE.parent / "datasets" / "ndjson_to_batches.py")
     parser.add_argument("--sha256sums", type=Path, default=HERE.parent / "datasets" / "SHA256SUMS",
                         help="the published checksums every dataset must match (default: %(default)s)")
+    parser.add_argument("--reset", choices=("reload", "snapshot"), default="reload",
+                        help="reset by reloading through HFS, or by restoring a copy of the loaded volume")
+    parser.add_argument("--host-wait-cap", type=float, default=120, help="seconds to wait for a quiet host before each run, then record it busy (default: %(default)s)")
     parser.add_argument("--bin-seconds", type=int, default=10, help="width of the time bins (default: %(default)s)")
     parser.add_argument("--build-profile", help="recorded HFS build profile (default: from the binary's path)")
     parser.add_argument("--docker-budget-gib", type=float, help="wait until running limits plus this leg's fit (for shared machines)")
@@ -1313,15 +1600,19 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
+    args.resume = False
+    args.label = "calibration"
+    return run_calibration(args)
+
+
+def run_calibration(args: argparse.Namespace) -> int:
     args.backend = "postgres"
     args.baseline = "on"
     args.mode = "closed"
     args.rate = 0
     args.rates = None
     args.no_reset = False
-    args.resume = False
     args.runs = 1
-    args.label = "calibration"
     args.unverified_dataset = False
     out_root, ok = run_plan(args)
     rows = list(csv.DictReader((out_root / "runs.csv").open(encoding="utf-8", newline="")))
@@ -1329,7 +1620,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     # A partial calibration adds to the file; each entry says when and where it was measured.
     rates = load_rates(args.rates_out)
     for row in rows:
-        if row["label"] != "calibration":
+        if row["label"] != args.label:
             continue
         if row["status"] != "ok" or float(row["ok_rps"]) <= 0:
             ok = False
@@ -1352,11 +1643,348 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         "profile": environment["profile"],
         "duration_s": args.duration,
         "warmup_s": args.warmup,
+        "run_note": args.note or "",
         "rates": dict(sorted(rates.items())),
     }
     args.rates_out.write_text(json.dumps(document, indent=1, sort_keys=False) + "\n", encoding="utf-8")
     log(f"wrote {args.rates_out}: {len(rates)} cells")
     return 0 if ok else 1
+
+
+LAPTOP_BANNER = (
+    "LAPTOP DRY RUN, NOT FOR THE REPORT. These are numbers from a laptop, for timings and for finding "
+    "bugs. ADR-aacruzgon-0002: laptop numbers never go in the report."
+)
+OVERNIGHT_LABEL = "laptop-dry-run"
+BUDGET_MARGIN_SECONDS = 120
+
+
+def overnight_parts(args: argparse.Namespace) -> List[dict]:
+    """The parts in the order they run. A part is a list of `run` plans sharing one purpose."""
+    ops = expand_ops(args.ops)
+    write_ops = [op for op in ops if op in ("create", "update")]
+    conc = args.concurrency
+    sizes = args.sizes
+    parts: List[dict] = [{"name": "calibration", "kind": "calibrate", "backend": "postgres", "sizes": sizes,
+                          "ops": ops, "concurrency": conc, "runs": 1, "out": "calibration",
+                          "label": f"{OVERNIGHT_LABEL}-calibration"}]
+    for size in sizes:
+        parts.append({"name": f"postgres-on-{size}", "kind": "run", "backend": "postgres", "baseline": "on",
+                      "sizes": [size], "ops": ops, "concurrency": conc, "runs": args.runs, "out": "matrix"})
+    for size in sizes:
+        parts.append({"name": f"cassandra-{size}", "kind": "run", "backend": "cassandra",
+                      "sizes": [size], "ops": ops, "concurrency": conc, "runs": args.runs, "out": "matrix"})
+    if write_ops:
+        parts.append({"name": "postgres-off", "kind": "run", "backend": "postgres", "baseline": "off",
+                      "sizes": sizes, "ops": write_ops, "concurrency": conc, "runs": args.runs, "out": "matrix"})
+    for backend in ("cassandra", "postgres"):
+        parts.append({"name": f"lwt-steady-{backend}", "kind": "run", "backend": backend, "baseline": "on",
+                      "sizes": sizes[:1], "ops": ["create"], "concurrency": [max(conc)], "runs": 3, "out": "lwt-steady",
+                      "mode": "closed", "duration": args.lwt_duration, "no_reset": True,
+                      "label": f"{OVERNIGHT_LABEL}-lwt-steady"})
+    return parts
+
+
+def overnight_preflight(args: argparse.Namespace, parts: List[dict]) -> None:
+    for size in sorted({size for part in parts for size in part["sizes"]}):
+        verify_dataset(args.dataset_dir.resolve() / f"patient-observation-{size}.ndjson", args.sha256sums.resolve())
+    log("preflight: datasets match the published checksums")
+    if not args.batches_tool.is_file():
+        raise Failure(f"no batches tool at {args.batches_tool}; see --batches-tool")
+    if not args.hfs_bin.is_file() or not os.access(args.hfs_bin, os.X_OK):
+        raise Failure(f"no hfs binary at {args.hfs_bin}: build it with cargo build --release -p helios-hfs --features cassandra,postgres")
+    if "release" not in str(args.hfs_bin) and args.build_profile != "release":
+        raise Failure(f"{args.hfs_bin} does not look like a release build; pass --build-profile release if it is one")
+    version = run_cmd([str(args.hfs_bin), "--version"], check=False)
+    if version.returncode != 0:
+        raise Failure(f"{args.hfs_bin} --version failed: {version.stderr[-300:]}")
+    log(f"preflight: {version.stdout.strip()}, release build")
+    k6 = run_cmd([str(args.k6), "version"], check=False)
+    if f"v{K6_VERSION}" not in k6.stdout:
+        raise Failure(f"k6 is not the pinned v{K6_VERSION}: {k6.stdout.strip() or k6.stderr.strip()}; see fetch-k6")
+    log(f"preflight: {k6.stdout.strip()}")
+    lines = run_cmd(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}"]).stdout.splitlines()
+    others = [line for line in lines if not line.startswith("hfsbench-")]
+    used = docker_limits_gib(others)
+    # 3 GiB per leg: legs run one at a time.
+    if used + 3 > args.docker_budget_gib:
+        raise Failure(f"docker budget: {used:.1f} GiB of limits are running, plus 3 for a leg is over {args.docker_budget_gib}; running: {others}")
+    log(f"preflight: docker limits {used:.1f} GiB running ({len(others)} containers) + 3 per leg, budget {args.docker_budget_gib}")
+    free = shutil.disk_usage(args.out).free / 1024**3
+    if free < 20:
+        log(f"warning: only {free:.0f} GiB free for results and Docker volumes")
+
+
+def part_records(out_root: Path, part: dict) -> List[dict]:
+    label = part.get("label", OVERNIGHT_LABEL)
+    records = []
+    for path in sorted((out_root / part["out"]).rglob("run.json")):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if record.get("label") != label or record.get("size") not in part["sizes"] or record.get("op") not in part["ops"]:
+            continue
+        expected_backend = part["backend"] if part["backend"] == "cassandra" else f"postgres-sync-{part.get('baseline', 'on')}"
+        if record.get("backend") == expected_backend:
+            records.append(record)
+    return records
+
+
+def part_counts(records: List[dict], part: dict) -> dict:
+    declined = {(r["size"], r["op"], r["concurrency"]) for r in records if r.get("status") in ("not_implemented", "refused")}
+    ok = [r for r in records if r.get("status") == "ok"]
+    # A cell the server declined is complete after its one probe.
+    done = len(ok) + len(declined) * part["runs"]
+    total = len(part["sizes"]) * len(part["ops"]) * len(part["concurrency"]) * part["runs"]
+    return {
+        "ok": len(ok), "declined_cells": len(declined),
+        "failed": sum(1 for r in records if r.get("status") in ("failed", "no_success")),
+        "busy_host": sum(1 for r in records if r.get("host_busy")),
+        "left": max(0, total - done), "total": total,
+    }
+
+
+def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume_command: str) -> None:
+    lines = [f"# Overnight dry run, {out_root.name}", "", f"**{LAPTOP_BANNER}**", "",
+             f"Started {state['started_utc']}, finished {datetime.now(timezone.utc).isoformat(timespec='seconds')}, "
+             f"budget {state['hours']} h, stopped by: {state['stopped_by']}.", "",
+             "| Part | Status | Took | Runs ok | Declined cells | Failed | Busy host | Left |",
+             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    failures: List[str] = []
+    left_any = False
+    for part in parts:
+        entry = state["parts"].get(part["name"], {})
+        records = part_records(out_root, part)
+        counts = part_counts(records, part)
+        left_any = left_any or counts["left"] > 0 or entry.get("status") != "complete"
+        minutes = entry.get("seconds", 0) / 60
+        lines.append(f"| {part['name']} | {entry.get('status', 'not started')} | {minutes:.0f} min | {counts['ok']} | "
+                     f"{counts['declined_cells']} | {counts['failed']} | {counts['busy_host']} | {counts['left']} of {counts['total']} |")
+        if entry.get("error"):
+            failures.append(f"- `{part['name']}`: {entry['error']}")
+        failures += [f"- `{r['backend']} {r['size']}/{r['op']}/c{r['concurrency']} run {r['run']}`: {r.get('status')}: {str(r.get('failure', ''))[:300]}"
+                     for r in records if r.get("status") in ("failed", "no_success")]
+    lines += ["", "## Failed or refused", ""] + (failures or ["None."])
+    lines += ["", "## What is left", ""]
+    lines += [f"Continue with:\n\n```bash\n{resume_command}\n```"] if left_any else ["Nothing: every part is complete."]
+    lines += ["", f"Results are under `{out_root}`: `matrix/`, `calibration/` and `lwt-steady/`, each with `runs.csv` and `summary.csv`."]
+    (out_root / "morning-summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cmd_overnight(args: argparse.Namespace) -> int:
+    if platform.system() == "Darwin" and not os.environ.get("HFSBENCH_CAFFEINATED"):
+        env = dict(os.environ, HFSBENCH_CAFFEINATED="1")
+        return subprocess.call(["caffeinate", "-dimsu", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], env=env)
+
+    # Both raise KeyboardInterrupt, so a stop runs the same cleanup as a finish
+    # (a backgrounded process otherwise ignores SIGINT).
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    args.profile = "3g"
+    if args.resume and args.out is None:
+        raise Failure("--resume needs --out, the directory named in the morning summary")
+    out_root = (args.out or Path.home() / "hfs-bench" / datetime.now().strftime("%Y-%m-%d")).expanduser().resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+    args.out = out_root
+    state_path = out_root / "overnight-state.json"
+    if state_path.exists() and not args.resume:
+        raise Failure(f"{out_root} already holds an overnight run: pass --resume to continue it, or another --out")
+    parts = overnight_parts(args)
+    overnight_preflight(args, parts)
+    (out_root / "NOT-FOR-REPORT.txt").write_text(LAPTOP_BANNER + "\n", encoding="utf-8")
+
+    state = json.loads(state_path.read_text(encoding="utf-8")) if args.resume and state_path.exists() else {"parts": {}}
+    state.update(started_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"), hours=args.hours, stopped_by="running")
+    deadline = time.monotonic() + args.hours * 3600 - BUDGET_MARGIN_SECONDS
+    run_seconds: Dict[Tuple[str, int], float] = {}
+    rates_path = out_root / "rates-laptop-dry-run.json"
+    resume_command = shlex.join(
+        ["python3", str(Path(__file__).resolve()), "overnight", "--resume", "--out", str(out_root),
+         "--hours", "8", "--dataset-dir", str(args.dataset_dir.resolve()), "--k6", str(args.k6),
+         "--hfs-bin", str(args.hfs_bin.resolve()), "--sha256sums", str(args.sha256sums.resolve()),
+         "--batches-tool", str(args.batches_tool.resolve())])
+
+    def save_state() -> None:
+        state_path.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
+
+    any_failed = False
+    budget_stopped = False
+    calibration_incomplete = False
+    stop_reason: Optional[str] = None
+    try:
+        for part in parts:
+            entry = state["parts"].setdefault(part["name"], {"seconds": 0.0})
+            if entry.get("status") == "complete":
+                log(f"part {part['name']}: already complete")
+                continue
+            if budget_stopped:
+                break
+            log(f"part {part['name']}: starting")
+            plan = argparse.Namespace(**vars(args))
+            plan.backend = part["backend"]
+            plan.baseline = part.get("baseline", "on")
+            plan.out = out_root / part["out"]
+            plan.sizes = part["sizes"]
+            plan.ops = ",".join(part["ops"])
+            plan.concurrency = part["concurrency"]
+            plan.runs = part["runs"]
+            plan.mode = part.get("mode", "open")
+            plan.no_reset = part.get("no_reset", False)
+            plan.duration = part.get("duration", args.duration)
+            plan.label = part.get("label", OVERNIGHT_LABEL)
+            plan.note = f"{LAPTOP_BANNER} {args.note or ''}".strip()
+            plan.rate = None
+            plan.rates = rates_path
+            plan.resume = True
+            plan.unverified_dataset = False
+            plan.keep_snapshots = True
+            plan.deadline = deadline
+            plan.run_seconds = run_seconds
+            plan.budget_stopped = False
+            started = time.monotonic()
+            try:
+                if part["kind"] == "calibrate":
+                    plan.rates_out = rates_path
+                    code = run_calibration(plan)
+                    ok = code == 0
+                else:
+                    if plan.mode == "closed":
+                        plan.rates = None
+                    _, ok = run_plan(plan)
+            except Failure as failure:
+                ok = False
+                entry["error"] = str(failure)
+                log(f"part {part['name']}: {failure}")
+            entry["seconds"] = entry.get("seconds", 0.0) + time.monotonic() - started
+            if plan.budget_stopped:
+                entry["status"] = "stopped at the budget"
+                budget_stopped = True
+            else:
+                entry["status"] = "complete" if ok else "complete with failures"
+                any_failed = any_failed or not ok
+            save_state()
+            if part["kind"] == "calibrate" and entry["status"] != "complete":
+                log("calibration is not complete, so the parts that need its rates can't run yet")
+                calibration_incomplete = True
+                break
+    except KeyboardInterrupt:
+        stop_reason = "a signal"
+    finally:
+        state["stopped_by"] = stop_reason or ("the time budget" if budget_stopped else "an incomplete calibration" if calibration_incomplete else "finishing every part")
+        save_state()
+        write_morning_summary(out_root, state, parts, resume_command)
+        log(f"wrote {out_root / 'morning-summary.md'}")
+    if all(state["parts"].get(part["name"], {}).get("status") == "complete" for part in parts):
+        for backend in (Cassandra(args), Postgres(args)):
+            backend.drop_snapshots()
+    return 1 if any_failed else 0
+
+
+def dirty_database(base: str, dataset: "Dataset") -> dict:
+    """What a run leaves behind: new resources and a new version of a loaded one."""
+    markers = []
+    for number in range(200):
+        status, _, parsed = fetch(f"{base}/Patient", "POST", json.dumps(
+            {"resourceType": "Patient", "active": True, "birthDate": f"1900-01-{number % 28 + 1:02d}"}).encode())
+        if status != 201 or not parsed:
+            raise Failure(f"marker POST answered {status}")
+        markers.append(f"Patient/{parsed['id']}")
+    line = dataset.path.read_text(encoding="utf-8").split("\n", 1)[0]
+    resource = json.loads(line)
+    target = f"{resource['resourceType']}/{resource['id']}"
+    resource["text"] = {"status": "generated", "div": '<div xmlns="http://www.w3.org/1999/xhtml">dirty</div>'}
+    status, _, parsed = fetch(f"{base}/{target}", "PUT", json.dumps(resource).encode())
+    if status not in (200, 201) or not parsed:
+        raise Failure(f"update PUT answered {status}")
+    return {"markers": markers, "target": target, "dirty_version": parsed["meta"]["versionId"]}
+
+
+def check_clean(base: str, dirt: dict) -> dict:
+    """That nothing the previous run wrote is still there."""
+    survivors = [m for m in dirt["markers"] if fetch(f"{base}/{m}")[0] != 404]
+    status, _, parsed = fetch(f"{base}/{dirt['target']}")
+    version = (parsed or {}).get("meta", {}).get("versionId")
+    return {
+        "marker_survivors": len(survivors), "markers_checked": len(dirt["markers"]),
+        "target_status": status, "target_version": version, "dirty_version": dirt["dirty_version"],
+        "clean": not survivors and status == 200 and version != dirt["dirty_version"] and "dirty" not in json.dumps(parsed),
+    }
+
+
+def cmd_snapshot_check(args: argparse.Namespace) -> int:
+    """Measure a reset by reloading against a snapshot restore, and that a restore is exact."""
+    args.reset = "snapshot"
+    backend: Backend = Cassandra(args) if args.backend == "cassandra" else Postgres(args)
+    out_root = args.out.resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+    dataset = Dataset(args.size, args.dataset_dir.resolve(), out_root / "prepared", args.batches_tool, args.sha256sums.resolve())
+    volume = f"{backend.project}_snapshot-check"
+    result: dict = {"backend": backend.label, "size": args.size, "profile": backend.profile, "restores": []}
+    hfs: Optional[Hfs] = None
+    log_path = out_root / f"hfs-snapshot-check-{backend.name}.log"
+
+    def start() -> Hfs:
+        return Hfs(args.hfs_bin, args.hfs_port, log_path, backend.hfs_env())
+
+    all_clean = True
+    try:
+        log(f"{backend.label} {args.size}: reset by reloading")
+        started = time.monotonic()
+        backend.reset()
+        boot = time.monotonic()
+        hfs = start()
+        load = load_dataset(hfs.base, dataset)
+        settle = backend.settle(flush=True)
+        result["reload"] = {
+            "reset_and_up_s": boot - started, "total_to_settled_s": time.monotonic() - started,
+            "load_s": load["seconds"], "settle": settle,
+        }
+        reference = backend.state_digest()
+        result["reference_rows"] = {name: entry["rows"] for name, entry in reference["tables"].items()}
+        hfs.stop()
+        hfs = None
+        started = time.monotonic()
+        backend.save_snapshot(volume)
+        result["save_s"] = time.monotonic() - started
+        size = run_cmd(["docker", "run", "--rm", "-v", f"{volume}:/s:ro", "--entrypoint", "du", backend._image(), "-sb", "/s"], check=False)
+        result["snapshot_bytes"] = int(size.stdout.split()[0]) if size.stdout.split() else None
+
+        for number in range(1, args.restores + 1):
+            log(f"{backend.label} {args.size}: restore {number}")
+            started = time.monotonic()
+            backend.restore_snapshot(volume)
+            copied = time.monotonic()
+            hfs = start()
+            check_restored(hfs, dataset)
+            settle = backend.settle(flush=False)
+            ready = time.monotonic()
+            digest = backend.state_digest()
+            identical = digest == reference
+            dirt = dirty_database(hfs.base, dataset)
+            hfs.stop()
+            hfs = None
+            backend.restore_snapshot(volume)
+            hfs = start()
+            clean = check_clean(hfs.base, dirt)
+            digest_after_dirty = backend.state_digest()
+            hfs.stop()
+            hfs = None
+            result["restores"].append(
+                {
+                    "number": number, "restore_and_up_s": copied - started,
+                    "total_to_settled_s": ready - started, "identical_to_reference": identical,
+                    "differs": [name for name, entry in digest["tables"].items() if reference["tables"].get(name) != entry],
+                    "identical_after_dirty_restore": digest_after_dirty == reference,
+                    "no_previous_data": clean,
+                }
+            )
+            all_clean = all_clean and identical and clean["clean"] and digest_after_dirty == reference
+            log(f"  restore {number}: {ready - started:.1f} s, identical {identical}, clean {clean['clean']}")
+    finally:
+        if hfs is not None:
+            hfs.stop()
+        (out_root / f"snapshot-check-{backend.name}-{args.size}.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
+        backend.stop()
+        run_cmd(["docker", "volume", "rm", "-f", volume], check=False)
+    return 0 if all_clean else 1
 
 
 def cmd_summarize(args: argparse.Namespace) -> int:
@@ -1419,6 +2047,22 @@ def main(argv: List[str]) -> int:
     add_run_arguments(calibrate_parser)
     calibrate_parser.add_argument("--rates-out", type=Path, default=HERE / "rates.json")
     calibrate_parser.set_defaults(handler=cmd_calibrate, duration=60)
+
+    check_parser = commands.add_parser("snapshot-check", help="measure reload against snapshot restore, and that a restore is exact")
+    add_run_arguments(check_parser)
+    check_parser.add_argument("--backend", choices=("cassandra", "postgres"), required=True)
+    check_parser.add_argument("--baseline", default="on")
+    check_parser.add_argument("--size", type=int, default=100000)
+    check_parser.add_argument("--restores", type=int, default=3)
+    check_parser.set_defaults(handler=cmd_snapshot_check)
+
+    overnight_parser = commands.add_parser("overnight", help="an unattended laptop dry run within a time budget; see README")
+    add_run_arguments(overnight_parser, out_required=False)
+    overnight_parser.add_argument("--hours", type=float, required=True, help="time budget in hours")
+    overnight_parser.add_argument("--runs", type=int, default=3)
+    overnight_parser.add_argument("--resume", action="store_true", help="continue the overnight run in --out")
+    overnight_parser.add_argument("--lwt-duration", type=int, default=600, help="seconds of each LWT steady-state run (default: %(default)s)")
+    overnight_parser.set_defaults(handler=cmd_overnight, docker_budget_gib=8.3, backend="postgres", baseline="on", reset="snapshot")
 
     summarize_parser = commands.add_parser("summarize", help="rewrite runs.csv and summary.csv from the run records")
     summarize_parser.add_argument("out", type=Path)

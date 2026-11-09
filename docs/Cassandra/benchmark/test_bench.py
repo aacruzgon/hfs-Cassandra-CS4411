@@ -172,6 +172,37 @@ class DatasetCheckTests(unittest.TestCase):
         self.assertIn("does not exist", str(caught.exception))
 
 
+class HostLoadTests(unittest.TestCase):
+    def test_own_descendants_are_excluded_and_small_processes_ignored(self):
+        text = "100 1 90.0 /usr/bin/python3\n200 100 80.0 k6\n300 200 70.0 hfs\n400 1 50.0 rustc\n500 1 1.0 idle thing\n"
+        foreign = bench.foreign_processes(bench.parse_ps(text), 100)
+        self.assertEqual([item["pid"] for item in foreign], [400])
+        self.assertEqual(foreign[0]["command"], "rustc")
+
+    def test_quiet(self):
+        quiet = {"load_1m": bench.QUIET_LOAD_PER_CPU * 8, "cpus": 8, "foreign_cpu_pct": bench.QUIET_FOREIGN_CPU_PCT}
+        self.assertTrue(bench.host_is_quiet(quiet))
+        self.assertFalse(bench.host_is_quiet(dict(quiet, load_1m=bench.QUIET_LOAD_PER_CPU * 8 + 1)))
+        self.assertFalse(bench.host_is_quiet(dict(quiet, foreign_cpu_pct=bench.QUIET_FOREIGN_CPU_PCT + 1)))
+
+
+class OvernightCountsTests(unittest.TestCase):
+    def test_a_declined_cell_counts_as_done_and_left_is_what_remains(self):
+        part = {"sizes": [10000], "ops": ["create", "token"], "concurrency": [8], "runs": 3}
+        records = [
+            {"size": 10000, "op": "create", "concurrency": 8, "status": "ok"},
+            {"size": 10000, "op": "create", "concurrency": 8, "status": "failed"},
+            {"size": 10000, "op": "token", "concurrency": 8, "status": "not_implemented", "host_busy": True},
+        ]
+        counts = bench.part_counts(records, part)
+        self.assertEqual(counts["ok"], 1)
+        self.assertEqual(counts["declined_cells"], 1)
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(counts["busy_host"], 1)
+        self.assertEqual(counts["left"], 2)
+        self.assertEqual(counts["total"], 6)
+
+
 class HelperTests(unittest.TestCase):
     def test_calibrated_rate_is_80_percent_floor(self):
         self.assertEqual(bench.calibrated_rate(1000.0), 800)

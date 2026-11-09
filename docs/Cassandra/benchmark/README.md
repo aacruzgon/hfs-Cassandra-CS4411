@@ -23,6 +23,15 @@ Before each of the three measured runs, in this order (roadmap Step 8):
 
 `--no-reset` keeps one data set across the three runs. Use it only for the LWT steady-state case below; it is the setting under which ADR-aacruzgon-0001 saw its decline.
 
+**Host load.** Before each run the harness records the host's 1, 5 and 15 minute load average, its CPU count, the processes above 5% CPU from `ps` without its own, and the sum of the running containers' memory limits (`host` in `run.json`). A host is quiet when the 1 minute load is at most 0.75 per CPU and the other processes use at most 200% CPU together. The idle Mac (18 GB, 11 cores, with a desktop session) read a median load of 3.9 and 95% CPU over 4 minutes, most of it WindowServer, with a maximum of 7.3 and 511%; a compile uses 700% or more. If the host isn't quiet, it waits up to `--host-wait-cap` seconds (default 120), then runs and records `host_busy`, which `runs.csv` and `summary.csv` carry. On Linux `ps` reports a process's lifetime CPU, so a brief spike there may not show.
+
+**Reset by snapshot (`--reset snapshot`).** Instead of reloading through HFS for every run, the harness loads each size once, settles it, stops the database and keeps a copy of the data volume, then restores that copy before each run. It is the same on both backends and needs no database command, and it is the state of a settled load, so HFS is never started on a node with tombstones (bug #74). `bench.py snapshot-check` measures it against a reload and proves it exact (row counts and checksums of every table, markers written by a dirty run gone).
+
+| 100,000 resources, laptop, 3 GiB | Reload | Restore |
+| --- | ---: | ---: |
+| PostgreSQL, ready to measure | 123 s | 8 s |
+| Cassandra, ready to measure | 98 s | 14 to 28 s |
+
 **What the measurement is.** The arrival rate is fixed before the run and doesn't depend on how fast the server answers. "Concurrency N" is k6's `maxVUs = N`. A backend that can't keep up runs out of virtual users, and the iterations it couldn't start are counted as `dropped_iterations`: read them next to the latency. A closed loop understates p95, which is why row 0.6 rules it out.
 
 **Dataset check.** Before every load the harness hashes the NDJSON and compares it with `docs/Cassandra/datasets/SHA256SUMS` (`--sha256sums` to point elsewhere), and refuses the run on a mismatch or a missing file or line, so every number names exactly the published bytes (`dataset_file`, `dataset_sha256` and `dataset_verified` in the CSVs). It only hashes; regenerating is `generate_datasets.py --verify`. `--unverified-dataset` is for development with a hand-cut file, requires `--profile 3g`, and marks its runs `dataset_verified False`: they never go in the report.
@@ -115,6 +124,26 @@ The defaults are three runs, 120 s measured, 60 s warm-up, the 5 GiB profile, bo
 | LWT steady state, both backends | 3 runs of 600 s, one load | 1 h |
 
 Per run, on top of 60 s of warm-up and 120 s measured: PostgreSQL 40 s of reset and settle at 10,000 resources and 3 to 6 minutes at 100,000, where loading dominates; Cassandra about 70 s of reset and boot, and 45 s of load at 100,000. Add `--resume` to continue a part that stopped, and split the parts over several nights if the machine's window needs it.
+
+## An overnight dry run on a laptop
+
+`bench.py overnight` runs the matrix unattended within a time budget. **These are laptop numbers, for timings and bugs, and never go in the report** (ADR-aacruzgon-0002): every run is labelled `laptop-dry-run`, and the output folder holds `NOT-FOR-REPORT.txt`.
+
+Keep the Mac on mains power with the lid open, or closed only with an external display. `caffeinate -dimsu` keeps it awake (`-d` keeps the display on too; it's harmless, and dimming the screen by hand does not stop the run). The harness uses the 3 GiB profile, the only one that fits an 8.8 GiB Docker VM, and counts the shared dev node's 3 GiB without touching it.
+
+```bash
+python3 docs/Cassandra/benchmark/bench.py overnight --hours 8 --dataset-dir ~/hfs-bench/datasets --k6 $K6
+```
+
+Before starting it checks the datasets against `SHA256SUMS`, the release `hfs`, the pinned k6 and the Docker budget, and refuses if any fails. It runs these parts in order, one run at a time, stopping before the budget runs out:
+
+1. Calibration (PostgreSQL, closed-loop, written to `rates-laptop-dry-run.json` in the output folder, never to `rates.json`).
+2. PostgreSQL `on` at 10,000, then at 100,000.
+3. Cassandra at 10,000, then at 100,000.
+4. PostgreSQL `off`, create and update.
+5. LWT steady state, on each backend (three no-reset runs of `--lwt-duration`).
+
+Results go to `~/hfs-bench/<date>/` (`--out` to change it) and nothing is committed. **In the morning,** read `morning-summary.md`: what ran, how long each part took, failed and busy-host runs, and the exact `--resume` command for what's left. Snapshots stay in Docker until the matrix completes.
 
 ## Reading a smoke run
 

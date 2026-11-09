@@ -401,10 +401,9 @@ async fn round_trip(hfs: &Hfs) {
     assert!(!id.is_empty());
     // R4 http.html#create: the server "SHALL also return a Location header
     // which contains the new Logical Id and Version Id", that is
-    // `[base]/Patient/[id]/_history/[vid]`. Upstream HFS sends
-    // `[base]/Patient/[id]` (HeliosSoftware/hfs#2517). Its fix,
-    // HeliosSoftware/hfs#2518, is backported here ahead of its upstream merge;
-    // the next upstream sync brings the same change.
+    // `[base]/Patient/[id]/_history/[vid]`. Upstream HFS sent
+    // `[base]/Patient/[id]` (HeliosSoftware/hfs#2517) until
+    // HeliosSoftware/hfs#2518 fixed it.
     assert_eq!(
         location,
         format!("{}/Patient/{id}/_history/1", hfs.base),

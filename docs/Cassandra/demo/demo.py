@@ -25,7 +25,8 @@ nothing an earlier run left, and two runs never clash. The script talks only
 to the URL it is given. It needs Python 3.9 or later and nothing else.
 
 Exit status: 0 when every step passed, 1 when any step failed, 2 when it could
-not start (bad arguments, or no server answered within --wait).
+not start: bad arguments or, with --wait, no server answered in time. Without
+--wait, a server that does not answer is a run of failed steps, so exit 1.
 """
 
 import argparse

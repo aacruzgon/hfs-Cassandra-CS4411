@@ -70,7 +70,7 @@ Row 8.6's job needs all three: a new log file for each run, `--server-log` with 
 
 Each step prints its name, the request, the expected and actual status, the time it took, and where the expected status is documented, followed by any problem. The last line counts the steps.
 
-The exit status is 0 when every step passed, 1 when any failed, and 2 when the script could not start: bad arguments, or no server answering within `--wait`.
+The exit status is 0 when every step passed, 1 when any failed, and 2 when the script could not start: bad arguments or, with `--wait`, no server answering in time. Without `--wait`, a server that does not answer is a run of failed steps, so 1.
 
 Sections share nothing, so a failure in one does not stop the others. Inside a section, a step whose result later steps need stops that section, and the run records this as a failed step.
 

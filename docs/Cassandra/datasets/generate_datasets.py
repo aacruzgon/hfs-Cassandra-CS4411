@@ -44,6 +44,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -648,17 +649,31 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         parser.error("--out-dir is required unless --verify is given")
     if args.threads < 1:
         parser.error("--threads must be at least 1")
+    if args.out_dir is not None and Path(args.out_dir).resolve() == HERE:
+        parser.error(
+            "--out-dir must not be the directory of the committed manifest.json "
+            "and SHA256SUMS; write elsewhere"
+        )
     # Synthea runs in its own directory, so every path it is given is absolute.
     if args.jar is not None:
         args.jar = args.jar.resolve()
+    args.jar_cache = args.jar_cache.resolve()
     if args.work_dir is not None:
         args.work_dir = str(Path(args.work_dir).resolve())
         Path(args.work_dir).mkdir(parents=True, exist_ok=True)
     return args
 
 
+def stop_on_signal(signum: int, _frame: object) -> None:
+    """Turn a signal into a Failure, so Synthea is killed and its output removed."""
+    signal.signal(signum, signal.SIG_IGN)
+    raise Failure(f"stopped by signal {signum}")
+
+
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
+    signal.signal(signal.SIGTERM, stop_on_signal)
+    signal.signal(signal.SIGINT, stop_on_signal)
     print(
         f"java {java_version()}, python {platform.python_version()}, "
         f"{platform.system()} {platform.machine()}",
@@ -673,6 +688,9 @@ def main(argv: List[str]) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
-    except (Failure, OSError, ValueError, KeyError, TypeError) as failure:
-        print(f"error: {failure!r}", file=sys.stderr)
+    except (Failure, OSError) as failure:
+        print(f"error: {failure}", file=sys.stderr)
+        sys.exit(2)
+    except (ValueError, KeyError, TypeError) as failure:
+        print(f"error: unexpected Synthea output: {failure!r}", file=sys.stderr)
         sys.exit(2)

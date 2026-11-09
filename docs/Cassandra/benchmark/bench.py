@@ -638,19 +638,54 @@ def build_search_params(dataset: Path) -> Tuple[List[str], Dict[str, List[str]]]
     }
 
 
+def published_sha256(sums: Path, name: str) -> Optional[str]:
+    """The checksum SHA256SUMS records for one file name, or None."""
+    if not sums.is_file():
+        return None
+    for line in sums.read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1].lstrip("*") == name:
+            return fields[0].lower()
+    return None
+
+
+def verify_dataset(path: Path, sums: Path) -> str:
+    """Return the file's SHA-256 if it is exactly the published file; refuse otherwise.
+
+    Hashing only. Whether a machine can regenerate the published bytes is
+    `generate_datasets.py --verify`, a separate step.
+    """
+    actual = sha256_file(path) if path.is_file() else None
+    expected = published_sha256(sums, path.name)
+    if expected is None or actual != expected:
+        if expected is not None:
+            expected_text = expected
+        elif sums.is_file():
+            expected_text = f"none ({sums} has no line for {path.name})"
+        else:
+            expected_text = f"none ({sums} does not exist; see --sha256sums)"
+        raise Failure(
+            f"refusing dataset {path}: expected sha256 {expected_text}, "
+            f"actual {actual or 'none (the file is missing)'}"
+        )
+    return actual
+
+
 class Dataset:
     """The dataset of one size and the files derived from it."""
 
-    def __init__(self, size: int, directory: Path, prepared: Path, batches_tool: Path):
+    def __init__(self, size: int, directory: Path, prepared: Path, batches_tool: Path,
+                 sums: Path, verified: bool = True):
         self.size = size
         self.path = directory / f"patient-observation-{size}.ndjson"
-        if not self.path.is_file():
-            raise Failure(f"no dataset at {self.path}; see docs/Cassandra/datasets/README.md")
-        self.root = prepared / str(size)
+        self.sums = sums
+        self.verified = verified
+        self.sha256 = self._current_sha256()
+        # Named by hash, so files derived from other bytes are never reused.
+        self.root = prepared / f"{size}-{self.sha256[:12]}"
         self.ids_file = self.root / "ids.txt"
         self.search_file = self.root / "search.json"
         self.batches = self.root / "batches"
-        self.sha256 = sha256_file(self.path)
         if not self.ids_file.is_file():
             self.root.mkdir(parents=True, exist_ok=True)
             ids, queries = build_search_params(self.path)
@@ -658,6 +693,19 @@ class Dataset:
             self.search_file.write_text(json.dumps(queries, indent=1), encoding="utf-8")
         if not self.batches.is_dir():
             run_cmd([sys.executable, str(batches_tool), str(self.path), str(self.batches)])
+
+    def _current_sha256(self) -> str:
+        if self.verified:
+            return verify_dataset(self.path, self.sums)
+        if not self.path.is_file():
+            raise Failure(f"no dataset at {self.path}")
+        return sha256_file(self.path)
+
+    def check_before_load(self) -> None:
+        """Hash the bytes about to be loaded, so every run names exactly its data."""
+        current = self._current_sha256()
+        if current != self.sha256:
+            raise Failure(f"refusing dataset {self.path}: expected sha256 {self.sha256}, actual {current}")
 
 
 def post_batch(base: str, path: Path) -> collections.Counter:
@@ -970,7 +1018,8 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         "label": args.label or "", "backend": backend.label, "profile": backend.profile,
         "size": dataset.size, "op": op, "concurrency": vus, "mode": args.mode,
         "target_rate": rate, "duration_s": args.duration, "warmup_s": args.warmup,
-        "dataset_sha256": dataset.sha256, "synchronous_commit": backend.baseline if backend.name == "postgres" else None,
+        "dataset_file": dataset.path.name, "dataset_sha256": dataset.sha256,
+        "dataset_verified": dataset.verified, "synchronous_commit": backend.baseline if backend.name == "postgres" else None,
         "hfs_commit": environment["hfs_commit"], "hfs_build_profile": environment["hfs_build_profile"],
     }
 
@@ -978,7 +1027,8 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         path = cell_dir / f"run{number}" / "run.json"
         if not args.resume or not path.is_file():
             return False
-        return json.loads(path.read_text(encoding="utf-8")).get("status") in ("ok", "not_implemented", "refused")
+        recorded = json.loads(path.read_text(encoding="utf-8"))
+        return recorded.get("status") in ("ok", "not_implemented", "refused") and recorded.get("dataset_sha256") == dataset.sha256
 
     def cell_refused() -> bool:
         path = cell_dir / "run1" / "run.json"
@@ -1011,6 +1061,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         try:
             timing: dict = {}
             if fresh:
+                dataset.check_before_load()
                 log(f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: reset")
                 timing.update(bring_up(run_dir))
                 if op in SEARCH_OPS:
@@ -1074,6 +1125,16 @@ def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
     # Every rate is looked up before anything starts, so a gap can't stop a long matrix halfway.
     planned = {(size, op, vus): pick_rate(args, rates, size, op, vus)
                for size in args.sizes for op in ops for vus in args.concurrency}
+    # Every dataset is checked before anything starts, so a bad file can't stop a long matrix halfway.
+    if args.unverified_dataset:
+        if backend.profile != "3g":
+            raise Failure("--unverified-dataset is for development only: it requires --profile 3g, which is never reported")
+        log("WARNING: --unverified-dataset: these runs are marked unverified and never go in the report")
+    datasets = {
+        size: Dataset(size, args.dataset_dir.resolve(), prepared, args.batches_tool,
+                      args.sha256sums.resolve(), verified=not args.unverified_dataset)
+        for size in args.sizes
+    }
     environment = environment_record(args, backend)
     if f"v{K6_VERSION}" not in environment["k6"]:
         raise Failure(f"k6 is not the pinned v{K6_VERSION}: {environment['k6']}; see fetch-k6")
@@ -1081,7 +1142,7 @@ def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
     all_ok = True
     try:
         for size in args.sizes:
-            dataset = Dataset(size, args.dataset_dir.resolve(), prepared, args.batches_tool)
+            dataset = datasets[size]
             for op in ops:
                 for vus in args.concurrency:
                     if not run_cell(args, backend, dataset, op, vus, planned[(size, op, vus)], out_root, environment):
@@ -1102,10 +1163,14 @@ RUN_FIELDS = [
     "max_ms", "s2xx", "s409", "s412", "s4xx_other", "s501", "s5xx_other", "s_other", "statuses",
     "dropped_iterations", "steady_change_pct", "mem_peak_used_mib", "mem_peak_anon_mib",
     "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib", "k6_peak_rss_mib", "oom_killed",
-    "synchronous_commit", "hfs_commit", "hfs_build_profile", "dataset_sha256", "memory_samples_missed", "failure",
+    "synchronous_commit", "hfs_commit", "hfs_build_profile", "dataset_file", "dataset_sha256",
+    "dataset_verified", "memory_samples_missed", "failure",
 ]
 
-SUMMARY_KEY = ["label", "backend", "profile", "size", "op", "concurrency", "mode", "target_rate", "synchronous_commit"]
+SUMMARY_KEY = [
+    "label", "backend", "profile", "size", "op", "concurrency", "mode", "target_rate", "synchronous_commit",
+    "dataset_file", "dataset_sha256", "dataset_verified",
+]
 
 SUMMARY_FIELDS = SUMMARY_KEY + [
     "cell_status", "runs_ok", "runs_recorded", "throughput_rps_mean", "throughput_rps_min",
@@ -1230,6 +1295,8 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db-port", type=int, help="host port of the database")
     parser.add_argument("--hfs-port", type=int, default=8180)
     parser.add_argument("--batches-tool", type=Path, default=HERE.parent / "datasets" / "ndjson_to_batches.py")
+    parser.add_argument("--sha256sums", type=Path, default=HERE.parent / "datasets" / "SHA256SUMS",
+                        help="the published checksums every dataset must match (default: %(default)s)")
     parser.add_argument("--bin-seconds", type=int, default=10, help="width of the time bins (default: %(default)s)")
     parser.add_argument("--build-profile", help="recorded HFS build profile (default: from the binary's path)")
     parser.add_argument("--docker-budget-gib", type=float, help="wait until running limits plus this leg's fit (for shared machines)")
@@ -1255,6 +1322,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     args.resume = False
     args.runs = 1
     args.label = "calibration"
+    args.unverified_dataset = False
     out_root, ok = run_plan(args)
     rows = list(csv.DictReader((out_root / "runs.csv").open(encoding="utf-8", newline="")))
     environment = json.loads((out_root / "environment-postgres-sync-on.json").read_text(encoding="utf-8"))
@@ -1272,6 +1340,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
             "rate_rps": calibrated_rate(capacity),
             "calibrated_at_utc": environment["recorded_at_utc"],
             "machine": environment["machine"].get("hostname"),
+            "dataset_sha256": row["dataset_sha256"],
         }
     document = {
         "note": "Closed-loop capacity on PostgreSQL with synchronous_commit on; rate_rps is 80% of it. Fixed once; Cassandra and PostgreSQL off run the same schedule.",
@@ -1342,6 +1411,8 @@ def main(argv: List[str]) -> int:
     run_parser.add_argument("--rates", type=Path, help="the calibrated rates (default: rates.json here)")
     run_parser.add_argument("--no-reset", action="store_true", help="run all three runs on one data set (the LWT steady-state case)")
     run_parser.add_argument("--resume", action="store_true", help="skip runs already recorded in --out")
+    run_parser.add_argument("--unverified-dataset", action="store_true",
+                            help="development only, with --profile 3g: run a file that is not the published one; its runs are marked dataset_verified False")
     run_parser.set_defaults(handler=cmd_run)
 
     calibrate_parser = commands.add_parser("calibrate", help="measure PostgreSQL capacity closed-loop and write the 80% rates")

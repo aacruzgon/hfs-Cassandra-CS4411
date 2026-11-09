@@ -25,6 +25,8 @@ Before each of the three measured runs, in this order (roadmap Step 8):
 
 **What the measurement is.** The arrival rate is fixed before the run and doesn't depend on how fast the server answers. "Concurrency N" is k6's `maxVUs = N`. A backend that can't keep up runs out of virtual users, and the iterations it couldn't start are counted as `dropped_iterations`: read them next to the latency. A closed loop understates p95, which is why row 0.6 rules it out.
 
+**Dataset check.** Before every load the harness hashes the NDJSON and compares it with `docs/Cassandra/datasets/SHA256SUMS` (`--sha256sums` to point elsewhere), and refuses the run on a mismatch or a missing file or line, so every number names exactly the published bytes (`dataset_file`, `dataset_sha256` and `dataset_verified` in the CSVs). It only hashes; regenerating is `generate_datasets.py --verify`. `--unverified-dataset` is for development with a hand-cut file, requires `--profile 3g`, and marks its runs `dataset_verified False`: they never go in the report.
+
 ## The operations
 
 | Name | Request | Input |

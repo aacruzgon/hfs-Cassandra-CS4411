@@ -124,6 +124,54 @@ class AnalyseTests(unittest.TestCase):
             self.assertLess(metrics["steady_change_pct"], -50.0)
 
 
+class DatasetCheckTests(unittest.TestCase):
+    NAME = "patient-observation-10000.ndjson"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.path = self.root / self.NAME
+        self.path.write_bytes(b'{"resourceType":"Patient","id":"a"}\n')
+        self.expected = bench.sha256_file(self.path)
+        self.sums = self.root / "SHA256SUMS"
+        self.sums.write_text(f"{self.expected}  {self.NAME}\n", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_the_published_file_passes(self):
+        self.assertEqual(bench.verify_dataset(self.path, self.sums), self.expected)
+
+    def test_a_one_byte_edit_is_refused_and_named(self):
+        self.path.write_bytes(b'{"resourceType":"Patient","id":"b"}\n')
+        with self.assertRaises(bench.Failure) as caught:
+            bench.verify_dataset(self.path, self.sums)
+        message = str(caught.exception)
+        self.assertIn(self.NAME, message)
+        self.assertIn(self.expected, message)
+        self.assertIn(bench.sha256_file(self.path), message)
+
+    def test_a_missing_file_is_refused(self):
+        self.path.unlink()
+        with self.assertRaises(bench.Failure) as caught:
+            bench.verify_dataset(self.path, self.sums)
+        self.assertIn(self.expected, str(caught.exception))
+        self.assertIn("missing", str(caught.exception))
+
+    def test_a_missing_line_is_refused(self):
+        self.sums.write_text("00  other.ndjson\n", encoding="utf-8")
+        with self.assertRaises(bench.Failure) as caught:
+            bench.verify_dataset(self.path, self.sums)
+        self.assertIn("no line", str(caught.exception))
+        self.assertIn(self.expected, str(caught.exception))
+
+    def test_a_missing_checksum_file_is_refused(self):
+        self.sums.unlink()
+        with self.assertRaises(bench.Failure) as caught:
+            bench.verify_dataset(self.path, self.sums)
+        self.assertIn("does not exist", str(caught.exception))
+
+
 class HelperTests(unittest.TestCase):
     def test_calibrated_rate_is_80_percent_floor(self):
         self.assertEqual(bench.calibrated_rate(1000.0), 800)

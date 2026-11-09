@@ -4,12 +4,16 @@
     python3 docs/Cassandra/benchmark/test_bench.py
 """
 
+import argparse
 import csv
 import gzip
 import json
+import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import bench
 
@@ -184,6 +188,16 @@ class HostLoadTests(unittest.TestCase):
         quiet = {"load_1m": 40.0, "cpus": 8, "foreign_cpu_pct": bench.QUIET_FOREIGN_CPU_PCT}
         self.assertTrue(bench.host_is_quiet(quiet))
         self.assertFalse(bench.host_is_quiet(dict(quiet, foreign_cpu_pct=bench.QUIET_FOREIGN_CPU_PCT + 1)))
+
+
+class DockerBudgetWaitTests(unittest.TestCase):
+    def test_a_full_budget_stops_at_the_deadline_instead_of_waiting_on(self):
+        args = argparse.Namespace(profile="3g", project=None, db_port=None, docker_budget_gib=8.3, deadline=time.monotonic() - 1)
+        backend = bench.Postgres(args)
+        full = subprocess.CompletedProcess([], 0, stdout="other\t1GiB / 8GiB\n", stderr="")
+        with mock.patch.object(bench, "run_cmd", return_value=full):
+            with self.assertRaises(bench.BudgetExhausted):
+                backend._wait_for_budget()
 
 
 class ResumeArgumentsTests(unittest.TestCase):

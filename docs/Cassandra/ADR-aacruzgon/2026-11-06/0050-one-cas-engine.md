@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0050: Every compare-and-swap goes through one write engine, under the rules of ADR-aacruzgon-0034 and 0035
 
 - **Date:** 2026-11-06
-- **Status:** accepted (Alan approved it on 2026-11-06, as drafted); the R2/R3 error mapping is amended by ADR-aacruzgon-0055
+- **Status:** accepted (Alan approved it on 2026-11-06, as drafted); the R2/R3 error mapping is amended by ADR-aacruzgon-0055; its reason that the "Partition, RF 3" failure test expects 503 is amended by ADR-aacruzgon-0072
 - **Context:**
     - **The question.** Roadmap Step 3 (CRUD core) adds four compare-and-swaps to Step 2's one: C2 (`update`), C3 (`delete` and `delete_versioned`) and C4 (revive), beside C1 (`create`), with `create_or_update` looping over C1, C2 and C4. ADR-aacruzgon-0024 already extended the unknown-outcome rule to "every compare-and-swap", and ADR-aacruzgon-0035 says "On every CAS (C1 for `create` now; C2 to C4 in Step 3)". But Step 2 implemented these rules only inside `create`'s own loop (`crates/persistence/src/backends/cassandra/write.rs:467-559`). The code that decides an outcome is hard-wired to version 1:
         - `CreateAttempt` and `write_version_row` bind version 1 (`write.rs:759`);

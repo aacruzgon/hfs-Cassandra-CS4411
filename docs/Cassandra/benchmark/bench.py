@@ -80,6 +80,11 @@ FORBIDDEN_PORTS = {59042, 55432}
 
 CALIBRATION_FRACTION = 0.8
 
+# Above this share of the schedule dropped, a run's latency is reported as saturated.
+# Healthy runs dropped 0.1 to 0.9% (start-up); one that couldn't hold its rate dropped 6 to 56%.
+# At 1%, at most a fifth of the 5% tail behind p95 can be missing.
+SATURATED_DROP_PCT = 1.0
+
 # A host is quiet when other processes use at most this much CPU in total.
 # Measured on the idle Mac; see README "Host load". The load average is
 # recorded but not used: it still holds the harness's own previous run.
@@ -263,6 +268,11 @@ def analyse(
     for label, fraction in (("p50_ms", 0.50), ("p95_ms", 0.95), ("p99_ms", 0.99)):
         metrics[label] = percentile(ordered, fraction)
     metrics["max_ms"] = ordered[-1] if ordered else float("nan")
+    # The same, over 2xx only: a fast 503 or 409 would otherwise pull the figures down.
+    ok_only = sorted(r[1] for r in rows if status_class(r[2]) == "s2xx")
+    for label, fraction in (("p50_ok_ms", 0.50), ("p95_ok_ms", 0.95), ("p99_ok_ms", 0.99)):
+        metrics[label] = percentile(ok_only, fraction)
+    metrics.update(saturation(len(rows), metrics["dropped_iterations"]))
 
     # Bins are counted from the first event, so bin 0 is the start of the run
     # and a slow start or a decline shows in the sequence.
@@ -296,6 +306,19 @@ def analyse(
             )
     metrics["steady_change_pct"] = steady_change_pct(ok_per_bin)
     return metrics
+
+
+def saturation(completed: int, dropped: int) -> dict:
+    """How much of the fixed schedule was served, and whether its latency can be read as latency.
+
+    A dropped iteration never got a virtual user, so its latency is in no
+    percentile: the more a backend sheds, the better what is left looks.
+    """
+    offered = completed + dropped
+    drop_pct = 100.0 * dropped / offered if offered else 0.0
+    saturated = drop_pct > SATURATED_DROP_PCT
+    return {"offered": offered, "drop_pct": drop_pct, "saturated": saturated,
+            "latency_reading": "saturated" if saturated else "normal"}
 
 
 def steady_change_pct(bin_rps: Sequence[float]) -> Optional[float]:
@@ -1488,6 +1511,8 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                 log(
                     f"  completed {metrics['completed']} ok_rps {metrics['ok_rps']:.1f} "
                     f"p50 {metrics['p50_ms']:.2f} p95 {metrics['p95_ms']:.2f} dropped {metrics['dropped_iterations']}"
+                    + (f"; SATURATED, {metrics['drop_pct']:.1f}% of the schedule dropped: these latencies are only of the requests that got a VU"
+                       if metrics["saturated"] else "")
                 )
             except BudgetExhausted as exhausted:
                 args.budget_stopped = True
@@ -1590,9 +1615,10 @@ def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
 
 RUN_FIELDS = [
     "label", "backend", "profile", "size", "op", "concurrency", "mode", "target_rate", "run",
-    "status", "duration_s", "completed", "throughput_rps", "ok_rps", "p50_ms", "p95_ms", "p99_ms",
+    "status", "latency_reading", "duration_s", "completed", "offered", "drop_pct", "throughput_rps", "ok_rps",
+    "p50_ms", "p95_ms", "p99_ms", "p50_ok_ms", "p95_ok_ms", "p99_ok_ms",
     "max_ms", "s2xx", "s409", "s412", "s4xx_other", "s501", "s5xx_other", "s_other", "statuses",
-    "dropped_iterations", "steady_change_pct", "mem_peak_used_mib", "mem_peak_anon_mib",
+    "dropped_iterations", "saturated", "steady_change_pct", "mem_peak_used_mib", "mem_peak_anon_mib",
     "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib", "k6_peak_rss_mib", "oom_killed",
     "synchronous_commit", "hfs_commit", "hfs_build_profile", "dataset_file", "dataset_sha256",
     "dataset_verified", "memory_samples_missed", "reset", "host_busy", "host_load_1m", "host_foreign_cpu_pct",
@@ -1605,9 +1631,9 @@ SUMMARY_KEY = [
 ]
 
 SUMMARY_FIELDS = SUMMARY_KEY + [
-    "cell_status", "runs_ok", "runs_recorded", "throughput_rps_mean", "throughput_rps_min",
-    "throughput_rps_max", "throughput_cv_pct", "ok_rps_mean", "p50_ms_mean", "p50_cv_pct",
-    "p95_ms_mean", "p95_cv_pct", "p99_ms_mean", "s2xx", "s409", "s412", "s4xx_other", "s501",
+    "cell_status", "latency_reading", "saturated_runs", "runs_ok", "runs_recorded", "throughput_rps_mean", "throughput_rps_min",
+    "throughput_rps_max", "throughput_cv_pct", "ok_rps_mean", "drop_pct_mean", "p50_ms_mean", "p50_cv_pct",
+    "p95_ms_mean", "p95_cv_pct", "p99_ms_mean", "p50_ok_ms_mean", "p95_ok_ms_mean", "p99_ok_ms_mean", "s2xx", "s409", "s412", "s4xx_other", "s501",
     "s5xx_other", "s_other", "dropped_iterations", "steady_change_pct_mean", "mem_peak_used_mib",
     "mem_peak_anon_mib", "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib",
     "k6_peak_rss_mib", "oom_killed", "host_busy_runs",
@@ -1666,6 +1692,12 @@ def summarize(out_root: Path) -> None:
             row = {field: value for field, value in zip(SUMMARY_KEY, key)}
             row.update(
                 cell_status=",".join(statuses),
+                latency_reading="saturated" if any(m.get("saturated") for m in ok) else "normal" if ok else "",
+                saturated_runs=sum(1 for m in ok if m.get("saturated")),
+                drop_pct_mean=mean("drop_pct"),
+                p50_ok_ms_mean=mean("p50_ok_ms"),
+                p95_ok_ms_mean=mean("p95_ok_ms"),
+                p99_ok_ms_mean=mean("p99_ok_ms"),
                 runs_ok=len(ok),
                 runs_recorded=len(members),
                 throughput_rps_mean=mean("throughput_rps"),
@@ -1889,6 +1921,7 @@ def part_counts(records: List[dict], part: dict) -> dict:
         "ok": len(ok), "declined_cells": len(declined),
         "failed": sum(1 for r in records if r.get("status") in ("failed", "no_success")),
         "busy_host": sum(1 for r in records if r.get("host_busy")),
+        "saturated": sum(1 for r in ok if r.get("saturated")),
         "left": max(0, total - done), "total": total,
     }
 
@@ -1903,8 +1936,8 @@ def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume
              + (f"finished {against_budget} min after the end of the budget." if against_budget > 0
                 else f"finished {-against_budget} min before the end of the budget."),
              "", f"Stopped by: {state['stopped_by']}.", "",
-             "| Part | Status | Took | Runs ok | Declined cells | Failed | Busy host | Left |",
-             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+             "| Part | Status | Took | Runs ok | Declined cells | Failed | Busy host | Saturated | Left |",
+             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     failures: List[str] = []
     left_any = False
     for part in parts:
@@ -1914,7 +1947,7 @@ def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume
         left_any = left_any or counts["left"] > 0 or entry.get("status") != "complete"
         minutes = entry.get("seconds", 0) / 60
         lines.append(f"| {part['name']} | {entry.get('status', 'not started')} | {minutes:.0f} min | {counts['ok']} | "
-                     f"{counts['declined_cells']} | {counts['failed']} | {counts['busy_host']} | {counts['left']} of {counts['total']} |")
+                     f"{counts['declined_cells']} | {counts['failed']} | {counts['busy_host']} | {counts['saturated']} | {counts['left']} of {counts['total']} |")
         if entry.get("error"):
             failures.append(f"- `{part['name']}`: {entry['error']}")
         failures += [f"- `{r['backend']} {r['size']}/{r['op']}/c{r['concurrency']} run {r['run']}`: {r.get('status')}: {str(r.get('failure', ''))[:300]}"

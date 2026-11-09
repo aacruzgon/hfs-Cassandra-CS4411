@@ -8,6 +8,7 @@ import argparse
 import csv
 import gzip
 import json
+import math
 import socket
 import subprocess
 import tempfile
@@ -352,6 +353,37 @@ class PortTests(unittest.TestCase):
                 bench.require_free_port(port)
             self.assertIn(f"port {port} is held", str(refused.exception))
         bench.require_free_port(port)
+
+
+class ReadingTests(unittest.TestCase):
+    def analyse(self, rows):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            write_k6_csv(root / "k6.csv.gz", rows)
+            return bench.analyse(root / "k6.csv.gz", root / "requests.csv.gz", root / "bins.csv", 10.0, 10)
+
+    def test_percentiles_over_2xx_leave_fast_failures_out(self):
+        rows = [("http_req_duration", 1000 + n, 100.0, "201") for n in range(50)]
+        rows += [("http_req_duration", 2000 + n, 1.0, "503") for n in range(50)]
+        metrics = self.analyse(rows)
+        self.assertEqual(metrics["p50_ms"], 1.0)
+        self.assertEqual(metrics["p50_ok_ms"], 100.0)
+        self.assertEqual(metrics["p95_ok_ms"], 100.0)
+
+    def test_a_run_with_no_2xx_has_no_2xx_percentile(self):
+        self.assertTrue(math.isnan(self.analyse([("http_req_duration", 1000, 1.0, "503")])["p95_ok_ms"]))
+
+    def test_saturation_is_above_one_percent_of_the_schedule(self):
+        self.assertEqual(bench.saturation(990, 10)["latency_reading"], "normal")
+        over = bench.saturation(980, 20)
+        self.assertEqual(over["latency_reading"], "saturated")
+        self.assertEqual(over["offered"], 1000)
+        self.assertAlmostEqual(over["drop_pct"], 2.0)
+
+    def test_an_analysed_run_carries_its_reading(self):
+        rows = [("http_req_duration", 1000 + n, 5.0, "200") for n in range(90)]
+        rows.append(("dropped_iterations", 1100, 10.0, ""))
+        self.assertEqual(self.analyse(rows)["latency_reading"], "saturated")
 
 
 if __name__ == "__main__":

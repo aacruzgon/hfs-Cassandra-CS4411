@@ -73,6 +73,10 @@ summary.csv                     one row per cell, over its runs
 
 **Run status.** `ok` is a measured run. `not_implemented` (501) and `refused` (other 4xx) mean the server declined the search, so no load ran. `no_success` means no request got a 2xx, and `failed` means the run could not finish (the reason is in `run.json`); both make the command exit 1.
 
+**Saturated runs.** A dropped iteration never got a virtual user, so its latency is in no percentile, and the more a backend sheds the better what is left looks. A run that dropped more than 1% of its schedule (`drop_pct`, of `offered` = completed + dropped) is marked `latency_reading saturated` in `runs.csv` and `summary.csv`, and counted in `morning-summary.md`. Read its percentiles as what the requests that got a VU saw, never as the backend's latency at that rate. Healthy runs dropped 0.1 to 0.9% (start-up); runs that couldn't hold the rate dropped 6 to 56%.
+
+**Percentiles.** `p50_ms`, `p95_ms` and `p99_ms` cover every response, and `p50_ok_ms`, `p95_ok_ms` and `p99_ok_ms` only the 2xx ones, so a fast 503 or 409 can't pull the figure down.
+
 **Status classes.** `runs.csv` and `summary.csv` count `s2xx`, `s409`, `s412`, `s4xx_other`, `s501`, `s5xx_other` and `s_other` (network errors, 3xx), so a 409 is never lost in `5xx` (roadmap Step 0, Spec). `statuses` carries the full histogram.
 
 **Steady state.** `bins.csv` has one row per 10 s for every run. `steady_change_pct` compares the first and last third of its full bins; a negative value is a decline. On an open-loop run below capacity the rate holds by construction, and the decline shows only as latency and drops. To see a decline in throughput, use the case in the next section.

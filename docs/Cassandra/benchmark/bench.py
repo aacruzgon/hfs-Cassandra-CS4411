@@ -29,6 +29,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
@@ -224,28 +225,31 @@ def analyse(
     for moment, value in dropped:
         dropped_per_bin[int((moment - first) // width_ms)] += int(value)
 
-    bin_rps: List[float] = []
+    ok_per_bin: List[float] = []
     with bins_out.open("w", encoding="utf-8", newline="") as sink:
         writer = csv.writer(sink)
         writer.writerow(BIN_FIELDS)
-        for index in sorted(set(per_bin) | set(dropped_per_bin)):
+        # Every bin up to the last event, empty ones included: a stall is a
+        # row of zeros, not a gap the steady-state figure would close up.
+        last = max(list(per_bin) + list(dropped_per_bin), default=-1)
+        for index in range(last + 1):
             members = per_bin.get(index, [])
             latencies = sorted(r[1] for r in members)
             counts: collections.Counter = collections.Counter(status_class(r[2]) for r in members)
-            rps = len(members) / bin_seconds
-            bin_rps.append(rps)
+            ok = counts["s2xx"] / bin_seconds
+            ok_per_bin.append(ok)
             writer.writerow(
-                [index * bin_seconds, len(members), f"{rps:.1f}", f"{counts['s2xx'] / bin_seconds:.1f}"]
-                + [f"{percentile(latencies, q):.3f}" for q in (0.50, 0.95, 0.99)]
+                [index * bin_seconds, len(members), f"{len(members) / bin_seconds:.1f}", f"{ok:.1f}"]
+                + [f"{percentile(latencies, q):.3f}" if latencies else "" for q in (0.50, 0.95, 0.99)]
                 + [counts[name] for name in CLASSES]
                 + [dropped_per_bin.get(index, 0)]
             )
-    metrics["steady_change_pct"] = steady_change_pct(bin_rps)
+    metrics["steady_change_pct"] = steady_change_pct(ok_per_bin)
     return metrics
 
 
 def steady_change_pct(bin_rps: Sequence[float]) -> Optional[float]:
-    """Change between the first and last third of the full bins, in percent.
+    """Change in successful throughput between the first and last third of the full bins, in percent.
 
     The first and last bins are partial and are left out. Negative means the
     throughput fell during the run, as in ADR-aacruzgon-0001. Needs at least 3
@@ -379,7 +383,7 @@ class Cassandra(Backend):
     name = "cassandra"
     service = "cassandra"
     port_var = "CASSANDRA_HOST_PORT"
-    default_port = 59142
+    default_port = 59542
 
     def files(self) -> List[Path]:
         base = REPO / "docker" / "cassandra"
@@ -520,6 +524,10 @@ class Hfs:
                 "HFS_DATA_DIR": str(REPO / "data"),
             }
         )
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                raise Failure(f"something is already listening on port {port}; load would go to it")
         self.base = f"http://127.0.0.1:{port}"
         self.log_path = log_path
         self.log_file = log_path.open("w", encoding="utf-8")
@@ -537,7 +545,7 @@ class Hfs:
                 raise Failure(f"hfs exited {self.process.returncode} at boot: {self.tail()}")
             try:
                 with urllib.request.urlopen(f"{self.base}/metadata", timeout=10) as response:
-                    if response.status == 200:
+                    if response.status == 200 and self.process.poll() is None:
                         self._check_seeded()
                         return
             except (urllib.error.URLError, OSError):
@@ -784,12 +792,18 @@ class MemorySampler(threading.Thread):
         self.pids = pids
         self.out_path = out_path
         self.halt = threading.Event()
+        self.missed = 0
         self.peaks = {"used_bytes": 0, "anon_bytes": 0, "current_bytes": 0, "hfs_rss_kib": 0, "k6_rss_kib": 0}
 
     def sample_container(self) -> Dict[str, int]:
         script = "cat /sys/fs/cgroup/memory.current; cat /sys/fs/cgroup/memory.stat"
-        result = run_cmd(["docker", "exec", self.container, "sh", "-c", script], check=False, timeout=20)
+        try:
+            result = run_cmd(["docker", "exec", self.container, "sh", "-c", script], check=False, timeout=20)
+        except (subprocess.SubprocessError, OSError):
+            self.missed += 1
+            return {}
         if result.returncode != 0:
+            self.missed += 1
             return {}
         lines = result.stdout.splitlines()
         current = int(lines[0])
@@ -868,10 +882,19 @@ def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: 
         )
         sampler = MemorySampler(container, {"hfs": hfs.process.pid, "k6": process.pid}, run_dir / "memory.csv")
         sampler.start()
-        code = process.wait(timeout=seconds + 900)
-        sampler.stop()
+        try:
+            code = process.wait(timeout=seconds + 900)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=30)
+            raise Failure(f"k6 still running {seconds + 900} s after its start; killed")
+        finally:
+            sampler.stop()
     if code != 0:
         raise Failure(f"k6 exited {code}; see {run_dir / 'k6.log'}")
+    # 3. A run during which HFS died is not a measurement of HFS.
+    if hfs.process.poll() is not None:
+        raise Failure(f"hfs exited {hfs.process.returncode} during the measurement: {hfs.tail()}")
     metrics = analyse(k6_csv, run_dir / "requests.csv.gz", run_dir / "bins.csv", seconds, args.bin_seconds)
     k6_csv.unlink()
     record = container_record(container)
@@ -886,7 +909,8 @@ def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: 
             "hfs_peak_rss_mib": sampler.peaks["hfs_rss_kib"] / 1024,
             "k6_peak_rss_mib": sampler.peaks["k6_rss_kib"] / 1024,
             "oom_killed": record["oom_killed"],
-            "image_id": record["image_id"],
+            "memory_samples_missed": sampler.missed,
+            "container": record,
         }
     )
     return metrics
@@ -956,7 +980,11 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
             return False
         return json.loads(path.read_text(encoding="utf-8")).get("status") in ("ok", "not_implemented", "refused")
 
-    if all(already_done(n) for n in range(1, args.runs + 1)):
+    def cell_refused() -> bool:
+        path = cell_dir / "run1" / "run.json"
+        return args.resume and path.is_file() and json.loads(path.read_text(encoding="utf-8")).get("status") in ("not_implemented", "refused")
+
+    if cell_refused() or all(already_done(n) for n in range(1, args.runs + 1)):
         log(f"skip {cell_id(dataset.size, op, vus)}: already recorded")
         return True
 
@@ -987,6 +1015,8 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                 timing.update(bring_up(run_dir))
                 if op in SEARCH_OPS:
                     code, body, _ = search_probe(hfs, op, dataset)
+                    if code >= 500 and code != 501:
+                        raise Failure(f"search probe answered {code}: {body}")
                     if not 200 <= code < 300:
                         status = "not_implemented" if code == 501 else "refused"
                         log(f"{backend.label} {op}: the server answered {code}; recorded, no load run")
@@ -1008,7 +1038,11 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
             log(f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: measure ({args.mode}, rate {rate}, {args.duration} s)")
             metrics = measure(args, backend, hfs, op, vus, args.mode, rate, args.duration, dataset, run_dir)
             backend.collect(run_dir)
-            record.update(metrics, status="ok", timing=timing, no_reset=bool(args.no_reset))
+            environment["container"] = metrics["container"]
+            # Nothing succeeded: the setup is broken, not merely slow.
+            measured = metrics["s2xx"] > 0
+            ok = ok and measured
+            record.update(metrics, status="ok" if measured else "no_success", timing=timing, no_reset=bool(args.no_reset))
             log(
                 f"  completed {metrics['completed']} ok_rps {metrics['ok_rps']:.1f} "
                 f"p50 {metrics['p50_ms']:.2f} p95 {metrics['p95_ms']:.2f} dropped {metrics['dropped_iterations']}"
@@ -1034,19 +1068,26 @@ def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
     out_root.mkdir(parents=True, exist_ok=True)
     prepared = out_root / "prepared"
     rates = load_rates(args.rates) if args.rates else {}
-    environment = environment_record(args, backend)
-    (out_root / f"environment-{backend.label}.json").write_text(json.dumps(environment, indent=1, sort_keys=True), encoding="utf-8")
-    all_ok = True
     ops = expand_ops(args.ops)
-    for size in args.sizes:
-        dataset = Dataset(size, args.dataset_dir, prepared, args.batches_tool)
-        for op in ops:
-            for vus in args.concurrency:
-                rate = pick_rate(args, rates, size, op, vus)
-                if not run_cell(args, backend, dataset, op, vus, rate, out_root, environment):
-                    all_ok = False
-    backend.stop()
-    summarize(out_root)
+    # Every rate is looked up before anything starts, so a gap can't stop a long matrix halfway.
+    planned = {(size, op, vus): pick_rate(args, rates, size, op, vus)
+               for size in args.sizes for op in ops for vus in args.concurrency}
+    environment = environment_record(args, backend)
+    if f"v{K6_VERSION}" not in environment["k6"]:
+        raise Failure(f"k6 is not the pinned v{K6_VERSION}: {environment['k6']}; see fetch-k6")
+    environment_path = out_root / f"environment-{backend.label}.json"
+    all_ok = True
+    try:
+        for size in args.sizes:
+            dataset = Dataset(size, args.dataset_dir.resolve(), prepared, args.batches_tool)
+            for op in ops:
+                for vus in args.concurrency:
+                    if not run_cell(args, backend, dataset, op, vus, planned[(size, op, vus)], out_root, environment):
+                        all_ok = False
+    finally:
+        backend.stop()
+        environment_path.write_text(json.dumps(environment, indent=1, sort_keys=True), encoding="utf-8")
+        summarize(out_root)
     return out_root, all_ok
 
 
@@ -1059,7 +1100,7 @@ RUN_FIELDS = [
     "max_ms", "s2xx", "s409", "s412", "s4xx_other", "s501", "s5xx_other", "s_other", "statuses",
     "dropped_iterations", "steady_change_pct", "mem_peak_used_mib", "mem_peak_anon_mib",
     "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib", "k6_peak_rss_mib", "oom_killed",
-    "synchronous_commit", "hfs_commit", "hfs_build_profile", "dataset_sha256", "failure",
+    "synchronous_commit", "hfs_commit", "hfs_build_profile", "dataset_sha256", "memory_samples_missed", "failure",
 ]
 
 SUMMARY_KEY = ["label", "backend", "profile", "size", "op", "concurrency", "mode", "target_rate", "synchronous_commit"]
@@ -1214,16 +1255,22 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     args.label = "calibration"
     out_root, ok = run_plan(args)
     rows = list(csv.DictReader((out_root / "runs.csv").open(encoding="utf-8", newline="")))
-    rates = {}
+    environment = json.loads((out_root / "environment-postgres-sync-on.json").read_text(encoding="utf-8"))
+    # A partial calibration adds to the file; each entry says when and where it was measured.
+    rates = load_rates(args.rates_out)
     for row in rows:
-        if row["label"] != "calibration" or row["status"] != "ok":
+        if row["label"] != "calibration":
+            continue
+        if row["status"] != "ok" or float(row["ok_rps"]) <= 0:
+            ok = False
             continue
         capacity = float(row["ok_rps"])
         rates[cell_id(int(row["size"]), row["op"], int(row["concurrency"]))] = {
             "capacity_rps": round(capacity, 1),
             "rate_rps": calibrated_rate(capacity),
+            "calibrated_at_utc": environment["recorded_at_utc"],
+            "machine": environment["machine"].get("hostname"),
         }
-    environment = json.loads((out_root / "environment-postgres-sync-on.json").read_text(encoding="utf-8"))
     document = {
         "note": "Closed-loop capacity on PostgreSQL with synchronous_commit on; rate_rps is 80% of it. Fixed once; Cassandra and PostgreSQL off run the same schedule.",
         "calibrated_at_utc": environment["recorded_at_utc"],

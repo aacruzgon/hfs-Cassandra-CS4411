@@ -99,6 +99,31 @@ class AnalyseTests(unittest.TestCase):
             self.assertEqual(bins[2]["dropped_iterations"], "2")
 
 
+    def test_a_stall_shows_as_zero_bins_and_a_decline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            k6 = root / "k6.csv.gz"
+            rows = [("http_req_duration", 1000 * s, 10.0, 200) for s in range(0, 40)]
+            rows += [("http_req_duration", 1000 * s, 10.0, 200) for s in range(80, 90)]
+            write_k6_csv(k6, rows)
+            metrics = bench.analyse(k6, root / "r.csv.gz", root / "bins.csv", 90.0, 10)
+            with (root / "bins.csv").open() as stream:
+                bins = list(csv.DictReader(stream))
+            self.assertEqual(len(bins), 9)
+            self.assertEqual(bins[5]["completed"], "0")
+            self.assertEqual(bins[5]["p50_ms"], "")
+            self.assertLess(metrics["steady_change_pct"], -50.0)
+
+    def test_errors_count_as_a_decline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            k6 = root / "k6.csv.gz"
+            rows = [("http_req_duration", 1000 * s, 10.0, 200 if s < 45 else 503) for s in range(0, 90)]
+            write_k6_csv(k6, rows)
+            metrics = bench.analyse(k6, root / "r.csv.gz", root / "bins.csv", 90.0, 10)
+            self.assertLess(metrics["steady_change_pct"], -50.0)
+
+
 class HelperTests(unittest.TestCase):
     def test_calibrated_rate_is_80_percent_floor(self):
         self.assertEqual(bench.calibrated_rate(1000.0), 800)

@@ -523,6 +523,30 @@ class StopSignalTests(unittest.TestCase):
             time.sleep(5)
         self.assertEqual(stopping, [signal.SIGINT])
 
+    def test_a_second_signal_that_reenters_the_handler_starts_no_second_reaper(self):
+        # A closed Rex pane sends two SIGHUPs about 1 ms apart. CPython runs a pending
+        # handler at a call, so the second one can run inside the first, at the first call
+        # it makes. Simulate that at the first call after the guard: signal.Signals.
+        # (SIGTERM takes the same path; SIGHUP would also detach this test's output.)
+        stopping = bench.stop_on_signals()
+        handler = signal.getsignal(signal.SIGTERM)
+        real_signals = signal.Signals
+        nested = []
+
+        def signals_reentering(number):
+            if not nested:
+                nested.append(True)
+                handler(signal.SIGTERM, None)  # the second signal, run re-entrantly
+            return real_signals(number)
+
+        with mock.patch.object(bench, "start_reaper") as start_reaper, \
+                mock.patch.object(bench.signal, "Signals", side_effect=signals_reentering):
+            with bench.cleanup_shield(raise_after=False):
+                handler(signal.SIGTERM, None)
+        self.assertEqual(nested, [True])
+        self.assertEqual(start_reaper.call_count, 1)
+        self.assertEqual(stopping, [signal.SIGTERM])
+
     def test_nohup_still_keeps_sighup_ignored(self):
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         bench.stop_on_signals()
@@ -604,6 +628,27 @@ class ReaperTests(unittest.TestCase):
         run_cmd.assert_not_called()
         self.assertFalse(plan.exists())
         self.assertFalse(plan.with_suffix(".log").exists())
+
+    def test_a_second_reaper_waits_for_the_first_and_cleans_nothing(self):
+        import fcntl
+        import threading
+        plan = self.dir / "plan.json"
+        plan.write_text(json.dumps({"reason": "SIGHUP", "backends": [], "processes": [], "overnight": None}))
+        holder = plan.open("rb")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)  # the first reaper, at work
+        result = []
+        with mock.patch.object(bench, "run_cmd") as run_cmd, mock.patch.object(bench, "summarize") as summarize:
+            second = threading.Thread(target=lambda: result.append(
+                bench.cmd_reap(argparse.Namespace(pid=self.gone_pid(), plan=plan))))
+            second.start()
+            time.sleep(0.5)
+            self.assertTrue(second.is_alive())  # held at the lock, not cleaning alongside
+            plan.unlink()  # the first reaper finishes: it removes its plan, then lets go
+            holder.close()
+            second.join(timeout=10)
+        self.assertEqual(result, [0])
+        run_cmd.assert_not_called()
+        summarize.assert_not_called()
 
     def test_a_killed_harness_is_finished_for_it(self):
         backend, args = self.backend()

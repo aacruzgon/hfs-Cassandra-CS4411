@@ -22,6 +22,7 @@ import argparse
 import collections
 import contextlib
 import csv
+import fcntl
 import gzip
 import hashlib
 import json
@@ -1994,6 +1995,15 @@ def cmd_reap(args: argparse.Namespace) -> int:
     """Wait for a stopped harness to exit; finish its cleanup if it was killed first."""
     global LOG_SINK
     done = args.plan.with_suffix(".done")
+    # One reaper per stop: a second one waits here until the first is done, then finds its
+    # plan gone and leaves. The lock also tells a starting harness that a reaper is at work.
+    try:
+        lock = args.plan.open("rb")
+    except FileNotFoundError:
+        return 0
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    if not args.plan.exists():
+        return 0
     while process_alive(args.pid):
         time.sleep(0.5)
     try:
@@ -2066,10 +2076,16 @@ def stop_on_signals() -> List[signal.Signals]:
     a first one that arrives inside a cleanup_shield waits for it to finish.
     """
     stopping: List[signal.Signals] = []
+    guard = {"taken": False}
 
     def on_signal(number: int, _frame) -> None:
-        if stopping:
+        # Tested and set before any call: CPython runs a pending handler at a call, and a
+        # closed Rex pane sends two SIGHUPs about 1 ms apart, so a second one could re-enter
+        # here before the first was recorded and start a second reaper. cmd_reap's lock
+        # covers what is left of that window.
+        if guard["taken"]:
             return  # The cleanup is under way; let it finish.
+        guard["taken"] = True
         stopping.append(signal.Signals(number))
         if number == signal.SIGHUP:
             detach_output()

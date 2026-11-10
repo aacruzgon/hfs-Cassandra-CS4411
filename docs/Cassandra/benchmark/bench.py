@@ -2362,7 +2362,7 @@ def cmd_snapshot_check(args: argparse.Namespace) -> int:
             hfs.stop()
         (out_root / f"snapshot-check-{backend.name}-{args.size}.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
         backend.stop()
-        run_cmd(["docker", "volume", "rm", "-f", volume], check=False)
+        run_cmd(["docker", "volume", "rm", "-f", volume], check=False, own_session=True)
     return 0 if all_clean else 1
 
 

@@ -1247,14 +1247,20 @@ class MemorySampler(threading.Thread):
             self.missed += 1
             return {}
         lines = result.stdout.splitlines()
-        current = int(lines[0])
-        stat = dict(line.split() for line in lines[1:])
-        return {
-            "current_bytes": current,
-            "used_bytes": current - int(stat.get("inactive_file", 0)),
-            "anon_bytes": int(stat.get("anon", 0)),
-            "file_bytes": int(stat.get("file", 0)),
-        }
+        try:
+            current = int(lines[0])
+            stat = dict(line.split() for line in lines[1:])
+            return {
+                "current_bytes": current,
+                "used_bytes": current - int(stat.get("inactive_file", 0)),
+                "anon_bytes": int(stat.get("anon", 0)),
+                "file_bytes": int(stat.get("file", 0)),
+            }
+        except (IndexError, ValueError):
+            # An answer cut short (a Ctrl-C reaches `docker exec` too) is a missed
+            # sample, not the end of the sampling thread.
+            self.missed += 1
+            return {}
 
     def rss(self, pid: int) -> int:
         result = run_cmd(["ps", "-o", "rss=", "-p", str(pid)], check=False)

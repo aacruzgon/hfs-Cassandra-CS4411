@@ -540,6 +540,15 @@ class StopSignalTests(unittest.TestCase):
         self.assertNotEqual(own, os.getpgrp())
 
 
+class SamplerTests(unittest.TestCase):
+    def test_an_empty_or_garbled_answer_is_a_missed_sample(self):
+        sampler = bench.MemorySampler("c", {"hfs": 1, "k6": 2}, Path(tempfile.mkdtemp()) / "memory.csv")
+        for output in ("", "12\nanon\n"):
+            with mock.patch.object(bench, "run_cmd", return_value=subprocess.CompletedProcess([], 0, output, "")):
+                self.assertEqual(sampler.sample_container(), {})
+        self.assertEqual(sampler.missed, 2)
+
+
 class ReaperTests(unittest.TestCase):
     """A stop that the terminal cuts short is finished by a process of its own."""
 

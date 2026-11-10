@@ -75,7 +75,7 @@ summary.csv                     one row per cell, over its runs
 
 **Run status.** `ok` is a measured run. `not_implemented` (501) and `refused` (other 4xx) mean the server declined the search, so no load ran. `no_success` means no request got a 2xx, `failed` means the run could not finish (the reason is in `run.json`), and `host_slept` means the host slept during the measurement (more than 2 s between the wall clock and the monotonic clock, `host_slept_s` in `run.json` and `runs.csv`, `host_slept_runs` in `summary.csv`): its bins hold a gap, so it is not a measurement, and `--resume` measures it again. All three make the command exit 1.
 
-**Saturated runs.** A dropped iteration never got a virtual user, so its latency is in no percentile, and the more a backend sheds the better what is left looks. A run that dropped more than 1% of its schedule (`drop_pct`, of `offered` = completed + dropped) is marked `latency_reading saturated` in `runs.csv` and `summary.csv`, and counted in `morning-summary.md`. Read its percentiles as what the requests that got a VU saw, never as the backend's latency at that rate. Healthy runs dropped 0.1 to 0.9% (start-up); runs that couldn't hold the rate dropped 6 to 56%.
+**Saturated runs.** A dropped iteration never got a virtual user, so its latency is in no percentile, and the more a backend sheds the better what is left looks. A run that dropped more than 1% of its schedule (`drop_pct`, of `offered` = completed + dropped) is marked `latency_reading saturated` in `runs.csv` and `summary.csv`, and counted in `morning-summary.md`. Read its percentiles as what the requests that got a VU saw, never as the backend's latency at that rate. Healthy runs dropped 0.1 to 0.9% (start-up); runs that couldn't hold the rate dropped 6 to 56%. **This range is under review:** at 120 s, PostgreSQL at 80% of its own closed-loop capacity dropped more than 1% in most cells, so whether the 80% rate or `maxVUs = concurrency` should change is an open decision for Alan (PR #76, and the ADR for this row), and until it is made a `saturated` run may not mean the backend fell behind.
 
 **Percentiles.** `p50_ms`, `p95_ms` and `p99_ms` cover every response, and `p50_ok_ms`, `p95_ok_ms` and `p99_ok_ms` only the 2xx ones, so a fast 503 or 409 can't pull the figure down.
 
@@ -151,7 +151,7 @@ python3 docs/Cassandra/benchmark/bench.py overnight --hours 8 --dataset-dir ~/hf
 
 `bench.py overnight` runs the matrix unattended within a time budget. **These are laptop numbers, for timings and bugs, and never go in the report** (ADR-aacruzgon-0002): every run is labelled `laptop-dry-run`, and the output folder holds `NOT-FOR-REPORT.txt`.
 
-`caffeinate -dimsu -w <pid>` keeps the Mac awake while the run lasts (`-d` keeps the display on too; it's harmless, and dimming the screen by hand does not stop the run). The harness uses the 3 GiB profile, the only one that fits an 8.8 GiB Docker VM, and counts the shared dev node's 3 GiB without touching it.
+`caffeinate -dimsu -w <pid>` keeps the Mac awake while the run lasts (`-d` keeps the display on too; it's harmless, and dimming the screen by hand does not stop the run). It does not stop a closed lid: the Mac sleeps anyway, and a run measured across that sleep is recorded as `host_slept`, not `ok` (see Run status); `--resume` measures it again. The harness uses the 3 GiB profile, the only one that fits an 8.8 GiB Docker VM, and counts the shared dev node's 3 GiB without touching it.
 
 Before starting it checks the datasets against `SHA256SUMS`, the release `hfs`, the pinned k6, the Docker budget and that the HFS port is free, and refuses if any fails. It runs these parts in order, one run at a time. It starts a run only if that run can finish inside the budget, and a steady-state part only if all its runs can:
 
@@ -165,7 +165,15 @@ Results go to `~/hfs-bench/<date>/` (`--out` to change it) and nothing is commit
 
 **To stop it:** Ctrl-C, `kill <pid>`, or closing the terminal. Each stops HFS and k6, takes the database container down, saves the state and writes the morning summary; continue with the summary's `--resume` command. `--resume` refuses to start while something else holds the HFS port, and names it. The progress is also in `overnight.log` in the output folder.
 
-**In the morning,** read `morning-summary.md`: what ran, how long each part took, when and why it stopped against the budget, failed, busy-host and saturated runs, and the exact `--resume` command for what's left. Snapshots stay in Docker until the matrix completes; a `run` removes only those it built.
+**In the morning,** read `morning-summary.md`: what ran, how long each part took, when and why it stopped against the budget, failed, busy-host and saturated runs, and the exact `--resume` command for what's left. Snapshots stay in Docker until the matrix completes; a `run` removes only those it built. To remove them from a matrix you won't finish (2.6 GB for PostgreSQL at 100,000), use the project names, `hfsbench-postgres` and `hfsbench-cassandra` unless you passed `--project`:
+
+```bash
+for project in hfsbench-postgres hfsbench-cassandra; do
+  docker volume ls -q --filter label=hfsbench.project=$project | xargs -r docker volume rm
+done
+```
+
+The summary's Host slept column counts runs measured across a sleep; on a Mac, `pmset -g log | grep -E '\sSleep\s'` says when and why it slept.
 
 ## Reading a smoke run
 

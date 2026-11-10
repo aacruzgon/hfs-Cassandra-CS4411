@@ -2400,13 +2400,14 @@ def cmd_overnight(args: argparse.Namespace) -> int:
                 entry["status"] = f"interrupted by {stopping[0].name}" if stopping else "interrupted"
                 raise
             entry["seconds"] = entry.get("seconds", 0.0) + time.monotonic() - started
+            # A run that failed or was measured across a sleep fails the night, budget or not.
+            any_failed = any_failed or not ok
             if plan.budget_stopped:
                 entry["status"] = "stopped at the budget"
                 budget_stopped = True
                 budget_stop_reason = plan.budget_stop_reason
             else:
                 entry["status"] = "complete" if ok else "complete with failures"
-                any_failed = any_failed or not ok
             save_state()
             if part["kind"] == "calibrate" and entry["status"] != "complete":
                 log("calibration is not complete, so the parts that need its rates can't run yet")

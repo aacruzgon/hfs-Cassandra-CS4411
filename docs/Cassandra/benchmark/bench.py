@@ -1767,7 +1767,7 @@ SUMMARY_FIELDS = [field for field in SUMMARY_KEY if field != "reset"] + [
     "p95_ms_mean", "p95_cv_pct", "p99_ms_mean", "p50_ok_ms_mean", "p95_ok_ms_mean", "p99_ok_ms_mean", "s2xx", "s409", "s412", "s4xx_other", "s501",
     "s5xx_other", "s_other", "dropped_iterations", "steady_change_pct_mean", "reset", "mem_peak_used_mib",
     "mem_peak_anon_mib", "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib",
-    "k6_peak_rss_mib", "oom_killed", "host_busy_runs", "host_slept_runs",
+    "k6_peak_rss_mib", "oom_killed", "host_busy_runs", "host_slept_runs", "memory_samples_missed",
 ]
 
 
@@ -1855,6 +1855,8 @@ def summarize(out_root: Path) -> None:
                 oom_killed=any(m.get("oom_killed") for m in ok),
                 host_busy_runs=sum(1 for m in members if m.get("host_busy")),
                 host_slept_runs=sum(1 for m in members if m.get("status") == "host_slept"),
+                # Over the runs the peaks come from: a missed sample is a gap in them.
+                memory_samples_missed=total("memory_samples_missed"),
             )
             writer.writerow([fmt(row.get(field)) for field in SUMMARY_FIELDS])
     log(f"wrote {out_root / 'runs.csv'} and {out_root / 'summary.csv'}")
@@ -2315,6 +2317,7 @@ def part_counts(records: List[dict], part: dict) -> dict:
         "busy_host": sum(1 for r in records if r.get("host_busy")),
         "host_slept": sum(1 for r in records if r.get("status") == "host_slept"),
         "saturated": sum(1 for r in ok if r.get("saturated")),
+        "missed_samples": sum(int(r.get("memory_samples_missed") or 0) for r in ok),
         "left": max(0, total - done), "total": total,
     }
 
@@ -2329,8 +2332,8 @@ def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume
              + (f"finished {against_budget} min after the end of the budget." if against_budget > 0
                 else f"finished {-against_budget} min before the end of the budget."),
              "", f"Stopped by: {state['stopped_by']}.", "",
-             "| Part | Status | Took (awake) | Runs ok | Declined cells | Failed | Busy host | Host slept | Saturated | Left |",
-             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+             "| Part | Status | Took (awake) | Runs ok | Declined cells | Failed | Busy host | Host slept | Saturated | Missed memory samples | Left |",
+             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     failures: List[str] = []
     left_any = False
     for part in parts:
@@ -2340,7 +2343,7 @@ def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume
         left_any = left_any or counts["left"] > 0 or entry.get("status") != "complete"
         minutes = entry.get("seconds", 0) / 60
         lines.append(f"| {part['name']} | {entry.get('status', 'not started')} | {minutes:.0f} min | {counts['ok']} | "
-                     f"{counts['declined_cells']} | {counts['failed']} | {counts['busy_host']} | {counts['host_slept']} | {counts['saturated']} | {counts['left']} of {counts['total']} |")
+                     f"{counts['declined_cells']} | {counts['failed']} | {counts['busy_host']} | {counts['host_slept']} | {counts['saturated']} | {counts['missed_samples']} | {counts['left']} of {counts['total']} |")
         if entry.get("error"):
             failures.append(f"- `{part['name']}`: {entry['error']}")
         failures += [f"- `{r['backend']} {r['size']}/{r['op']}/c{r['concurrency']} run {r['run']}`: {r.get('status')}: {str(r.get('failure', ''))[:300]}"

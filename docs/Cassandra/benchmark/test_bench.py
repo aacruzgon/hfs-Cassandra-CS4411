@@ -573,6 +573,20 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(sampler.missed, 2)
 
 
+    def test_missed_samples_reach_summary_csv_and_the_morning_summary(self):
+        root = Path(tempfile.mkdtemp())
+        for run, missed in ((1, 2), (2, 1)):
+            (root / f"run{run}").mkdir()
+            (root / f"run{run}" / "run.json").write_text(json.dumps(
+                {"label": "laptop-dry-run", "backend": "cassandra", "size": 10000, "op": "read", "concurrency": 8,
+                 "run": run, "status": "ok", "memory_samples_missed": missed}))
+        bench.summarize(root)
+        summary = list(csv.DictReader((root / "summary.csv").open()))
+        self.assertEqual(summary[0]["memory_samples_missed"], "3")
+        records = [json.loads((root / f"run{n}" / "run.json").read_text()) for n in (1, 2)]
+        part = {"sizes": [10000], "ops": ["read"], "concurrency": [8], "runs": 2}
+        self.assertEqual(bench.part_counts(records, part)["missed_samples"], 3)
+
 class ReaperTests(unittest.TestCase):
     """A stop that the terminal cuts short is finished by a process of its own."""
 

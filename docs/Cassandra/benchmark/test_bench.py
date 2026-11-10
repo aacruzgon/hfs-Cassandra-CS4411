@@ -682,6 +682,32 @@ class ReaperTests(unittest.TestCase):
         self.assertAlmostEqual(entry["seconds"], 345.0)  # an earlier attempt's 60 s, and this one's 285 s
         self.assertIn("| postgres-on-10000 | interrupted by SIGHUP | 6 min |", (self.dir / "morning-summary.md").read_text())
 
+    def test_a_command_refuses_to_start_while_a_reaper_is_at_work(self):
+        import fcntl
+        plan = self.dir / "hfsbench-cleanup-4242.json"
+        plan.write_text("{}")
+        (self.dir / "hfsbench-cleanup-17.json").write_text("{}")  # a leftover nobody holds
+        with mock.patch.object(bench.tempfile, "gettempdir", return_value=str(self.dir)):
+            self.assertIsNone(bench.reaper_at_work())
+            holder = plan.open("rb")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)  # a reaper at work
+            with self.assertRaisesRegex(bench.Failure, "still being cleaned up .*hfsbench-cleanup-4242.log"):
+                bench.require_no_reaper()
+            holder.close()
+            self.assertIsNone(bench.reaper_at_work())
+
+    def test_a_copy_from_a_volume_that_is_gone_creates_nothing(self):
+        backend, _ = self.backend()
+        calls = []
+
+        def fake(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 1 if command[:3] == ["docker", "volume", "inspect"] else 0, "", "")
+        with mock.patch.object(bench, "run_cmd", side_effect=fake):
+            with self.assertRaisesRegex(bench.Failure, "is gone"):
+                backend._copy_volume("mine_snapshot-postgres-10000-x", backend.data_volume, "true")
+        self.assertFalse([c for c in calls if c[:2] == ["docker", "run"]])
+
     def test_a_killed_harness_is_finished_for_it(self):
         backend, args = self.backend()
         bench.CLEANUP["plans"][id(args)] = (backend, args, self.dir / "matrix", [])

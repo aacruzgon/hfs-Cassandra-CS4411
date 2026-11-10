@@ -599,6 +599,9 @@ class Backend:
 
     def _copy_volume(self, source: str, destination: str, finish: str) -> None:
         name = f"{self.project}-volume-copy"
+        if run_cmd(["docker", "volume", "inspect", source], check=False).returncode != 0:
+            # `docker run -v` would create it empty, and a restore would then copy nothing.
+            raise Failure(f"the volume {source} is gone, so there is nothing to copy")
         try:
             run_cmd(
                 ["docker", "run", "--rm", "--name", name, "--network", "none", "--entrypoint", "sh",
@@ -2051,6 +2054,33 @@ def cmd_reap(args: argparse.Namespace) -> int:
     return 0
 
 
+def reaper_at_work() -> Optional[Path]:
+    """The log of a reaper still finishing a stop (it holds its plan's lock), or None.
+
+    A plan nobody holds is a leftover (a reaper killed with -9) and is passed over.
+    """
+    for plan in sorted(Path(tempfile.gettempdir()).glob("hfsbench-cleanup-*.json")):
+        try:
+            handle = plan.open("rb")
+        except OSError:
+            continue
+        with handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return plan.with_suffix(".log")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return None
+
+
+def require_no_reaper() -> None:
+    """Refuse to start while a stop is still being cleaned up: it would take this run's database down."""
+    log_path = reaper_at_work()
+    if log_path is not None:
+        raise Failure(f"a stopped run is still being cleaned up (its log is {log_path}): "
+                      "start again in a few seconds, once that log says the cleanup is done")
+
+
 # A stop that arrives while a cleanup is under way waits for it (cleanup_shield).
 SHIELD = {"depth": 0, "pending": False}
 
@@ -2129,6 +2159,7 @@ def stops_cleanly(command):
 
 @stops_cleanly
 def cmd_run(args: argparse.Namespace) -> int:
+    require_no_reaper()
     args.rates = args.rates if args.rates else HERE / "rates.json"
     if args.resume and args.no_reset:
         raise Failure("--resume cannot continue a --no-reset cell")
@@ -2138,6 +2169,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 @stops_cleanly
 def cmd_calibrate(args: argparse.Namespace) -> int:
+    require_no_reaper()
     args.resume = False
     args.label = "calibration"
     return run_calibration(args)
@@ -2226,6 +2258,7 @@ def overnight_parts(args: argparse.Namespace) -> List[dict]:
 
 
 def overnight_preflight(args: argparse.Namespace, parts: List[dict]) -> None:
+    require_no_reaper()
     require_free_port(args.hfs_port)
     for size in sorted({size for part in parts for size in part["sizes"]}):
         verify_dataset(args.dataset_dir.resolve() / f"patient-observation-{size}.ndjson", args.sha256sums.resolve())
@@ -2508,6 +2541,7 @@ def check_clean(base: str, dirt: dict) -> dict:
 @stops_cleanly
 def cmd_snapshot_check(args: argparse.Namespace) -> int:
     """Measure a reset by reloading against a snapshot restore, and that a restore is exact."""
+    require_no_reaper()
     args.reset = "snapshot"
     backend: Backend = Cassandra(args) if args.backend == "cassandra" else Postgres(args)
     out_root = args.out.resolve()

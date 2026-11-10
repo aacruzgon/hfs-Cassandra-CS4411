@@ -19,7 +19,7 @@ Before each of the three measured runs, in this order (roadmap Step 8):
 4. **Load,** when building the snapshot or with `--reset reload`: the dataset goes through batch Bundles of `PUT` entries (`docs/Cassandra/datasets/ndjson_to_batches.py`, cached under the output directory) and each entry's status is checked, since a batch answers 200 even when an entry fails.
 5. **Settle,** before the snapshot is taken, or after each reload. Cassandra: `nodetool flush`, then wait for `pending tasks: 0`. PostgreSQL: `CHECKPOINT` and `VACUUM (ANALYZE)`, its counterpart.
 6. **JIT warm-up:** the same operation on the same schedule for `--warmup` seconds (60 by default), results thrown away. Then wait again for pending compactions to reach zero, so that compaction from the warm-up does not run into the measurement.
-7. **Mark the window.** `pg_stat_statements` is reset and the `nodetool` readings are taken (`*-before.txt`), so the load and the warm-up are out of the figures collected after the run.
+7. **Mark the window.** `pg_stat_statements` is reset, so its calls cover only the measured window. The `nodetool` readings are taken too (`*-before.txt`), but of those only `gcstats` covers just the window, because it restarts on being read. `tablestats` counts from the node's start, so the window is the file after the run less the one before (at each restore the node starts afresh, so the file after the run holds the warm-up as well). `proxyhistograms` holds percentiles, which can't be subtracted, so they include the warm-up.
 8. **Measure** with `constant-arrival-rate`: `--duration` seconds (120 by default) at the calibrated rate, at most `concurrency` virtual users. Memory is sampled every 2 s throughout.
 
 `--no-reset` keeps one data set across the three runs. Use it only for the LWT steady-state case below; it is the setting under which ADR-aacruzgon-0001 saw its decline.
@@ -67,7 +67,7 @@ summary.csv                     one row per cell, over its runs
     db-settings.json            nodetool version/info/status and the config, or pg_settings
     proxyhistograms.txt, tablestats.txt, compactionstats.txt, gcstats.txt
     pg_stat_statements.txt, pg_stat_database.txt
-    <name>-before.txt           the same readings just before the measured window
+    <name>-before.txt           the same readings just before the measured window (see step 7: only gcstats is the window itself)
     k6.log, hfs.log
 ```
 

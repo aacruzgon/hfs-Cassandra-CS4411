@@ -667,7 +667,7 @@ class Backend:
         raise NotImplementedError
 
     def before_measure(self, out_dir: Path) -> None:
-        """Mark the start of the measured window, so collect() reads the window and not the load."""
+        """Just before the measured window: reset what can be reset, and read what can't for comparison."""
 
 
 class Cassandra(Backend):
@@ -764,8 +764,10 @@ class Cassandra(Backend):
             (out_dir / f"{name}.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
 
     def before_measure(self, out_dir: Path) -> None:
-        # nodetool's counters run from the node's start: this reading is what to
-        # take away from the one after the run. gcstats restarts on being read.
+        # Only gcstats covers the window after this: it restarts on being read.
+        # tablestats counts from the node's start, so the window is the reading
+        # after the run less this one; proxyhistograms' percentiles can't be
+        # subtracted, so the reading after the run still includes the warm-up.
         for name, command in (
             ("proxyhistograms", ["nodetool", "proxyhistograms"]),
             ("tablestats", ["nodetool", "tablestats", "helios"]),

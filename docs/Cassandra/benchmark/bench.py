@@ -539,14 +539,17 @@ class Backend:
     def label(self) -> str:
         return self.name
 
-    def compose(self, *arguments: str, check: bool = True, timeout: float = 900,
-                own_session: bool = False) -> subprocess.CompletedProcess:
+    def compose_command(self) -> List[str]:
         command = ["docker", "compose", "-p", self.project]
         for path in self.files():
             command += ["-f", str(path)]
+        return command
+
+    def compose(self, *arguments: str, check: bool = True, timeout: float = 900,
+                own_session: bool = False) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         env[self.port_var] = str(self.port)
-        return run_cmd(command + list(arguments), check=check, env=env, timeout=timeout, own_session=own_session)
+        return run_cmd(self.compose_command() + list(arguments), check=check, env=env, timeout=timeout, own_session=own_session)
 
     def exec_(self, *arguments: str, check: bool = True, timeout: float = 600) -> subprocess.CompletedProcess:
         return self.compose("exec", "-T", self.service, *arguments, check=check, timeout=timeout)
@@ -885,6 +888,7 @@ class Hfs:
         self.log_path = log_path
         self.log_file = log_path.open("w", encoding="utf-8")
         self.process = subprocess.Popen([str(binary)], env=env, stdout=self.log_file, stderr=subprocess.STDOUT)
+        CLEANUP["processes"][self.process.pid] = "hfs"
         try:
             self._wait_ready()
         except BaseException:  # A signal too: nothing else knows about this process yet.
@@ -922,6 +926,7 @@ class Hfs:
 
     def stop(self) -> None:
         stop_process(self.process)
+        CLEANUP["processes"].pop(self.process.pid, None)
         self.log_file.close()
 
 
@@ -1317,6 +1322,7 @@ def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: 
             k6_command(args, op, hfs.base, vus, mode, rate, seconds, dataset, k6_csv),
             env=k6_environment(), stdout=output, stderr=subprocess.STDOUT,
         )
+        CLEANUP["processes"][process.pid] = "k6"
         sampler = MemorySampler(container, {"hfs": hfs.process.pid, "k6": process.pid}, run_dir / "memory.csv")
         sampler.start()
         try:
@@ -1330,6 +1336,7 @@ def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: 
             k6_csv.unlink(missing_ok=True)
             raise
         finally:
+            CLEANUP["processes"].pop(process.pid, None)
             sampler.stop()
     ended = clocks()
     if code != 0:
@@ -1702,6 +1709,7 @@ def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
         raise Failure(f"k6 is not the pinned v{K6_VERSION}: {environment['k6']}; see fetch-k6")
     environment_path = out_root / f"environment-{backend.label}.json"
     all_ok = True
+    CLEANUP["plans"][id(args)] = (backend, args, out_root, [])
     try:
         for size in args.sizes:
             dataset = datasets[size]
@@ -1719,6 +1727,7 @@ def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
                 backend.drop_snapshots(args.built_snapshots)
             environment_path.write_text(json.dumps(environment, indent=1, sort_keys=True), encoding="utf-8")
             summarize(out_root)
+            CLEANUP["plans"].pop(id(args), None)
     return out_root, all_ok
 
 
@@ -1886,6 +1895,133 @@ def add_run_arguments(parser: argparse.ArgumentParser, out_required: bool = True
     parser.add_argument("--label", help="recorded with each run")
 
 
+# --- a stop the terminal cuts short ----------------------------------------------
+# A terminal can kill the harness before its cleanup is done: Rex kills a closed
+# pane's process group about 0.85 s after the SIGHUP, and Cassandra's `compose down`
+# alone takes about 5 s. So the first signal also starts a reaper in a session of its
+# own, which that kill doesn't reach. It waits for the harness to exit and, only if the
+# harness didn't get to the end of its cleanup, does the rest (cmd_reap).
+CLEANUP: dict = {"plans": {}, "processes": {}, "overnight": None}
+REAPER: Dict[str, Optional[Path]] = {"plan": None}
+
+
+def cleanup_plan(reason: str) -> dict:
+    """What the cleanup would still have to do, from what is running now."""
+    backends = []
+    for backend, args, out_root, volumes in CLEANUP["plans"].values():
+        snapshots = list(volumes)
+        if getattr(args, "reset", None) == "snapshot" and not getattr(args, "keep_snapshots", False):
+            snapshots += list(getattr(args, "built_snapshots", []))
+        backends.append({
+            "compose": backend.compose_command(), "env": {backend.port_var: str(backend.port)},
+            "containers": [f"{backend.project}-volume-copy"], "volumes": [backend.data_volume],
+            "snapshots": snapshots, "out": str(out_root) if out_root else None,
+        })
+    processes = [{"pid": pid, "name": name} for pid, name in CLEANUP["processes"].items()]
+    return {"reason": reason, "backends": backends, "processes": processes, "overnight": CLEANUP["overnight"]}
+
+
+def start_reaper(reason: str) -> None:
+    """Start the reaper for this stop, if there is anything to clean up. Never fails the stop."""
+    if not (CLEANUP["plans"] or CLEANUP["processes"] or CLEANUP["overnight"]):
+        return
+    try:
+        base = Path(tempfile.gettempdir()) / f"hfsbench-cleanup-{os.getpid()}"
+        plan_path = base.with_suffix(".json")
+        plan_path.write_text(json.dumps(cleanup_plan(reason)), encoding="utf-8")
+        with base.with_suffix(".log").open("a", encoding="utf-8") as sink:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "reap", "--pid", str(os.getpid()),
+                              "--plan", str(plan_path)], stdin=subprocess.DEVNULL, stdout=sink,
+                             stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+        REAPER["plan"] = plan_path
+    except Exception:  # The harness's own cleanup still runs.
+        pass
+
+
+def cleanup_finished() -> None:
+    """Tell the reaper that the harness's own cleanup got to the end."""
+    if REAPER["plan"] is not None:
+        REAPER["plan"].with_suffix(".done").write_text("", encoding="utf-8")
+
+
+def process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    state = run_cmd(["ps", "-o", "stat=", "-p", str(pid)], check=False).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def stop_leftover(pid: int, name: str) -> None:
+    """Stop a process the harness started, if it is still that process."""
+    command = run_cmd(["ps", "-o", "comm=", "-p", str(pid)], check=False).stdout.strip()
+    if not command or Path(command).name != name:
+        return
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(60):
+        if not process_alive(pid):
+            return
+        time.sleep(0.5)
+    os.kill(pid, signal.SIGKILL)
+
+
+def finish_overnight(overnight: dict, reason: str) -> None:
+    """The state and the morning summary, as the harness would have written them on a stop."""
+    state_path = Path(overnight["state_path"])
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if overnight.get("part"):
+        entry = state["parts"].setdefault(overnight["part"], {"seconds": 0.0})
+        if entry.get("status") != "complete":
+            entry["status"] = f"interrupted by {reason}"
+    state["stopped_by"] = (f"{reason}; the harness was killed before its cleanup was done, "
+                           "and a separate process finished it")
+    scratch = state_path.with_suffix(".tmp")
+    scratch.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
+    scratch.replace(state_path)
+    write_morning_summary(Path(overnight["out_root"]), state, overnight["parts"], overnight["resume_command"])
+
+
+def cmd_reap(args: argparse.Namespace) -> int:
+    """Wait for a stopped harness to exit; finish its cleanup if it was killed first."""
+    global LOG_SINK
+    done = args.plan.with_suffix(".done")
+    while process_alive(args.pid):
+        time.sleep(0.5)
+    try:
+        if done.exists():
+            return 0
+        plan = json.loads(args.plan.read_text(encoding="utf-8"))
+        overnight = plan.get("overnight")
+        if overnight:
+            LOG_SINK = (Path(overnight["out_root"]) / "overnight.log").open("a", encoding="utf-8")
+        log(f"reaper: the harness (pid {args.pid}) was killed after a {plan['reason']} before its cleanup was done; finishing it")
+        for entry in plan["processes"]:
+            stop_leftover(entry["pid"], entry["name"])
+        for backend in plan["backends"]:
+            env = dict(os.environ)
+            env.update(backend["env"])
+            commands = [backend["compose"] + ["down", "-v", "--remove-orphans"]]
+            commands += [["docker", "rm", "-f", name] for name in backend["containers"]]
+            commands += [["docker", "volume", "rm", "-f", name] for name in backend["volumes"] + backend["snapshots"]]
+            for command in commands:
+                try:
+                    run_cmd(command, check=False, env=env, timeout=300)
+                except (subprocess.SubprocessError, OSError) as failure:
+                    log(f"reaper: {' '.join(command[:4])}: {failure}")
+            if backend["out"]:
+                summarize(Path(backend["out"]))
+        if overnight:
+            finish_overnight(overnight, plan["reason"])
+        log("reaper: the cleanup is done")
+    finally:
+        args.plan.unlink(missing_ok=True)
+        done.unlink(missing_ok=True)
+    return 0
+
+
 # A stop that arrives while a cleanup is under way waits for it (cleanup_shield).
 SHIELD = {"depth": 0, "pending": False}
 
@@ -1929,6 +2065,7 @@ def stop_on_signals() -> List[signal.Signals]:
         stopping.append(signal.Signals(number))
         if number == signal.SIGHUP:
             detach_output()
+        start_reaper(signal.Signals(number).name)
         if SHIELD["depth"]:
             SHIELD["pending"] = True
             return
@@ -2202,6 +2339,10 @@ def cmd_overnight(args: argparse.Namespace) -> int:
         scratch.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
         scratch.replace(state_path)
 
+    # What a reaper needs to finish the state and the summary (start_reaper).
+    save_state()
+    CLEANUP["overnight"] = {"out_root": str(out_root), "state_path": str(state_path), "parts": parts,
+                            "resume_command": resume_command, "part": None}
     any_failed = False
     budget_stopped = False
     calibration_incomplete = False
@@ -2215,6 +2356,7 @@ def cmd_overnight(args: argparse.Namespace) -> int:
             if budget_stopped:
                 break
             log(f"part {part['name']}: starting")
+            CLEANUP["overnight"]["part"] = part["name"]
             # An error from an earlier night is about that attempt; this one records its own.
             entry.pop("error", None)
             plan = argparse.Namespace(**vars(args))
@@ -2340,6 +2482,7 @@ def cmd_snapshot_check(args: argparse.Namespace) -> int:
         return Hfs(args.hfs_bin, args.hfs_port, log_path, backend.hfs_env())
 
     all_clean = True
+    CLEANUP["plans"][id(args)] = (backend, args, None, [volume])
     try:
         log(f"{backend.label} {args.size}: reset by reloading")
         started = time.monotonic()
@@ -2400,6 +2543,7 @@ def cmd_snapshot_check(args: argparse.Namespace) -> int:
             (out_root / f"snapshot-check-{backend.name}-{args.size}.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
             backend.stop()
             run_cmd(["docker", "volume", "rm", "-f", volume], check=False, own_session=True)
+            CLEANUP["plans"].pop(id(args), None)
     return 0 if all_clean else 1
 
 
@@ -2484,6 +2628,11 @@ def build_parser() -> argparse.ArgumentParser:
     summarize_parser.add_argument("out", type=Path)
     summarize_parser.set_defaults(handler=cmd_summarize)
 
+    reap_parser = commands.add_parser("reap", help="internal: finish the cleanup of a harness killed during its stop")
+    reap_parser.add_argument("--pid", type=int, required=True)
+    reap_parser.add_argument("--plan", type=Path, required=True)
+    reap_parser.set_defaults(handler=cmd_reap)
+
     fetch_parser = commands.add_parser("fetch-k6", help="download the pinned k6 and verify its checksum")
     fetch_parser.add_argument("--dest", type=Path, required=True)
     fetch_parser.set_defaults(handler=cmd_fetch_k6)
@@ -2500,6 +2649,8 @@ def main(argv: List[str]) -> int:
         return 2
     except KeyboardInterrupt:
         return 130
+    finally:
+        cleanup_finished()
 
 
 if __name__ == "__main__":

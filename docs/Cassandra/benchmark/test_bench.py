@@ -540,5 +540,91 @@ class StopSignalTests(unittest.TestCase):
         self.assertNotEqual(own, os.getpgrp())
 
 
+class ReaperTests(unittest.TestCase):
+    """A stop that the terminal cuts short is finished by a process of its own."""
+
+    def setUp(self):
+        self.saved = {key: (dict(value) if isinstance(value, dict) else value) for key, value in bench.CLEANUP.items()}
+        bench.CLEANUP.update(plans={}, processes={}, overnight=None)
+        self.dir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        bench.CLEANUP.update(self.saved)
+        bench.REAPER["plan"] = None
+        if bench.LOG_SINK is not None:
+            bench.LOG_SINK.close()
+        bench.LOG_SINK = None
+
+    def backend(self):
+        args = argparse.Namespace(project="mine", db_port=None, profile="3g", baseline="on", reset="snapshot",
+                                  keep_snapshots=False, built_snapshots=["mine_snapshot-postgres-10000-x"])
+        return bench.Postgres(args), args
+
+    def test_the_plan_names_the_database_the_snapshots_built_and_the_results(self):
+        backend, args = self.backend()
+        bench.CLEANUP["plans"][id(args)] = (backend, args, self.dir, [])
+        bench.CLEANUP["processes"][12345] = "hfs"
+        plan = bench.cleanup_plan("SIGHUP")
+        (entry,) = plan["backends"]
+        self.assertEqual(entry["compose"][:4], ["docker", "compose", "-p", "mine"])
+        self.assertEqual(entry["volumes"], [backend.data_volume])
+        self.assertEqual(entry["snapshots"], ["mine_snapshot-postgres-10000-x"])
+        self.assertEqual(entry["out"], str(self.dir))
+        self.assertEqual(plan["processes"], [{"pid": 12345, "name": "hfs"}])
+        args.keep_snapshots = True  # overnight's snapshots outlive the stop
+        self.assertEqual(bench.cleanup_plan("SIGHUP")["backends"][0]["snapshots"], [])
+
+    def test_no_reaper_when_nothing_runs(self):
+        with mock.patch.object(bench.subprocess, "Popen") as popen:
+            bench.start_reaper("SIGINT")
+        popen.assert_not_called()
+        self.assertIsNone(bench.REAPER["plan"])
+
+    def gone_pid(self) -> int:
+        child = subprocess.Popen(["true"])
+        child.wait()
+        return child.pid
+
+    def test_a_harness_that_finished_its_cleanup_leaves_nothing_to_do(self):
+        plan = self.dir / "plan.json"
+        plan.write_text(json.dumps({"reason": "SIGINT", "backends": [], "processes": [], "overnight": None}))
+        plan.with_suffix(".done").write_text("")
+        with mock.patch.object(bench, "run_cmd") as run_cmd:
+            self.assertEqual(bench.cmd_reap(argparse.Namespace(pid=self.gone_pid(), plan=plan)), 0)
+        run_cmd.assert_not_called()
+        self.assertFalse(plan.exists())
+
+    def test_a_killed_harness_is_finished_for_it(self):
+        backend, args = self.backend()
+        bench.CLEANUP["plans"][id(args)] = (backend, args, self.dir / "matrix", [])
+        (self.dir / "matrix").mkdir()
+        parts = [{"name": "postgres-on-10000", "backend": "postgres", "baseline": "on", "sizes": [10000],
+                  "ops": ["create"], "concurrency": [8], "runs": 1, "out": "matrix"}]
+        state_path = self.dir / "overnight-state.json"
+        state_path.write_text(json.dumps({"parts": {}, "started_utc": "2026-11-10T02:00:00+00:00", "hours": 8,
+                                          "budget_end_utc": "2026-11-10T10:00:00+00:00", "stopped_by": "running"}))
+        bench.CLEANUP["overnight"] = {"out_root": str(self.dir), "state_path": str(state_path), "parts": parts,
+                                      "resume_command": "python3 bench.py overnight --resume", "part": "postgres-on-10000"}
+        plan = self.dir / "plan.json"
+        plan.write_text(json.dumps(bench.cleanup_plan("SIGHUP")))
+        with mock.patch.object(bench, "run_cmd", return_value=subprocess.CompletedProcess([], 0, "", "")) as run_cmd:
+            self.assertEqual(bench.cmd_reap(argparse.Namespace(pid=self.gone_pid(), plan=plan)), 0)
+        commands = [call.args[0] for call in run_cmd.call_args_list]
+        self.assertIn(["down", "-v", "--remove-orphans"], [command[-3:] for command in commands])
+        self.assertIn(["docker", "volume", "rm", "-f", backend.data_volume], commands)
+        self.assertIn(["docker", "volume", "rm", "-f", "mine_snapshot-postgres-10000-x"], commands)
+        down = next(call for call in run_cmd.call_args_list if call.args[0][-3:] == ["down", "-v", "--remove-orphans"])
+        self.assertEqual(down.kwargs["env"][backend.port_var], str(backend.port))
+        self.assertTrue((self.dir / "matrix" / "runs.csv").is_file())
+        state = json.loads(state_path.read_text())
+        self.assertEqual(state["parts"]["postgres-on-10000"]["status"], "interrupted by SIGHUP")
+        self.assertIn("a separate process finished it", state["stopped_by"])
+        summary = (self.dir / "morning-summary.md").read_text()
+        self.assertIn("| postgres-on-10000 | interrupted by SIGHUP |", summary)
+        self.assertIn("python3 bench.py overnight --resume", summary)
+        self.assertIn("reaper: the cleanup is done", (self.dir / "overnight.log").read_text())
+        self.assertFalse(plan.exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

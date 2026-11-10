@@ -589,10 +589,12 @@ class ReaperTests(unittest.TestCase):
         plan = self.dir / "plan.json"
         plan.write_text(json.dumps({"reason": "SIGINT", "backends": [], "processes": [], "overnight": None}))
         plan.with_suffix(".done").write_text("")
+        plan.with_suffix(".log").write_text("")
         with mock.patch.object(bench, "run_cmd") as run_cmd:
             self.assertEqual(bench.cmd_reap(argparse.Namespace(pid=self.gone_pid(), plan=plan)), 0)
         run_cmd.assert_not_called()
         self.assertFalse(plan.exists())
+        self.assertFalse(plan.with_suffix(".log").exists())
 
     def test_a_killed_harness_is_finished_for_it(self):
         backend, args = self.backend()

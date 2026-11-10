@@ -1992,6 +1992,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
         time.sleep(0.5)
     try:
         if done.exists():
+            # Nothing to do and nothing to say: its log would be empty.
+            args.plan.with_suffix(".log").unlink(missing_ok=True)
             return 0
         plan = json.loads(args.plan.read_text(encoding="utf-8"))
         overnight = plan.get("overnight")

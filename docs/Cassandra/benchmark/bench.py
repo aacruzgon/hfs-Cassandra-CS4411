@@ -20,6 +20,7 @@ server, 1 when any run failed, 2 on a usage or setup error.
 
 import argparse
 import collections
+import contextlib
 import csv
 import gzip
 import hashlib
@@ -1635,8 +1636,9 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                 break
     finally:
         # On a signal too: an HFS left behind would hold the port against --resume.
-        if hfs is not None:
-            hfs.stop()
+        with cleanup_shield():
+            if hfs is not None:
+                hfs.stop()
     (cell_dir / "environment.json").write_text(json.dumps(environment, indent=1, sort_keys=True), encoding="utf-8")
     return ok
 
@@ -1710,12 +1712,13 @@ def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
                     if not run_cell(args, backend, dataset, op, vus, planned[(size, op, vus)], out_root, environment):
                         all_ok = False
     finally:
-        backend.stop()
-        if args.reset == "snapshot" and not getattr(args, "keep_snapshots", False):
-            # Only what this command built: an overnight's snapshots outlive a `run` beside them.
-            backend.drop_snapshots(args.built_snapshots)
-        environment_path.write_text(json.dumps(environment, indent=1, sort_keys=True), encoding="utf-8")
-        summarize(out_root)
+        with cleanup_shield():
+            backend.stop()
+            if args.reset == "snapshot" and not getattr(args, "keep_snapshots", False):
+                # Only what this command built: an overnight's snapshots outlive a `run` beside them.
+                backend.drop_snapshots(args.built_snapshots)
+            environment_path.write_text(json.dumps(environment, indent=1, sort_keys=True), encoding="utf-8")
+            summarize(out_root)
     return out_root, all_ok
 
 
@@ -1883,6 +1886,31 @@ def add_run_arguments(parser: argparse.ArgumentParser, out_required: bool = True
     parser.add_argument("--label", help="recorded with each run")
 
 
+# A stop that arrives while a cleanup is under way waits for it (cleanup_shield).
+SHIELD = {"depth": 0, "pending": False}
+
+
+@contextlib.contextmanager
+def cleanup_shield(raise_after: bool = True):
+    """Run a cleanup that a first signal must not cut short; the stop takes effect after it.
+
+    A signal raises KeyboardInterrupt wherever the harness is, and when that is
+    inside a cleanup command, subprocess.run kills the command: a `compose down`
+    killed that way leaves the container and its volume. Inside this block the
+    signal is only noted, and KeyboardInterrupt is raised when the block ends
+    (raise_after False leaves that to the caller, who checks the stop itself).
+    """
+    SHIELD["depth"] += 1
+    try:
+        yield
+    finally:
+        SHIELD["depth"] -= 1
+    if SHIELD["depth"] == 0 and SHIELD["pending"]:
+        SHIELD["pending"] = False
+        if raise_after:
+            raise KeyboardInterrupt
+
+
 def stop_on_signals() -> List[signal.Signals]:
     """Turn SIGINT, SIGTERM and SIGHUP into KeyboardInterrupt; return the list that names the signal.
 
@@ -1890,7 +1918,8 @@ def stop_on_signals() -> List[signal.Signals]:
     k6 and takes the database down (a backgrounded process otherwise ignores
     SIGINT, and SIGTERM and SIGHUP would kill it with no cleanup at all). A
     closed terminal is a SIGHUP; `nohup` has already asked for that to be
-    ignored, so it stays so. A second signal during the cleanup is ignored.
+    ignored, so it stays so. A second signal during the cleanup is ignored, and
+    a first one that arrives inside a cleanup_shield waits for it to finish.
     """
     stopping: List[signal.Signals] = []
 
@@ -1900,6 +1929,9 @@ def stop_on_signals() -> List[signal.Signals]:
         stopping.append(signal.Signals(number))
         if number == signal.SIGHUP:
             detach_output()
+        if SHIELD["depth"]:
+            SHIELD["pending"] = True
+            return
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, on_signal)
@@ -2242,12 +2274,16 @@ def cmd_overnight(args: argparse.Namespace) -> int:
         stop_reason = stopping[0].name if stopping else "an interrupt"
         log(f"stopped by {stop_reason}; the cleanup has run")
     finally:
-        state["stopped_by"] = stop_reason or (
-            f"the time budget: {budget_stop_reason}" if budget_stopped
-            else "an incomplete calibration" if calibration_incomplete else "finishing every part")
-        save_state()
-        write_morning_summary(out_root, state, parts, resume_command)
-        log(f"wrote {out_root / 'morning-summary.md'}")
+        # A stop that arrives now is checked below, through `stopping`.
+        with cleanup_shield(raise_after=False):
+            if stopping and stop_reason is None:
+                stop_reason = stopping[0].name
+            state["stopped_by"] = stop_reason or (
+                f"the time budget: {budget_stop_reason}" if budget_stopped
+                else "an incomplete calibration" if calibration_incomplete else "finishing every part")
+            save_state()
+            write_morning_summary(out_root, state, parts, resume_command)
+            log(f"wrote {out_root / 'morning-summary.md'}")
     if stopping:
         return 128 + int(stopping[0])
     if all(state["parts"].get(part["name"], {}).get("status") == "complete" for part in parts):
@@ -2358,11 +2394,12 @@ def cmd_snapshot_check(args: argparse.Namespace) -> int:
             all_clean = all_clean and identical and clean["clean"] and digest_after_dirty == reference
             log(f"  restore {number}: {ready - started:.1f} s, identical {identical}, clean {clean['clean']}")
     finally:
-        if hfs is not None:
-            hfs.stop()
-        (out_root / f"snapshot-check-{backend.name}-{args.size}.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
-        backend.stop()
-        run_cmd(["docker", "volume", "rm", "-f", volume], check=False, own_session=True)
+        with cleanup_shield():
+            if hfs is not None:
+                hfs.stop()
+            (out_root / f"snapshot-check-{backend.name}-{args.size}.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
+            backend.stop()
+            run_cmd(["docker", "volume", "rm", "-f", volume], check=False, own_session=True)
     return 0 if all_clean else 1
 
 

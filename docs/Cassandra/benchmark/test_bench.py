@@ -491,6 +491,38 @@ class StopSignalTests(unittest.TestCase):
         self.assertEqual(bench.stops_cleanly(command)(argparse.Namespace()), 128 + signal.SIGINT)
         self.assertEqual(cleaned, [True])
 
+    def test_a_first_signal_during_a_cleanup_waits_for_it(self):
+        # The cleanup's own command runs to its end instead of being killed with the
+        # harness's KeyboardInterrupt, and the stop takes effect after the block.
+        finished = []
+
+        def command(args):
+            with bench.cleanup_shield():
+                os.kill(os.getpid(), signal.SIGTERM)
+                result = bench.run_cmd(["python3", "-c", "import time; time.sleep(1); print('done')"])
+                finished.append(result.stdout.strip())
+            finished.append("after the block")  # Never reached: the stop comes first.
+            return 0
+
+        self.assertEqual(bench.stops_cleanly(command)(argparse.Namespace()), 128 + signal.SIGTERM)
+        self.assertEqual(finished, ["done"])
+        self.assertEqual(bench.SHIELD, {"depth": 0, "pending": False})
+
+    def test_a_shield_that_does_not_raise_leaves_the_stop_to_its_caller(self):
+        stopping = bench.stop_on_signals()
+        with bench.cleanup_shield(raise_after=False):
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.1)
+        self.assertEqual(stopping, [signal.SIGINT])
+        self.assertEqual(bench.SHIELD, {"depth": 0, "pending": False})
+
+    def test_a_signal_outside_a_shield_still_stops_at_once(self):
+        stopping = bench.stop_on_signals()
+        with self.assertRaises(KeyboardInterrupt):
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(5)
+        self.assertEqual(stopping, [signal.SIGINT])
+
     def test_nohup_still_keeps_sighup_ignored(self):
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         bench.stop_on_signals()

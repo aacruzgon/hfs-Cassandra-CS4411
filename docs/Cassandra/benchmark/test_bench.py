@@ -194,7 +194,7 @@ class HostLoadTests(unittest.TestCase):
 
 class DockerBudgetWaitTests(unittest.TestCase):
     def test_a_full_budget_stops_at_the_deadline_instead_of_waiting_on(self):
-        args = argparse.Namespace(profile="3g", project=None, db_port=None, docker_budget_gib=8.3, deadline=time.monotonic() - 1)
+        args = argparse.Namespace(profile="3g", project=None, db_port=None, docker_budget_gib=8.3, deadline=time.time() - 1)
         backend = bench.Postgres(args)
         full = subprocess.CompletedProcess([], 0, stdout="other\t1GiB / 8GiB\n", stderr="")
         with mock.patch.object(bench, "run_cmd", return_value=full):
@@ -276,7 +276,7 @@ class BudgetTests(unittest.TestCase):
 
     @staticmethod
     def plan(left_seconds, **overrides):
-        values = dict(deadline=time.monotonic() + left_seconds, warmup=60, duration=120, no_reset=False,
+        values = dict(deadline=time.time() + left_seconds, warmup=60, duration=120, no_reset=False,
                       runs=3, mode="open", run_seconds={})
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -417,6 +417,37 @@ class MinorTests(unittest.TestCase):
             second = self.dataset(root, tool)
             self.assertEqual(batch.read_text(encoding="utf-8"), "{}")
             second.check_before_load()
+
+
+class HostSleepTests(unittest.TestCase):
+    """A run in which the host slept is marked, not measured."""
+
+    def test_a_sleep_is_the_wall_clock_running_ahead_of_the_monotonic_one(self):
+        self.assertAlmostEqual(bench.seconds_asleep((1000.0, 50.0), (1296.0, 170.0)), 176.0)
+        self.assertEqual(bench.seconds_asleep((1000.0, 50.0), (1119.9, 170.0)), 0.0)
+
+    def test_status(self):
+        self.assertEqual(bench.run_status({"s2xx": 10, "host_slept_s": 0.01}), "ok")
+        self.assertEqual(bench.run_status({"s2xx": 10, "host_slept_s": 176.0}), "host_slept")
+        self.assertEqual(bench.run_status({"s2xx": 0, "host_slept_s": 0.0}), "no_success")
+
+    def test_the_summaries_show_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = dict(label="x", backend="postgres-sync-on", profile="3g", size=1, op="read", concurrency=8,
+                        mode="open", target_rate=10, reset="snapshot", s2xx=5, throughput_rps=1.0)
+            for number, (status, slept) in enumerate((("ok", 0.0), ("host_slept", 176.0)), start=1):
+                run = root / f"run{number}"
+                run.mkdir()
+                (run / "run.json").write_text(json.dumps(dict(base, run=number, status=status, host_slept_s=slept)), encoding="utf-8")
+            bench.summarize(root)
+            runs = list(csv.DictReader((root / "runs.csv").open(encoding="utf-8")))
+            self.assertEqual([(r["status"], r["host_slept_s"]) for r in runs], [("ok", "0.000"), ("host_slept", "176.000")])
+            summary = list(csv.DictReader((root / "summary.csv").open(encoding="utf-8")))
+            self.assertEqual((summary[0]["runs_ok"], summary[0]["host_slept_runs"]), ("1", "1"))
+            part = {"sizes": [1], "ops": ["read"], "concurrency": [8], "runs": 2}
+            counts = bench.part_counts([json.loads((root / f"run{n}" / "run.json").read_text()) for n in (1, 2)], part)
+            self.assertEqual((counts["ok"], counts["host_slept"], counts["failed"], counts["left"]), (1, 1, 0, 1))
 
 
 if __name__ == "__main__":

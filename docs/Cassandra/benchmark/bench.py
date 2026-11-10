@@ -104,6 +104,9 @@ SETTLE_TIMEOUT_SECONDS = 1800
 RUN_OVERHEAD_SECONDS = 30
 # Before the first run of a no-reset cell: the restore, the boot, a settle.
 NO_RESET_START_SECONDS = 180
+# A gap this large between the wall clock and the monotonic clock over a measurement means
+# the host slept during it (a closed lid). Clock adjustments are far smaller than this.
+HOST_SLEEP_TOLERANCE_SECONDS = 2.0
 
 
 class Failure(Exception):
@@ -174,6 +177,20 @@ def run_cmd(
             f"{(result.stderr or result.stdout)[-800:]}"
         )
     return result
+
+
+def clocks() -> Tuple[float, float]:
+    """The wall clock, which runs on while the host sleeps, and the monotonic clock, which stops.
+
+    time.monotonic() is mach_absolute_time() on macOS and CLOCK_MONOTONIC on
+    Linux; neither counts a sleep or a suspend.
+    """
+    return time.time(), time.monotonic()
+
+
+def seconds_asleep(before: Tuple[float, float], after: Tuple[float, float]) -> float:
+    """How long the host slept between two readings of clocks()."""
+    return max(0.0, (after[0] - before[0]) - (after[1] - before[1]))
 
 
 def sha256_file(path: Path) -> str:
@@ -618,7 +635,7 @@ class Backend:
             deadline = getattr(self.args, "deadline", None)
             wait = 180
             if deadline is not None:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - time.time()
                 if remaining <= 0:
                     raise BudgetExhausted("the Docker budget stayed full until the time budget ran out")
                 wait = min(wait, max(1, remaining))
@@ -1282,6 +1299,7 @@ def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: 
             rate: int, seconds: int, dataset: Dataset, run_dir: Path) -> dict:
     container = backend.container_id()
     k6_csv = run_dir / "k6.csv.gz"
+    started = clocks()
     with (run_dir / "k6.log").open("w", encoding="utf-8") as output:
         process = subprocess.Popen(
             k6_command(args, op, hfs.base, vus, mode, rate, seconds, dataset, k6_csv),
@@ -1301,6 +1319,7 @@ def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: 
             raise
         finally:
             sampler.stop()
+    ended = clocks()
     if code != 0:
         raise Failure(f"k6 exited {code}; see {run_dir / 'k6.log'}")
     # 3. A run during which HFS died is not a measurement of HFS.
@@ -1322,9 +1341,21 @@ def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: 
             "oom_killed": record["oom_killed"],
             "memory_samples_missed": sampler.missed,
             "container": record,
+            # A sleep stops k6 and the database with it: its bins hold a gap, and its
+            # throughput and percentiles describe neither the rate nor the backend.
+            "measure_wall_s": round(ended[0] - started[0], 3),
+            "host_slept_s": round(seconds_asleep(started, ended), 3),
         }
     )
     return metrics
+
+
+def run_status(metrics: dict) -> str:
+    """ok, or why the run is not a measurement: the host slept, or nothing succeeded."""
+    if metrics.get("host_slept_s", 0.0) > HOST_SLEEP_TOLERANCE_SECONDS:
+        return "host_slept"
+    # Nothing succeeded: the setup is broken, not merely slow.
+    return "ok" if metrics["s2xx"] > 0 else "no_success"
 
 
 def warm_up(args: argparse.Namespace, hfs: Hfs, op: str, vus: int, mode: str, rate: int,
@@ -1395,7 +1426,7 @@ def out_of_budget(args: argparse.Namespace, backend: Backend, dataset: "Dataset"
     if deadline is None:
         return None
     needed = seconds_needed(args, backend, dataset, runs_left, fresh)
-    left = deadline - time.monotonic()
+    left = deadline - time.time()
     if needed > left:
         return f"it needs about {needed:.0f} s and {max(left, 0):.0f} s are left before the deadline"
     return None
@@ -1558,10 +1589,14 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                 metrics = measure(args, backend, hfs, op, vus, args.mode, rate, args.duration, dataset, run_dir)
                 backend.collect(run_dir)
                 environment["container"] = metrics["container"]
-                # Nothing succeeded: the setup is broken, not merely slow.
-                measured = metrics["s2xx"] > 0
-                ok = ok and measured
-                record.update(metrics, status="ok" if measured else "no_success", timing=timing, no_reset=bool(args.no_reset))
+                status = run_status(metrics)
+                ok = ok and status == "ok"
+                record.update(metrics, status=status, timing=timing, no_reset=bool(args.no_reset))
+                if status == "host_slept":
+                    record["failure"] = (f"the host slept {metrics['host_slept_s']:.0f} s during the measurement "
+                                         f"(it took {metrics['measure_wall_s']:.0f} s for {args.duration} s); not a measurement")
+                    log(f"HOST SLEPT {metrics['host_slept_s']:.0f} s during {cell_id(dataset.size, op, vus)} run {number}: "
+                        "recorded as host_slept, not ok; --resume measures it again")
                 log(
                     f"  completed {metrics['completed']} ok_rps {metrics['ok_rps']:.1f} "
                     f"p50 {metrics['p50_ms']:.2f} p95 {metrics['p95_ms']:.2f} dropped {metrics['dropped_iterations']}"
@@ -1685,7 +1720,7 @@ RUN_FIELDS = [
     "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib", "k6_peak_rss_mib", "oom_killed",
     "synchronous_commit", "hfs_commit", "hfs_build_profile", "dataset_file", "dataset_sha256",
     "dataset_verified", "memory_samples_missed", "host_busy", "host_load_1m", "host_foreign_cpu_pct",
-    "host_docker_limits_gib", "failure",
+    "host_docker_limits_gib", "host_slept_s", "measure_wall_s", "failure",
 ]
 
 SUMMARY_KEY = [
@@ -1699,7 +1734,7 @@ SUMMARY_FIELDS = [field for field in SUMMARY_KEY if field != "reset"] + [
     "p95_ms_mean", "p95_cv_pct", "p99_ms_mean", "p50_ok_ms_mean", "p95_ok_ms_mean", "p99_ok_ms_mean", "s2xx", "s409", "s412", "s4xx_other", "s501",
     "s5xx_other", "s_other", "dropped_iterations", "steady_change_pct_mean", "reset", "mem_peak_used_mib",
     "mem_peak_anon_mib", "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib",
-    "k6_peak_rss_mib", "oom_killed", "host_busy_runs",
+    "k6_peak_rss_mib", "oom_killed", "host_busy_runs", "host_slept_runs",
 ]
 
 
@@ -1786,6 +1821,7 @@ def summarize(out_root: Path) -> None:
                 k6_peak_rss_mib=largest("k6_peak_rss_mib"),
                 oom_killed=any(m.get("oom_killed") for m in ok),
                 host_busy_runs=sum(1 for m in members if m.get("host_busy")),
+                host_slept_runs=sum(1 for m in members if m.get("status") == "host_slept"),
             )
             writer.writerow([fmt(row.get(field)) for field in SUMMARY_FIELDS])
     log(f"wrote {out_root / 'runs.csv'} and {out_root / 'summary.csv'}")
@@ -1987,6 +2023,7 @@ def part_counts(records: List[dict], part: dict) -> dict:
         "ok": len(ok), "declined_cells": len(declined),
         "failed": sum(1 for r in records if r.get("status") in ("failed", "no_success")),
         "busy_host": sum(1 for r in records if r.get("host_busy")),
+        "host_slept": sum(1 for r in records if r.get("status") == "host_slept"),
         "saturated": sum(1 for r in ok if r.get("saturated")),
         "left": max(0, total - done), "total": total,
     }
@@ -2002,8 +2039,8 @@ def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume
              + (f"finished {against_budget} min after the end of the budget." if against_budget > 0
                 else f"finished {-against_budget} min before the end of the budget."),
              "", f"Stopped by: {state['stopped_by']}.", "",
-             "| Part | Status | Took | Runs ok | Declined cells | Failed | Busy host | Saturated | Left |",
-             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+             "| Part | Status | Took | Runs ok | Declined cells | Failed | Busy host | Host slept | Saturated | Left |",
+             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     failures: List[str] = []
     left_any = False
     for part in parts:
@@ -2013,11 +2050,11 @@ def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume
         left_any = left_any or counts["left"] > 0 or entry.get("status") != "complete"
         minutes = entry.get("seconds", 0) / 60
         lines.append(f"| {part['name']} | {entry.get('status', 'not started')} | {minutes:.0f} min | {counts['ok']} | "
-                     f"{counts['declined_cells']} | {counts['failed']} | {counts['busy_host']} | {counts['saturated']} | {counts['left']} of {counts['total']} |")
+                     f"{counts['declined_cells']} | {counts['failed']} | {counts['busy_host']} | {counts['host_slept']} | {counts['saturated']} | {counts['left']} of {counts['total']} |")
         if entry.get("error"):
             failures.append(f"- `{part['name']}`: {entry['error']}")
         failures += [f"- `{r['backend']} {r['size']}/{r['op']}/c{r['concurrency']} run {r['run']}`: {r.get('status')}: {str(r.get('failure', ''))[:300]}"
-                     for r in records if r.get("status") in ("failed", "no_success")]
+                     for r in records if r.get("status") in ("failed", "no_success", "host_slept")]
     lines += ["", "## Failed or refused", ""] + (failures or ["None."])
     lines += ["", "## What is left", ""]
     lines += [f"Continue, from the directory this run was started in, with:\n\n```bash\n{resume_command}\n```"] if left_any else ["Nothing: every part is complete."]
@@ -2081,7 +2118,8 @@ def cmd_overnight(args: argparse.Namespace) -> int:
     started_at = datetime.now(timezone.utc)
     state.update(started_utc=started_at.isoformat(timespec="seconds"), hours=args.hours, stopped_by="running",
                  budget_end_utc=(started_at + timedelta(hours=args.hours)).isoformat(timespec="seconds"))
-    deadline = time.monotonic() + args.hours * 3600 - BUDGET_MARGIN_SECONDS
+    # On the wall clock: a sleeping Mac must not push the end of the night out.
+    deadline = time.time() + args.hours * 3600 - BUDGET_MARGIN_SECONDS
     run_seconds: Dict[Tuple[str, int], float] = {}
     rates_path = out_root / "rates-laptop-dry-run.json"
     resume_command = shlex.join(

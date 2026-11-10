@@ -73,7 +73,7 @@ summary.csv                     one row per cell, over its runs
 
 `<leg>` is `cassandra`, `postgres-sync-on` or `postgres-sync-off`, so every number carries its baseline (ADR-aacruzgon-0005).
 
-**Run status.** `ok` is a measured run. `not_implemented` (501) and `refused` (other 4xx) mean the server declined the search, so no load ran. `no_success` means no request got a 2xx, and `failed` means the run could not finish (the reason is in `run.json`); both make the command exit 1.
+**Run status.** `ok` is a measured run. `not_implemented` (501) and `refused` (other 4xx) mean the server declined the search, so no load ran. `no_success` means no request got a 2xx, `failed` means the run could not finish (the reason is in `run.json`), and `host_slept` means the host slept during the measurement (more than 2 s between the wall clock and the monotonic clock, `host_slept_s` in `run.json` and `runs.csv`, `host_slept_runs` in `summary.csv`): its bins hold a gap, so it is not a measurement, and `--resume` measures it again. All three make the command exit 1.
 
 **Saturated runs.** A dropped iteration never got a virtual user, so its latency is in no percentile, and the more a backend sheds the better what is left looks. A run that dropped more than 1% of its schedule (`drop_pct`, of `offered` = completed + dropped) is marked `latency_reading saturated` in `runs.csv` and `summary.csv`, and counted in `morning-summary.md`. Read its percentiles as what the requests that got a VU saw, never as the backend's latency at that rate. Healthy runs dropped 0.1 to 0.9% (start-up); runs that couldn't hold the rate dropped 6 to 56%.
 

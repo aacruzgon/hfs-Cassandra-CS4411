@@ -173,7 +173,7 @@ for project in hfsbench-postgres hfsbench-cassandra; do
 done
 ```
 
-The summary's Host slept column counts runs measured across a sleep; on a Mac, `pmset -g log | grep -E '\sSleep\s'` says when and why it slept.
+The summary's Host slept column counts runs measured across a sleep; on a Mac, `pmset -g log | grep 'Entering Sleep'` says when it slept, why, and for how long.
 
 ## Reading a smoke run
 

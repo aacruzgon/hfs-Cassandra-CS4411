@@ -1983,6 +1983,9 @@ def finish_overnight(overnight: dict, reason: str) -> None:
         entry = state["parts"].setdefault(overnight["part"], {"seconds": 0.0})
         if entry.get("status") != "complete":
             entry["status"] = f"interrupted by {reason}"
+            # As cmd_overnight does when the part starts (it drops it in memory only, so the
+            # state on disk can still hold an earlier night's error for this part).
+            entry.pop("error", None)
     state["stopped_by"] = (f"{reason}; the harness was killed before its cleanup was done, "
                            "and a separate process finished it")
     scratch = state_path.with_suffix(".tmp")

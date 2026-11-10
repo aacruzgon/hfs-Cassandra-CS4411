@@ -650,6 +650,22 @@ class ReaperTests(unittest.TestCase):
         run_cmd.assert_not_called()
         summarize.assert_not_called()
 
+    def test_the_reaper_drops_an_earlier_nights_error_of_the_part_it_interrupts(self):
+        parts = [{"name": "cassandra-10000", "backend": "cassandra", "sizes": [10000], "ops": ["read"],
+                  "concurrency": [8], "runs": 1, "out": "matrix"}]
+        (self.dir / "matrix").mkdir()
+        state_path = self.dir / "overnight-state.json"
+        state_path.write_text(json.dumps({"parts": {"cassandra-10000": {"seconds": 1.0, "status": "complete with failures",
+                                                                        "error": "night 1: port 8180 is held"}},
+                                          "started_utc": "2026-11-10T02:00:00+00:00", "hours": 8,
+                                          "budget_end_utc": "2026-11-10T10:00:00+00:00", "stopped_by": "running"}))
+        bench.finish_overnight({"out_root": str(self.dir), "state_path": str(state_path), "parts": parts,
+                                "resume_command": "python3 bench.py overnight --resume", "part": "cassandra-10000"}, "SIGHUP")
+        entry = json.loads(state_path.read_text())["parts"]["cassandra-10000"]
+        self.assertEqual(entry["status"], "interrupted by SIGHUP")
+        self.assertNotIn("error", entry)
+        self.assertNotIn("night 1", (self.dir / "morning-summary.md").read_text())
+
     def test_a_killed_harness_is_finished_for_it(self):
         backend, args = self.backend()
         bench.CLEANUP["plans"][id(args)] = (backend, args, self.dir / "matrix", [])

@@ -2183,6 +2183,8 @@ def cmd_overnight(args: argparse.Namespace) -> int:
             if budget_stopped:
                 break
             log(f"part {part['name']}: starting")
+            # An error from an earlier night is about that attempt; this one records its own.
+            entry.pop("error", None)
             plan = argparse.Namespace(**vars(args))
             plan.backend = part["backend"]
             plan.baseline = part.get("baseline", "on")

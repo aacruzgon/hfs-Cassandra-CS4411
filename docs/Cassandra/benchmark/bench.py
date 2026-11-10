@@ -601,7 +601,7 @@ class Backend:
         name = f"{self.project}-volume-copy"
         if run_cmd(["docker", "volume", "inspect", source], check=False).returncode != 0:
             # `docker run -v` would create it empty, and a restore would then copy nothing.
-            raise Failure(f"the volume {source} is gone, so there is nothing to copy")
+            raise Failure(f"the volume {source} is gone (or Docker didn't answer), so there is nothing to copy")
         try:
             run_cmd(
                 ["docker", "run", "--rm", "--name", name, "--network", "none", "--entrypoint", "sh",
@@ -1989,7 +1989,9 @@ def finish_overnight(overnight: dict, reason: str, ended: Optional[float] = None
     """
     state_path = Path(overnight["state_path"])
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    if overnight.get("part"):
+    # "running" until the harness's own last save, which records the stop and the part's
+    # time itself: after that, the part is the harness's and must not be counted twice.
+    if overnight.get("part") and state.get("stopped_by") == "running":
         entry = state["parts"].setdefault(overnight["part"], {"seconds": 0.0})
         if entry.get("status") != "complete":
             entry["status"] = f"interrupted by {reason}"
@@ -2018,42 +2020,47 @@ def cmd_reap(args: argparse.Namespace) -> int:
         return 0
     fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
     if not args.plan.exists():
+        lock.close()
         return 0
-    while process_alive(args.pid):
-        time.sleep(0.5)
-    ended = time.monotonic()
     try:
-        if done.exists():
-            # Nothing to do and nothing to say: its log would be empty.
-            args.plan.with_suffix(".log").unlink(missing_ok=True)
-            return 0
-        plan = json.loads(args.plan.read_text(encoding="utf-8"))
-        overnight = plan.get("overnight")
-        if overnight:
-            LOG_SINK = (Path(overnight["out_root"]) / "overnight.log").open("a", encoding="utf-8")
-        log(f"reaper: the harness (pid {args.pid}) was killed after a {plan['reason']} before its cleanup was done; finishing it")
-        for entry in plan["processes"]:
-            stop_leftover(entry["pid"], entry["name"])
-        for backend in plan["backends"]:
-            env = dict(os.environ)
-            env.update(backend["env"])
-            commands = [backend["compose"] + ["down", "-v", "--remove-orphans"]]
-            commands += [["docker", "rm", "-f", name] for name in backend["containers"]]
-            commands += [["docker", "volume", "rm", "-f", name] for name in backend["volumes"] + backend["snapshots"]]
-            for command in commands:
-                try:
-                    run_cmd(command, check=False, env=env, timeout=300)
-                except (subprocess.SubprocessError, OSError) as failure:
-                    log(f"reaper: {' '.join(command[:4])}: {failure}")
-            if backend["out"]:
-                summarize(Path(backend["out"]))
-        if overnight:
-            finish_overnight(overnight, plan["reason"], ended)
-        log("reaper: the cleanup is done")
+        # A harness that got to the end of its cleanup has written `.done`: nothing to wait for.
+        while not done.exists() and process_alive(args.pid):
+            time.sleep(0.5)
+        ended = time.monotonic()
+        try:
+            if done.exists():
+                # Nothing to do and nothing to say: its log would be empty.
+                args.plan.with_suffix(".log").unlink(missing_ok=True)
+                return 0
+            plan = json.loads(args.plan.read_text(encoding="utf-8"))
+            overnight = plan.get("overnight")
+            if overnight:
+                LOG_SINK = (Path(overnight["out_root"]) / "overnight.log").open("a", encoding="utf-8")
+            log(f"reaper: the harness (pid {args.pid}) was killed after a {plan['reason']} before its cleanup was done; finishing it")
+            for entry in plan["processes"]:
+                stop_leftover(entry["pid"], entry["name"])
+            for backend in plan["backends"]:
+                env = dict(os.environ)
+                env.update(backend["env"])
+                commands = [backend["compose"] + ["down", "-v", "--remove-orphans"]]
+                commands += [["docker", "rm", "-f", name] for name in backend["containers"]]
+                commands += [["docker", "volume", "rm", "-f", name] for name in backend["volumes"] + backend["snapshots"]]
+                for command in commands:
+                    try:
+                        run_cmd(command, check=False, env=env, timeout=300)
+                    except (subprocess.SubprocessError, OSError) as failure:
+                        log(f"reaper: {' '.join(command[:4])}: {failure}")
+                if backend["out"]:
+                    summarize(Path(backend["out"]))
+            if overnight:
+                finish_overnight(overnight, plan["reason"], ended)
+            log("reaper: the cleanup is done")
+        finally:
+            args.plan.unlink(missing_ok=True)
+            done.unlink(missing_ok=True)
+        return 0
     finally:
-        args.plan.unlink(missing_ok=True)
-        done.unlink(missing_ok=True)
-    return 0
+        lock.close()  # after the plan is gone: a second reaper then finds nothing to do
 
 
 def reaper_at_work() -> Optional[Path]:
@@ -2067,6 +2074,8 @@ def reaper_at_work() -> Optional[Path]:
         except OSError:
             continue
         with handle:
+            if plan.with_suffix(".done").exists():
+                continue  # that harness finished its own cleanup; its reaper is only leaving
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -2483,7 +2492,8 @@ def cmd_overnight(args: argparse.Namespace) -> int:
             else:
                 entry["status"] = "complete" if ok else "complete with failures"
             save_state()
-            CLEANUP["overnight"]["part_started"] = None  # this part's time is in the saved state
+            # This part's result and time are in the saved state: a stop now interrupts no part.
+            CLEANUP["overnight"].update(part=None, part_started=None)
             if part["kind"] == "calibrate" and entry["status"] != "complete":
                 log("calibration is not complete, so the parts that need its rates can't run yet")
                 calibration_incomplete = True

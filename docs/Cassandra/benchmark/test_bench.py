@@ -722,6 +722,47 @@ class ReaperTests(unittest.TestCase):
                 backend._copy_volume("mine_snapshot-postgres-10000-x", backend.data_volume, "true")
         self.assertFalse([c for c in calls if c[:2] == ["docker", "run"]])
 
+    def test_a_reaper_leaves_once_the_harness_has_finished_its_cleanup(self):
+        # The harness writes .done and is still exiting: the reaper doesn't wait for it, and
+        # a command started then isn't refused.
+        import fcntl
+        harness = subprocess.Popen(["sleep", "30"])
+        try:
+            plan = self.dir / f"hfsbench-cleanup-{harness.pid}.json"
+            plan.write_text(json.dumps({"reason": "SIGINT", "backends": [], "processes": [], "overnight": None}))
+            plan.with_suffix(".log").write_text("")
+            holder = plan.open("rb")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)  # its reaper, waiting
+            plan.with_suffix(".done").write_text("")
+            with mock.patch.object(bench.tempfile, "gettempdir", return_value=str(self.dir)):
+                self.assertIsNone(bench.reaper_at_work())
+            holder.close()
+            started = time.monotonic()
+            with mock.patch.object(bench, "run_cmd") as run_cmd:
+                self.assertEqual(bench.cmd_reap(argparse.Namespace(pid=harness.pid, plan=plan)), 0)
+            self.assertLess(time.monotonic() - started, 5)
+            run_cmd.assert_not_called()
+            self.assertFalse(plan.exists() or plan.with_suffix(".log").exists() or plan.with_suffix(".done").exists())
+        finally:
+            harness.kill()
+            harness.wait()
+
+    def test_the_reaper_leaves_a_part_the_harness_already_saved(self):
+        # Killed after its own last save (stopped_by is no longer "running"): the part's time
+        # and status are the harness's, and the reaper adds nothing to them.
+        parts = [{"name": "postgres-on-10000", "backend": "postgres", "baseline": "on", "sizes": [10000],
+                  "ops": ["read"], "concurrency": [8], "runs": 1, "out": "matrix"}]
+        (self.dir / "matrix").mkdir()
+        state_path = self.dir / "overnight-state.json"
+        saved = {"seconds": 345.0, "status": "interrupted by SIGHUP"}
+        state_path.write_text(json.dumps({"parts": {"postgres-on-10000": dict(saved)},
+                                          "started_utc": "2026-11-10T02:00:00+00:00", "hours": 8,
+                                          "budget_end_utc": "2026-11-10T10:00:00+00:00", "stopped_by": "SIGHUP"}))
+        bench.finish_overnight({"out_root": str(self.dir), "state_path": str(state_path), "parts": parts,
+                                "resume_command": "python3 bench.py overnight --resume", "part": "postgres-on-10000",
+                                "part_started": 1000.0}, "SIGHUP", ended=1285.0)
+        self.assertEqual(json.loads(state_path.read_text())["parts"]["postgres-on-10000"], saved)
+
     def test_a_killed_harness_is_finished_for_it(self):
         backend, args = self.backend()
         bench.CLEANUP["plans"][id(args)] = (backend, args, self.dir / "matrix", [])

@@ -311,11 +311,18 @@ SELECT version_id FROM resource_versions
  ORDER BY version_id ASC;
 
 -- R5: every partition key of resources_by_type, paged (5,000 rows), LOCAL_QUORUM. The one
--- read that crosses tenants: the stored-SearchParameter reload, at startup and on each TTL
--- refresh, keeps the SearchParameter rows client-side to list the tenants to reload.
+-- read that crosses tenants, with its fallback R5b: the stored-SearchParameter reload, at
+-- startup and on each TTL refresh, keeps the SearchParameter rows client-side to list the
+-- tenants to reload.
 -- A key-range read, valid without ALLOW FILTERING; it changes no table or key
 -- (ADR-aacruzgon-0041).
 SELECT DISTINCT tenant_id, resource_type FROM resources_by_type;
+
+-- R5b: every partition key of resources, paged (5,000 rows), LOCAL_QUORUM. Only when R5, or the
+-- reload's read of a tenant's SearchParameter ids, fails with READ_TOO_MANY_TOMBSTONES (issues
+-- #74 and #79, ADR-aacruzgon-0075): one row per resource, on the one table that holds no
+-- tombstone (G39). It lists soft-deleted SearchParameters too; the reload's point reads drop them.
+SELECT DISTINCT tenant_id, resource_type, id FROM resources;
 ```
 
 ## 3. Writes

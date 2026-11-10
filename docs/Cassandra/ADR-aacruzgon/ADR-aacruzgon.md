@@ -119,3 +119,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0072](2026-11-09/0072-three-node-cluster.md) | 2026-11-09 | The three-node Compose cluster: RF 3 without touching the schema, two profiles, topology, and what RF 3 accepts | accepted |
 | [0073](2026-11-09/0073-benchmark-datasets.md) | 2026-11-09 | Benchmark datasets come from our own Synthea run, checksummed as filtered NDJSON | accepted |
 | [0074](2026-11-09/0074-demo-script.md) | 2026-11-09 | The demonstration script is a Python standard-library client under `docs/Cassandra/demo/`, against a server started separately on port 58080; a transaction's 501 on Cassandra is an accepted departure | accepted |
+| [0075](2026-11-09/0075-tenant-scan-tombstones.md) | 2026-11-09 | The stored-SearchParameter reload falls back to `resources` when tombstones stop its reads | accepted |

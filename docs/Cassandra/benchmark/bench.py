@@ -2261,7 +2261,7 @@ def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume
              + (f"finished {against_budget} min after the end of the budget." if against_budget > 0
                 else f"finished {-against_budget} min before the end of the budget."),
              "", f"Stopped by: {state['stopped_by']}.", "",
-             "| Part | Status | Took | Runs ok | Declined cells | Failed | Busy host | Host slept | Saturated | Left |",
+             "| Part | Status | Took (awake) | Runs ok | Declined cells | Failed | Busy host | Host slept | Saturated | Left |",
              "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     failures: List[str] = []
     left_any = False
@@ -2381,6 +2381,7 @@ def cmd_overnight(args: argparse.Namespace) -> int:
             plan.run_seconds = run_seconds
             plan.budget_stopped = False
             plan.budget_stop_reason = None
+            # Awake time: the monotonic clock stops while the host sleeps (Took (awake) in the summary).
             started = time.monotonic()
             try:
                 if part["kind"] == "calibrate":

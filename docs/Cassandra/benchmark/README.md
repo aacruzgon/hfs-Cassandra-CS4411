@@ -165,7 +165,7 @@ Results go to `~/hfs-bench/<date>/` (`--out` to change it) and nothing is commit
 
 **To stop it:** Ctrl-C, `kill <pid>`, or closing the terminal. Each stops HFS and k6, takes the database container down, saves the state and writes the morning summary; continue with the summary's `--resume` command. If the terminal kills the harness before that is done (Rex does within about a second), the reaper finishes it and says so in `overnight.log` and under "Stopped by" (see the run section above). `--resume` refuses to start while something else holds the HFS port, and names it. The progress is also in `overnight.log` in the output folder.
 
-**In the morning,** read `morning-summary.md`: what ran, how long each part took, when and why it stopped against the budget, failed, busy-host and saturated runs, and the exact `--resume` command for what's left. Snapshots stay in Docker until the matrix completes; a `run` removes only those it built. To remove them from a matrix you won't finish (2.6 GB for PostgreSQL at 100,000), use the project names, `hfsbench-postgres` and `hfsbench-cassandra` unless you passed `--project`:
+**In the morning,** read `morning-summary.md`: what ran, how long each part took (awake time: a sleep isn't counted, so the parts can add up to less than the night), when and why it stopped against the budget, failed, busy-host and saturated runs, and the exact `--resume` command for what's left. Snapshots stay in Docker until the matrix completes; a `run` removes only those it built. To remove them from a matrix you won't finish (2.6 GB for PostgreSQL at 100,000), use the project names, `hfsbench-postgres` and `hfsbench-cassandra` unless you passed `--project`:
 
 ```bash
 for project in hfsbench-postgres hfsbench-cassandra; do

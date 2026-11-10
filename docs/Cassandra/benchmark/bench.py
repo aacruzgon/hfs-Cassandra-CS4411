@@ -156,7 +156,13 @@ def run_cmd(
     env: Optional[Dict[str, str]] = None,
     stdin_path: Optional[Path] = None,
     timeout: Optional[float] = None,
+    own_session: bool = False,
 ) -> subprocess.CompletedProcess:
+    """Run a command and capture its output.
+
+    own_session puts it outside the terminal's process group, so a Ctrl-C
+    pressed again during the cleanup can't cut that cleanup short.
+    """
     stdin = stdin_path.open("rb") if stdin_path else subprocess.DEVNULL
     try:
         result = subprocess.run(
@@ -167,6 +173,7 @@ def run_cmd(
             text=True,
             env=env,
             timeout=timeout,
+            start_new_session=own_session,
         )
     finally:
         if stdin_path:
@@ -531,13 +538,14 @@ class Backend:
     def label(self) -> str:
         return self.name
 
-    def compose(self, *arguments: str, check: bool = True, timeout: float = 900) -> subprocess.CompletedProcess:
+    def compose(self, *arguments: str, check: bool = True, timeout: float = 900,
+                own_session: bool = False) -> subprocess.CompletedProcess:
         command = ["docker", "compose", "-p", self.project]
         for path in self.files():
             command += ["-f", str(path)]
         env = dict(os.environ)
         env[self.port_var] = str(self.port)
-        return run_cmd(command + list(arguments), check=check, env=env, timeout=timeout)
+        return run_cmd(command + list(arguments), check=check, env=env, timeout=timeout, own_session=own_session)
 
     def exec_(self, *arguments: str, check: bool = True, timeout: float = 600) -> subprocess.CompletedProcess:
         return self.compose("exec", "-T", self.service, *arguments, check=check, timeout=timeout)
@@ -555,12 +563,13 @@ class Backend:
         self.prepare()
 
     def stop(self) -> None:
-        self.compose("down", "-v", "--remove-orphans", check=False, timeout=300)
+        # The cleanup after a stop, too: out of the terminal's reach (see run_cmd).
+        self.compose("down", "-v", "--remove-orphans", check=False, timeout=300, own_session=True)
         self._remove_data_volume()
 
     def _remove_data_volume(self) -> None:
         # `down -v` skips a volume no container uses: one a restore created before a stop.
-        run_cmd(["docker", "volume", "rm", "-f", self.data_volume], check=False)
+        run_cmd(["docker", "volume", "rm", "-f", self.data_volume], check=False, own_session=True)
 
     # Snapshots: a copy of the data volume taken with the database stopped, so
     # a restore is the same on both backends and needs no database command.
@@ -594,7 +603,7 @@ class Backend:
             )
         except BaseException:
             # Killing `docker run` leaves its container copying, and holding both volumes.
-            run_cmd(["docker", "rm", "-f", name], check=False)
+            run_cmd(["docker", "rm", "-f", name], check=False, own_session=True)
             raise
 
     def quiesce(self) -> None:
@@ -619,7 +628,7 @@ class Backend:
             listed = run_cmd(["docker", "volume", "ls", "-q", "--filter", f"label=hfsbench.project={self.project}"], check=False)
             volumes = listed.stdout.split()
         for volume in volumes:
-            run_cmd(["docker", "volume", "rm", "-f", volume], check=False)
+            run_cmd(["docker", "volume", "rm", "-f", volume], check=False, own_session=True)
 
     def _wait_for_budget(self) -> None:
         budget = self.args.docker_budget_gib
@@ -1872,6 +1881,47 @@ def add_run_arguments(parser: argparse.ArgumentParser, out_required: bool = True
     parser.add_argument("--label", help="recorded with each run")
 
 
+def stop_on_signals() -> List[signal.Signals]:
+    """Turn SIGINT, SIGTERM and SIGHUP into KeyboardInterrupt; return the list that names the signal.
+
+    So a stop runs the same cleanup as a finish: every `finally` stops HFS and
+    k6 and takes the database down (a backgrounded process otherwise ignores
+    SIGINT, and SIGTERM and SIGHUP would kill it with no cleanup at all). A
+    closed terminal is a SIGHUP; `nohup` has already asked for that to be
+    ignored, so it stays so. A second signal during the cleanup is ignored.
+    """
+    stopping: List[signal.Signals] = []
+
+    def on_signal(number: int, _frame) -> None:
+        if stopping:
+            return  # The cleanup is under way; let it finish.
+        stopping.append(signal.Signals(number))
+        if number == signal.SIGHUP:
+            detach_output()
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, on_signal)
+    return stopping
+
+
+def stops_cleanly(command):
+    """A command whose `finally` blocks clean up, run so that a signal reaches them."""
+    def run(args: argparse.Namespace) -> int:
+        stopping = stop_on_signals()
+        try:
+            return command(args)
+        except KeyboardInterrupt:
+            log(f"stopped by {stopping[0].name if stopping else 'an interrupt'}; the cleanup has run")
+            return 128 + int(stopping[0]) if stopping else 130
+    run.__name__ = command.__name__
+    run.__doc__ = command.__doc__
+    return run
+
+
+@stops_cleanly
 def cmd_run(args: argparse.Namespace) -> int:
     args.rates = args.rates if args.rates else HERE / "rates.json"
     if args.resume and args.no_reset:
@@ -1880,6 +1930,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+@stops_cleanly
 def cmd_calibrate(args: argparse.Namespace) -> int:
     args.resume = False
     args.label = "calibration"
@@ -2078,23 +2129,8 @@ def resume_arguments(argv: Sequence[str]) -> List[str]:
 
 def cmd_overnight(args: argparse.Namespace) -> int:
     global LOG_SINK
-    # Each raises KeyboardInterrupt, so a stop runs the same cleanup as a finish
-    # (a backgrounded process otherwise ignores SIGINT). A closed terminal is a
-    # SIGHUP; `nohup` has already asked for that to be ignored, so it stays so.
-    stopping: List[signal.Signals] = []
-
-    def on_signal(number: int, _frame) -> None:
-        if stopping:
-            return  # The cleanup is under way; let it finish.
-        stopping.append(signal.Signals(number))
-        if number == signal.SIGHUP:
-            detach_output()
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGINT, on_signal)
-    signal.signal(signal.SIGTERM, on_signal)
-    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
-        signal.signal(signal.SIGHUP, on_signal)
+    # It catches the stop itself, to save the state and write the morning summary.
+    stopping = stop_on_signals()
     args.profile = "3g"
     if args.resume and args.out is None:
         raise Failure("--resume needs --out, the directory named in the morning summary")
@@ -2247,6 +2283,7 @@ def check_clean(base: str, dirt: dict) -> dict:
     }
 
 
+@stops_cleanly
 def cmd_snapshot_check(args: argparse.Namespace) -> int:
     """Measure a reset by reloading against a snapshot restore, and that a restore is exact."""
     args.reset = "snapshot"

@@ -115,7 +115,7 @@ python3 docs/Cassandra/benchmark/bench.py run --backend cassandra --ops create -
 python3 docs/Cassandra/benchmark/bench.py run --backend postgres --baseline on --ops create --sizes 10000 --concurrency 32 --mode closed --duration 600 --warmup 60 --no-reset --label lwt-steady --k6 $K6 --dataset-dir $DATA --out $OUT/lwt-steady
 ```
 
-The defaults are three runs, 120 s measured, 60 s warm-up, the 5 GiB profile, both sizes, all six operations, concurrency 1, 8 and 32. Add `--resume` to continue a matrix that stopped; recorded runs are skipped.
+The defaults are three runs, 120 s measured, 60 s warm-up, the 5 GiB profile, both sizes, all six operations, concurrency 1, 8 and 32. Add `--resume` to continue a matrix that stopped; recorded runs are skipped. Ctrl-C, `kill <pid>` or a closed terminal stops `run`, `calibrate` and `snapshot-check` cleanly: HFS and k6 are stopped and the database container taken down, so `--resume` can start at once. A second Ctrl-C during that cleanup is ignored.
 
 **On a shared machine** add `--docker-budget-gib N` to wait until the sum of the running containers' memory limits plus this leg's fits. On the 18 GB Macs, use `--profile 3g` and never report those numbers.
 

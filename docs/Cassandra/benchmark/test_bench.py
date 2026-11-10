@@ -9,6 +9,8 @@ import csv
 import gzip
 import json
 import math
+import os
+import signal
 import socket
 import subprocess
 import tempfile
@@ -448,6 +450,62 @@ class HostSleepTests(unittest.TestCase):
             part = {"sizes": [1], "ops": ["read"], "concurrency": [8], "runs": 2}
             counts = bench.part_counts([json.loads((root / f"run{n}" / "run.json").read_text()) for n in (1, 2)], part)
             self.assertEqual((counts["ok"], counts["host_slept"], counts["failed"], counts["left"]), (1, 1, 0, 1))
+
+
+class StopSignalTests(unittest.TestCase):
+    """run, calibrate and snapshot-check stop through their cleanup, as overnight does."""
+
+    def setUp(self):
+        self.saved = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+
+    def tearDown(self):
+        for number, handler in self.saved.items():
+            signal.signal(number, handler)
+
+    def test_a_signal_runs_the_cleanup_and_exits_128_plus_its_number(self):
+        cleaned = []
+
+        def command(args):
+            try:
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(5)
+            finally:
+                cleaned.append(True)
+            return 0
+
+        self.assertEqual(bench.stops_cleanly(command)(argparse.Namespace()), 128 + signal.SIGTERM)
+        self.assertEqual(cleaned, [True])
+
+    def test_a_second_signal_does_not_interrupt_the_cleanup(self):
+        cleaned = []
+
+        def command(args):
+            try:
+                os.kill(os.getpid(), signal.SIGINT)
+                time.sleep(5)
+            finally:
+                os.kill(os.getpid(), signal.SIGINT)
+                cleaned.append(True)
+            return 0
+
+        self.assertEqual(bench.stops_cleanly(command)(argparse.Namespace()), 128 + signal.SIGINT)
+        self.assertEqual(cleaned, [True])
+
+    def test_nohup_still_keeps_sighup_ignored(self):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        bench.stop_on_signals()
+        self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_IGN)
+
+    def test_the_commands_are_wrapped(self):
+        for name in ("cmd_run", "cmd_calibrate", "cmd_snapshot_check"):
+            self.assertIn("stops_cleanly", getattr(bench, name).__qualname__)
+
+    def test_cleanup_commands_run_outside_the_terminals_process_group(self):
+        script = ["python3", "-c", "import os; print(os.getpgrp())"]
+        own = int(bench.run_cmd(script, own_session=True).stdout)
+        shared = int(bench.run_cmd(script).stdout)
+        self.assertEqual(shared, os.getpgrp())
+        self.assertNotEqual(own, os.getpgrp())
 
 
 if __name__ == "__main__":

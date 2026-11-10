@@ -1975,14 +1975,21 @@ def stop_leftover(pid: int, name: str) -> None:
     os.kill(pid, signal.SIGKILL)
 
 
-def finish_overnight(overnight: dict, reason: str) -> None:
-    """The state and the morning summary, as the harness would have written them on a stop."""
+def finish_overnight(overnight: dict, reason: str, ended: Optional[float] = None) -> None:
+    """The state and the morning summary, as the harness would have written them on a stop.
+
+    ended is time.monotonic() when the harness was found gone. That clock is the
+    system's (mach_absolute_time on macOS, CLOCK_MONOTONIC on Linux), so it compares
+    with the part_started the harness read, and it is awake time, as Took (awake) is.
+    """
     state_path = Path(overnight["state_path"])
     state = json.loads(state_path.read_text(encoding="utf-8"))
     if overnight.get("part"):
         entry = state["parts"].setdefault(overnight["part"], {"seconds": 0.0})
         if entry.get("status") != "complete":
             entry["status"] = f"interrupted by {reason}"
+            if ended is not None and overnight.get("part_started") is not None:
+                entry["seconds"] = entry.get("seconds", 0.0) + max(0.0, ended - overnight["part_started"])
             # As cmd_overnight does when the part starts (it drops it in memory only, so the
             # state on disk can still hold an earlier night's error for this part).
             entry.pop("error", None)
@@ -2009,6 +2016,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         return 0
     while process_alive(args.pid):
         time.sleep(0.5)
+    ended = time.monotonic()
     try:
         if done.exists():
             # Nothing to do and nothing to say: its log would be empty.
@@ -2035,7 +2043,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
             if backend["out"]:
                 summarize(Path(backend["out"]))
         if overnight:
-            finish_overnight(overnight, plan["reason"])
+            finish_overnight(overnight, plan["reason"], ended)
         log("reaper: the cleanup is done")
     finally:
         args.plan.unlink(missing_ok=True)
@@ -2369,7 +2377,7 @@ def cmd_overnight(args: argparse.Namespace) -> int:
     # What a reaper needs to finish the state and the summary (start_reaper).
     save_state()
     CLEANUP["overnight"] = {"out_root": str(out_root), "state_path": str(state_path), "parts": parts,
-                            "resume_command": resume_command, "part": None}
+                            "resume_command": resume_command, "part": None, "part_started": None}
     any_failed = False
     budget_stopped = False
     calibration_incomplete = False
@@ -2384,6 +2392,7 @@ def cmd_overnight(args: argparse.Namespace) -> int:
                 break
             log(f"part {part['name']}: starting")
             CLEANUP["overnight"]["part"] = part["name"]
+            CLEANUP["overnight"]["part_started"] = None
             # An error from an earlier night is about that attempt; this one records its own.
             entry.pop("error", None)
             plan = argparse.Namespace(**vars(args))
@@ -2410,6 +2419,7 @@ def cmd_overnight(args: argparse.Namespace) -> int:
             plan.budget_stop_reason = None
             # Awake time: the monotonic clock stops while the host sleeps (Took (awake) in the summary).
             started = time.monotonic()
+            CLEANUP["overnight"]["part_started"] = started  # so a reaper can add this part's time
             try:
                 if part["kind"] == "calibrate":
                     plan.rates_out = rates_path
@@ -2437,6 +2447,7 @@ def cmd_overnight(args: argparse.Namespace) -> int:
             else:
                 entry["status"] = "complete" if ok else "complete with failures"
             save_state()
+            CLEANUP["overnight"]["part_started"] = None  # this part's time is in the saved state
             if part["kind"] == "calibrate" and entry["status"] != "complete":
                 log("calibration is not complete, so the parts that need its rates can't run yet")
                 calibration_incomplete = True

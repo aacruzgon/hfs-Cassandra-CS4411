@@ -666,6 +666,22 @@ class ReaperTests(unittest.TestCase):
         self.assertNotIn("error", entry)
         self.assertNotIn("night 1", (self.dir / "morning-summary.md").read_text())
 
+    def test_the_reaper_adds_the_interrupted_parts_time(self):
+        parts = [{"name": "postgres-on-10000", "backend": "postgres", "baseline": "on", "sizes": [10000],
+                  "ops": ["read"], "concurrency": [8], "runs": 1, "out": "matrix"}]
+        (self.dir / "matrix").mkdir()
+        state_path = self.dir / "overnight-state.json"
+        state_path.write_text(json.dumps({"parts": {"postgres-on-10000": {"seconds": 60.0}},
+                                          "started_utc": "2026-11-10T02:00:00+00:00", "hours": 8,
+                                          "budget_end_utc": "2026-11-10T10:00:00+00:00", "stopped_by": "running"}))
+        overnight = {"out_root": str(self.dir), "state_path": str(state_path), "parts": parts,
+                     "resume_command": "python3 bench.py overnight --resume", "part": "postgres-on-10000",
+                     "part_started": 1000.0}
+        bench.finish_overnight(overnight, "SIGHUP", ended=1285.0)
+        entry = json.loads(state_path.read_text())["parts"]["postgres-on-10000"]
+        self.assertAlmostEqual(entry["seconds"], 345.0)  # an earlier attempt's 60 s, and this one's 285 s
+        self.assertIn("| postgres-on-10000 | interrupted by SIGHUP | 6 min |", (self.dir / "morning-summary.md").read_text())
+
     def test_a_killed_harness_is_finished_for_it(self):
         backend, args = self.backend()
         bench.CLEANUP["plans"][id(args)] = (backend, args, self.dir / "matrix", [])

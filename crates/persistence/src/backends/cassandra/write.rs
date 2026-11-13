@@ -64,6 +64,13 @@
 //!   (ADR-aacruzgon-0050): a timeout is 504, and every other error is 503,
 //!   since the write may have applied ([`map_lookup_error`]; D3
 //!   sub-decision 4, ADR-aacruzgon-0055).
+//! - **Every 503 that may have applied says so** (ADR-aacruzgon-0077): R2's
+//!   and R3's, every statement's after an unknown outcome, and the
+//!   undecidable outcome's carry a message that the write may have been
+//!   stored, never the plain table's "Cassandra cannot serve the request
+//!   right now" or "no Cassandra node could be reached"
+//!   ([`unavailable_unless_timeout`], [`undecidable`]). A 504's
+//!   message is never sent to the client, so it is left as it is.
 //! - **An earlier attempt may apply late** (ADR-aacruzgon-0051). Once any
 //!   attempt's outcome was unknown, every later look at the row is first
 //!   matched against it: a definite miss (C1's returned row, or an R2 after
@@ -378,17 +385,20 @@ fn classify_cas_failure(error: DriverError) -> CasFailure {
     }
 }
 
-/// The undecidable outcome's error (design, "Which error, and why").
+/// The undecidable outcome's error (design, "Which error, and why"). The
+/// write may have applied, so the 503 says so, as every 503 after an
+/// unknown outcome does ([`unavailable_unless_timeout`], ADR-aacruzgon-0077).
 fn undecidable(timed_out: bool, operation: &str) -> StorageError {
+    let message = format!("{operation}: the compare-and-swap's outcome is unknown");
     StorageError::Backend(if timed_out {
         BackendError::Timeout {
             backend_name: BACKEND_NAME.to_string(),
-            message: format!("{operation}: the compare-and-swap's outcome is unknown"),
+            message,
         }
     } else {
         BackendError::Unavailable {
             backend_name: BACKEND_NAME.to_string(),
-            message: "Cassandra cannot serve the request right now".to_string(),
+            message: format!("{message}; the write may have been stored"),
         }
     })
 }
@@ -1242,8 +1252,9 @@ fn already_exists(resource_type: &str, id: &str) -> StorageError {
 /// Whatever the plain table would make 500 (`Internal` or `QueryError`: a
 /// `Server` error, an unmatched stream id, a row that cannot be decoded) is
 /// 503 too, never reported as a server bug for a write that may be stored.
-/// The client-facing message names no host; [`map_driver_error`] logs the
-/// driver's detail.
+/// Every one of those 503s carries this message, which says the write may
+/// have been stored (ADR-aacruzgon-0077) and names no host;
+/// [`map_driver_error`] logs the driver's detail.
 fn map_lookup_error(error: &DriverError, operation: &str) -> StorageError {
     StorageError::Backend(unavailable_unless_timeout(
         map_driver_error(error, operation),
@@ -1258,7 +1269,8 @@ fn map_lookup_error(error: &DriverError, operation: &str) -> StorageError {
 
 /// The rule of [`map_lookup_error`] for any statement a request sends once
 /// an earlier attempt's outcome was unknown (ADR-aacruzgon-0067): that
-/// attempt may have applied, so a 500 of the plain table is 503.
+/// attempt may have applied, so a 500 of the plain table is 503, and every
+/// 503 says the write may have been stored (ADR-aacruzgon-0077).
 fn may_have_applied(mapped: BackendError, operation: &str) -> BackendError {
     unavailable_unless_timeout(mapped, || {
         format!(
@@ -1268,18 +1280,25 @@ fn may_have_applied(mapped: BackendError, operation: &str) -> BackendError {
     })
 }
 
-/// An error already mapped by the table for plain statements: a timeout
-/// (504), an unavailable node or a lost connection (503) is kept, and
-/// anything else is `Unavailable` (503) with `message`, which names no host
-/// (REST sends it to the client verbatim).
+/// An error already mapped by the table for plain statements, for a write
+/// that may have applied. A timeout (504) is kept as it is: REST never sends
+/// its message. Everything else is 503 with `message`, which says the write
+/// may have been stored and names no host, since REST sends a 503's message
+/// to the client verbatim: a lost connection stays `ConnectionFailed`, and
+/// any other error is `Unavailable` (ADR-aacruzgon-0055, 0067). The plain
+/// table's own 503 texts ("Cassandra cannot serve the request right now",
+/// "no Cassandra node could be reached") are replaced too, so the same state
+/// never tells the client two different things (ADR-aacruzgon-0077, #77).
 fn unavailable_unless_timeout(
     mapped: BackendError,
     message: impl FnOnce() -> String,
 ) -> BackendError {
     match mapped {
-        BackendError::Timeout { .. }
-        | BackendError::Unavailable { .. }
-        | BackendError::ConnectionFailed { .. } => mapped,
+        BackendError::Timeout { .. } => mapped,
+        BackendError::ConnectionFailed { backend_name, .. } => BackendError::ConnectionFailed {
+            backend_name,
+            message: message(),
+        },
         _ => BackendError::Unavailable {
             backend_name: BACKEND_NAME.to_string(),
             message: message(),
@@ -1918,6 +1937,16 @@ mod tests {
         ))
     }
 
+    fn write_failure(write_type: WriteType) -> ErrorType {
+        ErrorType::WriteFailure(WriteFailureError::new(
+            Consistency::LocalQuorum,
+            0,
+            1,
+            FailureInfo::NumFailures(1),
+            write_type,
+        ))
+    }
+
     fn at(rfc3339: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(rfc3339)
             .unwrap()
@@ -2197,6 +2226,98 @@ mod tests {
         ));
     }
 
+    /// What every 503 for a write that may have applied says
+    /// (ADR-aacruzgon-0077), and the plain table's 503s never do.
+    const MAY_HAVE_BEEN_STORED: &str = "may have been stored";
+
+    /// A 503's variant and the message the client gets; any other error
+    /// panics, naming `what`.
+    fn the_503(error: StorageError, what: &str) -> (&'static str, String) {
+        match error {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                ("Unavailable", message)
+            }
+            StorageError::Backend(BackendError::ConnectionFailed { message, .. }) => {
+                ("ConnectionFailed", message)
+            }
+            other => panic!("{what}: expected a 503, got {other:?}"),
+        }
+    }
+
+    /// The errors the plain table already answers with 503, each with its
+    /// variant there: an unavailable node, replica failures, an overloaded
+    /// node, and a lost connection.
+    fn plain_503s() -> Vec<(DriverError, &'static str)> {
+        vec![
+            (
+                server(ErrorType::Unavailable(UnavailableError::new(
+                    Consistency::LocalSerial,
+                    2,
+                    1,
+                ))),
+                "Unavailable",
+            ),
+            (server(write_failure(WriteType::Cas)), "Unavailable"),
+            (
+                server(ErrorType::ReadFailure(
+                    cdrs_tokio::frame::message_error::ReadFailureError::new(
+                        Consistency::LocalSerial,
+                        0,
+                        1,
+                        FailureInfo::NumFailures(1),
+                        false,
+                    ),
+                )),
+                "Unavailable",
+            ),
+            (server(ErrorType::Overloaded), "Unavailable"),
+            (
+                DriverError::from(CdrsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "10.1.2.3:9042 reset",
+                ))),
+                "ConnectionFailed",
+            ),
+            (
+                DriverError::from(CdrsError::General(
+                    "Connection closed while waiting for response!".to_string(),
+                )),
+                "ConnectionFailed",
+            ),
+        ]
+    }
+
+    /// ADR-aacruzgon-0077 (#77): the plain table's 503 keeps its own text
+    /// on a statement that cannot have stored the write, and R2's and R3's
+    /// keep the variant (so the status and `Retry-After`) but say that the
+    /// write may have been stored.
+    #[test]
+    fn a_genuine_503_on_r2_or_r3_says_the_write_may_have_been_stored() {
+        for (error, variant) in plain_503s() {
+            let (plain, message) = the_503(
+                StorageError::Backend(map_driver_error(&error, "intent row")),
+                "plain table",
+            );
+            assert_eq!(plain, variant, "{error:?}");
+            assert!(
+                message == "Cassandra cannot serve the request right now"
+                    || message == "no Cassandra node could be reached",
+                "the plain table's own text: {message}"
+            );
+            for operation in ["serial read", "version read"] {
+                let (kept, message) = the_503(map_lookup_error(&error, operation), operation);
+                assert_eq!(kept, variant, "{operation}: {error:?}");
+                assert!(
+                    message.contains(MAY_HAVE_BEEN_STORED) && message.contains(operation),
+                    "{operation}: {error:?} gave {message}"
+                );
+                for host in ["127.0.0.1", "10.1.2.3"] {
+                    assert!(!message.contains(host), "{message}");
+                }
+            }
+        }
+    }
+
     /// ADR-aacruzgon-0055: after an unknown outcome, R2's and R3's own
     /// errors are 504 for a timeout and 503 for everything else; what the
     /// plain table makes 500 (`Server`, `Invalid`, an unmatched stream id, a
@@ -2239,13 +2360,9 @@ mod tests {
                 );
             }
             for error in &others {
-                match map_lookup_error(error, operation) {
-                    StorageError::Backend(
-                        BackendError::Unavailable { message, .. }
-                        | BackendError::ConnectionFailed { message, .. },
-                    ) => assert!(!message.contains("127.0.0.1"), "{message}"),
-                    other => panic!("{operation}: {error:?} gave {other:?}"),
-                }
+                let (_, message) = the_503(map_lookup_error(error, operation), operation);
+                assert!(!message.contains("127.0.0.1"), "{message}");
+                assert!(message.contains(MAY_HAVE_BEEN_STORED), "{message}");
             }
         }
         // The plain table itself is unchanged: the same `Server` error on any
@@ -2256,16 +2373,17 @@ mod tests {
         ));
     }
 
+    /// The 503 also says the write may have been stored
+    /// (ADR-aacruzgon-0077).
     #[test]
     fn undecidable_is_504_after_a_timeout_and_503_after_a_failure() {
         assert!(matches!(
             undecidable(true, "create"),
             StorageError::Backend(BackendError::Timeout { .. })
         ));
-        assert!(matches!(
-            undecidable(false, "create"),
-            StorageError::Backend(BackendError::Unavailable { .. })
-        ));
+        let (variant, message) = the_503(undecidable(false, "create"), "undecidable");
+        assert_eq!(variant, "Unavailable");
+        assert!(message.contains(MAY_HAVE_BEEN_STORED), "{message}");
     }
 
     #[test]
@@ -2645,6 +2763,75 @@ mod tests {
             request.after_unknown(denied, "pre-read"),
             Err(StorageError::Tenant(_))
         ));
+    }
+
+    /// ADR-aacruzgon-0077 (#77): before any outcome was unknown, a
+    /// statement's 503 keeps the plain table's text; after one, the same
+    /// error keeps its variant but says the write may have been stored, on
+    /// a re-run's statements and on a later turn's R1 alike.
+    #[test]
+    fn after_an_unknown_outcome_every_503_says_the_write_may_have_been_stored() {
+        let key = RowKey {
+            tenant_id: "t",
+            resource_type: "Patient",
+            id: "p",
+        };
+        let mut request = CasRequest {
+            operation: "update",
+            key,
+            attempts: Vec::new(),
+            reruns: 0,
+            stats: Arc::new(CasCounters::default()),
+        };
+        let pre_read = |error: &DriverError| {
+            Err::<(), _>(StorageError::Backend(map_driver_error(error, "pre-read")))
+        };
+        for (error, variant) in plain_503s() {
+            let (kept, message) = the_503(request.statement_error(&error, "intent row"), "before");
+            assert_eq!(kept, variant);
+            assert!(!message.contains(MAY_HAVE_BEEN_STORED), "{message}");
+            let (kept, message) = the_503(
+                request
+                    .after_unknown(pre_read(&error), "pre-read")
+                    .unwrap_err(),
+                "before",
+            );
+            assert_eq!(kept, variant);
+            assert!(!message.contains(MAY_HAVE_BEEN_STORED), "{message}");
+        }
+
+        request.attempts.push(Attempt {
+            write_id: Uuid::new_v4(),
+            last_updated: Utc::now(),
+            intent: IntentKey::new("t", "p", Utc::now()),
+            plan: Arc::new(CasPlan::create(
+                Json::Null,
+                "{}".to_string(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+                vec![IndexKey::ResourcesByType],
+            )),
+            unknown: Some(false),
+            settled: false,
+        });
+        for (error, variant) in plain_503s() {
+            for operation in ["previous version row", "intent row", "update"] {
+                let (kept, message) =
+                    the_503(request.statement_error(&error, operation), operation);
+                assert_eq!(kept, variant, "{operation}: {error:?}");
+                assert!(
+                    message.contains(MAY_HAVE_BEEN_STORED) && message.contains(operation),
+                    "{operation}: {error:?} gave {message}"
+                );
+            }
+            let (kept, message) = the_503(
+                request
+                    .after_unknown(pre_read(&error), "pre-read")
+                    .unwrap_err(),
+                "pre-read",
+            );
+            assert_eq!(kept, variant, "pre-read: {error:?}");
+            assert!(message.contains(MAY_HAVE_BEEN_STORED), "{message}");
+        }
     }
 
     /// "Another writer" after an unknown outcome maps from R2's row as a
@@ -3592,9 +3779,12 @@ mod node_tests {
                 .inject_fault(StatementKind::Cas, c1, Fault::FailWithWriteFailure);
         }
         let before = backend.cas_stats();
+        // Undecidable after a `WriteFailure`: the write may have applied, so
+        // the 503 says so (ADR-aacruzgon-0077).
         match backend.create(&tenant, "Patient", patient(), version).await {
-            Err(StorageError::Backend(BackendError::Unavailable { .. })) => {}
-            other => panic!("expected 503, got {other:?}"),
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. }))
+                if message.contains("may have been stored") => {}
+            other => panic!("expected a 503 that may have stored the write, got {other:?}"),
         }
         let stats = backend.cas_stats().since(&before);
         assert_eq!((stats.attempts, stats.unknown_write_failure), (3, 3));
@@ -3606,9 +3796,12 @@ mod node_tests {
             .session
             .inject_fault(StatementKind::Cas, c1, Fault::FailWithUnavailable);
         let before = backend.cas_stats();
+        // Nothing can have been stored, so the plain table's text stays
+        // (ADR-aacruzgon-0077).
         match backend.create(&tenant, "Patient", patient(), version).await {
-            Err(StorageError::Backend(BackendError::Unavailable { .. })) => {}
-            other => panic!("expected 503, got {other:?}"),
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. }))
+                if message == "Cassandra cannot serve the request right now" => {}
+            other => panic!("expected the plain table's 503, got {other:?}"),
         }
         let stats = backend.cas_stats().since(&before);
         assert_eq!(
@@ -3620,6 +3813,82 @@ mod node_tests {
             ),
             (1, 1, 0, 0)
         );
+    }
+
+    /// Issue #77 (ADR-aacruzgon-0077): the CAS applies and its reply is
+    /// lost (`ApplyThenTimeOut`), then R2 fails with a genuine
+    /// `Unavailable` or `WriteFailure`. The write is stored, and the 503
+    /// says it may have been, on create, update and delete; before, it said
+    /// "Cassandra cannot serve the request right now".
+    #[tokio::test]
+    async fn a_503_from_r2_after_an_applied_cas_says_the_write_may_have_been_stored() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        for (r2_fault, label) in [
+            (Fault::FailWithUnavailable, "unavailable"),
+            (Fault::FailWithWriteFailure, "write-failure"),
+        ] {
+            for operation in ["create", "update", "delete"] {
+                let case = format!("r2-503-{operation}-{label}");
+                let tenant = tenant_context(&case);
+                let stored = if operation == "create" {
+                    None
+                } else {
+                    Some(
+                        backend
+                            .create(&tenant, "Patient", patient(), version)
+                            .await
+                            .unwrap(),
+                    )
+                };
+                let cas = match operation {
+                    "create" => "INSERT INTO resources",
+                    "update" => "SET version_id = ?, data = ?",
+                    _ => "deleted_at = ?, last_updated",
+                };
+                backend
+                    .session
+                    .inject_fault(StatementKind::Cas, cas, Fault::ApplyThenTimeOut);
+                backend
+                    .session
+                    .inject_fault(StatementKind::SerialRead, "FROM resources", r2_fault);
+                let before = backend.cas_stats();
+                let result: StorageResult<()> = match &stored {
+                    None => backend
+                        .create(&tenant, "Patient", patient(), version)
+                        .await
+                        .map(|_| ()),
+                    Some(stored) if operation == "update" => {
+                        backend.update(&tenant, stored, patient()).await.map(|_| ())
+                    }
+                    Some(_) => backend.delete(&tenant, "Patient", "p").await,
+                };
+                let stats = backend.cas_stats().since(&before);
+                let row = current(&backend, &tenant).await;
+                eprintln!("[cas case={case} result={result:?} {stats}]");
+                assert_eq!(
+                    (stats.attempts, stats.reruns, stats.serial_read_failures),
+                    (1, 0, 1),
+                    "{case}: {stats}"
+                );
+                let target = if operation == "create" { 1 } else { 2 };
+                assert_eq!(row.version_id, target, "{case}: the CAS applied");
+                match result {
+                    Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => {
+                        assert!(
+                            message.contains("may have been stored")
+                                && message.contains("serial read"),
+                            "{case}: {message}"
+                        );
+                        assert!(!message.contains("127.0.0.1"), "{case}: {message}");
+                    }
+                    other => panic!("{case}: expected 503, got {other:?}"),
+                }
+            }
+        }
     }
 
     /// G23 on every operation (ADR-aacruzgon-0034, 0050): the CAS applied,

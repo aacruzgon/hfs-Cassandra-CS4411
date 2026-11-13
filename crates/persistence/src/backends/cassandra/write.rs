@@ -388,10 +388,18 @@ fn classify_cas_failure(error: DriverError) -> CasFailure {
 /// The client-facing text of the undecidable outcome's 503
 /// (ADR-aacruzgon-0077). It names no operation, since REST sends it
 /// verbatim and the internal names (`delete_versioned`, `create_or_update`)
-/// mean nothing to a client, and it reads the same for a create, an update
-/// and a delete.
-const UNDECIDABLE_503: &str =
-    "the outcome of the change could not be decided; it may have been stored";
+/// mean nothing to a client. Every "may have been stored" 503 says "the
+/// write", as ADR-aacruzgon-0055's R2 and R3 text does ([`map_lookup_error`],
+/// [`MAY_HAVE_APPLIED_503`]).
+const UNDECIDABLE_503: &str = "the write's outcome could not be decided; it may have been stored";
+
+/// The client-facing text of the 503 for a statement that failed after an
+/// earlier attempt's outcome was unknown ([`may_have_applied`],
+/// ADR-aacruzgon-0067, 0077). It names neither the request's operation nor
+/// the statement: REST sends it verbatim, and [`map_driver_error`] already
+/// logs the statement's label with the driver's error.
+const MAY_HAVE_APPLIED_503: &str =
+    "the write's outcome is unknown and a later step failed; it may have been stored";
 
 /// The undecidable outcome's error (design, "Which error, and why"). The
 /// write may have applied, so the 503 says so, as every 503 after an
@@ -959,7 +967,7 @@ impl CasRequest<'_> {
     fn statement_error(&self, error: &DriverError, operation: &str) -> StorageError {
         let mapped = map_driver_error(error, operation);
         StorageError::Backend(if self.had_unknown_outcome() {
-            may_have_applied(mapped, operation)
+            may_have_applied(mapped)
         } else {
             mapped
         })
@@ -970,14 +978,10 @@ impl CasRequest<'_> {
     /// from then on a backend error answers as R2's does
     /// (ADR-aacruzgon-0067). Its other errors (a permission, a validation)
     /// are the request's own, so they are kept.
-    pub(crate) fn after_unknown<T>(
-        &self,
-        result: StorageResult<T>,
-        operation: &str,
-    ) -> StorageResult<T> {
+    pub(crate) fn after_unknown<T>(&self, result: StorageResult<T>) -> StorageResult<T> {
         match result {
             Err(StorageError::Backend(mapped)) if self.had_unknown_outcome() => {
-                Err(StorageError::Backend(may_have_applied(mapped, operation)))
+                Err(StorageError::Backend(may_have_applied(mapped)))
             }
             other => other,
         }
@@ -1284,14 +1288,10 @@ fn map_lookup_error(error: &DriverError, operation: &str) -> StorageError {
 /// The rule of [`map_lookup_error`] for any statement a request sends once
 /// an earlier attempt's outcome was unknown (ADR-aacruzgon-0067): that
 /// attempt may have applied, so a 500 of the plain table is 503, and every
-/// 503 says the write may have been stored (ADR-aacruzgon-0077).
-fn may_have_applied(mapped: BackendError, operation: &str) -> BackendError {
-    unavailable_unless_timeout(mapped, || {
-        format!(
-            "{operation} failed after an earlier attempt's outcome was unknown; \
-             the write may have been stored"
-        )
-    })
+/// 503 says the write may have been stored, in [`MAY_HAVE_APPLIED_503`],
+/// which names no operation or statement (ADR-aacruzgon-0077).
+fn may_have_applied(mapped: BackendError) -> BackendError {
+    unavailable_unless_timeout(mapped, || MAY_HAVE_APPLIED_503.to_string())
 }
 
 /// An error already mapped by the table for plain statements, for a write
@@ -2387,6 +2387,27 @@ mod tests {
         ));
     }
 
+    /// Every 503 that says the write may have been stored says it the same
+    /// way, with "the write" (ADR-aacruzgon-0055's word): R2's and R3's,
+    /// a later statement's and the undecidable outcome's (ADR-aacruzgon-0077).
+    #[test]
+    fn every_may_have_been_stored_503_says_the_write() {
+        let unavailable = server(ErrorType::Unavailable(UnavailableError::new(
+            Consistency::LocalSerial,
+            2,
+            1,
+        )));
+        let (_, r2) = the_503(map_lookup_error(&unavailable, "serial read"), "R2");
+        for message in [r2.as_str(), MAY_HAVE_APPLIED_503, UNDECIDABLE_503] {
+            assert!(
+                message.starts_with("the write's outcome ")
+                    && message.ends_with("; it may have been stored"),
+                "{message}"
+            );
+            assert!(!message.contains("change"), "{message}");
+        }
+    }
+
     /// The 503 also says the write may have been stored, in one text that
     /// names no operation, since REST sends it to the client; the 504's
     /// message, which REST only logs, keeps the operation (ADR-aacruzgon-0077).
@@ -2744,7 +2765,7 @@ mod tests {
             )))
         };
         assert!(matches!(
-            request.after_unknown(internal(), "pre-read"),
+            request.after_unknown(internal()),
             Err(StorageError::Backend(BackendError::Internal { .. }))
         ));
 
@@ -2776,10 +2797,12 @@ mod tests {
             request.statement_error(&server(write_timeout(WriteType::Simple)), "intent row"),
             StorageError::Backend(BackendError::Timeout { .. })
         ));
-        assert!(matches!(
-            request.after_unknown(internal(), "pre-read"),
-            Err(StorageError::Backend(BackendError::Unavailable { .. }))
-        ));
+        match request.after_unknown(internal()) {
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => {
+                assert_eq!(message, MAY_HAVE_APPLIED_503)
+            }
+            other => panic!("expected a 503, got {other:?}"),
+        }
         let denied = Err::<(), _>(StorageError::Tenant(
             crate::error::TenantError::OperationNotPermitted {
                 tenant_id: crate::tenant::TenantId::new("t"),
@@ -2787,7 +2810,7 @@ mod tests {
             },
         ));
         assert!(matches!(
-            request.after_unknown(denied, "pre-read"),
+            request.after_unknown(denied),
             Err(StorageError::Tenant(_))
         ));
     }
@@ -2818,9 +2841,7 @@ mod tests {
             assert_eq!(kept, variant);
             assert!(!message.contains(MAY_HAVE_BEEN_STORED), "{message}");
             let (kept, message) = the_503(
-                request
-                    .after_unknown(pre_read(&error), "pre-read")
-                    .unwrap_err(),
+                request.after_unknown(pre_read(&error)).unwrap_err(),
                 "before",
             );
             assert_eq!(kept, variant);
@@ -2840,24 +2861,31 @@ mod tests {
             unknown: Some(false),
             settled: false,
         });
+        // The statement's label and the request's operation (the CAS a
+        // re-run's node refuses passes the operation) go to the log only:
+        // the client gets one text that names neither.
         for (error, variant) in plain_503s() {
-            for operation in ["previous version row", "intent row", "update"] {
+            for operation in [
+                "previous version row",
+                "intent row",
+                "update",
+                "delete_versioned",
+                "create_or_update",
+            ] {
                 let (kept, message) =
                     the_503(request.statement_error(&error, operation), operation);
                 assert_eq!(kept, variant, "{operation}: {error:?}");
-                assert!(
-                    message.contains(MAY_HAVE_BEEN_STORED) && message.contains(operation),
-                    "{operation}: {error:?} gave {message}"
-                );
+                assert_eq!(message, MAY_HAVE_APPLIED_503, "{operation}: {error:?}");
+                assert!(message.contains(MAY_HAVE_BEEN_STORED), "{message}");
+                assert!(!message.contains(operation), "{operation}: {message}");
             }
             let (kept, message) = the_503(
-                request
-                    .after_unknown(pre_read(&error), "pre-read")
-                    .unwrap_err(),
+                request.after_unknown(pre_read(&error)).unwrap_err(),
                 "pre-read",
             );
             assert_eq!(kept, variant, "pre-read: {error:?}");
-            assert!(message.contains(MAY_HAVE_BEEN_STORED), "{message}");
+            assert_eq!(message, MAY_HAVE_APPLIED_503, "pre-read: {error:?}");
+            assert!(!message.contains("pre-read"), "{message}");
         }
     }
 

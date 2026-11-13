@@ -15,6 +15,11 @@
 //!
 //! Included by `#[path]` into each backend's test binary, the same arrangement
 //! as `conditional_if_match_suite.rs`.
+//!
+//! Each race test has a `_with` variant that takes a [`RacePolicy`]; the plain
+//! function runs it with [`RacePolicy::strict`]. Only a backend whose
+//! compare-and-swap can answer an unknown outcome under contention by design
+//! passes anything else: Cassandra at RF 3 (issue #77).
 
 #![allow(dead_code)]
 
@@ -25,13 +30,81 @@ use tokio::sync::Barrier;
 
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, VersionedStorage};
-use helios_persistence::error::{ResourceError, StorageError};
+use helios_persistence::error::{BackendError, ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::StoredResource;
 
 use crate::seeding::SeedingStorage;
 
 const WRITERS: usize = 8;
+
+/// Finds a write that applied but whose request ended before the version row
+/// was written: the state a 504'd writer can leave (issue #77). Implemented
+/// by each backend that accepts timeouts, since only it knows where such a
+/// write is recorded.
+#[async_trait::async_trait]
+pub trait PendingWrites: Send + Sync {
+    /// The version of `Patient/{id}` that applied and is not in the history
+    /// yet, if there is one.
+    async fn pending_version(&self, tenant: &TenantContext, id: &str) -> Option<String>;
+}
+
+/// What the race checks accept from a writer answered
+/// `BackendError::Timeout` (504).
+pub enum RacePolicy {
+    /// A 504 fails the test, as any other error does.
+    Strict,
+    /// A 504 is an unknown outcome, which may have applied. The checks then
+    /// decide from the stored body which write landed, and allow the history
+    /// to lack its newest version only when `PendingWrites` reports that
+    /// version as pending.
+    AcceptTimeouts(Arc<dyn PendingWrites>),
+}
+
+impl RacePolicy {
+    pub fn strict() -> Self {
+        RacePolicy::Strict
+    }
+
+    pub fn accepts_timeouts(&self) -> bool {
+        matches!(self, RacePolicy::AcceptTimeouts(_))
+    }
+
+    /// Whether this error is an unknown outcome under this policy.
+    fn is_unknown(&self, error: &StorageError) -> bool {
+        self.accepts_timeouts()
+            && matches!(error, StorageError::Backend(BackendError::Timeout { .. }))
+    }
+}
+
+/// The history of `Patient/{id}`, with the version [`PendingWrites`] reports
+/// appended when it is the next one, and whether it was.
+async fn history<S: VersionedStorage>(
+    backend: &S,
+    policy: &RacePolicy,
+    t: &TenantContext,
+    id: &str,
+) -> (Vec<String>, bool) {
+    let mut versions = backend
+        .list_versions(t, "Patient", id)
+        .await
+        .expect("list versions");
+    if let RacePolicy::AcceptTimeouts(pending) = policy
+        && let Some(version) = pending.pending_version(t, id).await
+    {
+        let next = (versions.len() + 1).to_string();
+        if version == next {
+            versions.push(version);
+            return (versions, true);
+        }
+    }
+    (versions, false)
+}
+
+/// `["1", …, "n"]`.
+fn versions_up_to(n: usize) -> Vec<String> {
+    (1..=n).map(|v| v.to_string()).collect()
+}
 
 fn tenant(base: &str, label: &str) -> TenantContext {
     TenantContext::new(
@@ -85,7 +158,12 @@ enum Outcome {
     Failed(StorageError),
 }
 
-fn assert_losers_are_concurrency_errors(outcomes: &[Outcome], deleted: bool, context: &str) {
+fn assert_losers_are_concurrency_errors(
+    outcomes: &[Outcome],
+    deleted: bool,
+    policy: &RacePolicy,
+    context: &str,
+) {
     for outcome in outcomes {
         match outcome {
             Outcome::Updated(_) | Outcome::Deleted => {}
@@ -93,9 +171,30 @@ fn assert_losers_are_concurrency_errors(outcomes: &[Outcome], deleted: bool, con
             // A writer that lost to a *delete* finds no live resource at all.
             Outcome::Failed(StorageError::Resource(ResourceError::NotFound { .. })) if deleted => {}
             Outcome::Failed(StorageError::Resource(ResourceError::Gone { .. })) if deleted => {}
+            Outcome::Failed(e) if policy.is_unknown(e) => {}
             other => panic!("{context}: a loser is a concurrency refusal, got {other:?}"),
         }
     }
+}
+
+/// The writers whose outcome is unknown under `policy`, by index.
+fn unknown_writers(outcomes: &[Outcome], policy: &RacePolicy) -> Vec<usize> {
+    outcomes
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| matches!(o, Outcome::Failed(e) if policy.is_unknown(e)))
+        .map(|(n, _)| n)
+        .collect()
+}
+
+/// With no write landed, nobody can have been refused for losing to one: every
+/// writer must be an unknown outcome.
+fn assert_nobody_lost(outcomes: &[Outcome], unknown: &[usize], context: &str) {
+    assert_eq!(
+        unknown.len(),
+        outcomes.len(),
+        "{context}: no write landed, so no writer can have lost to one: {outcomes:?}"
+    );
 }
 
 /// `WRITERS` tasks all hold version 1 of the same resource and `update` it at
@@ -105,6 +204,27 @@ pub async fn concurrent_updates_from_the_same_version_admit_one<S>(
     backend: Arc<S>,
     base: &str,
     rounds: usize,
+) where
+    S: ResourceStorage + VersionedStorage + Send + Sync + 'static,
+{
+    concurrent_updates_from_the_same_version_admit_one_with(
+        backend,
+        base,
+        rounds,
+        &RacePolicy::strict(),
+    )
+    .await;
+}
+
+/// [`concurrent_updates_from_the_same_version_admit_one`] under `policy`.
+/// With timeouts accepted, the 504 can reach the winner: then no writer
+/// reports success, and version 2 must hold the body of one 504'd writer, or
+/// nothing landed and no writer was refused.
+pub async fn concurrent_updates_from_the_same_version_admit_one_with<S>(
+    backend: Arc<S>,
+    base: &str,
+    rounds: usize,
+    policy: &RacePolicy,
 ) where
     S: ResourceStorage + VersionedStorage + Send + Sync + 'static,
 {
@@ -148,40 +268,55 @@ pub async fn concurrent_updates_from_the_same_version_admit_one<S>(
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            winners.len(),
-            1,
+        let unknown = unknown_writers(&outcomes, policy);
+        assert!(
+            winners.len() == 1 || (winners.is_empty() && !unknown.is_empty()),
             "{context}: exactly one of {WRITERS} writers holding version 1 may write: {outcomes:?}"
         );
-        assert_losers_are_concurrency_errors(&outcomes, false, &context);
-        assert_eq!(winners[0].version_id(), "2", "{context}");
+        assert_losers_are_concurrency_errors(&outcomes, false, policy, &context);
 
         let stored = backend
             .read(&t, "Patient", &id)
             .await
             .expect("read after race")
             .expect("still live");
-        assert_eq!(stored.version_id(), "2", "{context}");
-        assert_eq!(family(&stored), family(winners[0]), "{context}");
+        if let Some(winner) = winners.first() {
+            assert_eq!(winner.version_id(), "2", "{context}");
+            assert_eq!(stored.version_id(), "2", "{context}");
+            assert_eq!(family(&stored), family(winner), "{context}");
+        } else if stored.version_id() == "1" {
+            assert_nobody_lost(&outcomes, &unknown, &context);
+        } else {
+            assert_eq!(stored.version_id(), "2", "{context}");
+            assert!(
+                unknown
+                    .iter()
+                    .any(|n| family(&stored) == format!("Writer{n}")),
+                "{context}: with no writer told it won, version 2 is a 504'd writer's: \
+                 {} after {outcomes:?}",
+                family(&stored)
+            );
+        }
 
+        let landed = stored.version_id() == "2";
+        let (versions, pending) = history(backend.as_ref(), policy, &t, &id).await;
         assert_eq!(
-            backend
-                .list_versions(&t, "Patient", &id)
-                .await
-                .expect("list versions"),
-            vec!["1".to_string(), "2".to_string()],
+            versions,
+            versions_up_to(if landed { 2 } else { 1 }),
             "{context}: history has no gap and no duplicate"
         );
-        let v2 = backend
-            .vread(&t, "Patient", &id, "2")
-            .await
-            .expect("vread 2")
-            .expect("version 2 exists");
-        assert_eq!(
-            family(&v2),
-            family(winners[0]),
-            "{context}: history's version 2 is the winner's content"
-        );
+        if landed && !pending {
+            let v2 = backend
+                .vread(&t, "Patient", &id, "2")
+                .await
+                .expect("vread 2")
+                .expect("version 2 exists");
+            assert_eq!(
+                family(&v2),
+                family(&stored),
+                "{context}: history's version 2 is the winner's content"
+            );
+        }
     }
 }
 
@@ -194,6 +329,27 @@ pub async fn concurrent_update_and_versioned_delete_admit_one<S>(
     backend: Arc<S>,
     base: &str,
     rounds: usize,
+) where
+    S: ResourceStorage + VersionedStorage + Send + Sync + 'static,
+{
+    concurrent_update_and_versioned_delete_admit_one_with(
+        backend,
+        base,
+        rounds,
+        &RacePolicy::strict(),
+    )
+    .await;
+}
+
+/// [`concurrent_update_and_versioned_delete_admit_one`] under `policy`. Which
+/// write landed is read from the stored state: a live version 2 is an update
+/// (an even writer), nothing live is the delete (an odd writer), and a live
+/// version 1 is nothing at all.
+pub async fn concurrent_update_and_versioned_delete_admit_one_with<S>(
+    backend: Arc<S>,
+    base: &str,
+    rounds: usize,
+    policy: &RacePolicy,
 ) where
     S: ResourceStorage + VersionedStorage + Send + Sync + 'static,
 {
@@ -241,36 +397,62 @@ pub async fn concurrent_update_and_versioned_delete_admit_one<S>(
             .iter()
             .filter(|o| matches!(o, Outcome::Updated(_) | Outcome::Deleted))
             .collect();
-        assert_eq!(
-            winners.len(),
-            1,
+        let unknown = unknown_writers(&outcomes, policy);
+        assert!(
+            winners.len() == 1 || (winners.is_empty() && !unknown.is_empty()),
             "{context}: exactly one of {WRITERS} writers holding version 1 may write: {outcomes:?}"
         );
-        let deleted = matches!(winners[0], Outcome::Deleted);
-        assert_losers_are_concurrency_errors(&outcomes, deleted, &context);
 
         let after = backend.read(&t, "Patient", &id).await;
-        match winners[0] {
-            Outcome::Updated(winner) => {
-                let stored = after.expect("read after race").expect("still live");
+        let deleted = matches!(
+            after,
+            Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. }))
+        );
+        assert_losers_are_concurrency_errors(&outcomes, deleted, policy, &context);
+        let live = if deleted {
+            None
+        } else {
+            Some(after.expect("read after race").expect("still live"))
+        };
+        match (winners.first(), &live) {
+            (Some(Outcome::Updated(winner)), Some(stored)) => {
                 assert_eq!(stored.version_id(), "2", "{context}");
-                assert_eq!(family(&stored), family(winner), "{context}");
+                assert_eq!(family(stored), family(winner), "{context}");
             }
-            _ => assert!(
-                matches!(
-                    after,
-                    Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. }))
-                ),
-                "{context}: the delete won, so nothing is live: {after:?}"
+            (Some(Outcome::Updated(_)), None) => {
+                panic!("{context}: the update won, but nothing is live: {outcomes:?}")
+            }
+            (Some(_), live) => assert!(
+                live.is_none(),
+                "{context}: the delete won, so nothing is live: {live:?}"
             ),
+            (None, None) => assert!(
+                unknown.iter().any(|n| n % 2 == 1),
+                "{context}: nothing is live, but no delete can have landed: {outcomes:?}"
+            ),
+            (None, Some(stored)) if stored.version_id() == "1" => {
+                assert_nobody_lost(&outcomes, &unknown, &context)
+            }
+            (None, Some(stored)) => {
+                assert_eq!(stored.version_id(), "2", "{context}");
+                assert!(
+                    unknown
+                        .iter()
+                        .any(|n| n % 2 == 0 && family(stored) == format!("Writer{n}")),
+                    "{context}: with no writer told it won, version 2 is a 504'd \
+                     update's: {} after {outcomes:?}",
+                    family(stored)
+                );
+            }
         }
 
+        let landed = live
+            .as_ref()
+            .is_none_or(|stored| stored.version_id() == "2");
+        let (versions, _) = history(backend.as_ref(), policy, &t, &id).await;
         assert_eq!(
-            backend
-                .list_versions(&t, "Patient", &id)
-                .await
-                .expect("list versions"),
-            vec!["1".to_string(), "2".to_string()],
+            versions,
+            versions_up_to(if landed { 2 } else { 1 }),
             "{context}: one write landed, as version 2"
         );
     }
@@ -285,6 +467,26 @@ pub async fn concurrent_update_and_plain_delete_stay_consistent<S>(
     backend: Arc<S>,
     base: &str,
     rounds: usize,
+) where
+    S: ResourceStorage + VersionedStorage + Send + Sync + 'static,
+{
+    concurrent_update_and_plain_delete_stay_consistent_with(
+        backend,
+        base,
+        rounds,
+        &RacePolicy::strict(),
+    )
+    .await;
+}
+
+/// [`concurrent_update_and_plain_delete_stay_consistent`] under `policy`. The
+/// writes that landed are counted from the history and the stored state; each
+/// beyond those reported as successes needs a 504'd writer of its kind.
+pub async fn concurrent_update_and_plain_delete_stay_consistent_with<S>(
+    backend: Arc<S>,
+    base: &str,
+    rounds: usize,
+    policy: &RacePolicy,
 ) where
     S: ResourceStorage + VersionedStorage + Send + Sync + 'static,
 {
@@ -344,35 +546,50 @@ pub async fn concurrent_update_and_plain_delete_stay_consistent<S>(
             deletes <= 1,
             "{context}: a resource is deleted once: {outcomes:?}"
         );
+        let unknown = unknown_writers(&outcomes, policy);
         assert!(
-            updates + deletes >= 1,
+            updates + deletes >= 1 || !unknown.is_empty(),
             "{context}: somebody wins: {outcomes:?}"
         );
-        assert_losers_are_concurrency_errors(&outcomes, true, &context);
-
-        let expected_versions: Vec<String> =
-            (1..=1 + updates + deletes).map(|v| v.to_string()).collect();
-        assert_eq!(
-            backend
-                .list_versions(&t, "Patient", &id)
-                .await
-                .expect("list versions"),
-            expected_versions,
-            "{context}: one version per successful write, no gap, no duplicate: {outcomes:?}"
-        );
+        assert_losers_are_concurrency_errors(&outcomes, true, policy, &context);
 
         let after = backend.read(&t, "Patient", &id).await;
-        if deletes == 1 {
-            assert!(
-                matches!(
-                    after,
-                    Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. }))
-                ),
-                "{context}: a delete landed, so nothing is live: {after:?}"
-            );
-        } else {
+        let deleted = matches!(
+            after,
+            Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. }))
+        );
+        assert!(
+            deletes == 0 || deleted,
+            "{context}: a delete landed, so nothing is live: {after:?}"
+        );
+        let (versions, _) = history(backend.as_ref(), policy, &t, &id).await;
+        let landed_deletes = usize::from(deleted);
+        let landed_updates = versions.len().saturating_sub(1 + landed_deletes);
+        let unknown_updates = unknown.iter().filter(|n| *n % 2 == 0).count();
+        let unknown_deletes = unknown.len() - unknown_updates;
+        assert!(
+            landed_updates <= 1
+                && (updates..=updates + unknown_updates).contains(&landed_updates)
+                && (deletes..=deletes + unknown_deletes).contains(&landed_deletes),
+            "{context}: one version per successful write, no gap, no duplicate: \
+             {versions:?} after {outcomes:?}"
+        );
+        assert_eq!(
+            versions,
+            versions_up_to(1 + landed_updates + landed_deletes),
+            "{context}: one version per successful write, no gap, no duplicate: {outcomes:?}"
+        );
+        if landed_updates + landed_deletes == 0 {
+            assert_nobody_lost(&outcomes, &unknown, &context);
+        }
+
+        if !deleted {
             let stored = after.expect("read after race").expect("still live");
-            assert_eq!(stored.version_id(), "2", "{context}");
+            assert_eq!(
+                stored.version_id(),
+                (1 + landed_updates).to_string(),
+                "{context}"
+            );
         }
     }
 }
@@ -396,6 +613,22 @@ pub async fn concurrent_puts_onto_a_tombstone_all_succeed<S>(
     backend: Arc<S>,
     base: &str,
     rounds: usize,
+) where
+    S: ResourceStorage + VersionedStorage + Send + Sync + 'static,
+{
+    concurrent_puts_onto_a_tombstone_all_succeed_with(backend, base, rounds, &RacePolicy::strict())
+        .await;
+}
+
+/// [`concurrent_puts_onto_a_tombstone_all_succeed`] under `policy`. A 504'd
+/// PUT may or may not have landed, so the history ends anywhere from the
+/// successes' count to that plus the 504s, and the restore may be among the
+/// 504s; the successes still each have their own version within it.
+pub async fn concurrent_puts_onto_a_tombstone_all_succeed_with<S>(
+    backend: Arc<S>,
+    base: &str,
+    rounds: usize,
+    policy: &RacePolicy,
 ) where
     S: ResourceStorage + VersionedStorage + Send + Sync + 'static,
 {
@@ -441,13 +674,21 @@ pub async fn concurrent_puts_onto_a_tombstone_all_succeed<S>(
         }
         let context = format!("round {round}");
 
+        let mut unknown = 0;
         let puts: Vec<(StoredResource, bool)> = puts
             .into_iter()
-            .map(|r| r.unwrap_or_else(|e| panic!("{context}: every PUT must succeed: {e:?}")))
+            .filter_map(|r| match r {
+                Ok(put) => Some(put),
+                Err(e) if policy.is_unknown(&e) => {
+                    unknown += 1;
+                    None
+                }
+                Err(e) => panic!("{context}: every PUT must succeed: {e:?}"),
+            })
             .collect();
-        assert_eq!(
-            puts.iter().filter(|(_, created)| *created).count(),
-            1,
+        let created = puts.iter().filter(|(_, created)| *created).count();
+        assert!(
+            created == 1 || (created == 0 && unknown > 0),
             "{context}: exactly one PUT restores the tombstone"
         );
         let mut versions: Vec<u64> = puts
@@ -455,13 +696,28 @@ pub async fn concurrent_puts_onto_a_tombstone_all_succeed<S>(
             .map(|(stored, _)| stored.version_id().parse().expect("numeric version"))
             .collect();
         versions.sort_unstable();
-        let expected: Vec<u64> = (3..3 + RESTORE_WRITERS as u64).collect();
+        versions.dedup();
+
+        let (chain, pending) = history(backend.as_ref(), policy, &t, &id).await;
+        let landed = chain.len().saturating_sub(2);
+        assert!(
+            (puts.len().max(1)..=puts.len() + unknown).contains(&landed),
+            "{context}: history has no gap and no duplicate: {chain:?}, \
+             {} PUTs succeeded and {unknown} answered 504",
+            puts.len()
+        );
         assert_eq!(
-            versions, expected,
-            "{context}: each PUT gets its own version, continuing the chain"
+            chain,
+            versions_up_to(2 + landed),
+            "{context}: history has no gap and no duplicate"
+        );
+        assert!(
+            versions.len() == puts.len()
+                && versions.iter().all(|v| (3..=2 + landed as u64).contains(v)),
+            "{context}: each PUT gets its own version, continuing the chain: {versions:?}"
         );
 
-        let newest = (2 + RESTORE_WRITERS).to_string();
+        let newest = (2 + landed).to_string();
         let stored = backend
             .read(&t, "Patient", &id)
             .await
@@ -469,26 +725,18 @@ pub async fn concurrent_puts_onto_a_tombstone_all_succeed<S>(
             .expect("live after restore");
         assert_eq!(stored.version_id(), newest, "{context}");
 
-        let expected_versions: Vec<String> =
-            (1..=2 + RESTORE_WRITERS).map(|v| v.to_string()).collect();
-        assert_eq!(
-            backend
-                .list_versions(&t, "Patient", &id)
+        if !pending {
+            let latest = backend
+                .vread(&t, "Patient", &id, &newest)
                 .await
-                .expect("list versions"),
-            expected_versions,
-            "{context}: history has no gap and no duplicate"
-        );
-        let latest = backend
-            .vread(&t, "Patient", &id, &newest)
-            .await
-            .expect("vread newest")
-            .expect("newest version exists");
-        assert_eq!(
-            latest.content(),
-            stored.content(),
-            "{context}: the newest history entry is the live body"
-        );
+                .expect("vread newest")
+                .expect("newest version exists");
+            assert_eq!(
+                latest.content(),
+                stored.content(),
+                "{context}: the newest history entry is the live body"
+            );
+        }
     }
 }
 

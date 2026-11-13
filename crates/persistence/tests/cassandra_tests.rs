@@ -594,7 +594,9 @@ mod step3_suites {
 
     use crate::cassandra_node::{self, CassandraNode, TEST_TENANT_PREFIX, URL_VAR};
     use crate::cassandra_testable::CassandraTestBackend;
+    use crate::versioned_write_race_suite::{PendingWrites, RacePolicy};
     use crate::{tenant_existence_suite, tenant_id_fidelity_suite, versioned_write_race_suite};
+    use helios_persistence::tenant::TenantContext;
 
     /// Rounds per race test: PostgreSQL's and MongoDB's 10, not SQLite's 40,
     /// on a node where each round is eight contending Paxos writers.
@@ -657,16 +659,59 @@ mod step3_suites {
         );
     }
 
+    /// The race suite's view of a write that applied but was answered 504
+    /// before its version row: [`cassandra_node::pending_version`].
+    struct IntentProbe(cassandra_node::TestSession);
+
+    #[async_trait::async_trait]
+    impl PendingWrites for IntentProbe {
+        async fn pending_version(&self, tenant: &TenantContext, id: &str) -> Option<String> {
+            cassandra_node::pending_version(&self.0, tenant, "Patient", id)
+                .await
+                .unwrap_or_else(|error| panic!("pending version of Patient/{id}: {error}"))
+                .map(|version| version.to_string())
+        }
+    }
+
+    /// The race checks' policy on this node: a 504 is an accepted outcome at
+    /// RF 2 or more, where a superseded `LOCAL_SERIAL` read answers it by
+    /// design (issue #77, ADR-aacruzgon-0072 decision 4), and fails the test
+    /// at RF 1, where it is always a bug (ADR-sara-lahourpour-0001). Prints
+    /// `[race policy case=race:<test> rf=<n> accept_504=<bool>]` beside the
+    /// `[cas …]` line, so a log shows which check ran.
+    pub(crate) async fn race_policy(node: &CassandraNode, test: &str) -> RacePolicy {
+        let session = node.session().await;
+        let rf = cassandra_node::replication_factor(&session)
+            .await
+            .unwrap_or_else(|error| panic!("replication factor: {error}"));
+        let policy = if rf >= 2 {
+            RacePolicy::AcceptTimeouts(Arc::new(IntentProbe(session)))
+        } else {
+            RacePolicy::strict()
+        };
+        eprintln!(
+            "[race policy case=race:{test} rf={rf} accept_504={}]",
+            policy.accepts_timeouts()
+        );
+        policy
+    }
+
     /// #1404: of eight writers holding the same version, one `update` writes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn cassandra_concurrent_updates_from_the_same_version_admit_one() {
         let node = node_or_skip!("cassandra_concurrent_updates_from_the_same_version_admit_one");
         let backend = race_backend(node, "race-update").await;
+        let policy = race_policy(
+            node,
+            "cassandra_concurrent_updates_from_the_same_version_admit_one",
+        )
+        .await;
         let before = backend.inner().cas_stats();
-        versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one(
+        versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one_with(
             Arc::clone(&backend),
             &unique_base("upd"),
             RACE_ROUNDS,
+            &policy,
         )
         .await;
         print_cas(
@@ -681,11 +726,17 @@ mod step3_suites {
     async fn cassandra_concurrent_update_and_versioned_delete_admit_one() {
         let node = node_or_skip!("cassandra_concurrent_update_and_versioned_delete_admit_one");
         let backend = race_backend(node, "race-vdelete").await;
+        let policy = race_policy(
+            node,
+            "cassandra_concurrent_update_and_versioned_delete_admit_one",
+        )
+        .await;
         let before = backend.inner().cas_stats();
-        versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
+        versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one_with(
             Arc::clone(&backend),
             &unique_base("vdel"),
             RACE_ROUNDS,
+            &policy,
         )
         .await;
         print_cas(
@@ -701,11 +752,17 @@ mod step3_suites {
     async fn cassandra_concurrent_update_and_plain_delete_stay_consistent() {
         let node = node_or_skip!("cassandra_concurrent_update_and_plain_delete_stay_consistent");
         let backend = race_backend(node, "race-pdelete").await;
+        let policy = race_policy(
+            node,
+            "cassandra_concurrent_update_and_plain_delete_stay_consistent",
+        )
+        .await;
         let before = backend.inner().cas_stats();
-        versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+        versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent_with(
             Arc::clone(&backend),
             &unique_base("pdel"),
             RACE_ROUNDS,
+            &policy,
         )
         .await;
         print_cas(
@@ -722,11 +779,17 @@ mod step3_suites {
     async fn cassandra_concurrent_puts_onto_a_tombstone_all_succeed() {
         let node = node_or_skip!("cassandra_concurrent_puts_onto_a_tombstone_all_succeed");
         let backend = race_backend(node, "race-restore").await;
+        let policy = race_policy(
+            node,
+            "cassandra_concurrent_puts_onto_a_tombstone_all_succeed",
+        )
+        .await;
         let before = backend.inner().cas_stats();
-        versioned_write_race_suite::concurrent_puts_onto_a_tombstone_all_succeed(
+        versioned_write_race_suite::concurrent_puts_onto_a_tombstone_all_succeed_with(
             Arc::clone(&backend),
             &unique_base("rest"),
             RACE_ROUNDS,
+            &policy,
         )
         .await;
         print_cas(

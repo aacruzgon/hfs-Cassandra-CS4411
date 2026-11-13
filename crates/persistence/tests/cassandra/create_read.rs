@@ -26,7 +26,9 @@ use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, Utc};
 use helios_persistence::backends::cassandra::CassandraBackend;
 use helios_persistence::core::ResourceStorage;
-use helios_persistence::error::{ResourceError, StorageError, TenantError, ValidationError};
+use helios_persistence::error::{
+    BackendError, ResourceError, StorageError, TenantError, ValidationError,
+};
 use helios_persistence::tenant::{TenantContext, TenantPermissions};
 use serde_json::json;
 
@@ -210,15 +212,27 @@ async fn cassandra_duplicate_create_is_already_exists() {
     assert_eq!(read.version_id(), "1");
 }
 
+/// Eight creates of one id make one resource. At RF 2 or more a creator may be
+/// answered 504 (issue #77), the winner included; then the live body names
+/// the 504'd writer that landed, and `count` may still be 0 while that
+/// write's intent is pending (ADR-sara-lahourpour-0001).
 #[tokio::test]
 async fn cassandra_concurrent_creates_of_one_id_make_exactly_one_resource() {
     let node = node_or_skip!("cassandra_concurrent_creates_of_one_id_make_exactly_one_resource");
     let (backend, _cql) = setup(node).await;
+    let session = node.session().await;
+    let rf = cassandra_node::replication_factor(&session).await.unwrap();
+    let accept_504 = rf >= 2;
+    eprintln!(
+        "[race policy case=race:cassandra_concurrent_creates_of_one_id_make_exactly_one_resource \
+         rf={rf} accept_504={accept_504}]"
+    );
     let tenant = unique_tenant("race");
     let version = crate::cassandra_node::test_fhir_version();
     let attempts = (0..8).map(|i| {
         let mut body = patient("race");
         body["gender"] = json!(if i % 2 == 0 { "male" } else { "female" });
+        body["name"] = json!([{"family": format!("Writer{i}")}]);
         backend.create(&tenant, "Patient", body, version)
     });
     let results = futures::future::join_all(attempts).await;
@@ -232,8 +246,54 @@ async fn cassandra_concurrent_creates_of_one_id_make_exactly_one_resource() {
             )
         })
         .count();
-    assert_eq!((created, refused), (1, 7), "{results:?}");
-    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    if !accept_504 {
+        assert_eq!((created, refused), (1, 7), "{results:?}");
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+        return;
+    }
+
+    let timed_out: Vec<String> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| matches!(r, Err(StorageError::Backend(BackendError::Timeout { .. }))))
+        .map(|(i, _)| format!("Writer{i}"))
+        .collect();
+    assert_eq!(
+        created + refused + timed_out.len(),
+        8,
+        "only a success, AlreadyExists or a 504: {results:?}"
+    );
+    assert!(
+        created == 1 || (created == 0 && !timed_out.is_empty()),
+        "{results:?}"
+    );
+    let count = backend.count(&tenant, Some("Patient")).await.unwrap();
+    let Some(stored) = backend.read(&tenant, "Patient", "race").await.unwrap() else {
+        assert_eq!(
+            (created, refused, count),
+            (0, 0, 0),
+            "nothing landed, so nobody was refused: {results:?}"
+        );
+        return;
+    };
+    let family = stored.content()["name"][0]["family"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    match results.iter().find_map(|r| r.as_ref().ok()) {
+        Some(winner) => assert_eq!(stored.content(), winner.content()),
+        None => assert!(
+            timed_out.contains(&family),
+            "with no writer told it won, the body is a 504'd writer's: {family} after {results:?}"
+        ),
+    }
+    let pending = cassandra_node::pending_version(&session, &tenant, "Patient", "race")
+        .await
+        .unwrap();
+    assert!(
+        count == 1 || (count == 0 && pending == Some(1)),
+        "count {count} with pending version {pending:?}"
+    );
 }
 
 #[tokio::test]

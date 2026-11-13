@@ -38,21 +38,29 @@
 //! partitioned across tenants, so a sweeper test asserts only on its own
 //! tenant's intents.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cdrs_tokio::cluster::session::{Session, SessionBuilder, TcpSessionBuilder};
 use cdrs_tokio::cluster::{NodeTcpConfigBuilder, TcpConnectionManager};
+use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::frame::Envelope;
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
+use cdrs_tokio::query::QueryValues;
+use cdrs_tokio::statement::StatementParamsBuilder;
 use cdrs_tokio::transport::TransportTcp;
-use cdrs_tokio::types::IntoRustByName;
+use cdrs_tokio::types::map::Map;
 use cdrs_tokio::types::rows::Row;
+use cdrs_tokio::types::value::Value;
+use cdrs_tokio::types::{AsRustType, IntoRustByName};
+use chrono::Utc;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt, TestcontainersError};
 use tokio::sync::OnceCell;
+use uuid::Uuid;
 
 /// The variable that names a running node (ADR-aacruzgon-0020, Rule 1).
 pub const URL_VAR: &str = "HFS_TEST_CASSANDRA_URL";
@@ -162,6 +170,10 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(240);
 /// From the CQL log line (or the first attempt on a URL node) to a `SELECT`
 /// that succeeds.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The intent table's shards per hour bucket (`src/backends/cassandra/write.rs`,
+/// `INTENT_SHARDS`); [`pending_version`] reads every one.
+const INTENT_SHARDS: i16 = 16;
 
 /// One connection attempt; a node that accepts TCP but never answers must not
 /// hang the suite.
@@ -501,6 +513,136 @@ pub fn text(row: &Row, column: &str) -> Result<String, String> {
 pub fn int(row: &Row, column: &str) -> Result<i32, String> {
     row.get_r_by_name(column)
         .map_err(|error| format!("column {column}: {error}"))
+}
+
+/// [`select`] with bound values, at `LOCAL_QUORUM`.
+async fn select_values(
+    session: &TestSession,
+    query: &str,
+    values: Vec<Value>,
+) -> Result<Vec<Row>, String> {
+    let params = StatementParamsBuilder::new()
+        .with_consistency(Consistency::LocalQuorum)
+        .with_values(QueryValues::SimpleValues(values))
+        .build();
+    let envelope: Envelope =
+        tokio::time::timeout(STATEMENT_TIMEOUT, session.query_with_params(query, params))
+            .await
+            .map_err(|_| format!("{query}: no answer within {STATEMENT_TIMEOUT:?}"))?
+            .map_err(|error| format!("{query}: {error}"))?;
+    let body = envelope
+        .response_body()
+        .map_err(|error| format!("{query}: {error}"))?;
+    Ok(body.into_rows().unwrap_or_default())
+}
+
+/// Keyspace `helios`'s replication factor in [`DATA_CENTER`], read from
+/// `system_schema.keyspaces`: 1 on the single node and in CI, 3 on the
+/// three-node cluster (`docker/cassandra/keyspace-three-node.cql`).
+///
+/// It decides whether the race checks accept a 504 (issue #77): a
+/// `LOCAL_SERIAL` read can be superseded, and answered 504, only when more
+/// than one replica takes part in the Paxos round, so RF 1 stays strict
+/// whatever node the tests run against (ADR-sara-lahourpour-0001).
+pub async fn replication_factor(session: &TestSession) -> Result<u32, String> {
+    let rows = select(
+        session,
+        &format!(
+            "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = '{KEYSPACE}'"
+        ),
+    )
+    .await?;
+    let [row] = rows.as_slice() else {
+        return Err(format!(
+            "keyspace {KEYSPACE}: {} rows in system_schema.keyspaces",
+            rows.len()
+        ));
+    };
+    let replication: Map = row
+        .get_r_by_name("replication")
+        .map_err(|error| format!("column replication: {error}"))?;
+    let replication: HashMap<String, String> = replication
+        .as_r_type()
+        .map_err(|error| format!("column replication: {error}"))?;
+    replication
+        .get(DATA_CENTER)
+        .ok_or_else(|| {
+            format!("keyspace {KEYSPACE} does not replicate to {DATA_CENTER}: {replication:?}")
+        })?
+        .parse()
+        .map_err(|error| format!("keyspace {KEYSPACE}'s factor in {DATA_CENTER}: {error}"))
+}
+
+/// The version of `resource_type/id` whose write applied but whose request
+/// ended before the version row: the `resources` row's version, when the
+/// row's `write_id` matches an intent row kept in `pending_index_writes` for
+/// that version. That is the state a write answered 504 by its serial read
+/// leaves (issue #77): the history lacks the version, and `count` may be one
+/// off, until the sweeper replays the intent (Step 5). `None` otherwise.
+///
+/// Reads this hour's and the previous hour's buckets, every shard, and keeps
+/// only this resource's rows, so it does not depend on the backend's shard
+/// function.
+pub async fn pending_version(
+    session: &TestSession,
+    tenant: &TenantContext,
+    resource_type: &str,
+    id: &str,
+) -> Result<Option<i32>, String> {
+    let tenant_id = tenant.tenant_id().as_str();
+    let rows = select_values(
+        session,
+        &format!(
+            "SELECT version_id, write_id FROM {KEYSPACE}.resources \
+             WHERE tenant_id = ? AND resource_type = ? AND id = ?"
+        ),
+        vec![
+            Value::from(tenant_id),
+            Value::from(resource_type),
+            Value::from(id),
+        ],
+    )
+    .await?;
+    let [row] = rows.as_slice() else {
+        return Ok(None);
+    };
+    let version = int(row, "version_id")?;
+    let write_id: Option<Uuid> = row
+        .get_by_name("write_id")
+        .map_err(|error| format!("column write_id: {error}"))?;
+    let Some(write_id) = write_id else {
+        return Ok(None);
+    };
+
+    let now = Utc::now();
+    for at in [now - chrono::Duration::hours(1), now] {
+        let bucket = at.format("%Y-%m-%dT%H").to_string();
+        for shard in 0..INTENT_SHARDS {
+            let intents = select_values(
+                session,
+                &format!(
+                    "SELECT tenant_id, resource_type, id, version_id, write_id \
+                     FROM {KEYSPACE}.pending_index_writes WHERE bucket = ? AND shard = ?"
+                ),
+                vec![Value::from(bucket.as_str()), Value::from(shard)],
+            )
+            .await?;
+            for intent in &intents {
+                let kept: Option<Uuid> = intent
+                    .get_by_name("write_id")
+                    .map_err(|error| format!("column write_id: {error}"))?;
+                if kept == Some(write_id)
+                    && int(intent, "version_id")? == version
+                    && text(intent, "tenant_id")? == tenant_id
+                    && text(intent, "resource_type")? == resource_type
+                    && text(intent, "id")? == id
+                {
+                    return Ok(Some(version));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Keyspace `helios` as recorded in `system_schema`, in the format of

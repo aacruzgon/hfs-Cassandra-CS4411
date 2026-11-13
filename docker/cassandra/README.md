@@ -202,23 +202,50 @@ that are expected today:
   rack assertion (`cassandra_tests.rs:185`) if the query reaches another node,
   and otherwise at `one node, no peers` (`:214`), because on the cluster the
   driver sees three nodes.
-- The concurrent-write tests fail some of the time with a backend `Timeout`
-  (504) from a `LOCAL_SERIAL` read: `CAS operation timed out: received 0 of 2
-  required responses`. They are the tests in `step3_suites`
-  (`versioned_write_race_suite.rs`) and
-  `create_read::cassandra_concurrent_creates_of_one_id_make_exactly_one_resource`.
-  Cassandra 5.0.9 raises the error when a competing proposal supersedes the
-  read's Paxos round. Raising the CPU limit from 2 to 4 per node did not change
-  the rate in the one test tried, on a host at load 14 to 18 (9 and 12 of 20
-  runs failed at 4 CPUs, 11 of 20 at 2). The answer can reach the writer that
-  won: seven of eight concurrent creates got `AlreadyExists` and the eighth got
-  the 504. These tests panic on the outcomes, before any version-history check,
-  so a failing run does not check the history; the runs that pass do.
+The concurrent-write tests, those in `step3_suites`
+(`versioned_write_race_suite.rs`) and
+`create_read::cassandra_concurrent_creates_of_one_id_make_exactly_one_resource`,
+can get a backend `Timeout` (504) from a `LOCAL_SERIAL` read: `CAS operation
+timed out: received 0 of 2 required responses`. Cassandra 5.0.9 raises it when
+a competing proposal supersedes the read's Paxos round, and it can reach the
+writer that won. On RF 3 this is an accepted answer (issue #77,
+ADR-aacruzgon-0072 decision 4), so these tests read the keyspace's replication
+factor and, at RF 2 or more, accept the 504 and check the invariants instead:
+no history gap, one winner per version, no lost write. Each prints its mode,
+`[race policy case=race:<test> rf=3 accept_504=true]`. A 504'd write that
+applied can leave its version out of the history and `count` one off until the
+sweeper replays its intent (Step 5), so the history may lack its newest version
+only when the `resources` row's `write_id` matches a kept intent row for it
+(ADR-sara-lahourpour-0001). At RF 1 the 504 still fails the test.
 
-On RF 3 this 504 is an accepted answer. Item 8.3 checks the invariants instead
-(no history gap, one winner per version, no lost write), and the race suites
-need a cluster-aware outcome check, which also verifies the history, before
-Step 8.
+### Docker Desktop for Windows and Mac
+
+From the host, every test fails after 60 s (the harness's `READY_TIMEOUT`):
+`SELECT table_name FROM system_schema.tables …: no answer within 60s`. The
+driver learns the other nodes' `172.29.59.x` addresses from
+`system.peers_v2`, and Docker Desktop does not route those from the host
+(including WSL 2). Build the test binary on the host and run it in a container
+on the cluster's network instead. From the repository root, on Ubuntu under
+WSL 2, with an image of the same Ubuntu release as the distro, so that its
+glibc matches the binary's (`ubuntu:26.04` here):
+
+```bash
+bin=$(cargo test -p helios-persistence --features cassandra --test cassandra_tests --no-run 2>&1 \
+      | sed -n 's/^ *Executable .* (\(.*\))$/\1/p')
+docker run --rm --network hfs-cassandra-cluster_cluster --user "$(id -u):$(id -g)" \
+  -v /usr/lib/x86_64-linux-gnu/libssl.so.3:/usr/lib/x86_64-linux-gnu/libssl.so.3:ro \
+  -v /usr/lib/x86_64-linux-gnu/libcrypto.so.3:/usr/lib/x86_64-linux-gnu/libcrypto.so.3:ro \
+  -v "$PWD":"$PWD":ro -v "$bin":/t/cassandra_tests:ro -w "$PWD/crates/persistence" \
+  -e HFS_TEST_CASSANDRA_URL=172.29.59.11:9042 ubuntu:26.04 /t/cassandra_tests
+```
+
+The repository is mounted at the same path because some tests read files by
+the path compiled into the binary. The two OpenSSL libraries come from the
+host, so the image needs nothing installed. On 2026-11-12 and 13 (Windows,
+Docker Desktop with WSL 2, the default limits), the tests passed this way
+except `node_runs_the_docker_cassandra_configuration`; one of five runs also
+had four ordinary `LOCAL_QUORUM` timeouts (`received only 1 responses`) in
+non-race tests, while the host was compiling.
 
 ## Failure procedures
 

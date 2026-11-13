@@ -385,20 +385,34 @@ fn classify_cas_failure(error: DriverError) -> CasFailure {
     }
 }
 
+/// The client-facing text of the undecidable outcome's 503
+/// (ADR-aacruzgon-0077). It names no operation, since REST sends it
+/// verbatim and the internal names (`delete_versioned`, `create_or_update`)
+/// mean nothing to a client, and it reads the same for a create, an update
+/// and a delete.
+const UNDECIDABLE_503: &str =
+    "the outcome of the change could not be decided; it may have been stored";
+
 /// The undecidable outcome's error (design, "Which error, and why"). The
 /// write may have applied, so the 503 says so, as every 503 after an
 /// unknown outcome does ([`unavailable_unless_timeout`], ADR-aacruzgon-0077).
+/// The 504's message, which REST logs and never sends, and the log line
+/// below name the operation for the operator.
 fn undecidable(timed_out: bool, operation: &str) -> StorageError {
-    let message = format!("{operation}: the compare-and-swap's outcome is unknown");
+    tracing::warn!(
+        operation,
+        timed_out,
+        "compare-and-swap outcome could not be decided; the intent row is kept for the sweeper"
+    );
     StorageError::Backend(if timed_out {
         BackendError::Timeout {
             backend_name: BACKEND_NAME.to_string(),
-            message,
+            message: format!("{operation}: the compare-and-swap's outcome is unknown"),
         }
     } else {
         BackendError::Unavailable {
             backend_name: BACKEND_NAME.to_string(),
-            message: format!("{message}; the write may have been stored"),
+            message: UNDECIDABLE_503.to_string(),
         }
     })
 }
@@ -2373,17 +2387,30 @@ mod tests {
         ));
     }
 
-    /// The 503 also says the write may have been stored
-    /// (ADR-aacruzgon-0077).
+    /// The 503 also says the write may have been stored, in one text that
+    /// names no operation, since REST sends it to the client; the 504's
+    /// message, which REST only logs, keeps the operation (ADR-aacruzgon-0077).
     #[test]
     fn undecidable_is_504_after_a_timeout_and_503_after_a_failure() {
-        assert!(matches!(
-            undecidable(true, "create"),
-            StorageError::Backend(BackendError::Timeout { .. })
-        ));
-        let (variant, message) = the_503(undecidable(false, "create"), "undecidable");
-        assert_eq!(variant, "Unavailable");
-        assert!(message.contains(MAY_HAVE_BEEN_STORED), "{message}");
+        for operation in [
+            "create",
+            "update",
+            "delete",
+            "delete_versioned",
+            "create_or_update",
+        ] {
+            match undecidable(true, operation) {
+                StorageError::Backend(BackendError::Timeout { message, .. }) => {
+                    assert!(message.starts_with(operation), "{message}")
+                }
+                other => panic!("{operation}: expected a 504, got {other:?}"),
+            }
+            let (variant, message) = the_503(undecidable(false, operation), operation);
+            assert_eq!(variant, "Unavailable");
+            assert_eq!(message, UNDECIDABLE_503, "{operation}");
+            assert!(message.contains(MAY_HAVE_BEEN_STORED), "{message}");
+            assert!(!message.contains(operation), "{operation}: {message}");
+        }
     }
 
     #[test]
@@ -3780,10 +3807,10 @@ mod node_tests {
         }
         let before = backend.cas_stats();
         // Undecidable after a `WriteFailure`: the write may have applied, so
-        // the 503 says so (ADR-aacruzgon-0077).
+        // the 503 says so, without naming the operation (ADR-aacruzgon-0077).
         match backend.create(&tenant, "Patient", patient(), version).await {
             Err(StorageError::Backend(BackendError::Unavailable { message, .. }))
-                if message.contains("may have been stored") => {}
+                if message == super::UNDECIDABLE_503 => {}
             other => panic!("expected a 503 that may have stored the write, got {other:?}"),
         }
         let stats = backend.cas_stats().since(&before);

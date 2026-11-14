@@ -171,10 +171,8 @@ impl CassandraBackend {
                 }
                 // After an unknown outcome, R1's error answers as R2's does
                 // (ADR-aacruzgon-0067).
-                let row = request.after_unknown(
-                    self.read_resource_row(tenant_id, resource_type, id).await,
-                    "pre-read",
-                )?;
+                let row = request
+                    .after_unknown(self.read_resource_row(tenant_id, resource_type, id).await)?;
                 if let Some(row) = &row {
                     created_at = row.created_at;
                 }
@@ -197,8 +195,7 @@ impl CassandraBackend {
                         row.version_id,
                     ),
                     (Branch::Revive, Some(row)) => {
-                        let previous =
-                            request.after_unknown(PreviousVersion::from_row(row), "pre-read")?;
+                        let previous = request.after_unknown(PreviousVersion::from_row(row))?;
                         let (body, data) =
                             normalized_body("create_or_update", resource_type, id, body)?;
                         let plan =

@@ -51,8 +51,8 @@ use super::errors::BACKEND_NAME;
 use super::index_keys::IndexKey;
 use super::read::ResourceRow;
 use super::write::{
-    Applied, CasKind, CasMiss, CasOutcome, CasPlan, PreviousVersion, RowKey, UPSERT_MISS_RETRIES,
-    check_id, check_search_parameter_code, normalized_body,
+    Applied, CasKind, CasMiss, CasOutcome, CasPlan, RowKey, UPSERT_MISS_RETRIES, check_id,
+    check_search_parameter_code, normalized_body,
 };
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
@@ -198,7 +198,7 @@ impl CassandraBackend {
                         row.version_id,
                     ),
                     (Branch::Revive, Some(row)) => {
-                        let previous = request.after_unknown(PreviousVersion::from_row(row))?;
+                        let previous = request.previous_version(row)?;
                         let (body, data) =
                             normalized_body("create_or_update", resource_type, id, body)?;
                         let plan =
@@ -374,8 +374,9 @@ mod node_tests {
     use crate::backends::cassandra::index_keys;
     use crate::backends::cassandra::session::{Fault, StatementKind};
     use crate::backends::cassandra::write::{
-        INSERT_VERSION, REVIVE_RESOURCE_IF_VERSION, SOFT_DELETE_RESOURCE_IF_VERSION,
-        UPDATE_RESOURCE_IF_VERSION, next_last_updated, write_ts_of,
+        INSERT_VERSION, PreviousVersion, REVIVE_RESOURCE_IF_VERSION,
+        SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, next_last_updated,
+        write_ts_of,
     };
     use crate::core::{ResourceStorage, SearchProvider};
     use crate::error::{ConcurrencyError, TenantError, ValidationError};

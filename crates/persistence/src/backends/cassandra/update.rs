@@ -45,8 +45,7 @@ use super::index_keys::IndexKey;
 use super::read::{ResourceRow, SELECT_RESOURCE};
 use super::session::StatementKind;
 use super::write::{
-    CasMiss, CasOutcome, CasPlan, CasRequest, PreviousVersion, RowKey, check_search_parameter_code,
-    normalized_body,
+    CasMiss, CasOutcome, CasPlan, CasRequest, RowKey, check_search_parameter_code, normalized_body,
 };
 use crate::error::{ConcurrencyError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
@@ -202,7 +201,7 @@ impl CassandraBackend {
         let key = request.key();
         // R1's row, decoded: after an unknown outcome its error answers as
         // R2's does (ADR-aacruzgon-0067).
-        let previous = request.after_unknown(PreviousVersion::from_row(row))?;
+        let previous = request.previous_version(row)?;
         let (body, data) = normalized_body("update", key.resource_type, key.id, resource)?;
         let plan = CasPlan::update(previous, body, data, vec![IndexKey::ResourcesByType]);
         self.run_cas(request, plan).await
@@ -377,7 +376,7 @@ mod node_tests {
     use crate::backends::cassandra::index_keys;
     use crate::backends::cassandra::session::Fault;
     use crate::backends::cassandra::write::{
-        SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, write_ts_of,
+        PreviousVersion, SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, write_ts_of,
     };
     use crate::core::{ResourceStorage, SearchProvider};
     use crate::error::{BackendError, ResourceError, TenantError};

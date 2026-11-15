@@ -58,9 +58,7 @@ use cdrs_tokio::types::rows::Row;
 use super::backend::CassandraBackend;
 use super::read::ResourceRow;
 use super::session::DriverError;
-use super::write::{
-    Applied, CasMiss, CasOutcome, CasPlan, PLAIN_DELETE_MISS_RETRIES, PreviousVersion, RowKey,
-};
+use super::write::{Applied, CasMiss, CasOutcome, CasPlan, PLAIN_DELETE_MISS_RETRIES, RowKey};
 use crate::error::{ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
 
@@ -242,7 +240,7 @@ impl CassandraBackend {
                 let expected = row.version_id;
 
                 // Steps 2 to 6.
-                let previous = request.after_unknown(PreviousVersion::from_row(row))?;
+                let previous = request.previous_version(row)?;
                 let plan = CasPlan::delete(previous);
                 match self.run_cas(&mut request, plan).await? {
                     CasOutcome::Applied(applied) => {
@@ -452,7 +450,7 @@ mod node_tests {
     use crate::backends::cassandra::CassandraConfig;
     use crate::backends::cassandra::index_keys::{self, IndexKey};
     use crate::backends::cassandra::session::{Fault, StatementKind};
-    use crate::backends::cassandra::write::normalized_body;
+    use crate::backends::cassandra::write::{PreviousVersion, normalized_body};
     use crate::core::{ResourceStorage, SearchProvider};
     use crate::error::BackendError;
     use crate::tenant::{TenantId, TenantPermissions};

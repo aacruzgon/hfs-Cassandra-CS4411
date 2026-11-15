@@ -991,17 +991,28 @@ impl CasRequest<'_> {
         self.after_unknown(rows.first().map(ResourceRow::decode).transpose())
     }
 
+    /// R1's row `row`, decoded into the next plan's V3
+    /// ([`PreviousVersion::from_row`]) through
+    /// [`after_unknown`](Self::after_unknown): `delete`'s turns,
+    /// `update_attempt` (which `create_or_update` also calls) and
+    /// `create_or_update`'s revive.
+    pub(crate) fn previous_version(&self, row: &ResourceRow) -> StorageResult<PreviousVersion> {
+        self.after_unknown(PreviousVersion::from_row(row))
+    }
+
     /// The result of a step the backend runs itself between its turns:
     /// decoding a later turn's R1 row ([`pre_read_row`](Self::pre_read_row))
-    /// and that row into the next plan ([`PreviousVersion::from_row`]).
-    /// Unchanged until an attempt's outcome was unknown; from then on a
-    /// backend error answers as R2's does (ADR-aacruzgon-0067). The 503 then
-    /// replaces the error's message, and nothing else has logged it, so it
-    /// is logged here, once (#84). A statement's driver error never comes
-    /// here: [`statement_error`](Self::statement_error) maps it, and
-    /// [`map_driver_error`] has logged it. Its other errors (a permission, a
-    /// validation) are the request's own, so they are kept.
-    pub(crate) fn after_unknown<T>(&self, result: StorageResult<T>) -> StorageResult<T> {
+    /// and that row into the next plan
+    /// ([`previous_version`](Self::previous_version)). Unchanged until an
+    /// attempt's outcome was unknown; from then on a backend error answers
+    /// as R2's does (ADR-aacruzgon-0067). The 503 then replaces the error's
+    /// message, and nothing else has logged it, so it is logged here, once
+    /// (#84). A statement's driver error never comes here: this is private,
+    /// and its only callers are those two, whose errors the backend built;
+    /// [`statement_error`](Self::statement_error) maps a statement's error,
+    /// and [`map_driver_error`] has logged it. Its other errors (a
+    /// permission, a validation) are the request's own, so they are kept.
+    fn after_unknown<T>(&self, result: StorageResult<T>) -> StorageResult<T> {
         match result {
             Err(StorageError::Backend(built)) if self.had_unknown_outcome() => {
                 // `error`, as `map_driver_error` logs an `Internal` it maps:

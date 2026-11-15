@@ -333,7 +333,8 @@ Without this check, an attempt that applied late would make the request report a
 - after a `WriteTimeout`/CAS, a client-side timeout or a dropped connection, the undecidable case is `BackendError::Timeout` (504);
 - after a `WriteFailure`/CAS, it is `BackendError::Unavailable` (503), because `Write_failure` is "a non-timeout exception during a write request": replicas answered with failures, which is the 503 family ("this instance cannot serve right now");
 - a serial read that times out is 504, and one that fails (`ReadFailure`, `Unavailable`) is 503;
-- when the 2 re-runs are used up, the last attempt's error decides the same way: 504 after a `WriteTimeout`, 503 after a `WriteFailure`.
+- when the 2 re-runs are used up, the last attempt's error decides the same way: 504 after a `WriteTimeout`, 503 after a `WriteFailure`;
+- every 503 returned once an outcome was unknown, these and the serial read's, the version read's and every later statement's (step 2 above), says that the write may have been stored. REST sends a 503's message to the client and never a 504's, so the 504 cannot say it (ADR-aacruzgon-0077).
 
 A `WriteTimeout` with `write_type = SIMPLE` is treated as an unknown outcome and confirmed by the serial read, like `WriteTimeout`/CAS. It usually means the CAS was decided and only its commit timed out, but that commit can be another coordinator's proposal that our prepare had to finish first, so only the read tells whose `write_id` was applied (ADR-aacruzgon-0035).
 

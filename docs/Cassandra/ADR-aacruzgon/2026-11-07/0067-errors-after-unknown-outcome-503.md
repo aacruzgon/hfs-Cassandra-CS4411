@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0067: After an unknown CAS outcome, every later statement's error is 504 for a timeout and 503 for anything else
 
 - **Date:** 2026-11-07
-- **Status:** accepted (Alan approved it on 2026-11-07). It amends ADR-aacruzgon-0055's "What does not change".
+- **Status:** accepted (Alan approved it on 2026-11-07). It amends ADR-aacruzgon-0055's "What does not change"; its message rule is amended by ADR-aacruzgon-0077.
 - **Context:**
     - **What ADR-0055 decided.** An error of R2 (the `LOCAL_SERIAL` read) or R3 (the version-row read) after an unknown CAS outcome is 504 for a timeout and 503 for anything else, never the plain table's 500. Its reason: "After an unknown outcome neither is known: the CAS may have applied". Its "What does not change" kept the plain table for every other statement: "the same `Server` error on I1, V1 or the X1 delta is still 500".
     - **What that left out.** After an unknown outcome, R2 or R3 is not the only statement the same request sends. A request whose R2 shows the row unchanged re-runs its attempt (up to 2 re-runs), and every re-run sends its own V3 (the rewrite of row N) and I1 (the intent row) before its CAS. A `delete` that takes its retry, and a `create_or_update` that takes its next turn, send a new R1 (the pre-read). The earlier attempt may have applied, or may still apply, during all of them. But those errors went through `map_driver_error` (`write.rs`, `run_cas` step 2 and `write_intent`; `delete.rs`, `delete_turns` step 0; `upsert.rs`, the loop's R1), so a `Server`, `Protocol`, `Truncate` or `QueryError` there answered 500.

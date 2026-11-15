@@ -217,7 +217,7 @@ impl CassandraBackend {
             loop {
                 // Step 0. After an unknown outcome, R1's error answers as R2's
                 // does (ADR-aacruzgon-0067).
-                let row = request.after_unknown(pre_read().await, "pre-read")?;
+                let row = request.after_unknown(pre_read().await)?;
                 if let Some(applied) = self
                     .check_earlier_attempts(&mut request, row.as_ref())
                     .await?
@@ -238,7 +238,7 @@ impl CassandraBackend {
                 let expected = row.version_id;
 
                 // Steps 2 to 6.
-                let previous = request.after_unknown(PreviousVersion::from_row(row), "pre-read")?;
+                let previous = request.after_unknown(PreviousVersion::from_row(row))?;
                 let plan = CasPlan::delete(previous);
                 match self.run_cas(&mut request, plan).await? {
                     CasOutcome::Applied(applied) => {

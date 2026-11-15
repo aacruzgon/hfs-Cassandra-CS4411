@@ -202,7 +202,7 @@ impl CassandraBackend {
         let key = request.key();
         // R1's row, decoded: after an unknown outcome its error answers as
         // R2's does (ADR-aacruzgon-0067).
-        let previous = request.after_unknown(PreviousVersion::from_row(row), "pre-read")?;
+        let previous = request.after_unknown(PreviousVersion::from_row(row))?;
         let (body, data) = normalized_body("update", key.resource_type, key.id, resource)?;
         let plan = CasPlan::update(previous, body, data, vec![IndexKey::ResourcesByType]);
         self.run_cas(request, plan).await

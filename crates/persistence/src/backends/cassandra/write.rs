@@ -976,8 +976,9 @@ impl CasRequest<'_> {
         })
     }
 
-    /// A later turn's pre-read (R1, `delete` and `create_or_update`), from
-    /// the statement's rows: the statement's error goes through
+    /// Each turn's pre-read (R1) of `delete`, `delete_versioned` and
+    /// `create_or_update`, the first turn's included, from the statement's
+    /// rows: the statement's error goes through
     /// [`statement_error`](Self::statement_error), which logs it in
     /// [`map_driver_error`], and the row's decoding error through
     /// [`after_unknown`](Self::after_unknown), which logs it once an outcome

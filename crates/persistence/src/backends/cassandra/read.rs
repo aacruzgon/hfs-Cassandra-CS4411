@@ -85,7 +85,10 @@ pub(super) fn fhir_version_of(row: &Row) -> FhirVersion {
 /// An R1 row of `resources`, decoded: the pre-read every Step 3 write runs
 /// (`update`'s read of `K(N)`, the pre-reads of `delete`, `delete_versioned`
 /// and each `create_or_update` turn; walkthrough section 2, "Reads", and
-/// G22). [`CassandraBackend::read_resource_row`] reads it.
+/// G22). [`CassandraBackend::read_resource_row`] reads it for `update`;
+/// `delete`, `delete_versioned` and `create_or_update` run the statement
+/// alone ([`CassandraBackend::select_resource_rows`]) and decode the row
+/// through [`CasRequest::pre_read_row`](super::write::CasRequest::pre_read_row).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResourceRow {
     /// `N`.
@@ -254,8 +257,9 @@ impl CassandraBackend {
         rows.first().map(ResourceRow::decode).transpose()
     }
 
-    /// R1's statement alone, with the driver's error unmapped: a later turn's
-    /// R1 maps it and decodes the row through
+    /// R1's statement alone, with the driver's error unmapped: each turn of
+    /// `delete`, `delete_versioned` and `create_or_update` maps it and
+    /// decodes the row through
     /// [`CasRequest::pre_read_row`](super::write::CasRequest::pre_read_row),
     /// which keeps the statement's error apart from the row's (#84).
     pub(crate) async fn select_resource_rows(

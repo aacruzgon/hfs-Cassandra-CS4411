@@ -53,8 +53,11 @@
 
 use std::future::Future;
 
+use cdrs_tokio::types::rows::Row;
+
 use super::backend::CassandraBackend;
 use super::read::ResourceRow;
+use super::session::DriverError;
 use super::write::{
     Applied, CasMiss, CasOutcome, CasPlan, PLAIN_DELETE_MISS_RETRIES, PreviousVersion, RowKey,
 };
@@ -162,7 +165,7 @@ impl CassandraBackend {
         tenant.check_permission(Operation::Delete, resource_type)?;
         let tenant_id = tenant.tenant_id().as_str();
         self.delete_turns(tenant_id, resource_type, id, Expect::Current, move || {
-            self.read_resource_row(tenant_id, resource_type, id)
+            self.select_resource_rows(tenant_id, resource_type, id)
         })
         .await
     }
@@ -183,17 +186,18 @@ impl CassandraBackend {
             resource_type,
             id,
             Expect::Version(expected_version),
-            move || self.read_resource_row(tenant_id, resource_type, id),
+            move || self.select_resource_rows(tenant_id, resource_type, id),
         )
         .await
     }
 
     /// The turns of one delete call, all in one request. `pre_read` is the
-    /// turn's R1: [`Self::read_resource_row`] in production, and in the node
-    /// tests R1 followed by another writer, which is how a test puts a write
-    /// between a turn's R1 and its C3 (the fault seam can defer a statement
-    /// only to the next statement of a kind, and the first turn already sends
-    /// every kind).
+    /// turn's R1 statement: [`Self::select_resource_rows`] in production,
+    /// and in the node tests R1 followed by another writer, which is how a
+    /// test puts a write between a turn's R1 and its C3 (the fault seam can
+    /// defer a statement only to the next statement of a kind, and the first
+    /// turn already sends every kind). Its rows are decoded, and its error
+    /// mapped, by [`CasRequest::pre_read_row`](super::write::CasRequest::pre_read_row).
     async fn delete_turns<F, Fut>(
         &self,
         tenant_id: &str,
@@ -204,7 +208,7 @@ impl CassandraBackend {
     ) -> StorageResult<()>
     where
         F: FnMut() -> Fut,
-        Fut: Future<Output = StorageResult<Option<ResourceRow>>>,
+        Fut: Future<Output = Result<Vec<Row>, DriverError>>,
     {
         let key = RowKey {
             tenant_id,
@@ -217,7 +221,7 @@ impl CassandraBackend {
             loop {
                 // Step 0. After an unknown outcome, R1's error answers as R2's
                 // does (ADR-aacruzgon-0067).
-                let row = request.after_unknown(pre_read().await)?;
+                let row = request.pre_read_row(pre_read().await)?;
                 if let Some(applied) = self
                     .check_earlier_attempts(&mut request, row.as_ref())
                     .await?
@@ -571,7 +575,9 @@ mod node_tests {
                     if let Interleave::DeleteFirst = interleave {
                         another_delete(backend, tenant_id).await;
                     }
-                    let row = backend.read_resource_row(tenant_id, "Patient", "p").await;
+                    let row = backend
+                        .select_resource_rows(tenant_id, "Patient", "p")
+                        .await;
                     match interleave {
                         Interleave::Update(n) => {
                             for _ in 0..n {
@@ -1877,7 +1883,7 @@ mod node_tests {
                             .await
                             .expect("an undecodable index_keys");
                     }
-                    let row = backend.read_resource_row(t, "Patient", "p").await;
+                    let row = backend.select_resource_rows(t, "Patient", "p").await;
                     if first {
                         another_update(backend, t).await;
                     }
@@ -1918,12 +1924,13 @@ mod node_tests {
             let result = backend
                 .delete_turns(t, "SearchParameter", "s", expect, move || async move {
                     let row = backend_ref
-                        .read_resource_row(t, "SearchParameter", "s")
+                        .select_resource_rows(t, "SearchParameter", "s")
                         .await;
-                    if row
-                        .as_ref()
-                        .is_ok_and(|r| r.as_ref().is_some_and(|r| !r.is_deleted()))
-                    {
+                    if row.as_ref().is_ok_and(|rows| {
+                        rows.first()
+                            .and_then(|r| ResourceRow::decode(r).ok())
+                            .is_some_and(|r| !r.is_deleted())
+                    }) {
                         other_ref
                             .delete(tenant_ref, "SearchParameter", "s")
                             .await

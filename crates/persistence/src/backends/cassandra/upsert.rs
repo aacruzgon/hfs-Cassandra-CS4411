@@ -8,8 +8,9 @@
 //! 1. **`check_id`** on the URL id, before any statement (Step 3 plan D11):
 //!    REST never checks it, and every key the design bounds holds it.
 //! 2. **Each turn** (at most `1 + UPSERT_MISS_RETRIES`, so 4):
-//!    1. R1 ([`CassandraBackend::read_resource_row`]), whose `index_keys`
-//!       is `K(N)` (G22);
+//!    1. R1 ([`CassandraBackend::select_resource_rows`], decoded by
+//!       [`CasRequest::pre_read_row`](super::write::CasRequest::pre_read_row)),
+//!       whose `index_keys` is `K(N)` (G22);
 //!    2. the pre-read check ([`CassandraBackend::check_earlier_attempts`]):
 //!       an earlier attempt of this request that applied late is this
 //!       request's success, so the body is never written twice (D13);
@@ -171,8 +172,10 @@ impl CassandraBackend {
                 }
                 // After an unknown outcome, R1's error answers as R2's does
                 // (ADR-aacruzgon-0067).
-                let row = request
-                    .after_unknown(self.read_resource_row(tenant_id, resource_type, id).await)?;
+                let row = request.pre_read_row(
+                    self.select_resource_rows(tenant_id, resource_type, id)
+                        .await,
+                )?;
                 if let Some(row) = &row {
                     created_at = row.created_at;
                 }

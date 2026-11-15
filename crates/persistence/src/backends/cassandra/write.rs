@@ -41,7 +41,9 @@
 //!   may have applied, so the error answers as R2's does, 504 for a timeout
 //!   and 503 for anything else, and the earlier attempt is left for the
 //!   sweeper (ADR-aacruzgon-0067). So does a later turn's R1, the decoding
-//!   of its row included ([`CasRequest::after_unknown`]).
+//!   of its row included ([`CasRequest::pre_read_row`],
+//!   [`CasRequest::after_unknown`]); a decoding error, which no statement
+//!   logged, is logged before the 503 replaces its message (#84).
 //! - The CAS is refused before it runs (the errors [`classify_cas_failure`]
 //!   takes as not applied): its error, by the table for plain statements,
 //!   with no retry (ADR-aacruzgon-0050); after an earlier attempt's unknown
@@ -397,7 +399,8 @@ const UNDECIDABLE_503: &str = "the write's outcome could not be decided; it may 
 /// earlier attempt's outcome was unknown ([`may_have_applied`],
 /// ADR-aacruzgon-0067, 0077). It names neither the request's operation nor
 /// the statement: REST sends it verbatim, and [`map_driver_error`] already
-/// logs the statement's label with the driver's error.
+/// logs the statement's label with the driver's error, as
+/// [`CasRequest::after_unknown`] logs an error the backend built itself.
 const MAY_HAVE_APPLIED_503: &str =
     "the write's outcome is unknown and a later step failed; it may have been stored";
 
@@ -973,15 +976,45 @@ impl CasRequest<'_> {
         })
     }
 
-    /// The result of a statement the operation sends between its turns, its
-    /// next pre-read (R1): unchanged until an attempt's outcome was unknown;
-    /// from then on a backend error answers as R2's does
-    /// (ADR-aacruzgon-0067). Its other errors (a permission, a validation)
-    /// are the request's own, so they are kept.
+    /// A later turn's pre-read (R1, `delete` and `create_or_update`), from
+    /// the statement's rows: the statement's error goes through
+    /// [`statement_error`](Self::statement_error), which logs it in
+    /// [`map_driver_error`], and the row's decoding error through
+    /// [`after_unknown`](Self::after_unknown), which logs it once an outcome
+    /// was unknown (#84). Until then it is what `read_resource_row` returns.
+    pub(crate) fn pre_read_row(
+        &self,
+        rows: Result<Vec<Row>, DriverError>,
+    ) -> StorageResult<Option<ResourceRow>> {
+        let rows = rows.map_err(|error| self.statement_error(&error, "pre-read"))?;
+        self.after_unknown(rows.first().map(ResourceRow::decode).transpose())
+    }
+
+    /// The result of a step the backend runs itself between its turns:
+    /// decoding a later turn's R1 row ([`pre_read_row`](Self::pre_read_row))
+    /// and that row into the next plan ([`PreviousVersion::from_row`]).
+    /// Unchanged until an attempt's outcome was unknown; from then on a
+    /// backend error answers as R2's does (ADR-aacruzgon-0067). The 503 then
+    /// replaces the error's message, and nothing else has logged it, so it
+    /// is logged here, once (#84). A statement's driver error never comes
+    /// here: [`statement_error`](Self::statement_error) maps it, and
+    /// [`map_driver_error`] has logged it. Its other errors (a permission, a
+    /// validation) are the request's own, so they are kept.
     pub(crate) fn after_unknown<T>(&self, result: StorageResult<T>) -> StorageResult<T> {
         match result {
-            Err(StorageError::Backend(mapped)) if self.had_unknown_outcome() => {
-                Err(StorageError::Backend(may_have_applied(mapped)))
+            Err(StorageError::Backend(built)) if self.had_unknown_outcome() => {
+                // `error`, as `map_driver_error` logs an `Internal` it maps:
+                // a stored row that cannot be decoded is a server fault,
+                // whatever status the client gets.
+                tracing::error!(
+                    operation = self.operation,
+                    resource_type = self.key.resource_type,
+                    id = %self.key.id,
+                    error = %built,
+                    "a later step failed after a compare-and-swap outcome was unknown; \
+                     answering that the write may have been stored"
+                );
+                Err(StorageError::Backend(may_have_applied(built)))
             }
             other => other,
         }
@@ -2758,14 +2791,8 @@ mod tests {
             request.statement_error(&server_error, "intent row"),
             StorageError::Backend(BackendError::Internal { .. })
         ));
-        let internal = || {
-            Err::<(), _>(StorageError::Backend(map_driver_error(
-                &server_error,
-                "pre-read",
-            )))
-        };
         assert!(matches!(
-            request.after_unknown(internal()),
+            request.pre_read_row(Err(server(ErrorType::Server))),
             Err(StorageError::Backend(BackendError::Internal { .. }))
         ));
 
@@ -2797,7 +2824,7 @@ mod tests {
             request.statement_error(&server(write_timeout(WriteType::Simple)), "intent row"),
             StorageError::Backend(BackendError::Timeout { .. })
         ));
-        match request.after_unknown(internal()) {
+        match request.pre_read_row(Err(server(ErrorType::Server))) {
             Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => {
                 assert_eq!(message, MAY_HAVE_APPLIED_503)
             }
@@ -2833,17 +2860,11 @@ mod tests {
             reruns: 0,
             stats: Arc::new(CasCounters::default()),
         };
-        let pre_read = |error: &DriverError| {
-            Err::<(), _>(StorageError::Backend(map_driver_error(error, "pre-read")))
-        };
         for (error, variant) in plain_503s() {
             let (kept, message) = the_503(request.statement_error(&error, "intent row"), "before");
             assert_eq!(kept, variant);
             assert!(!message.contains(MAY_HAVE_BEEN_STORED), "{message}");
-            let (kept, message) = the_503(
-                request.after_unknown(pre_read(&error)).unwrap_err(),
-                "before",
-            );
+            let (kept, message) = the_503(request.pre_read_row(Err(error)).unwrap_err(), "before");
             assert_eq!(kept, variant);
             assert!(!message.contains(MAY_HAVE_BEEN_STORED), "{message}");
         }
@@ -2879,14 +2900,218 @@ mod tests {
                 assert!(message.contains(MAY_HAVE_BEEN_STORED), "{message}");
                 assert!(!message.contains(operation), "{operation}: {message}");
             }
-            let (kept, message) = the_503(
-                request.after_unknown(pre_read(&error)).unwrap_err(),
-                "pre-read",
-            );
-            assert_eq!(kept, variant, "pre-read: {error:?}");
-            assert_eq!(message, MAY_HAVE_APPLIED_503, "pre-read: {error:?}");
+            let described = format!("{error:?}");
+            let (kept, message) =
+                the_503(request.pre_read_row(Err(error)).unwrap_err(), "pre-read");
+            assert_eq!(kept, variant, "pre-read: {described}");
+            assert_eq!(message, MAY_HAVE_APPLIED_503, "pre-read: {described}");
             assert!(!message.contains("pre-read"), "{message}");
         }
+    }
+
+    /// The text of the line [`CasRequest::after_unknown`] logs (#84).
+    const REPLACED_LOG: &str = "a later step failed after a compare-and-swap outcome was unknown";
+
+    /// A delete's request for `Patient/p`, with no attempt yet.
+    fn delete_request() -> CasRequest<'static> {
+        CasRequest {
+            operation: "delete",
+            key: RowKey {
+                tenant_id: "t",
+                resource_type: "Patient",
+                id: "p",
+            },
+            attempts: Vec::new(),
+            reruns: 0,
+            stats: Arc::new(CasCounters::default()),
+        }
+    }
+
+    /// An attempt whose outcome was unknown.
+    fn unknown_attempt() -> Attempt {
+        Attempt {
+            write_id: Uuid::new_v4(),
+            last_updated: Utc::now(),
+            intent: IntentKey::new("t", "p", Utc::now()),
+            plan: Arc::new(CasPlan::create(
+                Json::Null,
+                "{}".to_string(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+                vec![IndexKey::ResourcesByType],
+            )),
+            unknown: Some(true),
+            settled: false,
+        }
+    }
+
+    /// How many log lines the test has captured that contain `text`. A
+    /// macro, since `#[traced_test]` defines `logs_assert` in the test's own
+    /// body.
+    macro_rules! logged {
+        ($text:expr) => {{
+            let count = std::cell::Cell::new(0);
+            logs_assert(|lines: &[&str]| {
+                count.set(lines.iter().filter(|line| line.contains($text)).count());
+                Ok(())
+            });
+            count.get()
+        }};
+    }
+
+    /// #84: a later turn's row that cannot be decoded is an error the backend
+    /// builds itself, and nothing logs it: `ResourceRow::decode` (a null
+    /// `version_id`, through `pre_read_row` as a later turn's R1 decodes it)
+    /// and `PreviousVersion::from_row` (`index_keys` unset). Before any
+    /// outcome was unknown it is still the 500 REST logs, and the backend
+    /// logs nothing. After one, the 503 keeps ADR-aacruzgon-0077's variant
+    /// and text, and the detail is logged once, with the operation, type
+    /// and id, and never the row's body.
+    #[test]
+    #[tracing_test::traced_test]
+    fn after_an_unknown_outcome_a_row_that_cannot_be_decoded_is_logged_once() {
+        let body = r#"{"resourceType":"Patient","name":[{"family":"Bodyonly"}]}"#;
+        let null_version = || {
+            row(&[
+                ("version_id", ColType::Int, None),
+                ("data", ColType::Varchar, Some(body.as_bytes().to_vec())),
+                ("last_updated", ColType::Timestamp, timestamp(1)),
+                ("created_at", ColType::Timestamp, None),
+                ("deleted_at", ColType::Timestamp, timestamp(0)),
+                ("fhir_version", ColType::Varchar, None),
+                ("write_ts", ColType::Bigint, None),
+                ("write_id", ColType::Uuid, None),
+                ("index_keys", ColType::Blob, None),
+            ])
+        };
+        let unset_keys = ResourceRow {
+            version_id: 1,
+            data: Some(body.to_string()),
+            last_updated: Utc::now(),
+            created_at: None,
+            deleted_at: None,
+            fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            write_ts: None,
+            write_id: None,
+            index_keys: None,
+        };
+        let decode_detail = "pre-read: version_id";
+        let keys_detail = "pre-read: index_keys is unset";
+        let mut request = delete_request();
+
+        let plain = |result: StorageResult<()>, detail: &str| match result {
+            Err(StorageError::Backend(BackendError::Internal { message, .. })) => {
+                assert!(message.starts_with(detail), "{message}")
+            }
+            other => panic!("expected the plain 500, got {other:?}"),
+        };
+        plain(
+            request.pre_read_row(Ok(vec![null_version()])).map(|_| ()),
+            decode_detail,
+        );
+        plain(
+            request
+                .after_unknown(PreviousVersion::from_row(&unset_keys))
+                .map(|_| ()),
+            keys_detail,
+        );
+        assert_eq!(
+            logged!(decode_detail),
+            0,
+            "REST logs the 500, not the backend"
+        );
+        assert_eq!(
+            logged!(keys_detail),
+            0,
+            "REST logs the 500, not the backend"
+        );
+
+        request.attempts.push(unknown_attempt());
+        let replaced = |result: StorageResult<()>| match result {
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => {
+                assert_eq!(message, MAY_HAVE_APPLIED_503)
+            }
+            other => panic!("expected the 503, got {other:?}"),
+        };
+        replaced(request.pre_read_row(Ok(vec![null_version()])).map(|_| ()));
+        assert_eq!(logged!(decode_detail), 1, "ResourceRow::decode's error");
+        replaced(
+            request
+                .after_unknown(PreviousVersion::from_row(&unset_keys))
+                .map(|_| ()),
+        );
+        assert_eq!(logged!(keys_detail), 1, "PreviousVersion::from_row's error");
+
+        assert_eq!(logged!(REPLACED_LOG), 2);
+        logs_assert(|lines: &[&str]| {
+            for line in lines.iter().filter(|line| line.contains(REPLACED_LOG)) {
+                for field in [
+                    " ERROR ",
+                    r#"operation="delete""#,
+                    r#"resource_type="Patient""#,
+                    "id=p",
+                ] {
+                    if !line.contains(field) {
+                        return Err(format!("no {field} in {line}"));
+                    }
+                }
+            }
+            Ok(())
+        });
+        assert_eq!(logged!("Bodyonly"), 0, "the row's body is never logged");
+    }
+
+    /// #84: a statement's driver error after an unknown outcome is logged
+    /// once, by `map_driver_error`, and never again where the 503 replaces
+    /// it: a later turn's R1 (`pre_read_row`) and a re-run's statements
+    /// (`statement_error`), for the plain table's 500s (`Internal`,
+    /// `QueryError`) and its 503s alike.
+    #[test]
+    #[tracing_test::traced_test]
+    fn after_an_unknown_outcome_a_statements_driver_error_is_logged_once() {
+        let mut request = delete_request();
+        request.attempts.push(unknown_attempt());
+        let mut errors = vec![server(ErrorType::Server), server(ErrorType::Invalid)];
+        errors.extend(plain_503s().into_iter().map(|(error, _)| error));
+        let sent = errors.len();
+        for error in errors {
+            let described = format!("{error:?}");
+            assert!(
+                matches!(
+                    request.statement_error(&error, "intent row"),
+                    StorageError::Backend(
+                        BackendError::Unavailable { .. } | BackendError::ConnectionFailed { .. }
+                    )
+                ),
+                "{described}"
+            );
+            assert!(
+                matches!(
+                    request.pre_read_row(Err(error)),
+                    Err(StorageError::Backend(
+                        BackendError::Unavailable { .. } | BackendError::ConnectionFailed { .. }
+                    ))
+                ),
+                "{described}"
+            );
+        }
+        assert_eq!(
+            logged!(REPLACED_LOG),
+            0,
+            "a driver error is not logged again"
+        );
+        assert_eq!(logged!(r#"operation="intent row""#), sent);
+        assert_eq!(logged!(r#"operation="pre-read""#), sent);
+        logs_assert(|lines: &[&str]| {
+            if lines.len() == 2 * sent {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} lines for {} driver errors",
+                    lines.len(),
+                    2 * sent
+                ))
+            }
+        });
     }
 
     /// "Another writer" after an unknown outcome maps from R2's row as a

@@ -36,7 +36,7 @@ use uuid::Uuid;
 use super::backend::CassandraBackend;
 use super::errors::{BACKEND_NAME, map_driver_error};
 use super::index_keys::{self, IndexKey};
-use super::session::StatementKind;
+use super::session::{DriverError, StatementKind};
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
@@ -248,7 +248,23 @@ impl CassandraBackend {
         id: &str,
     ) -> StorageResult<Option<ResourceRow>> {
         let rows = self
-            .session
+            .select_resource_rows(tenant_id, resource_type, id)
+            .await
+            .map_err(|error| StorageError::Backend(map_driver_error(&error, "pre-read")))?;
+        rows.first().map(ResourceRow::decode).transpose()
+    }
+
+    /// R1's statement alone, with the driver's error unmapped: a later turn's
+    /// R1 maps it and decodes the row through
+    /// [`CasRequest::pre_read_row`](super::write::CasRequest::pre_read_row),
+    /// which keeps the statement's error apart from the row's (#84).
+    pub(crate) async fn select_resource_rows(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+    ) -> Result<Vec<Row>, DriverError> {
+        self.session
             .rows(
                 SELECT_RESOURCE,
                 vec![
@@ -259,8 +275,6 @@ impl CassandraBackend {
                 StatementKind::Read,
             )
             .await
-            .map_err(|error| StorageError::Backend(map_driver_error(&error, "pre-read")))?;
-        rows.first().map(ResourceRow::decode).transpose()
     }
 
     /// R1's statement at `LOCAL_SERIAL`, which first completes a proposal

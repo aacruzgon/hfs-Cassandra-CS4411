@@ -2972,12 +2972,14 @@ mod tests {
 
     /// #84: a later turn's row that cannot be decoded is an error the backend
     /// builds itself, and nothing logs it: `ResourceRow::decode` (a null
-    /// `version_id`, through `pre_read_row` as a later turn's R1 decodes it)
-    /// and `PreviousVersion::from_row` (`index_keys` unset). Before any
-    /// outcome was unknown it is still the 500 REST logs, and the backend
-    /// logs nothing. After one, the 503 keeps ADR-aacruzgon-0077's variant
-    /// and text, and the detail is logged once, with the operation, type
-    /// and id, and never the row's body.
+    /// `version_id`, and a `data` cell of the wrong type that holds the
+    /// body, through `pre_read_row` as a later turn's R1
+    /// decodes it) and `PreviousVersion::from_row` (`index_keys` unset,
+    /// through `previous_version`). Before any outcome was unknown it is
+    /// still the 500 REST logs, and the backend logs nothing. After one, the
+    /// 503 keeps ADR-aacruzgon-0077's variant and text, and the detail is
+    /// logged once, with the operation, type and id, and never the row's
+    /// body, though the body is the cell that failed.
     #[test]
     #[tracing_test::traced_test]
     fn after_an_unknown_outcome_a_row_that_cannot_be_decoded_is_logged_once() {
@@ -2986,6 +2988,21 @@ mod tests {
             row(&[
                 ("version_id", ColType::Int, None),
                 ("data", ColType::Varchar, Some(body.as_bytes().to_vec())),
+                ("last_updated", ColType::Timestamp, timestamp(1)),
+                ("created_at", ColType::Timestamp, None),
+                ("deleted_at", ColType::Timestamp, timestamp(0)),
+                ("fhir_version", ColType::Varchar, None),
+                ("write_ts", ColType::Bigint, None),
+                ("write_id", ColType::Uuid, None),
+                ("index_keys", ColType::Blob, None),
+            ])
+        };
+        // The body itself, in a `data` cell of the wrong type, so the cell
+        // that fails to decode is the one that holds the body.
+        let bad_data = || {
+            row(&[
+                ("version_id", ColType::Int, int(1)),
+                ("data", ColType::Blob, Some(body.as_bytes().to_vec())),
                 ("last_updated", ColType::Timestamp, timestamp(1)),
                 ("created_at", ColType::Timestamp, None),
                 ("deleted_at", ColType::Timestamp, timestamp(0)),
@@ -3007,6 +3024,7 @@ mod tests {
             index_keys: None,
         };
         let decode_detail = "pre-read: version_id";
+        let data_detail = "pre-read: data";
         let keys_detail = "pre-read: index_keys is unset";
         let mut request = delete_request();
 
@@ -3021,13 +3039,20 @@ mod tests {
             decode_detail,
         );
         plain(
-            request
-                .after_unknown(PreviousVersion::from_row(&unset_keys))
-                .map(|_| ()),
+            request.pre_read_row(Ok(vec![bad_data()])).map(|_| ()),
+            data_detail,
+        );
+        plain(
+            request.previous_version(&unset_keys).map(|_| ()),
             keys_detail,
         );
         assert_eq!(
             logged!(decode_detail),
+            0,
+            "REST logs the 500, not the backend"
+        );
+        assert_eq!(
+            logged!(data_detail),
             0,
             "REST logs the 500, not the backend"
         );
@@ -3046,14 +3071,12 @@ mod tests {
         };
         replaced(request.pre_read_row(Ok(vec![null_version()])).map(|_| ()));
         assert_eq!(logged!(decode_detail), 1, "ResourceRow::decode's error");
-        replaced(
-            request
-                .after_unknown(PreviousVersion::from_row(&unset_keys))
-                .map(|_| ()),
-        );
+        replaced(request.pre_read_row(Ok(vec![bad_data()])).map(|_| ()));
+        assert_eq!(logged!(data_detail), 1, "the data cell's decoding error");
+        replaced(request.previous_version(&unset_keys).map(|_| ()));
         assert_eq!(logged!(keys_detail), 1, "PreviousVersion::from_row's error");
 
-        assert_eq!(logged!(REPLACED_LOG), 2);
+        assert_eq!(logged!(REPLACED_LOG), 3);
         logs_assert(|lines: &[&str]| {
             for line in lines.iter().filter(|line| line.contains(REPLACED_LOG)) {
                 for field in [

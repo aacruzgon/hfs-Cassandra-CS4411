@@ -8,8 +8,9 @@
 //! 1. **`check_id`** on the URL id, before any statement (Step 3 plan D11):
 //!    REST never checks it, and every key the design bounds holds it.
 //! 2. **Each turn** (at most `1 + UPSERT_MISS_RETRIES`, so 4):
-//!    1. R1 ([`CassandraBackend::read_resource_row`]), whose `index_keys`
-//!       is `K(N)` (G22);
+//!    1. R1 ([`CassandraBackend::select_resource_rows`], decoded by
+//!       [`CasRequest::pre_read_row`](super::write::CasRequest::pre_read_row)),
+//!       whose `index_keys` is `K(N)` (G22);
 //!    2. the pre-read check ([`CassandraBackend::check_earlier_attempts`]):
 //!       an earlier attempt of this request that applied late is this
 //!       request's success, so the body is never written twice (D13);
@@ -50,8 +51,8 @@ use super::errors::BACKEND_NAME;
 use super::index_keys::IndexKey;
 use super::read::ResourceRow;
 use super::write::{
-    Applied, CasKind, CasMiss, CasOutcome, CasPlan, PreviousVersion, RowKey, UPSERT_MISS_RETRIES,
-    check_id, check_search_parameter_code, normalized_body,
+    Applied, CasKind, CasMiss, CasOutcome, CasPlan, RowKey, UPSERT_MISS_RETRIES, check_id,
+    check_search_parameter_code, normalized_body,
 };
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
@@ -171,8 +172,10 @@ impl CassandraBackend {
                 }
                 // After an unknown outcome, R1's error answers as R2's does
                 // (ADR-aacruzgon-0067).
-                let row = request
-                    .after_unknown(self.read_resource_row(tenant_id, resource_type, id).await)?;
+                let row = request.pre_read_row(
+                    self.select_resource_rows(tenant_id, resource_type, id)
+                        .await,
+                )?;
                 if let Some(row) = &row {
                     created_at = row.created_at;
                 }
@@ -195,7 +198,7 @@ impl CassandraBackend {
                         row.version_id,
                     ),
                     (Branch::Revive, Some(row)) => {
-                        let previous = request.after_unknown(PreviousVersion::from_row(row))?;
+                        let previous = request.previous_version(row)?;
                         let (body, data) =
                             normalized_body("create_or_update", resource_type, id, body)?;
                         let plan =
@@ -371,8 +374,9 @@ mod node_tests {
     use crate::backends::cassandra::index_keys;
     use crate::backends::cassandra::session::{Fault, StatementKind};
     use crate::backends::cassandra::write::{
-        INSERT_VERSION, REVIVE_RESOURCE_IF_VERSION, SOFT_DELETE_RESOURCE_IF_VERSION,
-        UPDATE_RESOURCE_IF_VERSION, next_last_updated, write_ts_of,
+        INSERT_VERSION, PreviousVersion, REVIVE_RESOURCE_IF_VERSION,
+        SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, next_last_updated,
+        write_ts_of,
     };
     use crate::core::{ResourceStorage, SearchProvider};
     use crate::error::{ConcurrencyError, TenantError, ValidationError};

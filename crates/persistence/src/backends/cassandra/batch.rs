@@ -33,6 +33,7 @@ use cdrs_tokio::error::Error as CdrsError;
 use cdrs_tokio::frame::message_error::{ErrorType, WriteType};
 use cdrs_tokio::types::value::Value;
 
+use super::errors::is_invalid;
 use super::session::DriverError;
 
 /// The index tables of `docs/Cassandra/schema/schema.cql`, the only tables a
@@ -277,16 +278,20 @@ pub(crate) enum BatchFailure {
     /// statement carries a fixed `USING TIMESTAMP`, so applying one twice
     /// writes the same cells.
     Retry,
-    /// `Invalid`: the node refused the batch or statement as it stands
-    /// ("Batch too large", a key over 64 KiB). Another try gets the same
-    /// answer, so none is made, and the writer logs it at `error`. G35's
-    /// bound and [`MAX_BATCH_BYTES`] should make it impossible.
+    /// `Invalid` ([`is_invalid`], the post-CAS writers' one definition): the
+    /// node refused the batch or statement as it stands ("Batch too large",
+    /// a key over 64 KiB). Another try gets the same answer, so none is
+    /// made, and the writer logs it at `error`. G35's bound and
+    /// [`MAX_BATCH_BYTES`] should make it impossible.
     Refused,
 }
 
 /// Classifies a failed index batch or index statement (IW15); see
 /// [`BatchFailure`].
 pub(crate) fn classify_failure(error: &DriverError) -> BatchFailure {
+    if is_invalid(error) {
+        return BatchFailure::Refused;
+    }
     let DriverError::Driver(error) = error else {
         // The backend's deadline: the batch may or may not have been
         // applied, and sending it again is safe.
@@ -299,7 +304,6 @@ pub(crate) fn classify_failure(error: &DriverError) -> BatchFailure {
         ErrorType::WriteTimeout(timeout) if timeout.write_type == WriteType::Batch => {
             BatchFailure::InBatchlog
         }
-        ErrorType::Invalid => BatchFailure::Refused,
         _ => BatchFailure::Retry,
     }
 }

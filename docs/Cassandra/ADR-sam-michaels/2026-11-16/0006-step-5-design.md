@@ -106,7 +106,7 @@
     - **ADRs:** ADR-aacruzgon-0013 (the sweeper), 0017 (repair), 0027 (G22, P5, the lease), 0058 and 0066 (the CQL audit).
     - **Issues and pull requests:** issue #77; Sara's PR #83.
     - **My plan:** the "Step 5 plan" tab of my Cassandra Write Path Plan (a Claude Doc).
-    - **This entry's commit and pull request:** <filled in at commit>.
+    - **This entry's pull request:** #86.
 
 ## The 74 decisions
 

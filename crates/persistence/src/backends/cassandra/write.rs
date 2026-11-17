@@ -3374,6 +3374,42 @@ mod tests {
         );
     }
 
+    /// IW11 and IW14: a delta's units become packed batches, whole units of
+    /// them, with what they hold counted; a unit whose rows have no
+    /// statement yet fails alone and the others are still packed.
+    #[test]
+    fn a_delta_is_packed_into_batches_of_whole_units() {
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let ts = write_ts_of(lu2);
+        let empty = index_batches(&key(), &index_delta(&[], version_keys(&[], lu2)), ts);
+        assert!(empty.batches.is_empty() && empty.failures.is_empty());
+        assert_eq!(empty.stats, IndexWriteStats::default());
+
+        let next = [IndexKey::ResourcesByType, gender("female")];
+        let previous = [(&next[0], lu1)];
+        let delta = index_delta(&previous, version_keys(&next, lu2));
+        assert_eq!(delta.units.len(), 2, "resources_by_type, and the token");
+        let packed = index_batches(&key(), &delta, ts);
+        assert_eq!(packed.failures, vec![WriteFailure::Permanent], "the token");
+        assert_eq!(packed.batches.len(), 1);
+        let batch = &packed.batches[0];
+        assert_eq!(
+            batch.iter().map(IndexStatement::cql).collect::<Vec<_>>(),
+            vec![
+                INSERT_RESOURCES_BY_TYPE.as_str(),
+                DELETE_RESOURCES_BY_TYPE.as_str()
+            ],
+            "the unit whole, its insert first"
+        );
+        let stats = packed.stats;
+        assert_eq!(
+            (stats.rows_inserted, stats.rows_deleted, stats.batches),
+            (1, 1, 1)
+        );
+        assert_eq!(stats.largest_batch_bytes, wire_bytes(batch) as u64);
+    }
+
     /// D4: the miss mapping from the returned columns (spike A1). A missing
     /// row returns `[applied]` alone, so "no row" is the condition columns
     /// being absent, not a null `version_id`.
@@ -5030,6 +5066,156 @@ mod node_tests {
             .map(|row| row.get_r_by_name("version_id").unwrap())
             .collect();
         assert_eq!(versions, vec![2]);
+    }
+
+    /// The `version_id` of every `resources_by_type` row of the tenant's
+    /// Patients, newest `last_updated` first.
+    async fn by_type_versions(backend: &CassandraBackend, tenant: &TenantContext) -> Vec<i32> {
+        backend
+            .session
+            .rows(
+                "SELECT version_id FROM resources_by_type \
+                 WHERE tenant_id = ? AND resource_type = ?",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("resources_by_type")
+            .iter()
+            .map(|row| row.get_r_by_name("version_id").unwrap())
+            .collect()
+    }
+
+    /// IW15: an index batch that times out with write type `BATCH` was
+    /// written to the batchlog, which replays it, so it is not sent again;
+    /// it is not taken as done either, so the write succeeds with its intent
+    /// kept (G23). The fault applies the batch and then reports the timeout,
+    /// as a node does when the replicas answer late: the row has moved, in
+    /// one try.
+    #[tokio::test]
+    async fn a_batch_timeout_after_the_batchlog_is_not_retried_and_keeps_the_intent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("in-batchlog");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
+            .await
+            .unwrap();
+        let row1 = current(&backend, &tenant).await;
+        let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let plan = CasPlan::update(
+            PreviousVersion::from_row(&row1).unwrap(),
+            json,
+            data,
+            vec![IndexKey::ResourcesByType],
+        );
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::ApplyThenTimeOut,
+        );
+        let (before, counted) = (backend.cas_stats(), backend.statement_counts());
+        let mut request = backend.cas_request("update", key_of(&tenant));
+        let applied = applied_of(backend.run_cas(&mut request, plan).await.unwrap());
+        let stats = backend.cas_stats().since(&before);
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(applied.version_id, 2);
+        assert!(!applied.post_cas_complete, "not confirmed, so not complete");
+        assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
+        // V3, I1, V1 sent alone; one try of the batch; no I2.
+        assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (1, 2), "one try: {spent}");
+        assert_eq!(
+            by_type_versions(&backend, &tenant).await,
+            vec![2],
+            "applied"
+        );
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+        let intent = &request.attempts[0].intent;
+        let intents = backend
+            .session
+            .rows(
+                "SELECT version_id FROM pending_index_writes \
+                 WHERE bucket = ? AND shard = ? AND enqueued_at = ? \
+                 AND tenant_id = ? AND resource_type = ? AND id = ?",
+                vec![
+                    Value::from(intent.bucket.as_str()),
+                    Value::from(intent.shard),
+                    Value::from(intent.enqueued_at),
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("pending_index_writes");
+        assert_eq!(intents.len(), 1, "the intent is kept for the sweeper");
+    }
+
+    /// IW16: the index phase has one deadline over its tries and pauses.
+    /// Every try fails at once here, so the 10 ms and 20 ms pauses are what
+    /// take the time, and a 15 ms deadline ends the phase during the second
+    /// pause: fewer than three tries, and the delta fails as
+    /// `TriesExhausted`, left to the sweeper.
+    #[tokio::test]
+    async fn the_index_phase_stops_at_its_deadline() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("deadline");
+        let key = key_of(&tenant);
+        let lu1 = Utc::now();
+        let lu2 = lu1 + chrono::Duration::milliseconds(1);
+        let x1 = [IndexKey::ResourcesByType];
+        let previous = [(&x1[0], lu1)];
+        let delta = index_delta(
+            &previous,
+            VersionKeys {
+                version_id: 2,
+                last_updated: lu2,
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                keys: &x1,
+            },
+        );
+        for _ in 0..POST_CAS_WRITE_TRIES {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resources_by_type",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        let counted = backend.statement_counts();
+        let started = std::time::Instant::now();
+        let outcome = backend
+            .write_index_delta_within(
+                &key,
+                &delta,
+                write_ts_of(lu2),
+                POST_CAS_WRITE_TRIES,
+                Duration::from_millis(15),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome.result, Err(WriteFailure::TriesExhausted));
+        assert!(
+            (1..u64::from(POST_CAS_WRITE_TRIES)).contains(&spent.batch),
+            "{spent}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(outcome.stats.batches, 1, "packed once, whatever its tries");
     }
 
     /// A superseded attempt, found by the pre-read check: the row is past

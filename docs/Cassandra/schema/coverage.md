@@ -230,7 +230,8 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 | `_lastUpdated` beside the cursor | G19 | **resolved** on the node: lower bound plus cursor in one query; for an upper bound, send the tighter of bound and cursor |
 | `_lastUpdated` combined with another parameter | G19 | **resolved**: a residual filter, as the design says; a token-table slice is an optional optimisation |
 | `_id` and `_lastUpdated` index rows from the extractor | G17 | **resolved** (P5, ADR-aacruzgon-0027): dropped |
-| Display-only tokens (`CodeableConcept.text`, empty code) and other rows no query reads | G18 | **resolved** (P5, ADR-aacruzgon-0027): display-only tokens, the `IMPLICIT` and `''` rows in `token_system_index`, and empty URIs are dropped |
+| Composite parameters' component values from the extractor | C7 | **dropped** (ADR-sam-michaels-0006, IW3): no composite search is served, so nothing reads them; on 10k Synthea they would add 104,820 rows, +53% |
+| Display-only tokens (`CodeableConcept.text`, empty code) and other rows no query reads | G18 | **resolved** (P5, ADR-aacruzgon-0027): display-only tokens, the `IMPLICIT` and `''` rows in `token_system_index`, and empty URIs are dropped; from Step 5 every empty code is dropped, with or without a system (ADR-sam-michaels-0006, IW2) |
 | "Date-only" with two date parameters, a repeated date, or a date with `_lastUpdated` | G20 | **resolved** (ADR-aacruzgon-0027), `ne` and cross-table comma lists included (section 3) |
 | `count(tenant, None)`; filtered `search_count` and the candidate cap | G7 | **resolved** (ADR-aacruzgon-0027): tag checks and the cap for a filtered `search_count`; `count(tenant, None)` over every enabled version's type names |
 | The candidate cap's error and status (`too-costly`) | G27 | **resolved** (ADR-aacruzgon-0027): 422 `TooManyResults`, issue `processing`; no `too-costly`; the cap counts distinct candidates point-read; the compartment cap follows it |

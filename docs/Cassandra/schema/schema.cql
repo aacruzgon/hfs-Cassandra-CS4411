@@ -54,11 +54,12 @@
 --     writes deleted_at = 0, which replaces ADR-aacruzgon-0024's literal
 --     "SET deleted_at = null" (ADR-aacruzgon-0027, walkthrough G39);
 --   * never ALLOW FILTERING;
---   * never write an index row whose code, system, uri or param is longer than
---     1,024 bytes in UTF-8, or starts with "sha256:": such a value is written
---     as "sha256:" and the 64 hex digits of its SHA-256, and queries map their
---     values the same way; nothing is refused for its length
---     (ADR-aacruzgon-0079, amending 0026 and 0027).
+--   * never write an extracted code, system, uri or param unmapped if it is
+--     longer than 1,024 bytes in UTF-8 or starts with "sha256:"; such a value
+--     is written as "sha256:" and the 64 hex digits of its SHA-256, exactly
+--     once (keys read back from index_keys are never mapped again), and
+--     queries map their parsed values the same way; nothing is refused for
+--     its length (ADR-aacruzgon-0079, amending 0026 and 0027).
 --
 -- Common types:
 --   tenant_id, resource_type, id   text (id is never uuid: FHIR ids are

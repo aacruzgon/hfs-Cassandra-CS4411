@@ -34,6 +34,18 @@
 //! `USING TIMESTAMP`, and re-sending an intent row or its delete writes the
 //! same key again.
 //!
+//! **Index batches** go through [`CassandraSession::batch`], the one place a
+//! native-protocol batch is sent (roadmap Step 5; ADR-sam-michaels-0006,
+//! IW10 and IW13). A batch is always logged, always `LOCAL_QUORUM`, and
+//! idempotent like any other write. Its consistency is set on the batch
+//! itself: `cdrs-tokio` 10 takes a batch's consistency from the batch
+//! request, not from the statement parameters (10.0.0,
+//! `cluster/session.rs:536`), and the driver's batch builder defaults it to
+//! `ONE` (`cassandra-protocol` 5.0.0, `query/batch_query_builder.rs:41`), so
+//! a batch sent without it would write at `ONE`. It takes only
+//! [`IndexStatement`]s, so it can hold nothing but index-table rows (IW20,
+//! `batch.rs`). A batch of one statement is sent as a plain write.
+//!
 //! **Prepared statements** are prepared once per CQL text and kept for the
 //! life of the driver session. The driver re-prepares one transparently when
 //! a node answers `Unprepared`, which means that node did not execute it.
@@ -48,7 +60,8 @@
 //!
 //! **Counting.** Every statement is counted by kind before it is sent
 //! ([`StatementCounts`], `CassandraBackend::statement_counts`), for the
-//! write-amplification report (Step 3 CI report R5).
+//! write-amplification report (Step 3 CI report R5). A batch counts once as
+//! a batch request, and its statements count as batched (IW14).
 //!
 //! **Fault injection, tests only.** Under `cfg(test)`, and only there, a test
 //! can make the next matching statement report `WriteTimeout`/CAS, with or
@@ -73,9 +86,10 @@ use cdrs_tokio::cluster::{NodeAddress, NodeInfo, NodeTcpConfigBuilder, TcpConnec
 use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::frame::Envelope;
 use cdrs_tokio::frame::Version;
+use cdrs_tokio::frame::message_batch::BatchType;
 use cdrs_tokio::load_balancing::TopologyAwareLoadBalancingStrategy;
 use cdrs_tokio::load_balancing::node_distance_evaluator::NodeDistanceEvaluator;
-use cdrs_tokio::query::{PreparedQuery, QueryValues};
+use cdrs_tokio::query::{BatchQueryBuilder, PreparedQuery, QueryBatch, QueryValues};
 use cdrs_tokio::retry::{DefaultRetryPolicy, FallthroughRetryPolicy, RetryPolicy};
 use cdrs_tokio::statement::{StatementParams, StatementParamsBuilder};
 use cdrs_tokio::transport::TransportTcp;
@@ -84,6 +98,7 @@ use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
 use parking_lot::RwLock;
 
+use super::batch::IndexStatement;
 use super::config::CassandraConfig;
 
 /// The native protocol version the session speaks. Cassandra 5.0 serves v5
@@ -120,7 +135,7 @@ pub(crate) enum StatementKind {
     /// proposal before it answers.
     SerialRead,
     /// A plain write at `LOCAL_QUORUM`: intent rows, version rows, index
-    /// batches.
+    /// rows. An index batch is sent as this kind, but counted apart.
     Write,
     /// A compare-and-swap on `resources`: Paxos at `LOCAL_SERIAL`, commit at
     /// `LOCAL_QUORUM`, never re-sent by the driver.
@@ -472,14 +487,94 @@ impl CassandraSession {
             }
         }
     }
+
+    /// Sends `statements` as one logged batch at `LOCAL_QUORUM` (IW10,
+    /// IW13), with what [`Self::execute`] gives a statement: each prepared
+    /// once and cached, counted before it is sent (one batch request,
+    /// `statements.len()` batched), the test fault seam, and one request
+    /// deadline over the prepares and the send. Nothing is sent for no
+    /// statements, and one statement goes as a plain [`StatementKind::Write`]
+    /// through [`Self::execute`], counted as a write: a batch of one buys
+    /// nothing, and the node would treat it as a single mutation anyway.
+    ///
+    /// Each statement binds its own `USING TIMESTAMP`, so the batch sets no
+    /// timestamp of its own. Cassandra applies the rows of one partition key
+    /// in a batch as one mutation, whole on each replica; the batchlog makes
+    /// the rest all or nothing across partitions, eventually (walkthrough
+    /// section 2, "Index rows"). What a failure means is
+    /// [`classify_failure`](super::batch::classify_failure)'s to say.
+    #[allow(dead_code)] // Unused until the index writer sends its units through it.
+    pub(crate) async fn batch(&self, statements: Vec<IndexStatement>) -> Result<(), DriverError> {
+        if statements.len() <= 1 {
+            return match statements.into_iter().next() {
+                Some(statement) => {
+                    let (cql, values) = statement.into_parts();
+                    self.execute(cql, values, StatementKind::Write)
+                        .await
+                        .map(|_| ())
+                }
+                None => Ok(()),
+            };
+        }
+        self.counts.count_batch(statements.len());
+        self.send_batch(&statements).await
+    }
+
+    /// Prepares (on first use) and sends one batch under the request
+    /// deadline, with no counting and no injected fault.
+    async fn send_batch(&self, statements: &[IndexStatement]) -> Result<(), DriverError> {
+        let started = Instant::now();
+        let mut prepared = Vec::with_capacity(statements.len());
+        for statement in statements {
+            let remaining = self.request_timeout.saturating_sub(started.elapsed());
+            prepared.push(self.prepared(statement.cql(), remaining).await?);
+        }
+        let batch = index_batch(statements.iter().zip(prepared.iter().map(Arc::as_ref)))?;
+        // The driver takes the consistency from the batch itself. From these
+        // parameters it takes the idempotence, so its default retry policy
+        // may re-send the batch (once on the same node after a `BATCH_LOG`
+        // timeout, `retry/retry_policy.rs:157-171`), and no retry policy of
+        // its own, since only a CAS overrides it.
+        let params = statement_params(StatementKind::Write, Vec::new(), &self.no_retry);
+        let remaining = self.request_timeout.saturating_sub(started.elapsed());
+        within(
+            remaining,
+            true,
+            self.session.batch_with_params(batch, &params),
+        )
+        .await??;
+        Ok(())
+    }
 }
 
-/// Statements sent, one counter per [`StatementKind`].
+/// The driver batch of `statements`, each with its prepared form: logged,
+/// at `LOCAL_QUORUM`, with no serial consistency and no batch-wide
+/// timestamp (IW10, IW13). The consistency must be set here: the builder's
+/// default is `ONE`, and the driver reads a batch's consistency from the
+/// batch, not from its parameters (see the module docs).
+fn index_batch<'a>(
+    statements: impl IntoIterator<Item = (&'a IndexStatement, &'a PreparedQuery)>,
+) -> Result<QueryBatch, DriverError> {
+    let mut builder = BatchQueryBuilder::new()
+        .with_batch_type(BatchType::Logged)
+        .with_consistency(StatementKind::Write.consistency());
+    for (statement, prepared) in statements {
+        builder = builder.add_query_prepared(
+            prepared,
+            QueryValues::SimpleValues(statement.values().to_vec()),
+        );
+    }
+    Ok(builder.build()?)
+}
+
+/// Statements sent, one counter per [`StatementKind`], and the batches.
 #[derive(Debug, Default)]
 struct StatementCounters {
     read: AtomicU64,
     serial_read: AtomicU64,
     write: AtomicU64,
+    batch: AtomicU64,
+    batched: AtomicU64,
     cas: AtomicU64,
 }
 
@@ -494,11 +589,19 @@ impl StatementCounters {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One batch request holding `statements` statements.
+    fn count_batch(&self, statements: usize) {
+        self.batch.fetch_add(1, Ordering::Relaxed);
+        self.batched.fetch_add(statements as u64, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> StatementCounts {
         StatementCounts {
             read: self.read.load(Ordering::Relaxed),
             serial_read: self.serial_read.load(Ordering::Relaxed),
             write: self.write.load(Ordering::Relaxed),
+            batch: self.batch.load(Ordering::Relaxed),
+            batched: self.batched.load(Ordering::Relaxed),
             cas: self.cas.load(Ordering::Relaxed),
         }
     }
@@ -509,6 +612,11 @@ impl StatementCounters {
 /// failed ones included (Step 3 CI report R5, write amplification). Take one
 /// snapshot before and one after an operation and subtract with
 /// [`StatementCounts::since`].
+///
+/// A batch is counted twice over, in fields of its own (IW14, separate
+/// fields): once in `batch`, as the one request it is, and once per
+/// statement it carries in `batched`. `write` counts only statements sent
+/// alone, so a reader sees both the round trips and the rows they carried.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StatementCounts {
@@ -516,8 +624,14 @@ pub struct StatementCounts {
     pub read: u64,
     /// Reads at `LOCAL_SERIAL` (R2).
     pub serial_read: u64,
-    /// Plain writes at `LOCAL_QUORUM` (V1 to V3, index rows, I1, I2).
+    /// Plain writes at `LOCAL_QUORUM` sent alone (V1 to V3, I1, I2, an index
+    /// row with no other row in its batch).
     pub write: u64,
+    /// Logged batch requests at `LOCAL_QUORUM` (index rows), each one round
+    /// trip whatever it holds.
+    pub batch: u64,
+    /// Statements carried inside those batches.
+    pub batched: u64,
     /// Compare-and-swaps (C1 to C4).
     pub cas: u64,
 }
@@ -529,23 +643,26 @@ impl StatementCounts {
             read: self.read.saturating_sub(earlier.read),
             serial_read: self.serial_read.saturating_sub(earlier.serial_read),
             write: self.write.saturating_sub(earlier.write),
+            batch: self.batch.saturating_sub(earlier.batch),
+            batched: self.batched.saturating_sub(earlier.batched),
             cas: self.cas.saturating_sub(earlier.cas),
         }
     }
 
-    /// Every statement, whatever its kind.
+    /// Every request sent, a batch as one: the round trips. `batched` is
+    /// left out, since its statements travel inside the `batch` requests.
     pub fn total(&self) -> u64 {
-        self.read + self.serial_read + self.write + self.cas
+        self.read + self.serial_read + self.write + self.batch + self.cas
     }
 }
 
 impl std::fmt::Display for StatementCounts {
-    /// `read=1 serial_read=0 write=4 cas=1`.
+    /// `read=1 serial_read=0 write=4 batch=1 batched=2 cas=1`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "read={} serial_read={} write={} cas={}",
-            self.read, self.serial_read, self.write, self.cas
+            "read={} serial_read={} write={} batch={} batched={} cas={}",
+            self.read, self.serial_read, self.write, self.batch, self.batched, self.cas
         )
     }
 }
@@ -905,5 +1022,276 @@ mod tests {
         assert!(StatementKind::Read.is_idempotent());
         assert!(StatementKind::SerialRead.is_idempotent());
         assert!(StatementKind::Write.is_idempotent());
+    }
+
+    /// IW13: the batch request itself carries `LOCAL_QUORUM` and the logged
+    /// type, which is what the driver sends; the statement parameters'
+    /// consistency is not used for a batch. A batch is sent with
+    /// [`StatementKind::Write`]'s parameters, idempotent with the session's
+    /// retry policy (`statement_params_carry_the_kind_rules`).
+    #[test]
+    fn an_index_batch_is_logged_at_local_quorum_with_no_batch_timestamp() {
+        use super::super::batch::IndexCql;
+        use cdrs_tokio::types::CBytesShort;
+
+        const INSERT_ROW: IndexCql =
+            IndexCql::new("INSERT INTO uri_index (tenant_id, uri) VALUES (?, ?) USING TIMESTAMP ?");
+        let prepared = PreparedQuery::new(
+            CBytesShort::new(vec![1; 16]),
+            INSERT_ROW.as_str(),
+            Some("helios".to_string()),
+            Vec::new(),
+            None,
+        );
+        let statements: Vec<IndexStatement> = (0..3_i64)
+            .map(|i| {
+                IndexStatement::new(
+                    INSERT_ROW,
+                    vec![
+                        Value::from("t"),
+                        Value::from(format!("u{i}")),
+                        Value::from(i),
+                    ],
+                )
+            })
+            .collect();
+        let batch = index_batch(statements.iter().map(|statement| (statement, &prepared)))
+            .expect("a batch");
+        assert_eq!(batch.request.batch_type, BatchType::Logged);
+        assert_eq!(batch.request.consistency, Consistency::LocalQuorum);
+        assert_eq!(batch.request.serial_consistency, None);
+        assert_eq!(batch.request.timestamp, None);
+        assert_eq!(batch.request.queries.len(), 3);
+        for (query, statement) in batch.request.queries.iter().zip(&statements) {
+            assert_eq!(
+                query.values,
+                QueryValues::SimpleValues(statement.values().to_vec())
+            );
+        }
+        // Kept so the driver can prepare the statement again on a node that
+        // answers `Unprepared` (10.0.0, `cluster/session.rs:566-600`).
+        assert_eq!(batch.prepared_queries.len(), 1);
+    }
+
+    /// IW14, separate fields: a batch is one round trip in `batch` and its
+    /// statements in `batched`; `write` counts only statements sent alone.
+    #[test]
+    fn a_batch_counts_as_one_round_trip_and_its_statements_as_batched() {
+        let counters = StatementCounters::default();
+        counters.count(StatementKind::Write);
+        let before = counters.snapshot();
+        counters.count(StatementKind::Read);
+        counters.count(StatementKind::Write);
+        counters.count(StatementKind::Cas);
+        counters.count_batch(3);
+        counters.count_batch(2);
+        let spent = counters.snapshot().since(&before);
+        assert_eq!(
+            (spent.read, spent.serial_read, spent.write, spent.cas),
+            (1, 0, 1, 1)
+        );
+        assert_eq!((spent.batch, spent.batched), (2, 5));
+        assert_eq!(spent.total(), 5, "read, write, cas and two batches");
+        assert_eq!(
+            spent.to_string(),
+            "read=1 serial_read=0 write=1 batch=2 batched=5 cas=1"
+        );
+        assert_eq!(StatementCounts::default().total(), 0);
+    }
+}
+
+/// [`CassandraSession::batch`] against the node at `HFS_TEST_CASSANDRA_URL`
+/// (skipped when unset), on `resources_by_type` rows under a tenant of each
+/// test's own (ADR-aacruzgon-0020, rule 2: never cleaned up). That the batch
+/// goes at `LOCAL_QUORUM` is the unit test's to show: one node answers every
+/// consistency level alike.
+#[cfg(test)]
+mod node_tests {
+    use chrono::{DateTime, Utc};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::backends::cassandra::batch::IndexCql;
+    use crate::backends::cassandra::test_support::test_config;
+    use cdrs_tokio::types::IntoRustByName;
+
+    /// X1 and its delete, as the writer sends them (`write.rs`).
+    const INSERT_ROW: IndexCql = IndexCql::new(
+        "INSERT INTO resources_by_type \
+         (tenant_id, resource_type, last_updated, id, version_id, fhir_version) \
+         VALUES (?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+    );
+    const DELETE_ROW: IndexCql = IndexCql::new(
+        "DELETE FROM resources_by_type USING TIMESTAMP ? \
+         WHERE tenant_id = ? AND resource_type = ? AND last_updated = ? AND id = ?",
+    );
+
+    async fn session() -> Option<CassandraSession> {
+        let url = std::env::var("HFS_TEST_CASSANDRA_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())?;
+        Some(
+            CassandraSession::connect(&CassandraConfig {
+                contact_points: vec![url],
+                ..test_config()
+            })
+            .await
+            .expect("connect"),
+        )
+    }
+
+    fn tenant(case: &str) -> String {
+        format!("test-batch-{case}-{}", Uuid::new_v4().simple())
+    }
+
+    fn at(millis: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(millis).expect("a timestamp")
+    }
+
+    /// The `resources_by_type` row of `id` at `last_updated` (ms), written
+    /// `USING TIMESTAMP ts`.
+    fn insert(
+        tenant: &str,
+        resource_type: &str,
+        id: &str,
+        last_updated: i64,
+        ts: i64,
+    ) -> IndexStatement {
+        IndexStatement::new(
+            INSERT_ROW,
+            vec![
+                Value::from(tenant),
+                Value::from(resource_type),
+                Value::from(at(last_updated)),
+                Value::from(id),
+                Value::from(1_i32),
+                Value::from("4.0"),
+                Value::from(ts),
+            ],
+        )
+    }
+
+    /// The delete of that row, `USING TIMESTAMP ts`.
+    fn delete(
+        tenant: &str,
+        resource_type: &str,
+        id: &str,
+        last_updated: i64,
+        ts: i64,
+    ) -> IndexStatement {
+        IndexStatement::new(
+            DELETE_ROW,
+            vec![
+                Value::from(ts),
+                Value::from(tenant),
+                Value::from(resource_type),
+                Value::from(at(last_updated)),
+                Value::from(id),
+            ],
+        )
+    }
+
+    /// `(id, writetime)` of every row in the `(tenant, resource_type)`
+    /// partition, newest `last_updated` first (the table's clustering
+    /// order).
+    async fn rows_of(
+        session: &CassandraSession,
+        tenant: &str,
+        resource_type: &str,
+    ) -> Vec<(String, i64)> {
+        session
+            .rows(
+                "SELECT id, WRITETIME(version_id) AS written FROM resources_by_type \
+                 WHERE tenant_id = ? AND resource_type = ?",
+                vec![Value::from(tenant), Value::from(resource_type)],
+                StatementKind::Read,
+            )
+            .await
+            .expect("resources_by_type")
+            .iter()
+            .map(|row| {
+                (
+                    row.get_r_by_name("id").expect("id"),
+                    row.get_r_by_name("written").expect("written"),
+                )
+            })
+            .collect()
+    }
+
+    /// IW13 and IW14: one batch over two partitions writes every row at the
+    /// timestamp its own statement binds, and counts as one batch request
+    /// carrying its statements; a later batch moves a row within its
+    /// partition, the delete and the insert together (IW9's unit).
+    #[tokio::test]
+    async fn a_batch_writes_every_row_at_its_own_timestamp_and_counts_once() {
+        let Some(session) = session().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant("rows");
+        let before = session.statement_counts();
+        session
+            .batch(vec![
+                insert(&t, "Patient", "p1", 1_000, 1_000_001),
+                insert(&t, "Patient", "p2", 2_000, 2_000_001),
+                insert(&t, "Observation", "o1", 3_000, 3_000_001),
+            ])
+            .await
+            .expect("the batch");
+        let spent = session.statement_counts().since(&before);
+        eprintln!("[statements op=batch {spent}]");
+        assert_eq!(
+            (spent.write, spent.batch, spent.batched, spent.total()),
+            (0, 1, 3, 1),
+            "{spent}"
+        );
+        assert_eq!(
+            rows_of(&session, &t, "Patient").await,
+            vec![("p2".to_string(), 2_000_001), ("p1".to_string(), 1_000_001)]
+        );
+        assert_eq!(
+            rows_of(&session, &t, "Observation").await,
+            vec![("o1".to_string(), 3_000_001)]
+        );
+
+        session
+            .batch(vec![
+                delete(&t, "Patient", "p1", 1_000, 4_000_001),
+                insert(&t, "Patient", "p1", 4_000, 4_000_001),
+            ])
+            .await
+            .expect("the move");
+        assert_eq!(
+            rows_of(&session, &t, "Patient").await,
+            vec![("p1".to_string(), 4_000_001), ("p2".to_string(), 2_000_001)]
+        );
+    }
+
+    /// IW13: no statement sends nothing, and one goes as a plain write.
+    #[tokio::test]
+    async fn a_batch_of_one_is_a_plain_write_and_an_empty_one_sends_nothing() {
+        let Some(session) = session().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant("one");
+        let before = session.statement_counts();
+        session.batch(Vec::new()).await.expect("nothing to send");
+        assert_eq!(session.statement_counts().since(&before).total(), 0);
+
+        session
+            .batch(vec![insert(&t, "Patient", "p1", 1_000, 1_000_001)])
+            .await
+            .expect("one row");
+        let spent = session.statement_counts().since(&before);
+        assert_eq!(
+            (spent.write, spent.batch, spent.batched),
+            (1, 0, 0),
+            "{spent}"
+        );
+        assert_eq!(
+            rows_of(&session, &t, "Patient").await,
+            vec![("p1".to_string(), 1_000_001)]
+        );
     }
 }

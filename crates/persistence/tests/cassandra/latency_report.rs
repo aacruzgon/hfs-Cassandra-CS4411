@@ -88,7 +88,11 @@ mod counters {
     pub type Counts = BTreeMap<String, u64>;
 
     /// Statements sent so far, by kind (R5): `read`, `serial_read`, `write`
-    /// and `cas`, every request counted, paged pages included.
+    /// and `cas`, every request counted, paged pages included; and the index
+    /// batches, as `batch` (requests) and `batched` (statements inside them),
+    /// so the column shows both the round trips and the rows they carried
+    /// (roadmap Step 5; ADR-sam-michaels-0006, IW14). `write` counts only
+    /// statements sent alone.
     pub fn statements(backend: &CassandraBackend) -> Option<Counts> {
         let counts = backend.statement_counts();
         Some(
@@ -96,6 +100,8 @@ mod counters {
                 ("read", counts.read),
                 ("serial_read", counts.serial_read),
                 ("write", counts.write),
+                ("batch", counts.batch),
+                ("batched", counts.batched),
                 ("cas", counts.cas),
             ]
             .into_iter()
@@ -569,7 +575,12 @@ async fn cassandra_latency_report() {
             statements,
         ));
     }
-    if !counters_exposed {
+    if counters_exposed {
+        md.push_str(
+            "\nStatements per call: `batch` counts index batch requests and `batched` the \
+             statements inside them; `write` counts writes sent alone.\n",
+        );
+    } else {
         md.push_str(
             "\nStatements per call and CAS outcomes: the backend's counters could not be read.\n",
         );

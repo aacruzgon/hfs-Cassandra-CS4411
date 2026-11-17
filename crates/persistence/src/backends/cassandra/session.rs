@@ -504,7 +504,6 @@ impl CassandraSession {
     /// the rest all or nothing across partitions, eventually (walkthrough
     /// section 2, "Index rows"). What a failure means is
     /// [`classify_failure`](super::batch::classify_failure)'s to say.
-    #[allow(dead_code)] // Unused until the index writer sends its units through it.
     pub(crate) async fn batch(&self, statements: Vec<IndexStatement>) -> Result<(), DriverError> {
         if statements.len() <= 1 {
             return match statements.into_iter().next() {

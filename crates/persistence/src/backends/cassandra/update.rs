@@ -662,11 +662,15 @@ mod node_tests {
             .expect("update");
         let spent = backend.statement_counts().since(&before);
         eprintln!("[statements op=update {spent}]");
-        // R1; V3, I1, V1, X1 delete, X1 insert, I2; one C2.
+        // R1; V3, I1, V1, I2 sent alone; the X1 insert and delete in one
+        // batch, since both rows sit in the `(tenant, Patient)` partition
+        // (IW9 B, IW14); one C2.
         assert_eq!(
             (spent.read, spent.serial_read, spent.write, spent.cas),
-            (1, 0, 6, 1)
+            (1, 0, 4, 1)
         );
+        assert_eq!((spent.batch, spent.batched), (1, 2), "{spent}");
+        assert_eq!(spent.total(), 7, "round trips: {spent}");
 
         assert_eq!(updated.version_id(), "2");
         assert_eq!(

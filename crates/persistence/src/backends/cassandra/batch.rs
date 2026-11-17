@@ -22,11 +22,6 @@
 //!
 //! [`CassandraSession::batch`]: super::session::CassandraSession::batch
 
-// Pull request 3 builds this module before the index writer uses it: the
-// session's batch call and its tests use the statement types now, and the
-// writer takes up `pack` and `classify_failure` in the same pull request.
-#![allow(dead_code)]
-
 use std::ops::Range;
 
 use cdrs_tokio::error::Error as CdrsError;

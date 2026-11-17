@@ -163,7 +163,6 @@ impl fmt::Display for CasStats {
 /// here too, although the session sends it as a plain write.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
-#[allow(dead_code)] // The index writer fills it from IW11's packing on.
 pub(crate) struct IndexWriteStats {
     /// Index rows inserted.
     pub(crate) rows_inserted: u64,
@@ -175,7 +174,6 @@ pub(crate) struct IndexWriteStats {
     pub(crate) largest_batch_bytes: u64,
 }
 
-#[allow(dead_code)] // The index writer fills it from IW11's packing on.
 impl IndexWriteStats {
     /// Counts one batch of `inserted` inserts and `deleted` deletes taking
     /// `bytes` on the wire.

@@ -20,6 +20,7 @@
     2. **The version row before the index rows, and no index rows without it (IW24).**
         - Step 4's version row is acknowledged before step 5 is sent, so anything search finds can be opened with vread and `_history`.
         - New: when the version row fails all its tries, step 5 is skipped, where today it runs anyway (`write.rs:1703-1707`). The intent stays, and the sweeper writes both.
+        - **The skip lands with the sweeper, in pull request 6, not in pull request 2** (decided 2026-11-17). Without a sweeper it does more harm than good. Take an update to N+1 whose version row fails, and a later update to N+2. N+2's index step takes N+1's keys as the rows to delete, so it never deletes N's `resources_by_type` row, and `count` shows the resource twice until the sweeper (whose superseded case deletes N's keys) or repair runs. Without the skip, the index moves to N+1, N+2 cleans up normally, and only vread of N+1 answers 404 until N+2 rewrites that row. Vread of the failed version answers 404 either way, since it reads only `resource_versions`.
     3. **One row-identity rule (IW7).** One function in `index_keys.rs` decides whether two index rows are the same row, by each table's own primary key. It fixes the tie bug, and it must merge before extraction is switched on. The writer, the sweeper, repair and the consistency check all call it.
     4. **The sweeper reads at quorum first (SW12). This departs from the signed-off design.**
         - The sweeper reads the resource row at `LOCAL_QUORUM`. If that shows version V or later, V is committed, so it replays with no Paxos promise. Only if there is no row, or the version is below V, does it fall back to `LOCAL_SERIAL`, which finishes a compare-and-swap that is still in flight before the intent is deleted.
@@ -88,6 +89,7 @@
     - **What the human changed:**
         - **IW9.** I asked why throughput mattered for IW9. The 9.7k-against-6.2k writes/s figure timed the index step alone, on one node, with no target behind it. The plan had led with it, and I had the decision reworded to lead with `count`, which is the real reason.
         - **SW12.** I asked that the plan and this entry say why the sweeper does not use a serial read for every intent.
+        - **IW24's timing.** The plan put the skip in pull request 2. The worker building it found the `count` orphan above, and I moved the skip to pull request 6.
         - **The other 68** I approved as recommended.
     - **What was verified, and how:**
         - **On the dev node (Cassandra 5.0.9, single node), by the research workers:**
@@ -113,11 +115,11 @@
 **Build order.** Eight pull requests, one roadmap concern each:
 
 1. This entry and the doc edits.
-2. Row identity and the shared writer, with no behaviour change (IW7, IW9, IW17, IW24).
+2. Row identity and the shared writer, with no behaviour change (IW7, IW9, IW17).
 3. Batches in the session (IW10, IW11, IW13, IW14, IW20).
 4. Crash checkpoints and the consistency check (RV10 to RV16).
 5. Extraction switched on, item 5.1.
-6. The sweeper, item 5.2.
+6. The sweeper, item 5.2, with IW24's skip.
 7. Repair, item 5.3.
 8. The crash tests and the required post-suite step, item 5.4 and Step 5's exit.
 

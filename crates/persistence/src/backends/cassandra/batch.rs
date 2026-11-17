@@ -306,6 +306,9 @@ pub(crate) fn classify_failure(error: &DriverError) -> BatchFailure {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
     use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::frame::message_error::{
         ErrorBody, FailureInfo, UnavailableError, WriteFailureError, WriteTimeoutError,
@@ -562,5 +565,156 @@ mod tests {
             classify_failure(&server(ErrorType::Invalid)),
             BatchFailure::Refused
         );
+    }
+
+    /// Every `.rs` file of the backend, subdirectories included.
+    fn backend_sources() -> Vec<(PathBuf, String)> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backends/cassandra");
+        let mut pending = vec![dir];
+        let mut files = Vec::new();
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).expect("the backend's directory") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let source = std::fs::read_to_string(&path).expect("a source file");
+                    files.push((path, source));
+                }
+            }
+        }
+        files
+    }
+
+    /// The `"…"` string literal that starts at `source[at..]` after any
+    /// whitespace, with escapes resolved and `\`-newline continuations folded
+    /// as the compiler folds them; `None` if no literal starts there.
+    fn literal_at(source: &str, at: usize) -> Option<String> {
+        let mut chars = source[at..].trim_start().chars().peekable();
+        if chars.next() != Some('"') {
+            return None;
+        }
+        let mut literal = String::new();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => return Some(literal),
+                '\\' => match chars.next()? {
+                    '\n' => {
+                        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                            chars.next();
+                        }
+                    }
+                    'n' => literal.push('\n'),
+                    escaped => literal.push(escaped),
+                },
+                c => literal.push(c),
+            }
+        }
+        None
+    }
+
+    /// An independent reading of what an index statement is, which does not
+    /// call [`writes_an_index_table`].
+    fn is_index_write(cql: &str) -> bool {
+        let pattern = format!(
+            r"^(INSERT INTO|{} FROM) ({})[ (]",
+            ["DE", "LETE"].concat(),
+            INDEX_TABLES.join("|")
+        );
+        regex::Regex::new(&pattern).unwrap().is_match(cql) && !cql.contains(';')
+    }
+
+    /// IW20, the source half of audit rule (d) (`ci-report.py`): a failed
+    /// native batch leaves no statement text in the audit log, so the proof
+    /// that none could hold a write to `resources` or `resource_versions`
+    /// comes from the source. Scanned in every file of the backend
+    /// (`read_dir`, so a new file is never missed):
+    ///
+    /// 1. every call of `IndexCql::new` initializes a `const` item, so the
+    ///    compiler runs its check, and its text writes an index table by a
+    ///    pattern of this test's own;
+    /// 2. an `IndexCql` is built nowhere else: its tuple constructor appears
+    ///    only in `batch.rs`, once in its declaration and once in `new`;
+    /// 3. the driver's batch call and builder appear only in `session.rs`,
+    ///    once, behind `CassandraSession::batch`, which takes
+    ///    `IndexStatement`s, so nothing sends a batch around the type.
+    #[test]
+    fn only_index_table_statements_can_reach_a_batch() {
+        let files = backend_sources();
+        assert!(files.len() >= 15, "scanned only {} files", files.len());
+        // A `const` item's name and type, then `=`, right before the call.
+        let const_item = regex::Regex::new(r"\bconst\s+[A-Z][A-Z0-9_]*\s*:\s*IndexCql\s*=\s*$")
+            .expect("a pattern");
+        let call = ["IndexCql", "::new("].concat();
+        let constructor = ["IndexCql", "("].concat();
+        let driver_batch = ["batch", "_with_params("].concat();
+        let builder = ["BatchQuery", "Builder"].concat();
+
+        let mut texts = BTreeSet::new();
+        let mut problems = Vec::new();
+        let mut constructors = Vec::new();
+        let mut driver_batches = Vec::new();
+        for (path, source) in &files {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            for (at, _) in source.match_indices(&call) {
+                // The item the call ends: from the last `;`, `{` or `}`.
+                let item = &source[source[..at].rfind([';', '{', '}']).map_or(0, |n| n + 1)..at];
+                if !const_item.is_match(item) {
+                    problems.push(format!("{name}: not a const item: {}", item.trim()));
+                }
+                match literal_at(source, at + call.len()) {
+                    Some(cql) if is_index_write(&cql) => {
+                        texts.insert(cql);
+                    }
+                    Some(cql) => problems.push(format!("{name}: not an index write: {cql}")),
+                    None => problems.push(format!("{name}: no literal after {call}")),
+                }
+            }
+            for (at, _) in source.match_indices(&constructor) {
+                // Only the tuple constructor itself, not a longer name.
+                let ends_a_name = source[..at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                if ends_a_name {
+                    constructors.push(name.to_string());
+                }
+            }
+            for _ in source.match_indices(&driver_batch) {
+                driver_batches.push(name.to_string());
+            }
+            if source.contains(&builder) && name != "session.rs" {
+                problems.push(format!("{name} builds a driver batch"));
+            }
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
+        assert!(!texts.is_empty(), "no IndexCql found");
+        assert_eq!(
+            constructors,
+            vec!["batch.rs", "batch.rs"],
+            "the tuple constructor outside its declaration and new"
+        );
+        assert_eq!(driver_batches, vec!["session.rs"], "driver batch calls");
+
+        // The scan's own pattern: what it lets through and what it refuses.
+        let delete = ["DE", "LETE FROM "].concat();
+        assert!(is_index_write(INSERT_ROW.as_str()));
+        assert!(is_index_write(&format!(
+            "{delete}resources_by_type USING TIMESTAMP ? WHERE id = ?"
+        )));
+        assert!(!is_index_write(&format!("{delete}resources WHERE id = ?")));
+        assert!(!is_index_write(&format!(
+            "{delete}resource_versions WHERE id = ?"
+        )));
+        assert!(!is_index_write("INSERT INTO resources (id) VALUES (?)"));
+        assert!(!is_index_write(&format!(
+            "INSERT INTO uri_index (id) VALUES (?); {delete}resources"
+        )));
+        assert_eq!(
+            literal_at(" \"A \\\n     B\\\"\" x", 0).as_deref(),
+            Some("A B\"")
+        );
+        assert!(const_item.is_match("    const INSERT_ROW: IndexCql = "));
+        assert!(!const_item.is_match("    let cql = "));
     }
 }

@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0026: Schema audit fixes: compartment and FHIR-version residuals, a 2 KiB limit on indexed values, `write_id` on version rows, and intersected `_id` parameters
 
 - **Date:** 2026-11-05
-- **Status:** accepted
+- **Status:** accepted; G35's refusal is replaced by hashing in ADR-aacruzgon-0079
 - **Context:**
     - **Why an audit.** Before the team records its sign-off on the schema (roadmap row 1.4), Alan asked for an independent review of `schema.cql`, the walkthrough, the coverage table and the design, against the code at `main` after the upstream sync (PR #28) and PR #32. A defect found now costs an edit; after Step 2 it costs a data migration.
     - **What the audit found that needed a decision.** Five gaps, each with workable alternatives:

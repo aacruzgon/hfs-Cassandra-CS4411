@@ -1,0 +1,16 @@
+k=16 update pattern, 32 writers x 500 writes; pass 1 (forward)
+  sequential                                    5422 writes/s  p50   5.28 ms  p95   7.28 ms  p99  22.93 ms
+  logged ins+del (A: 2 batches)                 6170 writes/s  p50   2.84 ms  p95  14.77 ms  p99  52.07 ms
+  logged one batch ins+del                      9682 writes/s  p50   1.51 ms  p95   3.31 ms  p99  52.16 ms
+  unlogged one batch ins+del                    9397 writes/s  p50   1.56 ms  p95   3.70 ms  p99  53.53 ms
+  concurrent ins then concurrent del            3799 writes/s  p50   3.44 ms  p95  60.27 ms  p99  65.21 ms
+  pairs: per-partition batch, concurrent        6419 writes/s  p50   2.06 ms  p95  11.11 ms  p99  60.26 ms
+  chains: per key ins then del, concurrent      4187 writes/s  p50   3.41 ms  p95  56.17 ms  p99  60.59 ms
+pass 2 (reverse order)
+  chains: per key ins then del, concurrent      3831 writes/s  p50   3.37 ms  p95  59.52 ms  p99  65.42 ms
+  pairs: per-partition batch, concurrent        6429 writes/s  p50   2.17 ms  p95  11.34 ms  p99  58.13 ms
+  concurrent ins then concurrent del            3971 writes/s  p50   3.52 ms  p95  56.60 ms  p99  63.32 ms
+  unlogged one batch ins+del                    9042 writes/s  p50   1.66 ms  p95   3.64 ms  p99  51.11 ms
+  logged one batch ins+del                      7149 writes/s  p50   1.78 ms  p95  12.45 ms  p99  63.13 ms
+  logged ins+del (A: 2 batches)                 4152 writes/s  p50   3.05 ms  p95  57.04 ms  p99  66.86 ms
+  sequential                                    3472 writes/s  p50   6.27 ms  p95  31.87 ms  p99  49.11 ms

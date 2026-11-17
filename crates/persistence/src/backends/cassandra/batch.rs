@@ -218,13 +218,17 @@ pub(crate) const MAX_BATCH_BYTES: usize = 5 * 1024 - 256;
 ///
 /// - **A unit is never split.** A unit is every row of one partition key, its
 ///   inserts and its deletes (IW9 B). Cassandra applies one partition's
-///   mutation whole on each replica, so a reader never sees half of it; most
-///   of all, `count` never sees an updated resource's `resources_by_type`
-///   row at both `last_updated` values at once.
+///   mutation whole on each replica; most of all, once the batch has
+///   reached a quorum, `count` never sees an updated resource's
+///   `resources_by_type` row at both `last_updated` values at once (on RF 3
+///   a batch that reached fewer can, for a while: ADR-sam-michaels-0006,
+///   IW9).
 /// - **A unit over `bound` goes alone**, as a batch of its own. Such a unit
 ///   is one partition, so the node neither size-checks it nor writes it to
 ///   the batchlog (`BatchStatement.java:331-367`). No fixture comes near:
-///   it takes values close to G35's 2,048-byte bound.
+///   it takes several values close to 1,024 bytes, the most an index value
+///   keeps before it is stored as its SHA-256 (G35 as amended by
+///   ADR-aacruzgon-0079).
 /// - **Order is kept.** Units fill a batch in the order given until the next
 ///   one would pass `bound` (next fit). Packing tighter would reorder units
 ///   and buy little: the batches of one write are sent at once (IW12).
@@ -265,9 +269,11 @@ pub(crate) enum BatchFailure {
     /// there first.
     InBatchlog,
     /// Worth another try: `WriteTimeout` with `BATCH_LOG` (the batchlog write
-    /// itself timed out, so nothing was applied), with `SIMPLE` (a lone
-    /// statement, or a batch of one partition, which the node runs without a
-    /// batchlog) or with another write type; `WriteFailure`, `Unavailable`,
+    /// timed out; the batch may or may not be applied later, by a batchlog
+    /// replay), with `SIMPLE` (a lone statement, or a batch of one
+    /// partition, which the node runs without a batchlog,
+    /// `StorageProxy.java:885`), with `UNLOGGED_BATCH` (IW10's fallback) or
+    /// with another write type; `WriteFailure`, `Unavailable`,
     /// `Overloaded`, a node-side `Server` error, a dropped connection, the
     /// backend's own deadline, and anything else but `Invalid`. Every index
     /// statement carries a fixed `USING TIMESTAMP`, so applying one twice
@@ -276,8 +282,9 @@ pub(crate) enum BatchFailure {
     /// `Invalid` ([`is_invalid`], the post-CAS writers' one definition): the
     /// node refused the batch or statement as it stands ("Batch too large",
     /// a key over 64 KiB). Another try gets the same answer, so none is
-    /// made, and the writer logs it at `error`. G35's bound and
-    /// [`MAX_BATCH_BYTES`] should make it impossible.
+    /// made, and the writer logs it at `error`. The 1,024-byte mapping of
+    /// G35 as amended (ADR-aacruzgon-0079) and [`MAX_BATCH_BYTES`] should
+    /// make it impossible.
     Refused,
 }
 

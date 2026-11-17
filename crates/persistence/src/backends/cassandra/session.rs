@@ -24,7 +24,9 @@
 //! `IsBootstrapping` (`:175-182`), whatever its idempotence, so a CAS also
 //! carries [`FallthroughRetryPolicy`], which never retries (`:52-69`). The
 //! other three kinds keep the default session: each of those re-sends is safe
-//! for a read, and for a write with a fixed `USING TIMESTAMP`. Whether a CAS
+//! for a read, and for a write with a fixed `USING TIMESTAMP`. An index batch
+//! carries [`FallthroughRetryPolicy`] too, so each of the writer's tries is
+//! one send (below). Whether a CAS
 //! whose outcome is unknown ran is decided by the caller, from a
 //! [`SerialRead`](StatementKind::SerialRead), never by the driver.
 //!
@@ -44,7 +46,10 @@
 //! `ONE` (`cassandra-protocol` 5.0.0, `query/batch_query_builder.rs:41`), so
 //! a batch sent without it would write at `ONE`. It takes only
 //! [`IndexStatement`]s, so it can hold nothing but index-table rows (IW20,
-//! `batch.rs`). A batch of one statement is sent as a plain write.
+//! `batch.rs`). A batch of one statement is sent as a plain write. The driver
+//! never re-sends a batch by itself: the writer retries it (IW16), and the
+//! driver's default policy would add a hidden second send after a
+//! `BATCH_LOG` timeout (`retry/retry_policy.rs:157-171`).
 //!
 //! **Prepared statements** are prepared once per CQL text and kept for the
 //! life of the driver session. The driver re-prepares one transparently when
@@ -534,12 +539,7 @@ impl CassandraSession {
             prepared.push(self.prepared(statement.cql(), remaining).await?);
         }
         let batch = index_batch(statements.iter().zip(prepared.iter().map(Arc::as_ref)))?;
-        // The driver takes the consistency from the batch itself. From these
-        // parameters it takes the idempotence, so its default retry policy
-        // may re-send the batch (once on the same node after a `BATCH_LOG`
-        // timeout, `retry/retry_policy.rs:157-171`), and no retry policy of
-        // its own, since only a CAS overrides it.
-        let params = statement_params(StatementKind::Write, Vec::new(), &self.no_retry);
+        let params = batch_params(&self.no_retry);
         let remaining = self.request_timeout.saturating_sub(started.elapsed());
         within(
             remaining,
@@ -569,6 +569,21 @@ fn index_batch<'a>(
         );
     }
     Ok(builder.build()?)
+}
+
+/// The parameters an index batch is sent with (IW13, IW16). The driver takes
+/// a batch's consistency from the batch itself ([`index_batch`]); from these
+/// it takes the idempotence and the retry policy. A batch carries
+/// [`FallthroughRetryPolicy`], as a CAS does, so the driver never re-sends it
+/// by itself: the default policy would re-send an idempotent batch once on
+/// the same node after a `BATCH_LOG` timeout (`cdrs-tokio` 10.0.0,
+/// `retry/retry_policy.rs:157-171`). Each of the writer's tries is then one
+/// send, which the counters see (IW14), and a hung node costs one node
+/// timeout per try, not two, inside the index phase's deadline.
+fn batch_params(no_retry: &Arc<dyn RetryPolicy + Send + Sync>) -> StatementParams {
+    let mut params = statement_params(StatementKind::Write, Vec::new(), no_retry);
+    params.retry_policy = Some(no_retry.clone());
+    params
 }
 
 /// Statements sent, one counter per [`StatementKind`], and the batches.
@@ -682,16 +697,33 @@ impl std::fmt::Display for StatementCounts {
 /// insert" keeps failing it once that row travels in a batch (IW14). The
 /// fault then acts on the whole batch, never on one statement of it, since
 /// the node applies or refuses a batch as a whole. A fault that reports a
-/// `WriteTimeout` reports it with the write type a batch would get, and with
-/// what that write type means for the rows (native protocol v5, section 9):
+/// `WriteTimeout` reports it with the write type a batch of **several
+/// partitions** would get, and with one outcome that write type allows for
+/// the rows (native protocol v5, section 9):
 ///
 /// | Fault | On a batch |
 /// | --- | --- |
 /// | `ApplyThenTimeOut` | applied, then `WriteTimeout`/`BATCH`: the batchlog was written and the replicas were too slow to answer |
-/// | `TimeOutWithoutApplying` | `WriteTimeout`/`BATCH_LOG`, not applied: the batchlog write itself timed out |
+/// | `TimeOutWithoutApplying` | `WriteTimeout`/`BATCH_LOG`, not applied: the batchlog write timed out, and the batch never reached it |
 /// | `ApplyLate` | `WriteTimeout`/`BATCH` now, applied just before the next statement of kind `before`: the batchlog's replay |
 /// | `PassThrough` | sent as usual |
 /// | every other fault | the same error as for one statement, not applied |
+///
+/// A real `BATCH_LOG` timeout says only that the batchlog write timed out:
+/// the batch may still be applied later, by a batchlog replay. The writer
+/// retries it either way, and `TimeOutWithoutApplying` takes the outcome
+/// where nothing was applied.
+///
+/// **A batch of one partition never gets `BATCH` or `BATCH_LOG` from a real
+/// node.** The node applies it as one mutation, without the batchlog, and
+/// times it out as `SIMPLE` (`BatchStatement.java`, a logged batch is atomic
+/// only across more than one mutation; `StorageProxy.java:885`), which the
+/// writer retries. The seam does not know a batch's partitions, so a test
+/// that fails such a batch with `ApplyThenTimeOut` or `ApplyLate` drives the
+/// writer's `BATCH` path with a timeout the node would not send for it. With
+/// the key set `[ResourcesByType]`, every write's batch is one partition, so
+/// until pull request 5 adds the token, date and URI rows, those tests check
+/// the writer's handling of `BATCH`, not a case a node can produce.
 ///
 /// A batch of one statement is a plain write, and a fault acts on it as on
 /// any statement.
@@ -1089,6 +1121,55 @@ mod tests {
                 "{kind:?}: only a CAS overrides the session retry policy"
             );
         }
+    }
+
+    /// IW16: a batch is never re-sent by the driver. The default policy
+    /// re-sends an idempotent batch once after a `BATCH_LOG` timeout; the
+    /// batch's own policy declines, so each writer try is one send.
+    #[test]
+    fn an_index_batch_is_never_re_sent_by_the_driver() {
+        use cdrs_tokio::frame::message_error::{
+            ErrorBody, ErrorType, WriteTimeoutError, WriteType,
+        };
+        use cdrs_tokio::retry::{QueryInfo, RetryDecision};
+
+        let no_retry: Arc<dyn RetryPolicy + Send + Sync> = Arc::new(FallthroughRetryPolicy);
+        let params = batch_params(&no_retry);
+        assert_eq!(params.query_params.consistency, Consistency::LocalQuorum);
+        assert_eq!(params.query_params.serial_consistency, None);
+        assert!(params.is_idempotent);
+        assert!(params.speculative_execution_policy.is_none());
+        let policy = params
+            .retry_policy
+            .expect("a batch carries its own retry policy");
+        assert!(Arc::ptr_eq(&policy, &no_retry));
+
+        let batch_log_timeout = cdrs_tokio::error::Error::Server {
+            body: ErrorBody::new(
+                "a batchlog write timed out",
+                ErrorType::WriteTimeout(WriteTimeoutError::new(
+                    Consistency::LocalQuorum,
+                    0,
+                    1,
+                    WriteType::BatchLog,
+                    None,
+                )),
+            ),
+            addr: "127.0.0.1:9042".parse().expect("an address"),
+        };
+        assert_eq!(
+            DefaultRetryPolicy
+                .new_session()
+                .decide(QueryInfo::new(&batch_log_timeout, true)),
+            RetryDecision::RetrySameNode,
+            "the default policy re-sends it, which is why a batch overrides it"
+        );
+        assert_eq!(
+            policy
+                .new_session()
+                .decide(QueryInfo::new(&batch_log_timeout, true)),
+            RetryDecision::DontRetry
+        );
     }
 
     fn node_in(datacenter: &str) -> NodeInfo {

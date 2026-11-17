@@ -2133,9 +2133,12 @@ impl CassandraBackend {
     /// - **Packed, never split** (IW9 B, IW11). The units are packed in order
     ///   into batches of at most [`MAX_BATCH_BYTES`] by [`wire_bytes`]
     ///   ([`index_batches`]). A unit is every row of one partition, which
-    ///   Cassandra applies whole on each replica, so no reader sees half of
-    ///   one; above all, `count` never sees an updated resource's
-    ///   `resources_by_type` row twice. A unit over the bound goes alone.
+    ///   Cassandra applies whole on each replica; above all, once the batch
+    ///   has reached a quorum, `count` never sees an updated resource's
+    ///   `resources_by_type` row twice. On RF 3 a batch that reached fewer
+    ///   can still be counted twice for a while, since blocking read repair
+    ///   copies only the rows a read covered (ADR-sam-michaels-0006, IW9). A
+    ///   unit over the bound goes alone.
     /// - **All at once, at most [`INDEX_BATCHES_IN_FLIGHT`] in flight**
     ///   (IW12), as futures inside the request's own task, never
     ///   `tokio::spawn`, so a request that is dropped, or a crash test that
@@ -5095,6 +5098,12 @@ mod node_tests {
     /// kept (G23). The fault applies the batch and then reports the timeout,
     /// as a node does when the replicas answer late: the row has moved, in
     /// one try.
+    ///
+    /// The update's batch holds one partition, `(tenant, Patient)`, which a
+    /// real node applies without the batchlog and would time out as `SIMPLE`
+    /// (see `Fault`, "On a batch"). So this checks the writer's handling of
+    /// `BATCH`; a node first sends `BATCH` for a write's batch once pull
+    /// request 5 spreads a write's rows over several partitions.
     #[tokio::test]
     async fn a_batch_timeout_after_the_batchlog_is_not_retried_and_keeps_the_intent() {
         let Some(backend) = backend().await else {

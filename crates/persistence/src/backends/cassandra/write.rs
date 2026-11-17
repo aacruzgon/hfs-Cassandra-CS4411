@@ -24,6 +24,11 @@
 //!    does not have, insert `K(N+1)`.
 //! 6. I2, the intent delete.
 //!
+//! Step 4 takes plain inputs ([`VersionRow`], a timestamp and a number of
+//! tries), not the request's [`CasPlan`], so the sweeper writes through the
+//! same code (IW17 = SW14). The Step 5 decisions cited here as IW… are
+//! recorded in ADR-sam-michaels-0006.
+//!
 //! **What `K(V)` holds in Step 3.** Only the `resources_by_type` row (X1),
 //! pulled forward from Step 5 so that `count` works and the conformance
 //! seeder can run at boot. Its key includes the version's `last_updated`, so
@@ -79,7 +84,8 @@
 //!   a C2, C3 or C4 miss), and the operation's next pre-read
 //!   ([`CassandraBackend::check_earlier_attempts`]). A match is that
 //!   attempt's success, and steps 4 to 6 use its values and its intent.
-//! - Steps 4 and 5 fail: retried with the same timestamps; when the retries
+//! - Steps 4 and 5 fail: retried with the same timestamps, except a statement
+//!   the node refuses as `Invalid`, which no retry changes; when the retries
 //!   run out the write still succeeds and its intent row is left for the
 //!   sweeper (G23), on every operation: a 5xx after an applied CAS would make
 //!   a client's retried request write twice.
@@ -100,7 +106,7 @@ use serde_json::Value as Json;
 use uuid::Uuid;
 
 use super::backend::CassandraBackend;
-use super::errors::{BACKEND_NAME, map_driver_error};
+use super::errors::{BACKEND_NAME, is_invalid, map_driver_error};
 use super::index_keys::{self, IndexKey};
 use super::read::{ResourceRow, SELECT_RESOURCE};
 use super::session::{DriverError, NO_NODE_IN_PLAN, StatementKind};
@@ -781,81 +787,93 @@ impl CasPlan {
         }
     }
 
-    /// Step 4's statement and binds: V2 for a delete, V1 otherwise.
+    /// Step 4's row for the attempt `(write_id, last_updated)`: V2 for a
+    /// delete, with the empty key set and `deleted_at = lu(N+1)`; V1
+    /// otherwise.
+    fn new_version(&self, write_id: Uuid, last_updated: DateTime<Utc>) -> VersionRow<'_> {
+        let marker = self.kind == CasKind::Delete;
+        VersionRow {
+            version_id: self.target_version(),
+            last_updated,
+            deleted_at: marker.then_some(last_updated),
+            data: self.data(),
+            fhir_version: self.fhir_version,
+            write_id: Some(write_id),
+            keys_blob: if marker {
+                &index_keys::EMPTY
+            } else {
+                &self.keys_blob
+            },
+        }
+    }
+
+    /// Step 4's statement and binds, at `ts(N+1)`: V2 for a delete, V1
+    /// otherwise.
+    #[cfg(test)]
     fn new_version_row(
         &self,
         key: &RowKey<'_>,
         write_id: Uuid,
         last_updated: DateTime<Utc>,
-    ) -> (&'static str, Vec<Value>) {
-        let write_ts = write_ts_of(last_updated);
-        let head = [
-            Value::from(key.tenant_id),
-            Value::from(key.resource_type),
-            Value::from(key.id),
-            Value::from(self.target_version()),
-        ];
-        match self.kind {
-            CasKind::Delete => (
-                INSERT_DELETE_MARKER,
-                head.into_iter()
-                    .chain([
-                        Value::from(last_updated),
-                        Value::from(last_updated),
-                        Value::from(self.fhir_version.as_mime_param()),
-                        Value::from(write_ts),
-                        Value::from(write_id),
-                        Value::from(Blob::from(index_keys::EMPTY.to_vec())),
-                        Value::from(write_ts),
-                    ])
-                    .collect(),
-            ),
-            _ => (
-                INSERT_VERSION,
-                head.into_iter()
-                    .chain([
-                        Value::from(self.data().unwrap_or_default()),
-                        Value::from(last_updated),
-                        Value::from(self.fhir_version.as_mime_param()),
-                        Value::from(write_ts),
-                        Value::from(write_id),
-                        Value::from(Blob::from(self.keys_blob.clone())),
-                        Value::from(write_ts),
-                    ])
-                    .collect(),
-            ),
-        }
+    ) -> Statement {
+        version_row(
+            key,
+            &self.new_version(write_id, last_updated),
+            write_ts_of(last_updated),
+        )
     }
 }
 
-/// V3's statement and binds: row `N` as `previous` holds it, at
-/// `ts(N) − 1`, so an existing row wins every cell and a missing one is
-/// restored (G40). A content row leaves `deleted_at` unset, a marker leaves
-/// `data` unset, and an unknown `w(N)` is left unset, never null.
-fn previous_version_row(
-    key: &RowKey<'_>,
-    previous: &PreviousVersion,
-) -> (&'static str, Vec<Value>) {
-    let write_ts = write_ts_of(previous.last_updated);
-    let write_id = previous.write_id.map_or(Value::NotSet, Value::from);
+/// One statement and its binds.
+pub(crate) type Statement = (&'static str, Vec<Value>);
+
+/// One `resource_versions` row, on plain inputs, so the request, the
+/// sweeper and repair write it through the same code (IW17 = SW14,
+/// ADR-sam-michaels-0006). [`version_row`] turns it into V1, V2 or V3.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VersionRow<'a> {
+    pub(crate) version_id: i32,
+    pub(crate) last_updated: DateTime<Utc>,
+    /// `Some` for a delete marker (V2), which has no `data`.
+    pub(crate) deleted_at: Option<DateTime<Utc>>,
+    /// The version's content; left unset when `None`, never null.
+    pub(crate) data: Option<&'a str>,
+    /// The resource's FHIR version, fixed at create (G13).
+    pub(crate) fhir_version: FhirVersion,
+    /// The `write_id` of the CAS that wrote the version; left unset when
+    /// `None` (a V3 whose `w(N)` R1 did not have), never null.
+    pub(crate) write_id: Option<Uuid>,
+    /// The version's key set as stored (`index_keys`, G22).
+    pub(crate) keys_blob: &'a [u8],
+}
+
+/// The statement that writes `row`, `USING TIMESTAMP ts`: V2
+/// ([`INSERT_DELETE_MARKER`]) for a marker, V1 ([`INSERT_VERSION`])
+/// otherwise. Every caller computes `ts` from the version's `last_updated`
+/// (RW10): `ts(V) = write_ts_of(lu(V))` for a version's own row (V1, V2),
+/// `ts(N) − 1` for V3. The `write_ts` column is always
+/// `write_ts_of(row.last_updated)` (ADR-aacruzgon-0016), so no caller can
+/// store a `write_ts` that disagrees with the row's `last_updated`. Every
+/// marker is bound to a value or left unset, never to null (a tombstone).
+pub(crate) fn version_row(key: &RowKey<'_>, row: &VersionRow<'_>, ts: i64) -> Statement {
     let head = [
         Value::from(key.tenant_id),
         Value::from(key.resource_type),
         Value::from(key.id),
-        Value::from(previous.version_id),
+        Value::from(row.version_id),
     ];
     let tail = [
-        Value::from(previous.fhir_version.as_mime_param()),
-        Value::from(write_ts),
-        write_id,
-        Value::from(Blob::from(previous.keys_blob.clone())),
-        Value::from(write_ts - 1),
+        Value::from(row.fhir_version.as_mime_param()),
+        Value::from(write_ts_of(row.last_updated)),
+        row.write_id.map_or(Value::NotSet, Value::from),
+        Value::from(Blob::from(row.keys_blob.to_vec())),
+        Value::from(ts),
     ];
-    match previous.deleted_at {
+    match row.deleted_at {
         Some(deleted_at) => (
             INSERT_DELETE_MARKER,
             head.into_iter()
-                .chain([Value::from(previous.last_updated), Value::from(deleted_at)])
+                .chain([Value::from(row.last_updated), Value::from(deleted_at)])
                 .chain(tail)
                 .collect(),
         ),
@@ -863,13 +881,30 @@ fn previous_version_row(
             INSERT_VERSION,
             head.into_iter()
                 .chain([
-                    previous.data.as_deref().map_or(Value::NotSet, Value::from),
-                    Value::from(previous.last_updated),
+                    row.data.map_or(Value::NotSet, Value::from),
+                    Value::from(row.last_updated),
                 ])
                 .chain(tail)
                 .collect(),
         ),
     }
+}
+
+/// V3's statement and binds: row `N` as `previous` holds it, at
+/// `ts(N) − 1`, so an existing row wins every cell and a missing one is
+/// restored (G40). A content row leaves `deleted_at` unset, a marker leaves
+/// `data` unset, and an unknown `w(N)` is left unset, never null.
+fn previous_version_row(key: &RowKey<'_>, previous: &PreviousVersion) -> Statement {
+    let row = VersionRow {
+        version_id: previous.version_id,
+        last_updated: previous.last_updated,
+        deleted_at: previous.deleted_at,
+        data: previous.data.as_deref(),
+        fhir_version: previous.fhir_version,
+        write_id: previous.write_id,
+        keys_blob: &previous.keys_blob,
+    };
+    version_row(key, &row, write_ts_of(previous.last_updated) - 1)
 }
 
 /// One index row of a version, with the `last_updated` its key carries.
@@ -893,6 +928,20 @@ fn index_delta<'a>(
         })
         .unwrap_or_default();
     (deletes, inserts)
+}
+
+/// Why a plain write after the CAS (a version row or an index unit) was not
+/// written. Either way the write still answers success and its intent is
+/// left for the sweeper (G23); the kind tells a caller that retries on its
+/// own, the sweeper, whether trying again can help (RW9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteFailure {
+    /// Every try failed with an error a later try may not have: a timeout,
+    /// an unavailable replica, a lost connection.
+    TriesExhausted,
+    /// No try can succeed: the node refused the statement as `Invalid`
+    /// (IW17: "an `Invalid` error is permanent"). Not retried.
+    Permanent,
 }
 
 /// The partition key of the resource a request writes.
@@ -1700,12 +1749,19 @@ impl CassandraBackend {
         let complete = if superseded {
             false
         } else {
-            let (cql, values) = plan.new_version_row(&key, attempt.write_id, attempt.last_updated);
-            let version_written = self.write_with_retries(cql, values, "version row").await;
+            let ts = write_ts_of(attempt.last_updated);
+            let version_written = self
+                .write_version_row(
+                    &key,
+                    &plan.new_version(attempt.write_id, attempt.last_updated),
+                    ts,
+                    POST_CAS_WRITE_TRIES,
+                )
+                .await;
             let indexed = self
                 .write_index_delta(&key, &plan, attempt.last_updated)
                 .await;
-            if version_written && indexed {
+            if version_written.is_ok() && indexed {
                 self.delete_intent(&attempt.intent, &key).await;
                 true
             } else {
@@ -1786,6 +1842,22 @@ impl CassandraBackend {
                 "intent delete failed; the sweeper deletes it"
             );
         }
+    }
+
+    /// Step 4 on plain inputs (IW17 = SW14, ADR-sam-michaels-0006): `row`
+    /// `USING TIMESTAMP ts`, with up to `tries` tries. The request passes 3
+    /// ([`POST_CAS_WRITE_TRIES`]); the sweeper, whose retry list already
+    /// retries, passes 1 per pass.
+    pub(crate) async fn write_version_row(
+        &self,
+        key: &RowKey<'_>,
+        row: &VersionRow<'_>,
+        ts: i64,
+        tries: u32,
+    ) -> Result<(), WriteFailure> {
+        let (cql, values) = version_row(key, row, ts);
+        self.write_with_retries(cql, values, "version row", tries)
+            .await
     }
 
     /// Step 5: the delta from `K(N)` to `K(N+1)` at `ts(N+1)`. `true` once
@@ -1879,28 +1951,46 @@ impl CassandraBackend {
                 return false;
             }
         };
-        self.write_with_retries(cql, values, "index row").await
+        self.write_with_retries(cql, values, "index row", POST_CAS_WRITE_TRIES)
+            .await
+            .is_ok()
     }
 
-    /// A plain, idempotent write with a fixed timestamp, tried up to
-    /// [`POST_CAS_WRITE_TRIES`] times.
-    async fn write_with_retries(&self, cql: &str, values: Vec<Value>, what: &str) -> bool {
-        for attempt in 1..=POST_CAS_WRITE_TRIES {
+    /// A plain, idempotent write with a fixed timestamp, tried up to `tries`
+    /// times, 10 ms then 20 ms apart. An `Invalid` refusal is not retried:
+    /// the node refuses the same statement every time (IW17, RW9).
+    async fn write_with_retries(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        what: &str,
+        tries: u32,
+    ) -> Result<(), WriteFailure> {
+        for attempt in 1..=tries {
             match self
                 .session
                 .execute(cql, values.clone(), StatementKind::Write)
                 .await
             {
-                Ok(_) => return true,
+                Ok(_) => return Ok(()),
+                Err(error) if is_invalid(&error) => {
+                    tracing::error!(
+                        attempt,
+                        what,
+                        error = ?error,
+                        "post-CAS write refused as invalid; not retried"
+                    );
+                    return Err(WriteFailure::Permanent);
+                }
                 Err(error) => {
                     tracing::warn!(attempt, what, error = ?error, "post-CAS write failed");
-                    if attempt < POST_CAS_WRITE_TRIES {
+                    if attempt < tries {
                         tokio::time::sleep(Duration::from_millis(10 * u64::from(attempt))).await;
                     }
                 }
             }
         }
-        false
+        Err(WriteFailure::TriesExhausted)
     }
 
     /// `ResourceStorage::create` (walkthrough 3.2): C1 through the engine.

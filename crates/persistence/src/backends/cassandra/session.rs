@@ -65,8 +65,9 @@
 //!
 //! **Fault injection, tests only.** Under `cfg(test)`, and only there, a test
 //! can make the next matching statement report `WriteTimeout`/CAS, with or
-//! without executing it, or execute it late (`Fault`). It has no Cargo
-//! feature, so nothing outside this crate's unit tests can reach it.
+//! without executing it, or execute it late (`Fault`). A fault registered for
+//! a write also matches a batch holding a statement that matches it. It has
+//! no Cargo feature, so nothing outside this crate's unit tests can reach it.
 //!
 //! **Deadlines.** `cdrs-tokio` 10 has no per-request timeout, so every
 //! statement runs under the configured request deadline. When it elapses the
@@ -517,6 +518,10 @@ impl CassandraSession {
             };
         }
         self.counts.count_batch(statements.len());
+        #[cfg(test)]
+        if let Some(result) = self.faults.intercept_batch(self, &statements).await {
+            return result;
+        }
         self.send_batch(&statements).await
     }
 
@@ -671,6 +676,26 @@ impl std::fmt::Display for StatementCounts {
 /// engine's unknown-outcome paths run on one healthy node (Step 3 plan,
 /// section 6). Compiled only under `cfg(test)`: there is no Cargo feature, so
 /// no build outside the crate's own unit tests can reach it.
+///
+/// **On a batch** ([`CassandraSession::batch`]). A fault registered for
+/// [`StatementKind::Write`] matches a batch when any of its statements'
+/// CQL contains the needle, so a test that fails "the `resources_by_type`
+/// insert" keeps failing it once that row travels in a batch (IW14). The
+/// fault then acts on the whole batch, never on one statement of it, since
+/// the node applies or refuses a batch as a whole. A fault that reports a
+/// `WriteTimeout` reports it with the write type a batch would get, and with
+/// what that write type means for the rows (native protocol v5, section 9):
+///
+/// | Fault | On a batch |
+/// | --- | --- |
+/// | `ApplyThenTimeOut` | applied, then `WriteTimeout`/`BATCH`: the batchlog was written and the replicas were too slow to answer |
+/// | `TimeOutWithoutApplying` | `WriteTimeout`/`BATCH_LOG`, not applied: the batchlog write itself timed out |
+/// | `ApplyLate` | `WriteTimeout`/`BATCH` now, applied just before the next statement of kind `before`: the batchlog's replay |
+/// | `PassThrough` | sent as usual |
+/// | every other fault | the same error as for one statement, not applied |
+///
+/// A batch of one statement is a plain write, and a fault acts on it as on
+/// any statement.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fault {
@@ -729,9 +754,17 @@ mod faults {
 
     struct Deferred {
         before: StatementKind,
-        cql: String,
-        values: Vec<Value>,
-        kind: StatementKind,
+        late: Late,
+    }
+
+    /// What a deferred apply sends.
+    enum Late {
+        Statement {
+            cql: String,
+            values: Vec<Value>,
+            kind: StatementKind,
+        },
+        Batch(Vec<IndexStatement>),
     }
 
     #[derive(Default)]
@@ -756,6 +789,25 @@ mod faults {
             });
         }
 
+        /// Sends every late apply due before a statement of `kind`.
+        async fn run_due(&self, session: &CassandraSession, kind: StatementKind) {
+            let due: Vec<Deferred> = {
+                let mut deferred = self.deferred.lock();
+                let (due, keep) = deferred.drain(..).partition(|d| d.before == kind);
+                *deferred = keep;
+                due
+            };
+            for deferred in due {
+                match deferred.late {
+                    Late::Statement { cql, values, kind } => {
+                        session.send(&cql, values, kind, None).await.map(|_| ())
+                    }
+                    Late::Batch(statements) => session.send_batch(&statements).await,
+                }
+                .expect("the late apply of an injected fault");
+            }
+        }
+
         /// Runs any late apply due before a statement of `kind` (never before
         /// a paged read's first page), then the fault for this statement, if
         /// one matches. `None` sends it as usual.
@@ -767,19 +819,8 @@ mod faults {
             kind: StatementKind,
             first_page: bool,
         ) -> Option<Result<Envelope, DriverError>> {
-            let due: Vec<Deferred> = if first_page {
-                Vec::new()
-            } else {
-                let mut deferred = self.deferred.lock();
-                let (due, keep) = deferred.drain(..).partition(|d| d.before == kind);
-                *deferred = keep;
-                due
-            };
-            for late in due {
-                session
-                    .send(&late.cql, late.values, late.kind, None)
-                    .await
-                    .expect("the late apply of an injected fault");
+            if !first_page {
+                self.run_due(session, kind).await;
             }
             let fault = {
                 let mut pending = self.pending.lock();
@@ -796,9 +837,11 @@ mod faults {
                 }
                 Fault::ApplyLate { before } => self.deferred.lock().push(Deferred {
                     before,
-                    cql: cql.to_string(),
-                    values: values.to_vec(),
-                    kind,
+                    late: Late::Statement {
+                        cql: cql.to_string(),
+                        values: values.to_vec(),
+                        kind,
+                    },
                 }),
                 Fault::FailWithWriteFailure => return Some(Err(server_error(write_failure()))),
                 Fault::FailWithUnavailable => return Some(Err(server_error(unavailable()))),
@@ -817,6 +860,61 @@ mod faults {
             Some(Err(server_error(ErrorType::WriteTimeout(
                 WriteTimeoutError::new(Consistency::LocalSerial, 0, 1, WriteType::Cas, None),
             ))))
+        }
+
+        /// [`Self::intercept`] for a batch of two statements or more: runs
+        /// any late apply due before a write, then the first fault for a
+        /// write whose needle any statement of the batch contains, on the
+        /// whole batch (see [`Fault`]). `None` sends it as usual.
+        pub(super) async fn intercept_batch(
+            &self,
+            session: &CassandraSession,
+            statements: &[IndexStatement],
+        ) -> Option<Result<(), DriverError>> {
+            self.run_due(session, StatementKind::Write).await;
+            let fault = {
+                let mut pending = self.pending.lock();
+                let at = pending.iter().position(|p| {
+                    p.kind == StatementKind::Write
+                        && !p.first_page
+                        && statements
+                            .iter()
+                            .any(|statement| statement.cql().contains(&p.cql_contains))
+                })?;
+                pending.remove(at).fault
+            };
+            let timeout = |write_type| {
+                server_error(ErrorType::WriteTimeout(WriteTimeoutError::new(
+                    Consistency::LocalQuorum,
+                    0,
+                    1,
+                    write_type,
+                    None,
+                )))
+            };
+            Some(match fault {
+                Fault::ApplyThenTimeOut => match session.send_batch(statements).await {
+                    Ok(()) => Err(timeout(WriteType::Batch)),
+                    Err(error) => Err(error),
+                },
+                Fault::TimeOutWithoutApplying => Err(timeout(WriteType::BatchLog)),
+                Fault::ApplyLate { before } => {
+                    self.deferred.lock().push(Deferred {
+                        before,
+                        late: Late::Batch(statements.to_vec()),
+                    });
+                    Err(timeout(WriteType::Batch))
+                }
+                Fault::PassThrough => session.send_batch(statements).await,
+                Fault::FailWithCasTimeout => Err(server_error(ErrorType::WriteTimeout(
+                    WriteTimeoutError::new(Consistency::LocalSerial, 0, 1, WriteType::Cas, None),
+                ))),
+                Fault::FailWithWriteFailure => Err(server_error(write_failure())),
+                Fault::FailWithUnavailable => Err(server_error(unavailable())),
+                Fault::FailWithTooManyTombstones => Err(server_error(too_many_tombstones())),
+                Fault::FailWithServerError => Err(server_error(ErrorType::Server)),
+                Fault::FailWithProtocolError => Err(server_error(ErrorType::Protocol)),
+            })
         }
     }
 
@@ -1111,7 +1209,7 @@ mod node_tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::backends::cassandra::batch::IndexCql;
+    use crate::backends::cassandra::batch::{BatchFailure, IndexCql, classify_failure};
     use crate::backends::cassandra::test_support::test_config;
     use cdrs_tokio::types::IntoRustByName;
 
@@ -1292,6 +1390,114 @@ mod node_tests {
         assert_eq!(
             rows_of(&session, &t, "Patient").await,
             vec![("p1".to_string(), 1_000_001)]
+        );
+    }
+
+    /// The fault seam on a batch: a fault for a write matches when any
+    /// statement of the batch contains its needle, acts on the whole batch,
+    /// and reports the write type a batch would get, which
+    /// [`classify_failure`] reads as IW15 says (see [`Fault`]).
+    #[tokio::test]
+    async fn a_write_fault_matches_a_batch_by_any_of_its_statements() {
+        let Some(session) = session().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant("faults");
+        let move_p1 = |from: i64, to: i64, ts: i64| {
+            vec![
+                insert(&t, "Patient", "p1", to, ts),
+                delete(&t, "Patient", "p1", from, ts),
+            ]
+        };
+        session
+            .batch(vec![insert(&t, "Patient", "p1", 1_000, 1_000_001)])
+            .await
+            .expect("the first row");
+
+        // The needle is the delete's, the second statement: not applied,
+        // and the batchlog timeout is worth another try.
+        session.inject_fault(
+            StatementKind::Write,
+            "DELETE FROM resources_by_type",
+            Fault::TimeOutWithoutApplying,
+        );
+        let before = session.statement_counts();
+        let error = session
+            .batch(move_p1(1_000, 2_000, 2_000_001))
+            .await
+            .expect_err("the injected timeout");
+        let spent = session.statement_counts().since(&before);
+        assert_eq!(
+            (spent.batch, spent.batched),
+            (1, 2),
+            "counted before the seam"
+        );
+        assert_eq!(classify_failure(&error), BatchFailure::Retry, "{error:?}");
+        assert_eq!(
+            rows_of(&session, &t, "Patient").await,
+            vec![("p1".to_string(), 1_000_001)],
+            "not applied, as a whole"
+        );
+
+        // Applied, then reported as a batch timeout: left to the batchlog.
+        session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::ApplyThenTimeOut,
+        );
+        let error = session
+            .batch(move_p1(1_000, 2_000, 2_000_001))
+            .await
+            .expect_err("the injected timeout");
+        assert_eq!(
+            classify_failure(&error),
+            BatchFailure::InBatchlog,
+            "{error:?}"
+        );
+        assert_eq!(
+            rows_of(&session, &t, "Patient").await,
+            vec![("p1".to_string(), 2_000_001)],
+            "applied, as a whole"
+        );
+
+        // Applied late, as the batchlog replays it: just before the next
+        // read, which then sees the moved row.
+        session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::ApplyLate {
+                before: StatementKind::Read,
+            },
+        );
+        let error = session
+            .batch(move_p1(2_000, 3_000, 3_000_001))
+            .await
+            .expect_err("the injected timeout");
+        assert_eq!(
+            classify_failure(&error),
+            BatchFailure::InBatchlog,
+            "{error:?}"
+        );
+        assert_eq!(
+            rows_of(&session, &t, "Patient").await,
+            vec![("p1".to_string(), 3_000_001)],
+            "applied before the read"
+        );
+
+        // A fault for another kind of statement never matches a batch.
+        session.inject_fault(
+            StatementKind::Cas,
+            "INSERT INTO resources_by_type",
+            Fault::TimeOutWithoutApplying,
+        );
+        session
+            .batch(move_p1(3_000, 4_000, 4_000_001))
+            .await
+            .expect("no write fault pending");
+        assert_eq!(
+            rows_of(&session, &t, "Patient").await,
+            vec![("p1".to_string(), 4_000_001)]
         );
     }
 }

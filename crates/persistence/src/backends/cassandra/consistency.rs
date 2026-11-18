@@ -103,7 +103,13 @@ pub(crate) enum ScanMode<'a> {
     Full,
     /// Use a scan taken earlier for many tenants (one scan, many checks:
     /// the planted test now, the post-suite step in PR 8). Panics unless the
-    /// scan covers the tenant.
+    /// scan covers the tenant, and panics if any resource the check examines
+    /// has an R1 or version row `write_ts` at or after the scan's `taken_at`
+    /// (a resource written after the scan was taken, so the scan is stale for
+    /// it). It cannot catch a write still in flight when the scan started
+    /// whose `write_ts` is earlier but whose index rows land later, nor an
+    /// index row planted by hand after the scan. Callers take the scan only
+    /// after every writer has returned, as T5 does.
     Shared(&'a IndexScan),
 }
 
@@ -153,6 +159,13 @@ pub(crate) struct IndexScan {
     scanned: usize,
     /// The first read that failed, `(what, error)`; the scan stops there.
     failed: Option<(String, String)>,
+    /// `Utc::now()` in microseconds, read before the first table. A shared
+    /// check refuses a resource whose `write_ts` is at or after it: a
+    /// resource written after the scan was taken. It cannot catch a write
+    /// in flight at that moment (earlier `write_ts`, index rows landing
+    /// later) or an index row planted by hand after the scan; callers take
+    /// the scan only after every writer has returned.
+    taken_at: i64,
 }
 
 /// A column read, as the error text a scan or check reports.
@@ -247,6 +260,7 @@ impl IndexScan {
             rows: BTreeMap::new(),
             scanned: 0,
             failed: None,
+            taken_at: Utc::now().timestamp_micros(),
         };
         for (table, cql) in SCANS {
             let seen = Cell::new(0usize);
@@ -782,6 +796,20 @@ async fn run(
                 shared.covers(tenant),
                 "the shared scan does not cover tenant {tenant}"
             );
+            for subject in &subjects {
+                let writes = std::iter::once(subject.row.write_ts)
+                    .chain(subject.versions.iter().map(|v| v.write_ts))
+                    .flatten();
+                for write_ts in writes {
+                    assert!(
+                        write_ts < shared.taken_at,
+                        "the shared scan is stale for {}/{}: written at write_ts {write_ts}, scan taken_at {}",
+                        subject.resource_type,
+                        subject.id,
+                        shared.taken_at
+                    );
+                }
+            }
             shared
         }
     };
@@ -1046,8 +1074,8 @@ pub(crate) fn assert_consistent(report: &ConsistencyReport) {
     panic!("{message}");
 }
 
-/// The version ids of `(tenant, "Patient"?, id)` rows in `resource_versions`,
-/// ascending (tests only; panics on a read error).
+/// The version ids of the `resource_versions` rows of `(tenant,
+/// resource_type, id)`, ascending (tests only; panics on a read error).
 pub(crate) async fn version_ids(
     backend: &CassandraBackend,
     tenant: &str,
@@ -1893,6 +1921,47 @@ mod tests {
         };
         assert_eq!(what, "scan resources_by_type");
         assert!(catch_unwind(AssertUnwindSafe(|| assert_consistent(&report))).is_err());
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    #[tokio::test]
+    async fn a_shared_scan_taken_before_a_write_is_refused() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("consistency-stale-scan");
+        let tenant = context(&t);
+        let version = test_fhir_version();
+        let p = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .expect("create p");
+        let own = t.clone();
+        let scan = IndexScan::take(&backend, move |x| x == own).await;
+        assert!(scan.failed.is_none(), "{:?}", scan.failed);
+        backend
+            .update(&tenant, &p, changed())
+            .await
+            .expect("update p");
+        let stale = futures::FutureExt::catch_unwind(AssertUnwindSafe(index_consistency(
+            &backend,
+            &t,
+            Scope::Tenant,
+            ScanMode::Shared(&scan),
+            Registry::Fixed,
+        )))
+        .await;
+        let payload = stale.expect_err("a stale shared scan must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("shared scan is stale for Patient/p"),
+            "{message}"
+        );
         assert_consistent(&check(&backend, &t).await);
     }
 }

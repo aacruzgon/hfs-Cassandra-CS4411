@@ -297,7 +297,14 @@ impl CassandraBackend {
         since: DateTime<Utc>,
     ) -> Vec<i32> {
         let shard = shard_of(tenant_id, id);
-        let hour = |at: DateTime<Utc>| at.with_minute(0).unwrap().with_second(0).unwrap();
+        let hour = |at: DateTime<Utc>| {
+            at.with_minute(0)
+                .unwrap()
+                .with_second(0)
+                .unwrap()
+                .with_nanosecond(0)
+                .unwrap()
+        };
         let (mut at, end) = (hour(since), hour(Utc::now()));
         let mut versions = Vec::new();
         while at <= end {

@@ -2134,11 +2134,15 @@ impl CassandraBackend {
     ///   into batches of at most [`MAX_BATCH_BYTES`] by [`wire_bytes`]
     ///   ([`index_batches`]). A unit is every row of one partition, which
     ///   Cassandra applies whole on each replica; above all, once the batch
-    ///   has reached a quorum, `count` never sees an updated resource's
-    ///   `resources_by_type` row twice. On RF 3 a batch that reached fewer
-    ///   can still be counted twice for a while, since blocking read repair
-    ///   copies only the rows a read covered (ADR-sam-michaels-0006, IW9). A
-    ///   unit over the bound goes alone.
+    ///   has reached a quorum, an update alone never lets `count` see an
+    ///   updated resource's `resources_by_type` row twice. `count` is still
+    ///   off by one either way, twice or not at all: twice after a write
+    ///   whose index step was skipped or did not finish, until the sweeper or
+    ///   repair finishes it (on RF 3 also after a batch that reached fewer
+    ///   than a quorum), and not at all when blocking read repair copies a
+    ///   delete onto a replica that missed the insert, since it repairs only
+    ///   the rows a read covered (ADR-sam-michaels-0006, IW9). A unit over
+    ///   the bound goes alone.
     /// - **All at once, at most [`INDEX_BATCHES_IN_FLIGHT`] in flight**
     ///   (IW12), as futures inside the request's own task, never
     ///   `tokio::spawn`, so a request that is dropped, or a crash test that

@@ -715,10 +715,10 @@ impl std::fmt::Display for StatementCounts {
 /// where nothing was applied.
 ///
 /// **A batch of one partition never gets `BATCH` or `BATCH_LOG` from a real
-/// node.** The node applies it as one mutation, without the batchlog, and
-/// times it out as `SIMPLE` (`BatchStatement.java`, a logged batch is atomic
-/// only across more than one mutation; `StorageProxy.java:885`), which the
-/// writer retries. The seam does not know a batch's partitions, so a test
+/// node.** The node applies it as one mutation, without the batchlog
+/// (`BatchStatement.java:444-445`: a logged batch goes through the batchlog
+/// only across more than one mutation) and times it out as `SIMPLE`
+/// (`StorageProxy.java:885`), which the writer retries. The seam does not know a batch's partitions, so a test
 /// that fails such a batch with `ApplyThenTimeOut` or `ApplyLate` drives the
 /// writer's `BATCH` path with a timeout the node would not send for it. With
 /// the key set `[ResourcesByType]`, every write's batch is one partition, so

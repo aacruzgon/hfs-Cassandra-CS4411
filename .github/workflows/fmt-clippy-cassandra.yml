@@ -5,9 +5,10 @@ name: fmt, clippy and Cassandra schema
 # into two jobs, and a single-node Cassandra that the schema is applied to and
 # tests/cassandra_tests.rs and tests/backend_capability_contract.rs run
 # against (ADR-aacruzgon-0020).
-# fmt and the Cassandra job are light and run on either runner; the clippy
-# pair is heavy and runs only on sam-7900x (ADR-aacruzgon-0023). Each runner
-# has one executor, so the jobs on one machine run one after another.
+# fmt and the Cassandra job are light, the clippy pair heavy
+# (ADR-aacruzgon-0023); both runners take both labels, so every job runs on
+# either (ADR-aacruzgon-0080). Each runner has one executor, so the jobs on
+# one machine run one after another.
 # Every job that compiles also writes CI reports (.github/scripts/ci-report.py):
 # measured figures in the run's summary page and in an artifact,
 # ci-report-<job>. Reports never fail a job for a figure. Every job reports
@@ -162,11 +163,12 @@ jobs:
   # Clippy is the CONTRIBUTING.md command split in two (ADR-sam-michaels-0003).
   # With --all-features, helios-fhir holds all four FHIR versions, and its lib
   # and lib-test units need about 12.8 GB each. In one command cargo builds
-  # them side by side, past the runner service's MemoryMax=20G. So helios-fhir
-  # is checked alone, one unit at a time, and the rest of the workspace after
-  # it, with helios-fhir only as a dependency. Together the two jobs lint the
+  # them side by side, past sam-7900x's MemoryMax=20G. So helios-fhir is
+  # checked alone, and the rest of the workspace after it, with helios-fhir
+  # only as a dependency; the helios-fhir job sets its cargo job count from
+  # the runner's own cap (ADR-aacruzgon-0080). Together the two jobs lint the
   # same crates and targets as the CONTRIBUTING.md command, with the same lint
-  # flags, at low priority because the runner is also Sam's desktop.
+  # flags, at low priority because each runner is also someone's desktop.
   clippy-fhir:
     name: cargo clippy (helios-fhir)
     # Fork guard (ADR-aacruzgon-0018).
@@ -223,14 +225,28 @@ jobs:
             echo "TARGET_DIR_CAP_GB=$CAP_GB"
           } >> "$GITHUB_ENV"
 
+      # How many units cargo builds at once, from this runner's own memory
+      # cap: the runner service's cgroup memory.max, which every job process
+      # inherits (ADR-aacruzgon-0080). helios-fhir's lib and lib-test units
+      # need about 12.8 GB each: under sam-7900x's 20G they build one at a
+      # time (1 job), under acruzdebian's 40G both at once (2 jobs).
+      # Unreadable, unlimited or under 32 GiB keeps 1.
+      - name: Pick the build job count for this runner's memory cap
+        id: jobs
+        run: |
+          max=$(cat "/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)/memory.max" 2>/dev/null || true)
+          if [[ "$max" =~ ^[0-9]+$ ]] && [ "$max" -ge $((32 * 1024 ** 3)) ]; then jobs=2; else jobs=1; fi
+          echo "Runner $RUNNER_NAME, memory.max ${max:-unreadable}: CARGO_BUILD_JOBS=$jobs"
+          echo "jobs=$jobs" >> "$GITHUB_OUTPUT"
+
       # Wrapped in ci-report.py build, which samples the runner's cgroup every
       # second and reports the wall time and the memory peaks
       # (ADR-aacruzgon-0023, ADR-sam-michaels-0003). It exits with clippy's
       # status. --timings writes cargo's per-unit chart, which the report
       # keeps in the artifact; it does not change what is built.
-      - name: cargo clippy -p helios-fhir --all-targets --all-features, one job at a time
+      - name: cargo clippy -p helios-fhir --all-targets --all-features
         env:
-          CARGO_BUILD_JOBS: 1
+          CARGO_BUILD_JOBS: ${{ steps.jobs.outputs.jobs }}
           CI_REPORT_PROFILE: clippy (dev profile, check only)
           # The commit the CI reports name: on a pull request, its head, not
           # the merge commit GITHUB_SHA names.
@@ -352,7 +368,9 @@ jobs:
       # CONTRIBUTING.md command (R4, R4B, R5, R6, xml, skip-r6-download);
       # without it, helios-fhir's build script downloads R6 examples from
       # build.fhir.org, because an excluded package gets no --all-features.
-      # Wrapped in ci-report.py build, as in clippy-fhir.
+      # Wrapped in ci-report.py build, as in clippy-fhir. 8 jobs on every
+      # runner: 16 on acruzdebian's 40G took 236 s cold against 241 s with 8,
+      # at the same 13.4 GiB peak anon (ADR-aacruzgon-0080).
       - name: cargo clippy --workspace --exclude helios-fhir --all-targets --all-features
         env:
           CARGO_BUILD_JOBS: 8
@@ -488,8 +506,8 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # Built before Cassandra starts, so the build's memory peak and the
-      # 3 GiB container never overlap. acruzdebian caps its runner service at
-      # 9 GiB (ADR-aacruzgon-0023), so each build runs under ci-report.py
+      # 3 GiB container never overlap. A light job must fit about 9 GB
+      # (ADR-aacruzgon-0023, 0080), so each build runs under ci-report.py
       # build, which samples the runner's cgroup every second and reports two
       # peaks: memory.current, page cache included, which reaches the cap
       # whenever the cache fills it; and memory.stat's anon, the memory the

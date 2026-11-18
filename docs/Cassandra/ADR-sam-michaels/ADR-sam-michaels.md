@@ -14,6 +14,7 @@ ADR-sam-michaels/
 **Rules**
 
 - Append-only. A decision that is later reversed gets a new entry that supersedes the old one; the old entry's status changes to `superseded by ADR-sam-michaels-NNNN`, and nothing is deleted.
+- A later entry may supersede a single ID of a multi-decision entry by naming it, for example "supersedes ADR-sam-michaels-0006, IW15". In the same commit the earlier entry gains only an added, dated note naming that ID and the later entry (for example "*Update YYYY-MM-DD:* IW15 is superseded by ADR-sam-michaels-NNNN"), and its index row's status gains "partly superseded by NNNN (IW15)". The earlier entry's existing text, that ID's row included, is not edited, and the rest of that entry stands.
 - One entry per decision, one file per entry. Numbers are sequential across the whole log, not per folder, so `ADR-sam-michaels-NNNN` stays a unique reference. The folder is the date the decision was worked on; a later entry that supersedes an earlier one goes in its own date folder.
 - Written by the human, in their own words, at the end of the session in which the decision was made. The AI assistant may draft it, but the human confirms every line before it is committed.
 - Only the owner of this log edits it. Another collaborator who disagrees with a decision opens an entry in their own log that references this one.
@@ -47,3 +48,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0003](2026-10-14/0003-fmt-clippy-cassandra-jobs.md) | 2026-10-14 | Item 0.5's fmt, clippy and Cassandra jobs, clippy split in two under a memory cap, and the weekly Docker prune | accepted |
 | [0004](2026-10-14/0004-rootless-docker-slirp4netns.md) | 2026-10-14 | gh-runner's rootless Docker uses slirp4netns with the builtin port driver, not pasta | accepted |
 | [0005](2026-10-15/0005-upstream-canary.md) | 2026-10-15 | The upstream canary merges upstream nightly, runs 0.4's check, and keeps one "upstream drift" issue | accepted |
+| [0006](2026-11-16/0006-step-5-design.md) | 2026-11-16 | Step 5's design: index rows by partition, the version row first, a quorum-first sweeper, bounded repair and a report-first CI check | accepted; amended on 2026-11-17 and 2026-11-18 after Alan's two reviews on #86 |

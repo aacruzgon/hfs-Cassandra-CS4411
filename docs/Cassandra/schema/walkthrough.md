@@ -45,7 +45,7 @@ Code facts were checked against the working tree on 2026-10-13 (`crates/persiste
 | Plain reads (`resources`, `resource_versions`, index tables, `pending_index_writes`) | `LOCAL_QUORUM` | — |
 | Plain writes (intent row, version row, index batches, intent delete) | `LOCAL_QUORUM` | — |
 | Compare-and-swap (CAS) on `resources` | `LOCAL_QUORUM` (commit) | `LOCAL_SERIAL` (Paxos) |
-| Read that must settle an in-flight CAS (sweeper; unknown CAS outcome) | `LOCAL_SERIAL` | — |
+| Read that must settle an in-flight CAS (unknown CAS outcome; the sweeper only when its quorum read shows no row or a version below the intent's, ADR-sam-michaels-0006, SW12) | `LOCAL_SERIAL` | — |
 
 The replication factor (RF) is the number of copies of each row: 1 on the single node, 3 on the cluster. With RF 1, `LOCAL_QUORUM` is one replica. `USING TIMESTAMP` is never put on a CAS: the node rejects it (spike A1).
 
@@ -83,8 +83,8 @@ DELETE FROM pending_index_writes
 SELECT enqueued_at, tenant_id, resource_type, id, version_id
   FROM pending_index_writes
  WHERE bucket = ? AND shard = ?
-   AND enqueued_at > ? AND enqueued_at < minTimeuuid(?)
- LIMIT ?;
+   AND enqueued_at >= minTimeuuid(?) AND enqueued_at < minTimeuuid(?);
+-- Both bounds in milliseconds; paged at 1,000 rows, no LIMIT (ADR-sam-michaels-0006, SW7).
 ```
 
 Partition: one `(bucket, shard)`. `bucket` is the UTC hour of `enqueued_at` (`'2026-10-14T10'`), `shard` is `hash(tenant_id, id) mod 16`. `minTimeuuid` is for query bounds only, never an inserted value.
@@ -228,7 +228,7 @@ Unfiltered `count` reads `resources_by_type`, not `resources`, so it never tests
 
 ### Index rows
 
-Every index statement carries `USING TIMESTAMP ts(V)` of the version being written. One version's inserts and deletes go in logged batches, each under 5 KiB (`batch_size_warn_threshold`), sent concurrently at `LOCAL_QUORUM`. The backend measures each batch itself, from every byte of its statements: the node's size check does not count partition-key bytes, which are most of an index row (checked on a 5.0.9 node, 2026-11-05: a 30-partition `uri_index` batch carrying about 120 KB of partition keys was accepted with no warning, while a `token_code_index` batch with 78 KiB of clustering values was refused as "Batch too large"). With the 2 KiB rule (G35) the largest single index row is about 4.3 KB, so every row fits in one batch.
+Every index statement carries `USING TIMESTAMP ts(V)` of the version being written, and is sent only after `V`'s version row is acknowledged (ADR-sam-michaels-0006, IW24). The delta compares rows by each table's own primary key, so a date row whose range did not change is re-inserted, never deleted (IW7). One version's inserts and deletes go in logged batches, all the rows of one partition in the same batch, never split, so once the batch has reached a quorum an update alone never lets `count` see both rows. `count` is still off by one either way, twice or not at all: twice after a write whose index step was skipped or did not finish, until the sweeper or repair finishes it (G23), and on RF 3 after a write that reached fewer than a quorum; not at all when read repair copies a delete onto a replica that missed the insert, because the default `read_repair = 'BLOCKING'` repairs only the rows a read covered (Alan's `read_repair` entry, to follow). `count`'s internal paging (10,000 rows per page) can also miss a resource updated between pages, so a paged count can only miss (IW9). Whole partitions are packed into batches of at most 4,864 bytes, under 5 KiB (`batch_size_warn_threshold`), sent concurrently at `LOCAL_QUORUM`, at most 8 in flight (IW11, IW12). The backend measures each batch itself, from every byte of its statements: the node's size check does not count partition-key bytes, which are most of an index row (checked on a 5.0.9 node, 2026-11-05: a 30-partition `uri_index` batch carrying about 120 KB of partition keys was accepted with no warning, while a `token_code_index` batch with 78 KiB of clustering values was refused as "Batch too large"). With the 1,024-byte mapping (ADR-aacruzgon-0079) the largest single index row is 3,299 bytes as an INSERT on the wire, so every row fits in one batch; a partition whose rows together exceed 4,864 bytes, such as an update's DELETE and INSERT of a maximal row (about 6,590 bytes), goes in a batch of its own.
 
 ```sql
 -- X1 resources_by_type. fhir_version is the resource's, fixed at create (G34).
@@ -276,9 +276,10 @@ DELETE FROM uri_index USING TIMESTAMP ?
 ```
 
 ```sql
--- How one version's index changes are sent: several of these, concurrently.
-BEGIN BATCH            -- logged; LOCAL_QUORUM; serialized size < 5 KiB
-  DELETE FROM ... USING TIMESTAMP ? WHERE ...;   -- keys in K(N) but not in K(N+1)
+-- How one version's index changes are sent: several of these, concurrently, each holding
+-- whole partitions (a partition's deletes and inserts are never split across batches).
+BEGIN BATCH            -- logged; LOCAL_QUORUM; at most 4,864 bytes, counting every byte
+  DELETE FROM ... USING TIMESTAMP ? WHERE ...;   -- rows of K(N) whose primary key K(N+1) does not produce
   INSERT INTO ... VALUES (...) USING TIMESTAMP ?; -- every key in K(N+1)
 APPLY BATCH;
 ```
@@ -291,13 +292,15 @@ APPLY BATCH;
 
 ```sql
 -- R1: current row. LOCAL_QUORUM. Used by read, exists, _id, the tag check, the pre-read of
--- delete, update_with_match and create_or_update, and update's read of K(N) (G22).
+-- delete, update_with_match and create_or_update, update's read of K(N) (G22), and the
+-- sweeper's first read of an intent's resource (ADR-sam-michaels-0006, SW12).
 -- index_keys is K(version_id): the writer's K(N), and repair's key set.
 SELECT version_id, data, last_updated, created_at, deleted_at, fhir_version, write_ts, write_id, index_keys
   FROM resources WHERE tenant_id = ? AND resource_type = ? AND id = ?;
 
 -- R2: the same SELECT at LOCAL_SERIAL. Completes or cancels an in-flight Paxos proposal.
--- Used after an unknown CAS outcome, and by the sweeper for every intent.
+-- Used after an unknown CAS outcome, and by the sweeper when R1 shows no row or a version
+-- below the intent's (ADR-sam-michaels-0006, SW12).
 
 -- R3: one version. LOCAL_QUORUM. write_id decides a superseded unknown outcome (3.1);
 -- index_keys gives the sweeper K(V-1) (G22).
@@ -337,7 +340,7 @@ Every write first calls `tenant.check_permission(Operation::…, resource_type)`
 | 2 | on update, delete and revive (`update`, `update_with_match`, `delete`, `delete_versioned`, and `create_or_update` on a live row or a delete marker): V3 for `N` at `ts(N) − 1`, from R1, with R1's `write_id` and `K(N)` (G40, ADR-aacruzgon-0061); then I1, with `version_id = N+1` | `resource_versions (T,P,id)` for V3, then `(bucket, shard)` | V3 timed out: 504; failed: 503; nothing changed, since V3 only rewrites row `N` at an older timestamp. I1 `Unavailable`: 503, nothing changed. I1 `WriteTimeout`: an unused intent is swept, so harmless; 504 (`BackendError::Timeout`, G26) |
 | 3 | C1 to C4 | `resources (T,P,id)` | not applied: I2, then the mapped error; unknown outcome below |
 | 4 | V1 or V2 for `N+1` at `ts(N+1)` (V3 for `N` already ran at step 2) | `resource_versions (T,P,id)` | retry with the same timestamps. Retries exhausted: return success, with I1 left for the sweeper (G23, ADR-aacruzgon-0034), on every operation (ADR-aacruzgon-0050) |
-| 5 | index batches, at `ts(N+1)` | index partitions | retry with the same timestamps; `WriteTimeout` type `BATCH` needs no retry (batchlog replays), `BATCH_LOG` does. Retries exhausted: return success, with I1 left for the sweeper, which makes the write searchable within one poll interval plus the grace period (G23, ADR-aacruzgon-0027) |
+| 5 | index batches, at `ts(N+1)` | index partitions | retry with the same timestamps; `WriteTimeout` type `BATCH` needs no retry (batchlog replays); `BATCH_LOG` means the batchlog write timed out, not that it failed (the batch may still be replayed), and is retried, as are `UNLOGGED_BATCH`, `WriteFailure` and a `SIMPLE` timeout of a single-partition batch. Batches use `FallthroughRetryPolicy`, so each try is one send (IW15). Retries exhausted: return success, with I1 left for the sweeper, which makes the write searchable within one poll interval plus the grace period (G23, ADR-aacruzgon-0027) |
 | 6 | I2 | `(bucket, shard)` | ignored: return success; the sweeper replays the same writes, which changes nothing, and deletes the intent |
 
 **Long values are hashed** (ADR-aacruzgon-0079, amending ADR-aacruzgon-0026's G35 and ADR-aacruzgon-0027's G38). At step 1, every `code`, `system`, `uri` and `param` in `K(N+1)` goes through `index_text`: a value of at most 1,024 bytes in UTF-8 that does not start with `sha256:` is kept as it is, and any other becomes `sha256:` followed by the 64 lowercase hex digits of the SHA-256 of its UTF-8 bytes (71 bytes). Search maps its parsed query values the same way (after unescaping and the `|` split), and every form Cassandra serves is an exact match (`coverage.md` sections 2, 4 and 6), so nothing is lost; SHA-256 collisions are treated as impossible, and the tag check never reads an indexed value. No write is refused for a value's length. The other key components are bounded by the server (`tenant_id` at most 64 bytes, `MAX_TENANT_ID_LEN` in `tenant/id.rs:34`; `id` at most 64; `resource_type` at most 34, the longest type name in the spec data; timestamps fixed). So the largest partition key, `token_system_code_index`'s with a 1,024-byte `param`, `system` and `code`, is 64 + 34 + 1,024 + 1,024 + 1,024 bytes plus 3 bytes of framing per component, 3,185 bytes, far below Cassandra's 65,535-byte key limit, and the same in every tenant. `K(N)`, the old keys, comes from `index_keys` already mapped, and is never mapped again: a digest starts with `sha256:`, so a second mapping would hash it again. The sweeper and repair likewise use stored keys as they are; only fresh extractions and query values go through `index_text`.
@@ -700,17 +703,17 @@ The other parameters drive as usual, in the shared order, so paging stays keyset
 
 A background task in each Helios process (ADR-aacruzgon-0013 to 0015). It never compares `write_id`. This project runs one Helios process, so one sweeper; several would be safe, only costlier (G12).
 
-**What it reads.** Every poll (a few seconds), I3 on the 16 shards of the current and previous hour bucket, 32 partitions. Each `(bucket, shard)` keeps a low-water mark in memory, and an intent's bucket is always the hour of its own `enqueued_at`. I3 reads only after the mark and before `now − grace` (30 s default), so it skips finished intents' tombstones. After each successful poll the mark moves to the slice's upper bound, even if no rows came back; an intent that fails goes to an in-memory retry list instead of holding the mark. At startup the sweeper first walks the 25 most recent buckets (a 24 h TTL can span 25), 400 partitions, in short slices.
+**What it reads.** Every poll (a few seconds), I3 on the 16 shards of every hour bucket that overlaps `[mark, now − grace)`: 16 partitions normally, 32 for about 35 s after each hour turns (ADR-sam-michaels-0006, SW8). Each `(bucket, shard)` keeps a low-water mark in memory, and an intent's bucket is always the hour of its own `enqueued_at`. I3 reads only after the mark and before `now − grace` (30 s default), so it skips finished intents' tombstones. After each successful poll the mark moves to the slice's upper bound, even if no rows came back; an intent that fails goes to an in-memory retry list instead of holding the mark. The list backs off from 5 s to 5 min and drops nothing before the 24 h TTL; when it is full, the marks it could not cover stop moving (SW18). At startup the sweeper walks the last 24 h and 1 min (a 24 h TTL can span 25 buckets, 400 partitions) in one-minute slices, in the background beside the normal loop (SW9).
 
-**For each intent, with `V = intent.version_id`:** R2 reads the `resources` row at `LOCAL_SERIAL`, which settles any in-flight Paxos proposal. Then one of four cases, each ending with I2:
+**For each intent, with `V = intent.version_id`:** R1 reads the `resources` row at `LOCAL_QUORUM`. If it shows no row or a version below `V`, R2 reads it again at `LOCAL_SERIAL`, which settles any in-flight Paxos proposal; a version `V` or later seen at quorum is already committed, so it needs no Paxos promise on a row live writes may be using (ADR-sam-michaels-0006, SW12). Then one of four cases, each ending with I2:
 
 | Case | Reads | Writes |
 | --- | --- | --- |
 | no row, or `version_id < V`: the CAS never applied | — | none |
-| `V` current: a crashed or slow request | R3 for `V-1` (not for `V = 1`) | `K(V)` is the `index_keys` R2 returned (G22). Step 4 for `V`'s own row (never V3), at `ts(V)`: V1, or V2 if `deleted_at > 0`, with `data`, `write_id` and `index_keys` from the `resources` row. It writes the same cells as `V`'s writer, so an existing row is unchanged. Then step 5 at `ts(V)`: delete `K(V-1) \ K(V)`, insert `K(V)` |
+| `V` current: a crashed or slow request | R3 for `V-1` (not for `V = 1`) | `K(V)` is the `index_keys` the read returned (G22). Step 4 for `V`'s own row (never V3), at `ts(V)`: V1, or V2 if `deleted_at > 0`, with `data`, `write_id` and `index_keys` from the `resources` row. It writes the same cells as `V`'s writer, so an existing row is unchanged. Then step 5 at `ts(V)`: delete `K(V-1) \ K(V)`, insert `K(V)` |
 | `V` superseded | R3 for `V` (for `ts(V)`) and `V-1` | delete all of `K(V-1)` at `ts(V)`; no inserts, since a later version already deleted `K(V)` and a late insert would outlive those tombstones (3 h) |
 
-`K(V-1)` is row `V-1`'s `index_keys` (G22), since `resources` holds only the current version's. Row `V-1` always exists for `V > 1`, and row `V` once `V` is superseded: each writer wrote the previous row (V3) before its CAS (G40). A missing row `V-1` therefore never stands for an empty set. It is empty for version 1, a marker, or a missing row `V-1`, whose writer never reached step 5. Every write is older than any later version's, so it never removes a newer row, even after that row's tombstones are purged. A sweeper and a slow request may run the same writes. The grace period is the one clock comparison (G11).
+`K(V-1)` is row `V-1`'s `index_keys` (G22), since `resources` holds only the current version's. Row `V-1` always exists for `V > 1`, and row `V` once `V` is superseded: each writer wrote the previous row (V3) before its CAS (G40). A missing row `V-1` therefore never stands for an empty set: the sweeper logs it at error, keeps the intent and counts it (ADR-sam-michaels-0006, SW13). The set is empty only for version 1 and for a delete marker. Every write is older than any later version's, so it never removes a newer row, even after that row's tombstones are purged. A sweeper and a slow request may run the same writes. The grace period is the one clock comparison (G11).
 
 ## 7. Worked example: one Patient, four versions
 
@@ -791,8 +794,8 @@ The two date keys are the ones version 3 deleted. They come back because the ins
 
 ### What a crash would change
 
-- **Killed after I1 of version 2** (no CAS): after 30 s the sweeper reads `resources` at `LOCAL_SERIAL`, sees version 1, below the intent's 2, and deletes the intent. Nothing else changes.
-- **Killed after C2 of version 2** (no version row, no index writes): `read` returns version 2 at once, but vread 2 is 404 until the sweep (G2). Search hides the patient. The sweeper finds version 2 current, and its R2 returns `K(2)`, which C2 wrote; `K(1)` is row 1's `index_keys`. It writes row 2 from the `resources` row, with that `K(2)` as `index_keys`, deletes `K(1) \ K(2)`, inserts `K(2)` at `ts(2)`, and deletes the intent.
+- **Killed after I1 of version 2** (no CAS): after 30 s the sweeper reads `resources` at `LOCAL_QUORUM` and sees version 1, below the intent's 2. A compare-and-swap could still be in flight, so it reads again at `LOCAL_SERIAL`, still sees version 1, and deletes the intent. Nothing else changes.
+- **Killed after C2 of version 2** (no version row, no index writes): `read` returns version 2 at once, but vread 2 is 404 until the sweep (G2). Search hides the patient. The sweeper's quorum read finds version 2 current and returns `K(2)`, which C2 wrote; `K(1)` is row 1's `index_keys`. It writes row 2 from the `resources` row, with that `K(2)` as `index_keys`, deletes `K(1) \ K(2)`, inserts `K(2)` at `ts(2)`, and deletes the intent.
 - **Same crash, but version 3 (the delete) lands before the sweeper runs.**
     - The delete's R1 gives version 2's content and `K(2)`, which C2 wrote (G22). Its V3, before C3, restores row 2 at `ts(2) − 1`, with that `K(2)` as `index_keys`. It deletes `K(2)` at `ts(3)`; of those 8 keys only the two date keys exist (equal to `K(1)`'s, tag 1), so the date rows go.
     - Left behind: the 6 non-date rows of `K(1)`, tag 1: `resources_by_type (lu(1), p1)`, three identifier rows and two gender `male` rows. The tag check hides them; `count` is 1 for a deleted patient (G7).
@@ -967,7 +970,7 @@ The CAS had already applied when step 5 failed, so no retry, sweep or repair cou
 
 **G8. Benchmark case: `count` and the last pages of an unfiltered search after a mass update.** *Resolved: a named benchmark case in roadmap Step 8 (ADR-aacruzgon-0027).* Updating every Patient once leaves a contiguous run of tombstones at the old end of `resources_by_type`, which a page reaching it reads in one command. 100,000 updated resources of one type give 100,000 tombstones, exactly the `tombstone_failure_threshold`; past it the read fails with `TombstoneOverwhelmingException`, a 5xx. That also needs `gc_grace_seconds` (3 h here) and compaction not to have purged them, which holds if the update phase and the reads run within 3 h. It is the design's own measure-first trigger (above 1,000 tombstones per read) firing by construction. Decided: roadmap Step 8 names it as a benchmark case, "mass update": update every resource of one type once, then run `count` and page an unfiltered search to its last page within 3 h, and record tombstones scanned per read against `tombstone_warn_threshold` (1,000) and `tombstone_failure_threshold` (100,000).
 
-**G12. Several Helios processes means several sweepers.** *Resolved: accepted, no lease row (ADR-aacruzgon-0027).* Each polls all 32 partitions with its own marks, runs its own startup scan, and races the others on the same intents. The writes are idempotent, so the cost is duplicate I3 reads, Paxos reads and replays. Decided: accept it. This project runs one Helios process. Every sweeper write carries the version's fixed timestamp, so two sweepers, or a sweeper and a slow request, write the same cells and change nothing; extra sweepers only add duplicate reads. A lease row would add an LWT per poll, and a lease that outlives a crashed holder would stall every intent until it expired.
+**G12. Several Helios processes means several sweepers.** *Resolved: accepted, no lease row (ADR-aacruzgon-0027).* Each polls the same partitions (at most 32) with its own marks, runs its own startup scan, and races the others on the same intents. The writes are idempotent, so the cost is duplicate I3 reads, `LOCAL_QUORUM` reads of the resource row and replays, plus serial reads only for an intent with no row or a version below V (SW12). Decided: accept it. This project runs one Helios process. Every sweeper write carries the version's fixed timestamp, so two sweepers, or a sweeper and a slow request, write the same cells and change nothing; extra sweepers only add duplicate reads. A lease row would add an LWT per poll, and a lease that outlives a crashed holder would stall every intent until it expired.
 
 **G22. Old keys are recomputed with today's registry.** *Resolved in the design: each version stores its key set (ADR-aacruzgon-0027).* `K(N)` was re-extracted with the registry and extractor as they are now. If a SearchParameter or the extractor changed since version `N` was indexed, the deletes missed rows that were written. The registry does change at runtime, per tenant: a `SearchParameter` write invalidates the tenant's registry (`crates/persistence/src/backends/sqlite/storage.rs:520-529`). The orphans would waste point reads, count against the candidate cap, and never be cleaned.
 

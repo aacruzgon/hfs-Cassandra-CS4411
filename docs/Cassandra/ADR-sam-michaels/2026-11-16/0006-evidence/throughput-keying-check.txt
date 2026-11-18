@@ -1,0 +1,150 @@
+Keying check for throughput.rs, 2026-11-18 (CodeRabbit thread on throughput.rs:74, PR #86).
+Own single node from docker/cassandra/docker-compose.yml (Cassandra 5.0.9, 4 CPUs, 3 GiB), on an Apple-silicon Mac, port 59742; client outside the container.
+Keyspace item5_iw dropped and re-created (token_code_index as in schema.cql) before each version's pass 1. Each run: 32 writers x 500 writes, 16 rows per write; BASE unset.
+old = throughput.rs before 2026-11-18 (every scenario and pass writes the same rows); new = one key range per scenario and pass. Port changed to 59742 in both copies, nothing else.
+Run order: old r1, new r1, old r2, new r2, then new r3, old r3, new r4, old r4.
+Rows left in partition c0000 after both passes: old 224, new 3136 (14 x 224), every repetition.
+
+== old rep 1 pass 1
+  sequential                                     608 writes/s  p50  48.25 ms  p95  89.36 ms  p99 154.12 ms
+  logged ins+del (A: 2 batches)                 3458 writes/s  p50   6.85 ms  p95  25.93 ms  p99  38.56 ms
+  logged one batch ins+del                      7908 writes/s  p50   3.01 ms  p95   9.23 ms  p99  22.82 ms
+  unlogged one batch ins+del                    8749 writes/s  p50   2.81 ms  p95   7.84 ms  p99  18.89 ms
+  concurrent ins then concurrent del            3579 writes/s  p50   8.20 ms  p95  14.96 ms  p99  22.98 ms
+  pairs: per-partition batch, concurrent        4594 writes/s  p50   6.07 ms  p95  13.51 ms  p99  22.22 ms
+  chains: per key ins then del, concurrent      2329 writes/s  p50  12.06 ms  p95  26.16 ms  p99  38.06 ms
+
+== old rep 1 pass 2 (REVERSE)
+  chains: per key ins then del, concurrent      2517 writes/s  p50  11.37 ms  p95  22.97 ms  p99  39.53 ms
+  pairs: per-partition batch, concurrent        4704 writes/s  p50   5.64 ms  p95  13.34 ms  p99  22.45 ms
+  concurrent ins then concurrent del            1487 writes/s  p50  13.60 ms  p95  61.16 ms  p99 145.00 ms
+  unlogged one batch ins+del                    5900 writes/s  p50   4.44 ms  p95  11.66 ms  p99  20.49 ms
+  logged one batch ins+del                      4419 writes/s  p50   5.20 ms  p95  19.10 ms  p99  33.51 ms
+  logged ins+del (A: 2 batches)                 2714 writes/s  p50   9.60 ms  p95  25.58 ms  p99  42.66 ms
+  sequential                                     660 writes/s  p50  47.24 ms  p95  67.09 ms  p99  78.85 ms
+
+== new rep 1 pass 1
+  sequential                                     693 writes/s  p50  45.01 ms  p95  63.69 ms  p99  76.37 ms
+  logged ins+del (A: 2 batches)                 4882 writes/s  p50   5.68 ms  p95  12.91 ms  p99  21.63 ms
+  logged one batch ins+del                      9410 writes/s  p50   2.66 ms  p95   7.64 ms  p99  16.73 ms
+  unlogged one batch ins+del                    9427 writes/s  p50   2.59 ms  p95   8.14 ms  p99  16.43 ms
+  concurrent ins then concurrent del            3881 writes/s  p50   7.28 ms  p95  15.39 ms  p99  23.17 ms
+  pairs: per-partition batch, concurrent        4726 writes/s  p50   4.99 ms  p95  20.31 ms  p99  33.90 ms
+  chains: per key ins then del, concurrent      3436 writes/s  p50   8.01 ms  p95  18.03 ms  p99  30.38 ms
+
+== new rep 1 pass 2 (REVERSE)
+  chains: per key ins then del, concurrent      3803 writes/s  p50   7.45 ms  p95  14.88 ms  p99  26.45 ms
+  pairs: per-partition batch, concurrent        6148 writes/s  p50   4.46 ms  p95  10.12 ms  p99  20.33 ms
+  concurrent ins then concurrent del            3577 writes/s  p50   7.89 ms  p95  16.89 ms  p99  28.74 ms
+  unlogged one batch ins+del                    6155 writes/s  p50   3.93 ms  p95  12.85 ms  p99  20.93 ms
+  logged one batch ins+del                      6966 writes/s  p50   3.63 ms  p95  10.63 ms  p99  20.93 ms
+  logged ins+del (A: 2 batches)                 4227 writes/s  p50   6.45 ms  p95  16.10 ms  p99  27.04 ms
+  sequential                                     703 writes/s  p50  45.08 ms  p95  60.78 ms  p99  74.75 ms
+
+== old rep 2 pass 1
+  sequential                                     675 writes/s  p50  45.24 ms  p95  68.39 ms  p99 104.07 ms
+  logged ins+del (A: 2 batches)                 4044 writes/s  p50   6.69 ms  p95  16.76 ms  p99  27.57 ms
+  logged one batch ins+del                      8027 writes/s  p50   2.94 ms  p95   9.64 ms  p99  18.85 ms
+  unlogged one batch ins+del                    9308 writes/s  p50   2.64 ms  p95   7.18 ms  p99  16.85 ms
+  concurrent ins then concurrent del            2820 writes/s  p50   9.93 ms  p95  20.37 ms  p99  36.96 ms
+  pairs: per-partition batch, concurrent        4945 writes/s  p50   5.49 ms  p95  12.76 ms  p99  23.04 ms
+  chains: per key ins then del, concurrent      3006 writes/s  p50   9.57 ms  p95  18.86 ms  p99  28.39 ms
+
+== old rep 2 pass 2 (REVERSE)
+  chains: per key ins then del, concurrent      3323 writes/s  p50   8.79 ms  p95  16.69 ms  p99  23.70 ms
+  pairs: per-partition batch, concurrent        6040 writes/s  p50   4.60 ms  p95  10.08 ms  p99  17.67 ms
+  concurrent ins then concurrent del            2915 writes/s  p50   9.68 ms  p95  19.46 ms  p99  31.61 ms
+  unlogged one batch ins+del                    8023 writes/s  p50   3.08 ms  p95   9.39 ms  p99  17.04 ms
+  logged one batch ins+del                      8325 writes/s  p50   3.02 ms  p95   8.74 ms  p99  21.37 ms
+  logged ins+del (A: 2 batches)                 4737 writes/s  p50   5.51 ms  p95  14.63 ms  p99  25.10 ms
+  sequential                                     748 writes/s  p50  42.68 ms  p95  57.08 ms  p99  65.28 ms
+
+== new rep 2 pass 1
+  sequential                                     718 writes/s  p50  44.42 ms  p95  58.19 ms  p99  64.52 ms
+  logged ins+del (A: 2 batches)                 6002 writes/s  p50   4.47 ms  p95  10.59 ms  p99  20.60 ms
+  logged one batch ins+del                      9823 writes/s  p50   2.50 ms  p95   7.42 ms  p99  15.34 ms
+  unlogged one batch ins+del                   10423 writes/s  p50   2.25 ms  p95   7.00 ms  p99  16.89 ms
+  concurrent ins then concurrent del            4038 writes/s  p50   7.06 ms  p95  14.02 ms  p99  25.21 ms
+  pairs: per-partition batch, concurrent        5502 writes/s  p50   4.11 ms  p95  21.19 ms  p99  36.59 ms
+  chains: per key ins then del, concurrent      3693 writes/s  p50   7.48 ms  p95  17.32 ms  p99  33.06 ms
+
+== new rep 2 pass 2 (REVERSE)
+  chains: per key ins then del, concurrent      3726 writes/s  p50   7.22 ms  p95  17.41 ms  p99  29.82 ms
+  pairs: per-partition batch, concurrent        6578 writes/s  p50   3.93 ms  p95   9.68 ms  p99  23.96 ms
+  concurrent ins then concurrent del            3674 writes/s  p50   7.72 ms  p95  16.45 ms  p99  24.92 ms
+  unlogged one batch ins+del                    8164 writes/s  p50   2.98 ms  p95   9.12 ms  p99  17.15 ms
+  logged one batch ins+del                      8902 writes/s  p50   2.69 ms  p95   8.46 ms  p99  19.64 ms
+  logged ins+del (A: 2 batches)                 5713 writes/s  p50   4.75 ms  p95  11.19 ms  p99  18.59 ms
+  sequential                                     738 writes/s  p50  42.99 ms  p95  56.75 ms  p99  64.18 ms
+
+== old rep 3 pass 1
+  sequential                                     756 writes/s  p50  42.34 ms  p95  55.19 ms  p99  60.44 ms
+  logged ins+del (A: 2 batches)                 5468 writes/s  p50   5.07 ms  p95  11.69 ms  p99  19.39 ms
+  logged one batch ins+del                     10211 writes/s  p50   2.51 ms  p95   6.77 ms  p99  16.83 ms
+  unlogged one batch ins+del                    9915 writes/s  p50   2.57 ms  p95   6.64 ms  p99  14.52 ms
+  concurrent ins then concurrent del            3597 writes/s  p50   8.05 ms  p95  15.38 ms  p99  23.51 ms
+  pairs: per-partition batch, concurrent        6273 writes/s  p50   4.27 ms  p95   9.62 ms  p99  23.63 ms
+  chains: per key ins then del, concurrent      3865 writes/s  p50   7.47 ms  p95  13.66 ms  p99  22.62 ms
+
+== old rep 3 pass 2 (REVERSE)
+  chains: per key ins then del, concurrent      3684 writes/s  p50   7.89 ms  p95  14.80 ms  p99  23.51 ms
+  pairs: per-partition batch, concurrent        6576 writes/s  p50   3.80 ms  p95  10.07 ms  p99  28.87 ms
+  concurrent ins then concurrent del            3707 writes/s  p50   7.71 ms  p95  15.05 ms  p99  24.88 ms
+  unlogged one batch ins+del                    9610 writes/s  p50   2.56 ms  p95   7.78 ms  p99  14.72 ms
+  logged one batch ins+del                      9463 writes/s  p50   2.68 ms  p95   7.11 ms  p99  17.42 ms
+  logged ins+del (A: 2 batches)                 4782 writes/s  p50   5.79 ms  p95  13.43 ms  p99  22.60 ms
+  sequential                                     799 writes/s  p50  39.77 ms  p95  52.41 ms  p99  58.34 ms
+
+== new rep 3 pass 1
+  sequential                                     747 writes/s  p50  42.48 ms  p95  56.54 ms  p99  62.51 ms
+  logged ins+del (A: 2 batches)                 5620 writes/s  p50   4.88 ms  p95  11.29 ms  p99  21.21 ms
+  logged one batch ins+del                     10385 writes/s  p50   2.40 ms  p95   6.75 ms  p99  17.18 ms
+  unlogged one batch ins+del                   10602 writes/s  p50   2.30 ms  p95   6.49 ms  p99  17.32 ms
+  concurrent ins then concurrent del            3946 writes/s  p50   6.94 ms  p95  15.01 ms  p99  26.65 ms
+  pairs: per-partition batch, concurrent        5482 writes/s  p50   4.56 ms  p95  14.21 ms  p99  29.97 ms
+  chains: per key ins then del, concurrent      3096 writes/s  p50   8.81 ms  p95  19.61 ms  p99  35.68 ms
+
+== new rep 3 pass 2 (REVERSE)
+  chains: per key ins then del, concurrent      3066 writes/s  p50   9.22 ms  p95  19.34 ms  p99  29.50 ms
+  pairs: per-partition batch, concurrent        5358 writes/s  p50   4.84 ms  p95  13.78 ms  p99  23.40 ms
+  concurrent ins then concurrent del            3684 writes/s  p50   7.94 ms  p95  15.12 ms  p99  23.99 ms
+  unlogged one batch ins+del                    8833 writes/s  p50   2.56 ms  p95   9.20 ms  p99  18.50 ms
+  logged one batch ins+del                      9127 writes/s  p50   2.65 ms  p95   8.24 ms  p99  17.84 ms
+  logged ins+del (A: 2 batches)                 5434 writes/s  p50   4.99 ms  p95  11.99 ms  p99  19.32 ms
+  sequential                                     738 writes/s  p50  43.17 ms  p95  56.48 ms  p99  62.54 ms
+
+== old rep 4 pass 1
+  sequential                                     790 writes/s  p50  40.07 ms  p95  53.88 ms  p99  60.87 ms
+  logged ins+del (A: 2 batches)                 5869 writes/s  p50   4.80 ms  p95   9.50 ms  p99  18.18 ms
+  logged one batch ins+del                      9925 writes/s  p50   2.72 ms  p95   6.10 ms  p99  17.04 ms
+  unlogged one batch ins+del                    8109 writes/s  p50   3.25 ms  p95   8.33 ms  p99  18.80 ms
+  concurrent ins then concurrent del            3099 writes/s  p50   9.08 ms  p95  20.28 ms  p99  28.30 ms
+  pairs: per-partition batch, concurrent        4586 writes/s  p50   5.81 ms  p95  14.04 ms  p99  27.57 ms
+  chains: per key ins then del, concurrent      2866 writes/s  p50   9.67 ms  p95  17.90 ms  p99  28.92 ms
+
+== old rep 4 pass 2 (REVERSE)
+  chains: per key ins then del, concurrent      3373 writes/s  p50   8.17 ms  p95  17.37 ms  p99  34.69 ms
+  pairs: per-partition batch, concurrent        6137 writes/s  p50   4.30 ms  p95  11.57 ms  p99  23.39 ms
+  concurrent ins then concurrent del            3457 writes/s  p50   8.40 ms  p95  16.83 ms  p99  23.79 ms
+  unlogged one batch ins+del                   10122 writes/s  p50   2.65 ms  p95   6.20 ms  p99  15.07 ms
+  logged one batch ins+del                      8206 writes/s  p50   3.17 ms  p95   8.25 ms  p99  18.09 ms
+  logged ins+del (A: 2 batches)                 6023 writes/s  p50   4.70 ms  p95   9.66 ms  p99  18.37 ms
+  sequential                                     781 writes/s  p50  40.68 ms  p95  52.61 ms  p99  58.03 ms
+
+== new rep 4 pass 1
+  sequential                                     773 writes/s  p50  41.26 ms  p95  54.11 ms  p99  59.62 ms
+  logged ins+del (A: 2 batches)                 5960 writes/s  p50   4.67 ms  p95   9.80 ms  p99  18.78 ms
+  logged one batch ins+del                      9837 writes/s  p50   2.70 ms  p95   6.94 ms  p99  16.16 ms
+  unlogged one batch ins+del                   10867 writes/s  p50   2.27 ms  p95   6.40 ms  p99  16.96 ms
+  concurrent ins then concurrent del            4212 writes/s  p50   6.31 ms  p95  17.25 ms  p99  30.32 ms
+  pairs: per-partition batch, concurrent        5533 writes/s  p50   3.85 ms  p95  23.27 ms  p99  38.14 ms
+  chains: per key ins then del, concurrent      4235 writes/s  p50   6.23 ms  p95  18.06 ms  p99  27.30 ms
+
+== new rep 4 pass 2 (REVERSE)
+  chains: per key ins then del, concurrent      4050 writes/s  p50   6.37 ms  p95  17.59 ms  p99  38.16 ms
+  pairs: per-partition batch, concurrent        6850 writes/s  p50   3.46 ms  p95  14.22 ms  p99  28.96 ms
+  concurrent ins then concurrent del            4064 writes/s  p50   6.64 ms  p95  16.69 ms  p99  24.08 ms
+  unlogged one batch ins+del                    8419 writes/s  p50   2.75 ms  p95   9.36 ms  p99  22.49 ms
+  logged one batch ins+del                      8303 writes/s  p50   3.01 ms  p95   8.78 ms  p99  18.03 ms
+  logged ins+del (A: 2 batches)                 5489 writes/s  p50   5.01 ms  p95  10.51 ms  p99  20.61 ms
+  sequential                                     753 writes/s  p50  42.19 ms  p95  55.97 ms  p99  61.69 ms

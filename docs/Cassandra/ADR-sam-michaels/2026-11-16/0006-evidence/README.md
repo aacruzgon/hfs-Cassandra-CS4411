@@ -8,7 +8,8 @@ Scratch scripts and outputs behind the numbers in `../0006-step-5-design.md`. Al
 | --- | --- |
 | `iwbench/` | A standalone cargo crate (empty `[workspace]`, not a member of the repository's workspace). `src/main.rs` runs the shared extractor over a file of resources and reports key-set sizes, rows per table, batch sizes and the values the P5 drops remove. `src/bin/latency.rs` and `src/bin/throughput.rs` time ways of sending one write's index rows. |
 | `iwbench-out.txt` | Output of `main.rs` on the three fixtures and the 10k Synthea dataset, first run (extraction timed in a debug build). |
-| `iwbench-opt.txt` | Output of `main.rs` again with `opt-level = 2` for the extractor's dependencies, and with the extra batch-packing lines for options A, B and B'. The row and drop counts are the same as in `iwbench-out.txt`. |
+| `iwbench-opt.txt` | Output of `main.rs` again with `opt-level = 2` for the extractor's dependencies, and with the extra batch-packing lines for options A, B and B'. The row and drop counts are the same as in `iwbench-out.txt`. Its "option B (pairs kept together)" line is pair-only packing, not 0006's whole partitions (see `iw11.md`, update of 2026-11-18). |
+| `iwbench-whole-partitions.txt` | Added 2026-11-18. Output of `main.rs` after it gained the "update option B, whole partitions" line, which packs whole partitions as 0006 chose (IW9, IW11), on the same files. Every other line matches `iwbench-opt.txt` except the extraction times. Run with the 10k dataset at the SHA-256 in `docs/Cassandra/datasets/SHA256SUMS`. |
 | `latency-out.txt` | Output of `latency.rs`: p50, p95 and p99 per scenario for 1, 8, 16, 32 and 64 rows per write, 300 samples each. |
 | `throughput-out.txt` | Output of `throughput.rs`: writes per second for 32 writers of 500 writes each, 16 rows per write, in two passes (forward, then reverse order). |
 | `iw11.md` | The research note on how a batch's size is measured (IW11), with the node-formula checks. |

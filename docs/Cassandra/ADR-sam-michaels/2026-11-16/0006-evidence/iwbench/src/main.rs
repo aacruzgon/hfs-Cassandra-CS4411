@@ -307,6 +307,32 @@ fn wire_size(b: &[(Key, bool)], rtype: usize) -> usize {
         .sum()
 }
 
+/// Packs units in order, never splitting one; a unit over the bound goes alone.
+/// Returns (batches, units over the bound, largest wire size of a batch of more than one unit).
+fn pack_whole(units: &[Vec<(Key, bool)>], rtype: usize, wire: bool) -> (usize, usize, usize) {
+    let size = |b: &[(Key, bool)]| if wire { wire_size(b, rtype) } else { server_size(b, rtype) };
+    let mut batches: Vec<(usize, Vec<(Key, bool)>)> = vec![];
+    let mut cur: (usize, Vec<(Key, bool)>) = (0, vec![]);
+    let mut over = 0;
+    for u in units {
+        if size(u) > WARN - 256 {
+            over += 1;
+        }
+        let mut t = cur.1.clone();
+        t.extend(u.iter().cloned());
+        if !cur.1.is_empty() && size(&t) > WARN - 256 {
+            batches.push(std::mem::take(&mut cur));
+        }
+        cur.0 += 1;
+        cur.1.extend(u.iter().cloned());
+    }
+    if !cur.1.is_empty() {
+        batches.push(cur);
+    }
+    let max_multi = batches.iter().filter(|b| b.0 > 1).map(|b| wire_size(&b.1, rtype)).max().unwrap_or(0);
+    (batches.len(), over, max_multi)
+}
+
 fn pct(v: &mut Vec<f64>, p: f64) -> f64 {
     if v.is_empty() {
         return 0.0;
@@ -359,6 +385,11 @@ struct Stats {
     wire_create: Vec<usize>,
     pair_batches_wire: Vec<usize>,
     pair_batches_server: Vec<usize>,
+    part_batches_wire: Vec<usize>,
+    part_batches_server: Vec<usize>,
+    parts_over_bound: usize,
+    max_part_wire: usize,
+    max_part_batch_wire: usize,
     upd_partitions: Vec<usize>,
     max_group_wire: usize,
     groups_over_4k: usize,
@@ -448,7 +479,8 @@ fn main() {
             st.wire_create.push(wc);
             st.wire_update_a.push(wc + wd);
             st.wire_delete.push(wx);
-            // Option B: each non-date key's delete next to its replacement insert; never split a pair.
+            // Option B, pair-only packing: each non-date key's delete next to its replacement
+            // insert; a pair is never split, but one partition's pairs can be split across batches.
             let mut units: Vec<Vec<(Key, bool)>> = vec![];
             for k in &keys {
                 if k.is_date() { units.push(vec![(k.clone(), true)]); } else { units.push(vec![(k.clone(), true), (k.clone(), false)]); }
@@ -466,6 +498,18 @@ fn main() {
             };
             st.pair_batches_wire.push(pack_units(true));
             st.pair_batches_server.push(pack_units(false));
+            // Option B as 0006 chose it (IW9, IW11): one unit per (table, partition key), all its
+            // inserts and deletes; a unit is never split, and a unit over the bound goes alone.
+            let mut parts: BTreeMap<(&'static str, Vec<String>), Vec<(Key, bool)>> = BTreeMap::new();
+            for u in &units { for x in u { parts.entry((x.0.table(), x.0.partition())).or_default().push(x.clone()); } }
+            let part_units: Vec<Vec<(Key, bool)>> = parts.into_values().collect();
+            let (pw, over, maxw) = pack_whole(&part_units, rtl, true);
+            let (ps, ..) = pack_whole(&part_units, rtl, false);
+            st.part_batches_wire.push(pw);
+            st.part_batches_server.push(ps);
+            st.parts_over_bound += over;
+            st.max_part_batch_wire = st.max_part_batch_wire.max(maxw);
+            for u in &part_units { st.max_part_wire = st.max_part_wire.max(wire_size(u, rtl)); }
             // Option B': one group per partition key (tables sharing the key value merge).
             let mut groups: BTreeMap<Vec<String>, Vec<(Key, bool)>> = BTreeMap::new();
             for u in &units { for x in u { groups.entry(x.0.partition()).or_default().push(x.clone()); } }
@@ -526,6 +570,12 @@ fn main() {
                 "   update option B (pairs kept together, <= 4864): wire-packed batches mean {:.2} max {}; server-packed mean {:.2} max {}",
                 mean(&s.pair_batches_wire), pcti(&mut s.pair_batches_wire.clone(), 1.0),
                 mean(&s.pair_batches_server), pcti(&mut s.pair_batches_server.clone(), 1.0)
+            );
+            println!(
+                "   update option B, whole partitions (IW9/IW11 as chosen, a partition never split, <= 4864): wire-packed batches mean {:.2} max {}; server-packed mean {:.2} max {}; partitions over 4864 wire bytes (sent alone) {}, largest partition {} wire bytes; largest batch of more than one partition {} wire bytes",
+                mean(&s.part_batches_wire), pcti(&mut s.part_batches_wire.clone(), 1.0),
+                mean(&s.part_batches_server), pcti(&mut s.part_batches_server.clone(), 1.0),
+                s.parts_over_bound, s.max_part_wire, s.max_part_batch_wire
             );
             println!(
                 "   update option B' (one group per partition): groups mean {:.1} max {}; largest group wire {} bytes; groups over 4 KiB {}",

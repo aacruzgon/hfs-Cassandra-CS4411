@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0031: `HFS_CASSANDRA_*` configuration names and defaults
 
 - **Date:** 2026-11-06
-- **Status:** accepted
+- **Status:** accepted; its `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` reason ("so the node reports a typed timeout first") no longer holds after a stalled node (ADR-sam-michaels-0006, SW28), see ADR-aacruzgon-0081
 - **Context:** Roadmap Step 2 (item 2.1) needs a `CassandraConfig` with contact points, keyspace, local data centre, credentials, pool size and timeouts, and the server must read it from the environment (`start_cassandra` in `crates/hfs/src/main.rs` calls it through `build_cassandra_config`, ADR-aacruzgon-0040). The design names none of these variables. The existing backends differ: MongoDB reads `HFS_MONGODB_URL` (falling back to `HFS_DATABASE_URL` when its scheme is `mongodb://`), `HFS_MONGODB_DATABASE`, `HFS_MONGODB_MAX_CONNECTIONS`, `HFS_MONGODB_CONNECT_TIMEOUT_MS` and `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`, with the reading done in `main.rs` through an injectable `env` closure (`crates/hfs/src/main.rs:870-938` at PR #37's head, `:890-958` from PR #45 on); PostgreSQL takes `HFS_DATABASE_URL` and `HFS_PG_*`. The names are user-facing and hard to change once documented, so this is a decision.
 - **Decision:** one prefix, `HFS_CASSANDRA_`, read by `CassandraConfig::from_env()` / `from_env_with(env)` in `crates/persistence/src/backends/cassandra/config.rs`, so the names and their parsing live with the backend and `main.rs` only adds the server's `fhir_version` and `data_dir`:
 

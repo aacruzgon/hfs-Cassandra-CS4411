@@ -69,10 +69,16 @@ async fn main() {
     let k = 16usize;
     let writers = 32usize;
     let per: usize = std::env::var("PER").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
-    let mut scenarios = vec!["sequential", "logged ins+del (A: 2 batches)", "logged one batch ins+del", "unlogged one batch ins+del", "concurrent ins then concurrent del", "pairs: per-partition batch, concurrent", "chains: per key ins then del, concurrent"];
-    if std::env::var("REVERSE").is_ok() { scenarios.reverse(); }
+    let scenarios = vec!["sequential", "logged ins+del (A: 2 batches)", "logged one batch ins+del", "unlogged one batch ins+del", "concurrent ins then concurrent del", "pairs: per-partition batch, concurrent", "chains: per key ins then del, concurrent"];
+    let n_scenarios = scenarios.len();
+    let pass = usize::from(std::env::var("REVERSE").is_ok());
+    // Each scenario of each pass writes its own range of row keys (ids, timestamps and
+    // codes), so no scenario overwrites or deletes over another's rows. BASE shifts every range.
+    let mut scenarios: Vec<(usize, &str)> = scenarios.into_iter().enumerate().collect();
+    if pass == 1 { scenarios.reverse(); }
     let base: usize = std::env::var("BASE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    for scenario in scenarios {
+    for (si, scenario) in scenarios {
+        let range = (pass * n_scenarios + si) * 100_000_000;
         let t0 = Instant::now();
         let mut handles = vec![];
         for w in 0..writers {
@@ -90,7 +96,7 @@ async fn main() {
                 let bparams = StatementParamsBuilder::new().idempotent(true).build();
                 let mut lat = vec![];
                 for i in 0..per {
-                    let seq = (w * 1_000_000 + i + base) as i64 + 50_000_000;
+                    let seq = (range + w * 1_000_000 + i + base) as i64 + 50_000_000;
                     let id = format!("t{seq:010}");
                     let lu = 1_700_100_000_000 + seq;
                     let codes: Vec<String> = (0..k).map(|j| format!("c{:04}", (seq as usize * 7 + j) % 1000)).collect();

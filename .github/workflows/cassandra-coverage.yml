@@ -50,9 +50,9 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # Light (ADR-aacruzgon-0023): the cold instrumented build peaked at
     # 4821 MiB anon on acruzdebian (run 42254248131) and 4709 MiB on
-    # sam-7900x (run 42253148327), more than 2 GiB under acruzdebian's 9 GiB
-    # cap, and light keeps it off the heavy queue the required clippy pair
-    # waits in.
+    # sam-7900x (run 42253148327), more than 2 GiB under the 9 GiB a light
+    # job must fit (ADR-aacruzgon-0080), and light keeps it off the heavy
+    # queue the required clippy pair waits in.
     runs-on: [self-hosted, hfs-cassandra-light]
     timeout-minutes: 60
     env:

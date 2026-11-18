@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0053: An 8 MiB bound on what a compare-and-swap carries, refused with 400 before any write
 
 - **Date:** 2026-11-06
-- **Status:** accepted (Alan approved it on 2026-11-06, as recommended)
+- **Status:** accepted (Alan approved it on 2026-11-06, as recommended); the 8 MiB bound stands, but the G35 and G38 refusals its 400 is compared with are replaced by hashing in ADR-aacruzgon-0079
 - **Context:**
     - **The open comment.** CodeRabbit's outside-diff comment on PR #33, "Bound version-write sizes before the CAS", was never applied (the Step 3 plan's D14). REST accepts bodies up to `max_body_size`, 128 MiB (`crates/rest/src/config.rs:2089`), and the backend sent whatever it received.
     - **What Cassandra 5.0.9 does with a large write.** From the source, at `cassandra-5.0.9`:

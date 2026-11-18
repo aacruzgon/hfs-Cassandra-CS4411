@@ -183,7 +183,7 @@ mod query_builder_tests {
     fn test_empty_query() {
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
         let query = SearchQuery::new("Patient");
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
 
         assert_eq!(es_query.index, "hfs_acme_patient");
 
@@ -220,7 +220,7 @@ mod query_builder_tests {
             let mut query = SearchQuery::new("Patient");
             query.total = mode;
             assert_eq!(
-                builder.build(&query).body["track_total_hits"],
+                builder.build(&query).unwrap().body["track_total_hits"],
                 expected,
                 "_total={mode:?}"
             );
@@ -239,7 +239,7 @@ mod query_builder_tests {
             components: vec![],
         });
 
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         let body_str = serde_json::to_string(&es_query.body).unwrap();
 
         assert!(body_str.contains("search_params.string"));
@@ -259,7 +259,7 @@ mod query_builder_tests {
             components: vec![],
         });
 
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         let body_str = serde_json::to_string(&es_query.body).unwrap();
 
         assert!(body_str.contains("search_params.token"));
@@ -279,7 +279,7 @@ mod query_builder_tests {
             components: vec![],
         });
 
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         let body_str = serde_json::to_string(&es_query.body).unwrap();
 
         assert!(body_str.contains("search_params.date"));
@@ -300,7 +300,7 @@ mod query_builder_tests {
             components: vec![],
         });
 
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         let body_str = serde_json::to_string(&es_query.body).unwrap();
 
         // Multiple values should produce a "should" (OR) clause
@@ -321,7 +321,7 @@ mod query_builder_tests {
             components: vec![],
         });
 
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         let body_str = serde_json::to_string(&es_query.body).unwrap();
 
         assert!(body_str.contains("resource_id"));
@@ -340,7 +340,7 @@ mod query_builder_tests {
             components: vec![],
         });
 
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         let body_str = serde_json::to_string(&es_query.body).unwrap();
 
         assert!(body_str.contains("last_updated"));
@@ -356,7 +356,7 @@ mod query_builder_tests {
             param_type: None,
         });
 
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         let sort = &es_query.body["sort"];
         let sort_arr = sort.as_array().unwrap();
 
@@ -372,7 +372,7 @@ mod query_builder_tests {
         let mut query = SearchQuery::new("Patient");
         query.count = Some(50);
 
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         // The query over-fetches by one hit beyond the requested count (#1079)
         assert_eq!(es_query.body["size"], 51);
     }
@@ -383,14 +383,14 @@ mod query_builder_tests {
         let mut query = SearchQuery::new("Patient");
         query.offset = Some(100);
 
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         assert_eq!(es_query.body["from"], 100);
     }
 
     #[test]
     fn test_count_query() {
         let query = SearchQuery::new("Patient");
-        let body = build_count_query("acme", "Patient", &query);
+        let body = build_count_query("acme", "Patient", &query).unwrap();
 
         // `_count` accepts only `query`: anything else the search builder
         // sets (size, sort, track_total_hits, ...) is a parsing_exception.
@@ -1247,6 +1247,14 @@ mod es_integration {
         .expect("reindex did not finish");
         assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
         assert!(progress.errors.is_empty(), "{progress:?}");
+        // The rebuild's `_bulk` writes do not inherit `write_refresh`
+        // (#1749), so the searches that follow could run before the next
+        // scheduled refresh: reveal them the way a reader that needs them
+        // does.
+        use helios_persistence::core::SearchProvider;
+        es.ensure_writes_visible(tenant, &["Observation", "Patient"])
+            .await
+            .unwrap();
     }
 
     /// #1629: a named resource that is gone from the source is not rebuilt, so
@@ -1907,6 +1915,46 @@ mod es_integration {
         backend
     }
 
+    /// A resource indexed by a bulk path (the page writer the ingest sink, the
+    /// deferred rebuild and `$reindex` use) is searchable once
+    /// `ensure_writes_visible` returns, also under `write_refresh = wait_for`
+    /// with `reindex_refresh` unset: the bulk paths never inherit `wait_for`
+    /// (#1749), so the refresh must not be skipped (combined-stack review F1).
+    #[tokio::test]
+    async fn es_integration_ensure_writes_visible_reveals_bulk_writes_under_wait_for() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::{SearchQuery, StoredResource};
+
+        // A long interval, so only an explicit refresh can reveal the write.
+        let backend = create_backend_with("30s", WriteRefreshPolicy::WaitFor).await;
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let patient = StoredResource::new(
+            "Patient",
+            "bulk-p1",
+            TenantId::new("t1"),
+            json!({"resourceType": "Patient", "id": "bulk-p1"}),
+            FhirVersion::default(),
+        );
+        let written = backend
+            .write_search_entries_page(&tenant, std::slice::from_ref(&patient))
+            .await;
+        assert!(written.iter().all(|r| r.is_ok()), "{written:?}");
+        backend
+            .ensure_writes_visible(&tenant, &["Patient"])
+            .await
+            .expect("ensure_writes_visible");
+        let found = backend
+            .search(&tenant, &SearchQuery::new("Patient"))
+            .await
+            .expect("search");
+        assert_eq!(
+            found.resources.items.len(),
+            1,
+            "a bulk-indexed resource must be searchable once ensure_writes_visible returned"
+        );
+    }
+
     /// A backend with a small `max_result_window` (10) and stable refresh, so
     /// the #1407 over-window `_contained` test walks more than one round of
     /// hits. The UUID prefix keeps its indices apart from every other test.
@@ -2268,15 +2316,6 @@ mod es_integration {
             &backend,
             "modifier-parity-1408",
             &[
-                // A short `:of-type` value adds no condition at all: every Patient.
-                Divergence {
-                    label: "Patient?identifier:ofType=MR|12345",
-                    expect: Expect::Ids(&["p1", "p2", "p3", "p4"]),
-                },
-                Divergence {
-                    label: "Patient?identifier:ofType=12345",
-                    expect: Expect::Ids(&["p1", "p2", "p3", "p4"]),
-                },
                 // `:code-text` is a word-prefix match (`match_phrase_prefix`), not a
                 // starts-with on the whole display.
                 Divergence {
@@ -5986,6 +6025,183 @@ mod es_integration {
         );
     }
 
+    /// #2509: a compartment membership with no params or no reference matches
+    /// nothing. It used to be read as "no compartment", so `search` returned
+    /// every Observation of the type and `search_count` counted them all.
+    #[tokio::test]
+    async fn es_integration_empty_compartment_membership_matches_nothing() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue, TotalMode,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("empty-compartment-2509");
+
+        for (id, patient) in [("obs-p1", "p1"), ("obs-p2", "p2")] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": {"text": "hr"},
+                        "subject": {"reference": format!("Patient/{patient}")}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let membership = |params: &[&str], reference: &str| {
+            Some(CompartmentMembership {
+                params: params.iter().map(|p| p.to_string()).collect(),
+                reference: reference.to_string(),
+            })
+        };
+        let status_final = SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("final")],
+            ..Default::default()
+        };
+
+        // The control first: the real membership holds its member, once the
+        // index has caught up. Without it "returns nothing" would pass on an
+        // index that has not.
+        let mut control = SearchQuery::new("Observation");
+        control.compartment = membership(&["subject", "performer"], "Patient/p1");
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            seen = backend
+                .search(&tenant, &control)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            if seen == ["obs-p1".to_string()] {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+        assert_eq!(seen, ["obs-p1".to_string()], "the control must find p1's");
+        assert_eq!(backend.search_count(&tenant, &control).await.unwrap(), 1);
+
+        // `_id` and `:missing=true` beside a membership: the id of a member is
+        // found, the id of a non-member is not, and p1's observation is not
+        // missing a status.
+        let id = |id: &str| SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq(id)],
+            ..Default::default()
+        };
+        let missing = |name: &str, param_type: SearchParamType| SearchParameter {
+            name: name.to_string(),
+            param_type,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("true")],
+            ..Default::default()
+        };
+        for (label, parameter, expected) in [
+            ("_id=obs-p1", id("obs-p1"), vec!["obs-p1".to_string()]),
+            ("_id=obs-p2", id("obs-p2"), vec![]),
+            (
+                "status:missing=true",
+                missing("status", SearchParamType::Token),
+                vec![],
+            ),
+            (
+                "performer:missing=true",
+                missing("performer", SearchParamType::Reference),
+                vec!["obs-p1".to_string()],
+            ),
+        ] {
+            let mut query = SearchQuery::new("Observation").with_parameter(parameter);
+            query.compartment = membership(&["subject", "performer"], "Patient/p1");
+            let found: Vec<String> = backend
+                .search(&tenant, &query)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            assert_eq!(found, expected, "control + {label}");
+            assert_eq!(
+                backend.search_count(&tenant, &query).await.unwrap(),
+                expected.len() as u64,
+                "control + {label}: search_count"
+            );
+        }
+
+        for (label, empty) in [
+            ("no params", membership(&[], "Patient/p1")),
+            ("empty reference", membership(&["subject"], "")),
+            // Matched on with its version stripped, which leaves nothing.
+            (
+                "version-only reference",
+                membership(&["subject"], "/_history/1"),
+            ),
+            ("neither", membership(&[], "")),
+        ] {
+            for (criteria, parameters) in [
+                ("alone", vec![]),
+                ("status=final", vec![status_final.clone()]),
+                ("_id=obs-p1", vec![id("obs-p1")]),
+                (
+                    "status:missing=true",
+                    vec![missing("status", SearchParamType::Token)],
+                ),
+                (
+                    "performer:missing=true",
+                    vec![missing("performer", SearchParamType::Reference)],
+                ),
+            ] {
+                let mut query = SearchQuery::new("Observation");
+                query.compartment = empty.clone();
+                query.total = Some(TotalMode::Accurate);
+                query.parameters = parameters;
+                let context = format!("{label} + {criteria}");
+
+                let found = backend.search(&tenant, &query).await.unwrap();
+                assert!(
+                    found.resources.items.is_empty(),
+                    "{context}: search returned {:?}",
+                    found
+                        .resources
+                        .items
+                        .iter()
+                        .map(|r| r.id().to_string())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(found.total, Some(0), "{context}: _total=accurate");
+                assert_eq!(
+                    backend.search_count(&tenant, &query).await.unwrap(),
+                    0,
+                    "{context}: search_count"
+                );
+                assert!(
+                    backend
+                        .search_ids(&tenant, &query)
+                        .await
+                        .unwrap()
+                        .items
+                        .is_empty(),
+                    "{context}: search_ids"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn es_integration_search_by_name_multiple() {
         use helios_persistence::core::SearchProvider;
@@ -6523,6 +6739,64 @@ mod es_integration {
                     if modifier == "not"
             ),
             "search_count must reject _lastUpdated:not as well, got: {err:?}"
+        );
+    }
+
+    /// #2510: a parameter that carries values but has no clause to build — a
+    /// `special`-typed one such as `Location.near`, which nothing indexes — is
+    /// refused by name, on `search` and on `search_count` alike. It used to be
+    /// dropped from the query, which then matched every Location.
+    #[tokio::test]
+    async fn es_integration_search_unevaluable_parameter_is_rejected() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Location",
+                json!({ "resourceType": "Location", "id": "a" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let query = SearchQuery::new("Location").with_parameter(SearchParameter {
+            name: "near".to_string(),
+            param_type: SearchParamType::Special,
+            modifier: None,
+            values: vec![SearchValue::eq("42.0|-71.0|10|km")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let err = backend.search(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::QueryParseError { ref message })
+                    if message.contains("'near'")
+            ),
+            "near must be refused, not dropped, got: {err:?}"
+        );
+
+        let err = backend.search_count(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::QueryParseError { ref message })
+                    if message.contains("'near'")
+            ),
+            "search_count must refuse near as well, got: {err:?}"
         );
     }
 

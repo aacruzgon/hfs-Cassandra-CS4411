@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0060: Step 3's scope: vread, list_versions and delete_with_match come forward from Step 4, PATCH is in, the multitenancy suites split, and four contradictions are realigned; Steps 4 to 8 left to the group (**X**)
 
 - **Date:** 2026-11-06
-- **Status:** accepted
+- **Status:** accepted; point 4's G38 bound is retired by ADR-aacruzgon-0079 (Step 5's extraction pull request removes it)
 - **Context:**
     - **The race suite needs Step 4 methods.** Roadmap Step 3's exit criterion and row 3.3 require every test of `search/versioned_write_race_suite.rs`. Its bound is `ResourceStorage + VersionedStorage`, and it calls `list_versions` in all five tests, `vread` in two and `delete_with_match` in one (Step 3 plan D1). All three were Step 4 stubs, and row 4.1 put `VersionedStorage` at Step 4.
     - **The versioned `Location` would point at a 501.** From Step 3, every create, update-as-create and revive answers `Location: …/_history/N` (ADR-aacruzgon-0049). With vread still a stub, every one of those links would answer 501, and `/metadata`'s `readHistory: true` would be false (plan D19; matrix V-6, CS-2). ADR-aacruzgon-0049 had the Milestone A `GET` of that `Location` assert 501 until Step 4.

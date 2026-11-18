@@ -49,7 +49,17 @@
         - both new steps, run locally against a stand-in cgroup: `memory.max` of 9 GiB, 20 GiB and 32 GiB minus one byte gives 1 and 8 jobs; exactly 32 GiB and 40 GiB give 2 and 16; `max` and a missing file give 1 and 8; against the real runner cgroup, still at 9G, it printed `memory.max 9663676416: CARGO_BUILD_JOBS=1`;
         - after the change: `systemctl show` reports `MemoryMax=42949672960`, `MemorySwapMax=0`, `OOMPolicy=continue`, `User=gh-runner`, `ActiveState=active`, with no restart; the service cgroup's `memory.max` is 42949672960 and `memory.swap.max` 0; the old drop-in is kept as `memory.conf.9G.bak`, which systemd ignores (only `*.conf` is read); against that cgroup the two steps print `CARGO_BUILD_JOBS=2` and `CARGO_BUILD_JOBS=16`;
         - `gh api .../actions/runners` after `POST .../runners/22/labels`: `acruzdebian` online with `self-hosted, Linux, X64, hfs-cassandra-light, hfs-runner-acruzdebian, hfs-cassandra-heavy`; `sam-7900x` offline, labels unchanged;
-        - *pending:* the PR's own run, with each clippy job's runner, `CARGO_BUILD_JOBS`, wall time and peak `anon`.
+        - **The first heavy jobs on `acruzdebian`,** from `ci-report-clippy-*` (`build-clippy-*.json`). The queued runs from before this PR ran first, with `main`'s workflow and its fixed counts:
+
+          | Run | Job | `CARGO_BUILD_JOBS` | Units built | Wall time | Peak `anon` | Peak `memory.current` | OOM kills |
+          | --- | --- | --- | --- | --- | --- | --- | --- |
+          | 44156440683 (`main`), cold | `cargo clippy (helios-fhir)` | 1 | 252 | 285.9 s | 13,744 MiB | 34,003 MiB | 0 |
+          | 44156440683 (`main`), cold | `cargo clippy (workspace)` | 8 | 1,341 | 241.2 s | 13,782 MiB | 40,959 MiB | 0 |
+          | 44243120084 (this PR), warm | `cargo clippy (helios-fhir)` | 2 | 0 | 0.2 s | 117 MiB | 28,175 MiB | 0 |
+          | 44243120084 (this PR), warm | `cargo clippy (workspace)` | 16 | 0 | 0.7 s | 120 MiB | 34,290 MiB | 0 |
+
+          On this PR's run both jobs landed on `acruzdebian`, read `memory.max` 42949672960, and picked 2 and 16; all four required checks of the workflow passed. The target directory was already warm from the earlier runs, so cargo built nothing, and this run measures neither the time nor the memory at 2 and 16 jobs. The cold build at 1 and 8 jobs peaked at 13.4 GiB `anon`, so the cap that held it back on `sam-7900x` was 20G, not the machine. `memory.current` reaching the 40 GiB cap is page cache, which the kernel reclaims; `anon` stayed 26 GiB under it;
+        - *pending:* a cold run at 2 and 16 jobs: wall time and peak `anon` against the 1-job and 8-job figures above.
 - **Links:**
     - ADR-aacruzgon-0023 (amended), 0018 and 0019 (update notes added), 0002.
     - ADR-sam-michaels-0002, 0003.

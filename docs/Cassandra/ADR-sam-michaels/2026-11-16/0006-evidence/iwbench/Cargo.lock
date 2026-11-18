@@ -1476,14 +1476,17 @@ name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hashlink"
-version = "0.10.0"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown 0.17.0",
 ]
 
 [[package]]
@@ -1504,7 +1507,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helios-audit"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "axum",
@@ -1521,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "helios-auth"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1542,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "helios-fhir"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
  "chrono",
  "clap",
@@ -1554,29 +1557,24 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
- "time",
  "tracing",
  "zip",
 ]
 
 [[package]]
 name = "helios-fhir-macro"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
  "heck",
- "helios-fhirpath-support",
  "proc-macro2",
  "quote",
- "serde",
- "serde_json",
  "syn 2.0.117",
 ]
 
 [[package]]
 name = "helios-fhirpath"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
- "arc-swap",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -1592,10 +1590,8 @@ dependencies = [
  "octofhir-ucum",
  "once_cell",
  "parking_lot",
- "rayon",
  "regex",
  "reqwest",
- "roxmltree",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
@@ -1609,14 +1605,14 @@ dependencies = [
 
 [[package]]
 name = "helios-fhirpath-support"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
  "rust_decimal",
 ]
 
 [[package]]
 name = "helios-observability"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "axum",
@@ -1631,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "helios-persistence"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1666,7 +1662,7 @@ dependencies = [
 
 [[package]]
 name = "helios-serde-support"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
  "erased-serde",
  "serde",
@@ -1675,10 +1671,8 @@ dependencies = [
 
 [[package]]
 name = "helios-sof"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
- "anyhow",
- "arc-swap",
  "arrow",
  "async-trait",
  "axum",
@@ -1706,7 +1700,6 @@ dependencies = [
  "sqlparser",
  "thiserror 1.0.69",
  "tokio",
- "tokio-stream",
  "tower",
  "tower-http",
  "tracing",
@@ -2232,9 +2225,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.31.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad8935b44e7c13394a179a438e0cebba0fe08fe01b54f152e29a93b5cf993fd4"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -3272,16 +3265,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "roxmltree"
-version = "0.20.0"
+name = "rsqlite-vfs"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
+dependencies = [
+ "hashbrown 0.16.1",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "rusqlite"
-version = "0.33.0"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c6d5e5acb6f6129fe3f7ba0a7fc77bca1942cb568535e18e7bc40262baf3110"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags",
  "fallible-iterator",
@@ -3290,6 +3287,7 @@ dependencies = [
  "libsqlite3-sys",
  "serde_json",
  "smallvec",
+ "sqlite-wasm-rs",
 ]
 
 [[package]]
@@ -3689,6 +3687,18 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sqlite-wasm-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
+dependencies = [
+ "cc",
+ "js-sys",
+ "rsqlite-vfs",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -4938,9 +4948,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.0.4"
+version = "9.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a954114b47a54df49f83d2722814e86b23d4bb1b54a1b90fb7d92b41619ddc22"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
 dependencies = [
  "aes",
  "bzip2",

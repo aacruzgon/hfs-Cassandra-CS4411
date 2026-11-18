@@ -40,7 +40,14 @@
 //! Messages: `Unavailable` and `ConnectionFailed` messages are sent to the
 //! client as the 503 text (`crate::error`, #2303), so they name no host; the
 //! driver detail is logged instead. `Timeout`, `QueryError` and `Internal`
-//! messages are logged by REST and never sent.
+//! messages are logged by REST and never sent. This table's 503 texts say
+//! only that Cassandra cannot serve the request or could not be reached,
+//! which is true of a write that cannot have applied. Once a compare-and-swap's
+//! outcome is unknown the write may have applied, so the write engine
+//! (`write.rs`, `unavailable_unless_timeout` and `undecidable`) replaces the
+//! message of every 503 it returns from then on with one that says the write
+//! may have been stored, keeping the variant, so the status and `Retry-After`
+//! stay the same (ADR-aacruzgon-0055, 0067, 0077).
 
 use cdrs_tokio::error::Error as CdrsError;
 use cdrs_tokio::frame::message_error::{ErrorType, FailureInfo};

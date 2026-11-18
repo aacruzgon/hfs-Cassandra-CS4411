@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0023: CI splits into light and heavy jobs, and `acruzdebian` joins as a second runner for light jobs only
 
 - **Date:** 2026-11-04
-- **Status:** accepted
+- **Status:** accepted; amended by [ADR-aacruzgon-0080](../2026-11-18/0080-acruzdebian-64gb-heavy.md) (`acruzdebian` has 64 GB, a 40G cap and the heavy label; the light and heavy labels and the "about 9 GB" rule stay)
 - **Context:**
     - **One runner meant no CI whenever it was off.** Every job used `runs-on: [self-hosted, hfs-cassandra]`, which only `sam-7900x` carried (ADR-sam-michaels-0001). It is Sam's own desktop, and on 2026-11-04 it was offline: the five required checks (ADR-aacruzgon-0019, 0021) on PR #28 and the nightly canary sat queued, and no pull request could merge.
     - **The second machine is smaller.** `acruzdebian` is my desktop: Debian 13 (trixie), x86_64, AMD Ryzen 7 5800X with 16 threads, 15 GB of RAM, 674 GB free on `/`, Docker 26.1.5 from Debian's packages, AppArmor rather than SELinux.

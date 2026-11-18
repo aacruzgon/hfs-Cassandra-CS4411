@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0072: The three-node Compose cluster: RF 3 without touching the schema, two profiles, topology, and what RF 3 accepts
 
 - **Date:** 2026-11-09
-- **Status:** accepted (Alan approved it on 2026-11-09, as drafted). It amends ADR-aacruzgon-0050's reason that the "Partition, RF 3" failure test expects 503: the test now expects `WriteTimeout` first and then 503 (decision 3). The commit that adds this entry appends that note to 0050's Status line and index row. Decision 4's history check is refined by ADR-sam-michaels-0006 (RV19, SW28: one scoped sweep at grace 0 after every writer has returned, once no writer's error was HFS's own deadline), see ADR-aacruzgon-0081.
+- **Status:** accepted (Alan approved it on 2026-11-09, as drafted). It amends ADR-aacruzgon-0050's reason that the "Partition, RF 3" failure test expects 503: the test now expects `WriteTimeout` first and then 503 (decision 3). The commit that adds this entry appends that note to 0050's Status line and index row. Decision 4's history check is refined by ADR-sam-michaels-0006 (RV19, SW28: one scoped sweep at grace 0 after every writer has returned, once no attempt of any writer ended in a client-side error, HFS's own deadline or a dropped connection), see ADR-aacruzgon-0081.
 - **Context:**
     - **Requirement.** Roadmap row 0.3 and the Step 0 Compose bullet ask for a second Compose file: three nodes on one host, RF 3, `GossipingPropertyFileSnitch`, one DC matching the keyspace's `NetworkTopologyStrategy` map. Section 6's cluster failure tests (row 8.3) run on it.
     - **Why these are decisions.**

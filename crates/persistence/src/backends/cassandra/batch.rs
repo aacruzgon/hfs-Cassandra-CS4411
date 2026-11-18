@@ -219,10 +219,13 @@ pub(crate) const MAX_BATCH_BYTES: usize = 5 * 1024 - 256;
 /// - **A unit is never split.** A unit is every row of one partition key, its
 ///   inserts and its deletes (IW9 B). Cassandra applies one partition's
 ///   mutation whole on each replica; most of all, once the batch has
-///   reached a quorum, `count` never sees an updated resource's
-///   `resources_by_type` row at both `last_updated` values at once (on RF 3
-///   a batch that reached fewer can, for a while: ADR-sam-michaels-0006,
-///   IW9).
+///   reached a quorum, an update alone never lets `count` see an updated
+///   resource's `resources_by_type` row at both `last_updated` values.
+///   `count` is still off by one either way, twice or not at all: twice
+///   after a write whose index step was skipped or did not finish, until the
+///   sweeper or repair finishes it (on RF 3 also after a batch that reached
+///   fewer than a quorum), and not at all when read repair copies a delete
+///   onto a replica that missed the insert (ADR-sam-michaels-0006, IW9).
 /// - **A unit over `bound` goes alone**, as a batch of its own. Such a unit
 ///   is one partition, so the node neither size-checks it nor writes it to
 ///   the batchlog (`BatchStatement.java:331-367`). No fixture comes near:
@@ -272,6 +275,7 @@ pub(crate) enum BatchFailure {
     /// timed out; the batch may or may not be applied later, by a batchlog
     /// replay), with `SIMPLE` (a lone statement, or a batch of one
     /// partition, which the node runs without a batchlog,
+    /// `BatchStatement.java:444-445`, and types as `SIMPLE`,
     /// `StorageProxy.java:885`), with `UNLOGGED_BATCH` (IW10's fallback) or
     /// with another write type; `WriteFailure`, `Unavailable`,
     /// `Overloaded`, a node-side `Server` error, a dropped connection, the

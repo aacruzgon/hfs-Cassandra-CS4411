@@ -322,6 +322,31 @@ pub struct SearchParameter {
     pub components: Vec<CompositeSearchComponent>,
 }
 
+impl SearchParameter {
+    /// A chained parameter's key as a request writes it, less the terminal
+    /// modifier: `subject:Patient.name`, or `patient._has:Group:member:_id`
+    /// for a chain that ends in `_has`. The name alone when not chained.
+    pub fn chain_key(&self) -> String {
+        let mut key = self.name.clone();
+        for (i, hop) in self.chain.iter().enumerate() {
+            if i > 0 {
+                key.push_str(&hop.reference_param);
+            }
+            if let Some(t) = &hop.target_type {
+                key.push(':');
+                key.push_str(t);
+            }
+            key.push('.');
+            match &hop.has {
+                Some(has) => key.push_str(&has.key_as_written()),
+                None if i + 1 == self.chain.len() => key.push_str(&hop.target_param),
+                None => {}
+            }
+        }
+        key
+    }
+}
+
 /// Component definition for a composite search parameter.
 ///
 /// Used when building composite search queries to define how each
@@ -463,8 +488,15 @@ pub struct ChainedParameter {
     /// Optional type modifier on the reference.
     pub target_type: Option<String>,
 
-    /// The target parameter on the referenced resource.
+    /// The target parameter on the referenced resource; `_has` when
+    /// [`has`](Self::has) is set.
     pub target_param: String,
+
+    /// The reverse chain a chain ends in: `_has:Group:member:_id` of
+    /// `Encounter?patient._has:Group:member:_id=102`, which the resource this
+    /// hop reaches must satisfy. Set on the last hop only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has: Option<Box<ReverseChainedParameter>>,
 }
 
 /// A reverse chained parameter (_has).
@@ -545,6 +577,17 @@ impl ReverseChainedParameter {
             Some(modifier) => format!("{}:{modifier}", self.search_param),
             None => self.search_param.clone(),
         }
+    }
+
+    /// The key as a request writes it, less the terminal modifier:
+    /// `_has:Observation:subject:code`, or
+    /// `_has:Observation:subject:_has:Provenance:target:agent` when nested.
+    pub fn key_as_written(&self) -> String {
+        let rest = match &self.nested {
+            Some(inner) => inner.key_as_written(),
+            None => self.search_param.clone(),
+        };
+        format!("_has:{}:{}:{rest}", self.source_type, self.reference_param)
     }
 
     /// Returns the depth of nesting (1 for non-nested, 2+ for nested).
@@ -735,6 +778,12 @@ pub struct SearchQuery {
     /// (`GET /{compartmentType}/{id}/{targetType}`). Restricts results to
     /// resources that reference the compartment via *any* of the membership
     /// params (OR), per the FHIR CompartmentDefinition.
+    ///
+    /// A `Some` always constrains the query, and it also carries patient-scope
+    /// confinement, so it is a security boundary: a membership with no
+    /// `params`, or with an empty `reference`, matches nothing (see
+    /// [`CompartmentMembership::matches_nothing`]). It is never skipped, which
+    /// would widen the search to every resource of the type.
     pub compartment: Option<CompartmentMembership>,
 
     /// Raw query parameters for debugging.
@@ -757,6 +806,10 @@ pub struct SearchQuery {
 /// A resource is in the compartment if it references `reference` through *any*
 /// of the `params` reference search parameters (logical OR). See
 /// https://hl7.org/fhir/compartmentdefinition.html.
+///
+/// A membership with no `params`, or with an empty `reference`, has no members:
+/// see [`CompartmentMembership::matches_nothing`]. It is a restriction that
+/// matches nothing, never the absence of a restriction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CompartmentMembership {
     /// The membership reference search parameters (e.g. `patient`, `recorder`,
@@ -764,6 +817,27 @@ pub struct CompartmentMembership {
     pub params: Vec<String>,
     /// The compartment reference value, e.g. `Patient/123`.
     pub reference: String,
+}
+
+impl CompartmentMembership {
+    /// Whether this membership can match no resource at all: it names no
+    /// membership parameter, or no compartment reference.
+    ///
+    /// The reference is judged the way every backend matches on it, after
+    /// [`strip_reference_version`]: `/_history/1` strips to the empty string, so
+    /// it names no compartment, however non-empty it looks.
+    ///
+    /// No resource can be a member of a compartment through no parameter, or of
+    /// a compartment that has no reference, so such a membership matches
+    /// nothing. It must never be read as "no compartment restriction": a
+    /// compartment search is also how a request is confined to one patient, and
+    /// skipping the restriction would return every resource of the type. Every
+    /// backend that can search therefore answers an empty membership with zero
+    /// rows and a count of 0, and no error. (Standalone S3 refuses every search
+    /// that has no index to answer it, this one included.)
+    pub fn matches_nothing(&self) -> bool {
+        self.params.is_empty() || strip_reference_version(&self.reference).is_empty()
+    }
 }
 
 /// Mode for the `_contained` parameter — whether contained resources (nested in
@@ -962,6 +1036,56 @@ impl SearchQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2556: a chained parameter's key as written, a chain that ends in a
+    /// (nested) `_has` included.
+    #[test]
+    fn test_chain_key() {
+        let hop = |reference: &str, target_type: Option<&str>, target: &str| ChainedParameter {
+            reference_param: reference.to_string(),
+            target_type: target_type.map(str::to_string),
+            target_param: target.to_string(),
+            has: None,
+        };
+        let param = |chain: Vec<ChainedParameter>| SearchParameter {
+            name: chain
+                .first()
+                .map_or("name".to_string(), |h| h.reference_param.clone()),
+            chain,
+            ..Default::default()
+        };
+
+        assert_eq!(param(vec![]).chain_key(), "name");
+        assert_eq!(
+            param(vec![hop("subject", None, "name")]).chain_key(),
+            "subject.name"
+        );
+        assert_eq!(
+            param(vec![
+                hop("subject", Some("Patient"), "organization"),
+                hop("organization", Some("Organization"), "name"),
+            ])
+            .chain_key(),
+            "subject:Patient.organization:Organization.name"
+        );
+
+        let mut last = hop("patient", None, "_has");
+        last.has = Some(Box::new(ReverseChainedParameter::nested(
+            "Observation",
+            "subject",
+            ReverseChainedParameter::terminal(
+                "Provenance",
+                "target",
+                "agent",
+                SearchValue::eq("Practitioner/1"),
+            )
+            .with_modifier(SearchModifier::Missing),
+        )));
+        assert_eq!(
+            param(vec![hop("encounter", Some("Encounter"), "patient"), last]).chain_key(),
+            "encounter:Encounter.patient._has:Observation:subject:_has:Provenance:target:agent"
+        );
+    }
 
     #[test]
     fn test_search_param_type_display() {
@@ -1358,5 +1482,51 @@ mod tests {
         assert_eq!(t("http://h/patient/p1"), None, "type must be capitalised");
         assert_eq!(t("http://h/Pat_ient/p1"), None);
         assert_eq!(t(&format!("http://h/Patient/{}", "a".repeat(65))), None);
+    }
+
+    /// #2509: a membership with no parameter or no reference can match nothing;
+    /// only one with both is a real restriction.
+    #[test]
+    fn membership_without_params_or_reference_matches_nothing() {
+        let membership = |params: &[&str], reference: &str| CompartmentMembership {
+            params: params.iter().map(|p| p.to_string()).collect(),
+            reference: reference.to_string(),
+        };
+        assert!(membership(&[], "Patient/p1").matches_nothing());
+        assert!(membership(&["patient"], "").matches_nothing());
+        assert!(membership(&[], "").matches_nothing());
+        assert!(CompartmentMembership::default().matches_nothing());
+        assert!(!membership(&["patient"], "Patient/p1").matches_nothing());
+        assert!(!membership(&["subject", "performer"], "Patient/p1").matches_nothing());
+    }
+
+    /// #2509: the reference is judged after its version is stripped, because
+    /// that is what every backend matches on. A bare `/_history/<vid>` strips to
+    /// the empty string and names no compartment; a versioned reference to a
+    /// real one is still a real restriction.
+    #[test]
+    fn a_reference_that_strips_to_nothing_matches_nothing() {
+        assert_eq!(strip_reference_version("/_history/1"), "");
+        assert_eq!(
+            strip_reference_version("Patient/p1/_history/2"),
+            "Patient/p1"
+        );
+        assert_eq!(strip_reference_version(""), "");
+
+        let membership = |reference: &str| CompartmentMembership {
+            params: vec!["subject".to_string()],
+            reference: reference.to_string(),
+        };
+        assert!(membership("/_history/1").matches_nothing());
+        assert!(membership("/_history/").matches_nothing());
+        assert!(!membership("Patient/p1/_history/2").matches_nothing());
+        assert!(!membership("Patient/p1").matches_nothing());
+        assert!(
+            CompartmentMembership {
+                params: vec![],
+                reference: "Patient/p1/_history/2".to_string(),
+            }
+            .matches_nothing()
+        );
     }
 }

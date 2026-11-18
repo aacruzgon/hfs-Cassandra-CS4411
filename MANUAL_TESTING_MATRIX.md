@@ -90,7 +90,7 @@ part of T4.
 
 | Tool | Why |
 |---|---|
-| Rust 1.91.1+ (edition 2024), `cargo` | build |
+| Rust 1.95+ (edition 2024), `cargo` | build |
 | Python 3 with dev headers, `maturin` not required | `--workspace` includes `pysof` (PyO3 cdylib); the build needs a Python interpreter on `PATH` |
 | Docker | Postgres, Elasticsearch, MongoDB, MinIO |
 | `curl`, `jq` | T1 smoke check; T3 corpus and count checks (7.1, 7.5); `jq` optionally trims the import manifest in T3 |
@@ -177,9 +177,9 @@ docker run -d --name hfs-es -p 9200:9200 \
   -v hfs-es-data:/usr/share/elasticsearch/data \
   elasticsearch:8.15.0
 
-# MongoDB 7.0 (mongodb, mongo-es) — a single-node replica set: transaction Bundles
+# MongoDB 7.0, minimum 7.0.48 (CVE-2026-118383) (mongodb, mongo-es) — a single-node replica set: transaction Bundles
 # need multi-document transactions, which a standalone mongod cannot run (T2 6.3).
-docker run -d --name hfs-mongo -p 27017:27017 mongo:7.0 --replSet rs0 --bind_ip_all
+docker run -d --name hfs-mongo -p 27017:27017 mongo:7.0.48 --replSet rs0 --bind_ip_all
 docker exec hfs-mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 
 # MinIO (s3, s3-es, and the S3 output-backend variants of T5/T7)
@@ -1329,11 +1329,39 @@ Save this batch Bundle as `$WORK/fixtures/encounters.json`:
    2, 6, 14, 30 and 62 s after the upload and then every minute, so a receiver
    restarted within the roughly five-minute retry window is reached on the next one),
    and the two queued behind it follow within milliseconds.
+4. `$status` and `$events` (run after step 1, before step 3, so the counter is exactly 3;
+   `$HFS` is the server base, `$BASE` = `$HFS/fhir` or your configured base URL):
+   - `curl -s $BASE/Subscription/manual-sub/\$status` → `200`, a `Parameters` resource
+     (R4) with `subscription` (an **absolute** URL ending `/Subscription/manual-sub`),
+     `topic`, `status` = `active`, `type` = `query-status` and
+     `events-since-subscription-start` = `3`.
+   - `curl -s "$BASE/Subscription/manual-sub/\$events?eventsSinceNumber=1&eventsUntilNumber=3"`
+     → `200`, a `history` Bundle (R4/R4B; `subscription-notification` on R5/R6).
+     `entry[0].resource` is the status: on **R4** a `Parameters` (never a
+     `SubscriptionStatus`) with `type` = `query-event`, the same absolute `subscription`
+     reference as `$status`, `events-since-subscription-start` = `3` and **3**
+     `notification-event` parts (`event-number` 1, 2, 3, a `timestamp`, and a `focus`
+     reference `Encounter/<id>`); on **R4B and later** a `SubscriptionStatus` with
+     `type` = `query-event` and 3 `notificationEvent` entries. `entry[0].request` is
+     `GET Subscription/manual-sub/$status`. Entries 1-3 are id-only (`fullUrl` and
+     `request GET Encounter/<id>`, no `resource`).
+   - `...$events?eventsSinceNumber=2&eventsUntilNumber=2` → the same shape with exactly
+     **1** event (number 2): the range parameters change the result.
+   - `...$events?eventsSinceNumber=4` (the next number, nothing new yet) → `200` with the
+     status and **0** events (`events-since-subscription-start` still `3`).
+   - `...eventsSinceNumber=3&eventsUntilNumber=1` and `...eventsSinceNumber=abc` → `400`
+     with an `OperationOutcome` (issue code `invalid`).
+   - The event history is in memory (size `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE`, default
+     100) and is empty after a server restart; a range entirely older than the retained
+     events is also `400`.
 
 Pass criteria: the handshake arrives; the stored Subscription flips
 `requested → active` with a new version; each created Encounter yields exactly one
 notification carrying the configured `Authorization` header; a non-matching resource
-does not notify; retries deliver after the receiver returns.
+does not notify; retries deliver after the receiver returns; `$events` returns the
+status in the server's FHIR-version shape (R4: `Parameters`, not `SubscriptionStatus`)
+with `type` `query-event`, an absolute subscription reference, exactly the requested
+events, and `400` + `OperationOutcome` for an invalid range.
 
 ---
 

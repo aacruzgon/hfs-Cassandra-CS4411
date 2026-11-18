@@ -464,8 +464,10 @@ reviews:
           the job before it starts.
         - runs-on is [self-hosted, hfs-cassandra-light] or
           [self-hosted, hfs-cassandra-heavy] (a job that may need more than
-          about 9 GB, such as the clippy pair, is heavy). Never the bare
-          hfs-cassandra label in a new job.
+          about 9 GB, such as the clippy pair, is heavy). Both runners take
+          both labels, so every job must fit sam-7900x's 20G cap
+          (ADR-aacruzgon-0080). Never the bare hfs-cassandra label in a new
+          job.
         - No paths: or paths-ignore: filter on r4b-compile-check.yml or
           fmt-clippy-cassandra.yml: their jobs are required checks, and a
           skipped workflow never reports.

@@ -14,8 +14,8 @@ name: FHIR versions (report only)
 #
 # Runs on the team's self-hosted runners with the fork guard on every job
 # (ADR-aacruzgon-0018): the two checks are light jobs, on either runner; the
-# test job builds every FHIR version at once, so it is heavy, on sam-7900x
-# only (ADR-aacruzgon-0023). Each job reports the size of its target directory
+# test job builds every FHIR version at once, so it is heavy
+# (ADR-aacruzgon-0023); both runners take heavy jobs (ADR-aacruzgon-0080). Each job reports the size of its target directory
 # and where its time went (.github/scripts/ci-report.py), in the run's summary
 # page and in its artifact ci-report-<job>.
 
@@ -274,15 +274,15 @@ jobs:
     name: Cassandra tests (all FHIR versions)
     # Fork guard (ADR-aacruzgon-0018).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # Every FHIR version's generated models in each build: heavy, sam-7900x
-    # only (ADR-aacruzgon-0023).
+    # Every FHIR version's generated models in each build: heavy
+    # (ADR-aacruzgon-0023), on either runner (ADR-aacruzgon-0080).
     runs-on: [self-hosted, hfs-cassandra-heavy]
     timeout-minutes: 60
     env:
       COMPOSE_FILE: docker/cassandra/docker-compose.yml
       # Not the developers' default 59042 (ADR-sam-michaels-0001). It is also
-      # cassandra-coverage.yml's port, which is safe because sam-7900x, the
-      # only heavy runner, is one runner instance and runs one job at a time.
+      # cassandra-coverage.yml's port, which is safe because each machine is
+      # one runner instance and runs one job at a time.
       # Every compose command below names this job's own project,
       # hfs-cassandra-fhir-versions, so down -v can only ever remove this
       # job's containers and volume.

@@ -52,19 +52,19 @@ otel = ["helios-observability/otel"]
 
 [dependencies]
 # Core dependencies
-helios-fhir = { path = "../fhir", version = "0.2.7", default-features = false }
-helios-persistence = { path = "../persistence", version = "0.2.7", default-features = false }
-helios-serde = { path = "../serde", version = "0.2.7", optional = true, default-features = false }
-helios-sof = { path = "../sof", version = "0.2.7", default-features = false }
-helios-auth = { path = "../auth", version = "0.2.7" }
+helios-fhir = { path = "../fhir", version = "0.2.9", default-features = false }
+helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false }
+helios-serde = { path = "../serde", version = "0.2.9", optional = true, default-features = false }
+helios-sof = { path = "../sof", version = "0.2.9", default-features = false }
+helios-auth = { path = "../auth", version = "0.2.9" }
 # `SearchProvider::search_param_registry` returns a `parking_lot::RwLock`; the
 # patient-compartment confinement (#1618) names it, as do the batch unit
 # tests' mock storage.
 parking_lot = "0.12"
-helios-audit = { path = "../audit", version = "0.2.7", default-features = false }
-helios-subscriptions = { path = "../subscriptions", version = "0.2.7", optional = true, default-features = false }
-helios-fhir-validator = { path = "../fhir-validator", version = "0.2.7", default-features = false, features = ["fhirpath"] }
-helios-observability = { path = "../observability", version = "0.2.7" }
+helios-audit = { path = "../audit", version = "0.2.9", default-features = false }
+helios-subscriptions = { path = "../subscriptions", version = "0.2.9", optional = true, default-features = false }
+helios-fhir-validator = { path = "../fhir-validator", version = "0.2.9", default-features = false, features = ["fhirpath"] }
+helios-observability = { path = "../observability", version = "0.2.9" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -95,7 +95,6 @@ serde_urlencoded = "0.7"
 
 # Error handling
 thiserror = "2"
-anyhow = "1.0"
 
 # Logging and tracing
 tracing = "0.1"
@@ -169,7 +168,7 @@ rand = "0.8"
 
 # Direct SQLite fixture access for legacy-row REST tests. Bounded to the version
 # already used by helios-persistence; no new backend code is exposed.
-rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"] }
+rusqlite = { version = "0.41", features = ["bundled", "serde_json", "functions"] }
 
 # Read streamed Parquet / Arrow IPC responses back in tests. Same versions as
 # helios-sof, which does the encoding.

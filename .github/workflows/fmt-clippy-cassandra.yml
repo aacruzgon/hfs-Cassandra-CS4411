@@ -165,10 +165,10 @@ jobs:
   # and lib-test units need about 12.8 GB each. In one command cargo builds
   # them side by side, past sam-7900x's MemoryMax=20G. So helios-fhir is
   # checked alone, and the rest of the workspace after it, with helios-fhir
-  # only as a dependency; each job sets its cargo job count from the runner's
-  # own cap (ADR-aacruzgon-0080). Together the two jobs lint the same crates
-  # and targets as the CONTRIBUTING.md command, with the same lint flags, at
-  # low priority because each runner is also someone's desktop.
+  # only as a dependency; the helios-fhir job sets its cargo job count from
+  # the runner's own cap (ADR-aacruzgon-0080). Together the two jobs lint the
+  # same crates and targets as the CONTRIBUTING.md command, with the same lint
+  # flags, at low priority because each runner is also someone's desktop.
   clippy-fhir:
     name: cargo clippy (helios-fhir)
     # Fork guard (ADR-aacruzgon-0018).
@@ -363,28 +363,17 @@ jobs:
             echo "TARGET_DIR_CAP_GB=$CAP_GB"
           } >> "$GITHUB_ENV"
 
-      # How many units cargo builds at once, from this runner's own memory
-      # cap: the runner service's cgroup memory.max, which every job process
-      # inherits (ADR-aacruzgon-0080): 8 jobs under sam-7900x's 20G, and 16,
-      # acruzdebian's thread count, under its 40G.
-      # Unreadable, unlimited or under 32 GiB keeps 8.
-      - name: Pick the build job count for this runner's memory cap
-        id: jobs
-        run: |
-          max=$(cat "/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)/memory.max" 2>/dev/null || true)
-          if [[ "$max" =~ ^[0-9]+$ ]] && [ "$max" -ge $((32 * 1024 ** 3)) ]; then jobs=16; else jobs=8; fi
-          echo "Runner $RUNNER_NAME, memory.max ${max:-unreadable}: CARGO_BUILD_JOBS=$jobs"
-          echo "jobs=$jobs" >> "$GITHUB_OUTPUT"
-
       # helios-fhir is built here once, as a dependency, never its test target.
       # helios-fhir/skip-r6-download gives it the same features as the
       # CONTRIBUTING.md command (R4, R4B, R5, R6, xml, skip-r6-download);
       # without it, helios-fhir's build script downloads R6 examples from
       # build.fhir.org, because an excluded package gets no --all-features.
-      # Wrapped in ci-report.py build, as in clippy-fhir.
+      # Wrapped in ci-report.py build, as in clippy-fhir. 8 jobs on every
+      # runner: 16 on acruzdebian's 40G took 236 s cold against 241 s with 8,
+      # at the same 13.4 GiB peak anon (ADR-aacruzgon-0080).
       - name: cargo clippy --workspace --exclude helios-fhir --all-targets --all-features
         env:
-          CARGO_BUILD_JOBS: ${{ steps.jobs.outputs.jobs }}
+          CARGO_BUILD_JOBS: 8
           CI_REPORT_PROFILE: clippy (dev profile, check only)
           # The commit the CI reports name: on a pull request, its head, not
           # the merge commit GITHUB_SHA names.

@@ -123,4 +123,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0077](2026-11-13/0077-every-503-that-may-have-applied-says-so.md) | 2026-11-13 | Every 503 the backend returns while the write may have applied says the write may have been stored | accepted; see [0078](2026-11-15/0078-log-the-replaced-error.md) |
 | [0078](2026-11-15/0078-log-the-replaced-error.md) | 2026-11-15 | The error a 503 replaces after an unknown outcome is logged once, and a later turn's R1 keeps its statement apart from its decoding | accepted |
 | [0079](2026-11-17/0079-hash-oversized-index-values.md) | 2026-11-17 | Oversized index values are hashed, not refused (G35 amended) | accepted |
-| [0080](2026-11-18/0080-acruzdebian-64gb-heavy.md) | 2026-11-18 | `acruzdebian` has 64 GB: its runner cap goes to 40G, it takes heavy jobs, and the clippy pair sets its cargo job count from the runner's cap | proposed |
+| [0080](2026-11-18/0080-acruzdebian-64gb-heavy.md) | 2026-11-18 | `acruzdebian` has 64 GB: its runner cap goes to 40G, it takes heavy jobs, and `cargo clippy (helios-fhir)` sets its cargo job count from the runner's cap | accepted |

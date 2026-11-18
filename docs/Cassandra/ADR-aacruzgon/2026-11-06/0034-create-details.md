@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0034: The choices inside Step 2's `create`: post-CAS retries, every attempt's `write_id`, id and code checks
 
 - **Date:** 2026-11-06
-- **Status:** accepted
+- **Status:** accepted; its SearchParameter `code` refusal is retired by ADR-aacruzgon-0079
 - **Context:** PR #38 implements `ResourceStorage::create` as the walkthrough's create sequence (3.2): permission check, intent row I1, `INSERT … IF NOT EXISTS` (C1) with `deleted_at = 0`, version row V1, index rows, intent delete I2. The design leaves open how often steps 4 and 5 are retried before the write returns success and leaves its intent for the sweeper ("retry with the same timestamps", G23), whether a client-supplied id is checked, and whether the SearchParameter `code` bound (G38), listed under step 1 of every write, lands now or in Step 3. Its unknown-outcome rule ("exactly like `WriteTimeout`") also leaves a false 409 possible after a dropped connection, which `create` had to close.
 - **Decision:**
     - **Steps 4 and 5:** each statement is tried up to 3 times, 10 then 20 ms apart, with its fixed `USING TIMESTAMP`. If either still fails, the create returns success (201) and I2 is skipped, so the intent row stays for the sweeper (G23): after an applied CAS, a 5xx would make a client's retried POST create a second resource.

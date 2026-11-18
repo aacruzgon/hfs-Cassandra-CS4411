@@ -3290,8 +3290,10 @@ mod tests {
     }
 
     /// IW9 B: a unit is every row of one partition, inserts and deletes
-    /// together, so an update's `resources_by_type` pair is one unit (`count`
-    /// never sees both rows). A changed value is one unit when it only
+    /// together, so an update's `resources_by_type` pair is one unit (once
+    /// its batch has reached a quorum an update alone never lets `count` see
+    /// both rows; `count` is still off by one either way after an unfinished
+    /// write or through read repair, ADR-sam-michaels-0006, IW9). A changed value is one unit when it only
     /// changes clustering columns (a token's code in `token_system_index`, a
     /// date's range) and two when it changes the partition key (a token's
     /// code in `token_code_index`). `date_index` and `date_index_by_end` are

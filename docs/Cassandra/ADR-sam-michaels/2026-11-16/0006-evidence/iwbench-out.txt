@@ -1,0 +1,72 @@
+
+=== crates/persistence/tests/fixtures/patients.json: 5 resources ===
+-- Patient: n=5
+   extract us (debug build): p50 215 p90 269 p99 269 max 269
+   keys/resource: mean 17.4 p50 14 p99 29 max 29
+   index_keys bytes: mean 531 p50 450 p99 947 max 947; data bytes mean 501 p50 475 max 706
+   partitions touched by a create: mean 17.2 max 29
+   rows per table (total): {"date_index": 6, "date_index_by_end": 6, "resources_by_type": 5, "token_code_index": 29, "token_system_code_index": 29, "token_system_index": 12}
+   create: server dataSize total mean 2194 max 3669; wire bytes total mean 3305 max 5592
+   batches (server size <= 4864): create mean 1.00 max 1; update rule A (inserts then deletes) mean 2.00 max 2; update one-pass mean 1.20 max 2; delete mean 1.00 max 1
+   largest batch: server 3669 bytes, wire 5592 bytes
+   update: deletes mean 15.0 inserts mean 17.4
+   largest index_keys: [(947, "patient-1"), (520, "patient-4"), (450, "patient-2")]
+   resources with a failing parameter: 0 {}
+   drops: _id/_lastUpdated 10 composite 0 display-only 0 empty-code 0 empty-uri 0 bad-date 0 ts-index implicit/empty 17 duplicates 12 over-2048 0 other types {"Reference": 2, "String": 44}
+
+=== crates/persistence/tests/fixtures/observations.json: 6 resources ===
+-- Observation: n=6
+   extract us (debug build): p50 533 p90 653 p99 653 max 653
+   keys/resource: mean 15.0 p50 14 p99 20 max 20
+   index_keys bytes: mean 632 p50 584 p99 893 max 893; data bytes mean 619 p50 584 max 813
+   partitions touched by a create: mean 15.0 max 20
+   rows per table (total): {"date_index": 6, "date_index_by_end": 6, "resources_by_type": 6, "token_code_index": 26, "token_system_code_index": 26, "token_system_index": 20}
+   create: server dataSize total mean 1964 max 2608; wire bytes total mean 3084 max 4169
+   batches (server size <= 4864): create mean 1.00 max 1; update rule A (inserts then deletes) mean 2.00 max 2; update one-pass mean 1.00 max 1; delete mean 1.00 max 1
+   largest batch: server 2608 bytes, wire 4169 bytes
+   update: deletes mean 13.0 inserts mean 15.0
+   largest index_keys: [(893, "obs-social-1"), (584, "obs-vitals-2"), (584, "obs-vitals-1")]
+   resources with a failing parameter: 0 {}
+   drops: _id/_lastUpdated 12 composite 53 display-only 2 empty-code 0 empty-uri 0 bad-date 0 ts-index implicit/empty 6 duplicates 0 over-2048 0 other types {"Quantity": 8, "Reference": 13, "String": 1}
+
+=== crates/persistence/tests/fixtures/organizations.json: 5 resources ===
+-- Organization: n=5
+   extract us (debug build): p50 138 p90 141 p99 141 max 141
+   keys/resource: mean 8.8 p50 9 p99 11 max 11
+   index_keys bytes: mean 364 p50 373 p99 474 max 474; data bytes mean 505 p50 517 max 644
+   partitions touched by a create: mean 8.8 max 11
+   rows per table (total): {"resources_by_type": 5, "token_code_index": 15, "token_system_code_index": 15, "token_system_index": 9}
+   create: server dataSize total mean 1153 max 1445; wire bytes total mean 1821 max 2296
+   batches (server size <= 4864): create mean 1.00 max 1; update rule A (inserts then deletes) mean 2.00 max 2; update one-pass mean 1.00 max 1; delete mean 1.00 max 1
+   largest batch: server 1445 bytes, wire 2296 bytes
+   update: deletes mean 8.8 inserts mean 8.8
+   largest index_keys: [(474, "org-hospital"), (373, "org-lab"), (373, "org-insurance")]
+   resources with a failing parameter: 0 {}
+   drops: _id/_lastUpdated 10 composite 0 display-only 1 empty-code 0 empty-uri 0 bad-date 0 ts-index implicit/empty 6 duplicates 0 over-2048 0 other types {"Reference": 2, "String": 30}
+
+=== datasets/patient-observation-10000.ndjson: 10000 resources ===
+-- Observation: n=9982
+   extract us (debug build): p50 536 p90 581 p99 6343 max 7843
+   keys/resource: mean 19.7 p50 15 p99 207 max 213
+   index_keys bytes: mean 870 p50 663 p99 8823 max 9129; data bytes mean 1019 p50 904 max 8083
+   partitions touched by a create: mean 18.5 max 150
+   rows per table (total): {"date_index": 9982, "date_index_by_end": 9982, "resources_by_type": 9982, "token_code_index": 55908, "token_system_code_index": 55908, "token_system_index": 45926, "uri_index": 9181}
+   create: server dataSize total mean 2518 max 25035; wire bytes total mean 4097 max 44246
+   batches (server size <= 4864): create mean 1.09 max 6; update rule A (inserts then deletes) mean 2.14 max 11; update one-pass mean 1.18 max 10; delete mean 1.07 max 5
+   largest batch: server 4860 bytes, wire 10194 bytes
+   update: deletes mean 17.7 inserts mean 19.7
+   largest index_keys: [(9129, "0369323a-de7c-57d6-fd82-10616a780060"), (9129, "0369323a-de7c-57d6-fa90-471a0de2c72d"), (9129, "0369323a-de7c-57d6-ed29-18d335a29f31")]
+   resources with a failing parameter: 0 {}
+-- Patient: n=18
+   extract us (debug build): p50 523 p90 542 p99 562 max 562
+   keys/resource: mean 31.3 p50 32 p99 34 max 34
+   index_keys bytes: mean 1503 p50 1552 p99 1610 max 1610; data bytes mean 3135 p50 3193 max 3326
+   partitions touched by a create: mean 30.3 max 33
+   rows per table (total): {"date_index": 21, "date_index_by_end": 21, "resources_by_type": 18, "token_code_index": 174, "token_system_code_index": 174, "token_system_index": 138, "uri_index": 18}
+   create: server dataSize total mean 4057 max 4400; wire bytes total mean 6518 max 7037
+   batches (server size <= 4864): create mean 1.00 max 1; update rule A (inserts then deletes) mean 2.00 max 2; update one-pass mean 2.00 max 2; delete mean 1.00 max 1
+   largest batch: server 4400 bytes, wire 7037 bytes
+   update: deletes mean 29.0 inserts mean 31.3
+   largest index_keys: [(1610, "0369323a-de7c-57d6-c3c0-29dafacffee4"), (1606, "01500893-6186-5e45-c40c-22904d31ebb0"), (1594, "03b8b995-27af-90ea-d233-880cd60985a2")]
+   resources with a failing parameter: 0 {}
+   drops: _id/_lastUpdated 10000 composite 104820 display-only 0 empty-code 0 empty-uri 0 bad-date 0 ts-index implicit/empty 10018 duplicates 10179 over-2048 0 other types {"Quantity": 17476, "Reference": 29946, "String": 1947}

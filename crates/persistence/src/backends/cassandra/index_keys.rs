@@ -174,6 +174,14 @@ pub(crate) struct RowId<'a> {
     last_updated: Option<DateTime<Utc>>,
 }
 
+#[cfg(test)]
+impl RowId<'_> {
+    /// The `last_updated` this row is keyed by; `None` for a date row (IW7).
+    pub(crate) fn last_updated(&self) -> Option<DateTime<Utc>> {
+        self.last_updated
+    }
+}
+
 /// One index partition of a resource's tenant and type, as
 /// [`IndexKey::partition`] names it: the table and its partition-key columns
 /// other than `tenant_id` and `resource_type`. Two tables never share a

@@ -116,6 +116,8 @@ use super::backend::CassandraBackend;
 use super::batch::{
     BatchFailure, IndexCql, IndexStatement, MAX_BATCH_BYTES, classify_failure, pack, wire_bytes,
 };
+#[cfg(test)]
+use super::checkpoint::Checkpoint;
 use super::errors::{BACKEND_NAME, is_invalid, map_driver_error};
 use super::index_keys::{self, IndexKey, Partition};
 use super::read::{ResourceRow, SELECT_RESOURCE};
@@ -274,6 +276,55 @@ fn shard_of(tenant_id: &str, id: &str) -> i16 {
         hash = hash.wrapping_mul(PRIME);
     }
     (hash % INTENT_SHARDS) as i16
+}
+
+#[cfg(test)]
+const SELECT_INTENTS_OF_SHARD: &str = "SELECT tenant_id, resource_type, id, version_id \
+     FROM pending_index_writes WHERE bucket = ? AND shard = ?";
+
+#[cfg(test)]
+impl CassandraBackend {
+    /// The `version_id` of every intent row of `(tenant_id, resource_type,
+    /// id)` in the hour buckets from `since`'s UTC hour to now's (one or two
+    /// single-partition reads of shard `shard_of(tenant_id, id)`), sorted
+    /// ascending: what a test asserts about I1 and I2 (ADR-sam-michaels-0006,
+    /// RV16). Panics on a read error.
+    pub(crate) async fn intent_versions(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+        since: DateTime<Utc>,
+    ) -> Vec<i32> {
+        let shard = shard_of(tenant_id, id);
+        let hour = |at: DateTime<Utc>| at.with_minute(0).unwrap().with_second(0).unwrap();
+        let (mut at, end) = (hour(since), hour(Utc::now()));
+        let mut versions = Vec::new();
+        while at <= end {
+            let rows = self
+                .session
+                .rows_paged(
+                    SELECT_INTENTS_OF_SHARD,
+                    vec![Value::from(bucket_of(at)), Value::from(shard)],
+                    StatementKind::Read,
+                )
+                .await
+                .expect("read the intents of a shard");
+            for row in rows {
+                let text =
+                    |name: &str| -> String { row.get_r_by_name(name).expect("intent column") };
+                if text("tenant_id") == tenant_id
+                    && text("resource_type") == resource_type
+                    && text("id") == id
+                {
+                    versions.push(row.get_r_by_name("version_id").expect("intent version"));
+                }
+            }
+            at += chrono::Duration::hours(1);
+        }
+        versions.sort_unstable();
+        versions
+    }
 }
 
 /// A version-1 (time-based) UUID for `at`, as a `timeuuid` column needs.
@@ -1778,6 +1829,10 @@ impl CassandraBackend {
             )
             .await
             .map_err(|error| request.statement_error(&error, "intent row"))?;
+            // RV15/RV16 (ADR-sam-michaels-0006): a test can hold or crash the request here.
+            #[cfg(test)]
+            self.checkpoint(Checkpoint::AfterIntent, &key, plan.target_version())
+                .await;
 
             // Step 3.
             request.stats.attempt();
@@ -2022,6 +2077,10 @@ impl CassandraBackend {
         let plan = attempt.plan.clone();
         let key = request.key;
         let version_id = plan.target_version();
+        // RV15/RV16 (ADR-sam-michaels-0006): a test can hold or crash the request here.
+        #[cfg(test)]
+        self.checkpoint(Checkpoint::AfterCas, &key, version_id)
+            .await;
         let mut index = IndexWriteStats::default();
         let complete = if superseded {
             false
@@ -2035,10 +2094,18 @@ impl CassandraBackend {
                     POST_CAS_WRITE_TRIES,
                 )
                 .await;
+            // RV15/RV16 (ADR-sam-michaels-0006): a test can hold or crash the request here.
+            #[cfg(test)]
+            self.checkpoint(Checkpoint::AfterVersionRow, &key, version_id)
+                .await;
             let previous = plan.previous_rows();
             let delta = index_delta(&previous, plan.version_keys(attempt.last_updated));
             let indexed = self
                 .write_index_delta(&key, &delta, ts, POST_CAS_WRITE_TRIES)
+                .await;
+            // RV15/RV16 (ADR-sam-michaels-0006): a test can hold or crash the request here.
+            #[cfg(test)]
+            self.checkpoint(Checkpoint::AfterIndex, &key, version_id)
                 .await;
             index = indexed.stats;
             if version_written.is_ok() && indexed.result.is_ok() {

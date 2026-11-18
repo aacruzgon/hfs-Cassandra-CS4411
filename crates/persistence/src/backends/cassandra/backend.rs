@@ -52,7 +52,8 @@ const SELECT_TENANT_TYPES: &str = "SELECT DISTINCT tenant_id, resource_type FROM
 /// tombstone (`schema.cql`, walkthrough G39), so nothing can stop it the same
 /// way. It also lists soft-deleted SearchParameters, and so a tenant whose
 /// SearchParameters are all deleted; the point reads of the reload drop them.
-const SELECT_RESOURCE_KEYS: &str = "SELECT DISTINCT tenant_id, resource_type, id FROM resources";
+pub(super) const SELECT_RESOURCE_KEYS: &str =
+    "SELECT DISTINCT tenant_id, resource_type, id FROM resources";
 
 /// How many SearchParameter reads a reload runs at once.
 const STORED_SEARCH_PARAMETER_READS: usize = 16;
@@ -301,6 +302,9 @@ pub struct CassandraBackend {
     note_seq: AtomicU64,
     /// The write engine's outcome counters ([`Self::cas_stats`]).
     pub(super) cas_counters: Arc<CasCounters>,
+    /// Crash checkpoints a test arms in the write path (ADR-sam-michaels-0006, RV15).
+    #[cfg(test)]
+    pub(super) checkpoints: super::checkpoint::Checkpoints,
 }
 
 impl fmt::Debug for CassandraBackend {
@@ -385,6 +389,8 @@ impl CassandraBackend {
             stored_by_tenant,
             note_seq: AtomicU64::new(0),
             cas_counters: Arc::new(CasCounters::default()),
+            #[cfg(test)]
+            checkpoints: Default::default(),
         })
     }
 

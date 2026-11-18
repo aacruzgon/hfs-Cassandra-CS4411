@@ -544,6 +544,23 @@ pub(super) fn normalized_body(
     Ok((resource, data))
 }
 
+impl CassandraBackend {
+    /// `K(V)` for a live version whose normalized body is `body`: the writer's
+    /// extraction (IW8, ADR-sam-michaels-0006), called wherever a plan gets a
+    /// body, and the one the consistency check compares stored key sets with
+    /// (RV13), so the check tests the writer, not a second extractor. Until
+    /// pull request 5 switches extraction on (IW1), it is the
+    /// `resources_by_type` row alone, as on `main` since Step 2.
+    pub(crate) fn index_keys_of(
+        &self,
+        _tenant_id: &str,
+        _resource_type: &str,
+        _body: &Json,
+    ) -> Vec<IndexKey> {
+        vec![IndexKey::ResourcesByType]
+    }
+}
+
 /// Which compare-and-swap an attempt runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CasKind {
@@ -2359,12 +2376,8 @@ impl CassandraBackend {
             resource_type,
             id: &id,
         };
-        let plan = CasPlan::create(
-            resource,
-            data,
-            fhir_version,
-            vec![IndexKey::ResourcesByType],
-        );
+        let keys = self.index_keys_of(tenant_id, resource_type, &resource);
+        let plan = CasPlan::create(resource, data, fhir_version, keys);
 
         let mut request = self.cas_request("create", key);
         let outcome = match self.run_cas(&mut request, plan).await {

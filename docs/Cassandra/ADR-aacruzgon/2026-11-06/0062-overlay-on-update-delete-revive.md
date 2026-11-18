@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0062: Stored SearchParameters stay current in the overlay on update, delete and revive, with removals ordered by `last_updated`
 
 - **Date:** 2026-11-06
-- **Status:** accepted; amended by ADR-aacruzgon-0068; its limitations are closed by ADR-sam-michaels-0006 (IW19, SW19), see ADR-aacruzgon-0081
+- **Status:** accepted; amended by ADR-aacruzgon-0068; its two limitations are narrowed by ADR-sam-michaels-0006 (IW19, SW19), and the second stays open for an intent that expires after 24 h, see ADR-aacruzgon-0081
 - **Context:**
     - **The overlay as Step 2 left it** (ADR-aacruzgon-0041). Each instance keeps, per tenant, the stored SearchParameters it serves on top of the spec registry. It held one definition per `url`, replaced by precedence. `create` noted a new one; a TTL reload rebuilt it from a scan, keeping the notes made after the reload began. Nothing removed a definition.
     - **What Step 3 adds.** `update`, `delete` and revive all change stored SearchParameters. Without a removal, a deleted or deactivated parameter stays in force on the writing instance until the next TTL refresh, while SQLite drops it at once (`backends/sqlite/storage.rs:821-824`, `:1668-1671`, `:1795-1801`). Step 3 plan D9 compared four designs; the first draft's "remove by id, then note" was shown wrong three ways (it loses another id's definition of the same `url`, a reload that read before the delete puts it back, and an update to a non-`active` body never invalidates).

@@ -137,7 +137,10 @@ impl IndexKey {
     /// as one unit, which Cassandra applies whole on each replica (IW9 B,
     /// ADR-sam-michaels-0006). An update's `resources_by_type` rows at
     /// `lu(N)` and `lu(N+1)` share the `(tenant_id, resource_type)`
-    /// partition, so `count` never sees both. Rows of one key at two
+    /// partition, so once the batch has reached a quorum an update alone
+    /// never lets `count` see both. `count` is still off by one either way,
+    /// twice or not at all, after an unfinished write or through read repair
+    /// (ADR-sam-michaels-0006, IW9). Rows of one key at two
     /// versions always share a partition, since `last_updated` is never a
     /// partition-key column; a changed value may or may not (a token's `code`
     /// is in the partition key of `token_code_index`, but a clustering column

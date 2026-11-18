@@ -14,7 +14,7 @@ ADR-sam-michaels/
 **Rules**
 
 - Append-only. A decision that is later reversed gets a new entry that supersedes the old one; the old entry's status changes to `superseded by ADR-sam-michaels-NNNN`, and nothing is deleted.
-- A later entry may supersede a single ID of a multi-decision entry by naming it, for example "supersedes ADR-sam-michaels-0006, IW15"; the earlier entry's row for that ID gets "(superseded by NNNN)" in the same commit, and the rest of that entry stands.
+- A later entry may supersede a single ID of a multi-decision entry by naming it, for example "supersedes ADR-sam-michaels-0006, IW15". In the same commit the earlier entry gains only an added, dated note naming that ID and the later entry (for example "*Update YYYY-MM-DD:* IW15 is superseded by ADR-sam-michaels-NNNN"), and its index row's status gains "partly superseded by NNNN (IW15)". The earlier entry's existing text, that ID's row included, is not edited, and the rest of that entry stands.
 - One entry per decision, one file per entry. Numbers are sequential across the whole log, not per folder, so `ADR-sam-michaels-NNNN` stays a unique reference. The folder is the date the decision was worked on; a later entry that supersedes an earlier one goes in its own date folder.
 - Written by the human, in their own words, at the end of the session in which the decision was made. The AI assistant may draft it, but the human confirms every line before it is committed.
 - Only the owner of this log edits it. Another collaborator who disagrees with a decision opens an entry in their own log that references this one.

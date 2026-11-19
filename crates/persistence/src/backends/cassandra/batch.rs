@@ -221,11 +221,11 @@ pub(crate) const MAX_BATCH_BYTES: usize = 5 * 1024 - 256;
 ///   mutation whole on each replica; most of all, once the batch has
 ///   reached a quorum, an update alone never lets `count` see an updated
 ///   resource's `resources_by_type` row at both `last_updated` values.
-///   `count` is still off by one either way, twice or not at all: twice
-///   after a write whose index step was skipped or did not finish, until the
-///   sweeper or repair finishes it (on RF 3 also after a batch that reached
-///   fewer than a quorum), and not at all when read repair copies a delete
-///   onto a replica that missed the insert (ADR-sam-michaels-0006, IW9).
+///   `count` can still be off (ADR-aacruzgon-0081, decision 2): too high, by
+///   up to one per unfinished update or delete, and one too low after an
+///   unfinished create or revive, until the sweeper or repair finishes it;
+///   and on RF 3, twice or not at all through read repair after a batch that
+///   reached fewer than a quorum.
 /// - **A unit over `bound` goes alone**, as a batch of its own. Such a unit
 ///   is one partition, so the node neither size-checks it nor writes it to
 ///   the batchlog (`BatchStatement.java:331-367`). No fixture comes near:

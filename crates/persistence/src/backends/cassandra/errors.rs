@@ -94,9 +94,8 @@ pub(crate) fn is_too_many_tombstones(error: &DriverError) -> bool {
 
 /// Whether the node refused the statement as `Invalid`: a request that no
 /// later try can change, so the post-CAS writers do not retry it (IW17,
-/// ADR-sam-michaels-0006; RW9). For an index or version row that is a batch
-/// over `batch_size_fail_threshold` ("Batch too large") or a key over 64 KiB,
-/// both bounded before anything is written (IW6, IW11), so it stops a bug
+/// ADR-sam-michaels-0006; RW9). For an index or version row that is a key
+/// over 64 KiB, bounded before anything is written (IW6), so it stops a bug
 /// from being retried rather than a case the backend expects.
 pub(crate) fn is_invalid(error: &DriverError) -> bool {
     let DriverError::Driver(error) = error else {

@@ -4998,7 +4998,7 @@ mod node_tests {
         ];
         let counted = backend.statement_counts();
         let outcome = backend
-            .write_with_retries(INSERT_RESOURCES_BY_TYPE, values, "index row", 3)
+            .write_with_retries(INSERT_RESOURCES_BY_TYPE.as_str(), values, "index row", 3)
             .await;
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");

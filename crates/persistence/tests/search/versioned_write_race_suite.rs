@@ -101,6 +101,22 @@ async fn history<S: VersionedStorage>(
     (versions, false)
 }
 
+/// What `vread` finds at `version` of `Patient/{id}`: `Some(true)` for a
+/// delete marker, `Some(false)` for a live body, `None` for no such version.
+async fn is_delete_marker<S: VersionedStorage>(
+    backend: &S,
+    t: &TenantContext,
+    id: &str,
+    version: &str,
+) -> Option<bool> {
+    match backend.vread(t, "Patient", id, version).await {
+        Ok(Some(stored)) => Some(stored.is_deleted()),
+        Ok(None) => None,
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => Some(true),
+        Err(e) => panic!("vread Patient/{id}/_history/{version}: {e}"),
+    }
+}
+
 /// `["1", …, "n"]`.
 fn versions_up_to(n: usize) -> Vec<String> {
     (1..=n).map(|v| v.to_string()).collect()
@@ -562,7 +578,7 @@ pub async fn concurrent_update_and_plain_delete_stay_consistent_with<S>(
             deletes == 0 || deleted,
             "{context}: a delete landed, so nothing is live: {after:?}"
         );
-        let (versions, _) = history(backend.as_ref(), policy, &t, &id).await;
+        let (versions, pending) = history(backend.as_ref(), policy, &t, &id).await;
         let landed_deletes = usize::from(deleted);
         let landed_updates = versions.len().saturating_sub(1 + landed_deletes);
         let unknown_updates = unknown.iter().filter(|n| *n % 2 == 0).count();
@@ -579,6 +595,30 @@ pub async fn concurrent_update_and_plain_delete_stay_consistent_with<S>(
             versions_up_to(1 + landed_updates + landed_deletes),
             "{context}: one version per successful write, no gap, no duplicate: {outcomes:?}"
         );
+        // `read` and the history's length alone can't tell "the delete landed
+        // at v2" from "the update landed at v2 and the delete's v3 is lost":
+        // both show nothing live and a history of `["1", "2"]`. So when
+        // nothing is live, the newest version must be the delete marker
+        // (unless it is the pending one, which has no version row to read
+        // yet), and an update that landed must be v2's live body.
+        if deleted && !pending {
+            let newest = versions.last().expect("history has version 1");
+            assert_eq!(
+                is_delete_marker(backend.as_ref(), &t, &id, newest).await,
+                Some(true),
+                "{context}: nothing is live, so the newest version, {newest}, is the \
+                 delete marker: {versions:?} after {outcomes:?}"
+            );
+        }
+        let update_is_pending = pending && versions.len() == 2;
+        if landed_updates == 1 && !update_is_pending {
+            assert_eq!(
+                is_delete_marker(backend.as_ref(), &t, &id, "2").await,
+                Some(false),
+                "{context}: the update landed as version 2, a live body: \
+                 {versions:?} after {outcomes:?}"
+            );
+        }
         if landed_updates + landed_deletes == 0 {
             assert_nobody_lost(&outcomes, &unknown, &context);
         }

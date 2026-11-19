@@ -199,9 +199,9 @@ These tests were written for one node, and on three a few fail for reasons
 that are expected today:
 
 - `node_runs_the_docker_cassandra_configuration` always fails. It fails at the
-  rack assertion (`cassandra_tests.rs:185`) if the query reaches another node,
-  and otherwise at `one node, no peers` (`:214`), because on the cluster the
-  driver sees three nodes.
+  rack assertion (`cassandra_tests.rs:186`) if the query reaches another node,
+  and otherwise at the replication factor (`:205`), because the cluster's
+  keyspace is RF 3, not the single node's 1.
 The concurrent-write tests, those in `step3_suites`
 (`versioned_write_race_suite.rs`) and
 `create_read::cassandra_concurrent_creates_of_one_id_make_exactly_one_resource`,

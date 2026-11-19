@@ -164,8 +164,9 @@ async fn node_has_the_signed_off_schema() {
 }
 
 /// The node runs `docker/cassandra`'s configuration: the pinned release,
-/// `paxos_variant: v2` (ADR-aacruzgon-0001) and the DC the keyspace replicates
-/// to (ADR-aacruzgon-0003).
+/// `paxos_variant: v2` (ADR-aacruzgon-0001), the DC the keyspace replicates
+/// to (ADR-aacruzgon-0003), and replication factor 1, which keeps the race
+/// checks strict (issue #77).
 #[tokio::test]
 async fn node_runs_the_docker_cassandra_configuration() {
     let node = node_or_skip!("node_runs_the_docker_cassandra_configuration");
@@ -197,6 +198,15 @@ async fn node_runs_the_docker_cassandra_configuration() {
         );
     };
     assert_eq!(text(paxos, "value").unwrap(), "v2");
+
+    // The race checks accept a 504 only when `replication_factor` reports 2
+    // or more (`race_policy`). If it ever read 3 here, every race test would
+    // still pass, loosened, and only its `[race policy …]` line would show it.
+    assert_eq!(
+        cassandra_node::replication_factor(&session).await,
+        Ok(1),
+        "keyspace {KEYSPACE} on the single node: replication factor 1 in {DATA_CENTER}"
+    );
 
     // The driver keeps the contact point as the node's address: it does not
     // switch to the container IP that system.local reports as rpc_address

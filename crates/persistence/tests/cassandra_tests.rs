@@ -28,8 +28,8 @@ use std::collections::HashSet;
 
 use cassandra_node::{
     DATA_CENTER, KEYSPACE, MAX_FHIR_ID_LEN, RELEASE_VERSION, TABLES, TEST_TENANT_PREFIX, URL_VAR,
-    cql_statements, parse_url, read_schema_file, schema_listing, select, text, unique_id,
-    unique_tenant, unique_tenant_id,
+    cql_statements, parse_url, read_schema_file, schema_listing, select, select_values, text,
+    unique_id, unique_tenant, unique_tenant_id,
 };
 use helios_persistence::tenant::{MAX_TENANT_ID_LEN, TenantId};
 
@@ -227,6 +227,86 @@ async fn node_runs_the_docker_cassandra_configuration() {
         "the driver addresses the node as {addresses:?}, not as {} ({contact_point:?})",
         node.contact_point()
     );
+}
+
+/// `pending_version` (issue #77), which lets the race checks at RF 2 or more
+/// accept a history missing its newest version: it reports the `resources`
+/// row's version only when an intent row for that version carries the row's
+/// `write_id`. If it always reported "pending", every race test would still
+/// pass, loosened, so this pins it on the single node.
+///
+/// The state a 504'd writer leaves is written with CQL, under this test's
+/// own tenant, one resource per case. Only the columns `pending_version`
+/// reads are set.
+#[tokio::test]
+async fn pending_version_needs_an_intent_with_the_rows_write_id() {
+    use cdrs_tokio::types::value::Value;
+    use uuid::Uuid;
+
+    let node = node_or_skip!("pending_version_needs_an_intent_with_the_rows_write_id");
+    let session = node.session().await;
+    let tenant = unique_tenant("pending-version");
+    let tenant_id = tenant.tenant_id().as_str();
+    // `pending_version` reads this hour's and the previous hour's bucket,
+    // in the backend's format (`bucket_of`, `write.rs`), and every shard.
+    let bucket = chrono::Utc::now().format("%Y-%m-%dT%H").to_string();
+
+    let row_write_id = Uuid::new_v4();
+    let loser_write_id = Uuid::new_v4();
+    // (id, write_id of the intent row for version 2, if any, expected)
+    let cases = [
+        ("applied", Some(row_write_id), Some(2)),
+        ("loser", Some(loser_write_id), None),
+        ("no-intent", None, None),
+    ];
+
+    for (id, intent_write_id, _) in &cases {
+        select_values(
+            &session,
+            &format!(
+                "INSERT INTO {KEYSPACE}.resources \
+                 (tenant_id, resource_type, id, version_id, write_id) VALUES (?, ?, ?, ?, ?)"
+            ),
+            vec![
+                Value::from(tenant_id),
+                Value::from("Patient"),
+                Value::from(*id),
+                Value::from(2_i32),
+                Value::from(row_write_id),
+            ],
+        )
+        .await
+        .unwrap();
+        if let Some(write_id) = intent_write_id {
+            select_values(
+                &session,
+                &format!(
+                    "INSERT INTO {KEYSPACE}.pending_index_writes \
+                     (bucket, shard, enqueued_at, tenant_id, resource_type, id, write_id, \
+                     version_id) VALUES (?, ?, now(), ?, ?, ?, ?, ?)"
+                ),
+                vec![
+                    Value::from(bucket.as_str()),
+                    Value::from(0_i16),
+                    Value::from(tenant_id),
+                    Value::from("Patient"),
+                    Value::from(*id),
+                    Value::from(*write_id),
+                    Value::from(2_i32),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    for (id, _, expected) in &cases {
+        assert_eq!(
+            cassandra_node::pending_version(&session, &tenant, "Patient", id).await,
+            Ok(*expected),
+            "case {id}"
+        );
+    }
 }
 
 #[test]

@@ -516,7 +516,7 @@ pub fn int(row: &Row, column: &str) -> Result<i32, String> {
 }
 
 /// [`select`] with bound values, at `LOCAL_QUORUM`.
-async fn select_values(
+pub async fn select_values(
     session: &TestSession,
     query: &str,
     values: Vec<Value>,

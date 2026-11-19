@@ -600,7 +600,8 @@ pub async fn concurrent_update_and_plain_delete_stay_consistent_with<S>(
         // both show nothing live and a history of `["1", "2"]`. So when
         // nothing is live, the newest version must be the delete marker
         // (unless it is the pending one, which has no version row to read
-        // yet), and an update that landed must be v2's live body.
+        // yet), and an update that landed must be v2's live body, written by
+        // the writer told it updated or, with none, by a 504'd updater.
         if deleted && !pending {
             let newest = versions.last().expect("history has version 1");
             assert_eq!(
@@ -610,14 +611,46 @@ pub async fn concurrent_update_and_plain_delete_stay_consistent_with<S>(
                  delete marker: {versions:?} after {outcomes:?}"
             );
         }
-        let update_is_pending = pending && versions.len() == 2;
-        if landed_updates == 1 && !update_is_pending {
-            assert_eq!(
-                is_delete_marker(backend.as_ref(), &t, &id, "2").await,
-                Some(false),
+        if landed_updates == 1 {
+            // A pending v2 has no version row yet; it is then the live
+            // resource, since a delete on top of it would be v3.
+            let v2 = if pending && versions.len() == 2 {
+                match &after {
+                    Ok(Some(stored)) => stored.clone(),
+                    other => panic!("{context}: the pending update is live: {other:?}"),
+                }
+            } else {
+                backend
+                    .vread(&t, "Patient", &id, "2")
+                    .await
+                    .expect("vread 2")
+                    .expect("version 2 exists")
+            };
+            assert!(
+                !v2.is_deleted(),
                 "{context}: the update landed as version 2, a live body: \
                  {versions:?} after {outcomes:?}"
             );
+            let landed = family(&v2);
+            let told_updated = outcomes.iter().find_map(|o| match o {
+                Outcome::Updated(stored) => Some(stored),
+                _ => None,
+            });
+            match told_updated {
+                Some(winner) => assert_eq!(
+                    landed,
+                    family(winner),
+                    "{context}: version 2 is the body of the writer told it updated: \
+                     {outcomes:?}"
+                ),
+                None => assert!(
+                    unknown
+                        .iter()
+                        .any(|n| n % 2 == 0 && landed == format!("Writer{n}")),
+                    "{context}: with no writer told it updated, version 2 is a 504'd \
+                     update's: {landed} after {outcomes:?}"
+                ),
+            }
         }
         if landed_updates + landed_deletes == 0 {
             assert_nobody_lost(&outcomes, &unknown, &context);

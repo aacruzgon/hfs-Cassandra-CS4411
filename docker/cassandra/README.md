@@ -218,7 +218,7 @@ sweeper replays its intent (Step 5), so the history may lack its newest version
 only when the `resources` row's `write_id` matches a kept intent row for it
 (ADR-sara-lahourpour-0001). At RF 1 the 504 still fails the test.
 
-### Docker Desktop for Windows and Mac
+### Docker Desktop with WSL 2
 
 From the host, every test fails after 60 s (the harness's `READY_TIMEOUT`):
 `SELECT table_name FROM system_schema.tables …: no answer within 60s`. The
@@ -232,6 +232,7 @@ glibc matches the binary's (`ubuntu:26.04` here):
 ```bash
 bin=$(cargo test -p helios-persistence --features cassandra --test cassandra_tests --no-run 2>&1 \
       | sed -n 's/^ *Executable .* (\(.*\))$/\1/p')
+bin=$(realpath "$bin")
 docker run --rm --network hfs-cassandra-cluster_cluster --user "$(id -u):$(id -g)" \
   -v /usr/lib/x86_64-linux-gnu/libssl.so.3:/usr/lib/x86_64-linux-gnu/libssl.so.3:ro \
   -v /usr/lib/x86_64-linux-gnu/libcrypto.so.3:/usr/lib/x86_64-linux-gnu/libcrypto.so.3:ro \
@@ -239,13 +240,27 @@ docker run --rm --network hfs-cassandra-cluster_cluster --user "$(id -u):$(id -g
   -e HFS_TEST_CASSANDRA_URL=172.29.59.11:9042 ubuntu:26.04 /t/cassandra_tests
 ```
 
-The repository is mounted at the same path because some tests read files by
-the path compiled into the binary. The two OpenSSL libraries come from the
-host, so the image needs nothing installed. On 2026-11-12 and 13 (Windows,
-Docker Desktop with WSL 2, the default limits), the tests passed this way
-except `node_runs_the_docker_cassandra_configuration`; one of five runs also
-had four ordinary `LOCAL_QUORUM` timeouts (`received only 1 responses`) in
-non-race tests, while the host was compiling.
+`realpath` is needed because cargo prints the executable relative to the
+repository (`target/debug/…`), and `docker run -v` takes a relative path for a
+volume name and refuses it. The repository is mounted at the same path because
+some tests read files by the path compiled into the binary. The two OpenSSL
+libraries come from the host, so the image needs nothing installed. The URL
+and the network name assume the defaults: the subnet prefix `172.29.59`
+(`CASSANDRA_CLUSTER_SUBNET_PREFIX`) and the Compose project name
+`hfs-cassandra-cluster` (`name:` in `docker-compose.cluster.yml`, which makes
+the network `hfs-cassandra-cluster_cluster`). If you changed either, change
+both here too. On 2026-11-12 and 13 (Windows, Docker Desktop with WSL 2, the
+default limits), the tests passed this way except
+`node_runs_the_docker_cassandra_configuration`; one of five runs also had four
+ordinary `LOCAL_QUORUM` timeouts (`received only 1 responses`) in non-race
+tests, while the host was compiling.
+
+This does not work on a Mac: cargo there builds a macOS (Mach-O) binary, which
+a Linux container cannot run, and the mounted libraries are x86_64 Linux ones.
+Use OrbStack instead. It routes the container addresses from the host (see the
+end of the cluster's "Run" section), so the command under "Backend tests
+against the cluster" works as it is. Otherwise the test binary has to be built
+for Linux.
 
 ## Failure procedures
 

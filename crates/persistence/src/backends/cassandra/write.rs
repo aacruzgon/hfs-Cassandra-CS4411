@@ -4770,6 +4770,41 @@ mod node_tests {
         assert_eq!(spent.write, 1, "{spent}");
     }
 
+    /// IW17: `write_index_delta` passes an `Invalid` unit's `Permanent` up
+    /// instead of folding it into `TriesExhausted`. One insert and no delete
+    /// is one statement, never a batch, so the node refuses a single
+    /// statement (a partition key over 65,535 bytes) and nothing is written.
+    #[tokio::test]
+    async fn an_invalid_index_unit_fails_the_delta_as_permanent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = format!("test-invalid-{}", "x".repeat(70_000));
+        let key = RowKey {
+            tenant_id: &tenant,
+            resource_type: "Patient",
+            id: "p",
+        };
+        let keys = [IndexKey::ResourcesByType];
+        let delta = index_delta(
+            &[],
+            VersionKeys {
+                version_id: 1,
+                last_updated: Utc::now(),
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                keys: &keys,
+            },
+        );
+        let counted = backend.statement_counts();
+        let outcome = backend
+            .write_index_delta(&key, &delta, 1, POST_CAS_WRITE_TRIES)
+            .await;
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
+        assert_eq!(spent.write, 1, "{spent}");
+    }
+
     /// An update whose new `resources_by_type` row fails all three tries
     /// keeps the old row: its delete is never sent, so the live resource
     /// stays counted, and the write succeeds with I1 left for the sweeper

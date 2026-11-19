@@ -2078,13 +2078,16 @@ impl CassandraBackend {
     /// inserts and its deletes (IW9 B, ADR-sam-michaels-0006). `statements`
     /// are the unit's, inserts first, all at the version's timestamp.
     ///
-    /// **A unit is never split**, because that is what keeps `count` exact.
+    /// **A unit is never split.**
     /// `count` is `COUNT(*)` over the `(tenant_id, resource_type)` partition
     /// of `resources_by_type`, with no version-tag check (`read.rs`), and an
     /// update moves the resource's row there from `lu(N)` to `lu(N+1)`: both
     /// rows are in that one partition, so in one unit. Sent as one logged
-    /// batch, Cassandra applies the unit whole on each replica, so no reader
-    /// sees both rows (the resource counted twice) or neither.
+    /// batch, Cassandra applies the unit whole on each replica, so an update
+    /// alone never lets a quorum read see both rows once its batch has reached
+    /// a quorum. ADR-aacruzgon-0081 (decision 2) gives the cases where `count`
+    /// is still off: an unfinished write, and read repair on RF 3 after a
+    /// write that reached fewer than a quorum.
     ///
     /// **For now the statements go one at a time**, in that order, each with
     /// up to `tries` tries, stopping at the first that fails them all, so no
@@ -3102,8 +3105,8 @@ mod tests {
     /// IW9 B: a unit is every row of one partition, inserts and deletes
     /// together, so an update's `resources_by_type` pair is one unit (once
     /// its batch has reached a quorum an update alone never lets `count` see
-    /// both rows; `count` is still off by one either way after an unfinished
-    /// write or through read repair, ADR-sam-michaels-0006, IW9). A changed value is one unit when it only
+    /// both rows; the cases where `count` is still off are in
+    /// ADR-aacruzgon-0081, decision 2). A changed value is one unit when it only
     /// changes clustering columns (a token's code in `token_system_index`, a
     /// date's range) and two when it changes the partition key (a token's
     /// code in `token_code_index`). `date_index` and `date_index_by_end` are

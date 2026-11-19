@@ -786,6 +786,78 @@ mod step3_suites {
         policy
     }
 
+    /// A probe for [`only_a_504_is_an_unknown_outcome`], which never asks it:
+    /// `is_unknown` reads only the error.
+    struct NoPendingWrites;
+
+    #[async_trait::async_trait]
+    impl PendingWrites for NoPendingWrites {
+        async fn pending_version(&self, _tenant: &TenantContext, _id: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// `RacePolicy::is_unknown`: at RF 2 or more only a 504
+    /// (`BackendError::Timeout`) is an unknown outcome. A 503 from the serial
+    /// read has not been seen in a race and still fails it (issue #77,
+    /// ADR-aacruzgon-0055), but the races alone would notice a loosening only
+    /// in a run where a 503 happened. At RF 1 nothing is unknown.
+    #[test]
+    fn only_a_504_is_an_unknown_outcome() {
+        use helios_persistence::error::{BackendError, ConcurrencyError, StorageError};
+
+        let backend_name = "cassandra".to_string();
+        let message = "test".to_string();
+        let timeout = StorageError::Backend(BackendError::Timeout {
+            backend_name: backend_name.clone(),
+            message: message.clone(),
+        });
+        let not_unknown = [
+            (
+                "503 Unavailable",
+                StorageError::Backend(BackendError::Unavailable {
+                    backend_name: backend_name.clone(),
+                    message: message.clone(),
+                }),
+            ),
+            (
+                "503 ConnectionFailed",
+                StorageError::Backend(BackendError::ConnectionFailed {
+                    backend_name: backend_name.clone(),
+                    message,
+                }),
+            ),
+            (
+                "503 PoolExhausted",
+                StorageError::Backend(BackendError::PoolExhausted { backend_name }),
+            ),
+            (
+                "409 VersionConflict",
+                StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    resource_type: "Patient".to_string(),
+                    id: "p".to_string(),
+                    expected_version: "1".to_string(),
+                    actual_version: "2".to_string(),
+                }),
+            ),
+        ];
+
+        let cluster = RacePolicy::AcceptTimeouts(Arc::new(NoPendingWrites));
+        assert!(cluster.is_unknown(&timeout), "a 504 at RF 2 or more");
+        for (name, error) in &not_unknown {
+            assert!(
+                !cluster.is_unknown(error),
+                "{name} is not an unknown outcome at RF 2 or more"
+            );
+        }
+
+        let single_node = RacePolicy::strict();
+        assert!(!single_node.is_unknown(&timeout), "a 504 at RF 1");
+        for (name, error) in &not_unknown {
+            assert!(!single_node.is_unknown(error), "{name} at RF 1");
+        }
+    }
+
     /// #1404: of eight writers holding the same version, one `update` writes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn cassandra_concurrent_updates_from_the_same_version_admit_one() {

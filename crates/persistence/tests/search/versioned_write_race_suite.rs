@@ -71,7 +71,7 @@ impl RacePolicy {
     }
 
     /// Whether this error is an unknown outcome under this policy.
-    fn is_unknown(&self, error: &StorageError) -> bool {
+    pub fn is_unknown(&self, error: &StorageError) -> bool {
         self.accepts_timeouts()
             && matches!(error, StorageError::Backend(BackendError::Timeout { .. }))
     }

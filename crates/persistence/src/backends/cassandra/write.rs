@@ -3074,7 +3074,8 @@ mod tests {
             (&dropped, lu1),
             (&x1, lu2),
         ];
-        let next = [x1.clone(), t.clone(), d.clone()];
+        // `t` is listed twice: its row is inserted once.
+        let next = [x1.clone(), t.clone(), d.clone(), t.clone()];
         let delta = index_delta(&previous, version_keys(&next, lu3));
         let deletes: Vec<IndexRow<'_>> = delta
             .units
@@ -3090,6 +3091,11 @@ mod tests {
         assert_eq!(
             set(&deletes),
             set(&[(&t, lu1), (&t, lu2), (&dropped, lu1), (&x1, lu2)])
+        );
+        assert_eq!(
+            inserts.len(),
+            3,
+            "a row listed twice is inserted once: {inserts:?}"
         );
         assert_eq!(set(&inserts), set(&[(&x1, lu3), (&t, lu3), (&d, lu3)]));
         // The token's unit: its two stale rows and its current one.

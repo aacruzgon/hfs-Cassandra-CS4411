@@ -4975,6 +4975,45 @@ mod node_tests {
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
     }
 
+    /// IW15, IW17: an index batch the node refuses as `Invalid` is tried
+    /// once, not `tries` times. One unit (an insert and a delete of the
+    /// `resources_by_type` partition) whose key is over 65,535 bytes goes as
+    /// one batch of two statements, and the node refuses it at execute time,
+    /// so nothing is written.
+    #[tokio::test]
+    async fn an_invalid_index_batch_is_tried_once() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = format!("test-invalid-{}", "x".repeat(70_000));
+        let key = RowKey {
+            tenant_id: &tenant,
+            resource_type: "Patient",
+            id: "p",
+        };
+        let lu1 = Utc::now();
+        let lu2 = lu1 + chrono::Duration::milliseconds(1);
+        let x1 = IndexKey::ResourcesByType;
+        let delta = index_delta(
+            &[(&x1, lu1)],
+            VersionKeys {
+                version_id: 2,
+                last_updated: lu2,
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                keys: std::slice::from_ref(&x1),
+            },
+        );
+        let batches = index_batches(&key, &delta, 1).batches;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 2);
+        let counted = backend.statement_counts();
+        let outcome = backend.send_index_batch(&batches[0], 3).await;
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
+        assert_eq!(spent.batch, 1, "{spent}");
+    }
+
     /// IW17, RW9: a post-CAS write the node refuses as `Invalid` is tried
     /// once, not `tries` times. A partition key over 65,535 bytes is refused
     /// at execute time, so nothing is written.

@@ -3265,7 +3265,8 @@ mod tests {
             (&dropped, lu1),
             (&x1, lu2),
         ];
-        let next = [x1.clone(), t.clone(), d.clone()];
+        // `t` is listed twice: its row is inserted once.
+        let next = [x1.clone(), t.clone(), d.clone(), t.clone()];
         let delta = index_delta(&previous, version_keys(&next, lu3));
         let deletes: Vec<IndexRow<'_>> = delta
             .units
@@ -3282,6 +3283,11 @@ mod tests {
             set(&deletes),
             set(&[(&t, lu1), (&t, lu2), (&dropped, lu1), (&x1, lu2)])
         );
+        assert_eq!(
+            inserts.len(),
+            3,
+            "a row listed twice is inserted once: {inserts:?}"
+        );
         assert_eq!(set(&inserts), set(&[(&x1, lu3), (&t, lu3), (&d, lu3)]));
         // The token's unit: its two stale rows and its current one.
         let unit = delta
@@ -3296,8 +3302,8 @@ mod tests {
     /// IW9 B: a unit is every row of one partition, inserts and deletes
     /// together, so an update's `resources_by_type` pair is one unit (once
     /// its batch has reached a quorum an update alone never lets `count` see
-    /// both rows; `count` is still off by one either way after an unfinished
-    /// write or through read repair, ADR-sam-michaels-0006, IW9). A changed value is one unit when it only
+    /// both rows; the cases where `count` is still off are in
+    /// ADR-aacruzgon-0081, decision 2). A changed value is one unit when it only
     /// changes clustering columns (a token's code in `token_system_index`, a
     /// date's range) and two when it changes the partition key (a token's
     /// code in `token_code_index`). `date_index` and `date_index_by_end` are
@@ -4969,6 +4975,34 @@ mod node_tests {
         assert_eq!((spent.write, spent.cas), (5, 1), "{spent}");
         assert_eq!((spent.batch, spent.batched), (0, 0), "{spent}");
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    }
+
+    /// IW17, RW9: a post-CAS write the node refuses as `Invalid` is tried
+    /// once, not `tries` times. A partition key over 65,535 bytes is refused
+    /// at execute time, so nothing is written.
+    #[tokio::test]
+    async fn an_invalid_post_cas_write_is_tried_once() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = format!("test-invalid-{}", "x".repeat(70_000));
+        let values = vec![
+            Value::from(tenant),
+            Value::from("Patient"),
+            Value::from(Utc::now()),
+            Value::from("p"),
+            Value::from(1_i32),
+            Value::from("4.0"),
+            Value::from(1_i64),
+        ];
+        let counted = backend.statement_counts();
+        let outcome = backend
+            .write_with_retries(INSERT_RESOURCES_BY_TYPE, values, "index row", 3)
+            .await;
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
+        assert_eq!(spent.write, 1, "{spent}");
     }
 
     /// An update whose new `resources_by_type` row fails all three tries

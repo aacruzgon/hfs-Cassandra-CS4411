@@ -138,10 +138,13 @@ impl IndexKey {
     /// ADR-sam-michaels-0006). An update's `resources_by_type` rows at
     /// `lu(N)` and `lu(N+1)` share the `(tenant_id, resource_type)`
     /// partition, so once the batch has reached a quorum an update alone
-    /// never lets `count` see both. `count` is still off by one either way,
-    /// twice or not at all, after an unfinished write or through read repair
-    /// (ADR-sam-michaels-0006, IW9). Rows of one key at two
-    /// versions always share a partition, since `last_updated` is never a
+    /// never lets `count` see both. `count` can still be off
+    /// (ADR-aacruzgon-0081, decision 2): too high, by up to one per
+    /// unfinished update or delete, and one too low after an unfinished create
+    /// or revive, until the sweeper or repair finishes it; and on RF 3, twice
+    /// or not at all through read repair after a write that reached fewer than
+    /// a quorum. Rows of one key at two versions always share a partition,
+    /// since `last_updated` is never a
     /// partition-key column; a changed value may or may not (a token's `code`
     /// is in the partition key of `token_code_index`, but a clustering column
     /// of `token_system_index`).
@@ -551,8 +554,10 @@ mod tests {
     }
 
     /// `((tenant_id, resource_type), last_updated, id)`: an update moves the
-    /// row, and both versions' rows share the type's one partition, which is
-    /// what keeps `count` exact under IW9.
+    /// row, and both versions' rows share the type's one partition, so an
+    /// update alone never lets a quorum read see both once its batch has
+    /// reached a quorum (IW9; the other cases are in ADR-aacruzgon-0081,
+    /// decision 2).
     #[test]
     fn a_resources_by_type_row_is_its_last_updated() {
         check_table(IndexKey::ResourcesByType, true, &[]);

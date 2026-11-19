@@ -764,6 +764,10 @@ pub(crate) enum Fault {
     /// engine takes as not applied, which the table for plain statements
     /// maps to 500 (ADR-aacruzgon-0067).
     FailWithProtocolError,
+    /// Fail with a node-side `Invalid` error without executing: what the node
+    /// answers to a statement or batch it refuses, so nothing refused need be
+    /// sent to it.
+    FailWithInvalid,
 }
 
 #[cfg(test)]
@@ -883,6 +887,7 @@ mod faults {
                 Fault::FailWithProtocolError => {
                     return Some(Err(server_error(ErrorType::Protocol)));
                 }
+                Fault::FailWithInvalid => return Some(Err(server_error(ErrorType::Invalid))),
                 Fault::PassThrough => {
                     return Some(session.send(cql, values.to_vec(), kind, None).await);
                 }
@@ -945,6 +950,7 @@ mod faults {
                 Fault::FailWithTooManyTombstones => Err(server_error(too_many_tombstones())),
                 Fault::FailWithServerError => Err(server_error(ErrorType::Server)),
                 Fault::FailWithProtocolError => Err(server_error(ErrorType::Protocol)),
+                Fault::FailWithInvalid => Err(server_error(ErrorType::Invalid)),
             })
         }
     }

@@ -5064,18 +5064,23 @@ mod node_tests {
 
     /// IW15, IW17: an index batch the node refuses as `Invalid` is tried
     /// once, not `tries` times. One unit (an insert and a delete of the
-    /// `resources_by_type` partition) whose key is over 65,535 bytes goes as
-    /// one batch of two statements, and the node refuses it at execute time,
-    /// so nothing is written.
+    /// `resources_by_type` partition) goes as one batch of two statements,
+    /// and the fault seam refuses it as `Invalid` without sending it: a node
+    /// that is sent a batch it refuses leaves its statements out of the audit
+    /// log, which the CI audit of the schema job reads as a possible DELETE.
+    /// Were the batch tried again, the seam would let the second try through
+    /// to the node, which would apply it, so `batch == 1` and `Permanent`
+    /// show a single try. The server's own `Invalid` is covered, for a single
+    /// statement, by `an_invalid_index_unit_fails_the_delta_as_permanent`.
     #[tokio::test]
     async fn an_invalid_index_batch_is_tried_once() {
         let Some(backend) = backend().await else {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
         };
-        let tenant = format!("test-invalid-{}", "x".repeat(70_000));
+        let tenant = hardening_tenant("invalid-batch");
         let key = RowKey {
-            tenant_id: &tenant,
+            tenant_id: tenant.tenant_id().as_str(),
             resource_type: "Patient",
             id: "p",
         };
@@ -5094,8 +5099,15 @@ mod node_tests {
         let batches = index_batches(&key, &delta, 1).batches;
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 2);
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::FailWithInvalid,
+        );
         let counted = backend.statement_counts();
-        let outcome = backend.send_index_batch(&batches[0], 3).await;
+        let outcome = backend
+            .send_index_batch(&batches[0], POST_CAS_WRITE_TRIES)
+            .await;
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
         assert_eq!(spent.batch, 1, "{spent}");
@@ -5122,11 +5134,52 @@ mod node_tests {
         ];
         let counted = backend.statement_counts();
         let outcome = backend
-            .write_with_retries(INSERT_RESOURCES_BY_TYPE.as_str(), values, "index row", 3)
+            .write_with_retries(
+                INSERT_RESOURCES_BY_TYPE.as_str(),
+                values,
+                "index row",
+                POST_CAS_WRITE_TRIES,
+            )
             .await;
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
         assert_eq!(spent.write, 1, "{spent}");
+    }
+
+    /// IW17: `write_index_delta` passes an `Invalid` unit's `Permanent` up
+    /// instead of folding it into `TriesExhausted`. One insert and no delete
+    /// is one statement, never a batch (`CassandraSession::batch` sends a lone
+    /// statement as a plain write), so the node refuses a single statement (a
+    /// partition key over 65,535 bytes) and nothing is written.
+    #[tokio::test]
+    async fn an_invalid_index_unit_fails_the_delta_as_permanent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = format!("test-invalid-{}", "x".repeat(70_000));
+        let key = RowKey {
+            tenant_id: &tenant,
+            resource_type: "Patient",
+            id: "p",
+        };
+        let keys = [IndexKey::ResourcesByType];
+        let delta = index_delta(
+            &[],
+            VersionKeys {
+                version_id: 1,
+                last_updated: Utc::now(),
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                keys: &keys,
+            },
+        );
+        let counted = backend.statement_counts();
+        let outcome = backend
+            .write_index_delta(&key, &delta, 1, POST_CAS_WRITE_TRIES)
+            .await;
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome.result, Err(WriteFailure::Permanent), "{spent}");
+        assert_eq!((spent.write, spent.batch), (1, 0), "{spent}");
     }
 
     /// An update whose new `resources_by_type` row fails all three tries

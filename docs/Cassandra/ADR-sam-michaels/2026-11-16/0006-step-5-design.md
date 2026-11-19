@@ -163,6 +163,8 @@ Alan reviewed this entry on #86. Sam chose D1 to D6; the mechanical fixes follow
 - **Index and Status:** the index row follows the Status line; the Links line lists the roadmap's exit criterion, sections 6 and 8, and the walkthrough's failure table and G12.
 - **`read_repair`:** cites Alan's entry on it, whose number follows when he records it (0080 went to the `acruzdebian` runner, #91).
 
+*Update 2026-11-19:* Alan's `read_repair` entry, cited above as "to follow" (Links and Amendments, point 2), is [ADR-aacruzgon-0081](../../ADR-aacruzgon/2026-11-18/0081-what-step5-design-changes.md), merged in #97. Its decision 2 states `count`'s bound more exactly than this entry: after an unfinished update or delete, `count` is too high, by up to one per such write; after an unfinished create or revive, it is one too low; "twice or not at all" is the read-repair case on RF 3, after a write that reached fewer than a quorum.
+
 ## The 74 decisions
 
 **Build order.** Eight pull requests, one roadmap concern each:

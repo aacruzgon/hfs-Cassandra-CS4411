@@ -4737,6 +4737,34 @@ mod node_tests {
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
     }
 
+    /// IW17, RW9: a post-CAS write the node refuses as `Invalid` is tried
+    /// once, not `tries` times. A partition key over 65,535 bytes is refused
+    /// at execute time, so nothing is written.
+    #[tokio::test]
+    async fn an_invalid_post_cas_write_is_tried_once() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = format!("test-invalid-{}", "x".repeat(70_000));
+        let values = vec![
+            Value::from(tenant),
+            Value::from("Patient"),
+            Value::from(Utc::now()),
+            Value::from("p"),
+            Value::from(1_i32),
+            Value::from("4.0"),
+            Value::from(1_i64),
+        ];
+        let counted = backend.statement_counts();
+        let outcome = backend
+            .write_with_retries(INSERT_RESOURCES_BY_TYPE, values, "index row", 3)
+            .await;
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
+        assert_eq!(spent.write, 1, "{spent}");
+    }
+
     /// An update whose new `resources_by_type` row fails all three tries
     /// keeps the old row: its delete is never sent, so the live resource
     /// stays counted, and the write succeeds with I1 left for the sweeper

@@ -27,7 +27,8 @@
 //! for a read, and for a write with a fixed `USING TIMESTAMP`. The exception
 //! is an index write sent by [`CassandraSession::batch`]: an index batch and
 //! a lone index row carry [`FallthroughRetryPolicy`] too, so each of the
-//! writer's tries is one send (below). Whether a CAS
+//! writer's tries is one send (below; apart from a re-prepare inside the
+//! driver, see [`StatementCounts`]). Whether a CAS
 //! whose outcome is unknown ran is decided by the caller, from a
 //! [`SerialRead`](StatementKind::SerialRead), never by the driver.
 //!
@@ -48,7 +49,8 @@
 //! a batch sent without it would write at `ONE`. It takes only
 //! [`IndexStatement`]s, so it can hold nothing but index-table rows (IW20,
 //! `batch.rs`). A batch of one statement is sent as a plain write with the
-//! same no-retry policy, so one try is one send either way. The driver
+//! same no-retry policy, so one try is one send either way (apart from a
+//! re-prepare inside the driver, see [`StatementCounts`]). The driver
 //! never re-sends a batch by itself: the writer retries it (IW16), and the
 //! driver's default policy would add a hidden second send after a
 //! `BATCH_LOG` timeout (`retry/retry_policy.rs:157-174`).
@@ -258,6 +260,21 @@ pub(crate) struct CassandraSession {
     /// The faults tests inject (`cfg(test)` only; see [`Fault`]).
     #[cfg(test)]
     faults: faults::Faults,
+    /// What each plain send used, in order (`cfg(test)` only).
+    #[cfg(test)]
+    plain_sends: parking_lot::Mutex<Vec<PlainSend>>,
+}
+
+/// What one plain send used (`cfg(test)` only): the statement's kind, the
+/// [`Retries`] it asked for, and whether the parameters actually built
+/// carry a retry policy of their own (so, not the session's default). Both
+/// are recorded, since a bug can honour the one and not the other.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlainSend {
+    kind: StatementKind,
+    retries: Retries,
+    own_retry_policy: bool,
 }
 
 impl std::fmt::Debug for CassandraSession {
@@ -299,6 +316,8 @@ impl CassandraSession {
             counts: StatementCounters::default(),
             #[cfg(test)]
             faults: faults::Faults::default(),
+            #[cfg(test)]
+            plain_sends: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -311,6 +330,12 @@ impl CassandraSession {
     /// How many statements of each kind this session has been asked to send.
     pub(crate) fn statement_counts(&self) -> StatementCounts {
         self.counts.snapshot()
+    }
+
+    /// What each plain send used since the session opened (tests only).
+    #[cfg(test)]
+    fn plain_sends(&self) -> Vec<PlainSend> {
+        self.plain_sends.lock().clone()
     }
 
     /// Makes the next statement of `kind` whose CQL contains `cql_contains`
@@ -380,7 +405,7 @@ impl CassandraSession {
             if (paging.is_none() || first_page)
                 && let Some(result) = self
                     .faults
-                    .intercept(self, cql, &values, kind, first_page)
+                    .intercept(self, cql, &values, kind, retries, first_page)
                     .await
             {
                 return result;
@@ -390,21 +415,9 @@ impl CassandraSession {
     }
 
     /// Prepares (on first use) and sends one statement under the request
-    /// deadline, with no counting and no injected fault. Only the test fault
-    /// seam sends this way.
-    #[cfg(test)]
-    async fn send(
-        &self,
-        cql: &str,
-        values: Vec<Value>,
-        kind: StatementKind,
-        paging: Option<Paging>,
-    ) -> Result<Envelope, DriverError> {
-        self.send_with(cql, values, kind, paging, Retries::OfKind)
-            .await
-    }
-
-    /// [`Self::send`] with the retry policy chosen by `retries`.
+    /// deadline, with no counting and no injected fault, and with the retry
+    /// policy `retries` chooses. The test fault seam sends this way too, with
+    /// the statement's own `retries`.
     async fn send_with(
         &self,
         cql: &str,
@@ -419,6 +432,12 @@ impl CassandraSession {
             Retries::OfKind => statement_params(kind, values, &self.no_retry),
             Retries::Never => lone_row_params(values, &self.no_retry),
         };
+        #[cfg(test)]
+        self.plain_sends.lock().push(PlainSend {
+            kind,
+            retries,
+            own_retry_policy: params.retry_policy.is_some(),
+        });
         if let Some(paging) = paging {
             params.query_params.page_size = Some(paging.page_size);
             params.query_params.paging_state = paging.state;
@@ -525,7 +544,8 @@ impl CassandraSession {
     /// through [`Self::execute`]'s path, counted as a write, but with the
     /// no-retry policy a batch has ([`lone_row_params`]): a batch of one buys
     /// nothing, and the node would treat it as a single mutation anyway. So
-    /// "one try, one send" holds for a batch and for a lone row alike.
+    /// "one try, one send" holds for a batch and for a lone row alike (apart
+    /// from a re-prepare inside the driver, see [`StatementCounts`]).
     ///
     /// Each statement binds its own `USING TIMESTAMP`, so the batch sets no
     /// timestamp of its own. Cassandra applies the rows of one partition key
@@ -603,7 +623,9 @@ fn index_batch<'a>(
 /// the same node after a `BATCH_LOG` timeout (`cdrs-tokio` 10.0.0,
 /// `retry/retry_policy.rs:157-174`). Each of the writer's tries is then one
 /// send, which the counters see (IW14), and a hung node costs one node
-/// timeout per try, not two, inside the index phase's deadline.
+/// timeout per try, not two, inside the index phase's deadline. (A
+/// re-prepare inside the driver is still one request, see
+/// [`StatementCounts`].)
 fn batch_params(no_retry: &Arc<dyn RetryPolicy + Send + Sync>) -> StatementParams {
     let mut params = statement_params(StatementKind::Write, Vec::new(), no_retry);
     params.retry_policy = Some(no_retry.clone());
@@ -613,8 +635,11 @@ fn batch_params(no_retry: &Arc<dyn RetryPolicy + Send + Sync>) -> StatementParam
 /// The parameters a lone index row is sent with (IW13, IW15): those of a
 /// plain [`StatementKind::Write`], with [`FallthroughRetryPolicy`] in place
 /// of the session's, as a batch has ([`batch_params`]). The default policy
-/// would re-send an idempotent write once after `Unavailable`, a send the
-/// counters never see; with this one, each of the writer's tries is one send.
+/// would re-send an idempotent write to the next node after `Unavailable`
+/// (once), `Io`, `General`, `Overloaded`, `Server`, `Truncate` and
+/// `IsBootstrapping` (`retry/retry_policy.rs:92-123`, `:175-182`), sends the
+/// counters never see; with this one, each of the writer's tries is one send
+/// (apart from a re-prepare inside the driver, see [`StatementCounts`]).
 fn lone_row_params(
     values: Vec<Value>,
     no_retry: &Arc<dyn RetryPolicy + Send + Sync>,
@@ -684,10 +709,12 @@ impl StatementCounters {
 /// statement it carries in `batched`. `write` counts only statements sent
 /// alone, so a reader sees both the requests and the rows they carried.
 ///
-/// These are the writer's requests, not wire round trips: when the
+/// These are the writer's requests, not every send on the wire: when the
 /// coordinator has lost a prepared ID, `cdrs-tokio` prepares it again and
 /// re-sends inside the same call (10.0.0, `cluster/session.rs:567-600`), and
-/// such a request counts once.
+/// such a request counts once. So does a plain statement the driver's
+/// default policy re-sends to the next node (a read, or a write that is not
+/// an index write, such as a version row): the caller made one request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StatementCounts {
@@ -850,6 +877,7 @@ mod faults {
             cql: String,
             values: Vec<Value>,
             kind: StatementKind,
+            retries: Retries,
         },
         Batch(Vec<IndexStatement>),
     }
@@ -886,9 +914,15 @@ mod faults {
             };
             for deferred in due {
                 match deferred.late {
-                    Late::Statement { cql, values, kind } => {
-                        session.send(&cql, values, kind, None).await.map(|_| ())
-                    }
+                    Late::Statement {
+                        cql,
+                        values,
+                        kind,
+                        retries,
+                    } => session
+                        .send_with(&cql, values, kind, None, retries)
+                        .await
+                        .map(|_| ()),
                     Late::Batch(statements) => session.send_batch(&statements).await,
                 }
                 .expect("the late apply of an injected fault");
@@ -904,6 +938,7 @@ mod faults {
             cql: &str,
             values: &[Value],
             kind: StatementKind,
+            retries: Retries,
             first_page: bool,
         ) -> Option<Result<Envelope, DriverError>> {
             if !first_page {
@@ -918,7 +953,10 @@ mod faults {
             };
             match fault {
                 Fault::ApplyThenTimeOut => {
-                    if let Err(error) = session.send(cql, values.to_vec(), kind, None).await {
+                    if let Err(error) = session
+                        .send_with(cql, values.to_vec(), kind, None, retries)
+                        .await
+                    {
                         return Some(Err(error));
                     }
                 }
@@ -928,6 +966,7 @@ mod faults {
                         cql: cql.to_string(),
                         values: values.to_vec(),
                         kind,
+                        retries,
                     },
                 }),
                 Fault::FailWithWriteFailure => return Some(Err(server_error(write_failure()))),
@@ -941,7 +980,11 @@ mod faults {
                 }
                 Fault::FailWithInvalid => return Some(Err(server_error(ErrorType::Invalid))),
                 Fault::PassThrough => {
-                    return Some(session.send(cql, values.to_vec(), kind, None).await);
+                    return Some(
+                        session
+                            .send_with(cql, values.to_vec(), kind, None, retries)
+                            .await,
+                    );
                 }
                 Fault::TimeOutWithoutApplying | Fault::FailWithCasTimeout => {}
             }
@@ -1151,6 +1194,21 @@ mod tests {
         }
     }
 
+    /// `total` adds every request kind, `serial_read` included, and leaves
+    /// out `batched`.
+    #[test]
+    fn total_counts_every_request_kind_but_the_batched_statements() {
+        let counts = StatementCounts {
+            read: 1,
+            serial_read: 20,
+            write: 300,
+            batch: 4_000,
+            batched: 50_000,
+            cas: 600_000,
+        };
+        assert_eq!(counts.total(), 604_321);
+    }
+
     #[test]
     fn statement_params_carry_the_kind_rules() {
         let no_retry: Arc<dyn RetryPolicy + Send + Sync> = Arc::new(FallthroughRetryPolicy);
@@ -1343,7 +1401,7 @@ mod tests {
     /// IW14, separate fields: a batch is one request in `batch` and its
     /// statements in `batched`; `write` counts only statements sent alone.
     #[test]
-    fn a_batch_counts_as_one_round_trip_and_its_statements_as_batched() {
+    fn a_batch_counts_as_one_request_and_its_statements_as_batched() {
         let counters = StatementCounters::default();
         counters.count(StatementKind::Write);
         let before = counters.snapshot();
@@ -1555,6 +1613,16 @@ mod node_tests {
             (spent.write, spent.batch, spent.batched),
             (1, 0, 0),
             "{spent}"
+        );
+        // The send used no driver retry: it asked for `Never`, and the
+        // parameters it was built with carry a policy of their own.
+        assert_eq!(
+            session.plain_sends(),
+            vec![PlainSend {
+                kind: StatementKind::Write,
+                retries: Retries::Never,
+                own_retry_policy: true,
+            }]
         );
         assert_eq!(
             rows_of(&session, &t, "Patient").await,

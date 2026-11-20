@@ -1196,7 +1196,8 @@ struct IndexBatches {
 
 /// Packs `delta`'s units into batches (IW11): each unit's statements at
 /// `ts`, sized by [`wire_bytes`], then [`pack`]ed in order under
-/// [`MAX_BATCH_BYTES`], never splitting a unit. A unit whose statements
+/// [`MAX_BATCH_BYTES`]. A unit is never split, so one over the limit on its
+/// own goes alone, as one batch over it. A unit whose statements
 /// cannot be built fails alone, as it did when each unit was sent on its
 /// own, and the others are still packed.
 fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatches {
@@ -1456,7 +1457,7 @@ pub(crate) struct Applied {
     #[allow(dead_code)]
     // No operation reports it (`cas_stats` counts it); the engine's tests check it.
     pub(crate) post_cas_complete: bool,
-    /// What step 5 sent (IW14); all zero when it was skipped.
+    /// What step 5 packed (IW14), not what it sent; all zero when it was skipped.
     #[allow(dead_code)] // No operation reports it; the engine's tests check it.
     pub(crate) index: IndexWriteStats,
     /// The plan of the attempt that applied, whose values the operation
@@ -2245,9 +2246,10 @@ impl CassandraBackend {
     ///
     /// A batch that fails is not confirmed: it may or may not have applied
     /// (after a `BATCH` timeout, or when the deadline dropped it after it was
-    /// sent, it may well have). Its partitions' old rows, tagged with an
-    /// older version, are still there for the tag check to hide, whether or
-    /// not the new ones landed; the others are written.
+    /// sent, it may well have). If it applied, the unit's new rows replaced
+    /// the old; if not, the old rows, tagged with an older version, are
+    /// still there for the tag check to hide. Either way the intent is
+    /// kept; the other batches are written.
     /// The result is `Ok` once every batch is confirmed. A failure is
     /// [`WriteFailure::Permanent`] if any batch's was, then
     /// [`WriteFailure::TriesExhausted`], then [`WriteFailure::InBatchlog`];
@@ -2342,7 +2344,8 @@ impl CassandraBackend {
     /// through [`CassandraSession::batch`](super::session::CassandraSession::batch)
     /// (IW13): one logged batch at `LOCAL_QUORUM`, or a plain write for a
     /// lone statement; either way the driver never re-sends it, so one try is
-    /// one send. Up to `tries` tries, 10 ms then 20 ms apart (IW16),
+    /// one send (apart from a re-prepare inside the driver, see
+    /// [`StatementCounts`](super::StatementCounts)). Up to `tries` tries, 10 ms then 20 ms apart (IW16),
     /// each failure read by [`classify_failure`] (IW15):
     ///
     /// - `WriteTimeout`/`BATCH`: the batchlog holds the batch and replays it,

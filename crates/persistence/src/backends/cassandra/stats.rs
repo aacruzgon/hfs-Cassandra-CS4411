@@ -11,8 +11,8 @@
 //! The statements themselves are counted per kind in `session.rs`
 //! ([`StatementCounts`](super::StatementCounts), report R5).
 //!
-//! [`IndexWriteStats`] counts what one write's index phase sent: its rows,
-//! its batches and the largest of them (roadmap Step 5; ADR-sam-michaels-0006,
+//! [`IndexWriteStats`] counts what one write's index phase packed: its
+//! planned rows, its batches and the largest of them (roadmap Step 5; ADR-sam-michaels-0006,
 //! IW14).
 
 use std::fmt;
@@ -168,9 +168,9 @@ impl fmt::Display for CasStats {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct IndexWriteStats {
-    /// Index rows inserted.
+    /// Index rows planned for insert.
     pub(crate) rows_inserted: u64,
-    /// Index rows deleted.
+    /// Index rows planned for delete.
     pub(crate) rows_deleted: u64,
     /// Batches the rows were packed into.
     pub(crate) batches: u64,

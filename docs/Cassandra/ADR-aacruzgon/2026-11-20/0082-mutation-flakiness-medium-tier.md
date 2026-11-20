@@ -25,7 +25,7 @@
       - **The clippy job count still works.** `cargo clippy (helios-fhir)` still reads its cargo job count from the cgroup of the runner it lands on, which does not depend on the label.
     - **The labels change through the API only, in two steps.**
         - On 2026-11-20, before the workflow change was pushed, `hfs-cassandra-medium` was added to both runners: `POST .../actions/runners/22/labels` and `.../21/labels`.
-        - Removing `hfs-cassandra-heavy` from `sam-7900x` is Alan's session's first step right after PR #100 merges: `DELETE /repos/aacruzgon/hfs-Cassandra-CS4411/actions/runners/21/labels/hfs-cassandra-heavy` (id 21 is `sam-7900x`), then a check with `GET .../actions/runners` that it carries `hfs-cassandra, hfs-cassandra-light, hfs-cassandra-medium, hfs-runner-sam-7900x`.
+        - Removing `hfs-cassandra-heavy` from `sam-7900x` is Alan's session's first step right after PR #100 merges: `DELETE /repos/aacruzgon/hfs-Cassandra-CS4411/actions/runners/21/labels/hfs-cassandra-heavy` (id 21 is `sam-7900x`), then a check with `GET .../actions/runners` that its custom labels are `hfs-cassandra, hfs-cassandra-light, hfs-cassandra-medium, hfs-runner-sam-7900x` (the API also lists the default `self-hosted, Linux, X64`).
             - Not before the merge: until then `main`'s clippy pair still targets heavy, so the DELETE would take two required checks off `sam-7900x`.
             - Not later: until the DELETE a heavy job, such as a pull request labelled `mutants`, can still land on `sam-7900x`, at up to 15.4 GiB `anon` under its 20G cap and 32.9 GiB of scratch disk on Sam's desktop.
         - Every job stays runnable at each step. Nothing on `sam-7900x` itself changes.
@@ -55,6 +55,19 @@
         - **Running them:** the job builds the two test binaries once and starts its own node (project `hfs-cassandra-flaky`, port 59442). It runs each test 20 times (a dispatch input for more), one test per process with `--exact`, with the tombstone tests and the latency report opted in.
         - **The report:** one row per test, with runs, passes, failures, timeouts, status and the first failure's message. A test that failed some of its runs is a warning annotation; the job never fails on it.
         - **Medium:** its build peaked at 4,116 MiB `anon`.
+    - **Both report jobs, as hardened after the two independent audits of PR #100 (at `84ec924f4` and `c950d5dc1`):**
+        - **The dispatch inputs are checked before anything runs,** because git read a range such as `--output=<file>` as an option and wrote that file:
+            - `head`, `base` and `in_diff` must look like a ref or a range: a letter, digit or `_` first, then only `A-Za-z0-9._/@{}~^+-`, so no leading `-` and no whitespace;
+            - `head` must not be a short SHA (7 to 39 hex digits), which `actions/checkout` looks up as a branch or tag;
+            - an empty `base` means `main`;
+            - `jobs` must be 1 to 6, which fits 40G, and `runs` 1 to 200;
+            - a rejected input fails the dispatch with an error naming it;
+            - every `git diff` that takes the range also passes `--end-of-options`, so each layer holds on its own.
+        - **Each dispatch's concurrency group holds every input** that changes what it runs, so two dispatches of one head with different inputs do not cancel each other.
+        - **Their own host ports:** the mutation node on 59842 and the flakiness node on 59442. Rootless Docker publishes on the host itself, and the mutation job's first port, 59342, was the three-node Compose file's default. No Compose file, workflow, README, the nightly three-node job (59642 to 59644) or the benchmark harness (59542) uses either. `docker/cassandra/README.md` lists every CI port.
+        - **The node is tried three times, 35 s apart.** Every CI port is even and inside Linux's ephemeral range (32768 to 60999 on `acruzdebian`, none reserved), and `connect()` takes even ports first. So the client side of the previous job's loopback test connections can sit on the port in TIME-WAIT for 60 s, and no listener can bind over it, `SO_REUSEADDR` or not. Run 44765908091 hit it: the mutation job reaches its node with no build first, 17 to 46 s after the previous job's tests. The third try comes about 70 s after the first, so any TIME-WAIT present at the first has expired.
+        - **A run that cannot start warns instead of failing.** A failed cargo-mutants install, or a node that does not start or take the schema, skips the run with a warning and a summary line saying nothing was tested, and the job stays green. The node's logs print in either case. A failed or killed install leaves no partial directory.
+        - **No reserved ports on the runners (my decision).** The retry is the mitigation for the two report jobs. The required Cassandra job stays as it is: its build runs before its node starts, so the previous job's TIME-WAITs have expired by its bind, and none of the 22 failed runs of `fmt-clippy-cassandra.yml`, `fhir-versions.yml` and `cassandra-coverage.yml` since 2026-10-15 shows "address already in use". If a required job ever hits it, the CI ports move below 32768 in one pull request coordinated with #101 and #76.
     - **A fix in `ci-report.py`.** The `context` command writes its own section to `context.json`, which is also the file the job's context is kept in. So every section after it nested the whole context section as its context (run 44655683717's `node-stats.json` and `tests.json`), and a `build` report after it failed with `KeyError('runner')`, which the new jobs hit. `context()` now unwraps that section, and a new test in `test_ci_report.py` fails without the fix.
 - **Alternatives considered:**
     - **The mutation job on every push to a backend pull request:** lost. It was the first version. It holds `acruzdebian` for about 26 minutes a push, and while `sam-7900x` is offline every required check queues behind it on the one runner left: on 2026-11-20 the queue reached 14 runs.
@@ -68,6 +81,10 @@
     - **Mutating the whole backend on every pull request:** lost. That is 1,327 mutants, more than the budget; a dispatch with `in_diff: none` still does it.
     - **`--cap-lints=true`:** dropped after the first #90 run. It also caps `-D long_running_const_eval`, and the crate denies no warning that would otherwise make a mutant unviable.
     - **The flakiness job on light:** possible by memory (its build is the required Cassandra job's), but it holds a runner for minutes of repeated runs; medium, the smallest tier I wanted for the new report jobs, keeps it on either runner.
+    - **Against the busy port, `net.ipv4.ip_local_reserved_ports=59042-59999` on the runners:** lost. It needs root on each runner, `sam-7900x` included, which is Sam's machine; it lives outside the repository, so a re-installed or new runner silently lacks it; and the retry covers the two jobs that are exposed.
+    - **The CI ports moved below 32768 now:** deferred, not lost. It covers every job on any Linux runner without root, but it renumbers about ten port values across this branch, #101 (the three-node job and the cluster file) and #76 (the benchmark harness), the required workflow's env included. It is the plan if a required job ever shows "address already in use".
+    - **Odd ports, outside `connect()`'s preference:** lost. `bind(0)` prefers odd ports, so it trades one clash for another, and it rests on a kernel heuristic.
+    - **A shorter retry pause (20 s):** dropped after the delta audit. Its third try came about 41 s after the first, inside the 60 s TIME-WAIT.
     - **Re-run every test of a changed file:** lost. #90's changed files hold 111 tests; the 36 it adds or changes are what a reviewer re-ran by hand.
 - **Consequences:**
     - **A backend pull request labelled `mutants` shows its missed mutants; every backend pull request shows its unstable tests.** On #90's head: 153 mutants, 91 caught, 8 missed, 54 unviable, 0 timed out, in 24.6 minutes. Its 36 added or changed tests passed 720 of 720 runs, in 3.9 minutes.
@@ -85,7 +102,8 @@
     - **To revisit:**
         - the job count: kept at 4, with room for about 6 under 40G at 14.6 GiB `anon`;
         - the 32.9 GiB of transient disk, which grows with the job count;
-        - the bare `hfs-cassandra` label, which only `sam-7900x` carries and no `runs-on:` uses (it is in `.github/actionlint.yaml` and the docs).
+        - the bare `hfs-cassandra` label, which only `sam-7900x` carries and no `runs-on:` uses (it is in `.github/actionlint.yaml` and the docs);
+        - the CI ports below 32768, if a required job ever fails with "address already in use".
     - **Sam needs to know that GitHub keeps the labels, not the runner.**
         - A restart keeps them.
         - Re-registering `sam-7900x` with `config.sh`, with or without `--replace`, sets only the labels passed with `--labels`. GitHub's labels page: "If you replace an existing runner, then you must reassign any custom labels."
@@ -100,10 +118,11 @@
         - turning incremental builds back on, after finding `CARGO_INCREMENTAL=0` from `dtolnay/rust-toolchain` in the job's environment;
         - the node on by default, from the measured cost;
         - the label's `if:` and the separate concurrency group for other labels;
+        - after the audits, the input checks and their bounds, the full concurrency groups, the ports 59842 and 59442, the node retry and warn-instead-of-fail; the delta audit found the TIME-WAIT cause and the 35 s pause;
         - the `ci-report.py` fix;
         - the upload retry, after one upload was lost to a DNS error;
         - the job-to-tier table.
-    - **What the human changed:** I chose the three tiers and the order of the label calls; report-only for both jobs; the scope (`--in-diff` on the backend, `--lib`, 20 runs); and heavy for the mutation job. After the first version ran pure tests only, I asked for the node tests to be included, which took the missed mutants on #90 from 21 to 8. I chose a `mutants` label over running on every push, so the required checks don't queue behind a 26-minute job while `acruzdebian` is the only runner online. I kept 4 jobs, left the bare `hfs-cassandra` label for a later cleanup, and had the 8 survivors posted on #90 as leads.
+    - **What the human changed:** I chose the three tiers and the order of the label calls; report-only for both jobs; the scope (`--in-diff` on the backend, `--lib`, 20 runs); and heavy for the mutation job. After the first version ran pure tests only, I asked for the node tests to be included, which took the missed mutants on #90 from 21 to 8. I chose a `mutants` label over running on every push, so the required checks don't queue behind a 26-minute job while `acruzdebian` is the only runner online. I kept 4 jobs, left the bare `hfs-cassandra` label for a later cleanup, and had the 8 survivors posted on #90 as leads. After the delta audit I decided against reserving ports on the runners: the retry covers the two report jobs, the required job stays as it is, and the CI ports move below 32768 only if a required job ever hits a busy port.
     - **Verified:**
         - **Labels:** after the two `POST` calls, `gh api .../actions/runners` lists `acruzdebian` (online) with `hfs-cassandra-light, hfs-runner-acruzdebian, hfs-cassandra-heavy, hfs-cassandra-medium` and `sam-7900x` (offline) with `hfs-cassandra, hfs-cassandra-light, hfs-cassandra-heavy, hfs-runner-sam-7900x, hfs-cassandra-medium`.
         - **The `mutants` label,** on head `10d03db50` of #100, which touches no backend file:
@@ -111,6 +130,11 @@
             - adding `mutants`: run 44749302167 queued, then ran and passed (0 files under the backend, 17 s);
             - adding `documentation` while that run was queued: run 44749353272 `skipped`, and 44749302167 was not cancelled; both labels were then removed;
             - a dispatch with no label: run 44749420210 ran and passed.
+        - **The audits' fixes:**
+            - the input check, locally: before it, `git diff … "--output=<scratch>/written-by-git.txt"` exited 0 and wrote the file; after it, that value and other option-like or malformed ones are rejected, and `--end-of-options` alone makes git refuse it as a bad revision; in CI, run 44761023874 rejected `in_diff=--output=x` in 5 s;
+            - the ports: run 44760964004 (flakiness, node on 59442, 36 tests stable) and run 44767030236 (mutation, node on 59842, 5 mutants, 3 caught, 2 unviable, 7.6 min, 9,920 MiB `anon`);
+            - the node retry and the install warning, locally with a fake `docker` and a fake `cargo`;
+            - the TIME-WAIT cause, by the delta audit: 2,243 loopback TIME-WAIT sockets on even ephemeral ports on `acruzdebian` during a job with a node, and in a Linux container a listener refused on a port in client TIME-WAIT, with and without `SO_REUSEADDR`, for about 60 s;
         - **The move to medium:** the first push's runs, with the clippy pair and the all-versions job on medium, passed on `acruzdebian`, and no job sat queued without a runner.
         - **Lint and tests:** `actionlint` 1.7.12 with `shellcheck` passes on every workflow (bar its known false positive on `runner.workspace`). The scripts' unit tests pass: 11 for `mutants-report.py`, 28 for `flaky-tests.py`, and the new one among `ci-report.py`'s 62, all run by the fmt job.
         - **The mutation runs,** all on `acruzdebian`, 4 jobs (memory from `ci-report.py build` on the runner's cgroup; scratch disk sampled every 30 s):

@@ -208,13 +208,19 @@ jobs:
       # with a checksum to verify, so it is built rather than downloaded. Into
       # a directory next to its final place and renamed into it, so a job
       # killed mid-install never leaves a partial binary that later runs would
-      # trust.
+      # trust; what such a job leaves is removed by the next install, and a
+      # failed install removes its own. Report only: a failed install (a
+      # crates.io outage, a build error) skips the run and is a warning.
       - name: Install cargo-mutants
+        id: install
+        continue-on-error: true
         run: |
           dir="${RUNNER_TOOL_CACHE:?}/cargo-mutants/$CARGO_MUTANTS_VERSION"
           if [ ! -x "$dir/bin/cargo-mutants" ]; then
+            rm -rf "$dir".partial.*
             tmp="$dir.partial.$$"
-            rm -rf "$tmp" && mkdir -p "$tmp"
+            trap 'rm -rf "$tmp"' EXIT
+            mkdir -p "$tmp"
             CARGO_TARGET_DIR="$tmp/build" nice -n 10 cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION" --root "$tmp/root"
             rm -rf "$dir" && mv "$tmp/root" "$dir"
             rm -rf "$tmp"
@@ -265,7 +271,7 @@ jobs:
       # Not for a diff that changes no file under the backend: there is
       # nothing to mutate.
       - name: Start a Cassandra node and apply the schema
-        if: env.MUTANTS_NODE == 'true' && steps.diff.outputs.files != '0'
+        if: env.MUTANTS_NODE == 'true' && steps.diff.outputs.files != '0' && steps.install.outcome == 'success'
         run: |
           docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
           python3 "$CI_SCRIPTS/ci-report.py" timed node-start "Start and healthcheck (compose up --wait)" -- \
@@ -298,7 +304,7 @@ jobs:
       # ended and never fails the step.
       - name: cargo mutants (report only)
         id: mutants
-        if: steps.diff.outcome == 'success'
+        if: steps.diff.outcome == 'success' && steps.install.outcome == 'success'
         timeout-minutes: 140
         env:
           RANGE: ${{ steps.diff.outputs.range }}
@@ -361,6 +367,14 @@ jobs:
             --exit-status "${STATUS:-}" --title-note "$note" "${diff_args[@]}" > /dev/null
           python3 "$CI_SCRIPTS/ci-report.py" add mutants "Mutation testing (cargo-mutants, report only)" \
             --markdown "$out/mutants.md" --json "$out/mutants.json"
+
+      - name: Report a failed install
+        if: always() && steps.install.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          msg="cargo-mutants $CARGO_MUTANTS_VERSION did not install, so no mutant was tested; the install step's log says why"
+          echo "::warning title=Mutation testing::$msg"
+          { echo "## Mutation testing (cargo-mutants, report only)"; echo; echo "$msg."; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cassandra logs
         if: failure() && env.MUTANTS_NODE == 'true'

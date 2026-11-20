@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Tests for mutants-report.py, the report of the `mutants` job in
-.github/workflows/cassandra-mutants.yml. Standard library only, as
-test_ci_report.py:
+.github/workflows/cassandra-mutants.yml, and for mutants-result-alias.py,
+which lets cargo-mutants see through `StorageResult<T>` in the job's
+checkout. Standard library only, as test_ci_report.py:
 
     PYTHONPATH=.github/scripts python3 -m unittest -v test_mutants_report
 
@@ -13,6 +14,7 @@ mutant), with the names and files changed to the backend's.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import io
 import json
@@ -25,6 +27,11 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("mutants_report", HERE / "mutants-report.py")
 report = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(report)
+alias_spec = importlib.util.spec_from_file_location("mutants_result_alias", HERE / "mutants-result-alias.py")
+alias = importlib.util.module_from_spec(alias_spec)
+alias_spec.loader.exec_module(alias)
+
+STORAGE = {"StorageResult": "crate::error::StorageError"}
 
 FILE = "crates/persistence/src/backends/cassandra/batch.rs"
 
@@ -196,6 +203,202 @@ class Failures(Run):
         data = report.build(out, 0, None)
         self.assertEqual(sum(data["counts"].values()), 0)
         self.assertTrue(any("unknown outcome 'Weird'" in w for w in data["warnings"]))
+
+
+def unviable(line: int, what: str, replacement: str, error: str | None) -> tuple[dict, str | None]:
+    """An unviable mutant's outcome, and the log its build left (None: no log written)."""
+    m = {"Mutant": mutant(line, 9, what, "f", replacement)}
+    log = None if error is None else ("\x1b[1m\x1b[92m   Compiling\x1b[0m helios-persistence v0.2.9\n"
+                                      f"\x1b[0m\x1b[1m\x1b[91m{error}\x1b[0m\n"
+                                      "\x1b[1m\x1b[91merror\x1b[0m: could not compile `helios-persistence`\n")
+    return outcome("Unviable", m, 7.0, None), log
+
+
+ALIAS_ERROR = "error[E0599]: no variant, associated function, or constant named `new` found for enum `Result<T, E>`"
+CONST_ERROR = "error[E0080]: evaluation panicked: an index batch takes only an INSERT INTO or a DELETE FROM"
+DEFAULT_ERROR = "error[E0277]: the trait bound `BackendCapability: Default` is not satisfied"
+
+
+class Unviable(Run):
+    def write_logs(self, out: Path, items: list[tuple[dict, str | None]]) -> None:
+        (out / "log").mkdir(exist_ok=True)
+        for item, log in items:
+            if log is not None:
+                (out / item["log_path"]).write_text(log)
+
+    def run_of(self, items: list[tuple[dict, str | None]], *viable: dict) -> dict:
+        out = self.write(outcomes(*viable, *(i for i, _ in items)), None)
+        self.write_logs(out, items)
+        return report.build(out, 0, None)
+
+    def test_an_alias_run_tested_little_and_says_why(self):
+        # Run 44801901198's shape: one caught, and all the rest StorageResult alias mutants.
+        items = [unviable(200 + i, f"replace f -> StorageResult<Option<String>> with StorageResult::{c}(None)",
+                          f"StorageResult::{c}(None)", ALIAS_ERROR) for i, c in enumerate(("new", "from", "from_iter"))]
+        data = self.run_of(items, ALL[0])
+        self.assertTrue(data["tested_little"])
+        self.assertEqual((data["untestable"], data["untestable_share"]), (3, 0.75))
+        [reason] = data["unviable_reasons"]
+        self.assertEqual(reason["count"], 3)
+        self.assertIn("`StorageResult::new`", reason["reason"])
+        self.assertIn("does not see through", reason["reason"])
+        self.assertEqual(data["unviable"][0]["rustc_error"]["code"], "E0599")
+        [warning] = data["warnings"]
+        self.assertIn("tested little: 3 of 4 mutants (75%)", warning)
+        self.assertIn("StorageResult::new", warning)
+        md = report.markdown(data)
+        self.assertTrue(md.startswith("> **Warning: this run tested little.** 3 of 4 mutants (75%)"))
+        self.assertIn("### Why the unviable mutants did not compile", md)
+
+    def test_const_eval_rejections_are_as_good_as_caught_and_do_not_warn(self):
+        items = [unviable(101 + i, f"replace < with > in writes_an_index_table #{i}", ">", CONST_ERROR) for i in range(3)]
+        items.append(unviable(120, "replace += with *= in has_at", "*=",
+                              "error: constant evaluation is taking a long time"))
+        data = self.run_of(items, ALL[0])
+        self.assertFalse(data["tested_little"])
+        self.assertEqual(data["untestable"], 0)
+        [reason] = data["unviable_reasons"]
+        self.assertTrue(reason["const_eval"])
+        self.assertEqual(reason["count"], 4)
+        self.assertEqual(data["warnings"], [])
+        self.assertNotIn("tested little", report.markdown(data))
+
+    def test_half_untestable_warns_and_less_does_not(self):
+        default = unviable(438, "replace f -> Vec<BackendCapability> with vec![Default::default()]",
+                           "vec![Default::default()]", DEFAULT_ERROR)
+        self.assertTrue(self.run_of([default], ALL[0])["tested_little"])
+        data = self.run_of([default], ALL[0], ALL[1])
+        self.assertFalse(data["tested_little"])
+        self.assertEqual(data["unviable_reasons"][0]["reason"], "`Default::default()` for a type with no `Default` impl")
+
+    def test_other_reasons(self):
+        items = [
+            unviable(243, "replace pack -> Vec<Range<usize>> with vec![Range::new(0)]", "vec![Range::new(0)]",
+                     "error[E0599]: no associated function or constant named `new` found for struct `Range`"),
+            unviable(244, "replace pack -> Vec<Range<usize>> with vec![Range::from(0)]", "vec![Range::from(0)]",
+                     "error[E0277]: the trait bound `Range<usize>: From<{integer}>` is not satisfied"),
+            unviable(2198, "replace + with * in g", "*", "error[E0369]: cannot multiply `Duration` by `Duration`"),
+            unviable(2199, "replace - with + in g", "+", None),
+        ]
+        data = self.run_of(items, *ALL[:2], ALL[0], ALL[0], ALL[0], ALL[0])
+        reasons = {r["reason"]: r["count"] for r in data["unviable_reasons"]}
+        self.assertEqual(reasons, {
+            "a guessed constructor the type does not have (`T::new`, `::from` or `::from_iter`)": 2,
+            "rustc E0369: cannot multiply `…` by `…`": 1,
+            "no rustc error found in the mutant's log": 1,
+        })
+        self.assertFalse(data["tested_little"])
+
+    def test_first_rustc_error_skips_the_summary_lines(self):
+        log = ("\x1b[91merror\x1b[0m: aborting due to 2 previous errors\n"
+               "\x1b[1m\x1b[91merror[E0283]\x1b[0m\x1b[1m: type annotations needed\x1b[0m\n")
+        self.assertEqual(report.first_rustc_error(log), ("E0283", "type annotations needed"))
+        self.assertIsNone(report.first_rustc_error("warning: unused import\n"))
+
+
+class Unalias(Run):
+    def test_rewritten_names_are_spelled_as_the_source(self):
+        name = (f"{FILE}:200:9: replace current_version -> ::core::result::Result<Option<Vec<String>>, "
+                "crate::error::StorageError> with Ok(None)")
+        self.assertEqual(report.unalias(name, STORAGE),
+                         f"{FILE}:200:9: replace current_version -> StorageResult<Option<Vec<String>>> with Ok(None)")
+        other = "replace f -> ::core::result::Result<u8, Other> with Ok(0)"
+        self.assertEqual(report.unalias(other, STORAGE), other)
+        self.assertEqual(report.unalias(name, {}), name)
+
+    def test_build_and_main_unalias_the_names(self):
+        m = {"Mutant": mutant(200, 9, "replace f -> ::core::result::Result<(), crate::error::StorageError> with Ok(())",
+                              "f", "Ok(())")}
+        out = self.write(outcomes(outcome("MissedMutant", m, 30.0, 1.0)), None)
+        self.assertEqual(report.build(out, 2, None, STORAGE)["missed"][0]["mutation"],
+                         "replace f -> StorageResult<()> with Ok(())")
+        dest = out.parent / "report"
+        with redirect_stdout(io.StringIO()):
+            report.main([str(out), str(dest), "--alias", "StorageResult=crate::error::StorageError"])
+        self.assertIn("replace f -> StorageResult<()> with Ok(())", (dest / "mutants.md").read_text())
+
+
+class ResultAlias(unittest.TestCase):
+    def rewrite(self, text: str) -> str:
+        new, _ = alias.rewrite_source(text, STORAGE)
+        self.assertEqual(new.count("\n"), text.count("\n"))
+        return new
+
+    def test_a_return_type_is_spelled_as_a_result(self):
+        self.assertEqual(self.rewrite("fn f() -> StorageResult<Option<String>> {\n"),
+                         "fn f() -> ::core::result::Result<Option<String>, crate::error::StorageError> {\n")
+        self.assertEqual(self.rewrite("fn f() -> crate::error::StorageResult<()> {"),
+                         "fn f() -> ::core::result::Result<(), crate::error::StorageError> {")
+
+    def test_multi_line_nested_and_arrows_inside(self):
+        text = ("fn f(\n) -> StorageResult<\n    Vec<(String, Box<dyn Fn() -> u8>)>,\n> {\n"
+                "fn g() -> StorageResult<Vec<StorageResult<u8>>> {}\n")
+        self.assertEqual(self.rewrite(text),
+                         "fn f(\n) -> ::core::result::Result<\n    Vec<(String, Box<dyn Fn() -> u8>)>,\n"
+                         " crate::error::StorageError> {\n"
+                         "fn g() -> ::core::result::Result<Vec<StorageResult<u8>>, crate::error::StorageError> {}\n")
+
+    def test_only_return_types_in_code_are_rewritten(self):
+        text = ('use crate::error::StorageResult;\n'
+                '/// fn f() -> StorageResult<T> is documented, /* -> StorageResult< */\n'
+                'let s = "-> StorageResult<"; let c = \'"\'; let r = r#"-> StorageResult<"#;\n'
+                'let x: StorageResult<()> = Ok(()); fn h<\'a>(v: &\'a str) -> StorageResult<&\'a str> {}\n')
+        new, count = alias.rewrite_source(text, STORAGE)
+        self.assertEqual(count, 1)
+        self.assertEqual(new, text.replace("-> StorageResult<&'a str>",
+                                           "-> ::core::result::Result<&'a str, crate::error::StorageError>"))
+        self.assertEqual(alias.rewrite_source("fn f() -> SearchResult<u8> {}", STORAGE), ("fn f() -> SearchResult<u8> {}", 0))
+
+    def test_an_unbalanced_bracket_is_refused(self):
+        with self.assertRaises(alias.Unbalanced):
+            alias.rewrite_source("fn f() -> StorageResult<u8 {\n}\n", STORAGE)
+
+    def test_the_diff_follows_the_rewritten_file(self):
+        path = "crates/persistence/src/backends/cassandra/x.rs"
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,3 +1,4 @@\n"
+                " fn f() -> StorageResult<u8> {\n-    old\n+    new\n+++ looks like a header\n }\n"
+                "\\ No newline at end of file\n")
+        rewritten = ["fn f() -> ::core::result::Result<u8, crate::error::StorageError> {", "    new",
+                     "++ looks like a header", "}"]
+        self.assertEqual(alias.realign_diff(diff, {path: rewritten}), diff.replace(
+            " fn f() -> StorageResult<u8> {", " fn f() -> ::core::result::Result<u8, crate::error::StorageError> {"))
+        self.assertEqual(alias.realign_diff(diff, {}), diff)
+
+    def test_main_rewrites_the_tree_and_the_diff_or_nothing(self):
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        src = tmp / "crates/persistence/src/backends/cassandra"
+        src.mkdir(parents=True)
+        (src / "a.rs").write_text("fn f() -> StorageResult<u8> {\n    Ok(1)\n}\n")
+        (src / "b.rs").write_text("fn g() -> u8 {\n    1\n}\n")
+        diff = tmp / "pr.diff"
+        rel = "crates/persistence/src/backends/cassandra/a.rs"
+        diff.write_text(f"--- a/{rel}\n+++ b/{rel}\n@@ -1,3 +1,3 @@\n fn f() -> StorageResult<u8> {{\n-    Ok(0)\n+    Ok(1)\n }}\n")
+        summary = tmp / "alias.json"
+        cwd = Path.cwd()
+        try:
+            import os
+            os.chdir(tmp)
+            with redirect_stdout(io.StringIO()):
+                status = alias.main(["--alias", "StorageResult=crate::error::StorageError", "--diff", str(diff),
+                                     "--summary", str(summary), "crates/persistence/src/backends/cassandra"])
+            self.assertEqual(status, 0)
+            self.assertIn("-> ::core::result::Result<u8, crate::error::StorageError> {", (src / "a.rs").read_text())
+            self.assertIn(" fn f() -> ::core::result::Result<u8, crate::error::StorageError> {\n", diff.read_text())
+            self.assertIn("-    Ok(0)\n", diff.read_text())
+            self.assertEqual(json.loads(summary.read_text())["files"], {rel: 1})
+            # A file it cannot rewrite: nothing changes, and it exits 1.
+            (src / "a.rs").write_text("fn f() -> StorageResult<u8> {\n")
+            (src / "c.rs").write_text("fn h() -> StorageResult<u8 {\n")
+            before = diff.read_text()
+            with redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(alias.main(["--alias", "StorageResult=crate::error::StorageError", "--diff",
+                                             str(diff), "crates/persistence/src/backends/cassandra"]), 1)
+            self.assertEqual((src / "a.rs").read_text(), "fn f() -> StorageResult<u8> {\n")
+            self.assertEqual(diff.read_text(), before)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(alias.main(["--alias", "bad", "x"]), 2)
+        finally:
+            os.chdir(cwd)
 
 
 class Diff(Run):

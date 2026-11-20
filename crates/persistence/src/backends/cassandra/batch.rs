@@ -335,6 +335,20 @@ mod tests {
          VALUES (?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
     );
 
+    /// `has_at` matches a part that ends exactly at the last byte of the
+    /// text, and refuses one that would pass it. (`writes_an_index_table`
+    /// cannot show this: it needs a byte after a table name, so no part it
+    /// asks about ends the text.)
+    #[test]
+    fn has_at_matches_a_part_at_the_end_of_the_text() {
+        assert!(has_at(b"INSERT INTO resources", 12, b"resources"));
+        assert!(has_at(b"abc", 0, b"abc"));
+        assert!(has_at(b"abc", 3, b""));
+        assert!(!has_at(b"abc", 1, b"bcd"));
+        assert!(!has_at(b"abc", 4, b""));
+        assert!(!has_at(b"abc", 1, b"bx"));
+    }
+
     #[test]
     fn every_index_table_and_verb_is_accepted() {
         for verb in INDEX_VERBS {

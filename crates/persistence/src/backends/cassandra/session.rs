@@ -1194,6 +1194,21 @@ mod tests {
         }
     }
 
+    /// `total` adds every request kind, `serial_read` included, and leaves
+    /// out `batched`.
+    #[test]
+    fn total_counts_every_request_kind_but_the_batched_statements() {
+        let counts = StatementCounts {
+            read: 1,
+            serial_read: 20,
+            write: 300,
+            batch: 4_000,
+            batched: 50_000,
+            cas: 600_000,
+        };
+        assert_eq!(counts.total(), 604_321);
+    }
+
     #[test]
     fn statement_params_carry_the_kind_rules() {
         let no_retry: Arc<dyn RetryPolicy + Send + Sync> = Arc::new(FallthroughRetryPolicy);

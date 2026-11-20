@@ -411,11 +411,20 @@ jobs:
           else
             msg="The Cassandra node did not start or take the schema, so no mutant was tested; the node step's log says why"
           fi
-          echo "::warning title=Mutation testing::$msg"
-          { echo "## Mutation testing (cargo-mutants, report only)"; echo; echo "$msg."; } >> "$GITHUB_STEP_SUMMARY"
+          # Through ci-report.py add, so the ci-report-mutants artifact has the
+          # mutants section too, and the warning is an annotation.
+          out="$RUNNER_TEMP/ci-report/inputs/mutants"
+          mkdir -p "$out"
+          echo "$msg." > "$out/mutants.md"
+          python3 -I -c 'import json, sys; json.dump({"tested": 0, "warnings": [sys.argv[1]]}, open(sys.argv[2], "w"))' \
+            "Mutation testing: $msg" "$out/mutants.json"
+          python3 "$CI_SCRIPTS/ci-report.py" add mutants "Mutation testing (cargo-mutants, report only)" \
+            --markdown "$out/mutants.md" --json "$out/mutants.json"
 
+      # Also when the node step failed: it is continue-on-error, so failure()
+      # stays false, and a schema that does not apply leaves the node up.
       - name: Cassandra logs
-        if: failure() && env.MUTANTS_NODE == 'true'
+        if: (failure() || steps.node.outcome == 'failure') && env.MUTANTS_NODE == 'true'
         run: docker compose -p "$COMPOSE_PROJECT" logs --tail 200
 
       # down -v is safe here only because -p names this job's own project.

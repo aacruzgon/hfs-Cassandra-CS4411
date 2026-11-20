@@ -319,8 +319,10 @@ jobs:
           python3 "$CI_SCRIPTS/ci-report.py" add flaky "Flaky tests (re-runs of the added and changed tests, report only)" \
             --markdown "$out/flaky-section.md" --json "$out/flaky.json"
 
+      # Also when the node step failed: it is continue-on-error, so failure()
+      # stays false, and a schema that does not apply leaves the node up.
       - name: Cassandra logs
-        if: failure() && steps.build.outcome == 'success'
+        if: (failure() || steps.node.outcome == 'failure') && steps.build.outcome == 'success'
         run: docker compose -p "$COMPOSE_PROJECT" logs --tail 200
 
       # down -v is safe here only because -p names this job's own project.

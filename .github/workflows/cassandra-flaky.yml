@@ -237,11 +237,30 @@ jobs:
       # (ADR-aacruzgon-0020); a run killed mid-job skips its cleanup, so
       # leftovers go first.
       - name: Start a Cassandra node and apply the schema
+        id: node
         if: steps.build.outcome == 'success'
+        # Report only: a node that does not start skips the re-runs, with a
+        # warning, rather than failing the job.
+        continue-on-error: true
         run: |
           docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
-          python3 "$CI_SCRIPTS/ci-report.py" timed node-start "Start and healthcheck (compose up --wait)" -- \
-            docker compose -p "$COMPOSE_PROJECT" up -d --wait --wait-timeout 240
+          # Up to three tries. Every CI port is inside Linux's ephemeral range
+          # (32768-60999), so a client socket can hold this one for a moment: run
+          # 44765908091 failed with "bind: address already in use" on 59842, which
+          # nothing was listening on 33 s later.
+          for try in 1 2 3; do
+            if python3 "$CI_SCRIPTS/ci-report.py" timed node-start "Start and healthcheck (compose up --wait), try $try" -- \
+              docker compose -p "$COMPOSE_PROJECT" up -d --wait --wait-timeout 240; then
+              break
+            fi
+            docker compose -p "$COMPOSE_PROJECT" logs --tail 50 || true
+            docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
+            if [ "$try" = 3 ]; then
+              echo "::warning title=Flaky tests::the Cassandra node did not start in 3 tries, so nothing was run; see this step's log"
+              exit 1
+            fi
+            sleep 20
+          done
           cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
             -f docs/Cassandra/schema/keyspace-single-node.cql
           cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
@@ -258,7 +277,7 @@ jobs:
       # step.
       - name: Re-run each test (report only)
         id: runs
-        if: steps.build.outcome == 'success'
+        if: steps.build.outcome == 'success' && steps.node.outcome == 'success'
         timeout-minutes: 90
         run: |
           out="$RUNNER_TEMP/ci-report/inputs/flaky"

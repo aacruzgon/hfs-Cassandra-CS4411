@@ -12,7 +12,8 @@ name: Cassandra mutation testing (report only)
 # scans, and comments checked against the ADRs.
 #
 # Report only. The job passes whatever survives, and whenever cargo-mutants
-# fails to install or fails itself it writes a warning instead of failing.
+# fails to install, its node does not start, or it fails itself, it writes a
+# warning instead of failing.
 # Only a dispatch whose inputs do not look like a ref, a range or a job count
 # fails, before anything runs. Its name is in no
 # ruleset and must never match one of the five required checks
@@ -272,11 +273,30 @@ jobs:
       # Not for a diff that changes no file under the backend: there is
       # nothing to mutate.
       - name: Start a Cassandra node and apply the schema
+        id: node
         if: env.MUTANTS_NODE == 'true' && steps.diff.outputs.files != '0' && steps.install.outcome == 'success'
+        # Report only: a node that does not start skips the run, with a
+        # warning, rather than failing the job.
+        continue-on-error: true
         run: |
           docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
-          python3 "$CI_SCRIPTS/ci-report.py" timed node-start "Start and healthcheck (compose up --wait)" -- \
-            docker compose -p "$COMPOSE_PROJECT" up -d --wait --wait-timeout 240
+          # Up to three tries. Every CI port is inside Linux's ephemeral range
+          # (32768-60999), so a client socket can hold this one for a moment: run
+          # 44765908091 failed with "bind: address already in use" on 59842, which
+          # nothing was listening on 33 s later.
+          for try in 1 2 3; do
+            if python3 "$CI_SCRIPTS/ci-report.py" timed node-start "Start and healthcheck (compose up --wait), try $try" -- \
+              docker compose -p "$COMPOSE_PROJECT" up -d --wait --wait-timeout 240; then
+              break
+            fi
+            docker compose -p "$COMPOSE_PROJECT" logs --tail 50 || true
+            docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
+            if [ "$try" = 3 ]; then
+              echo "::warning title=Mutation testing::the Cassandra node did not start in 3 tries, so nothing was run; see this step's log"
+              exit 1
+            fi
+            sleep 20
+          done
           cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
             -f docs/Cassandra/schema/keyspace-single-node.cql
           cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
@@ -305,7 +325,7 @@ jobs:
       # ended and never fails the step.
       - name: cargo mutants (report only)
         id: mutants
-        if: steps.diff.outcome == 'success' && steps.install.outcome == 'success'
+        if: steps.diff.outcome == 'success' && steps.install.outcome == 'success' && steps.node.outcome != 'failure'
         timeout-minutes: 140
         env:
           RANGE: ${{ steps.diff.outputs.range }}
@@ -369,11 +389,17 @@ jobs:
           python3 "$CI_SCRIPTS/ci-report.py" add mutants "Mutation testing (cargo-mutants, report only)" \
             --markdown "$out/mutants.md" --json "$out/mutants.json"
 
-      - name: Report a failed install
-        if: always() && steps.install.outcome == 'failure'
+      - name: Report a run that did not start
+        if: always() && (steps.install.outcome == 'failure' || steps.node.outcome == 'failure')
         continue-on-error: true
+        env:
+          INSTALL: ${{ steps.install.outcome }}
         run: |
-          msg="cargo-mutants $CARGO_MUTANTS_VERSION did not install, so no mutant was tested; the install step's log says why"
+          if [ "$INSTALL" = failure ]; then
+            msg="cargo-mutants $CARGO_MUTANTS_VERSION did not install, so no mutant was tested; the install step's log says why"
+          else
+            msg="The Cassandra node did not start or take the schema, so no mutant was tested; the node step's log says why"
+          fi
           echo "::warning title=Mutation testing::$msg"
           { echo "## Mutation testing (cargo-mutants, report only)"; echo; echo "$msg."; } >> "$GITHUB_STEP_SUMMARY"
 

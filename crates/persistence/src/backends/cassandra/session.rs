@@ -49,7 +49,7 @@
 //! `batch.rs`). A batch of one statement is sent as a plain write. The driver
 //! never re-sends a batch by itself: the writer retries it (IW16), and the
 //! driver's default policy would add a hidden second send after a
-//! `BATCH_LOG` timeout (`retry/retry_policy.rs:157-171`).
+//! `BATCH_LOG` timeout (`retry/retry_policy.rs:157-174`).
 //!
 //! **Prepared statements** are prepared once per CQL text and kept for the
 //! life of the driver session. The driver re-prepares one transparently when
@@ -571,13 +571,13 @@ fn index_batch<'a>(
     Ok(builder.build()?)
 }
 
-/// The parameters an index batch is sent with (IW13, IW16). The driver takes
+/// The parameters an index batch is sent with (IW13, IW15). The driver takes
 /// a batch's consistency from the batch itself ([`index_batch`]); from these
 /// it takes the idempotence and the retry policy. A batch carries
 /// [`FallthroughRetryPolicy`], as a CAS does, so the driver never re-sends it
 /// by itself: the default policy would re-send an idempotent batch once on
 /// the same node after a `BATCH_LOG` timeout (`cdrs-tokio` 10.0.0,
-/// `retry/retry_policy.rs:157-171`). Each of the writer's tries is then one
+/// `retry/retry_policy.rs:157-174`). Each of the writer's tries is then one
 /// send, which the counters see (IW14), and a hung node costs one node
 /// timeout per try, not two, inside the index phase's deadline.
 fn batch_params(no_retry: &Arc<dyn RetryPolicy + Send + Sync>) -> StatementParams {
@@ -1129,7 +1129,7 @@ mod tests {
         }
     }
 
-    /// IW16: a batch is never re-sent by the driver. The default policy
+    /// IW15: a batch is never re-sent by the driver. The default policy
     /// re-sends an idempotent batch once after a `BATCH_LOG` timeout; the
     /// batch's own policy declines, so each writer try is one send.
     #[test]
@@ -1211,8 +1211,10 @@ mod tests {
     /// IW13: the batch request itself carries `LOCAL_QUORUM` and the logged
     /// type, which is what the driver sends; the statement parameters'
     /// consistency is not used for a batch. A batch is sent with
-    /// [`StatementKind::Write`]'s parameters, idempotent with the session's
-    /// retry policy (`statement_params_carry_the_kind_rules`).
+    /// [`StatementKind::Write`]'s parameters, idempotent, but with the
+    /// no-retry policy that `batch_params` sets in place of the session's
+    /// (`statement_params_carry_the_kind_rules`,
+    /// `an_index_batch_is_never_re_sent_by_the_driver`).
     #[test]
     fn an_index_batch_is_logged_at_local_quorum_with_no_batch_timestamp() {
         use super::super::batch::IndexCql;

@@ -2189,9 +2189,12 @@ impl CassandraBackend {
         // The futures are built first and only then streamed: a stream holding
         // the closure that builds them is not `Send` for every lifetime, which
         // the storage traits' futures must be.
+        // The phase's end, worked out once: each try checks it before it
+        // starts (`send_index_batch`), which the timeout alone cannot do.
+        let ends_at = tokio::time::Instant::now() + deadline;
         let sends: Vec<_> = batches
             .iter()
-            .map(|batch| self.send_index_batch(batch, tries))
+            .map(|batch| self.send_index_batch(batch, tries, ends_at))
             .collect();
         let sends = futures::stream::iter(sends)
             .buffer_unordered(INDEX_BATCHES_IN_FLIGHT)
@@ -2253,12 +2256,23 @@ impl CassandraBackend {
     /// - anything else: another try, then [`WriteFailure::TriesExhausted`].
     ///   Every statement carries a fixed `USING TIMESTAMP`, so a batch
     ///   applied twice writes the same cells.
+    ///
+    /// `ends_at` is the index phase's absolute deadline. It is checked before
+    /// each try, the first included: once it has passed, nothing is sent and
+    /// the result is [`WriteFailure::TriesExhausted`]. The caller's
+    /// `tokio::time::timeout` still bounds a try already in flight, but it
+    /// polls its future before its timer, so on its own it would let a
+    /// stalled writer start one more try after the deadline.
     async fn send_index_batch(
         &self,
         statements: &[IndexStatement],
         tries: u32,
+        ends_at: tokio::time::Instant,
     ) -> Result<(), WriteFailure> {
         for attempt in 1..=tries {
+            if tokio::time::Instant::now() >= ends_at {
+                return Err(WriteFailure::TriesExhausted);
+            }
             let Err(error) = self.session.batch(statements.to_vec()).await else {
                 return Ok(());
             };
@@ -5054,7 +5068,11 @@ mod node_tests {
         );
         let counted = backend.statement_counts();
         let outcome = backend
-            .send_index_batch(&batches[0], POST_CAS_WRITE_TRIES)
+            .send_index_batch(
+                &batches[0],
+                POST_CAS_WRITE_TRIES,
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            )
             .await;
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
@@ -5390,6 +5408,67 @@ mod node_tests {
         );
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
         assert_eq!(outcome.stats.batches, 1, "packed once, whatever its tries");
+    }
+
+    /// IW16: a stall past both the phase's deadline and the retry pause must
+    /// not start another try. The tokio clock is paused after the backend is
+    /// up, and the writer is polled by hand: try 1 fails at once (a fault, no
+    /// node), the writer waits out its 10 ms pause, the clock then moves a
+    /// whole second with the writer not polled (the stall), and it is polled
+    /// again. `tokio::time::timeout` polls its future before its timer, so
+    /// without a check of the deadline before each try, that poll sends try
+    /// 2. Nothing here reaches the node, so the paused clock has no request
+    /// timeout to fire.
+    #[tokio::test]
+    async fn a_stalled_index_phase_starts_no_try_after_its_deadline() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("stalled");
+        let key = key_of(&tenant);
+        let lu1 = Utc::now();
+        let lu2 = lu1 + chrono::Duration::milliseconds(1);
+        let x1 = [IndexKey::ResourcesByType];
+        let previous = [(&x1[0], lu1)];
+        let delta = index_delta(
+            &previous,
+            VersionKeys {
+                version_id: 2,
+                last_updated: lu2,
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                keys: &x1,
+            },
+        );
+        for _ in 0..POST_CAS_WRITE_TRIES {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resources_by_type",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        let counted = backend.statement_counts();
+        tokio::time::pause();
+        let phase = backend.write_index_delta_within(
+            &key,
+            &delta,
+            write_ts_of(lu2),
+            POST_CAS_WRITE_TRIES,
+            Duration::from_millis(15),
+        );
+        let mut phase = std::pin::pin!(phase);
+        assert!(
+            futures::poll!(phase.as_mut()).is_pending(),
+            "try 1 failed, and the writer waits out its pause"
+        );
+        assert_eq!(backend.statement_counts().since(&counted).batch, 1);
+        // The stall: the deadline (15 ms) and the pause (10 ms) both pass
+        // while the writer is not polled.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let outcome = phase.await;
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome.result, Err(WriteFailure::TriesExhausted));
+        assert_eq!(spent.batch, 1, "no try starts past the deadline: {spent}");
     }
 
     /// A superseded attempt, found by the pre-read check: the row is past

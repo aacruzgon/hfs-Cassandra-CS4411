@@ -59,6 +59,8 @@ SUBJECT_ERROR = re.compile(
 # received 0 of 2 required responses" (ADR-aacruzgon-0072 decision 4). The
 # backend prefixes the operation (errors.rs, "{operation}: {message}"), so a
 # CAS write's timeout ("create: CAS operation timed out: …") is another 504.
+# Since PR #83 (merged 2026-11-20) the race checks accept a 504 at RF 2 or
+# more, so on main a test failing on one is new: the class reports it.
 ISSUE_77 = re.compile(r"^serial read: CAS operation timed out")
 ANY_504 = re.compile(r"Timeout \{")
 ANY_77 = re.compile(r"serial read: CAS operation timed out")

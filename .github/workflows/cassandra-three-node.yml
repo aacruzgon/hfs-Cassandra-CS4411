@@ -89,20 +89,22 @@ jobs:
     name: Cassandra three-node tests (report only)
     # Fork guard (ADR-aacruzgon-0018); schedule and dispatch always pass it.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # Heavy (ADR-aacruzgon-0023, 0080): the build (the required Cassandra
-    # job's two persistence binaries, 4.0 to 4.7 GiB anon measured) fits a
-    # runner's 20G cap. The cap covers the build only: the three nodes (3 x
-    # 1700 MiB limits) and the test container (6 GiB limit) run in
-    # gh-runner's rootless Docker, outside the runner service's cgroup, and
-    # measured about 3.7 GiB together. PR #100 narrows heavy to acruzdebian;
-    # this workflow merges after it.
+    # Heavy, so acruzdebian only, within its 40G cap (ADR-aacruzgon-0023,
+    # 0080, 0082). The cap covers the build only (the required Cassandra
+    # job's two persistence binaries, 4.0 to 4.7 GiB anon measured): the
+    # three nodes (3 x 1700 MiB limits) and the test container (6 GiB limit)
+    # run in gh-runner's rootless Docker, outside the runner service's
+    # cgroup, and measured about 3.7 GiB together. The build alone would fit
+    # medium's 20G, but medium also runs on sam-7900x, a developer's desktop,
+    # where the containers would sit beside that cap (ADR-aacruzgon-0083).
     runs-on: [self-hosted, hfs-cassandra-heavy]
     timeout-minutes: 120
     env:
       THREE_NODE_PROJECT: hfs-cassandra-3n
       # Each test binary runs this many times on the same cluster: a pass of
       # both takes about 10 s on acruzdebian, and issue #77's 504 is a rate,
-      # not a yes or no (0 to 4 race failures per run, ADR-aacruzgon-0072).
+      # not a yes or no (0 to 4 race failures per run before PR #83,
+      # ADR-aacruzgon-0072; none in run 44758590016 on #83's code).
       THREE_NODE_REPEATS: ${{ inputs.repeats || '5' }}
       # This workflow's own .github/ and docker/ (the second checkout below).
       THREE_NODE_JOB_FILES: .three-node-job

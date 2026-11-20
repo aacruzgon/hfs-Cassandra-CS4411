@@ -10,6 +10,10 @@
 //!
 //! The statements themselves are counted per kind in `session.rs`
 //! ([`StatementCounts`](super::StatementCounts), report R5).
+//!
+//! [`IndexWriteStats`] counts what one write's index phase packed: its
+//! planned rows, its batches and the largest of them (roadmap Step 5;
+//! ADR-sam-michaels-0006, IW14).
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -134,6 +138,69 @@ cas_counters! {
 
 impl fmt::Display for CasStats {
     /// `attempts=3 applied=3 …`, every counter, space-separated.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for (name, value) in self.pairs() {
+            if !first {
+                f.write_str(" ")?;
+            }
+            first = false;
+            write!(f, "{name}={value}")?;
+        }
+        Ok(())
+    }
+}
+
+/// What one write's index phase packed (IW14): the index rows planned for
+/// insert and for delete, the batches they were packed into, and the largest
+/// of those batches by [`wire_bytes`](super::batch::wire_bytes), the measure
+/// every batch is packed by (IW11). The figures are filled when the batches
+/// are packed, before anything is sent, so they are not what was sent or
+/// applied: a batch that failed is counted here all the same. One per write,
+/// returned with its outcome, so a test or a log line reads one operation's
+/// figures.
+///
+/// A batch here is one packed group of units, counted once however many
+/// tries it took; the session's `statement_counts()`
+/// ([`StatementCounts`](super::StatementCounts)) counts what was sent, the
+/// requests, retries included. A group of one statement counts as a batch
+/// here too, although the session sends it as a plain write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) struct IndexWriteStats {
+    /// Index rows planned for insert.
+    pub(crate) rows_inserted: u64,
+    /// Index rows planned for delete.
+    pub(crate) rows_deleted: u64,
+    /// Batches the rows were packed into.
+    pub(crate) batches: u64,
+    /// The largest of those batches, in wire bytes; 0 with no batch.
+    pub(crate) largest_batch_bytes: u64,
+}
+
+impl IndexWriteStats {
+    /// Counts one batch of `inserted` inserts and `deleted` deletes taking
+    /// `bytes` on the wire.
+    pub(crate) fn batch(&mut self, inserted: u64, deleted: u64, bytes: u64) {
+        self.rows_inserted += inserted;
+        self.rows_deleted += deleted;
+        self.batches += 1;
+        self.largest_batch_bytes = self.largest_batch_bytes.max(bytes);
+    }
+
+    /// Every counter as `(name, value)`, in declaration order.
+    pub(crate) fn pairs(&self) -> [(&'static str, u64); 4] {
+        [
+            ("rows_inserted", self.rows_inserted),
+            ("rows_deleted", self.rows_deleted),
+            ("batches", self.batches),
+            ("largest_batch_bytes", self.largest_batch_bytes),
+        ]
+    }
+}
+
+impl fmt::Display for IndexWriteStats {
+    /// `rows_inserted=1 rows_deleted=1 batches=1 largest_batch_bytes=312`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
         for (name, value) in self.pairs() {
@@ -274,5 +341,26 @@ mod tests {
         let printed = delta.to_string();
         assert!(printed.starts_with("attempts=2 applied=1 applied_late=1 "));
         assert_eq!(printed.split(' ').count(), delta.pairs().len());
+    }
+
+    #[test]
+    fn index_stats_sum_rows_and_batches_and_keep_the_largest_batch() {
+        let mut stats = IndexWriteStats::default();
+        assert_eq!(
+            stats.to_string(),
+            "rows_inserted=0 rows_deleted=0 batches=0 largest_batch_bytes=0"
+        );
+        stats.batch(3, 2, 900);
+        stats.batch(1, 0, 4_800);
+        stats.batch(0, 4, 300);
+        assert_eq!(
+            (stats.rows_inserted, stats.rows_deleted, stats.batches),
+            (4, 6, 3)
+        );
+        assert_eq!(stats.largest_batch_bytes, 4_800);
+        assert_eq!(
+            stats.to_string(),
+            "rows_inserted=4 rows_deleted=6 batches=3 largest_batch_bytes=4800"
+        );
     }
 }

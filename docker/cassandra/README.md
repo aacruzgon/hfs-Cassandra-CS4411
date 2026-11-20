@@ -213,10 +213,14 @@ ADR-aacruzgon-0072 decision 4), so these tests read the keyspace's replication
 factor and, at RF 2 or more, accept the 504 and check the invariants instead:
 no history gap, one winner per version, no lost write. Each prints its mode,
 `[race policy case=race:<test> rf=3 accept_504=true]`. A 504'd write that
-applied can leave its version out of the history and `count` one off until the
-sweeper replays its intent (Step 5), so the history may lack its newest version
-only when the `resources` row's `write_id` matches a kept intent row for it
-(ADR-sara-lahourpour-0001). At RF 1 the 504 still fails the test.
+applied can leave its version out of the history until the sweeper replays its
+intent (Step 5), so the history may lack its newest version only when the
+`resources` row's `write_id` matches a kept intent row for it
+(ADR-sara-lahourpour-0001). The race tests check no `count`: a write that
+applied without its index step, followed by a clean write on top, leaves
+`count` off with nothing pending. Only the concurrent-create test checks it,
+since a create has one version. The exact history and `count` wait for Step 5's
+sweep (issue #89). At RF 1 the 504 still fails the test.
 
 ### Docker Desktop with WSL 2
 

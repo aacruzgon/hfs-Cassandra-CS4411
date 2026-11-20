@@ -3423,6 +3423,41 @@ mod tests {
         assert_eq!(stats.largest_batch_bytes, wire_bytes(batch) as u64);
     }
 
+    /// IW11: a unit is every row of one partition and is never split, even
+    /// when it alone is over the batch limit: it goes as one batch.
+    #[test]
+    fn an_oversized_unit_is_sent_as_one_batch() {
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let ts = write_ts_of(lu2);
+        let tenant = format!("test-{}", "x".repeat(3_000));
+        let big = RowKey {
+            tenant_id: &tenant,
+            resource_type: "Patient",
+            id: "p",
+        };
+        let next = [IndexKey::ResourcesByType];
+        let previous = [(&next[0], lu1)];
+        let delta = index_delta(&previous, version_keys(&next, lu2));
+        assert_eq!(
+            delta.units.len(),
+            1,
+            "one partition, an insert and a delete"
+        );
+        let packed = index_batches(&big, &delta, ts);
+        assert!(packed.failures.is_empty());
+        assert_eq!(packed.batches.len(), 1, "the unit is not split");
+        let batch = &packed.batches[0];
+        assert!(wire_bytes(batch) > MAX_BATCH_BYTES, "over the limit");
+        assert_eq!(
+            batch.iter().map(IndexStatement::cql).collect::<Vec<_>>(),
+            vec![
+                INSERT_RESOURCES_BY_TYPE.as_str(),
+                DELETE_RESOURCES_BY_TYPE.as_str()
+            ]
+        );
+    }
+
     /// D4: the miss mapping from the returned columns (spike A1). A missing
     /// row returns `[applied]` alone, so "no row" is the condition columns
     /// being absent, not a null `version_id`.

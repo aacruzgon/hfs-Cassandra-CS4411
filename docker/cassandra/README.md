@@ -68,6 +68,7 @@ then stayed healthy for 120 s each.
 | Direct memory | 512M, or 1G with the override | Half the heap. Otherwise `cassandra-env.sh` sizes it from the host's RAM. |
 | GC threads | 4 parallel, 4 concurrent | Otherwise `cassandra-env.sh` uses the host's core count, not the CPU limit |
 | Host port | `127.0.0.1:59042` (`CASSANDRA_HOST_PORT` overrides) | A process already listening on 9042 on the host would answer instead of the container without any error. See ADR-aacruzgon-0007. |
+| CI host ports | `CASSANDRA_HOST_PORT`, one per job: 59142 (the required Cassandra job), 59242 (coverage and FHIR versions), 59442 (`Cassandra flaky tests (report only)`), 59842 (`Cassandra mutants (report only)`) | Rootless Docker publishes on the host itself, so no two of these, the developers' 59042 or the three-node cluster's 59342 to 59344 may be the same; the benchmark harness (PR #76) uses 59542 and the nightly three-node job 59642 to 59644. Pick a new job's port outside all of them. |
 | CPU limit | 4 | Same in both profiles and for PostgreSQL |
 | Memory limit | 3 GiB, or 5 GiB with the override; swap disabled | Indicative, Apple-silicon 18 GB laptop under OrbStack: idle 1.61 GiB (1G heap) and 2.65 GiB (2G heap); peak under a 32-thread write load 1.91 GiB of 3 GiB and 3.31 GiB of 5 GiB; no OOM kill. With the stock yaml a 1.5 GiB limit was OOM-killed at boot. |
 | Unchanged | `commitlog_sync: periodic` (10000ms), `batch_size_warn_threshold` 5KiB, `batch_size_fail_threshold` 50KiB, tombstone warn 1000 / fail 100000, `num_tokens` 16 | The same in both files. Recorded so that a benchmark report can state them |
@@ -184,7 +185,7 @@ through; run it in a container on the cluster's network instead.
 | GC threads | 2 parallel and 2 concurrent, or 4 with the override | Matches the CPU limit. |
 | CPU limit | 2 per node (6 in all), or 4 per node with the override | |
 | Memory limit | 2.5 GiB per node (7.5 GiB in all), or 5 GiB per node with the override; swap disabled | Indicative, Apple-silicon laptop under OrbStack, 768M heap, a 2 GiB limit for the check: 1.31 GiB per node at idle; `memory.peak` 1.47 GiB over the failure procedures and the backend tests; no OOM kill. The 2.5 GiB default then booted from clean and peaked at 1.42 GiB. No sustained load was measured, and the 2G override has not been booted. |
-| Host ports | `127.0.0.1:59342`, `59343`, `59344` (`CASSANDRA_CLUSTER_HOST_PORT_1` to `_3` override) | Not 59042 (developers), 59142 (the required CI job) or 59242 (coverage and FHIR versions). |
+| Host ports | `127.0.0.1:59342`, `59343`, `59344` (`CASSANDRA_CLUSTER_HOST_PORT_1` to `_3` override) | Not 59042 (developers), 59142 (the required CI job), 59242 (coverage and FHIR versions), 59442 (the flakiness job) or 59842 (the mutation job). |
 | Network | Fixed addresses `172.29.59.11` to `.13` (`CASSANDRA_CLUSTER_SUBNET_PREFIX` overrides `172.29.59`) | A node keeps its address over a restart and a reconnect, and the seed list can name addresses. |
 | `stop_grace_period` | 60 s | Long enough for a drain on `SIGTERM`. |
 

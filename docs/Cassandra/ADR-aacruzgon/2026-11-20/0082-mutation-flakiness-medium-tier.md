@@ -30,7 +30,7 @@
     - **Mutation testing, report only: `.github/workflows/cassandra-mutants.yml`, job `Cassandra mutants (report only)`.**
         - **The tool:** `cargo-mutants` 27.1.0, released 2026-06-02, built once per runner into its tool cache with `cargo install --locked`.
         - **What it mutates:** the pull request's changed lines under `crates/persistence/src/backends/cassandra/` (`--in-diff` on `git diff origin/main...HEAD` of that directory), in `helios-persistence` with `--features cassandra`.
-        - **The tests:** each mutant runs the `--lib` tests filtered to `backends::cassandra`, against a Cassandra node of the job's own (project `hfs-cassandra-mutants`, port 59342).
+        - **The tests:** each mutant runs the `--lib` tests filtered to `backends::cassandra`, against a Cassandra node of the job's own (project `hfs-cassandra-mutants`, port 59842, which no Compose file, workflow or benchmark harness publishes: rootless Docker publishes on the host itself, and the first version's 59342 was the three-node Compose file's default).
         - **Runner and limits:**
             - heavy, with 4 jobs and cargo-mutants' jobserver sharing the 16 CPUs between them;
             - incremental builds;

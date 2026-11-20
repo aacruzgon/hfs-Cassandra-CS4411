@@ -124,11 +124,16 @@ jobs:
       # and of each build directory's size.
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
-      # Its own node, if any: neither a developer's 59042 nor the other jobs'
-      # 59142 and 59242, and its own Compose project, so down -v can only
-      # remove this job's container and volume.
+      # Its own node, if any, on a port nothing else publishes: not a
+      # developer's 59042, the required job's 59142, coverage's and FHIR
+      # versions' 59242, the three-node Compose file's 59342 to 59344, the
+      # flakiness job's 59442, the benchmark harness's 59542 or the nightly
+      # three-node job's 59642 to 59644 (docker/cassandra/README.md). Rootless
+      # Docker publishes on the host itself, so a clash with a cluster started
+      # by hand on the same machine would fail one of them. Its own Compose
+      # project, so down -v can only remove this job's container and volume.
       COMPOSE_FILE: docker/cassandra/docker-compose.yml
-      CASSANDRA_HOST_PORT: 59342
+      CASSANDRA_HOST_PORT: 59842
       COMPOSE_PROJECT: hfs-cassandra-mutants
       CI_REPORT_PROFILE: test (debug=0, incremental; cargo-mutants build directories)
     steps:

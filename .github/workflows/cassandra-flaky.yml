@@ -82,9 +82,13 @@ jobs:
       # reached; this leaves the job room for the build, the node and the
       # reports.
       FLAKY_BUDGET_MINUTES: 80
-      # Its own node: neither a developer's 59042 nor the other jobs' 59142,
-      # 59242 and 59342, and its own Compose project, so down -v can only
-      # remove this job's container and volume.
+      # Its own node, on a port nothing else publishes: not a developer's
+      # 59042, the required job's 59142, coverage's and FHIR versions' 59242,
+      # the three-node Compose file's 59342 to 59344, the benchmark harness's
+      # 59542, the nightly three-node job's 59642 to 59644 or the mutation
+      # job's 59842 (docker/cassandra/README.md). Rootless Docker publishes on
+      # the host itself. Its own Compose project, so down -v can only remove
+      # this job's container and volume.
       COMPOSE_FILE: docker/cassandra/docker-compose.yml
       CASSANDRA_HOST_PORT: 59442
       COMPOSE_PROJECT: hfs-cassandra-flaky

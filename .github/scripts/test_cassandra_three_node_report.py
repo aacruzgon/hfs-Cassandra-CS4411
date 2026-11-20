@@ -382,6 +382,24 @@ test ok_test ... ok
         self.assertEqual(data["runs_with_77"], {})
         self.assertIn("`cassandra-tests` 4, 1 (5 in 2 runs)", md.read_text())
         self.assertIn("No test failed", md.read_text())
+        self.assertEqual(data["accepting_uncounted"], [])
+
+    # CodeRabbit on #101: the create race accepts a 504 and prints no [cas]
+    # line (create_read.rs), so the report names it as uncounted.
+    def test_accepting_race_without_cas_line_is_named(self) -> None:
+        self.log("cassandra-tests-r1", "     Running tests/cassandra_tests.rs (/x/cassandra_tests-abc)\n\n"
+                 "running 2 tests\n"
+                 "[race policy case=race:cassandra_concurrent_creates_of_one_id_make_exactly_one_resource rf=3 accept_504=true]\n"
+                 "[race policy case=race:cassandra_concurrent_updates_from_the_same_version_admit_one rf=3 accept_504=true]\n"
+                 "[cas case=race:cassandra_concurrent_updates_from_the_same_version_admit_one serial_read_failures=2]\n"
+                 "test a ... ok\ntest b ... ok\n\n"
+                 "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n",
+                 {"exit_status": 0})
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        data = json.loads(js.read_text())
+        self.assertEqual(data["accepting_uncounted"], ["cassandra_concurrent_creates_of_one_id_make_exactly_one_resource"])
+        self.assertIn("print no `[cas]` line", md.read_text())
 
     # CodeRabbit on #101: the fallback writes never raise, and main exits 0
     # when the JSON destination cannot be written.

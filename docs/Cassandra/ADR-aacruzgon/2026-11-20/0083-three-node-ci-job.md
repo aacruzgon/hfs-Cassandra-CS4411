@@ -56,7 +56,7 @@
         Each scenario's state is checked, not assumed:
         - **A batch sent at once** counts only if node 1 still reports the paused nodes `UN` in the status taken right after it. A paused node goes from `UN` to `DN` and not back. Otherwise the scenario is "invalid", not compared.
         - **A batch for `DN`** is sent only once node 1 reports the nodes `DN`. Otherwise it is "not run".
-        - **A failed `docker pause`** leaves its window's scenarios "not run", and **a failed seed** of a scenario's v1 row (s1 to s3) leaves that scenario "not run".
+        - **A failed `docker pause`** leaves its window's scenarios "not run". So does **a failed seed** of a scenario's v1 row (s1 to s3): a nonzero exit, an error, or no consistency line.
         - **No `cqlsh` output** is an unknown answer, not a success.
     - **Reports.** The job writes these to the step summary and the artifact `ci-report-three-node` (14 days):
         - from `ci-report.py`: the build (peak `anon` and `memory.current`, OOM kills, `--timings`), the start and schema apply, the test counts and skips of every repeat, the CAS counters, the intent rows left behind, each node's statistics, the target directory's size, and where the time went;
@@ -71,7 +71,12 @@
                 - **cause unknown:** a failure whose output a stopped run never printed;
                 - **other:** everything else. An invariant panic that lists the writers' outcomes, a 504 among them (PR #83's), is "other", with a note.
             - with no test log at all (the tests were skipped), "no test ran", with a warning, not a pass;
-            - the race tests' failed serial reads per run, from their `[cas case=race:…]` lines (`serial_read_failures`). A timed-out serial read is a #77 504, which a race test accepts since #83. The `--lib` fault tests' cases fail a serial read on purpose and are not counted. Neither is a test that panics before it prints its line, which is why runs 1 and 2 show 0;
+            - the race tests' failed serial reads per run, from their `[cas case=race:…]` lines (`serial_read_failures`):
+                - **What it counts:** a timed-out serial read is a #77 504, which a race test accepts since #83. A failed one is a 503, so the count is an upper bound on the #77 504s.
+                - **Not counted:**
+                    - the `--lib` fault tests' cases, which fail a serial read on purpose;
+                    - a test that panics before it prints its line, which is why runs 1 and 2 show 0;
+                    - a race test that accepts the 504 but prints no `[cas]` line. The create race in `create_read.rs` is one; the report names each such test from its `[race policy … accept_504=true]` line.
             - the pause scenarios;
             - each container's `memory.peak` and OOM kills, and a `docker stats` sample every 5 s;
         - in the artifact: the full test logs, `nodetool status` and `describecluster` from every node, each node's `system.log` tail and container log, and the scenarios' raw `cqlsh` output.
@@ -169,7 +174,7 @@
     - **What the human changed:** After the PR #90 review's hand runs on three nodes, I asked for a CI job that runs the cluster ("should we also do the 3 node one?"), with the scope my session briefed: report-only, nightly and by dispatch, no `pull_request` trigger in this first version, no test changes, and the pause scenarios only if they need no backend test code. I approved the draft's choices as written: the container route, 10:00 UTC, the reserved subnet and ports, and 5 repeats. After the independent audit of #101 (2026-11-20), I had its findings fixed before undraft: the failure classes read from the panic's own first line, a stopped run's hung test and earlier messages, `ref` with two checkouts, the hour picked again from the runs' real start times (10:37 UTC), and its minor findings except M9 (linting in CI), which is under "To revisit". After the delta audit, I had its minors fixed too: a 504 inside `Err(…)`, the configuration test's 503 and 504, an OOM-killed run's tests, a commit SHA on no branch, and the trap's wording. After undraft, I had CodeRabbit's eight threads checked and all eight fixed: the pause scenarios' state checks, missing evidence reported as such, deadline-skipped repeats listed, best-effort fallback writes, whitespace in `ref`, and `pipefail` before `tee`. After #100 and #83 merged, I had `main` merged in, the wording brought up to date, the report's tests added to the fmt job, and the `CLAUDE.md` and `AGENTS.md` sentence carried in this PR. CodeRabbit's five threads on those commits were fixed too: the failed seed and pause, a cut-off read, the response counts, and the count of the race tests' failed serial reads, which corrected "no #77 504" in run 44758590016 to "no test failed on one".
     - **Verified:**
         - **The CI runs above:** their logs and their artifact `ci-report-three-node`.
-        - **`report.py`:** `.github/scripts/test_cassandra_three_node_report.py`, 35 tests. They run locally, and in CI in the `cargo fmt --check` job's unittest step (`fmt-clippy-cassandra.yml`). What it covers:
+        - **`report.py`:** `.github/scripts/test_cassandra_three_node_report.py`, 36 tests. They run locally, and in CI in the `cargo fmt --check` job's unittest step (`fmt-clippy-cassandra.yml`). What it covers:
             - a #77 504, through the race suites and through a `--lib` unwrap;
             - a plain write's 504, a CAS write's 504 and an unknown-outcome 504, each "another 504";
             - a 503;
@@ -187,7 +192,7 @@
             - a repeat skipped at the deadline: listed, and not counted as a run;
             - a destination that cannot be written: the report still exits 0;
             - the pause scenarios: run 44758590016's outputs, all as the review found; a missing or empty output, unknown; a batch sent at once with the node already `DN`, invalid; a `DN` batch not sent, not run; a changed response count, a difference; a read cut off after a whole row, unread;
-            - the race tests' failed serial reads, counted in passing runs.
+            - the race tests' failed serial reads, counted in passing runs, and a race test that accepts a 504 without a `[cas]` line, named.
 
           It also matches the classes of runs 1, 2 and 3's real logs, and was run on the review's own `cqlsh` outputs (`3n-cqlsh*-rep1.txt`).
         - **Lint:** `actionlint` 1.7.12 reports only `runner.workspace`, which it also reports three times in the required `fmt-clippy-cassandra.yml`. `shellcheck` is clean.
@@ -208,7 +213,7 @@
         - **`pause-scenarios.sh`:** run locally against a fake `docker`.
             - Node 2 reported `DN` at once: s1, s2 and s4a were invalid.
             - `nodetool status` failing while nodes were paused: s1, s2 and s4a were invalid, and s3 and s4b were not sent.
-            - A failed seed of s3: s3 was not sent.
+            - A failed seed of s3, and a seed of s1 that exited 1 after its consistency line: neither scenario was sent.
             - A failing `docker pause`: all five were not sent.
             - The normal sequence was unchanged.
         - **`run-tests.sh`:** run locally against a fake `docker`.

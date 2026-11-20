@@ -144,7 +144,8 @@ run_scenario() {
   esac
 }
 
-# seeded ID: cqlsh ran the seed (its consistency line) and printed no error.
+# seeded ID: cqlsh ran the seed (its consistency line) and printed no error;
+# the caller also checks that it exited 0.
 seeded() {
   local f; f="$out/seed-$(tenant_of "$1").out"
   grep -q '^Consistency level set' "$f" && ! grep -qE 'Error|Exception|NoHostAvailable' "$f"
@@ -192,8 +193,11 @@ snapshot start
 # scenario whose seed failed is not sent (run_scenario).
 unseeded=""
 for id in s1 s2 s3; do
-  seed "$(tenant_of "$id")"
-  seeded "$id" || { unseeded="$unseeded $id"; log "the seed of $id failed: $(head -c 200 "$out/seed-$(tenant_of "$id").out")"; }
+  seed "$(tenant_of "$id")"; status=$?
+  if [ "$status" != 0 ] || ! seeded "$id"; then
+    unseeded="$unseeded $id"
+    log "the seed of $id failed (exit $status): $(head -c 200 "$out/seed-$(tenant_of "$id").out")"
+  fi
 done
 log "seeded v1 for s1, s2 and s3${unseeded:+, except$unseeded}"
 

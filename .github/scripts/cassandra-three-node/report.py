@@ -44,6 +44,10 @@ STILL_RUNNING = re.compile(r"^test (\S+) has been running for over \d+ seconds$"
 # before it prints its line is not in it. Only race: cases count: the --lib
 # node tests' cases (c4-r2-timeout, r2-503-…) fail a serial read on purpose.
 CAS_LINE = re.compile(r"\[cas case=(race:\S+) ([^\]]*)\]")
+# A race test that accepts the 504 says so ("[race policy case=race:<test> rf=3
+# accept_504=true]"); one that prints no [cas] line too (the create race,
+# create_read.rs) is not in the count, and the report names it.
+RACE_POLICY = re.compile(r"\[race policy case=(race:\S+) rf=\d+ accept_504=true\]")
 SERIAL_READ_FAILURES = re.compile(r"(?:^| )serial_read_failures=(\d+)(?= |$)")
 BLOCK = re.compile(r"^---- (\S+) std(?:out|err) ----$")
 PANIC_NEW = re.compile(r"^thread '([^']*)' (?:\(\d+\) )?panicked at (\S+?):?$")
@@ -265,10 +269,13 @@ def parse_log(path: Path, stopped: str | None = None) -> dict:
     suite["ignored"] = sorted(n for n, r in suite["tests"].items() if r == "ignored")
     suite["cas_lines"] = 0
     suite["serial_read_failures"] = 0
+    counted = set()
     for m in CAS_LINE.finditer(text):
         suite["cas_lines"] += 1
+        counted.add(m.group(1))
         if n := SERIAL_READ_FAILURES.search(m.group(2)):
             suite["serial_read_failures"] += int(n.group(1))
+    suite["accepting_uncounted"] = sorted({m.group(1) for m in RACE_POLICY.finditer(text)} - counted)
     del suite["blocks"]
     return suite
 
@@ -363,9 +370,14 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
                "lines, per run): "
                + "; ".join(f"`{step}` {', '.join(map(str, ns))} ({sum(ns)} in {len(ns)} runs)"
                            for step, ns in sorted(serial.items()))
-               + ". A serial read that timed out is issue #77's 504 (one that failed is a 503). Since PR #83 a "
-                 "race test accepts the 504 at RF 2 or more and passes, so a 504 a passing test accepted shows only "
-                 "here; a test that panics before it prints its `[cas]` line is not counted.\n")
+               + ". A serial read that timed out is issue #77's 504, and one that failed is a 503, so the count "
+                 "is an upper bound on the #77 504s. Since PR #83 a race test accepts the 504 at RF 2 or more and "
+                 "passes, so a 504 a passing test accepted shows only here; a test that panics before it prints "
+                 "its `[cas]` line is not counted.\n")
+    uncounted = sorted({name.removeprefix("race:") for s_ in ran for name in s_["accepting_uncounted"]})
+    if uncounted:
+        md += ("\n**Race tests that accept a 504 but print no `[cas]` line**, so their 504s are in no count: "
+               + ", ".join(f"`{n}`" for n in uncounted) + ".\n")
     if by_test:
         md += "\n**Every failing test, over all runs:**\n\n" + table(
             ["Step", "Test", "Failed in", "Cause", "First line of the failure (first run it failed in)", "Where"],
@@ -402,6 +414,7 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
     )
     write(md_path, json_path, md, {"suites": suites, "runs": runs, "failures_by_class": counts,
                                    "runs_with_77": runs_with_77, "serial_read_failures": serial,
+                                   "accepting_uncounted": uncounted,
                                    "by_test": list(by_test.values()),
                                    "warnings": warnings})
 

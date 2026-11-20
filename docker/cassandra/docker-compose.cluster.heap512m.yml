@@ -1,0 +1,29 @@
+# Override for the report-only three-node CI job
+# (.github/workflows/cassandra-three-node.yml), and for any host where the
+# default 2.5 GiB per node does not fit. Use together with
+# docker-compose.cluster.yml; only the values below change. They are the
+# limits the PR #90 review's three-node run used on acruzdebian (2026-11-19),
+# and close to issue #77's twelve runs (512M heap, 1800 MiB per node).
+#
+#   Heap             MAX_HEAP_SIZE=512M (G1, so -Xms = -Xmx)
+#   Direct memory    MAX_DIRECT_MEMORY_SIZE=256M (half the heap)
+#   GC threads       2 parallel / 2 concurrent, as in the base file
+#   CPU limit        2 CPUs per node, as in the base file
+#   Memory limit     1700 MiB per node, 5100 MiB in all, swap disabled
+#
+# A functional profile: like the base file's default, it reports no
+# benchmark numbers (ADR-aacruzgon-0002, 0072).
+
+x-cassandra-environment: &cassandra-environment
+  MAX_HEAP_SIZE: 512M
+  MAX_DIRECT_MEMORY_SIZE: 256M
+
+x-cassandra-limits: &cassandra-limits
+  environment: *cassandra-environment
+  mem_limit: 1700m
+  memswap_limit: 1700m
+
+services:
+  cassandra-1: *cassandra-limits
+  cassandra-2: *cassandra-limits
+  cassandra-3: *cassandra-limits

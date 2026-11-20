@@ -188,8 +188,7 @@ jobs:
           # $1 is expanded by the inner bash, which gets the path as its argument.
           # shellcheck disable=SC2016
           python3 "$CI_SCRIPTS/ci-report.py" build build-flaky "Build: helios-persistence --lib and cassandra_tests" -- \
-            bash -c 'nice -n 10 cargo test -p helios-persistence --features cassandra --lib --test cassandra_tests \
-              --no-run --message-format=json-render-diagnostics > "$1"' _ "$out/cargo.json"
+            bash -c 'nice -n 10 cargo test -p helios-persistence --features cassandra --lib --test cassandra_tests --no-run --message-format=json-render-diagnostics > "$1"' _ "$out/cargo.json"
           python3 -I "$CI_SCRIPTS/flaky-tests.py" bins --cargo-json "$out/cargo.json" --out "$out/bins.json"
 
       # Started the way the required Cassandra job starts its own

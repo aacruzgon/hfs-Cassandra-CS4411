@@ -4,7 +4,8 @@ name: Cassandra mutation testing (report only)
 # changes the code a pull request touches under
 # crates/persistence/src/backends/cassandra/, one small change at a time
 # (an operator swapped, a function body replaced by a default value), and
-# runs the backend's --lib tests against each one. A mutant that no test
+# runs the backend's --lib tests against each one, on a Cassandra node of the
+# job's own, so the node tests can catch a mutant too. A mutant that no test
 # notices is "missed": the summary lists each with its file:line and the
 # replacement, as a lead for the reviewer. Hand review still covers what the
 # tool cannot: mutations specific to the design, bypasses of the source
@@ -16,9 +17,11 @@ name: Cassandra mutation testing (report only)
 # (ADR-aacruzgon-0019, 0021), so it is a workflow of its own.
 #
 # Heavy (ADR-aacruzgon-0082): cargo-mutants builds one copy of the workspace
-# per job, cold, and several at once need more than sam-7900x's 20G, so it
-# runs only on acruzdebian (40G). A paths: filter is fine here: no required
-# check lives in this workflow.
+# per job, cold. With 4 jobs it peaked at 15.4 GiB anon on #90, less than
+# 5 GiB under sam-7900x's 20G (ADR-aacruzgon-0080's margin), with up to
+# 22.7 GB of build directories, and it holds its runner for about 40 minutes,
+# so it runs only on acruzdebian (40G), where the job count can grow. A
+# paths: filter is fine here: no required check lives in this workflow.
 
 on:
   pull_request:
@@ -44,10 +47,10 @@ on:
         required: false
         default: ''
       node:
-        description: Run the --lib tests against a Cassandra node of the job's own, so the node tests can catch mutants too.
+        description: Run the --lib tests against a Cassandra node of the job's own, so the node tests can catch mutants too. Off, only the pure tests can.
         type: boolean
         required: false
-        default: false
+        default: true
       jobs:
         description: cargo-mutants --jobs, the build directories tested at once.
         required: false
@@ -93,7 +96,9 @@ jobs:
       MUTANTS_SCRATCH_NAME: mutants-scratch
       MUTANTS_JOBS: ${{ inputs.jobs || '4' }}
       MUTANTS_MINUTES: 130
-      MUTANTS_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.node && 'true' || 'false' }}
+      # On for pull requests: on f7911aed3 the node took the missed mutants
+      # from 18 to 8 for about 4 more minutes (ADR-aacruzgon-0082).
+      MUTANTS_NODE: ${{ (github.event_name != 'workflow_dispatch' || inputs.node) && 'true' || 'false' }}
       # No debug info: nothing reads it here, and it is most of the link time
       # and of each build directory's size.
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -173,7 +178,7 @@ jobs:
           mkdir -p "$out"
           if [ "$RANGE" = none ]; then
             echo "Whole backend: no --in-diff"
-            echo "range=none" >> "$GITHUB_OUTPUT"
+            { echo "range=none"; echo "files=all"; } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ -z "$RANGE" ]; then
@@ -181,19 +186,25 @@ jobs:
             RANGE="$base...HEAD"
           fi
           git diff --no-color --no-ext-diff "$RANGE" -- crates/persistence/src/backends/cassandra/ > "$out/pr.diff"
-          echo "Range $RANGE: $(grep -c '^+++ b/' "$out/pr.diff" || true) file(s) under the backend"
+          files=$(grep -c '^+++ b/' "$out/pr.diff" || true)
+          echo "Range $RANGE: $files file(s) under the backend"
           git diff --stat "$RANGE" -- crates/persistence/src/backends/cassandra/ | tail -n 20
           {
             echo "range=$RANGE"
             echo "diff=$out/pr.diff"
+            echo "files=$files"
           } >> "$GITHUB_OUTPUT"
 
-      # Only when asked (input node): the --lib tests' node tests then run
-      # against it too. Started the way the required Cassandra job starts its
+      # Unless a dispatch turns it off (input node): the --lib tests' node
+      # tests run against it. Every test isolates its data by tenant
+      # (ADR-aacruzgon-0020), so the jobs share the node. Started the way the
+      # required Cassandra job starts its
       # own (ADR-aacruzgon-0020); a run killed mid-job skips its cleanup, so
       # leftovers go first.
+      # Not for a diff that changes no file under the backend: there is
+      # nothing to mutate.
       - name: Start a Cassandra node and apply the schema
-        if: env.MUTANTS_NODE == 'true'
+        if: env.MUTANTS_NODE == 'true' && steps.diff.outputs.files != '0'
         run: |
           docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
           python3 "$CI_SCRIPTS/ci-report.py" timed node-start "Start and healthcheck (compose up --wait)" -- \
@@ -206,8 +217,10 @@ jobs:
 
       # cargo-mutants on helios-persistence with the cassandra feature, its
       # --lib tests filtered to backends::cassandra, as in the required job.
-      # Without a node, the node tests skip, so only the pure tests can catch
-      # a mutant. Each job is a build directory of its own; one jobserver
+      # Without a node (a dispatch with node off), the node tests skip, so
+      # only the pure tests can catch a mutant; the tombstone, restart and
+      # size-probe tests stay off as in the required job. Each job is a build
+      # directory of its own; one jobserver
       # shares the runner's CPUs between all their builds (cargo-mutants'
       # default, one task per CPU). A mutant that makes a const fn loop forever
       # (`+=` into `*=` in batch.rs's const scans) would hold its job for the

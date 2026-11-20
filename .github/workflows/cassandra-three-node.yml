@@ -45,14 +45,6 @@ on:
     # (concurrency, below); ADR-aacruzgon-0083 says to check when the first
     # scheduled runs really start.
     - cron: "37 10 * * *"
-  # TEMPORARY, for one run with the independent audit's fixes; removed again
-  # in the next commit. workflow_dispatch answers HTTP 404 until the file is
-  # on main.
-  push:
-    branches: [cassandra/ci-three-node]
-    paths:
-      - .github/workflows/cassandra-three-node.yml
-      - .github/scripts/cassandra-three-node/**
   workflow_dispatch:
     inputs:
       ref:
@@ -151,9 +143,7 @@ jobs:
       - name: Checkout the code under test
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # TEMPORARY, with the push trigger: on a push, test PR #83's branch,
-          # which has none of this job's files, to prove the two checkouts.
-          ref: ${{ inputs.ref || (github.event_name == 'push' && 'cassandra/77-cluster-aware-race-check' || '') }}
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       # This workflow's own scripts and Compose files, from the commit the run

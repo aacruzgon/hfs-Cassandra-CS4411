@@ -20,9 +20,17 @@
 //!    `IF version_id = N`, setting `deleted_at = 0` (G39).
 //! 4. V1 (content) or V2 (delete marker) for the new version,
 //!    `USING TIMESTAMP ts(N+1)`.
-//! 5. The index delta at `ts(N+1)`: delete the rows of `K(N)` that `K(N+1)`
-//!    does not have, insert `K(N+1)`.
+//! 5. The index delta at `ts(N+1)` ([`index_delta`]): delete the rows of
+//!    `K(N)` that `K(N+1)` does not have, compared by each table's primary
+//!    key, so a date key both versions have is only re-inserted (IW7);
+//!    insert `K(N+1)`. Every row of one partition goes as one unit, and all
+//!    units go at once (IW9 B; [`CassandraBackend::write_index_delta`]).
 //! 6. I2, the intent delete.
+//!
+//! Steps 4 and 5 take plain inputs ([`VersionRow`], [`VersionKeys`], a
+//! timestamp and a number of tries), not the request's [`CasPlan`], so the
+//! sweeper and repair write through the same code (IW17 = SW14). The Step 5
+//! decisions cited here as IW… are recorded in ADR-sam-michaels-0006.
 //!
 //! **What `K(V)` holds in Step 3.** Only the `resources_by_type` row (X1),
 //! pulled forward from Step 5 so that `count` works and the conformance
@@ -79,12 +87,14 @@
 //!   a C2, C3 or C4 miss), and the operation's next pre-read
 //!   ([`CassandraBackend::check_earlier_attempts`]). A match is that
 //!   attempt's success, and steps 4 to 6 use its values and its intent.
-//! - Steps 4 and 5 fail: retried with the same timestamps; when the retries
+//! - Steps 4 and 5 fail: retried with the same timestamps, except a statement
+//!   the node refuses as `Invalid`, which no retry changes; when the retries
 //!   run out the write still succeeds and its intent row is left for the
 //!   sweeper (G23), on every operation: a 5xx after an applied CAS would make
 //!   a client's retried request write twice.
 //! - Step 6 fails: ignored; the sweeper deletes the intent.
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -100,8 +110,8 @@ use serde_json::Value as Json;
 use uuid::Uuid;
 
 use super::backend::CassandraBackend;
-use super::errors::{BACKEND_NAME, map_driver_error};
-use super::index_keys::{self, IndexKey};
+use super::errors::{BACKEND_NAME, is_invalid, map_driver_error};
+use super::index_keys::{self, IndexKey, Partition};
 use super::read::{ResourceRow, SELECT_RESOURCE};
 use super::session::{DriverError, NO_NODE_IN_PLAN, StatementKind};
 use super::stats::{CasCounters, MissKind};
@@ -781,81 +791,119 @@ impl CasPlan {
         }
     }
 
-    /// Step 4's statement and binds: V2 for a delete, V1 otherwise.
+    /// Step 4's row for the attempt `(write_id, last_updated)`: V2 for a
+    /// delete, with the empty key set and `deleted_at = lu(N+1)`; V1
+    /// otherwise.
+    fn new_version(&self, write_id: Uuid, last_updated: DateTime<Utc>) -> VersionRow<'_> {
+        let marker = self.kind == CasKind::Delete;
+        VersionRow {
+            version_id: self.target_version(),
+            last_updated,
+            deleted_at: marker.then_some(last_updated),
+            data: self.data(),
+            fhir_version: self.fhir_version,
+            write_id: Some(write_id),
+            keys_blob: if marker {
+                &index_keys::EMPTY
+            } else {
+                &self.keys_blob
+            },
+        }
+    }
+
+    /// Step 4's statement and binds, at `ts(N+1)`: V2 for a delete, V1
+    /// otherwise.
+    #[cfg(test)]
     fn new_version_row(
         &self,
         key: &RowKey<'_>,
         write_id: Uuid,
         last_updated: DateTime<Utc>,
-    ) -> (&'static str, Vec<Value>) {
-        let write_ts = write_ts_of(last_updated);
-        let head = [
-            Value::from(key.tenant_id),
-            Value::from(key.resource_type),
-            Value::from(key.id),
-            Value::from(self.target_version()),
-        ];
-        match self.kind {
-            CasKind::Delete => (
-                INSERT_DELETE_MARKER,
-                head.into_iter()
-                    .chain([
-                        Value::from(last_updated),
-                        Value::from(last_updated),
-                        Value::from(self.fhir_version.as_mime_param()),
-                        Value::from(write_ts),
-                        Value::from(write_id),
-                        Value::from(Blob::from(index_keys::EMPTY.to_vec())),
-                        Value::from(write_ts),
-                    ])
-                    .collect(),
-            ),
-            _ => (
-                INSERT_VERSION,
-                head.into_iter()
-                    .chain([
-                        Value::from(self.data().unwrap_or_default()),
-                        Value::from(last_updated),
-                        Value::from(self.fhir_version.as_mime_param()),
-                        Value::from(write_ts),
-                        Value::from(write_id),
-                        Value::from(Blob::from(self.keys_blob.clone())),
-                        Value::from(write_ts),
-                    ])
-                    .collect(),
-            ),
+    ) -> Statement {
+        version_row(
+            key,
+            &self.new_version(write_id, last_updated),
+            write_ts_of(last_updated),
+        )
+    }
+
+    /// `K(N+1)` for the index delta: the new version's keys at
+    /// `last_updated`, the attempt's.
+    fn version_keys(&self, last_updated: DateTime<Utc>) -> VersionKeys<'_> {
+        VersionKeys {
+            version_id: self.target_version(),
+            last_updated,
+            fhir_version: self.fhir_version,
+            keys: &self.keys,
         }
+    }
+
+    /// `K(N)` for the index delta: every key of version `N` at `lu(N)`,
+    /// which all of `N`'s rows carry; empty for a create.
+    fn previous_rows(&self) -> Vec<IndexRow<'_>> {
+        self.previous
+            .as_ref()
+            .map(|previous| {
+                previous
+                    .keys
+                    .iter()
+                    .map(|key| (key, previous.last_updated))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
-/// V3's statement and binds: row `N` as `previous` holds it, at
-/// `ts(N) − 1`, so an existing row wins every cell and a missing one is
-/// restored (G40). A content row leaves `deleted_at` unset, a marker leaves
-/// `data` unset, and an unknown `w(N)` is left unset, never null.
-fn previous_version_row(
-    key: &RowKey<'_>,
-    previous: &PreviousVersion,
-) -> (&'static str, Vec<Value>) {
-    let write_ts = write_ts_of(previous.last_updated);
-    let write_id = previous.write_id.map_or(Value::NotSet, Value::from);
+/// One statement and its binds.
+pub(crate) type Statement = (&'static str, Vec<Value>);
+
+/// One `resource_versions` row, on plain inputs, so the request, the
+/// sweeper and repair write it through the same code (IW17 = SW14,
+/// ADR-sam-michaels-0006). [`version_row`] turns it into V1, V2 or V3.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VersionRow<'a> {
+    pub(crate) version_id: i32,
+    pub(crate) last_updated: DateTime<Utc>,
+    /// `Some` for a delete marker (V2), which has no `data`.
+    pub(crate) deleted_at: Option<DateTime<Utc>>,
+    /// The version's content; left unset when `None`, never null.
+    pub(crate) data: Option<&'a str>,
+    /// The resource's FHIR version, fixed at create (G13).
+    pub(crate) fhir_version: FhirVersion,
+    /// The `write_id` of the CAS that wrote the version; left unset when
+    /// `None` (a V3 whose `w(N)` R1 did not have), never null.
+    pub(crate) write_id: Option<Uuid>,
+    /// The version's key set as stored (`index_keys`, G22).
+    pub(crate) keys_blob: &'a [u8],
+}
+
+/// The statement that writes `row`, `USING TIMESTAMP ts`: V2
+/// ([`INSERT_DELETE_MARKER`]) for a marker, V1 ([`INSERT_VERSION`])
+/// otherwise. Every caller computes `ts` from the version's `last_updated`
+/// (RW10): `ts(V) = write_ts_of(lu(V))` for a version's own row (V1, V2),
+/// `ts(N) − 1` for V3. The `write_ts` column is always
+/// `write_ts_of(row.last_updated)` (ADR-aacruzgon-0016), so no caller can
+/// store a `write_ts` that disagrees with the row's `last_updated`. Every
+/// marker is bound to a value or left unset, never to null (a tombstone).
+pub(crate) fn version_row(key: &RowKey<'_>, row: &VersionRow<'_>, ts: i64) -> Statement {
     let head = [
         Value::from(key.tenant_id),
         Value::from(key.resource_type),
         Value::from(key.id),
-        Value::from(previous.version_id),
+        Value::from(row.version_id),
     ];
     let tail = [
-        Value::from(previous.fhir_version.as_mime_param()),
-        Value::from(write_ts),
-        write_id,
-        Value::from(Blob::from(previous.keys_blob.clone())),
-        Value::from(write_ts - 1),
+        Value::from(row.fhir_version.as_mime_param()),
+        Value::from(write_ts_of(row.last_updated)),
+        row.write_id.map_or(Value::NotSet, Value::from),
+        Value::from(Blob::from(row.keys_blob.to_vec())),
+        Value::from(ts),
     ];
-    match previous.deleted_at {
+    match row.deleted_at {
         Some(deleted_at) => (
             INSERT_DELETE_MARKER,
             head.into_iter()
-                .chain([Value::from(previous.last_updated), Value::from(deleted_at)])
+                .chain([Value::from(row.last_updated), Value::from(deleted_at)])
                 .chain(tail)
                 .collect(),
         ),
@@ -863,8 +911,8 @@ fn previous_version_row(
             INSERT_VERSION,
             head.into_iter()
                 .chain([
-                    previous.data.as_deref().map_or(Value::NotSet, Value::from),
-                    Value::from(previous.last_updated),
+                    row.data.map_or(Value::NotSet, Value::from),
+                    Value::from(row.last_updated),
                 ])
                 .chain(tail)
                 .collect(),
@@ -872,27 +920,185 @@ fn previous_version_row(
     }
 }
 
-/// One index row of a version, with the `last_updated` its key carries.
-type ConcreteKey<'a> = (&'a IndexKey, DateTime<Utc>);
+/// V3's statement and binds: row `N` as `previous` holds it, at
+/// `ts(N) − 1`, so an existing row wins every cell and a missing one is
+/// restored (G40). A content row leaves `deleted_at` unset, a marker leaves
+/// `data` unset, and an unknown `w(N)` is left unset, never null.
+fn previous_version_row(key: &RowKey<'_>, previous: &PreviousVersion) -> Statement {
+    let row = VersionRow {
+        version_id: previous.version_id,
+        last_updated: previous.last_updated,
+        deleted_at: previous.deleted_at,
+        data: previous.data.as_deref(),
+        fhir_version: previous.fhir_version,
+        write_id: previous.write_id,
+        keys_blob: &previous.keys_blob,
+    };
+    version_row(key, &row, write_ts_of(previous.last_updated) - 1)
+}
 
-/// Step 5's delta: the rows of `K(N)` (at `lu(N)`) that `K(N+1)` (at
-/// `lu(N+1)`) does not have, to delete, and every row of `K(N+1)`, to insert.
-/// The `resources_by_type` row's key holds the version's `last_updated`, so
-/// an update moves it and a delete removes it.
-fn index_delta<'a>(
-    previous: Option<(&'a [IndexKey], DateTime<Utc>)>,
-    next: (&'a [IndexKey], DateTime<Utc>),
-) -> (Vec<ConcreteKey<'a>>, Vec<ConcreteKey<'a>>) {
-    let inserts: Vec<ConcreteKey<'a>> = next.0.iter().map(|key| (key, next.1)).collect();
-    let deletes = previous
-        .map(|(keys, at)| {
-            keys.iter()
-                .map(|key| (key, at))
-                .filter(|old| !inserts.contains(old))
-                .collect()
-        })
-        .unwrap_or_default();
-    (deletes, inserts)
+/// One version's key set, as the index writer needs it (IW17): the rows it
+/// inserts are `keys` at `last_updated`, tagged `version_id`, and the
+/// `resources_by_type` row carries `fhir_version` (G34). The sweeper's
+/// superseded case passes an empty `keys`, so its delta only deletes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VersionKeys<'a> {
+    pub(crate) version_id: i32,
+    pub(crate) last_updated: DateTime<Utc>,
+    pub(crate) fhir_version: FhirVersion,
+    pub(crate) keys: &'a [IndexKey],
+}
+
+/// One index row of a delta: its key, and the `last_updated` of the version
+/// that wrote it (a delete) or writes it (an insert).
+pub(crate) type IndexRow<'a> = (&'a IndexKey, DateTime<Utc>);
+
+/// Every row of a delta that lives in one partition ([`IndexKey::partition`]):
+/// the inserts and the deletes of that partition together. The writer sends
+/// a unit whole and never splits one (IW9 B, ADR-sam-michaels-0006; see
+/// [`CassandraBackend::send_index_unit`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IndexUnit<'a> {
+    /// Rows of the new version, at its `last_updated`.
+    pub(crate) inserts: Vec<IndexRow<'a>>,
+    /// Rows of earlier versions that the new version does not have, each at
+    /// its own `last_updated`.
+    pub(crate) deletes: Vec<IndexRow<'a>>,
+}
+
+/// Step 5's delta for one version, in units by partition. Every statement
+/// of it is written at the version's `ts` (`USING TIMESTAMP`).
+#[derive(Debug, Clone)]
+pub(crate) struct IndexDelta<'a> {
+    /// The tag every inserted row carries.
+    pub(crate) version_id: i32,
+    /// The `fhir_version` the `resources_by_type` row carries (G34).
+    pub(crate) fhir_version: FhirVersion,
+    /// One unit per partition the delta touches, in partition order.
+    pub(crate) units: Vec<IndexUnit<'a>>,
+}
+
+/// Step 5's delta (IW7, IW9, IW17; ADR-sam-michaels-0006): insert every row
+/// of `next`; delete every row of `previous` that `next` does not have.
+///
+/// Rows are compared by [`IndexKey::row_at`], each table's own primary key,
+/// never by `(key, last_updated)` pairs: a date key that `previous` and
+/// `next` both have is the same row, so it is only re-inserted (which
+/// rewrites its `version_id` tag). Deleting it too, at the same timestamp,
+/// would delete it for good, since Cassandra lets a delete win a tie (IW7).
+/// The `resources_by_type`, token and URI rows carry `last_updated` in their
+/// key, so an update moves them: the row at `lu(N)` is deleted and the row
+/// at `lu(N+1)` inserted.
+///
+/// `previous` gives each row its own `last_updated`: the request passes
+/// `K(N)` at `lu(N)`, the sweeper row `V−1`'s keys at `lu(V−1)`, and repair
+/// the stale rows it found, which may come from several versions (RW9). A
+/// row listed twice is deleted or inserted once.
+///
+/// The rows are grouped into units by [`IndexKey::partition`] (IW9 B), and
+/// within a unit the inserts and the deletes keep the order of `next` and
+/// `previous`.
+pub(crate) fn index_delta<'a>(previous: &[IndexRow<'a>], next: VersionKeys<'a>) -> IndexDelta<'a> {
+    let mut units: BTreeMap<Partition<'a>, IndexUnit<'a>> = BTreeMap::new();
+    let mut inserted = HashSet::new();
+    for key in next.keys {
+        if inserted.insert(key.row_at(next.last_updated)) {
+            units
+                .entry(key.partition())
+                .or_default()
+                .inserts
+                .push((key, next.last_updated));
+        }
+    }
+    let mut deleted = HashSet::new();
+    for &(key, last_updated) in previous {
+        let row = key.row_at(last_updated);
+        if !inserted.contains(&row) && deleted.insert(row) {
+            units
+                .entry(key.partition())
+                .or_default()
+                .deletes
+                .push((key, last_updated));
+        }
+    }
+    IndexDelta {
+        version_id: next.version_id,
+        fhir_version: next.fhir_version,
+        units: units.into_values().collect(),
+    }
+}
+
+/// The statements of one unit, every one `USING TIMESTAMP ts`: the inserts,
+/// then the deletes. A row kind with no statement yet fails the unit before
+/// anything is sent.
+fn unit_statements(
+    key: &RowKey<'_>,
+    delta: &IndexDelta<'_>,
+    unit: &IndexUnit<'_>,
+    ts: i64,
+) -> Result<Vec<Statement>, WriteFailure> {
+    let inserts = unit.inserts.iter().map(|row| (row, true));
+    let deletes = unit.deletes.iter().map(|row| (row, false));
+    inserts
+        .chain(deletes)
+        .map(|(&(index_key, at), insert)| index_statement(key, delta, index_key, at, ts, insert))
+        .collect()
+}
+
+/// One row of a delta as a statement: an insert of `index_key` at
+/// `last_updated`, tagged with the delta's version, or its delete.
+fn index_statement(
+    key: &RowKey<'_>,
+    delta: &IndexDelta<'_>,
+    index_key: &IndexKey,
+    last_updated: DateTime<Utc>,
+    ts: i64,
+    insert: bool,
+) -> Result<Statement, WriteFailure> {
+    match (index_key, insert) {
+        (IndexKey::ResourcesByType, true) => Ok((
+            INSERT_RESOURCES_BY_TYPE,
+            vec![
+                Value::from(key.tenant_id),
+                Value::from(key.resource_type),
+                Value::from(last_updated),
+                Value::from(key.id),
+                Value::from(delta.version_id),
+                Value::from(delta.fhir_version.as_mime_param()),
+                Value::from(ts),
+            ],
+        )),
+        (IndexKey::ResourcesByType, false) => Ok((
+            DELETE_RESOURCES_BY_TYPE,
+            vec![
+                Value::from(ts),
+                Value::from(key.tenant_id),
+                Value::from(key.resource_type),
+                Value::from(last_updated),
+                Value::from(key.id),
+            ],
+        )),
+        (other, _) => {
+            // Step 5 adds these rows; Steps 2 to 4 never have them.
+            tracing::error!(key = ?other, "index row kind not written before Step 5");
+            Err(WriteFailure::Permanent)
+        }
+    }
+}
+
+/// Why a plain write after the CAS (a version row or an index unit) was not
+/// written. Either way the write still answers success and its intent is
+/// left for the sweeper (G23); the kind tells a caller that retries on its
+/// own, the sweeper, whether trying again can help (RW9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteFailure {
+    /// Every try failed with an error a later try may not have: a timeout,
+    /// an unavailable replica, a lost connection.
+    TriesExhausted,
+    /// No try can succeed: the node refused the statement as `Invalid`
+    /// (IW17: "an `Invalid` error is permanent"), or this build has no
+    /// statement for the row. Not retried.
+    Permanent,
 }
 
 /// The partition key of the resource a request writes.
@@ -1700,12 +1906,21 @@ impl CassandraBackend {
         let complete = if superseded {
             false
         } else {
-            let (cql, values) = plan.new_version_row(&key, attempt.write_id, attempt.last_updated);
-            let version_written = self.write_with_retries(cql, values, "version row").await;
-            let indexed = self
-                .write_index_delta(&key, &plan, attempt.last_updated)
+            let ts = write_ts_of(attempt.last_updated);
+            let version_written = self
+                .write_version_row(
+                    &key,
+                    &plan.new_version(attempt.write_id, attempt.last_updated),
+                    ts,
+                    POST_CAS_WRITE_TRIES,
+                )
                 .await;
-            if version_written && indexed {
+            let previous = plan.previous_rows();
+            let delta = index_delta(&previous, plan.version_keys(attempt.last_updated));
+            let indexed = self
+                .write_index_delta(&key, &delta, ts, POST_CAS_WRITE_TRIES)
+                .await;
+            if version_written.is_ok() && indexed.is_ok() {
                 self.delete_intent(&attempt.intent, &key).await;
                 true
             } else {
@@ -1788,119 +2003,147 @@ impl CassandraBackend {
         }
     }
 
-    /// Step 5: the delta from `K(N)` to `K(N+1)` at `ts(N+1)`. `true` once
-    /// every row is written.
+    /// Step 4 on plain inputs (IW17 = SW14, ADR-sam-michaels-0006): `row`
+    /// `USING TIMESTAMP ts`, with up to `tries` tries. The request passes 3
+    /// ([`POST_CAS_WRITE_TRIES`]); the sweeper, whose retry list already
+    /// retries, passes 1 per pass.
+    pub(crate) async fn write_version_row(
+        &self,
+        key: &RowKey<'_>,
+        row: &VersionRow<'_>,
+        ts: i64,
+        tries: u32,
+    ) -> Result<(), WriteFailure> {
+        let (cql, values) = version_row(key, row, ts);
+        self.write_with_retries(cql, values, "version row", tries)
+            .await
+    }
+
+    /// Step 5 on plain inputs (IW17 = SW14, ADR-sam-michaels-0006): every
+    /// unit of `delta`, `USING TIMESTAMP ts`, each with up to `tries` tries.
+    /// The request passes 3 ([`POST_CAS_WRITE_TRIES`]), the sweeper 1 per
+    /// pass and repair 1. Every caller computes `ts = write_ts_of(lu(V))`
+    /// for the version `delta` writes.
     ///
-    /// The inserts go first, so a concurrent `count` never sees the resource
-    /// missing while its `resources_by_type` row moves. The deletes of
-    /// `K(N) \ K(N+1)` are sent only once every insert is acknowledged. If an
-    /// insert still fails after its tries, the old rows are kept and this
-    /// returns `false`: the write succeeds with I1 left (G23), and the
-    /// sweeper, which reads `K(N)` from row `N` and `K(N+1)` from the
-    /// `resources` row, writes the missing rows and deletes the old ones.
-    /// The walkthrough's batch template (section 2, "Index rows") sends a
-    /// version's deletes and inserts in one logged batch, all or nothing, so
-    /// this keeps what it guarantees: no old row is deleted without its
-    /// replacement written.
-    async fn write_index_delta(
+    /// **All units go at once** (IW9 B): each is one partition's rows,
+    /// which Cassandra applies whole on each replica once a unit is a batch
+    /// ([`Self::send_index_unit`]), so no reader sees half of one, and the
+    /// units do not wait on each other. A unit that fails keeps its
+    /// partition's old rows, tagged with an older version, which the tag
+    /// check hides; the others are written. The futures run inside the
+    /// request's own task, never `tokio::spawn`, so a request that is
+    /// dropped stops its writes with it (IW12).
+    ///
+    /// `Ok` once every unit is written. A failure is [`WriteFailure::Permanent`]
+    /// if any unit's was, otherwise [`WriteFailure::TriesExhausted`]; the
+    /// caller keeps the intent either way, and the sweeper replays the whole
+    /// delta, which rewrites the units that were written with the same
+    /// cells.
+    pub(crate) async fn write_index_delta(
         &self,
         key: &RowKey<'_>,
-        plan: &CasPlan,
-        last_updated: DateTime<Utc>,
-    ) -> bool {
-        let write_ts = write_ts_of(last_updated);
-        let previous = plan
-            .previous
-            .as_ref()
-            .map(|p| (p.keys.as_slice(), p.last_updated));
-        let (deletes, inserts) = index_delta(previous, (&plan.keys, last_updated));
-        let mut inserted = true;
-        for (index_key, at) in inserts {
-            inserted &= self
-                .write_index_row(key, plan, write_ts, index_key, at, true)
-                .await;
+        delta: &IndexDelta<'_>,
+        ts: i64,
+        tries: u32,
+    ) -> Result<(), WriteFailure> {
+        let sends = delta.units.iter().map(|unit| async move {
+            let statements = unit_statements(key, delta, unit, ts)?;
+            self.send_index_unit(&statements, tries).await
+        });
+        let failures: Vec<WriteFailure> = futures::future::join_all(sends)
+            .await
+            .into_iter()
+            .filter_map(Result::err)
+            .collect();
+        if failures.is_empty() {
+            return Ok(());
         }
-        if !inserted {
-            tracing::warn!(
-                resource_type = key.resource_type,
-                id = key.id,
-                version_id = plan.target_version(),
-                "an index insert failed after its tries; the old index rows are kept \
-                 for the sweeper"
-            );
-            return false;
+        tracing::warn!(
+            resource_type = key.resource_type,
+            id = key.id,
+            version_id = delta.version_id,
+            failed_units = failures.len(),
+            units = delta.units.len(),
+            "index units failed after their tries; their partitions' old index rows are \
+             kept for the sweeper"
+        );
+        if failures.contains(&WriteFailure::Permanent) {
+            Err(WriteFailure::Permanent)
+        } else {
+            Err(WriteFailure::TriesExhausted)
         }
-        let mut deleted = true;
-        for (index_key, at) in deletes {
-            deleted &= self
-                .write_index_row(key, plan, write_ts, index_key, at, false)
-                .await;
-        }
-        deleted
     }
 
-    /// One row of step 5's delta, an insert or a delete at `write_ts`, with
-    /// its retries. `false` if it was not written.
-    async fn write_index_row(
+    /// Sends one unit of an index delta: every row of one partition, its
+    /// inserts and its deletes (IW9 B, ADR-sam-michaels-0006). `statements`
+    /// are the unit's, inserts first, all at the version's timestamp.
+    ///
+    /// **A unit is never split.**
+    /// `count` is `COUNT(*)` over the `(tenant_id, resource_type)` partition
+    /// of `resources_by_type`, with no version-tag check (`read.rs`), and an
+    /// update moves the resource's row there from `lu(N)` to `lu(N+1)`: both
+    /// rows are in that one partition, so in one unit. Sent as one logged
+    /// batch, Cassandra applies the unit whole on each replica, so an update
+    /// alone never lets a quorum read see both rows once its batch has reached
+    /// a quorum. ADR-aacruzgon-0081 (decision 2) gives the cases where `count`
+    /// is still off: an unfinished write, and read repair on RF 3 after a
+    /// write that reached fewer than a quorum.
+    ///
+    /// **For now the statements go one at a time**, in that order, each with
+    /// up to `tries` tries, stopping at the first that fails them all, so no
+    /// delete is sent unless every insert of its unit was written. Pull
+    /// request 3 replaces only this body with one batch through
+    /// `CassandraSession::batch` (IW13), and until then `count` may see the
+    /// moved row twice between the insert and the delete, as before Step 5.
+    /// With the key set still `[ResourcesByType]`, a write has one unit, so
+    /// it sends the same statements in the same order as before.
+    async fn send_index_unit(
         &self,
-        key: &RowKey<'_>,
-        plan: &CasPlan,
-        write_ts: i64,
-        index_key: &IndexKey,
-        at: DateTime<Utc>,
-        insert: bool,
-    ) -> bool {
-        let (cql, values) = match (index_key, insert) {
-            (IndexKey::ResourcesByType, true) => (
-                INSERT_RESOURCES_BY_TYPE,
-                vec![
-                    Value::from(key.tenant_id),
-                    Value::from(key.resource_type),
-                    Value::from(at),
-                    Value::from(key.id),
-                    Value::from(plan.target_version()),
-                    Value::from(plan.fhir_version.as_mime_param()),
-                    Value::from(write_ts),
-                ],
-            ),
-            (IndexKey::ResourcesByType, false) => (
-                DELETE_RESOURCES_BY_TYPE,
-                vec![
-                    Value::from(write_ts),
-                    Value::from(key.tenant_id),
-                    Value::from(key.resource_type),
-                    Value::from(at),
-                    Value::from(key.id),
-                ],
-            ),
-            (other, _) => {
-                // Step 5 adds these rows; Steps 2 to 4 never have them.
-                tracing::error!(key = ?other, "index row kind not written before Step 5");
-                return false;
-            }
-        };
-        self.write_with_retries(cql, values, "index row").await
+        statements: &[Statement],
+        tries: u32,
+    ) -> Result<(), WriteFailure> {
+        for (cql, values) in statements {
+            self.write_with_retries(cql, values.clone(), "index row", tries)
+                .await?;
+        }
+        Ok(())
     }
 
-    /// A plain, idempotent write with a fixed timestamp, tried up to
-    /// [`POST_CAS_WRITE_TRIES`] times.
-    async fn write_with_retries(&self, cql: &str, values: Vec<Value>, what: &str) -> bool {
-        for attempt in 1..=POST_CAS_WRITE_TRIES {
+    /// A plain, idempotent write with a fixed timestamp, tried up to `tries`
+    /// times, 10 ms then 20 ms apart. An `Invalid` refusal is not retried:
+    /// the node refuses the same statement every time (IW17, RW9).
+    async fn write_with_retries(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        what: &str,
+        tries: u32,
+    ) -> Result<(), WriteFailure> {
+        for attempt in 1..=tries {
             match self
                 .session
                 .execute(cql, values.clone(), StatementKind::Write)
                 .await
             {
-                Ok(_) => return true,
+                Ok(_) => return Ok(()),
+                Err(error) if is_invalid(&error) => {
+                    tracing::error!(
+                        attempt,
+                        what,
+                        error = ?error,
+                        "post-CAS write refused as invalid; not retried"
+                    );
+                    return Err(WriteFailure::Permanent);
+                }
                 Err(error) => {
                     tracing::warn!(attempt, what, error = ?error, "post-CAS write failed");
-                    if attempt < POST_CAS_WRITE_TRIES {
+                    if attempt < tries {
                         tokio::time::sleep(Duration::from_millis(10 * u64::from(attempt))).await;
                     }
                 }
             }
         }
-        false
+        Err(WriteFailure::TriesExhausted)
     }
 
     /// `ResourceStorage::create` (walkthrough 3.2): C1 through the engine.
@@ -2675,6 +2918,39 @@ mod tests {
         assert!(!values.iter().any(|value| matches!(value, Value::Null)));
     }
 
+    /// `index_delta` as the request calls it, `previous` all at one
+    /// `last_updated` (`None` for a create), with the deletes and the
+    /// inserts of every unit, in unit order.
+    fn delta<'a>(
+        previous: Option<(&'a [IndexKey], DateTime<Utc>)>,
+        next: (&'a [IndexKey], DateTime<Utc>),
+    ) -> (Vec<IndexRow<'a>>, Vec<IndexRow<'a>>) {
+        let previous: Vec<IndexRow<'a>> = previous
+            .map(|(keys, at)| keys.iter().map(|key| (key, at)).collect())
+            .unwrap_or_default();
+        let delta = index_delta(&previous, version_keys(next.0, next.1));
+        let deletes = delta
+            .units
+            .iter()
+            .flat_map(|unit| unit.deletes.iter().copied())
+            .collect();
+        let inserts = delta
+            .units
+            .iter()
+            .flat_map(|unit| unit.inserts.iter().copied())
+            .collect();
+        (deletes, inserts)
+    }
+
+    fn version_keys(keys: &[IndexKey], last_updated: DateTime<Utc>) -> VersionKeys<'_> {
+        VersionKeys {
+            version_id: 2,
+            last_updated,
+            fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            keys,
+        }
+    }
+
     /// Step 5's delta: an update moves the `resources_by_type` row from
     /// `(lu(N), id)` to `(lu(N+1), id)`; a delete removes every key of
     /// `K(N)`; a create only inserts.
@@ -2683,23 +2959,242 @@ mod tests {
         let x1 = [IndexKey::ResourcesByType];
         let lu_n = at("2026-11-06T10:00:00.000Z");
         let lu_v = at("2026-11-06T10:00:00.001Z");
-        let (deletes, inserts) = index_delta(Some((&x1, lu_n)), (&x1, lu_v));
+        let (deletes, inserts) = delta(Some((&x1, lu_n)), (&x1, lu_v));
         assert_eq!(deletes, vec![(&x1[0], lu_n)]);
         assert_eq!(inserts, vec![(&x1[0], lu_v)]);
 
-        let (deletes, inserts) = index_delta(Some((&x1, lu_n)), (&[], lu_v));
+        let (deletes, inserts) = delta(Some((&x1, lu_n)), (&[], lu_v));
         assert_eq!(deletes, vec![(&x1[0], lu_n)]);
         assert!(inserts.is_empty());
 
-        let (deletes, inserts) = index_delta(None, (&x1, lu_v));
+        let (deletes, inserts) = delta(None, (&x1, lu_v));
         assert!(deletes.is_empty());
         assert_eq!(inserts, vec![(&x1[0], lu_v)]);
 
-        // A row both versions hold at the same key is not deleted (only
-        // possible for a key without `last_updated`, which no table has; the
-        // set difference is still exact).
-        let (deletes, _) = index_delta(Some((&x1, lu_v)), (&x1, lu_v));
+        // A row both versions hold is not deleted: the set difference is
+        // exact. Every `resources_by_type` row has its version's
+        // `last_updated` in its key, so this takes the same `lu` twice; a
+        // date key is the real case (`an_unchanged_date_key_is_insert_only`).
+        let (deletes, _) = delta(Some((&x1, lu_v)), (&x1, lu_v));
         assert!(deletes.is_empty());
+    }
+
+    const IMPLICIT: &str = "urn:x-helios:implicit code system";
+    const MRN: &str = "http://hospital.example/mrn";
+    const B0: i64 = 326_073_600_000; // 1980-05-01T00:00:00Z
+    const B1: i64 = 326_160_000_000; // 1980-05-02T00:00:00Z
+    const B2: i64 = 326_246_400_000; // 1980-05-03T00:00:00Z
+
+    fn gender(code: &str) -> IndexKey {
+        IndexKey::TokenCode {
+            param: "gender".to_string(),
+            code: code.to_string(),
+            system: IMPLICIT.to_string(),
+        }
+    }
+
+    fn identifier_system(code: &str) -> IndexKey {
+        IndexKey::TokenSystem {
+            param: "identifier".to_string(),
+            system: MRN.to_string(),
+            code: code.to_string(),
+        }
+    }
+
+    fn birthdate(start: i64, end: i64) -> [IndexKey; 2] {
+        [
+            IndexKey::Date {
+                param: "birthdate".to_string(),
+                start,
+                end,
+            },
+            IndexKey::DateByEnd {
+                param: "birthdate".to_string(),
+                end,
+                start,
+            },
+        ]
+    }
+
+    fn set<'a>(rows: &[IndexRow<'a>]) -> std::collections::BTreeSet<IndexRow<'a>> {
+        rows.iter().copied().collect()
+    }
+
+    /// IW7, the date-key fix (SW14's test): a birth date both versions have
+    /// is only re-inserted, never deleted at the timestamp it is inserted
+    /// at, which would leave no row (Cassandra lets the delete win the tie).
+    /// The token and `resources_by_type` rows carry `last_updated` in their
+    /// key, so they move.
+    #[test]
+    fn an_unchanged_date_key_is_insert_only() {
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let [d, d_end] = birthdate(B0, B1);
+        let keys = [IndexKey::ResourcesByType, gender("male"), d, d_end];
+        let (deletes, inserts) = delta(Some((&keys, lu1)), (&keys, lu2));
+        assert_eq!(
+            set(&deletes),
+            set(&[(&keys[0], lu1), (&keys[1], lu1)]),
+            "the date rows are not deleted"
+        );
+        assert_eq!(
+            set(&inserts),
+            set(&[
+                (&keys[0], lu2),
+                (&keys[1], lu2),
+                (&keys[2], lu2),
+                (&keys[3], lu2),
+            ]),
+            "every row of K(N+1) is inserted, the date rows to re-tag them"
+        );
+    }
+
+    /// RW9, repair's case: `previous` holds stale rows from several versions,
+    /// each at its own `last_updated`. A token row at two old versions is two
+    /// rows to delete; a date row at two old versions is one row, kept
+    /// because the current version has it; a value the current version
+    /// dropped is deleted; a row listed twice is deleted once.
+    #[test]
+    fn previous_rows_from_two_versions() {
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let lu3 = at("2026-11-16T10:00:00.002Z");
+        let [d, _] = birthdate(B0, B1);
+        let (x1, t, dropped) = (
+            IndexKey::ResourcesByType,
+            gender("male"),
+            identifier_system("12345"),
+        );
+        let previous = [
+            (&t, lu1),
+            (&t, lu2),
+            (&t, lu1),
+            (&d, lu1),
+            (&d, lu2),
+            (&dropped, lu1),
+            (&x1, lu2),
+        ];
+        // `t` is listed twice: its row is inserted once.
+        let next = [x1.clone(), t.clone(), d.clone(), t.clone()];
+        let delta = index_delta(&previous, version_keys(&next, lu3));
+        let deletes: Vec<IndexRow<'_>> = delta
+            .units
+            .iter()
+            .flat_map(|unit| unit.deletes.iter().copied())
+            .collect();
+        let inserts: Vec<IndexRow<'_>> = delta
+            .units
+            .iter()
+            .flat_map(|unit| unit.inserts.iter().copied())
+            .collect();
+        assert_eq!(deletes.len(), 4, "{deletes:?}");
+        assert_eq!(
+            set(&deletes),
+            set(&[(&t, lu1), (&t, lu2), (&dropped, lu1), (&x1, lu2)])
+        );
+        assert_eq!(
+            inserts.len(),
+            3,
+            "a row listed twice is inserted once: {inserts:?}"
+        );
+        assert_eq!(set(&inserts), set(&[(&x1, lu3), (&t, lu3), (&d, lu3)]));
+        // The token's unit: its two stale rows and its current one.
+        let unit = delta
+            .units
+            .iter()
+            .find(|unit| unit.inserts.contains(&(&next[1], lu3)))
+            .unwrap();
+        assert_eq!(unit.deletes, vec![(&t, lu1), (&t, lu2)]);
+        assert_eq!(unit.inserts, vec![(&next[1], lu3)]);
+    }
+
+    /// IW9 B: a unit is every row of one partition, inserts and deletes
+    /// together, so an update's `resources_by_type` pair is one unit (once
+    /// its batch has reached a quorum an update alone never lets `count` see
+    /// both rows; the cases where `count` is still off are in
+    /// ADR-aacruzgon-0081, decision 2). A changed value is one unit when it only
+    /// changes clustering columns (a token's code in `token_system_index`, a
+    /// date's range) and two when it changes the partition key (a token's
+    /// code in `token_code_index`). `date_index` and `date_index_by_end` are
+    /// two tables, so two units.
+    #[test]
+    fn a_unit_is_every_row_of_one_partition() {
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let [d_old, d_end_old] = birthdate(B0, B1);
+        let [d_new, d_end_new] = birthdate(B1, B2);
+        let old = [
+            IndexKey::ResourcesByType,
+            gender("male"),
+            identifier_system("111"),
+            d_old,
+            d_end_old,
+        ];
+        let new = [
+            IndexKey::ResourcesByType,
+            gender("female"),
+            identifier_system("222"),
+            d_new,
+            d_end_new,
+        ];
+        let previous: Vec<IndexRow<'_>> = old.iter().map(|key| (key, lu1)).collect();
+        let delta = index_delta(&previous, version_keys(&new, lu2));
+        let units: Vec<(Vec<IndexRow<'_>>, Vec<IndexRow<'_>>)> = delta
+            .units
+            .iter()
+            .map(|unit| (unit.inserts.clone(), unit.deletes.clone()))
+            .collect();
+        assert_eq!(
+            units,
+            vec![
+                // resources_by_type: the pair.
+                (vec![(&new[0], lu2)], vec![(&old[0], lu1)]),
+                // token_code_index: the code is in the partition key.
+                (vec![(&new[1], lu2)], vec![]),
+                (vec![], vec![(&old[1], lu1)]),
+                // token_system_index: the code is a clustering column.
+                (vec![(&new[2], lu2)], vec![(&old[2], lu1)]),
+                // date_index, then date_index_by_end: one partition each.
+                (vec![(&new[3], lu2)], vec![(&old[3], lu1)]),
+                (vec![(&new[4], lu2)], vec![(&old[4], lu1)]),
+            ]
+        );
+    }
+
+    /// A unit's statements, as the writer sends them until pull request 3
+    /// batches them: its inserts, then its deletes, every one at the one
+    /// timestamp `ts`, the insert tagged with the delta's version. A row kind
+    /// with no statement yet fails the unit before anything is sent.
+    #[test]
+    fn a_unit_sends_its_inserts_then_its_deletes_at_one_timestamp() {
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let x1 = [IndexKey::ResourcesByType];
+        let previous = [(&x1[0], lu1)];
+        let delta = index_delta(&previous, version_keys(&x1, lu2));
+        assert_eq!(delta.units.len(), 1);
+        let ts = write_ts_of(lu2);
+        let statements = unit_statements(&key(), &delta, &delta.units[0], ts).unwrap();
+        let (insert, delete) = (&statements[0], &statements[1]);
+        assert_eq!(statements.len(), 2);
+        assert_eq!(insert.0, INSERT_RESOURCES_BY_TYPE);
+        assert_eq!(delete.0, DELETE_RESOURCES_BY_TYPE);
+        for (cql, values) in [insert, delete] {
+            assert_eq!(values.len(), cql.matches('?').count(), "{cql}");
+            assert!(values.iter().all(|value| matches!(value, Value::Some(_))));
+        }
+        assert_eq!(insert.1[2], Value::from(lu2), "the new row");
+        assert_eq!(insert.1[4], Value::from(2_i32), "tagged with V");
+        assert_eq!(insert.1[6], Value::from(ts), "USING TIMESTAMP");
+        assert_eq!(delete.1[0], Value::from(ts), "USING TIMESTAMP");
+        assert_eq!(delete.1[3], Value::from(lu1), "the old row");
+
+        let t = [gender("male")];
+        let delta = index_delta(&[], version_keys(&t, lu2));
+        assert_eq!(
+            unit_statements(&key(), &delta, &delta.units[0], ts),
+            Err(WriteFailure::Permanent)
+        );
     }
 
     /// D4: the miss mapping from the returned columns (spike A1). A missing
@@ -4240,6 +4735,74 @@ mod node_tests {
         // I1, three tries of V1, X1; no I2.
         assert_eq!((spent.write, spent.cas), (5, 1), "{spent}");
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    }
+
+    /// IW17, RW9: a post-CAS write the node refuses as `Invalid` is tried
+    /// once, not `tries` times. A partition key over 65,535 bytes is refused
+    /// at execute time, so nothing is written.
+    #[tokio::test]
+    async fn an_invalid_post_cas_write_is_tried_once() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = format!("test-invalid-{}", "x".repeat(70_000));
+        let values = vec![
+            Value::from(tenant),
+            Value::from("Patient"),
+            Value::from(Utc::now()),
+            Value::from("p"),
+            Value::from(1_i32),
+            Value::from("4.0"),
+            Value::from(1_i64),
+        ];
+        let counted = backend.statement_counts();
+        let outcome = backend
+            .write_with_retries(
+                INSERT_RESOURCES_BY_TYPE,
+                values,
+                "index row",
+                POST_CAS_WRITE_TRIES,
+            )
+            .await;
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
+        assert_eq!(spent.write, 1, "{spent}");
+    }
+
+    /// IW17: `write_index_delta` passes an `Invalid` unit's `Permanent` up
+    /// instead of folding it into `TriesExhausted`. One insert and no delete
+    /// is one statement, never a batch, so the node refuses a single
+    /// statement (a partition key over 65,535 bytes) and nothing is written.
+    #[tokio::test]
+    async fn an_invalid_index_unit_fails_the_delta_as_permanent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = format!("test-invalid-{}", "x".repeat(70_000));
+        let key = RowKey {
+            tenant_id: &tenant,
+            resource_type: "Patient",
+            id: "p",
+        };
+        let keys = [IndexKey::ResourcesByType];
+        let delta = index_delta(
+            &[],
+            VersionKeys {
+                version_id: 1,
+                last_updated: Utc::now(),
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                keys: &keys,
+            },
+        );
+        let counted = backend.statement_counts();
+        let outcome = backend
+            .write_index_delta(&key, &delta, 1, POST_CAS_WRITE_TRIES)
+            .await;
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
+        assert_eq!(spent.write, 1, "{spent}");
     }
 
     /// An update whose new `resources_by_type` row fails all three tries

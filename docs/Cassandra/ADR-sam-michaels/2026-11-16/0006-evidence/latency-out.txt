@@ -1,0 +1,50 @@
+--- rows per write k=1 (token_code_index, one partition per row; 300 samples) ---
+  sequential                               p50   0.12 ms  p95   0.21 ms  p99   0.23 ms
+  concurrent                               p50   0.14 ms  p95   0.20 ms  p99   0.22 ms
+  logged                                   p50   0.14 ms  p95   0.21 ms  p99   0.24 ms
+  unlogged                                 p50   0.15 ms  p95   0.21 ms  p99   0.23 ms
+  logged ins+del (A: 2 batches)            p50   0.27 ms  p95   0.35 ms  p99   0.43 ms
+  logged one batch ins+del                 p50   0.14 ms  p95   0.20 ms  p99   0.22 ms
+  concurrent ins then concurrent del       p50   0.25 ms  p95   0.34 ms  p99   0.41 ms
+  pairs: per-partition batch, concurrent   p50   0.13 ms  p95   0.18 ms  p99   0.22 ms
+  chains: per key ins then del, concurrent p50   0.22 ms  p95   0.34 ms  p99   0.37 ms
+--- rows per write k=8 (token_code_index, one partition per row; 300 samples) ---
+  sequential                               p50   0.78 ms  p95   1.10 ms  p99   1.23 ms
+  concurrent                               p50   0.12 ms  p95   0.18 ms  p99   0.23 ms
+  logged                                   p50   0.27 ms  p95   0.36 ms  p99   0.39 ms
+  unlogged                                 p50   0.14 ms  p95   0.22 ms  p99   0.23 ms
+  logged ins+del (A: 2 batches)            p50   0.45 ms  p95   0.57 ms  p99   0.64 ms
+  logged one batch ins+del                 p50   0.28 ms  p95   0.33 ms  p99   0.37 ms
+  concurrent ins then concurrent del       p50   0.26 ms  p95   0.34 ms  p99   0.41 ms
+  pairs: per-partition batch, concurrent   p50   0.15 ms  p95   0.19 ms  p99   0.22 ms
+  chains: per key ins then del, concurrent p50   0.23 ms  p95   0.32 ms  p99   0.36 ms
+--- rows per write k=16 (token_code_index, one partition per row; 300 samples) ---
+  sequential                               p50   1.49 ms  p95   1.97 ms  p99   2.28 ms
+  concurrent                               p50   0.15 ms  p95   0.21 ms  p99   0.24 ms
+  logged                                   p50   0.28 ms  p95   0.32 ms  p99   0.36 ms
+  unlogged                                 p50   0.21 ms  p95   0.28 ms  p99   0.30 ms
+  logged ins+del (A: 2 batches)            p50   0.54 ms  p95   0.64 ms  p99   0.73 ms
+  logged one batch ins+del                 p50   0.29 ms  p95   0.36 ms  p99   0.40 ms
+  concurrent ins then concurrent del       p50   0.32 ms  p95   0.40 ms  p99   0.49 ms
+  pairs: per-partition batch, concurrent   p50   0.17 ms  p95   0.23 ms  p99   0.28 ms
+  chains: per key ins then del, concurrent p50   0.30 ms  p95   0.38 ms  p99   0.42 ms
+--- rows per write k=32 (token_code_index, one partition per row; 300 samples) ---
+  sequential                               p50   3.06 ms  p95   3.93 ms  p99   4.51 ms
+  concurrent                               p50   0.24 ms  p95   0.30 ms  p99   0.35 ms
+  logged                                   p50   0.41 ms  p95   0.50 ms  p99   0.53 ms
+  unlogged                                 p50   0.30 ms  p95   0.37 ms  p99   0.39 ms
+  logged ins+del (A: 2 batches)            p50   0.71 ms  p95   0.87 ms  p99   0.98 ms
+  logged one batch ins+del                 p50   0.52 ms  p95   0.64 ms  p99   0.69 ms
+  concurrent ins then concurrent del       p50   0.48 ms  p95   0.59 ms  p99   0.65 ms
+  pairs: per-partition batch, concurrent   p50   0.25 ms  p95   0.32 ms  p99   0.35 ms
+  chains: per key ins then del, concurrent p50   0.41 ms  p95   0.52 ms  p99   0.60 ms
+--- rows per write k=64 (token_code_index, one partition per row; 300 samples) ---
+  sequential                               p50   6.23 ms  p95   7.57 ms  p99   8.04 ms
+  concurrent                               p50   0.35 ms  p95   0.43 ms  p99   0.47 ms
+  logged                                   p50   0.65 ms  p95   0.78 ms  p99   0.90 ms
+  unlogged                                 p50   0.60 ms  p95   0.80 ms  p99   0.92 ms
+  logged ins+del (A: 2 batches)            p50   1.26 ms  p95   1.44 ms  p99   1.51 ms
+  logged one batch ins+del                 p50   0.79 ms  p95   0.93 ms  p99   1.05 ms
+  concurrent ins then concurrent del       p50   0.71 ms  p95   0.87 ms  p99   0.97 ms
+  pairs: per-partition batch, concurrent   p50   0.40 ms  p95   0.55 ms  p99   0.70 ms
+  chains: per key ins then del, concurrent p50   0.62 ms  p95   0.78 ms  p99  42.36 ms

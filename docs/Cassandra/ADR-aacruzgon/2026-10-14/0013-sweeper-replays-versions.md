@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0013: The sweeper replays the intent's version, even if superseded
 
 - **Date:** 2026-10-14
-- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Status:** accepted (team review at the schema session, roadmap item 1.4); its LOCAL_SERIAL read for every intent is replaced by a quorum read first (ADR-sam-michaels-0006, SW12), see ADR-aacruzgon-0081
 - **Context:**
     - **What the design said.** If the resource's `write_id` differs from the intent's, the sweeper deletes the intent, because "a later version has already superseded it, whose own intent row covers it".
     - **Why that is wrong.** The later version's writer deletes only the keys of the version it read (N+1), and those were never written. The index rows of N are never deleted.

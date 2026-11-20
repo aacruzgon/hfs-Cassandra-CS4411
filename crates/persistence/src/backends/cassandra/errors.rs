@@ -92,6 +92,21 @@ pub(crate) fn is_too_many_tombstones(error: &DriverError) -> bool {
     )
 }
 
+/// Whether the node refused the statement as `Invalid`: a request that no
+/// later try can change, so the post-CAS writers do not retry it (IW17,
+/// ADR-sam-michaels-0006; RW9). For an index or version row that is a key
+/// over 64 KiB, bounded before anything is written (IW6), so it stops a bug
+/// from being retried rather than a case the backend expects.
+pub(crate) fn is_invalid(error: &DriverError) -> bool {
+    let DriverError::Driver(error) = error else {
+        return false;
+    };
+    matches!(
+        error.as_ref(),
+        CdrsError::Server { body, .. } if matches!(body.ty, ErrorType::Invalid)
+    )
+}
+
 /// Maps a failed statement to a [`BackendError`]. `operation` names what was
 /// being done, for the log and for the messages that are not sent to clients.
 pub(crate) fn map_driver_error(error: &DriverError, operation: &str) -> BackendError {
@@ -409,6 +424,34 @@ pub(super) mod tests {
                 matches!(mapped, BackendError::QueryError { .. }),
                 "{ty:?} -> {mapped:?}"
             );
+        }
+    }
+
+    /// IW17: only the node's `Invalid` refusal stops the post-CAS writers'
+    /// retries. Timeouts, unavailable replicas, failures, lost connections
+    /// and the backend's deadline may pass on a later try.
+    #[test]
+    fn only_an_invalid_refusal_is_permanent() {
+        assert!(is_invalid(&server(ErrorType::Invalid)));
+        let retried = [
+            server(write_timeout(WriteType::Simple)),
+            server(write_timeout(WriteType::Batch)),
+            server(write_failure(WriteType::Simple)),
+            server(ErrorType::Unavailable(UnavailableError::new(
+                Consistency::LocalQuorum,
+                2,
+                1,
+            ))),
+            server(ErrorType::Overloaded),
+            server(ErrorType::Server),
+            DriverError::from(CdrsError::Io(std::io::Error::other("reset"))),
+            DriverError::Deadline {
+                after: std::time::Duration::from_millis(10),
+                sent: true,
+            },
+        ];
+        for error in retried {
+            assert!(!is_invalid(&error), "{error:?}");
         }
     }
 

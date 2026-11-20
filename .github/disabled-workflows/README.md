@@ -11,8 +11,10 @@ Seven workflows are active. Six run on the team's self-hosted runners
 `cassandra-coverage.yml` and `fhir-versions.yml`. Light jobs use
 `[self-hosted, hfs-cassandra-light]`, the two clippy jobs and
 `fhir-versions.yml`'s all-versions test job
-`[self-hosted, hfs-cassandra-heavy]`, and the Rust jobs keep a bounded cargo
-target directory on each machine instead of a cache (ADR-sam-michaels-0002).
+`[self-hosted, hfs-cassandra-medium]`, and the mutation-testing job, the only
+one that needs more than 20G, `[self-hosted, hfs-cassandra-heavy]`
+(ADR-aacruzgon-0082). The Rust jobs keep a bounded cargo target directory on
+each machine instead of a cache (ADR-sam-michaels-0002).
 
 The standalone `.github/workflows/coverage.yml` workflow runs on standard
 GitHub-hosted Linux runners. It measures the default Rust workspace
@@ -36,8 +38,9 @@ those jobs queued indefinitely. Since #16 it has `sam-7900x`
 (ADR-aacruzgon-0023), but `ci.yml` still lacks the remote Docker host. Several
 `ci.yml` jobs target plain `[self-hosted]` or `[self-hosted, Linux]`, which both
 runners match, so a restored copy must be retargeted to
-`[self-hosted, hfs-cassandra-light]` or `[self-hosted, hfs-cassandra-heavy]` and
-given the fork guard from ADR-aacruzgon-0018 first. Follow-up CI, including
+`[self-hosted, hfs-cassandra-light]`, `[self-hosted, hfs-cassandra-medium]` or
+`[self-hosted, hfs-cassandra-heavy]` (ADR-aacruzgon-0082) and given the fork
+guard from ADR-aacruzgon-0018 first. Follow-up CI, including
 adapting the benchmark to Cassandra/PostgreSQL, runs on the self-hosted runners
 (ADR-aacruzgon-0018).
 

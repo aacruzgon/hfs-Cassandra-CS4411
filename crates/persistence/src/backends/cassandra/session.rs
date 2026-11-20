@@ -720,7 +720,7 @@ impl StatementCounts {
         }
     }
 
-    /// Every request sent, a batch as one: the round trips. `batched` is
+    /// Every request sent, a batch as one. `batched` is
     /// left out, since its statements travel inside the `batch` requests.
     pub fn total(&self) -> u64 {
         self.read + self.serial_read + self.write + self.batch + self.cas
@@ -1340,7 +1340,7 @@ mod tests {
         assert_eq!(batch.prepared_queries.len(), 1);
     }
 
-    /// IW14, separate fields: a batch is one round trip in `batch` and its
+    /// IW14, separate fields: a batch is one request in `batch` and its
     /// statements in `batched`; `write` counts only statements sent alone.
     #[test]
     fn a_batch_counts_as_one_round_trip_and_its_statements_as_batched() {

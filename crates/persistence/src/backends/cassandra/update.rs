@@ -670,7 +670,7 @@ mod node_tests {
             (1, 0, 4, 1)
         );
         assert_eq!((spent.batch, spent.batched), (1, 2), "{spent}");
-        assert_eq!(spent.total(), 7, "round trips: {spent}");
+        assert_eq!(spent.total(), 7, "requests: {spent}");
 
         assert_eq!(updated.version_id(), "2");
         assert_eq!(

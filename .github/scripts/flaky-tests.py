@@ -32,7 +32,8 @@ Commands:
       Runs every test N times, each run its own process:
       `<binary> --exact <name> --show-output --test-threads 1`. Writes
       DIR/results.json and one log per test. Past M minutes no new run
-      starts; the report counts the runs not reached.
+      starts; the report counts the runs not reached. Inputs it cannot read
+      give a warning and a results.json that says why.
 
   report --results FILE --out DIR
       DIR/flaky.md and DIR/flaky.json: per test, the runs, passes, failures,
@@ -510,7 +511,10 @@ def table(headers: list[str], rows: list[list[object]]) -> str:
     return "\n".join(out) + "\n"
 
 
-def report(results: dict, found: dict | None = None) -> tuple[str, dict]:
+def report(results: dict, found: dict | None = None, unreadable: str | None = None) -> tuple[str, dict]:
+    """`unreadable` says why the results could not be read, if they could
+    not; then an empty result list is not taken to mean that nothing was
+    found."""
     rows, data_rows, warnings = [], [], list((found or {}).get("warnings") or [])
     for entry in results.get("results") or []:
         runs = entry.get("runs") or []
@@ -543,10 +547,17 @@ def report(results: dict, found: dict | None = None) -> tuple[str, dict]:
             warnings.append(f"{entry['name']}: {entry['not_reached']} of its runs were not reached within the time budget")
         if row["always_fails"]:
             warnings.append(f"{entry['name']} failed every one of its {len(runs)} runs")
+        # A run that printed "skipping:" passed without testing anything, so
+        # it is never counted as evidence of stability.
+        if skipped:
+            warnings.append(f"{entry['name']}: {skipped} of {len(runs)} runs printed `skipping:` and tested nothing"
+                            + (" (no node?)" if skipped == len(runs) else ""))
         status = ("flaky" if row["flaky"] else "fails every run" if row["always_fails"] else
                   "ignored" if row["ignored"] == len(runs) and runs else
                   "not run (its name matched no test)" if count["not run"] == len(runs) and runs else
-                  "skipped (no node?)" if skipped == len(runs) and runs else "stable" if runs else "not run")
+                  "skipped (no node?)" if skipped == len(runs) and runs else
+                  f"stable in {len(runs) - skipped} run(s), {skipped} skipped" if skipped else
+                  "stable" if runs else "not run")
         rows.append([
             f"`{entry['name']}`", entry["target"], entry.get("change") or "–", len(runs), count["pass"],
             count["fail"] + count["error"], count["timeout"], status,
@@ -561,7 +572,14 @@ def report(results: dict, found: dict | None = None) -> tuple[str, dict]:
     if total == 0 and expected:
         md += (f"{expected} test(s) were found in the diff, but none was run: the build or the node "
                "did not come up. See the job's log.\n")
+        if unreadable:
+            md += f"\nThe re-run results: {unreadable}.\n"
         warnings.append(f"Flaky tests: {expected} test(s) found, none run")
+    elif total == 0 and unreadable and found is None:
+        # Without the list of tests found, unreadable results say nothing
+        # about whether there was anything to re-run.
+        md += f"No result is reported: {unreadable}. See the job's log.\n"
+        warnings.append(f"Flaky tests: no results ({unreadable})")
     elif total == 0:
         md += "No test added or changed under the backend's lib or tests/cassandra/, so nothing was re-run.\n"
     else:
@@ -589,6 +607,12 @@ def report(results: dict, found: dict | None = None) -> tuple[str, dict]:
 
 
 # --- the command line -------------------------------------------------------------
+
+
+def json_kind(value: object) -> str:
+    """What a decoded JSON value is, in JSON's own words."""
+    return {dict: "object", list: "array", str: "string", bool: "boolean", int: "number",
+            float: "number", type(None): "null"}.get(type(value), type(value).__name__)
 
 
 def option(args: list[str], name: str, default: str | None = None) -> str | None:
@@ -627,26 +651,43 @@ def main(argv: list[str]) -> int:
         print(json.dumps(found, indent=2))
         return 0
     if cmd == "run":
-        tests = json.loads(Path(option(args, "--tests")).read_text())["tests"]
-        binaries = json.loads(Path(option(args, "--bins")).read_text())
         logs = Path(option(args, "--logs"))
+        logs.mkdir(parents=True, exist_ok=True)
+        try:
+            tests = json.loads(Path(option(args, "--tests")).read_text())["tests"]
+            binaries = json.loads(Path(option(args, "--bins")).read_text())
+            if not isinstance(tests, list) or not isinstance(binaries, dict):
+                raise ValueError("--tests needs a tests list and --bins an object")
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            # Report only: say why, keep a results file the report can read,
+            # and exit 0.
+            message = f"the re-run inputs could not be read ({error.__class__.__name__}: {error})"
+            print(f"warning: {message}")
+            (logs / "results.json").write_text(json.dumps({"results": [], "error": message}, indent=2) + "\n")
+            return 0
         budget = option(args, "--budget-minutes")
         result = run(tests, binaries, int(option(args, "--runs", "20")), logs, float(option(args, "--timeout", "300")),
                      float(budget) * 60 if budget else None)
         (logs / "results.json").write_text(json.dumps(result, indent=2) + "\n")
         return 0
     if cmd == "report":
+        unreadable = None
         try:
             results = json.loads(Path(option(args, "--results")).read_text())
-        except (OSError, ValueError, TypeError):
+            if not isinstance(results, dict):
+                raise ValueError(f"a JSON {json_kind(results)}, not an object")
+        except (OSError, ValueError, TypeError) as error:
             results = {"results": []}
+            unreadable = f"{option(args, '--results')} could not be read ({error.__class__.__name__})"
+        if unreadable is None and results.get("error"):
+            unreadable = str(results["error"])
         found = None
         if option(args, "--found"):
             try:
                 found = json.loads(Path(option(args, "--found")).read_text())
             except (OSError, ValueError):
                 found = None
-        md, data = report(results, found)
+        md, data = report(results, found, unreadable)
         out = Path(option(args, "--out", "."))
         out.mkdir(parents=True, exist_ok=True)
         (out / "flaky.md").write_text(md)

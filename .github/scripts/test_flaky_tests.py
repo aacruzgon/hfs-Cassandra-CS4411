@@ -400,6 +400,24 @@ class Report(unittest.TestCase):
         self.assertFalse(any("c failed every one" in w for w in data["warnings"]))
 
 
+class Skipped(unittest.TestCase):
+    def test_a_mix_of_skipped_and_executed_runs_is_not_plain_stable_and_warns(self):
+        ok = {"outcome": "pass", "seconds": 0.1, "skipped": False}
+        skip = {"outcome": "pass", "seconds": 0.1, "skipped": True}
+        md, data = flaky.report({"runs_per_test": 2, "timeout_s": 300, "results": [
+            {"target": "lib", "name": "m", "runs": [ok, skip]},
+            {"target": "lib", "name": "s", "runs": [skip, skip]},
+            {"target": "lib", "name": "a", "runs": [ok, ok]},
+        ]})
+        status = {r[0]: r for r in (line.split(" | ") for line in md.splitlines() if line.startswith("| `"))}
+        self.assertIn("stable in 1 run(s), 1 skipped", status["| `m`"])
+        self.assertIn("skipped (no node?)", status["| `s`"])
+        self.assertIn("stable", status["| `a`"])
+        self.assertIn("m: 1 of 2 runs printed `skipping:` and tested nothing", data["warnings"])
+        self.assertIn("s: 2 of 2 runs printed `skipping:` and tested nothing (no node?)", data["warnings"])
+        self.assertFalse(any(w.startswith("a:") for w in data["warnings"]))
+
+
 class Ignored(unittest.TestCase):
     def test_an_ignored_test_keeps_its_status_and_the_summary_says_why(self):
         ignored = {"outcome": "ignored", "seconds": 0.1, "skipped": False}
@@ -421,11 +439,70 @@ class Ignored(unittest.TestCase):
 
 
 class Main(unittest.TestCase):
-    def test_report_with_no_results_file_exits_0(self):
-        tmp = temp_dir(self)
+    def report(self, tmp: Path, results_text: str | None, found: dict | None) -> tuple[str, dict]:
+        args = ["report", "--results", str(tmp / "results.json"), "--out", str(tmp / "out")]
+        if results_text is not None:
+            (tmp / "results.json").write_text(results_text)
+        if found is not None:
+            (tmp / "found.json").write_text(json.dumps(found))
+            args += ["--found", str(tmp / "found.json")]
         with redirect_stdout(io.StringIO()):
-            self.assertEqual(flaky.main(["report", "--results", str(tmp / "missing.json"), "--out", str(tmp / "out")]), 0)
-        self.assertIn("No test added or changed", (tmp / "out" / "flaky.md").read_text())
+            self.assertEqual(flaky.main(args), 0)
+        return (tmp / "out" / "flaky.md").read_text(), json.loads((tmp / "out" / "flaky.json").read_text())
+
+    def test_no_results_file_and_nothing_found_is_no_change(self):
+        md, data = self.report(temp_dir(self), None, {"tests": [], "warnings": []})
+        self.assertIn("No test added or changed", md)
+        self.assertEqual(data["warnings"], [])
+
+    def test_no_results_file_and_no_list_of_tests_found_says_so_and_warns(self):
+        md, data = self.report(temp_dir(self), None, None)
+        self.assertNotIn("No test added or changed", md)
+        self.assertIn("No result is reported", md)
+        self.assertTrue(any("Flaky tests: no results" in w for w in data["warnings"]))
+
+    def test_malformed_results_are_not_taken_for_an_empty_selection(self):
+        for text in ('{"results": [', "[]", "null"):
+            md, data = self.report(temp_dir(self), text, None)
+            self.assertNotIn("No test added or changed", md, text)
+            self.assertTrue(any("could not be read" in w for w in data["warnings"]), text)
+
+    def test_malformed_results_with_tests_found_say_none_ran_and_why(self):
+        md, data = self.report(temp_dir(self), '{"results": [', {"tests": [{"name": "a"}], "warnings": []})
+        self.assertIn("1 test(s) were found in the diff, but none was run", md)
+        self.assertIn("could not be read", md)
+
+    def test_run_with_unreadable_inputs_warns_exits_0_and_leaves_a_results_file(self):
+        tmp = temp_dir(self)
+        (tmp / "tests.json").write_text('{"tests": [')
+        (tmp / "bins.json").write_text("{}")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            status = flaky.main(["run", "--tests", str(tmp / "tests.json"), "--bins", str(tmp / "bins.json"),
+                                 "--runs", "1", "--logs", str(tmp / "logs")])
+        self.assertEqual(status, 0)
+        self.assertIn("warning: the re-run inputs could not be read", out.getvalue())
+        results = json.loads((tmp / "logs" / "results.json").read_text())
+        self.assertEqual(results["results"], [])
+        md, data = self.report_from(tmp / "logs" / "results.json", {"tests": [{"name": "a"}], "warnings": []}, tmp)
+        self.assertIn("could not be read", md)
+
+    def report_from(self, results: Path, found: dict, tmp: Path) -> tuple[str, dict]:
+        return self.report(tmp, results.read_text(), found)
+
+    def test_run_with_valid_inputs_still_runs(self):
+        tmp = temp_dir(self)
+        (tmp / "pass.txt").write_text(PASS)
+        fake = tmp / "fake-test"
+        fake.write_text(f"#!/bin/sh\ncat {tmp}/pass.txt\n")
+        fake.chmod(0o755)
+        (tmp / "tests.json").write_text(json.dumps({"tests": [{"target": "lib", "name": "a", "file": LIB, "line": 1, "change": "added"}]}))
+        (tmp / "bins.json").write_text(json.dumps({"lib": str(fake)}))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(flaky.main(["run", "--tests", str(tmp / "tests.json"), "--bins", str(tmp / "bins.json"),
+                                         "--runs", "2", "--logs", str(tmp / "logs")]), 0)
+        results = json.loads((tmp / "logs" / "results.json").read_text())
+        self.assertEqual([r["outcome"] for r in results["results"][0]["runs"]], ["pass", "pass"])
 
     def test_find_writes_its_json(self):
         diff, root = git_diff(self, {LIB: SOURCE}, {LIB: SOURCE.replace("fn plain()", "fn plain2()")})
@@ -447,7 +524,7 @@ class NoTempDirLeft(unittest.TestCase):
         loader = unittest.TestLoader()
         suite = unittest.TestSuite(
             loader.loadTestsFromTestCase(case)
-            for case in (Blank, TestsIn, ChangedLines, Find, Bins, Classify, Run, Budget, Report, Ignored, Main))
+            for case in (Blank, TestsIn, ChangedLines, Find, Bins, Classify, Run, Budget, Report, Skipped, Ignored, Main))
         saved = tempfile.tempdir
         tempfile.tempdir = str(scratch)
         try:

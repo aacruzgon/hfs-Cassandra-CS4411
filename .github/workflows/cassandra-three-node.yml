@@ -56,6 +56,10 @@ on:
         description: "libtest filter for the --lib tests"
         required: false
         default: "node_tests"
+      repeats:
+        description: "How many times each test binary runs (a full pass takes seconds; repeats measure the #77 rate)"
+        required: false
+        default: "5"
 
 permissions:
   contents: read
@@ -90,6 +94,10 @@ jobs:
     timeout-minutes: 120
     env:
       THREE_NODE_PROJECT: hfs-cassandra-3n
+      # Each test binary runs this many times on the same cluster: a pass of
+      # both takes about 10 s on acruzdebian, and issue #77's 504 is a rate,
+      # not a yes or no (0 to 4 race failures per run, ADR-aacruzgon-0072).
+      THREE_NODE_REPEATS: ${{ inputs.repeats || '5' }}
       COMPOSE_FILE: docker/cassandra/docker-compose.cluster.yml:docker/cassandra/docker-compose.cluster.heap512m.yml
       # Not the base file's 59342 to 59344, the bench harness's 59542, a
       # developer's 59042, the required job's 59142 or coverage's and FHIR
@@ -128,6 +136,10 @@ jobs:
             echo "THREE_NODE_CONTACT=${CASSANDRA_CLUSTER_SUBNET_PREFIX}.11:9042"
           } >> "$GITHUB_ENV"
           echo "Testing $(git rev-parse HEAD) ($(git log -1 --format=%s))"
+          case "$THREE_NODE_REPEATS" in
+            ''|*[!0-9]*|0) echo "::error::repeats must be a number from 1 to 20, not '$THREE_NODE_REPEATS'"; exit 1 ;;
+          esac
+          [ "$THREE_NODE_REPEATS" -le 20 ] || { echo "::error::repeats must be at most 20"; exit 1; }
 
       # A bounded persistent target directory of its own, as in the other
       # workflows (ADR-sam-michaels-0002), with the required Cassandra job's
@@ -210,9 +222,12 @@ jobs:
       - name: Start the memory sampler
         run: |
           mkdir -p "$THREE_NODE_OUT"
-          nohup .github/scripts/cassandra-three-node/sample-memory.sh \
-            "$THREE_NODE_OUT/memory-samples.tsv" "hfs-cassandra-3n-" 5 > /dev/null 2>&1 &
+          nohup bash .github/scripts/cassandra-three-node/sample-memory.sh \
+            "$THREE_NODE_OUT/memory-samples.tsv" "hfs-cassandra-3n-" 5 > "$RUNNER_TEMP/three-node-sampler.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/three-node-sampler.pid"
+          sleep 2
+          kill -0 "$(cat "$RUNNER_TEMP/three-node-sampler.pid")" \
+            || { echo "::warning::the memory sampler is not running"; cat "$RUNNER_TEMP/three-node-sampler.log"; }
           echo "Host before the boot:"; free -m
 
       # The nodes start one at a time behind their CQL healthcheck (the base
@@ -233,6 +248,19 @@ jobs:
           done
           docker exec -e MAX_HEAP_SIZE=128m "$n1" nodetool status
           [ "$up" = 3 ] || { echo "::error::node 1 sees $up nodes UN, not 3"; exit 1; }
+
+      # Measured, not assumed: whether the runner itself reaches the nodes'
+      # cluster addresses, which is why the tests run in a container
+      # (run-tests.sh). Report only.
+      - name: Check whether the runner reaches the nodes' cluster addresses
+        continue-on-error: true
+        run: |
+          for n in 1 2 3; do
+            ip="$CASSANDRA_CLUSTER_SUBNET_PREFIX.1$n"
+            if timeout 3 bash -c "exec 3<>/dev/tcp/$ip/9042" 2>/dev/null; then r=reachable; else r="not reachable"; fi
+            echo "$ip:9042 from the runner: $r" | tee -a "$THREE_NODE_OUT/routing.txt"
+          done
+          docker info --format 'Docker {{.ServerVersion}}; security options {{.SecurityOptions}}' | tee -a "$THREE_NODE_OUT/routing.txt"
 
       - name: Report the context
         continue-on-error: true
@@ -271,19 +299,24 @@ jobs:
       # Step 1: tests/cassandra_tests.rs against the cluster, through node 1
       # (HFS_TEST_CASSANDRA_URL, tests/common/cassandra.rs). The driver
       # routes to all three. --show-output, as in the required job, so the
-      # test report names every live test that printed a skip. A failing test
-      # fails this step only (continue-on-error); the reports below read it.
+      # test report names every live test that printed a skip. Every repeat
+      # runs whatever the one before it did; a failing test fails this step
+      # only (continue-on-error), and the reports below read every repeat.
       - name: tests/cassandra_tests.rs against the three nodes
         id: cassandra-tests
         if: ${{ !cancelled() && steps.schema.outcome == 'success' }}
         continue-on-error: true
-        timeout-minutes: 40
+        timeout-minutes: 45
         env:
           FILTER: ${{ inputs.test_filter }}
-          THREE_NODE_TEST_TIMEOUT_MIN: 35
+          THREE_NODE_TEST_TIMEOUT_MIN: 8
         run: |
-          .github/scripts/cassandra-three-node/run-tests.sh cassandra-tests tests/cassandra_tests.rs \
-            "$CASSANDRA_TESTS_BIN" ${FILTER:+"$FILTER"} --show-output
+          status=0
+          for r in $(seq 1 "$THREE_NODE_REPEATS"); do
+            .github/scripts/cassandra-three-node/run-tests.sh "cassandra-tests-r$r" tests/cassandra_tests.rs \
+              "$CASSANDRA_TESTS_BIN" ${FILTER:+"$FILTER"} --show-output || status=$?
+          done
+          exit "$status"
 
       # Step 2: the backend's live unit tests, every node_tests module
       # (write.rs, backend.rs, delete.rs, update.rs, upsert.rs, versions.rs).
@@ -293,13 +326,17 @@ jobs:
         id: lib-tests
         if: ${{ !cancelled() && steps.schema.outcome == 'success' }}
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 35
         env:
           FILTER: ${{ inputs.lib_filter || 'node_tests' }}
-          THREE_NODE_TEST_TIMEOUT_MIN: 25
+          THREE_NODE_TEST_TIMEOUT_MIN: 6
         run: |
-          .github/scripts/cassandra-three-node/run-tests.sh persistence-lib-tests "unittests src/lib.rs" \
-            "$PERSISTENCE_LIB_BIN" "$FILTER" --show-output
+          status=0
+          for r in $(seq 1 "$THREE_NODE_REPEATS"); do
+            .github/scripts/cassandra-three-node/run-tests.sh "persistence-lib-tests-r$r" "unittests src/lib.rs" \
+              "$PERSISTENCE_LIB_BIN" "$FILTER" --show-output || status=$?
+          done
+          exit "$status"
 
       # After the tests, so a paused node cannot reach them: one or two
       # replicas paused, raw CQL from cqlsh on node 1, the results read back
@@ -380,8 +417,7 @@ jobs:
           out="$THREE_NODE_OUT" in="$RUNNER_TEMP/ci-report/inputs/three-node"
           mkdir -p "$in"
           report=.github/scripts/cassandra-three-node/report.py
-          python3 .github/scripts/ci-report.py tests tests "Tests on three nodes" \
-            "$out/logs/cassandra-tests.log" "$out/logs/persistence-lib-tests.log"
+          python3 .github/scripts/ci-report.py tests tests "Tests on three nodes, every repeat" "$out"/logs/*.log
           python3 "$report" tests "$out" "$in/failures.md" "$in/failures.json"
           python3 .github/scripts/ci-report.py add failures "Failing tests on three nodes, by cause" \
             --markdown "$in/failures.md" --json "$in/failures.json"
@@ -391,8 +427,7 @@ jobs:
           python3 "$report" memory "$out" "$in/memory.md" "$in/memory.json"
           python3 .github/scripts/ci-report.py add memory "Memory: the nodes and the test containers" \
             --markdown "$in/memory.md" --json "$in/memory.json"
-          python3 .github/scripts/ci-report.py cas cas "CAS outcome counters" \
-            "$out/logs/cassandra-tests.log" "$out/logs/persistence-lib-tests.log"
+          python3 .github/scripts/ci-report.py cas cas "CAS outcome counters, every repeat" "$out"/logs/*.log
 
       - name: Report the target directory's size
         if: always()

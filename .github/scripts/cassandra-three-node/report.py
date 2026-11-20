@@ -136,7 +136,7 @@ def parse_log(path: Path) -> dict:
         block = suite["blocks"].get(name, [])
         first, where = first_failure_line(block)
         failures.append({
-            "suite": suite["suite"] or suite["label"], "test": name,
+            "label": suite["label"], "suite": suite["suite"] or suite["label"], "test": name,
             "class": classify(name, "\n".join(block)),
             "first_line": first, "location": where,
         })
@@ -172,15 +172,43 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
         ])
         failures += s["failures"]
     counts = {key: sum(1 for f in failures if f["class"] == key) for key, _ in CLASSES}
+    # Repeats: run-tests.sh labels are <step>-r<N>. Per step, how many runs,
+    # and per test, in how many of them it failed.
+    def step_of(label: str) -> str:
+        return re.sub(r"-r\d+$", "", label)
+    runs: dict[str, int] = {}
+    for s_ in suites:
+        runs[step_of(s_["label"])] = runs.get(step_of(s_["label"]), 0) + 1
+    by_test: dict[tuple, dict] = {}
+    for f in failures:
+        key = (step_of(f["label"]), f["test"])
+        entry = by_test.setdefault(key, {"step": key[0], "suite": f["suite"], "test": f["test"], "runs_failed": 0,
+                                         "classes": [], "first_line": f["first_line"], "location": f["location"]})
+        entry["runs_failed"] += 1
+        if f["class"] not in entry["classes"]:
+            entry["classes"].append(f["class"])
+    runs_with_77 = {}
+    for s_ in suites:
+        if any(f["class"] == "504-77" for f in s_["failures"]):
+            runs_with_77[step_of(s_["label"])] = runs_with_77.get(step_of(s_["label"]), 0) + 1
     md = table(["Step", "Suite", "Passed", "Failed", "Ignored", "Filtered out", "libtest time",
                 "Exit", "Timed out", "Wall time", "Test container memory.peak", "OOM kills"], rows)
-    md += "\n**Failures by cause:** " + "; ".join(f"{label}: {counts[key]}" for key, label in CLASSES) + ".\n"
-    if failures:
-        md += "\n" + table(
-            ["Suite", "Test", "Cause", "First line of the failure", "Where"],
-            [[f"`{f['suite']}`", f"`{f['test']}`", dict(CLASSES)[f["class"]],
-              (f["first_line"] or "")[:300], f"`{f['location']}`" if f["location"] else None] for f in failures],
+    md += ("\n**Failures by cause** (one per failing test per run): "
+           + "; ".join(f"{label}: {counts[key]}" for key, label in CLASSES) + ".\n")
+    md += ("\n**Runs with at least one #77 504:** "
+           + "; ".join(f"`{step}` {runs_with_77.get(step, 0)} of {n}" for step, n in sorted(runs.items())) + ".\n")
+    if by_test:
+        md += "\n**Every failing test, over all runs:**\n\n" + table(
+            ["Step", "Test", "Failed in", "Cause", "First line of the failure (first run it failed in)", "Where"],
+            [[e["step"], f"`{e['test']}`", f"{e['runs_failed']} of {runs.get(e['step'], '?')} runs",
+              ", ".join(dict(CLASSES)[c] for c in e["classes"]),
+              (e["first_line"] or "")[:300], f"`{e['location']}`" if e["location"] else None]
+             for e in sorted(by_test.values(), key=lambda e: (e["step"], -e["runs_failed"], e["test"]))],
         )
+        md += "\n<details><summary>Each failure in each run</summary>\n\n" + table(
+            ["Run", "Test", "Cause", "First line of the failure"],
+            [[f["label"], f"`{f['test']}`", dict(CLASSES)[f["class"]], (f["first_line"] or "")[:300]] for f in failures],
+        ) + "\n</details>\n"
     else:
         md += "\nNo test failed.\n"
     md += (
@@ -190,7 +218,9 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
         "(docker/cassandra/README.md, \"Backend tests against the cluster\"). The job never fails on a test; "
         "this table is the result.\n"
     )
-    write(md_path, json_path, md, {"suites": suites, "failures_by_class": counts, "warnings": warnings})
+    write(md_path, json_path, md, {"suites": suites, "runs": runs, "failures_by_class": counts,
+                                   "runs_with_77": runs_with_77, "by_test": list(by_test.values()),
+                                   "warnings": warnings})
 
 
 # --- pause scenarios ---------------------------------------------------------
@@ -365,9 +395,10 @@ def cmd_memory(out_dir: str, md_path: str, json_path: str) -> None:
         values = dict(l.split(" ", 1) for l in f.read_text().splitlines() if " " in l)
         peak = values.get("memory.peak", "").strip()
         state = out / "nodes" / f"{f.stem}.state"
+        limit = values.get("memory.max", "").strip()
         peaks.append({"node": f.stem, "state": state.read_text().strip() if state.exists() else None,
                       "memory_peak_bytes": int(peak) if peak.isdigit() else None,
-                      "memory_max": values.get("memory.max", "").strip() or None,
+                      "memory_max": f"{int(limit) // MIB:,} MiB" if limit.isdigit() else (limit or None),
                       "oom_kill": values.get("oom_kill", "").strip() or None})
     for f in sorted((out / "run").glob("*.json")) if (out / "run").exists() else []:
         run = json.loads(f.read_text())

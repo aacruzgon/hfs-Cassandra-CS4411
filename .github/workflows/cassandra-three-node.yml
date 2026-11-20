@@ -19,6 +19,12 @@ name: Cassandra three nodes (report only)
 # ports (59642 to 59644); down -v at the end removes only that project. The
 # tests run in a container on the cluster's network (run-tests.sh says why).
 #
+# Two checkouts: the code under test (the ref input, or the run's own commit)
+# at the workspace root, and this workflow's own commit's .github/ and docker/
+# in .three-node-job/, so the job's scripts, the Compose override and the CI
+# report helper are always this workflow's, whatever the ref is. The schema
+# (docs/Cassandra/schema/schema.cql) comes with the code under test.
+#
 # Its sections go through the CI report helper (.github/scripts/ci-report.py)
 # and the job's own .github/scripts/cassandra-three-node/report.py into the
 # job summary and the artifact ci-report-three-node, with the full test logs,
@@ -26,16 +32,23 @@ name: Cassandra three nodes (report only)
 
 on:
   schedule:
-    # Daily 10:00 UTC: 06:00 Eastern in summer time, 05:00 in winter (cron is
-    # UTC). The quietest hour on the fork's runners: of the last 1,000 runs
-    # (2026-11-04 to 2026-11-20), none started between 10:00 and 12:59 UTC and
-    # 3 at 09:00, against 45 to 108 an hour in the evening. Clear of the
-    # canary (02:00) and the Saturday prune (20:00).
-    - cron: "0 10 * * *"
+    # Daily at 10:37 UTC (05:37 Eastern in winter), picked from when runs
+    # really start (run_started_at; scheduled runs counted where they
+    # started, not at their cron). Of the fork's 1,000 most recent runs
+    # (2026-11-08T01:09 to 2026-11-20T14:24 UTC), none started between 10:00
+    # and 12:59 UTC, against 14 at 08:00, 19 at 09:00 and 39 at 13:00, and 32
+    # to 107 an hour from 16:00 to 22:00. GitHub starts this fork's scheduled
+    # runs hours late: the canary's 02:00 cron was created at 08:16 to 09:52
+    # (on 2026-11-20 its job started at 09:59 on acruzdebian), and the
+    # Saturday prune's 20:00 at 23:28 to 23:42. Off the hour (:37), where
+    # GitHub's schedule load and delays are lower. A late run only queues
+    # (concurrency, below); ADR-aacruzgon-0083 says to check when the first
+    # scheduled runs really start.
+    - cron: "37 10 * * *"
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branch, tag or commit to test (empty: the ref the run was dispatched on)"
+        description: "Branch, tag or commit of this repository to test (empty: the dispatched ref). Never a fork's refs/pull/N/head: it would run that code on a self-hosted runner, so the job refuses refs/pull/."
         required: false
         default: ""
       test_filter:
@@ -56,9 +69,11 @@ permissions:
   # The step-timings report reads this job's steps from the Actions API.
   actions: read
 
-# One run at a time across every ref: two clusters would not fit the 20G a
-# job must fit (ADR-aacruzgon-0080), and the ports are fixed. A run that is
-# queued waits; it does not cancel the one in flight.
+# One run at a time across every ref: the ports, the subnet and the Compose
+# project are fixed. cancel-in-progress: false never cancels the run in
+# flight, but GitHub keeps at most one pending run per group: a third run
+# (a dispatch while the nightly is queued, say) cancels the pending one and
+# takes its place.
 concurrency:
   group: cassandra-three-node
   cancel-in-progress: false
@@ -74,12 +89,13 @@ jobs:
     name: Cassandra three-node tests (report only)
     # Fork guard (ADR-aacruzgon-0018); schedule and dispatch always pass it.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # Heavy: the build (the required Cassandra job's two persistence binaries,
-    # about 5 GiB anon there) and three nodes at 1700 MiB plus a 6 GiB test
-    # container. Until PR #100 narrows the label to acruzdebian, heavy also
-    # matches sam-7900x, so the job keeps to its 20G cap
-    # (ADR-aacruzgon-0023, 0080). The containers run in gh-runner's rootless
-    # Docker, outside the runner service's cgroup.
+    # Heavy (ADR-aacruzgon-0023, 0080): the build (the required Cassandra
+    # job's two persistence binaries, 4.0 to 4.7 GiB anon measured) fits a
+    # runner's 20G cap. The cap covers the build only: the three nodes (3 x
+    # 1700 MiB limits) and the test container (6 GiB limit) run in
+    # gh-runner's rootless Docker, outside the runner service's cgroup, and
+    # measured about 3.7 GiB together. PR #100 narrows heavy to acruzdebian;
+    # this workflow merges after it.
     runs-on: [self-hosted, hfs-cassandra-heavy]
     timeout-minutes: 120
     env:
@@ -88,7 +104,9 @@ jobs:
       # both takes about 10 s on acruzdebian, and issue #77's 504 is a rate,
       # not a yes or no (0 to 4 race failures per run, ADR-aacruzgon-0072).
       THREE_NODE_REPEATS: ${{ inputs.repeats || '5' }}
-      COMPOSE_FILE: docker/cassandra/docker-compose.cluster.yml:docker/cassandra/docker-compose.cluster.heap512m.yml
+      # This workflow's own .github/ and docker/ (the second checkout below).
+      THREE_NODE_JOB_FILES: .three-node-job
+      COMPOSE_FILE: .three-node-job/docker/cassandra/docker-compose.cluster.yml:.three-node-job/docker/cassandra/docker-compose.cluster.heap512m.yml
       # Not the base file's 59342 to 59344, the bench harness's 59542, a
       # developer's 59042, the required job's 59142 or coverage's and FHIR
       # versions' 59242; free on acruzdebian on 2026-11-20 (ss -ltn).
@@ -103,10 +121,42 @@ jobs:
       CARGO_INCREMENTAL: 0
       CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
     steps:
-      - name: Checkout
+      # Before any checkout: repeats is a whole number from 1 to 20 (no
+      # leading zero: seq 1 00 runs nothing), and the ref is not a pull
+      # request's. Printed with %q, so a newline cannot start a workflow
+      # command.
+      - name: Check the dispatch inputs
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          if ! [[ $THREE_NODE_REPEATS =~ ^([1-9]|1[0-9]|20)$ ]]; then
+            printf '::error::repeats must be a whole number from 1 to 20, not %q\n' "$THREE_NODE_REPEATS"
+            exit 1
+          fi
+          case "$REF" in
+            *refs/pull/*|pull/*|*$'\n'*)
+              printf '::error::ref must be a branch, tag or commit of this repository, not %q\n' "$REF"
+              exit 1 ;;
+          esac
+
+      # The code under test.
+      - name: Checkout the code under test
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # This workflow's own scripts and Compose files, from the commit the run
+      # was started on, so a ref without them (a branch older than this job)
+      # still runs.
+      - name: Checkout this workflow's scripts and Compose files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .three-node-job
+          sparse-checkout: |
+            .github
+            docker
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -126,10 +176,17 @@ jobs:
             echo "THREE_NODE_CONTACT=${CASSANDRA_CLUSTER_SUBNET_PREFIX}.11:9042"
           } >> "$GITHUB_ENV"
           echo "Testing $(git rev-parse HEAD) ($(git log -1 --format=%s))"
-          case "$THREE_NODE_REPEATS" in
-            ''|*[!0-9]*|0) echo "::error::repeats must be a number from 1 to 20, not '$THREE_NODE_REPEATS'"; exit 1 ;;
-          esac
-          [ "$THREE_NODE_REPEATS" -le 20 ] || { echo "::error::repeats must be at most 20"; exit 1; }
+          echo "The job's scripts and Compose files: $(git -C "$THREE_NODE_JOB_FILES" rev-parse HEAD)"
+
+      # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
+      # Before the build, so a cluster such a run left does not stay up
+      # through it.
+      - name: Remove leftovers of an earlier run
+        run: |
+          docker ps -aq --filter "name=^hfs-cassandra-3n-tests-" | xargs -r docker rm -f
+          docker compose -p "$THREE_NODE_PROJECT" unpause 2>/dev/null || true
+          docker compose -p "$THREE_NODE_PROJECT" down -v --remove-orphans
+          echo "THREE_NODE_IMAGE=$(docker compose -p "$THREE_NODE_PROJECT" config --images | sort -u | head -1)" >> "$GITHUB_ENV"
 
       # A bounded persistent target directory of its own, as in the other
       # workflows (ADR-sam-michaels-0002), with the required Cassandra job's
@@ -176,7 +233,7 @@ jobs:
       - name: Build tests/cassandra_tests.rs and the --lib tests, and report the memory peak
         id: build
         run: |
-          python3 .github/scripts/ci-report.py build build-three-node \
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py build build-three-node \
             "Build: helios-persistence cassandra_tests and --lib tests" -- \
             nice -n 10 cargo test -p helios-persistence --features cassandra \
               --test cassandra_tests --lib --no-run --timings
@@ -199,20 +256,12 @@ jobs:
           ' | tee -a "$GITHUB_ENV"
           grep -q '^CASSANDRA_TESTS_BIN=' "$GITHUB_ENV" && grep -q '^PERSISTENCE_LIB_BIN=' "$GITHUB_ENV"
 
-      # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
-      - name: Remove leftovers of an earlier run
-        run: |
-          docker ps -aq --filter "name=^hfs-cassandra-3n-tests-" | xargs -r docker rm -f
-          docker compose -p "$THREE_NODE_PROJECT" unpause 2>/dev/null || true
-          docker compose -p "$THREE_NODE_PROJECT" down -v --remove-orphans
-          echo "THREE_NODE_IMAGE=$(docker compose -p "$THREE_NODE_PROJECT" config --images | sort -u | head -1)" >> "$GITHUB_ENV"
-
       # From before the boot to the end: the three nodes and the test
       # containers every 5 s, and the host's MemAvailable.
       - name: Start the memory sampler
         run: |
           mkdir -p "$THREE_NODE_OUT"
-          nohup bash .github/scripts/cassandra-three-node/sample-memory.sh \
+          nohup bash "$THREE_NODE_JOB_FILES"/.github/scripts/cassandra-three-node/sample-memory.sh \
             "$THREE_NODE_OUT/memory-samples.tsv" "hfs-cassandra-3n-" 5 > "$RUNNER_TEMP/three-node-sampler.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/three-node-sampler.pid"
           sleep 2
@@ -225,7 +274,7 @@ jobs:
       - name: Start the three nodes and wait for their healthchecks
         id: cluster
         run: |
-          python3 .github/scripts/ci-report.py timed node-start "Start and healthcheck, three nodes (compose up --wait)" -- \
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py timed node-start "Start and healthcheck, three nodes (compose up --wait)" -- \
             docker compose -p "$THREE_NODE_PROJECT" up -d --wait --wait-timeout 900
 
       - name: Wait until node 1 sees three nodes UN
@@ -254,7 +303,7 @@ jobs:
 
       - name: Report the context
         continue-on-error: true
-        run: python3 .github/scripts/ci-report.py context --cassandra-container "$THREE_NODE_PROJECT-cassandra-1-1"
+        run: python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py context --cassandra-container "$THREE_NODE_PROJECT-cassandra-1-1"
 
       # keyspace-three-node.cql (RF 3) instead of keyspace-single-node.cql,
       # then the signed-off schema.cql, from the runner through node 1's
@@ -263,10 +312,10 @@ jobs:
       - name: Apply keyspace-three-node.cql, then schema.cql, and wait for schema agreement
         id: schema
         run: |
-          python3 .github/scripts/ci-report.py timed node-start "Apply keyspace-three-node.cql (RF 3)" -- \
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py timed node-start "Apply keyspace-three-node.cql (RF 3)" -- \
             cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_CLUSTER_HOST_PORT_1" \
-              -f docker/cassandra/keyspace-three-node.cql
-          python3 .github/scripts/ci-report.py timed node-start "Apply schema.cql (ten tables)" -- \
+              -f "$THREE_NODE_JOB_FILES"/docker/cassandra/keyspace-three-node.cql
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py timed node-start "Apply schema.cql (ten tables)" -- \
             cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_CLUSTER_HOST_PORT_1" \
               -k helios -f docs/Cassandra/schema/schema.cql
           n1="$THREE_NODE_PROJECT-cassandra-1-1"
@@ -284,12 +333,15 @@ jobs:
       - name: Report the nodes' start and schema apply
         continue-on-error: true
         timeout-minutes: 2
-        run: python3 .github/scripts/ci-report.py node-start node-start "Cassandra start and schema apply (node 1)" "$THREE_NODE_PROJECT-cassandra-1-1" node-start
+        run: python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py node-start node-start "Cassandra start and schema apply (node 1)" "$THREE_NODE_PROJECT-cassandra-1-1" node-start
 
       # Step 1: tests/cassandra_tests.rs against the cluster, through node 1
       # (HFS_TEST_CASSANDRA_URL, tests/common/cassandra.rs). The driver
-      # routes to all three. --show-output, as in the required job, so the
-      # test report names every live test that printed a skip. Every repeat
+      # routes to all three. --nocapture, so libtest prints each panic when it
+      # happens: a run the timeout stops keeps the messages of the tests that
+      # failed before it (report.py), and ci-report.py still finds a printed
+      # skip. Each run's timeout is cut to end before this step's own
+      # (THREE_NODE_DEADLINE, run-tests.sh), so no container outlives it. Every repeat
       # runs whatever the one before it did; a failing test fails this step
       # only (continue-on-error), and the reports below read every repeat.
       - name: tests/cassandra_tests.rs against the three nodes
@@ -302,9 +354,10 @@ jobs:
           THREE_NODE_TEST_TIMEOUT_MIN: 8
         run: |
           status=0
+          export THREE_NODE_DEADLINE=$(( $(date +%s) + 44 * 60 ))
           for r in $(seq 1 "$THREE_NODE_REPEATS"); do
-            .github/scripts/cassandra-three-node/run-tests.sh "cassandra-tests-r$r" tests/cassandra_tests.rs \
-              "$CASSANDRA_TESTS_BIN" ${FILTER:+"$FILTER"} --show-output || status=$?
+            "$THREE_NODE_JOB_FILES"/.github/scripts/cassandra-three-node/run-tests.sh "cassandra-tests-r$r" tests/cassandra_tests.rs \
+              "$CASSANDRA_TESTS_BIN" ${FILTER:+"$FILTER"} --nocapture || status=$?
           done
           exit "$status"
 
@@ -322,9 +375,10 @@ jobs:
           THREE_NODE_TEST_TIMEOUT_MIN: 6
         run: |
           status=0
+          export THREE_NODE_DEADLINE=$(( $(date +%s) + 34 * 60 ))
           for r in $(seq 1 "$THREE_NODE_REPEATS"); do
-            .github/scripts/cassandra-three-node/run-tests.sh "persistence-lib-tests-r$r" "unittests src/lib.rs" \
-              "$PERSISTENCE_LIB_BIN" "$FILTER" --show-output || status=$?
+            "$THREE_NODE_JOB_FILES"/.github/scripts/cassandra-three-node/run-tests.sh "persistence-lib-tests-r$r" "unittests src/lib.rs" \
+              "$PERSISTENCE_LIB_BIN" "$FILTER" --nocapture || status=$?
           done
           exit "$status"
 
@@ -336,7 +390,8 @@ jobs:
         if: ${{ !cancelled() && steps.schema.outcome == 'success' }}
         continue-on-error: true
         timeout-minutes: 15
-        run: .github/scripts/cassandra-three-node/pause-scenarios.sh "$THREE_NODE_OUT/pause"
+        run: |
+          "$THREE_NODE_JOB_FILES"/.github/scripts/cassandra-three-node/pause-scenarios.sh "$THREE_NODE_OUT/pause"
 
       # What each node saw, before anything below can stop it: nodetool
       # status and describecluster from every node, each node's state, its
@@ -375,10 +430,10 @@ jobs:
         timeout-minutes: 12
         run: |
           for n in 1 2 3; do
-            python3 .github/scripts/ci-report.py node-stats "node-stats-$n" "Node statistics: cassandra-$n" \
+            python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py node-stats "node-stats-$n" "Node statistics: cassandra-$n" \
               "$THREE_NODE_PROJECT-cassandra-$n-1"
           done
-          python3 .github/scripts/ci-report.py intents intents "Intent rows left in pending_index_writes" \
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py intents intents "Intent rows left in pending_index_writes" \
             "$THREE_NODE_PROJECT-cassandra-1-1"
 
       - name: Stop the memory sampler
@@ -406,26 +461,26 @@ jobs:
         run: |
           out="$THREE_NODE_OUT" in="$RUNNER_TEMP/ci-report/inputs/three-node"
           mkdir -p "$in"
-          report=.github/scripts/cassandra-three-node/report.py
-          python3 .github/scripts/ci-report.py tests tests "Tests on three nodes, every repeat" "$out"/logs/*.log
+          report="$THREE_NODE_JOB_FILES"/.github/scripts/cassandra-three-node/report.py
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py tests tests "Tests on three nodes, every repeat" "$out"/logs/*.log
           python3 "$report" tests "$out" "$in/failures.md" "$in/failures.json"
-          python3 .github/scripts/ci-report.py add failures "Failing tests on three nodes, by cause" \
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py add failures "Failing tests on three nodes, by cause" \
             --markdown "$in/failures.md" --json "$in/failures.json"
           python3 "$report" pause "$out/pause" "$in/pause.md" "$in/pause.json"
-          python3 .github/scripts/ci-report.py add pause "Pause scenarios (raw CQL, RF 3)" \
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py add pause "Pause scenarios (raw CQL, RF 3)" \
             --markdown "$in/pause.md" --json "$in/pause.json"
           python3 "$report" memory "$out" "$in/memory.md" "$in/memory.json"
-          python3 .github/scripts/ci-report.py add memory "Memory: the nodes and the test containers" \
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py add memory "Memory: the nodes and the test containers" \
             --markdown "$in/memory.md" --json "$in/memory.json"
-          python3 .github/scripts/ci-report.py cas cas "CAS outcome counters, every repeat" "$out"/logs/*.log
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py cas cas "CAS outcome counters, every repeat" "$out"/logs/*.log
 
       - name: Report the target directory's size
         if: always()
         continue-on-error: true
         run: |
           out="$RUNNER_TEMP/ci-report/inputs/build-size"
-          python3 .github/scripts/build-size-report.py "$out"
-          python3 .github/scripts/ci-report.py add build-size "Target directory size" \
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/build-size-report.py "$out"
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py add build-size "Target directory size" \
             --markdown "$out/build-size.md" --json "$out/build-size.json"
 
       - name: Report where this job's time went
@@ -435,8 +490,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           out="$RUNNER_TEMP/ci-report/inputs/step-timings"
-          python3 .github/scripts/job-step-timings.py "Cassandra three-node tests (report only)" "$out"
-          python3 .github/scripts/ci-report.py add step-timings "Where this job's time went" \
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/job-step-timings.py "Cassandra three-node tests (report only)" "$out"
+          python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py add step-timings "Where this job's time went" \
             --markdown "$out/step-timings.md" --json "$out/step-timings.json"
 
       # Every report section, the full test logs, nodetool status, each

@@ -21,7 +21,7 @@ name: Cassandra mutation testing (report only)
 # Heavy (ADR-aacruzgon-0082): cargo-mutants builds one copy of the workspace
 # per job, cold. With 4 jobs it peaked at 15.4 GiB anon on #90, less than
 # 5 GiB under sam-7900x's 20G (ADR-aacruzgon-0080's margin), with up to
-# 22.7 GB of build directories, and it holds its runner for about 26 minutes,
+# 32.9 GiB of build directories, and it holds its runner for about 26 minutes,
 # so it runs only on acruzdebian (40G), where the job count can grow. A
 # paths: filter is fine here: no required check lives in this workflow.
 #

@@ -162,7 +162,7 @@ class Failures(Run):
         self.assertTrue(any("exited 1 (usage error)" in w for w in data["warnings"]))
 
     def test_an_outcomes_document_of_the_wrong_shape_warns_and_reads_nothing(self):
-        for doc in ([], None, "x", {"outcomes": {"a": 1}}):
+        for doc in ([], None, "x", {"outcomes": {"a": 1}}, {}, {"outcomes": None}):
             tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
             out = tmp / "mutants.out"
             out.mkdir()
@@ -175,6 +175,13 @@ class Failures(Run):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(report.main([str(out), str(dest), "--exit-status", "0"]), 0)
             self.assertTrue((dest / "mutants.md").exists() and (dest / "mutants.json").exists())
+
+    def test_an_empty_outcomes_array_is_read(self):
+        doc = outcomes()
+        doc["outcomes"] = []
+        data = report.build(self.write(doc, None), 0, None)
+        self.assertTrue(data["outcomes_read"])
+        self.assertFalse(any("not an outcomes document" in w for w in data["warnings"]))
 
     def test_an_outcome_that_is_not_an_object_is_skipped_and_the_rest_counted(self):
         doc = outcomes(*ALL)

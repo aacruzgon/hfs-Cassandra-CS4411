@@ -156,7 +156,9 @@ def build(out_dir: Path, exit_status: int | None, diff: Path | None) -> dict:
         return data
     # Valid JSON is not yet an outcomes document: `[]` or `null` would fail
     # at the first field, and the job would get no report at all.
-    if not isinstance(outcomes, dict) or not isinstance(outcomes.get("outcomes", []), (list, type(None))):
+    # cargo-mutants always writes the outcomes array, so `{}` or
+    # `{"outcomes": null}` is a damaged file, not a run with nothing in it.
+    if not isinstance(outcomes, dict) or not isinstance(outcomes.get("outcomes"), list):
         data["outcomes_read"] = False
         data["note"] = f"outcomes.json is not an outcomes document (a JSON {json_kind(outcomes)}), so no outcome was read"
         warnings.append(f"Mutation testing: {out_dir / 'outcomes.json'} is not an outcomes document "

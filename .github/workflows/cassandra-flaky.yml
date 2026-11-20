@@ -244,10 +244,14 @@ jobs:
         continue-on-error: true
         run: |
           docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
-          # Up to three tries. Every CI port is inside Linux's ephemeral range
-          # (32768-60999), so a client socket can hold this one for a moment: run
-          # 44765908091 failed with "bind: address already in use" on 59842, which
-          # nothing was listening on 33 s later.
+          # Up to three tries, 35 s apart, so the third comes about 70 s after
+          # the first. Every CI port is even and inside Linux's ephemeral range
+          # (32768-60999), and connect() takes even ports first, so the client
+          # side of the previous job's loopback test connections can sit on
+          # this port in TIME-WAIT for 60 s, which no listener can bind over,
+          # SO_REUSEADDR or not. Run 44765908091 hit it: its bind on 59842 came
+          # 17-46 s after the previous job's tests against 59242. This job
+          # reaches its node with no build first, so it is the most exposed.
           for try in 1 2 3; do
             if python3 "$CI_SCRIPTS/ci-report.py" timed node-start "Start and healthcheck (compose up --wait), try $try" -- \
               docker compose -p "$COMPOSE_PROJECT" up -d --wait --wait-timeout 240; then
@@ -259,7 +263,7 @@ jobs:
               echo "::warning title=Flaky tests::the Cassandra node did not start in 3 tries, so nothing was run; see this step's log"
               exit 1
             fi
-            sleep 20
+            sleep 35
           done
           cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
             -f docs/Cassandra/schema/keyspace-single-node.cql

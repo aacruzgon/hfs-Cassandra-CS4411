@@ -31,27 +31,50 @@ RESULT = re.compile(
     r"^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; "
     r"(\d+) filtered out; finished in ([\d.]+)s"
 )
+RUNNING_N = re.compile(r"^running (\d+) tests?$")
 TEST_LINE = re.compile(r"^test (\S+) \.\.\. (\w+)")
+# libtest's warning for a test still running after 60 s. With the timeout
+# stopping the binary, it is the only line a hung test leaves.
+STILL_RUNNING = re.compile(r"^test (\S+) has been running for over \d+ seconds$")
 BLOCK = re.compile(r"^---- (\S+) std(?:out|err) ----$")
 PANIC_NEW = re.compile(r"^thread '([^']*)' (?:\(\d+\) )?panicked at (\S+?):?$")
 PANIC_OLD = re.compile(r"^thread '([^']*)' panicked at '(.*)', (\S+)$")
 
+# A failure is classified from its panic's own message, the first line after
+# "panicked at", and only when that line's subject is a backend error: the
+# line ends with the error, right after "got " or ": " (an assertion's
+# `got {outcome:?}`, an unwrap's "on an `Err` value: "). An invariant panic
+# that lists every writer's outcome ("nothing is live: [Updated(…),
+# Failed(Backend(Timeout { … }))]", PR #83) is about the invariant, not the
+# 504, so it is "other", with a note.
+SUBJECT_ERROR = re.compile(
+    r"(?:: |got )(?:Failed\()?(?:Backend\()?(?P<kind>Timeout|Unavailable) \{ backend_name: \"[^\"]*\", "
+    r"message: \"(?P<message>(?:[^\"\\]|\\.)*)\" \}\)?\)?$"
+)
 # Issue #77: on RF 3 a LOCAL_SERIAL read superseded by a competing Paxos round
-# answers BackendError::Timeout (504), "CAS operation timed out: received 0 of
-# 2 required responses" (ADR-aacruzgon-0072 decision 4). Any other Timeout is
-# a 504 too, but not that one.
-TIMEOUT = re.compile(r"Timeout \{|operation timed out|\b504\b")
-CAS_SIGNATURE = re.compile(r"CAS operation timed out|received \d+ of \d+ required responses|serial read")
-UNAVAILABLE = re.compile(r"Unavailable \{|backend unavailable|\b503\b")
-# docker/cassandra/README.md, "Backend tests against the cluster": always
-# fails on three nodes (rack assertion, or "one node, no peers").
-EXPECTED_ON_CLUSTER = {"node_runs_the_docker_cassandra_configuration"}
+# answers BackendError::Timeout (504), "serial read: CAS operation timed out:
+# received 0 of 2 required responses" (ADR-aacruzgon-0072 decision 4). The
+# backend prefixes the operation (errors.rs, "{operation}: {message}"), so a
+# CAS write's timeout ("create: CAS operation timed out: …") is another 504.
+ISSUE_77 = re.compile(r"^serial read: CAS operation timed out")
+ANY_504 = re.compile(r"Timeout \{")
+ANY_77 = re.compile(r"serial read: CAS operation timed out")
+# docker/cassandra/README.md, "Backend tests against the cluster": on three
+# nodes this test fails at the rack assertion (when system.local is answered
+# by node 2 or 3) or at "one node, no peers". Only those two are expected; it
+# also checks the release, the data centre and paxos_variant.
+EXPECTED_ON_CLUSTER = "node_runs_the_docker_cassandra_configuration"
+EXPECTED_PEERS = re.compile(r"^assertion `left == right` failed: one node, no peers: ")
+EXPECTED_RACK_LEFT = re.compile(r'^\s*left: "helios-rack[0-9]+"$')
+EXPECTED_RACK_RIGHT = re.compile(r'^\s*right: "helios-rack1"$')
 
 CLASSES = [
-    ("504-77", "504, issue #77 (serial read or CAS timed out)"),
+    ("504-77", "504, issue #77 (serial read timed out)"),
     ("504-other", "504, another timeout"),
     ("503", "503 (Unavailable)"),
     ("expected", "expected on three nodes (README)"),
+    ("timed-out", "timed out (still running when the run was stopped)"),
+    ("unknown", "cause unknown (the run was stopped before libtest printed it)"),
     ("other", "other"),
 ]
 
@@ -72,42 +95,98 @@ def write(md_path: str, json_path: str, md: str, data: dict) -> None:
     Path(json_path).write_text(json.dumps(data, indent=2))
 
 
-def classify(name: str, text: str) -> str:
-    short = name.rsplit("::", 1)[-1]
-    if short in EXPECTED_ON_CLUSTER:
-        return "expected"
-    if TIMEOUT.search(text):
-        return "504-77" if CAS_SIGNATURE.search(text) else "504-other"
-    if UNAVAILABLE.search(text):
-        return "503"
-    return "other"
+def classify(name: str, message: list[str], text: str) -> tuple[str, str | None]:
+    """The class of one failure, from its panic message's lines (`message`,
+    the first one first), and a note. `text` is the test's whole output, used
+    only for the note."""
+    first = message[0] if message else ""
+    if name.rsplit("::", 1)[-1] == EXPECTED_ON_CLUSTER:
+        rack = (first == "assertion `left == right` failed" and len(message) >= 3
+                and EXPECTED_RACK_LEFT.match(message[1]) and EXPECTED_RACK_RIGHT.match(message[2]))
+        if rack or EXPECTED_PEERS.match(first):
+            return "expected", None
+        return "other", "not the rack or peers assertion the README expects"
+    if m := SUBJECT_ERROR.search(first):
+        if m.group("kind") == "Unavailable":
+            return "503", None
+        if ISSUE_77.match(m.group("message")):
+            return "504-77", None
+        return "504-other", None
+    if ANY_77.search(text):
+        return "other", "a #77 504 among the outcomes it prints"
+    if ANY_504.search(text):
+        return "other", "a 504 among the outcomes it prints"
+    return "other", None
+
+
+def panic_message(lines: list[str], start: int) -> list[str]:
+    """The panic message's lines after a "panicked at" header at `start`: up to
+    a blank line, the backtrace note, or the next libtest line."""
+    message = []
+    for line in lines[start + 1:]:
+        if not line.strip():
+            if message:
+                break
+            continue
+        if (line.startswith("note: run with `RUST_BACKTRACE") or PANIC_NEW.match(line)
+                or TEST_LINE.match(line) or STILL_RUNNING.match(line) or BLOCK.match(line)):
+            break
+        message.append(line.rstrip())
+    return message
+
+
+def shown(message: list[str]) -> str:
+    """The message's first line; for a bare `assert_eq!`, with its left and
+    right, which say which assertion failed."""
+    first = message[0]
+    if first == "assertion `left == right` failed" and len(message) >= 3:
+        return f"{first} ({message[1].strip()}, {message[2].strip()})"
+    return first
+
+
+def panics(lines: list[str]) -> list[dict]:
+    """Every panic in `lines`: the thread (libtest names it after the test),
+    the location, and the message's lines."""
+    found = []
+    for i, line in enumerate(lines):
+        if m := PANIC_OLD.match(line):
+            found.append({"thread": m.group(1), "location": m.group(3), "message": [m.group(2)]})
+        elif m := PANIC_NEW.match(line):
+            found.append({"thread": m.group(1), "location": m.group(2), "message": panic_message(lines, i)})
+    return found
 
 
 def first_failure_line(lines: list[str]) -> tuple[str | None, str | None]:
     """The first line of the panic message, and where it panicked."""
-    for i, line in enumerate(lines):
-        if m := PANIC_OLD.match(line):
-            return m.group(2), m.group(3)
-        if m := PANIC_NEW.match(line):
-            for following in lines[i + 1:]:
-                if following.strip():
-                    return following.strip(), m.group(2)
-            return None, m.group(2)
+    for p in panics(lines):
+        return (p["message"][0] if p["message"] else None), p["location"]
     for line in lines:
         if line.strip():
             return line.strip(), None
     return None, None
 
 
-def parse_log(path: Path) -> dict:
+def parse_log(path: Path, stopped: bool = False) -> dict:
+    """One run's log. Reads the captured blocks after "failures:" (capture
+    mode) and every panic in the log (`--nocapture`, where libtest prints a
+    panic as it happens, under the test's thread name). `stopped`: the run
+    was stopped (timeout or kill), so a test without a result is reported."""
     text = ANSI.sub("", path.read_text(errors="replace"))
     lines = [l.rstrip() for l in text.splitlines()]
-    suite = {"label": path.stem, "suite": None, "tests": {}, "result": None, "blocks": {}}
+    suite = {"label": path.stem, "suite": None, "tests": {}, "result": None, "blocks": {},
+             "announced": None, "still_running": []}
     current = None
     in_failures = False
     for line in lines:
         if m := RUNNING.match(line):
             suite["suite"] = m.group(1)
+            continue
+        if m := RUNNING_N.match(line):
+            suite["announced"] = int(m.group(1))
+            continue
+        if m := STILL_RUNNING.match(line):
+            if m.group(1) not in suite["still_running"]:
+                suite["still_running"].append(m.group(1))
             continue
         if m := TEST_LINE.match(line):
             suite["tests"][m.group(1)] = m.group(2)
@@ -129,44 +208,81 @@ def parse_log(path: Path) -> dict:
             continue
         if current is not None:
             suite["blocks"][current].append(line)
+    inline: dict[str, dict] = {}
+    for p in panics(lines):
+        inline.setdefault(p["thread"], p)
     failures = []
     for name, result in suite["tests"].items():
         if result != "FAILED":
             continue
-        block = suite["blocks"].get(name, [])
-        first, where = first_failure_line(block)
+        block = suite["blocks"].get(name)
+        source = panics(block)[0] if block and panics(block) else inline.get(name)
+        message = source["message"] if source else []
+        if source is None and suite["result"] is None:
+            cls, note = "unknown", None
+        else:
+            cls, note = classify(name, message, "\n".join(block) if block else "\n".join(message))
         failures.append({
             "label": suite["label"], "suite": suite["suite"] or suite["label"], "test": name,
-            "class": classify(name, "\n".join(block)),
-            "first_line": first, "location": where,
+            "class": cls, "note": note,
+            "first_line": shown(message) if message else (first_failure_line(block)[0] if block else None),
+            "location": source["location"] if source else None,
         })
+    if stopped or suite["result"] is None:
+        for name in suite["still_running"]:
+            if name not in suite["tests"]:
+                failures.append({
+                    "label": suite["label"], "suite": suite["suite"] or suite["label"], "test": name,
+                    "class": "timed-out", "note": None,
+                    "first_line": "still running when the run was stopped (libtest: running for over 60 seconds)",
+                    "location": None,
+                })
+    reported = len(suite["tests"]) + sum(1 for n in suite["still_running"] if n not in suite["tests"])
+    suite["unreported"] = (max(suite["announced"] - reported, 0)
+                           if suite["result"] is None and suite["announced"] is not None else 0)
     suite["failures"] = failures
     suite["ignored"] = sorted(n for n, r in suite["tests"].items() if r == "ignored")
     del suite["blocks"]
     return suite
 
 
+def ended(run: dict) -> str | None:
+    """How the run ended, from run-tests.sh's JSON: an exit, the timeout
+    (coreutils timeout's 124), or a kill (137: the timeout's SIGKILL 30 s
+    after its SIGINT, or the kernel's OOM killer, which oom_kills tells)."""
+    if not run or run.get("exit_status") is None:
+        return None
+    if run.get("timed_out"):
+        return "timeout"
+    if run.get("killed"):
+        return "killed (OOM kill)" if (run.get("oom_kills") or 0) > 0 else "killed"
+    return "exit"
+
+
 def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
     out = Path(out_dir)
     suites = []
     for log in sorted((out / "logs").glob("*.log")):
-        suite = parse_log(log)
-        run = out / "run" / f"{log.stem}.json"
-        suite["run"] = json.loads(run.read_text()) if run.exists() else None
+        run_file = out / "run" / f"{log.stem}.json"
+        run = json.loads(run_file.read_text()) if run_file.exists() else None
+        suite = parse_log(log, stopped=bool(run and (run.get("timed_out") or run.get("killed"))))
+        suite["run"] = run
         suites.append(suite)
     rows, failures, warnings = [], [], []
     for s in suites:
         r = s["result"] or {}
         run = s["run"] or {}
         peak = run.get("memory_peak_bytes")
+        how = ended(run)
         if not s["result"]:
             warnings.append(f"Three-node tests: {s['label']} printed no `test result` line"
-                            + (" (stopped by the timeout)" if run.get("timed_out") else ""))
+                            + (f" (ended: {how})" if how and how != "exit" else "")
+                            + (f"; {s['unreported']} test(s) never reported a result" if s["unreported"] else ""))
         rows.append([
             s["label"], f"`{s['suite']}`" if s["suite"] else None,
             r.get("passed"), r.get("failed"), r.get("ignored"), r.get("filtered_out"),
             f"{r['seconds']:.1f} s" if "seconds" in r else None,
-            run.get("exit_status"), "yes" if run.get("timed_out") else "no",
+            run.get("exit_status"), how,
             f"{run['wall_s']} s" if run.get("wall_s") is not None else None,
             f"{peak // MIB:,} MiB" if peak else None, run.get("oom_kills"),
         ])
@@ -183,16 +299,21 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
     for f in failures:
         key = (step_of(f["label"]), f["test"])
         entry = by_test.setdefault(key, {"step": key[0], "suite": f["suite"], "test": f["test"], "runs_failed": 0,
-                                         "classes": [], "first_line": f["first_line"], "location": f["location"]})
+                                         "classes": [], "notes": [], "first_line": f["first_line"],
+                                         "location": f["location"]})
         entry["runs_failed"] += 1
         if f["class"] not in entry["classes"]:
             entry["classes"].append(f["class"])
+        if f.get("note") and f["note"] not in entry["notes"]:
+            entry["notes"].append(f["note"])
+        if not entry["first_line"] and f["first_line"]:
+            entry["first_line"], entry["location"] = f["first_line"], f["location"]
     runs_with_77 = {}
     for s_ in suites:
         if any(f["class"] == "504-77" for f in s_["failures"]):
             runs_with_77[step_of(s_["label"])] = runs_with_77.get(step_of(s_["label"]), 0) + 1
     md = table(["Step", "Suite", "Passed", "Failed", "Ignored", "Filtered out", "libtest time",
-                "Exit", "Timed out", "Wall time", "Test container memory.peak", "OOM kills"], rows)
+                "Exit", "Ended", "Wall time", "Test container memory.peak", "OOM kills"], rows)
     md += ("\n**Failures by cause** (one per failing test per run): "
            + "; ".join(f"{label}: {counts[key]}" for key, label in CLASSES) + ".\n")
     md += ("\n**Runs with at least one #77 504:** "
@@ -201,22 +322,30 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
         md += "\n**Every failing test, over all runs:**\n\n" + table(
             ["Step", "Test", "Failed in", "Cause", "First line of the failure (first run it failed in)", "Where"],
             [[e["step"], f"`{e['test']}`", f"{e['runs_failed']} of {runs.get(e['step'], '?')} runs",
-              ", ".join(dict(CLASSES)[c] for c in e["classes"]),
+              ", ".join(dict(CLASSES)[c] for c in e["classes"]) + "".join(f" ({n})" for n in e["notes"]),
               (e["first_line"] or "")[:300], f"`{e['location']}`" if e["location"] else None]
              for e in sorted(by_test.values(), key=lambda e: (e["step"], -e["runs_failed"], e["test"]))],
         )
         md += "\n<details><summary>Each failure in each run</summary>\n\n" + table(
             ["Run", "Test", "Cause", "First line of the failure"],
-            [[f["label"], f"`{f['test']}`", dict(CLASSES)[f["class"]], (f["first_line"] or "")[:300]] for f in failures],
+            [[f["label"], f"`{f['test']}`", dict(CLASSES)[f["class"]] + (f" ({f['note']})" if f.get("note") else ""),
+              (f["first_line"] or "")[:300]] for f in failures],
         ) + "\n</details>\n"
     else:
         md += "\nNo test failed.\n"
+    unreported = [(s_["label"], s_["unreported"]) for s_ in suites if s_["unreported"]]
+    if unreported:
+        md += ("\n**Tests that never reported a result** (the run was stopped; libtest names a test only "
+               "once it has run for 60 s): " + "; ".join(f"{label}: {n}" for label, n in unreported) + ".\n")
     md += (
-        "\nA failure is a 504 of issue #77 when its output has a backend `Timeout` together with the serial "
-        "read's or CAS's text (`CAS operation timed out`, `received N of M required responses`). "
-        "`node_runs_the_docker_cassandra_configuration` always fails on three nodes "
-        "(docker/cassandra/README.md, \"Backend tests against the cluster\"). The job never fails on a test; "
-        "this table is the result.\n"
+        "\nA failure's cause is read from its panic's first line, and only when that line's subject is the "
+        "backend error (`got Failed(Backend(Timeout { … }))`, or an unwrap's `` `Err` value: ``). It is a 504 "
+        "of issue #77 when that error is a `Timeout` whose message starts `serial read: CAS operation timed "
+        "out`; a CAS write's timeout (`create: CAS operation timed out`) is another 504. A panic about "
+        "something else that lists outcomes including a 504 is \"other\", with a note. "
+        "`node_runs_the_docker_cassandra_configuration` is expected only at its rack assertion or at "
+        "`one node, no peers` (docker/cassandra/README.md, \"Backend tests against the cluster\"). "
+        "The job never fails on a test; this table is the result.\n"
     )
     write(md_path, json_path, md, {"suites": suites, "runs": runs, "failures_by_class": counts,
                                    "runs_with_77": runs_with_77, "by_test": list(by_test.values()),

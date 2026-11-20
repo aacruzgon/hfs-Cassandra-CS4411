@@ -511,10 +511,13 @@ def table(headers: list[str], rows: list[list[object]]) -> str:
     return "\n".join(out) + "\n"
 
 
-def report(results: dict, found: dict | None = None, unreadable: str | None = None) -> tuple[str, dict]:
+def report(results: dict, found: dict | None = None, unreadable: str | None = None,
+           results_missing: bool = False) -> tuple[str, dict]:
     """`unreadable` says why the results could not be read, if they could
     not; then an empty result list is not taken to mean that nothing was
-    found."""
+    found. `results_missing` says the file was simply absent, which is
+    expected when nothing was found (the runs step is skipped); any other
+    read error is always a warning."""
     rows, data_rows, warnings = [], [], list((found or {}).get("warnings") or [])
     for entry in results.get("results") or []:
         runs = entry.get("runs") or []
@@ -582,6 +585,9 @@ def report(results: dict, found: dict | None = None, unreadable: str | None = No
         warnings.append(f"Flaky tests: no results ({unreadable})")
     elif total == 0:
         md += "No test added or changed under the backend's lib or tests/cassandra/, so nothing was re-run.\n"
+        if unreadable and not results_missing:
+            md += f"\nThe re-run results could not be read either: {unreadable}.\n"
+            warnings.append(f"Flaky tests: {unreadable}")
     else:
         md += (f"{total} test(s) re-run {results.get('runs_per_test')} times each, one test per process "
                f"(`--exact`), {results.get('timeout_s'):.0f} s timeout per run: {flaky} flaky, {failing} failing every run. "
@@ -671,7 +677,7 @@ def main(argv: list[str]) -> int:
         (logs / "results.json").write_text(json.dumps(result, indent=2) + "\n")
         return 0
     if cmd == "report":
-        unreadable = None
+        unreadable, results_missing = None, False
         try:
             results = json.loads(Path(option(args, "--results")).read_text())
             if not isinstance(results, dict):
@@ -679,6 +685,7 @@ def main(argv: list[str]) -> int:
         except (OSError, ValueError, TypeError) as error:
             results = {"results": []}
             unreadable = f"{option(args, '--results')} could not be read ({error.__class__.__name__})"
+            results_missing = isinstance(error, FileNotFoundError)
         if unreadable is None and results.get("error"):
             unreadable = str(results["error"])
         found = None
@@ -687,7 +694,7 @@ def main(argv: list[str]) -> int:
                 found = json.loads(Path(option(args, "--found")).read_text())
             except (OSError, ValueError):
                 found = None
-        md, data = report(results, found, unreadable)
+        md, data = report(results, found, unreadable, results_missing)
         out = Path(option(args, "--out", "."))
         out.mkdir(parents=True, exist_ok=True)
         (out / "flaky.md").write_text(md)

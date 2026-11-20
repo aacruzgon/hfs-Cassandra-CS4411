@@ -467,6 +467,13 @@ class Main(unittest.TestCase):
             self.assertNotIn("No test added or changed", md, text)
             self.assertTrue(any("could not be read" in w for w in data["warnings"]), text)
 
+    def test_malformed_results_with_nothing_found_still_warn(self):
+        for text in ('{"results": [', "[]", '{"results": [], "error": "the re-run inputs could not be read (x)"}'):
+            md, data = self.report(temp_dir(self), text, {"tests": [], "warnings": []})
+            self.assertIn("No test added or changed", md, text)
+            self.assertIn("could not be read", md, text)
+            self.assertTrue(any("could not be read" in w for w in data["warnings"]), text)
+
     def test_malformed_results_with_tests_found_say_none_ran_and_why(self):
         md, data = self.report(temp_dir(self), '{"results": [', {"tests": [{"name": "a"}], "warnings": []})
         self.assertIn("1 test(s) were found in the diff, but none was run", md)

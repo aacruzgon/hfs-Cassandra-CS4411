@@ -25,7 +25,9 @@
       - **The clippy job count still works.** `cargo clippy (helios-fhir)` still reads its cargo job count from the cgroup of the runner it lands on, which does not depend on the label.
     - **The labels change through the API only, in two steps.**
         - On 2026-11-20, before the workflow change was pushed, `hfs-cassandra-medium` was added to both runners: `POST .../actions/runners/22/labels` and `.../21/labels`.
-        - Once PR #100 has merged, `hfs-cassandra-heavy` comes off `sam-7900x`: `DELETE .../actions/runners/21/labels/hfs-cassandra-heavy`.
+        - Removing `hfs-cassandra-heavy` from `sam-7900x` is Alan's session's first step right after PR #100 merges: `DELETE /repos/aacruzgon/hfs-Cassandra-CS4411/actions/runners/21/labels/hfs-cassandra-heavy` (id 21 is `sam-7900x`), then a check with `GET .../actions/runners` that it carries `hfs-cassandra, hfs-cassandra-light, hfs-cassandra-medium, hfs-runner-sam-7900x`.
+            - Not before the merge: until then `main`'s clippy pair still targets heavy, so the DELETE would take two required checks off `sam-7900x`.
+            - Not later: until the DELETE a heavy job, such as a pull request labelled `mutants`, can still land on `sam-7900x`, at up to 15.4 GiB `anon` under its 20G cap and 32.9 GiB of scratch disk on Sam's desktop.
         - Every job stays runnable at each step. Nothing on `sam-7900x` itself changes.
     - **Mutation testing, report only: `.github/workflows/cassandra-mutants.yml`, job `Cassandra mutants (report only)`.**
         - **The tool:** `cargo-mutants` 27.1.0, released 2026-06-02, built once per runner into its tool cache with `cargo install --locked`.

@@ -148,6 +148,16 @@ def build(out_dir: Path, exit_status: int | None, diff: Path | None) -> dict:
         if exit_status is not None and exit_status not in RAN:
             warnings.append(f"Mutation testing: cargo-mutants exited {exit_status} ({data['exit_meaning'] or 'unknown status'})")
         return data
+    # Valid JSON is not yet an outcomes document: `[]` or `null` would fail
+    # at the first field, and the job would get no report at all.
+    if not isinstance(outcomes, dict) or not isinstance(outcomes.get("outcomes", []), (list, type(None))):
+        data["outcomes_read"] = False
+        data["note"] = f"outcomes.json is not an outcomes document (a JSON {type(outcomes).__name__}), so no outcome was read"
+        warnings.append(f"Mutation testing: {out_dir / 'outcomes.json'} is not an outcomes document "
+                        f"({type(outcomes).__name__}); no outcome was read")
+        if exit_status is not None and exit_status not in RAN:
+            warnings.append(f"Mutation testing: cargo-mutants exited {exit_status} ({data['exit_meaning'] or 'unknown status'})")
+        return data
     data["outcomes_read"] = True
     data["cargo_mutants_version"] = outcomes.get("cargo_mutants_version")
     data["start_time"] = outcomes.get("start_time")
@@ -159,6 +169,9 @@ def build(out_dir: Path, exit_status: int | None, diff: Path | None) -> dict:
     tests: list[float] = []
     baseline = None
     for outcome in outcomes.get("outcomes") or []:
+        if not isinstance(outcome, dict):
+            warnings.append(f"Mutation testing: an outcome that is not an object ({type(outcome).__name__}) was skipped")
+            continue
         summary = outcome.get("summary")
         mutant = mutant_of(outcome)
         if mutant is None:

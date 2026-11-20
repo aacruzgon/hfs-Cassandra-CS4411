@@ -161,6 +161,28 @@ class Failures(Run):
         data = report.build(out, 1, None)
         self.assertTrue(any("exited 1 (usage error)" in w for w in data["warnings"]))
 
+    def test_an_outcomes_document_of_the_wrong_shape_warns_and_reads_nothing(self):
+        for doc in ([], None, "x", {"outcomes": {"a": 1}}):
+            tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+            out = tmp / "mutants.out"
+            out.mkdir()
+            (out / "outcomes.json").write_text(json.dumps(doc))
+            data = report.build(out, 0, None)
+            self.assertFalse(data["outcomes_read"], doc)
+            self.assertTrue(any("not an outcomes document" in w for w in data["warnings"]), doc)
+            self.assertIn("not an outcomes document", report.markdown(data))
+            dest = tmp / "report"
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(report.main([str(out), str(dest), "--exit-status", "0"]), 0)
+            self.assertTrue((dest / "mutants.md").exists() and (dest / "mutants.json").exists())
+
+    def test_an_outcome_that_is_not_an_object_is_skipped_and_the_rest_counted(self):
+        doc = outcomes(*ALL)
+        doc["outcomes"].append(["not", "an", "object"])
+        data = report.build(self.write(doc, None), 2, None)
+        self.assertEqual(data["counts"], {"caught": 1, "missed": 1, "unviable": 1, "timeout": 1})
+        self.assertTrue(any("not an object (list)" in w for w in data["warnings"]))
+
     def test_an_unknown_outcome_is_reported_not_counted(self):
         odd = outcome("Weird", CAUGHT, 1.0, 1.0)
         out = self.write(outcomes(odd), None)

@@ -181,7 +181,7 @@ class Failures(Run):
         doc["outcomes"].append(["not", "an", "object"])
         data = report.build(self.write(doc, None), 2, None)
         self.assertEqual(data["counts"], {"caught": 1, "missed": 1, "unviable": 1, "timeout": 1})
-        self.assertTrue(any("not an object (list)" in w for w in data["warnings"]))
+        self.assertTrue(any("not an object (a JSON array)" in w for w in data["warnings"]))
 
     def test_an_unknown_outcome_is_reported_not_counted(self):
         odd = outcome("Weird", CAUGHT, 1.0, 1.0)

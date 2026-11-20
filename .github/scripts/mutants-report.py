@@ -72,6 +72,12 @@ def table(headers: list[str], rows: list[list[object]]) -> str:
     return "\n".join(out) + "\n"
 
 
+def json_kind(value: object) -> str:
+    """What a decoded JSON value is, in JSON's own words."""
+    return {dict: "object", list: "array", str: "string", bool: "boolean", int: "number",
+            float: "number", type(None): "null"}.get(type(value), type(value).__name__)
+
+
 def mutant_of(outcome: dict) -> dict | None:
     scenario = outcome.get("scenario")
     if isinstance(scenario, dict) and isinstance(scenario.get("Mutant"), dict):
@@ -152,9 +158,9 @@ def build(out_dir: Path, exit_status: int | None, diff: Path | None) -> dict:
     # at the first field, and the job would get no report at all.
     if not isinstance(outcomes, dict) or not isinstance(outcomes.get("outcomes", []), (list, type(None))):
         data["outcomes_read"] = False
-        data["note"] = f"outcomes.json is not an outcomes document (a JSON {type(outcomes).__name__}), so no outcome was read"
+        data["note"] = f"outcomes.json is not an outcomes document (a JSON {json_kind(outcomes)}), so no outcome was read"
         warnings.append(f"Mutation testing: {out_dir / 'outcomes.json'} is not an outcomes document "
-                        f"({type(outcomes).__name__}); no outcome was read")
+                        f"(a JSON {json_kind(outcomes)}); no outcome was read")
         if exit_status is not None and exit_status not in RAN:
             warnings.append(f"Mutation testing: cargo-mutants exited {exit_status} ({data['exit_meaning'] or 'unknown status'})")
         return data
@@ -170,7 +176,7 @@ def build(out_dir: Path, exit_status: int | None, diff: Path | None) -> dict:
     baseline = None
     for outcome in outcomes.get("outcomes") or []:
         if not isinstance(outcome, dict):
-            warnings.append(f"Mutation testing: an outcome that is not an object ({type(outcome).__name__}) was skipped")
+            warnings.append(f"Mutation testing: an outcome that is not an object (a JSON {json_kind(outcome)}) was skipped")
             continue
         summary = outcome.get("summary")
         mutant = mutant_of(outcome)

@@ -63,10 +63,15 @@ run_dir="$THREE_NODE_OUT/run/$label"
 # A container of an earlier, killed run.
 docker rm -f "$name" >/dev/null 2>&1 || true
 
-# On a cancel or a signal from the step, remove the container: docker run's
-# client does not stop it (its PID 1 is sh, which ignores the forwarded
-# SIGINT). docker run runs in the background and the script waits for it, so
-# the trap runs as soon as the signal arrives.
+# On a signal sent to this script itself (SIGINT, SIGTERM, SIGHUP), remove
+# the container: docker run's client does not stop it (its PID 1 is sh, which
+# ignores the forwarded SIGINT). docker run runs in the background and the
+# script waits for it, so the trap runs as soon as the signal arrives.
+# A GitHub cancel does not reach this script: the runner signals only the
+# step's shell (actions/runner, ProcessInvoker), which waits for its
+# foreground child. What covers a cancel is the workflow's always() step
+# "Stop the cluster", which removes every hfs-cassandra-3n-tests-* container,
+# and what prevents a step timeout is THREE_NODE_DEADLINE, above.
 # shellcheck disable=SC2329  # called from the traps below
 remove_container() { docker rm -f "$name" >/dev/null 2>&1 || true; }
 trap 'remove_container; exit 130' INT

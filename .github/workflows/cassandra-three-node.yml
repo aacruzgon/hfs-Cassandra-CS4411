@@ -48,7 +48,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branch, tag or commit of this repository to test (empty: the dispatched ref). Never a fork's refs/pull/N/head: it would run that code on a self-hosted runner, so the job refuses refs/pull/."
+        description: "Branch, tag or commit of this repository to test (empty: the dispatched ref). Never a fork's refs/pull/N/head nor its commit SHA: it would run that code on a self-hosted runner, so the job refuses refs/pull/ and any SHA no branch here contains."
         required: false
         default: ""
       test_filter:
@@ -138,6 +138,30 @@ jobs:
               printf '::error::ref must be a branch, tag or commit of this repository, not %q\n' "$REF"
               exit 1 ;;
           esac
+
+      # A 40- or 64-hex ref is checked out by commit, so the refs/pull/ check
+      # above cannot see a fork pull request's head given as a SHA. Refuse a
+      # commit that no branch of this repository contains, before it is
+      # checked out: compare each branch head with it (the default branch
+      # first); "behind" or "identical" means the branch contains it.
+      - name: Check that a commit SHA is on one of this repository's branches
+        if: ${{ inputs.ref != '' }}
+        timeout-minutes: 5
+        env:
+          REF: ${{ inputs.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ $REF =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]] || { echo "Not a commit SHA: checked out as a branch or tag name."; exit 0; }
+          default=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
+          heads=$(gh api --paginate "repos/$GITHUB_REPOSITORY/branches?per_page=100" --jq '.[] | .name + " " + .commit.sha')
+          while read -r name sha; do
+            status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$sha...$REF" --jq .status 2>/dev/null) || continue
+            case "$status" in
+              behind|identical) echo "$REF is on $name"; exit 0 ;;
+            esac
+          done < <(grep "^$default " <<< "$heads"; grep -v "^$default " <<< "$heads")
+          printf '::error::ref %s is a commit that no branch of %s contains (a fork pull request commit, say), so it is not checked out\n' "$REF" "$GITHUB_REPOSITORY"
+          exit 1
 
       # The code under test.
       - name: Checkout the code under test

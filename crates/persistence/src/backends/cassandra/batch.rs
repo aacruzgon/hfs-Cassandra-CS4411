@@ -230,7 +230,7 @@ pub(crate) const MAX_BATCH_BYTES: usize = 5 * 1024 - 256;
 /// - **A unit over `bound` goes alone**, as a batch of its own. Such a unit
 ///   is one partition, so the node neither size-checks it nor writes it to
 ///   the batchlog (`BatchStatement.java:444-445`; the size check it also
-///   skips is `:333-334`). No fixture comes near:
+///   skips is `:333-335`). No fixture comes near:
 ///   it takes several values close to 1,024 bytes, the most an index value
 ///   keeps before it is stored as its SHA-256 (G35 as amended by
 ///   ADR-aacruzgon-0079).

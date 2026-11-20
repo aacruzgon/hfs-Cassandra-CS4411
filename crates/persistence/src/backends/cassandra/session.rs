@@ -635,7 +635,9 @@ fn batch_params(no_retry: &Arc<dyn RetryPolicy + Send + Sync>) -> StatementParam
 /// The parameters a lone index row is sent with (IW13, IW15): those of a
 /// plain [`StatementKind::Write`], with [`FallthroughRetryPolicy`] in place
 /// of the session's, as a batch has ([`batch_params`]). The default policy
-/// would re-send an idempotent write once after `Unavailable`, a send the
+/// would re-send an idempotent write to the next node after `Unavailable`
+/// (once), `Io`, `General`, `Overloaded`, `Server`, `Truncate` and
+/// `IsBootstrapping` (`retry/retry_policy.rs:92-123`, `:175-182`), sends the
 /// counters never see; with this one, each of the writer's tries is one send
 /// (apart from a re-prepare inside the driver, see [`StatementCounts`]).
 fn lone_row_params(
@@ -710,7 +712,9 @@ impl StatementCounters {
 /// These are the writer's requests, not every send on the wire: when the
 /// coordinator has lost a prepared ID, `cdrs-tokio` prepares it again and
 /// re-sends inside the same call (10.0.0, `cluster/session.rs:567-600`), and
-/// such a request counts once.
+/// such a request counts once. So does a plain statement the driver's
+/// default policy re-sends to the next node (a read, or a write that is not
+/// an index write, such as a version row): the caller made one request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StatementCounts {

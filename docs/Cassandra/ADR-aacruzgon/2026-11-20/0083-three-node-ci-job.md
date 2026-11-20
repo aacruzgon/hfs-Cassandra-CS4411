@@ -11,7 +11,10 @@
     - **Issue #77.** On RF 3 a concurrent write can answer 504 (ADR-aacruzgon-0072, decision 4).
         - **Before PR #83,** the race suites panicked on it: `main` at `e5e8ea67f` had neither an env var nor node-count detection, so every #77 504 on `main` was a failing test. Runs 44680155092 and 44681897890 below are that record.
         - **PR #83 merged on 2026-11-20** (`0ea8904e9`), and issue #77 is closed. Its race checks read the `helios` keyspace's RF, rather than an env var or the node count (my comment on #77, 2026-11-12), and accept a 504 at RF 2 or more.
-        - **Run 44758590016,** on #83's code, had no test fail on a #77 504 in 5 passes. The 504s did not stop, though: the race tests' own counters show 17 failed serial reads (6, 5, 4, 1 and 1), which #83's checks now accept. A passing test that accepted a 504 leaves no failure, only that counter. So the nightly on `main` measures two things: whether any test still fails on a #77 504, and how many serial reads fail in the race tests.
+        - **Run 44758590016,** on #83's code, had no test fail on a #77 504 in 5 passes. The 504s did not stop, though: the race tests' own counters show 17 failed serial reads (6, 5, 4, 1 and 1), which #83's checks now accept. A passing test that accepted a 504 leaves no failure, only that counter. So the nightly on `main` measures three things, without changing a test:
+            - whether any test still fails on a #77 504;
+            - how many serial reads fail in the race tests;
+            - what the nodes themselves answered during each repeat (below, "Reports").
     - **The runners' Docker is rootless,** with `slirp4netns` and the `builtin` port driver (ADR-sam-michaels-0004, ADR-aacruzgon-0023). The nodes' addresses on the cluster network live in rootlesskit's network namespace, so the runner reaches only the published ports. The backend's driver learns every node's address from `system.peers_v2` and routes to all three (`session.rs`: `TopologyAwareLoadBalancingStrategy` with `LocalDcOnly`). `docker/cassandra/README.md` already says the same for Docker Desktop.
     - **The runner tiers.** PR #100 (`ci-mutation-flake`, merged 2026-11-20) split the runners into light, medium and heavy, and `hfs-cassandra-heavy` was then removed from `sam-7900x`. Heavy is on `acruzdebian` (40G) only (ADR-aacruzgon-0082).
         - **This job is heavy,** so it runs on `acruzdebian` only.
@@ -77,6 +80,14 @@
                     - the `--lib` fault tests' cases, which fail a serial read on purpose;
                     - a test that panics before it prints its line, which is why runs 1 and 2 show 0;
                     - a race test that accepts the 504 but prints no `[cas]` line. The create race in `create_read.rs` is one; the report names each such test from its `[race policy … accept_504=true]` line.
+            - **what the nodes answered during each repeat:** each node's coordinator meters, read before and after every run of a test binary (`coordinator-metrics.sh`, from `run-tests.sh`), summed over the nodes, next to that run's failing tests:
+                - **How they are read:** `nodetool sjk mx` on the JMX beans `org.apache.cassandra.metrics:type=ClientRequest,scope=*,name=Timeouts`, `Unavailables` and `Failures` (their `Count`), three calls per node, about 1.4 s a node. Cassandra 5.0.9 has no virtual table for them: `system_views` has latencies only, and `system_metrics` is not in 5.0. A single `sjk` pattern over every `ClientRequest` bean stops at the first bean without a `Count`.
+                - **What a column counts,** from 5.0.9's source with Paxos v2, which the job's nodes run (`entrypoint.sh`):
+                    - **`CASWrite` timeouts:** a conditional write that timed out, and a serial read that a competing Paxos round superseded or that ran out of contention retries (`Paxos.java` `read()`, lines 886 to 901, through `markAndThrowAsTimeoutOrFailure(true, …)`, 563 to 565). That read's answer, "CAS operation timed out: received 0 of 2 required responses", is #77's 504. So #77's 504s are in this column, mixed with the CAS writes' own timeouts; the meters cannot tell them apart.
+                    - **`CASRead` timeouts:** a serial read whose own proposal timed out (line 878).
+                    - **`Read` and `Write`:** the other reads and writes. An LWT marks its CAS meter and the per-consistency one (`Write-LOCAL_SERIAL`), not these.
+                    - **Unavailables (503) and failures:** summed over the four.
+                - **An upper bound:** a coordinator counts every such answer, including one the backend then settled without returning a 504. A CAS write timeout that the backend's serial read decided is one. So the columns bound from above the 504s the tests saw, accepted or failed on.
             - the pause scenarios;
             - each container's `memory.peak` and OOM kills, and a `docker stats` sample every 5 s;
         - in the artifact: the full test logs, `nodetool status` and `describecluster` from every node, each node's `system.log` tail and container log, and the scenarios' raw `cqlsh` output.
@@ -105,11 +116,12 @@
         - Every night, every failure on three nodes on `main`, with its cause, including any #77 504.
             - Runs 1 and 2, before #83, failed on #77 504s.
             - Run 44758590016, on #83's code, had no such failure, and 17 failed serial reads in its race tests.
-            - The nightly shows both on `main`.
+            - The nightly shows both on `main`, and the nodes' `CASWrite` and `CASRead` timeouts per repeat.
         - The three coordinator answers the review found by hand are checked every night.
         - Steps 4, 5 and 8 have a running cluster job to add their own three-node tests to.
     - **Harder.**
         - The heavy runner is busy for about 8 to 10 minutes a night, and disk use on each runner grows by up to 15 GB.
+        - Reading the nodes' meters adds two snapshots to each run, about 4 s each on three nodes, so about 1.5 minutes over the ten runs.
         - `workflow_dispatch` only works once the file is on `main` (GitHub answers HTTP 404 otherwise). While it was not, a temporary `push` trigger, limited to `cassandra/ci-three-node` and the job's own files, ran it. It was removed in `09cd1988b`, added back once to run the job with the audit's fixes, and removed again; #101 merges with no `push` trigger.
     - **What the first runs measured** (`acruzdebian`, Cassandra 5.0.9, `write_request_timeout` 2000 ms):
         - **Run 44680155092** (one pass each, commit `cc7e97834`), 8 min 13 s from the job's start to its end (Actions API):
@@ -152,7 +164,7 @@
     - **`ci-report.py node-stats`** says "before the readiness test restarts the node" in every section. That is true of the required job, not of this one; the wording is in my file.
     - **To revisit:**
         - the first nightly runs on `main` after #83 (merged 2026-11-20): whether any #77 504 still fails a test, and the race tests' failed serial reads;
-        - logging each 504 a race test accepts, naming the test and the writer: a test change, for Steps 4 and 5 (CodeRabbit on #101). Until then, the job counts failed serial reads, not accepted 504s;
+        - logging each 504 a race test accepts, naming the test and the writer: a test change, for Steps 4 and 5 (CodeRabbit on #101). Until then, the job counts failed serial reads and the nodes' timeouts, which bound the accepted 504s from above, not the accepted 504s themselves;
         - when Step 8 writes the three-node failure tests (row 8.3);
         - whether to add a `pull_request` trigger;
         - whether `medium` would do: the build needs about 5 GiB, but the cluster and the test container run outside any runner's cap, and medium includes `sam-7900x`;
@@ -171,10 +183,10 @@
         - the repeats and their default of 5;
         - the scenarios' raw-CQL form;
         - the temporary push trigger.
-    - **What the human changed:** After the PR #90 review's hand runs on three nodes, I asked for a CI job that runs the cluster ("should we also do the 3 node one?"), with the scope my session briefed: report-only, nightly and by dispatch, no `pull_request` trigger in this first version, no test changes, and the pause scenarios only if they need no backend test code. I approved the draft's choices as written: the container route, 10:00 UTC, the reserved subnet and ports, and 5 repeats. After the independent audit of #101 (2026-11-20), I had its findings fixed before undraft: the failure classes read from the panic's own first line, a stopped run's hung test and earlier messages, `ref` with two checkouts, the hour picked again from the runs' real start times (10:37 UTC), and its minor findings except M9 (linting in CI), which is under "To revisit". After the delta audit, I had its minors fixed too: a 504 inside `Err(…)`, the configuration test's 503 and 504, an OOM-killed run's tests, a commit SHA on no branch, and the trap's wording. After undraft, I had CodeRabbit's eight threads checked and all eight fixed: the pause scenarios' state checks, missing evidence reported as such, deadline-skipped repeats listed, best-effort fallback writes, whitespace in `ref`, and `pipefail` before `tee`. After #100 and #83 merged, I had `main` merged in, the wording brought up to date, the report's tests added to the fmt job, and the `CLAUDE.md` and `AGENTS.md` sentence carried in this PR. CodeRabbit's five threads on those commits were fixed too: the failed seed and pause, a cut-off read, the response counts, and the count of the race tests' failed serial reads, which corrected "no #77 504" in run 44758590016 to "no test failed on one".
+    - **What the human changed:** After the PR #90 review's hand runs on three nodes, I asked for a CI job that runs the cluster ("should we also do the 3 node one?"), with the scope my session briefed: report-only, nightly and by dispatch, no `pull_request` trigger in this first version, no test changes, and the pause scenarios only if they need no backend test code. I approved the draft's choices as written: the container route, 10:00 UTC, the reserved subnet and ports, and 5 repeats. After the independent audit of #101 (2026-11-20), I had its findings fixed before undraft: the failure classes read from the panic's own first line, a stopped run's hung test and earlier messages, `ref` with two checkouts, the hour picked again from the runs' real start times (10:37 UTC), and its minor findings except M9 (linting in CI), which is under "To revisit". After the delta audit, I had its minors fixed too: a 504 inside `Err(…)`, the configuration test's 503 and 504, an OOM-killed run's tests, a commit SHA on no branch, and the trap's wording. After undraft, I had CodeRabbit's eight threads checked and all eight fixed: the pause scenarios' state checks, missing evidence reported as such, deadline-skipped repeats listed, best-effort fallback writes, whitespace in `ref`, and `pipefail` before `tee`. After #100 and #83 merged, I had `main` merged in, the wording brought up to date, the report's tests added to the fmt job, and the `CLAUDE.md` and `AGENTS.md` sentence carried in this PR. CodeRabbit's five threads on those commits were fixed too: the failed seed and pause, a cut-off read, the response counts, and the count of the race tests' failed serial reads, which corrected "no #77 504" in run 44758590016 to "no test failed on one". I then asked for the #77 rate to be measured still, without a test change, and had the nodes' coordinator meters counted for each repeat.
     - **Verified:**
         - **The CI runs above:** their logs and their artifact `ci-report-three-node`.
-        - **`report.py`:** `.github/scripts/test_cassandra_three_node_report.py`, 36 tests. They run locally, and in CI in the `cargo fmt --check` job's unittest step (`fmt-clippy-cassandra.yml`). What it covers:
+        - **`report.py`:** `.github/scripts/test_cassandra_three_node_report.py`, 38 tests. They run locally, and in CI in the `cargo fmt --check` job's unittest step (`fmt-clippy-cassandra.yml`). What it covers:
             - a #77 504, through the race suites and through a `--lib` unwrap;
             - a plain write's 504, a CAS write's 504 and an unknown-outcome 504, each "another 504";
             - a 503;
@@ -192,7 +204,8 @@
             - a repeat skipped at the deadline: listed, and not counted as a run;
             - a destination that cannot be written: the report still exits 0;
             - the pause scenarios: run 44758590016's outputs, all as the review found; a missing or empty output, unknown; a batch sent at once with the node already `DN`, invalid; a `DN` batch not sent, not run; a changed response count, a difference; a read cut off after a whole row, unread;
-            - the race tests' failed serial reads, counted in passing runs, and a race test that accepts a 504 without a `[cas]` line, named.
+            - the race tests' failed serial reads, counted in passing runs, and a race test that accepts a 504 without a `[cas]` line, named;
+            - the nodes' meters before and after a run, summed over the nodes per run, and a meter that could not be read, a warning.
 
           It also matches the classes of runs 1, 2 and 3's real logs, and was run on the review's own `cqlsh` outputs (`3n-cqlsh*-rep1.txt`).
         - **Lint:** `actionlint` 1.7.12 reports only `runner.workspace`, which it also reports three times in the required `fmt-clippy-cassandra.yml`. `shellcheck` is clean.
@@ -216,6 +229,12 @@
             - A failed seed of s3, and a seed of s1 that exited 1 after its consistency line: neither scenario was sent.
             - A failing `docker pause`: all five were not sent.
             - The normal sequence was unchanged.
+        - **The nodes' meters,** on a single node of my own on the Mac, from the pinned image:
+            - `system_views` and the absent `system_metrics` were checked first;
+            - `coordinator-metrics.sh` read all 12 base meters;
+            - `run-tests.sh` ran `cqlsh` as its binary, sending batches that a one-node RF 3 keyspace cannot serve. The before and after files differed by the expected unavailables and failures: 2 conditional writes, 2 `CASWrite` failures, 1 unavailable. The report's table showed them.
+            - First with the image's default Paxos v1, then with the project's `entrypoint.sh` (Paxos v2). v1 also marks a serial read under `Read`; v2 does not.
+            - A timeout cannot be made cleanly on one node, so the timeout columns rest on the 5.0.9 source above, and first show real counts in the nightly.
         - **`run-tests.sh`:** run locally against a fake `docker`.
             - Exits 101, 124 and 137 were recorded as an exit, a timeout and a kill.
             - A deadline 100 s away skipped the run with exit 125, writing its log and run file. One 300 s away cut the timeout to 240 s.

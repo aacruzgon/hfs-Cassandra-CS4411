@@ -155,7 +155,8 @@ jobs:
             rm -rf "$dir" && mv "$tmp/root" "$dir"
             rm -rf "$tmp"
           fi
-          "$dir/bin/cargo-mutants" --version | grep -qx "cargo-mutants $CARGO_MUTANTS_VERSION"
+          # Run as cargo runs it: the binary takes its subcommand, mutants, first.
+          "$dir/bin/cargo-mutants" mutants --version | grep -qx "cargo-mutants $CARGO_MUTANTS_VERSION"
           echo "CARGO_MUTANTS=$dir/bin/cargo-mutants" >> "$GITHUB_ENV"
 
       # The diff cargo-mutants mutates (--in-diff), limited to the backend:

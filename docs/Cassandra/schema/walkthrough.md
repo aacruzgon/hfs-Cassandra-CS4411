@@ -414,9 +414,9 @@ REST has already read the row, checked `If-Match` (412 on a mismatch, before sto
 | `deleted_at > 0` | soft-deleted after REST's read | `NotFound`, 404 (design step 3; the race suite also accepts `Gone`, G9) |
 | `version_id ≠ N`, `deleted_at` 0 | lost the race | `ConcurrencyError::VersionConflict`, 409 |
 
-`update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `OptimisticLockFailure` (412) without a CAS; a CAS miss after that is 409. Its V3, at step 2, is built from that R1, so it carries R1's `write_id`, as plain `update`'s does (ADR-aacruzgon-0061).
+`update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `VersionConflict` (409) without a CAS; a CAS miss after that is 409 for another update and `NotFound` for a delete, as `update`'s. Its V3, at step 2, is built from that R1, so it carries R1's `write_id`, as plain `update`'s does (ADR-aacruzgon-0061).
 
-*Open for Step 4.* Until Step 4, `update_with_match` is a stub that answers `UnsupportedCapability` (501) (`crates/persistence/src/backends/cassandra/storage.rs:171-180`); this paragraph is its design. Which error the mismatch answers is Step 4's to decide, in its ADR, which updates this paragraph. Step 4's handover (roadmap Step 4, "Open for the Step 4 group") recommends `VersionConflict` (409): `versioning_suite`'s `test_update_with_match_etag_mismatch` asserts it, SQLite, PostgreSQL, MongoDB and this backend's `delete_with_match` (4.4) answer it, and REST answers an `If-Match` mismatch with 412 from its own read and never calls this method.
+*Decided at Step 4* (ADR-sara-lahourpour-0002), which replaced this paragraph's 412 with 409: `versioning_suite`'s `test_update_with_match_etag_mismatch` asserts it, SQLite, PostgreSQL, MongoDB and this backend's `delete_with_match` (4.4) answer it, and REST answers an `If-Match` mismatch with 412 from its own read and never calls this method. `update_with_match` hands its write to `update` after the comparison (`crates/persistence/src/backends/cassandra/versions.rs`).
 
 ### 3.4 Delete (`delete` and `delete_versioned`, `DELETE /Patient/id`)
 

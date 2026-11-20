@@ -25,9 +25,9 @@
 //! carries [`FallthroughRetryPolicy`], which never retries (`:52-69`). The
 //! other three kinds keep the default session: each of those re-sends is safe
 //! for a read, and for a write with a fixed `USING TIMESTAMP`. The exception
-//! is an index write sent by [`CassandraSession::batch`]: an index batch
-//! carries [`FallthroughRetryPolicy`] too, so each of the writer's tries is
-//! one send (below), and so does a lone index row. Whether a CAS
+//! is an index write sent by [`CassandraSession::batch`]: an index batch and
+//! a lone index row carry [`FallthroughRetryPolicy`] too, so each of the
+//! writer's tries is one send (below). Whether a CAS
 //! whose outcome is unknown ran is decided by the caller, from a
 //! [`SerialRead`](StatementKind::SerialRead), never by the driver.
 //!

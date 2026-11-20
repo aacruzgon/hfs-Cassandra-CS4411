@@ -125,3 +125,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0079](2026-11-17/0079-hash-oversized-index-values.md) | 2026-11-17 | Oversized index values are hashed, not refused (G35 amended) | accepted |
 | [0080](2026-11-18/0080-acruzdebian-64gb-heavy.md) | 2026-11-18 | `acruzdebian` has 64 GB: its runner cap goes to 40G, it takes heavy jobs, and `cargo clippy (helios-fhir)` sets its cargo job count from the runner's cap | accepted |
 | [0081](2026-11-18/0081-what-step5-design-changes.md) | 2026-11-18 | What ADR-sam-michaels-0006 changes in this log, Alan's acceptance of its six cross-team decisions, and `read_repair` on `resources_by_type` left to Step 8 | accepted |
+| [0083](2026-11-20/0083-three-node-ci-job.md) | 2026-11-20 | A report-only nightly job runs the backend's tests and five pause scenarios on three nodes, with the tests in a container on the cluster's network | accepted |

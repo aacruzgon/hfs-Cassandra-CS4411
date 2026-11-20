@@ -454,7 +454,7 @@ reviews:
     - path: ".github/workflows/**"
       instructions: |
         CI rules (CLAUDE.md "Commits and CI"; ADR-aacruzgon-0018, 0019, 0021,
-        0022, 0023, 0045, 0058):
+        0022, 0023, 0045, 0058, 0080, 0082):
         - Every job on a self-hosted runner has the fork guard:
           if: github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
@@ -462,12 +462,15 @@ reviews:
         - Every uses: is pinned to a full 40-character commit SHA with its
           version in a comment, e.g. "@<sha> # v7.0.2". A tag or branch fails
           the job before it starts.
-        - runs-on is [self-hosted, hfs-cassandra-light] or
-          [self-hosted, hfs-cassandra-heavy] (a job that may need more than
-          about 9 GB, such as the clippy pair, is heavy). Both runners take
-          both labels, so every job must fit sam-7900x's 20G cap
-          (ADR-aacruzgon-0080). Never the bare hfs-cassandra label in a new
-          job.
+        - runs-on is [self-hosted, hfs-cassandra-light] (fits about 9 GB),
+          [self-hosted, hfs-cassandra-medium] (more than that, within
+          sam-7900x's 20G cap, such as the clippy pair) or
+          [self-hosted, hfs-cassandra-heavy] (more than 20G, within
+          acruzdebian's 40G, such as the mutation-testing job, which runs
+          only on a pull request labelled mutants). Both runners
+          take light and medium; only acruzdebian takes heavy, so no required
+          check may be heavy (ADR-aacruzgon-0080, 0082). Never the bare
+          hfs-cassandra label in a new job.
         - No paths: or paths-ignore: filter on r4b-compile-check.yml or
           fmt-clippy-cassandra.yml: their jobs are required checks, and a
           skipped workflow never reports.

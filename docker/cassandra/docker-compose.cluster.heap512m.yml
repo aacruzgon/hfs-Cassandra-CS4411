@@ -9,7 +9,7 @@
 #   Direct memory    MAX_DIRECT_MEMORY_SIZE=256M (half the heap)
 #   GC threads       2 parallel / 2 concurrent, as in the base file
 #   CPU limit        2 CPUs per node, as in the base file
-#   Memory limit     1700 MiB per node, 5100 MiB in all, swap disabled
+#   Memory limit     1700 MiB per node, 5100 MiB (4.98 GiB) in all, swap disabled
 #
 # A functional profile: like the base file's default, it reports no
 # benchmark numbers (ADR-aacruzgon-0002, 0072).

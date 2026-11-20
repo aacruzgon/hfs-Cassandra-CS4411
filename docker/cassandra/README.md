@@ -136,7 +136,7 @@ docker compose -f docker/cassandra/docker-compose.cluster.yml up -d --wait
 docker compose -f docker/cassandra/docker-compose.cluster.yml \
                -f docker/cassandra/docker-compose.cluster.heap2g.yml up -d --wait
 
-# Where 7.5 GiB does not fit, and the nightly CI job (512M heap, 5.1 GiB in all)
+# Where 7.5 GiB does not fit, and the nightly CI job (512M heap, 5,100 MiB in all)
 docker compose -f docker/cassandra/docker-compose.cluster.yml \
                -f docker/cassandra/docker-compose.cluster.heap512m.yml up -d --wait
 ```
@@ -189,7 +189,7 @@ the nightly job does (`.github/scripts/cassandra-three-node/run-tests.sh`).
 | Direct memory | 384M, or 1G with the override, or 256M with `docker-compose.cluster.heap512m.yml` | Half the heap, as on the single node. |
 | GC threads | 2 parallel and 2 concurrent, or 4 with the override | Matches the CPU limit. |
 | CPU limit | 2 per node (6 in all), or 4 per node with the override | |
-| Memory limit | 2.5 GiB per node (7.5 GiB in all), or 5 GiB per node with the override, or 1700 MiB per node (5.1 GiB in all) with `docker-compose.cluster.heap512m.yml`; swap disabled | Indicative, Apple-silicon laptop under OrbStack, 768M heap, a 2 GiB limit for the check: 1.31 GiB per node at idle; `memory.peak` 1.47 GiB over the failure procedures and the backend tests; no OOM kill. The 2.5 GiB default then booted from clean and peaked at 1.42 GiB. No sustained load was measured, and the 2G override has not been booted. |
+| Memory limit | 2.5 GiB per node (7.5 GiB in all), or 5 GiB per node with the override, or 1700 MiB per node (5,100 MiB, 4.98 GiB, in all) with `docker-compose.cluster.heap512m.yml`; swap disabled | Indicative, Apple-silicon laptop under OrbStack, 768M heap, a 2 GiB limit for the check: 1.31 GiB per node at idle; `memory.peak` 1.47 GiB over the failure procedures and the backend tests; no OOM kill. The 2.5 GiB default then booted from clean and peaked at 1.42 GiB. No sustained load was measured, and the 2G override has not been booted. |
 | Host ports | `127.0.0.1:59342`, `59343`, `59344` (`CASSANDRA_CLUSTER_HOST_PORT_1` to `_3` override) | Not 59042 (developers), 59142 (the required CI job), 59242 (coverage and FHIR versions) or 59642 to 59644 (the nightly three-node job, with subnet `10.59.142`). |
 | Network | Fixed addresses `172.29.59.11` to `.13` (`CASSANDRA_CLUSTER_SUBNET_PREFIX` overrides `172.29.59`) | A node keeps its address over a restart and a reconnect, and the seed list can name addresses. |
 | `stop_grace_period` | 60 s | Long enough for a drain on `SIGTERM`. |

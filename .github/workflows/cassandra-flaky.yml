@@ -10,7 +10,9 @@ name: Cassandra flaky tests (report only)
 #
 # Report only. The job passes whatever the runs find: the summary has one row
 # per test (runs, passes, failures, timeouts, the first failure's message),
-# and a test that failed some of its runs is a warning annotation. Its name is
+# and a test that failed some of its runs is a warning annotation. Only a
+# dispatch whose inputs do not look like a ref, a range or a run count fails,
+# before anything runs. Its name is
 # in no ruleset and must never match one of the five required checks
 # (ADR-aacruzgon-0019, 0021), so it is a workflow of its own.
 #
@@ -97,6 +99,35 @@ jobs:
       CARGO_INCREMENTAL: 0
       CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
     steps:
+      # A dispatch's inputs reach git and actions/checkout as arguments. A
+      # value that starts with - would be read as an option (git diff
+      # --output=<file> writes that file), so each input must look like what
+      # it is. A pull request has no inputs: its refs come from GitHub.
+      - name: Check the dispatch inputs
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          HEAD_IN: ${{ inputs.head }}
+          BASE_IN: ${{ inputs.base }}
+          RANGE_IN: ${{ inputs.in_diff }}
+          RUNS_IN: ${{ inputs.runs }}
+        run: |
+          # A ref, a commit or a revision such as main~3; a range (a..b,
+          # a...b) is made of the same characters.
+          ref='[A-Za-z0-9_][A-Za-z0-9._/@{}~^+-]*'
+          bad=0
+          check() { # input name, value, pattern
+            if ! [[ $2 =~ ^($3)$ ]]; then
+              echo "::error title=Dispatch input::$1 must match ^($3)\$, got $(printf %q "$2")"
+              bad=1
+            fi
+          }
+          [ -z "$HEAD_IN" ] || check head "$HEAD_IN" "$ref"
+          check base "$BASE_IN" "$ref"
+          [ -z "$RANGE_IN" ] || check in_diff "$RANGE_IN" "$ref"
+          # 1 to 200 runs per test.
+          check runs "$RUNS_IN" '[1-9][0-9]?|1[0-9][0-9]|200'
+          exit "$bad"
+
       # The pull request's head, not the merge commit, so the tests and lines
       # are the ones the pull request shows. Full history, for the merge base.
       - name: Checkout the code under test
@@ -145,7 +176,9 @@ jobs:
             if git rev-parse --verify -q "refs/remotes/origin/$BASE^{commit}" > /dev/null; then base="origin/$BASE"; else base="$BASE"; fi
             RANGE="$base...HEAD"
           fi
-          git diff -U0 --no-color --no-ext-diff "$RANGE" -- \
+          # --end-of-options: whatever the range holds, git reads it as a
+          # revision, never as an option.
+          git diff -U0 --no-color --no-ext-diff --end-of-options "$RANGE" -- \
             crates/persistence/src/backends/cassandra/ crates/persistence/tests/cassandra/ \
             crates/persistence/tests/cassandra_tests.rs > "$out/pr.diff"
           echo "Range $RANGE"

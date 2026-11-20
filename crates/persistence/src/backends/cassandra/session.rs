@@ -27,7 +27,8 @@
 //! for a read, and for a write with a fixed `USING TIMESTAMP`. The exception
 //! is an index write sent by [`CassandraSession::batch`]: an index batch and
 //! a lone index row carry [`FallthroughRetryPolicy`] too, so each of the
-//! writer's tries is one send (below). Whether a CAS
+//! writer's tries is one send (below; apart from a re-prepare inside the
+//! driver, see [`StatementCounts`]). Whether a CAS
 //! whose outcome is unknown ran is decided by the caller, from a
 //! [`SerialRead`](StatementKind::SerialRead), never by the driver.
 //!
@@ -48,7 +49,8 @@
 //! a batch sent without it would write at `ONE`. It takes only
 //! [`IndexStatement`]s, so it can hold nothing but index-table rows (IW20,
 //! `batch.rs`). A batch of one statement is sent as a plain write with the
-//! same no-retry policy, so one try is one send either way. The driver
+//! same no-retry policy, so one try is one send either way (apart from a
+//! re-prepare inside the driver, see [`StatementCounts`]). The driver
 //! never re-sends a batch by itself: the writer retries it (IW16), and the
 //! driver's default policy would add a hidden second send after a
 //! `BATCH_LOG` timeout (`retry/retry_policy.rs:157-174`).
@@ -525,7 +527,8 @@ impl CassandraSession {
     /// through [`Self::execute`]'s path, counted as a write, but with the
     /// no-retry policy a batch has ([`lone_row_params`]): a batch of one buys
     /// nothing, and the node would treat it as a single mutation anyway. So
-    /// "one try, one send" holds for a batch and for a lone row alike.
+    /// "one try, one send" holds for a batch and for a lone row alike (apart
+    /// from a re-prepare inside the driver, see [`StatementCounts`]).
     ///
     /// Each statement binds its own `USING TIMESTAMP`, so the batch sets no
     /// timestamp of its own. Cassandra applies the rows of one partition key
@@ -603,7 +606,9 @@ fn index_batch<'a>(
 /// the same node after a `BATCH_LOG` timeout (`cdrs-tokio` 10.0.0,
 /// `retry/retry_policy.rs:157-174`). Each of the writer's tries is then one
 /// send, which the counters see (IW14), and a hung node costs one node
-/// timeout per try, not two, inside the index phase's deadline.
+/// timeout per try, not two, inside the index phase's deadline. (A
+/// re-prepare inside the driver is still one request, see
+/// [`StatementCounts`].)
 fn batch_params(no_retry: &Arc<dyn RetryPolicy + Send + Sync>) -> StatementParams {
     let mut params = statement_params(StatementKind::Write, Vec::new(), no_retry);
     params.retry_policy = Some(no_retry.clone());
@@ -614,7 +619,8 @@ fn batch_params(no_retry: &Arc<dyn RetryPolicy + Send + Sync>) -> StatementParam
 /// plain [`StatementKind::Write`], with [`FallthroughRetryPolicy`] in place
 /// of the session's, as a batch has ([`batch_params`]). The default policy
 /// would re-send an idempotent write once after `Unavailable`, a send the
-/// counters never see; with this one, each of the writer's tries is one send.
+/// counters never see; with this one, each of the writer's tries is one send
+/// (apart from a re-prepare inside the driver, see [`StatementCounts`]).
 fn lone_row_params(
     values: Vec<Value>,
     no_retry: &Arc<dyn RetryPolicy + Send + Sync>,
@@ -684,7 +690,7 @@ impl StatementCounters {
 /// statement it carries in `batched`. `write` counts only statements sent
 /// alone, so a reader sees both the requests and the rows they carried.
 ///
-/// These are the writer's requests, not wire round trips: when the
+/// These are the writer's requests, not every send on the wire: when the
 /// coordinator has lost a prepared ID, `cdrs-tokio` prepares it again and
 /// re-sends inside the same call (10.0.0, `cluster/session.rs:567-600`), and
 /// such a request counts once.
@@ -1343,7 +1349,7 @@ mod tests {
     /// IW14, separate fields: a batch is one request in `batch` and its
     /// statements in `batched`; `write` counts only statements sent alone.
     #[test]
-    fn a_batch_counts_as_one_round_trip_and_its_statements_as_batched() {
+    fn a_batch_counts_as_one_request_and_its_statements_as_batched() {
         let counters = StatementCounters::default();
         counters.count(StatementKind::Write);
         let before = counters.snapshot();

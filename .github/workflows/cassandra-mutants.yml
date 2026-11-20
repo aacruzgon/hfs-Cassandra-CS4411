@@ -59,10 +59,11 @@ permissions:
   # (.github/scripts/job-step-timings.py). Read-only, like contents.
   actions: read
 
-# One run per pull request, or per ref and head for a dispatch; a newer push
-# cancels the run in flight, so pushes do not pile up behind the one runner.
+# One run per pull request, or per ref, head and node choice for a dispatch;
+# a newer push cancels the run in flight, so pushes do not pile up behind the
+# one runner.
 concurrency:
-  group: cassandra-mutants-${{ github.event.pull_request.number || format('{0}-{1}', github.ref, inputs.head) }}
+  group: cassandra-mutants-${{ github.event.pull_request.number || format('{0}-{1}-{2}', github.ref, inputs.head, inputs.node) }}
   cancel-in-progress: true
 
 env:

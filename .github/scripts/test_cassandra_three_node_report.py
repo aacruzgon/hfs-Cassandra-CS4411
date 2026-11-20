@@ -325,6 +325,149 @@ test ok_test ... ok
         self.assertEqual(report.ended({"exit_status": 124, "timed_out": True}), "timeout")
         self.assertEqual(report.ended({"exit_status": 101}), "exit")
 
+    # CodeRabbit on #101: no log at all (the schema step failed, so both test
+    # steps were skipped) is not "No test failed".
+    def test_no_logs_is_no_test_ran(self) -> None:
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        self.assertNotIn("No test failed", md.read_text())
+        self.assertIn("No test ran", md.read_text())
+        self.assertTrue(any("no test ran" in w for w in json.loads(js.read_text())["warnings"]))
+
+    # CodeRabbit on #101: a repeat run-tests.sh did not start (too close to
+    # the step's deadline) is listed as not run and is not counted as a run.
+    def test_deadline_skipped_repeat_is_listed_and_not_counted(self) -> None:
+        self.log("cassandra-tests-r1", captured("step3_suites::race_a", RACE, loser(SERIAL_READ_504)),
+                 {"exit_status": 101, "timed_out": False, "killed": False, "wall_s": 6, "oom_kills": 0})
+        self.log("cassandra-tests-r2", "     Running tests/cassandra_tests.rs (/x/cassandra_tests-abc)\n"
+                 "not run (run-tests.sh): 40 s left before the step's deadline\n",
+                 {"skipped": "deadline", "left_s": 40})
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        data = json.loads(js.read_text())
+        self.assertEqual(data["runs"], {"cassandra-tests": 1})
+        self.assertIn("| cassandra-tests-r2 |", md.read_text())
+        self.assertIn("| not run (deadline) |", md.read_text())
+        self.assertIn("1 of 1 runs", md.read_text())
+        self.assertTrue(any("cassandra-tests-r2 not run (deadline: 40 s" in w for w in data["warnings"]))
+        self.assertFalse(any("printed no `test result` line" in w for w in data["warnings"]))
+
+    def test_every_repeat_skipped_is_no_test_ran(self) -> None:
+        self.log("cassandra-tests-r1", "     Running tests/cassandra_tests.rs (/x/cassandra_tests-abc)\n",
+                 {"skipped": "deadline", "left_s": 10})
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        self.assertIn("No test ran", md.read_text())
+        self.assertEqual(json.loads(js.read_text())["runs"], {})
+
+    # CodeRabbit on #101: the fallback writes never raise, and main exits 0
+    # when the JSON destination cannot be written.
+    def test_report_exits_zero_when_a_destination_is_unwritable(self) -> None:
+        import contextlib
+        import io
+        import sys
+        md, js = self.out / "f.md", self.out / "missing" / "f.json"
+        argv, sys.argv = sys.argv, ["report.py", "tests", str(self.out), str(md), str(js)]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                self.assertEqual(report.main(), 0)
+        finally:
+            sys.argv = argv
+        self.assertIn("The report could not be built", md.read_text())
+        self.assertIn("could not write", printed.getvalue())
+
+
+# The pause scenarios, with the outputs of run 44758590016 (2026-11-20) as
+# the shape: cqlsh prints "Consistency level set" first, an error on the
+# line of the failing statement, and the read at ALL as SELECT JSON rows.
+CONSISTENCY = "Consistency level set to LOCAL_QUORUM.\n"
+OUT = {
+    "s1": CONSISTENCY,
+    "s2": "<stdin>:6:WriteTimeout: Error from server: code=1100 [Coordinator node timed out waiting for replica "
+          "nodes' responses] message=\"Operation timed out - received only 1 responses.\" info={'consistency': "
+          "'LOCAL_QUORUM', 'required_responses': 2, 'received_responses': 1, 'write_type': 'SIMPLE'}\n" + CONSISTENCY,
+    "s3": "<stdin>:6:NoHostAvailable: ('Unable to complete the operation against any hosts', {<Host: "
+          "127.0.0.1:9042 helios-dc1>: Unavailable('Error from server: code=1000 [Unavailable exception] "
+          "message=\"Cannot achieve consistency level LOCAL_QUORUM\" info={\\'consistency\\': "
+          "\\'LOCAL_QUORUM\\', \\'required_replicas\\': 2, \\'alive_replicas\\': 1}')})\n" + CONSISTENCY,
+    "s4a": "<stdin>:6:WriteTimeout: Error from server: code=1100 [Coordinator node timed out waiting for replica "
+           "nodes' responses] message=\"Operation timed out - received only 1 responses.\" info={'consistency': "
+           "'TWO', 'required_responses': 2, 'received_responses': 1, 'write_type': 'BATCH_LOG'}\n" + CONSISTENCY,
+    "s4b": CONSISTENCY,
+}
+P2 = '{"resource_type": "Patient", "lu": 2000, "id": "p", "version_id": 2, "w": 2000001}'
+P1 = '{"resource_type": "Patient", "lu": 1000, "id": "p", "version_id": 1, "w": 1000001}'
+P1NEW = '{"resource_type": "Patient", "lu": 2000, "id": "p", "version_id": 1, "w": 2000001}'
+O1 = '{"resource_type": "Observation", "lu": 2000, "id": "o", "version_id": 1, "w": 2000001}'
+READ = {"s1": [P2], "s2": [P2], "s3": [P1], "s4a": [O1, P1NEW], "s4b": [O1, P1NEW]}
+KIND = {"s1": "one", "s2": "one", "s3": "one", "s4a": "two", "s4b": "two"}
+
+
+class Pause(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        for sid in OUT:
+            (self.dir / f"{sid}.meta").write_text(f"id={sid}\nkind={KIND[sid]}\nstate=UN (at once)\ntook_ms=1\n")
+            (self.dir / f"{sid}.out").write_text(OUT[sid])
+            rows = "".join(f" {r}\n" for r in READ[sid])
+            (self.dir / f"{sid}.read").write_text(f"Consistency level set to ALL.\n\n [json]\n---\n{rows}\n"
+                                                  f"({len(READ[sid])} rows)\n")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def run_pause(self) -> tuple[dict, str, list[str]]:
+        md, js = self.dir / "p.md", self.dir / "p.json"
+        report.cmd_pause(str(self.dir), str(md), str(js))
+        data = json.loads(js.read_text())
+        return {s["id"]: s for s in data["scenarios"]}, md.read_text(), data["warnings"]
+
+    def test_run_44758590016_is_as_expected(self) -> None:
+        scenarios, _, warnings = self.run_pause()
+        self.assertEqual({sid: s["as_expected"] for sid, s in scenarios.items()},
+                         {sid: True for sid in OUT})
+        self.assertEqual(warnings, [])
+
+    # CodeRabbit on #101: no output file is unknown, not success.
+    def test_missing_output_is_unknown(self) -> None:
+        (self.dir / "s1.out").unlink()
+        scenarios, md, warnings = self.run_pause()
+        self.assertEqual(scenarios["s1"]["outcome"], "unknown")
+        self.assertIsNone(scenarios["s1"]["as_expected"])
+        self.assertIn("| unknown |", md)
+        self.assertTrue(any("s1: its answer is unknown (no cqlsh output file)" in w for w in warnings))
+
+    def test_empty_output_is_unknown(self) -> None:
+        (self.dir / "s4b.out").write_text("")
+        scenarios, _, warnings = self.run_pause()
+        self.assertEqual(scenarios["s4b"]["outcome"], "unknown")
+        self.assertIsNone(scenarios["s4b"]["as_expected"])
+
+    # CodeRabbit on #101: a batch sent "at once" after which node 1 already
+    # reports the paused node DN is invalid, not compared.
+    def test_at_once_batch_without_un_is_invalid(self) -> None:
+        with (self.dir / "s4a.meta").open("a") as f:
+            f.write("seen_after=10.59.142.12 DN\ninvalid=node 1 reported 10.59.142.12 DN right after the batch\n")
+        scenarios, md, warnings = self.run_pause()
+        self.assertIsNone(scenarios["s4a"]["as_expected"])
+        self.assertIn("UN (at once); 10.59.142.12 DN right after", md)
+        self.assertIn("| invalid |", md)
+        self.assertTrue(any(w.startswith("Pause scenario s4a is invalid") for w in warnings))
+        self.assertFalse(any("s4a differs" in w for w in warnings))
+
+    # CodeRabbit on #101: a DN batch the script did not send (node 1 never
+    # reported the node DN) is not run.
+    def test_dn_batch_not_sent_is_not_run(self) -> None:
+        (self.dir / "s4b.out").unlink()
+        (self.dir / "s4b.meta").write_text("id=s4b\nkind=two\nstate=DN\n"
+                                           "not_run=node 1 did not report node 2 DN within the wait\n")
+        scenarios, md, warnings = self.run_pause()
+        self.assertEqual(scenarios["s4b"]["outcome"], "not run")
+        self.assertIsNone(scenarios["s4b"]["as_expected"])
+        self.assertIn("| not run | node 1 did not report node 2 DN within the wait |", md)
+        self.assertTrue(any(w.startswith("Pause scenario s4b not run") for w in warnings))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -259,7 +259,10 @@ def parse_log(path: Path, stopped: str | None = None) -> dict:
 def ended(run: dict) -> str | None:
     """How the run ended, from run-tests.sh's JSON: an exit, the timeout
     (coreutils timeout's 124), or a kill (137: the timeout's SIGKILL 30 s
-    after its SIGINT, or the kernel's OOM killer, which oom_kills tells)."""
+    after its SIGINT, or the kernel's OOM killer, which oom_kills tells),
+    or not started at all (too close to the step's deadline)."""
+    if run and run.get("skipped"):
+        return f"not run ({run['skipped']})"
     if not run or run.get("exit_status") is None:
         return None
     if run.get("timed_out"):
@@ -285,7 +288,10 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
         run = s["run"] or {}
         peak = run.get("memory_peak_bytes")
         how = ended(run)
-        if not s["result"]:
+        if run.get("skipped"):
+            warnings.append(f"Three-node tests: {s['label']} not run ({run['skipped']}: "
+                            f"{run.get('left_s')} s left before the step's deadline)")
+        elif not s["result"]:
             warnings.append(f"Three-node tests: {s['label']} printed no `test result` line"
                             + (f" (ended: {how})" if how and how != "exit" else "")
                             + (f"; {s['unreported']} test(s) never reported a result" if s["unreported"] else ""))
@@ -303,8 +309,10 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
     # and per test, in how many of them it failed.
     def step_of(label: str) -> str:
         return re.sub(r"-r\d+$", "", label)
+    # A repeat that was not started is not a run.
+    ran = [s_ for s_ in suites if not (s_["run"] or {}).get("skipped")]
     runs: dict[str, int] = {}
-    for s_ in suites:
+    for s_ in ran:
         runs[step_of(s_["label"])] = runs.get(step_of(s_["label"]), 0) + 1
     by_test: dict[tuple, dict] = {}
     for f in failures:
@@ -342,8 +350,13 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
             [[f["label"], f"`{f['test']}`", dict(CLASSES)[f["class"]] + (f" ({f['note']})" if f.get("note") else ""),
               (f["first_line"] or "")[:300]] for f in failures],
         ) + "\n</details>\n"
-    else:
+    elif ran:
         md += "\nNo test failed.\n"
+    else:
+        md += ("\n**No test ran:** no repeat of either step left a log (`logs/*.log`), or every repeat was "
+               "not started. The tests were skipped (the cluster or the schema step failed) or their logs "
+               "are missing; this is not a pass.\n")
+        warnings.append("Three-node tests: no test ran (no log, or no repeat started), so no failure count")
     unreported = [(s_["label"], s_["unreported"]) for s_ in suites if s_["unreported"]]
     if unreported:
         md += ("\n**Tests that never reported a result** (the run was stopped; libtest names a test only "
@@ -376,10 +389,17 @@ EXPECTED = {
 }
 
 
-def parse_outcome(text: str) -> dict:
+def parse_outcome(text: str | None) -> dict:
+    """cqlsh's answer to one batch. Success needs evidence that cqlsh ran it:
+    no error line, and the "Consistency level set" line it prints first.
+    No output file (None), or output without either, is unknown."""
+    if text is None:
+        return {"outcome": "unknown", "error": "no cqlsh output file"}
     errors = [l for l in text.splitlines() if re.search(r"Error|Exception|NoHostAvailable", l)]
     if not errors:
-        return {"outcome": "success"}
+        if re.search(r"^Consistency level set to ", text, re.MULTILINE):
+            return {"outcome": "success"}
+        return {"outcome": "unknown", "error": "cqlsh printed neither an error nor its consistency line"}
     line = errors[0]
     result = {"error": line.strip()[:400]}
     info = {}
@@ -458,15 +478,37 @@ def cmd_pause(directory: str, md_path: str, json_path: str) -> None:
             rows.append([sid, None, None, None, "did not run", None, None, None, None, None])
             continue
         m = meta(mpath)
-        outcome = parse_outcome((d / f"{sid}.out").read_text(errors="replace") if (d / f"{sid}.out").exists() else "")
+        expected = EXPECTED[sid]
+        expected_text = (f"{expected['outcome']}{' ' + expected['write_type'] if expected['write_type'] else ''}, "
+                         f"applied {expected['applied']}")
+        # pause-scenarios.sh did not send the batch: the state it needs
+        # (node 1 marking the paused nodes DN) was never seen.
+        if m.get("not_run"):
+            warnings.append(f"Pause scenario {sid} not run: {m['not_run']}")
+            scenarios.append({**m, "outcome": "not run", "expected": expected, "as_expected": None})
+            rows.append([sid, m.get("description"), m.get("paused"), m.get("state"), "not run", m["not_run"],
+                         None, None, expected_text, "–"])
+            continue
+        out_file = d / f"{sid}.out"
+        outcome = parse_outcome(out_file.read_text(errors="replace") if out_file.exists() else None)
+        if outcome["outcome"] == "unknown":
+            warnings.append(f"Pause scenario {sid}: its answer is unknown ({outcome['error']})")
         read = d / f"{sid}.read"
         rows_read = parse_rows(read.read_text(errors="replace")) if read.exists() else None
         got_applied = applied(m.get("kind", ""), rows_read)
-        expected = EXPECTED[sid]
         same = (outcome["outcome"] == expected["outcome"]
                 and (expected["write_type"] is None or outcome.get("write_type") == expected["write_type"])
                 and got_applied == expected["applied"])
-        if not same:
+        # Not comparable: the batch's state was not established (node 1 no
+        # longer saw the paused nodes UN right after it), or its answer is
+        # unknown.
+        verdict = "yes" if same else "**no**"
+        if m.get("invalid"):
+            same, verdict = None, "invalid"
+            warnings.append(f"Pause scenario {sid} is invalid: {m['invalid']}")
+        elif outcome["outcome"] == "unknown":
+            same, verdict = None, "unknown"
+        elif not same:
             warnings.append(f"Pause scenario {sid} differs from the PR #90 review's run: "
                             f"{outcome['outcome']} {outcome.get('write_type') or ''}, applied {got_applied}")
         detail = ", ".join(f"{k} {outcome[k]}" for k in ("write_type", "consistency", "received_responses",
@@ -474,21 +516,25 @@ def cmd_pause(directory: str, md_path: str, json_path: str) -> None:
                            if k in outcome)
         scenarios.append({**m, **outcome, "applied": got_applied, "rows": rows_read,
                           "expected": expected, "as_expected": same})
-        rows.append([sid, m.get("description"), m.get("paused"), m.get("state"), outcome["outcome"], detail or None,
-                     f"{m.get('took_ms')} ms", got_applied,
-                     f"{expected['outcome']}{' ' + expected['write_type'] if expected['write_type'] else ''}, applied {expected['applied']}",
-                     "yes" if same else "**no**"])
+        state = m.get("state")
+        if m.get("seen_after"):
+            state = f"{state}; {m['seen_after']} right after"
+        rows.append([sid, m.get("description"), m.get("paused"), state, outcome["outcome"], detail or None,
+                     f"{m.get('took_ms')} ms", got_applied, expected_text, verdict])
     windows = meta(d / "windows.meta") if (d / "windows.meta").exists() else {}
     md = table(["Scenario", "Batch", "Paused", "Node 1 saw them", "Answer", "Detail", "Time",
                 "Applied (read at ALL)", "PR #90 review", "Same"], rows)
     md += (
         f"\nTime until node 1 marked a paused node DN: {windows.get('w1_down_s', '?')} s with node 2 paused "
-        f"(after s1 and s4a), {windows.get('w2_down_s', '?')} s with nodes 2 and 3 (after s2).\n"
+        f"(after s1 and s4a), {windows.get('w2_down_s', '?')} s with nodes 2 and 3 (after s2); "
+        "\"timeout\" is not within the script's wait, and the DN scenario of that window is then not run.\n"
         "\nRaw CQL from `cqlsh` on node 1 (the coordinator), `LOCAL_QUORUM`, keyspace RF 3, no HFS code. "
         "One-partition: an update's index delta (insert v2, delete v1 of one `(tenant, Patient)` row). "
         "Two-partition: Patient and Observation rows in one LOGGED batch. \"Applied\" is read at `ALL` once every "
         "node is UN again and 25 s have passed (batchlog replay runs every 10 s). `cqlsh`'s Python driver re-sends "
-        "a `BATCH_LOG` timeout once, so s4a's time is about two node timeouts. Recorded, not asserted.\n"
+        "a `BATCH_LOG` timeout once, so s4a's time is about two node timeouts. A batch sent \"at once\" counts "
+        "only if node 1 still reports the paused nodes UN right after it (a paused node goes from UN to DN, not "
+        "back), and is \"invalid\" otherwise. Recorded, not asserted.\n"
     )
     write(md_path, json_path, md, {"scenarios": scenarios, "windows": windows, "warnings": warnings})
 
@@ -572,8 +618,15 @@ def main() -> int:
         {"tests": cmd_tests, "pause": cmd_pause, "memory": cmd_memory}[command](*args)
     except Exception as error:  # noqa: BLE001  report only
         print(f"::warning::three-node report {command} failed: {error!r}")
-        Path(args[1]).write_text(f"The report could not be built: `{error!r}`.\n")
-        Path(args[2]).write_text(json.dumps({"warnings": [f"three-node report {command} failed: {error!r}"]}))
+        # Each fallback on its own: a destination that cannot be written
+        # (the error above may be just that) does not stop the other, and
+        # the report still exits 0.
+        for path, text in ((args[1], f"The report could not be built: `{error!r}`.\n"),
+                           (args[2], json.dumps({"warnings": [f"three-node report {command} failed: {error!r}"]}))):
+            try:
+                Path(path).write_text(text)
+            except OSError as write_error:
+                print(f"::warning::three-node report {command}: could not write {path}: {write_error!r}")
     return 0
 
 

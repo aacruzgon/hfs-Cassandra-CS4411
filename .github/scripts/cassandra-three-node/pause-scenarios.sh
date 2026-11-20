@@ -30,6 +30,15 @@
 # every node is UN again and 25 s have passed (batchlog replay runs every
 # 10 s; hints are delivered on UN).
 #
+# Each scenario's state is checked, not assumed. A batch sent "at once"
+# counts only if node 1 still reports the paused nodes UN in the status taken
+# right after it: a paused node cannot gossip, so it goes from UN to DN and
+# not back, and UN after the batch means UN while it was sent. Otherwise its
+# .meta says invalid=. A "DN" batch is sent only once node 1 reports the
+# paused nodes DN; if that is not seen within the wait (or nodetool fails),
+# the batch is not sent and its .meta says not_run=. The CI runs so far sent
+# s4a about 5 s after the pause and saw node 2 DN about 18 s after it.
+#
 # Writes OUT_DIR/<id>.out (cqlsh's output), OUT_DIR/<id>.meta (key=value),
 # OUT_DIR/<id>.read (the read at ALL), OUT_DIR/timeline.log and
 # OUT_DIR/status-*.txt (nodetool status at each step). Always unpauses every
@@ -111,6 +120,35 @@ send() {
   log "$id ($desc): $(grep -v '^Consistency level' "$out/$id.out" | grep -v '^$' | head -1 | cut -c1-200) [${took} ms]"
 }
 
+# not_sent ID KIND PAUSED STATE DESCRIPTION EXPECTED REASON: the scenario's
+# .meta, without sending its batch.
+not_sent() {
+  {
+    echo "id=$1"; echo "kind=$2"; echo "paused=$3"; echo "state=$4"
+    echo "description=$5"; echo "expected=$6"; echo "not_run=$7"; echo "tenant=$(tenant_of "$1")"
+  } > "$out/$1.meta"
+  log "$1 ($5): not sent: $7"
+}
+
+# confirm_un SNAPSHOT "IP..." ID...: after the batches sent "at once", node 1
+# must still report every paused IP UN in status-SNAPSHOT.txt; otherwise each
+# ID is invalid.
+confirm_un() {
+  local snap=$1 ips=$2 seen="" ok=1 ip s id; shift 2
+  for ip in $ips; do
+    s=$(awk -v ip="$ip" '$2 == ip {print $1}' "$out/status-$snap.txt")
+    [ "$s" = UN ] || ok=0
+    seen="${seen:+$seen, }$ip ${s:-not listed}"
+  done
+  for id in "$@"; do
+    echo "seen_after=$seen" >> "$out/$id.meta"
+    if [ "$ok" = 0 ]; then
+      echo "invalid=node 1 reported $seen right after the batch, so it is not known to have been sent while node 1 saw them UN" >> "$out/$id.meta"
+      log "$id: invalid, node 1 reported $seen right after it"
+    fi
+  done
+}
+
 read_all() { # ID: the scenario's rows at ALL
   local tenant; tenant=$(tenant_of "$1")
   docker exec "$N1" cqlsh --request-timeout 30 -k helios -e "CONSISTENCY ALL; SELECT JSON resource_type, toUnixTimestamp(last_updated) AS lu, id, version_id, WRITETIME(version_id) AS w FROM resources_by_type WHERE tenant_id = '$tenant' AND resource_type IN ('Patient', 'Observation');" \
@@ -124,22 +162,39 @@ snapshot start
 for id in s1 s2 s3; do seed "$(tenant_of "$id")"; done
 log "seeded v1 for s1, s2 and s3"
 
-# Window 1: node 2 paused.
-docker pause "$N2" >/dev/null; log "paused node 2 ($IP2)"; snapshot w1-paused
+# Window 1: node 2 paused. The status snapshot comes after the two batches
+# sent at once, so it does not delay them, and confirms their state.
+docker pause "$N2" >/dev/null; log "paused node 2 ($IP2)"
 send s1 one "node 2" "UN (at once)" "one-partition batch, one replica paused" "success"
 send s4a two "node 2" "UN (at once)" "two-partition batch, one replica paused" "WriteTimeout BATCH_LOG, received 1, block_for 2; applied later"
-d=$(wait_down "$IP2"); log "node 1 marked node 2 DN after ${d} s more"; echo "w1_down_s=$d" >> "$out/windows.meta"; snapshot w1-down
-send s4b two "node 2" "DN" "two-partition batch, one replica marked down" "success"
+snapshot w1-sent; confirm_un w1-sent "$IP2" s1 s4a
+if d=$(wait_down "$IP2"); then
+  log "node 1 marked node 2 DN after ${d} s more"; snapshot w1-down
+  send s4b two "node 2" "DN" "two-partition batch, one replica marked down" "success"
+else
+  log "node 1 did not report node 2 DN within the wait"; snapshot w1-down
+  not_sent s4b two "node 2" "DN" "two-partition batch, one replica marked down" "success" \
+    "node 1 did not report node 2 DN within the wait (or nodetool status failed)"
+fi
+echo "w1_down_s=$d" >> "$out/windows.meta"
 docker unpause "$N2" >/dev/null
 if wait_up; then log "unpaused node 2, 3 UN"; else log "node 2 did not come back UN"; fi
 snapshot w1-up
 
 # Window 2: nodes 2 and 3 paused.
-docker pause "$N2" "$N3" >/dev/null; log "paused nodes 2 and 3 ($IP2, $IP3)"; snapshot w2-paused
+docker pause "$N2" "$N3" >/dev/null; log "paused nodes 2 and 3 ($IP2, $IP3)"
 send s2 one "nodes 2 and 3" "UN (at once)" "one-partition batch, two replicas paused" "WriteTimeout SIMPLE, received 1, block_for 2; applied on the coordinator"
-d2=$(wait_down "$IP2"); d3=$(wait_down "$IP3"); log "node 1 marked nodes 2 and 3 DN (${d2} s, then ${d3} s more)"
-echo "w2_down_s=$d2+$d3" >> "$out/windows.meta"; snapshot w2-down
-send s3 one "nodes 2 and 3" "DN" "one-partition batch, two replicas marked down" "Unavailable, required 2, alive 1; not applied"
+snapshot w2-sent; confirm_un w2-sent "$IP2 $IP3" s2
+d3=skipped
+if d2=$(wait_down "$IP2") && d3=$(wait_down "$IP3"); then
+  log "node 1 marked nodes 2 and 3 DN (${d2} s, then ${d3} s more)"; snapshot w2-down
+  send s3 one "nodes 2 and 3" "DN" "one-partition batch, two replicas marked down" "Unavailable, required 2, alive 1; not applied"
+else
+  log "node 1 did not report nodes 2 and 3 DN within the wait"; snapshot w2-down
+  not_sent s3 one "nodes 2 and 3" "DN" "one-partition batch, two replicas marked down" "Unavailable, required 2, alive 1; not applied" \
+    "node 1 did not report nodes 2 and 3 DN within the wait (or nodetool status failed)"
+fi
+echo "w2_down_s=$d2+$d3" >> "$out/windows.meta"
 docker unpause "$N2" "$N3" >/dev/null
 ok=0; wait_up && ok=1
 if [ $ok = 1 ]; then log "unpaused nodes 2 and 3, 3 UN"; else log "nodes 2 and 3 did not come back UN"; fi

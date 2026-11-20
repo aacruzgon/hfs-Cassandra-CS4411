@@ -22,7 +22,8 @@
 #   logs/LABEL.log          the libtest output, after a cargo-style "Running" line
 #                           so ci-report.py's test parser reads it
 #   run/LABEL.json          exit status, wall time, the container's memory.peak
-#                           and OOM kills, the timeout
+#                           and OOM kills, the timeout; or "skipped": "deadline"
+#                           for a run not started (below)
 #
 # Exits with the test binary's status: 124 when the timeout stopped it, 137
 # when it was killed (the timeout's SIGKILL, 30 s after its SIGINT, or the
@@ -32,7 +33,8 @@
 #
 # THREE_NODE_DEADLINE (epoch seconds, optional): the step's own deadline. The
 # timeout is cut so the container ends a minute before it, and a run with
-# under two minutes left is not started (exit 125), so the step's
+# under two minutes left is not started (exit 125; its log and run file say
+# so), so the step's
 # timeout-minutes never has to kill a docker client and leave its container
 # running.
 set -uo pipefail
@@ -47,18 +49,26 @@ timeout_s=$(( timeout_min * 60 ))
 memory=${THREE_NODE_TEST_MEMORY:-6g}
 name="hfs-cassandra-3n-tests-$label"
 
+mkdir -p "$THREE_NODE_OUT/logs" "$THREE_NODE_OUT/run" "$THREE_NODE_OUT/run/$label"
+log="$THREE_NODE_OUT/logs/$label.log"
+run_dir="$THREE_NODE_OUT/run/$label"
+
+# A repeat not started still gets its log (the "Running" line, so both
+# reports list it) and a run file saying why, so report.py shows it as not
+# run instead of leaving it out.
 if [ -n "${THREE_NODE_DEADLINE:-}" ]; then
   left=$(( THREE_NODE_DEADLINE - $(date +%s) - 60 ))
   if [ "$left" -lt 120 ]; then
     echo "::warning::$label not run: ${left} s left before the step's deadline"
+    { echo "     Running $suite ($binary)"
+      echo "not run (run-tests.sh): ${left} s left before the step's deadline"; } > "$log"
+    python3 -c 'import json, sys; l, s, b, left = sys.argv[2:]; json.dump({"label": l, "suite": s, "binary": b,
+"skipped": "deadline", "left_s": int(left)}, open(sys.argv[1], "w"), indent=2)' \
+      "$THREE_NODE_OUT/run/$label.json" "$label" "$suite" "$binary" "$left"
     exit 125
   fi
   [ "$left" -lt "$timeout_s" ] && timeout_s=$left
 fi
-
-mkdir -p "$THREE_NODE_OUT/logs" "$THREE_NODE_OUT/run" "$THREE_NODE_OUT/run/$label"
-log="$THREE_NODE_OUT/logs/$label.log"
-run_dir="$THREE_NODE_OUT/run/$label"
 
 # A container of an earlier, killed run.
 docker rm -f "$name" >/dev/null 2>&1 || true

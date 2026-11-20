@@ -199,6 +199,25 @@ class Find(unittest.TestCase):
         found = self.changed(SOURCE.replace("    #[ignore]\n    #[tokio::test(", "    #[tokio::test(", 1))
         self.assertEqual(list(found), ["backends::cassandra::batch::tests::flavoured"])
 
+    def test_a_deleted_test_marks_no_other_test(self):
+        deleted = SOURCE.replace('    #[test]\n    fn plain() {\n        assert_eq!(pack("a"), 1);\n    }\n\n', "")
+        self.assertNotEqual(deleted, SOURCE)
+        for context in (0, 3):
+            self.assertEqual(self.changed(deleted, context), {}, context)
+
+    def test_a_change_on_the_first_line_of_a_multi_line_attribute_counts(self):
+        attr = '    #[cfg_attr(not(feature = "x"),\n        ignore\n    )]\n    #[test]\n    fn plain()'
+        self.old = {LIB: SOURCE.replace("    #[test]\n    fn plain()", attr)}
+        found = self.changed(SOURCE.replace("    #[test]\n    fn plain()", attr.replace('"x"', '"y"')))
+        self.assertEqual(list(found), ["backends::cassandra::batch::tests::plain"])
+        self.assertEqual(found["backends::cassandra::batch::tests::plain"]["change"], "changed")
+
+    def test_a_multi_line_attribute_taken_away_counts(self):
+        attr = '    #[cfg_attr(\n        not(feature = "x"),\n        ignore\n    )]\n    #[test]\n    fn plain()'
+        self.old = {LIB: SOURCE.replace("    #[test]\n    fn plain()", attr)}
+        found = self.changed(SOURCE)
+        self.assertEqual(list(found), ["backends::cassandra::batch::tests::plain"])
+
     def test_a_rename_is_the_new_name(self):
         found = self.changed(SOURCE.replace("fn plain()", "fn plain_renamed()"))
         self.assertEqual(list(found), ["backends::cassandra::batch::tests::plain_renamed"])
@@ -381,6 +400,26 @@ class Report(unittest.TestCase):
         self.assertFalse(any("c failed every one" in w for w in data["warnings"]))
 
 
+class Ignored(unittest.TestCase):
+    def test_an_ignored_test_keeps_its_status_and_the_summary_says_why(self):
+        ignored = {"outcome": "ignored", "seconds": 0.1, "skipped": False}
+        ok = {"outcome": "pass", "seconds": 0.1, "skipped": False}
+        md, data = flaky.report({"runs_per_test": 2, "timeout_s": 300, "results": [
+            {"target": "lib", "name": "i", "runs": [ignored, ignored]},
+            {"target": "lib", "name": "a", "runs": [ok, ok]},
+        ]})
+        status = {r[0]: r for r in (line.split(" | ") for line in md.splitlines() if line.startswith("| `"))}
+        self.assertIn("ignored", status["| `i`"])
+        self.assertIn("1 test(s) are `#[ignore]`d", md)
+        self.assertIn("without `--include-ignored`", md)
+        self.assertFalse(any("i failed" in w for w in data["warnings"]))
+
+    def test_no_ignored_test_no_note(self):
+        ok = {"outcome": "pass", "seconds": 0.1, "skipped": False}
+        md, _ = flaky.report({"runs_per_test": 1, "timeout_s": 300, "results": [{"target": "lib", "name": "a", "runs": [ok]}]})
+        self.assertNotIn("#[ignore]", md)
+
+
 class Main(unittest.TestCase):
     def test_report_with_no_results_file_exits_0(self):
         tmp = temp_dir(self)
@@ -408,7 +447,7 @@ class NoTempDirLeft(unittest.TestCase):
         loader = unittest.TestLoader()
         suite = unittest.TestSuite(
             loader.loadTestsFromTestCase(case)
-            for case in (Blank, TestsIn, ChangedLines, Find, Bins, Classify, Run, Budget, Report, Main))
+            for case in (Blank, TestsIn, ChangedLines, Find, Bins, Classify, Run, Budget, Report, Ignored, Main))
         saved = tempfile.tempdir
         tempfile.tempdir = str(scratch)
         try:

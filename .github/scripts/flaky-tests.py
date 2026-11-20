@@ -158,6 +158,60 @@ def inline_mods(code: str) -> list[tuple[int, int, str]]:
     return [(m.end() - 1, match_brace(code, m.end() - 1), m.group(1)) for m in INLINE_MOD.finditer(code)]
 
 
+def attributes_above(code: str, at: int) -> int:
+    """The offset of the first of the outer attributes that end right above
+    `at` (blanked code, so comments are spaces), or `at` if there are none.
+    Walks back over each `#[…]` by its brackets, so an attribute written
+    over several lines counts from its `#[` line."""
+    while True:
+        k = at - 1
+        while k >= 0 and code[k].isspace():
+            k -= 1
+        if k < 0 or code[k] != "]":
+            return at
+        depth = 0
+        while k >= 0:
+            if code[k] == "]":
+                depth += 1
+            elif code[k] == "[":
+                depth -= 1
+                if depth == 0:
+                    break
+            k -= 1
+        h = k - 1
+        while h >= 0 and code[h].isspace():
+            h -= 1
+        # `#[…]` only: `#![…]` is an inner attribute, and anything else
+        # (an array, an index) is not an attribute at all.
+        if k < 0 or h < 0 or code[h] != "#":
+            return at
+        at = h
+
+
+def only_attributes(lines: list[str]) -> bool:
+    """Whether removed lines hold attributes and nothing else (comments and
+    blank lines aside): a removal of those right above a test changes the
+    test, a removal of a whole item (a deleted test) does not."""
+    code = blank("\n".join(lines)).strip()
+    if not code:
+        return False
+    while code:
+        if not code.startswith("#"):
+            return False
+        rest = code[1:].lstrip()
+        if not rest.startswith("["):
+            return False
+        depth, k = 0, 0
+        for k, c in enumerate(rest):
+            depth += {"[": 1, "]": -1}.get(c, 0)
+            if depth == 0:
+                break
+        if depth:
+            return False
+        code = rest[k + 1:].lstrip()
+    return True
+
+
 def tests_in(source: str) -> list[dict]:
     """Every test function in one file: its name, the inline modules it is
     in, and the lines from its first attribute to its closing brace."""
@@ -178,12 +232,10 @@ def tests_in(source: str) -> list[dict]:
         if body < 0:
             continue
         end = match_brace(code, body)
-        # The attribute block: the test attribute and every attribute line
-        # right above it (#[ignore], #[should_panic], #[cfg_attr(…)]).
-        start_line = lines.of(attr.start())
-        source_lines = code.split("\n")
-        while start_line > 1 and source_lines[start_line - 2].strip().startswith("#["):
-            start_line -= 1
+        # The attribute block: the test attribute and every attribute right
+        # above it (#[ignore], #[should_panic], #[cfg_attr(…)], also one
+        # written over several lines), with comments and doc comments.
+        start_line = lines.of(attributes_above(code, attr.start()))
         path = [name for (o, c, name) in mods if o < fn.start() < c]
         found.append({
             "fn": fn.group(1),
@@ -199,8 +251,9 @@ def tests_in(source: str) -> list[dict]:
 
 
 def changed_lines(diff: str) -> dict[str, dict]:
-    """Per new-side file: the lines the diff adds, and the points where it
-    removes lines (a removal between new lines c and c+1 is recorded as c)."""
+    """Per new-side file: the lines the diff adds, the points where it
+    removes lines (a removal between new lines c and c+1 is recorded as c),
+    and the lines each removal takes away."""
     files: dict[str, dict] = {}
     current = None
     new_line = 0
@@ -215,7 +268,7 @@ def changed_lines(diff: str) -> dict[str, dict]:
                 current = None
             else:
                 name = name[2:] if name.startswith("b/") else name
-                current = files.setdefault(name, {"added": set(), "removed_at": set()})
+                current = files.setdefault(name, {"added": set(), "removed_at": set(), "removed": {}})
             continue
         m = HUNK.match(line)
         if m:
@@ -232,6 +285,7 @@ def changed_lines(diff: str) -> dict[str, dict]:
             new_line += 1
         elif line.startswith("-"):
             current["removed_at"].add(new_line - 1)
+            current["removed"].setdefault(new_line - 1, []).append(line[1:])
         elif line.startswith(" ") or line == "":
             new_line += 1
     return files
@@ -240,8 +294,13 @@ def changed_lines(diff: str) -> dict[str, dict]:
 def touched(test: dict, change: dict) -> str | None:
     span = range(test["start"], test["end"] + 1)
     added = [n for n in span if n in change["added"]]
-    # A removal just above the first line (an attribute taken away) counts too.
-    removed = [c for c in change["removed_at"] if test["start"] - 1 <= c < test["end"]]
+    removed = [c for c in change["removed_at"] if test["start"] <= c < test["end"]]
+    # A removal just above the first line counts when it took attributes away
+    # (`#[ignore]` dropped), not when it took a whole item (the test before
+    # it deleted).
+    above = test["start"] - 1
+    if above in change["removed_at"] and only_attributes(change.get("removed", {}).get(above, [])):
+        removed.append(above)
     if not added and not removed:
         return None
     return "added" if len(added) == len(span) and not removed else "changed"
@@ -510,6 +569,13 @@ def report(results: dict, found: dict | None = None) -> tuple[str, dict]:
                f"(`--exact`), {results.get('timeout_s'):.0f} s timeout per run: {flaky} flaky, {failing} failing every run. "
                "Report only: the job passes whatever this finds. A test that printed `skipping:` passed without "
                "testing anything.\n\n")
+        ignored = sum(1 for r in data_rows if r["runs"] and r["ignored"] == r["runs"])
+        if ignored:
+            md += (f"{ignored} test(s) are `#[ignore]`d, so each of their runs reports \"ignored\" and tests nothing: "
+                   "the job runs every test as the required Cassandra job does, without `--include-ignored`. "
+                   "An ignored test is off by default because it is slow or needs a setting or resource this "
+                   "job does not provide, so re-running it here would not tell flakiness from that. "
+                   "Re-run one by hand with `--ignored`.\n\n")
         if results.get("stopped_at_budget"):
             md += (f"The run stopped at its {results.get('budget_s', 0) / 60:.0f}-minute budget; "
                    "the tests with fewer runs than the rest were not finished.\n\n")

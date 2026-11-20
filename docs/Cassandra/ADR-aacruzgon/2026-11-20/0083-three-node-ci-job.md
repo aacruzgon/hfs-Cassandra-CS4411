@@ -26,7 +26,7 @@
             - **If it runs late:** a late run only queues (`concurrency`).
             - **Correction of the first version:** it said 10:00 UTC, "clear of the canary (02:00)". It gave its window as 2026-11-04 to 2026-11-20 (it was 2026-11-07 to 11-20) and its evening range as 45 to 108 (it was 32 to 108). The independent audit of #101 found all three.
         - **The job:** `Cassandra three-node tests (report only)`, in no ruleset, on `[self-hosted, hfs-cassandra-heavy]`, `timeout-minutes: 120`, with the fork guard. `concurrency` is one group for every ref, `cassandra-three-node`, with `cancel-in-progress: false`, so two runs never overlap. GitHub keeps at most one pending run per group, so a third run (a dispatch while the nightly is queued) cancels the pending one.
-        - **Two checkouts.** The code under test (`ref`, or the run's own commit) goes at the workspace root, and the schema `docs/Cassandra/schema/schema.cql` comes with it. This workflow's own commit's `.github/` and `docker/` go in `.three-node-job/`: the job's scripts, the Compose files and `ci-report.py`. So `ref` can name a branch without this job's files, such as #83's. `ref` refuses `refs/pull/`, and, before any checkout, a commit SHA that no branch of this repository contains (the compare API, each branch head against the SHA): a fork pull request's code, by ref or by commit, must not run on a self-hosted runner.
+        - **Two checkouts.** The code under test (`ref`, or the run's own commit) goes at the workspace root, and the schema `docs/Cassandra/schema/schema.cql` comes with it. This workflow's own commit's `.github/` and `docker/` go in `.three-node-job/`: the job's scripts, the Compose files and `ci-report.py`. So `ref` can name a branch without this job's files, such as #83's. `ref` refuses `refs/pull/` and any ASCII whitespace (`actions/checkout` strips it before deciding that a ref is a SHA, so `" <sha>"` would pass as a name), and, before any checkout, a commit SHA that no branch of this repository contains (the compare API, each branch head against the SHA): a fork pull request's code, by ref or by commit, must not run on a self-hosted runner.
         - **`repeats`:** a whole number from 1 to 20, with no leading zero, checked before the checkouts.
     - **The cluster.**
         - `docker-compose.cluster.yml` with a new override, `docker-compose.cluster.heap512m.yml`: 512M heap, 256M direct memory, `mem_limit` and `memswap_limit` 1700m, as the review used. 5,100 MiB (4.98 GiB) of limits in all.
@@ -46,6 +46,11 @@
         - **s4a and s4b:** a two-partition logged batch (Patient and Observation) with node 2 paused, sent at once and then after it is marked `DN`.
 
         Each answer, its write type and counts, its time, and whether it applied (read at `ALL` once every node is `UN` again and 25 s have passed) are compared with the review's results. They are recorded, not asserted.
+
+        Each scenario's state is checked, not assumed:
+        - **A batch sent at once** counts only if node 1 still reports the paused nodes `UN` in the status taken right after it. A paused node goes from `UN` to `DN` and not back. Otherwise the scenario is "invalid", not compared.
+        - **A batch for `DN`** is sent only once node 1 reports the nodes `DN`. Otherwise it is "not run".
+        - **No `cqlsh` output** is an unknown answer, not a success.
     - **Reports.** The job writes these to the step summary and the artifact `ci-report-three-node` (14 days):
         - from `ci-report.py`: the build (peak `anon` and `memory.current`, OOM kills, `--timings`), the start and schema apply, the test counts and skips of every repeat, the CAS counters, the intent rows left behind, each node's statistics, the target directory's size, and where the time went;
         - from `report.py`:
@@ -58,11 +63,12 @@
                 - **killed:** a test still running when the binary was killed (exit 137, an OOM kill or the timeout's `SIGKILL`);
                 - **cause unknown:** a failure whose output a stopped run never printed;
                 - **other:** everything else. An invariant panic that lists the writers' outcomes, a 504 among them (PR #83's), is "other", with a note.
+            - with no test log at all (the tests were skipped), "no test ran", with a warning, not a pass;
             - the pause scenarios;
             - each container's `memory.peak` and OOM kills, and a `docker stats` sample every 5 s;
         - in the artifact: the full test logs, `nodetool status` and `describecluster` from every node, each node's `system.log` tail and container log, and the scenarios' raw `cqlsh` output.
     - **Limits.** Its own target directory, `target/cassandra-three-node`, with the required Cassandra job's 15 GB cap and reset rule (ADR-sam-michaels-0002), and the cargo `CACHEDIR.TAG` (ADR-aacruzgon-0070). The test container is capped at 6 GiB.
-        - **Each run of a binary** is stopped after 8 minutes (6 for `--lib`), cut short so it ends about two minutes before its step's own timeout (a deadline a minute early, less another minute in `run-tests.sh`). A run with under two minutes left is not started. So the step's timeout never has to kill a `docker run` client and leave its container running.
+        - **Each run of a binary** is stopped after 8 minutes (6 for `--lib`), cut short so it ends about two minutes before its step's own timeout (a deadline a minute early, less another minute in `run-tests.sh`). A run with under two minutes left is not started; its log and run file say so, and the report lists it as not run. So the step's timeout never has to kill a `docker run` client and leave its container running.
         - **A cancel** is cleaned up by the `always()` step "Stop the cluster", which removes every `hfs-cassandra-3n-tests-*` container. The runner signals only the step's shell, not `run-tests.sh`. `run-tests.sh` also removes its container on a `SIGINT`, `SIGTERM` or `SIGHUP` sent to the script itself.
         - **How a run ended:** coreutils `timeout`'s 124 is reported as a timeout. 137 is reported as "killed", with the container's OOM kills saying whether the kernel did it.
         - **Leftovers of a killed run** are removed before the build.
@@ -146,10 +152,10 @@
         - the repeats and their default of 5;
         - the scenarios' raw-CQL form;
         - the temporary push trigger.
-    - **What the human changed:** After the PR #90 review's hand runs on three nodes, I asked for a CI job that runs the cluster ("should we also do the 3 node one?"), with the scope my session briefed: report-only, nightly and by dispatch, no `pull_request` trigger in this first version, no test changes, and the pause scenarios only if they need no backend test code. I approved the draft's choices as written: the container route, 10:00 UTC, the reserved subnet and ports, and 5 repeats. After the independent audit of #101 (2026-11-20), I had its findings fixed before undraft: the failure classes read from the panic's own first line, a stopped run's hung test and earlier messages, `ref` with two checkouts, the hour picked again from the runs' real start times (10:37 UTC), and its minor findings except M9 (linting in CI), which is under "To revisit". After the delta audit, I had its minors fixed too: a 504 inside `Err(…)`, the configuration test's 503 and 504, an OOM-killed run's tests, a commit SHA on no branch, and the trap's wording.
+    - **What the human changed:** After the PR #90 review's hand runs on three nodes, I asked for a CI job that runs the cluster ("should we also do the 3 node one?"), with the scope my session briefed: report-only, nightly and by dispatch, no `pull_request` trigger in this first version, no test changes, and the pause scenarios only if they need no backend test code. I approved the draft's choices as written: the container route, 10:00 UTC, the reserved subnet and ports, and 5 repeats. After the independent audit of #101 (2026-11-20), I had its findings fixed before undraft: the failure classes read from the panic's own first line, a stopped run's hung test and earlier messages, `ref` with two checkouts, the hour picked again from the runs' real start times (10:37 UTC), and its minor findings except M9 (linting in CI), which is under "To revisit". After the delta audit, I had its minors fixed too: a 504 inside `Err(…)`, the configuration test's 503 and 504, an OOM-killed run's tests, a commit SHA on no branch, and the trap's wording. After undraft, I had CodeRabbit's eight threads checked and all eight fixed: the pause scenarios' state checks, missing evidence reported as such, deadline-skipped repeats listed, best-effort fallback writes, whitespace in `ref`, and `pipefail` before `tee`.
     - **Verified:**
         - **The CI runs above:** their logs and their artifact `ci-report-three-node`.
-        - **`report.py`:** `.github/scripts/test_cassandra_three_node_report.py`, 23 tests, run locally. The classes it covers:
+        - **`report.py`:** `.github/scripts/test_cassandra_three_node_report.py`, 32 tests, run locally. What it covers:
             - a #77 504, through the race suites and through a `--lib` unwrap;
             - a plain write's 504, a CAS write's 504 and an unknown-outcome 504, each "another 504";
             - a 503;
@@ -162,9 +168,13 @@
             - two invariant panics listing a #77 504, "other" with a note;
             - a run stopped by the timeout, in capture mode and with `--nocapture`;
             - a finished `--nocapture` run;
-            - the section's "Ended" column for a timeout and an OOM kill.
+            - the section's "Ended" column for a timeout and an OOM kill;
+            - no test log, and every repeat skipped at the deadline: "no test ran";
+            - a repeat skipped at the deadline: listed, and not counted as a run;
+            - a destination that cannot be written: the report still exits 0;
+            - the pause scenarios: run 44758590016's outputs, all as the review found; a missing or empty output, unknown; a batch sent at once with the node already `DN`, invalid; a `DN` batch not sent, not run.
 
-          It also matches the classes of run 1's and run 2's real logs, and was run on the review's own `cqlsh` outputs (`3n-cqlsh*-rep1.txt`).
+          It also matches the classes of runs 1, 2 and 3's real logs, and was run on the review's own `cqlsh` outputs (`3n-cqlsh*-rep1.txt`).
         - **Lint:** `actionlint` 1.7.12 reports only `runner.workspace`, which it also reports three times in the required `fmt-clippy-cassandra.yml`. `shellcheck` is clean.
         - **The image:** `docker run` of the pinned image showed `libssl.so.3`, `libcrypto.so.3` and glibc 2.41. On Linux, `cargo tree -i openssl-sys` showed the binaries link `openssl` through `native-tls`.
         - **The ports:** `ss -ltn` on `acruzdebian` (read-only, in a visible pane).
@@ -176,9 +186,17 @@
             - It accepted `main`'s head, a commit 40 back on `main`, and #83's head (on its branch, after 46 s).
             - It refused upstream `HeliosSoftware/hfs`'s `main` head (in the fork's network, on no branch of the fork, after 81 s) and a random SHA.
             - It passed a branch name straight through.
+        - **The whitespace check:** the input step's script, run locally.
+            - It refused upstream's `main` SHA with a leading space, a trailing space, or a leading tab, carriage return, vertical tab or form feed, which the guard had let through as names.
+            - It also refused a ref with a newline and `refs/pull/101/head`.
+            - It passed an empty ref, `main`, `cassandra/ci-three-node`, a tag name, `refs/heads/main` and the bare SHA. The guard then refuses the bare SHA.
+        - **`pause-scenarios.sh`:** run locally against a fake `docker`.
+            - Node 2 reported `DN` at once: s1, s2 and s4a were invalid.
+            - `nodetool status` failing while nodes were paused: s1, s2 and s4a were invalid, and s3 and s4b were not sent.
+            - The normal sequence was unchanged.
         - **`run-tests.sh`:** run locally against a fake `docker`.
             - Exits 101, 124 and 137 were recorded as an exit, a timeout and a kill.
-            - A deadline 100 s away skipped the run with exit 125, and one 300 s away cut the timeout to 240 s.
+            - A deadline 100 s away skipped the run with exit 125, writing its log and run file. One 300 s away cut the timeout to 240 s.
             - A `SIGTERM` removed the container and exited 143 within about 2 s.
         - **#77 and #83:** read in full; `tests/common/cassandra.rs` on `e5e8ea67f` has no RF or node-count check.
 - **Links:**

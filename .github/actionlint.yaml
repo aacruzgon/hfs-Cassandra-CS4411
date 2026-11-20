@@ -1,10 +1,12 @@
 # The self-hosted runners' custom labels, so actionlint does not report them as
-# unknown: hfs-cassandra (ADR-sam-michaels-0001), the light and heavy job labels
-# and each runner's own hfs-runner-* label (ADR-aacruzgon-0023).
+# unknown: hfs-cassandra (ADR-sam-michaels-0001), the light, medium and heavy
+# job labels (ADR-aacruzgon-0023, 0082) and each runner's own hfs-runner-*
+# label (ADR-aacruzgon-0023).
 self-hosted-runner:
   labels:
     - hfs-cassandra
     - hfs-cassandra-light
+    - hfs-cassandra-medium
     - hfs-cassandra-heavy
     - hfs-runner-sam-7900x
     - hfs-runner-acruzdebian

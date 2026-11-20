@@ -42,4 +42,5 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 
 | ADR | Date | Title | Status |
 | --- | --- | --- | --- |
+| [0001](2026-11-13/0001-race-checks-accept-504-at-rf-2.md) | 2026-11-13 | The race checks accept a 504 at RF 2 or more, read from the keyspace, and check the history instead | accepted |
 | [0002](2026-11-20/0002-step-4-versioning.md) | 2026-11-20 | Step 4's three open questions: 409 on a mismatch, live tests for the conditional suite, and `current_version` overridden | accepted |

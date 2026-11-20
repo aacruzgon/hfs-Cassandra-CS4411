@@ -5,10 +5,11 @@ name: fmt, clippy and Cassandra schema
 # into two jobs, and a single-node Cassandra that the schema is applied to and
 # tests/cassandra_tests.rs and tests/backend_capability_contract.rs run
 # against (ADR-aacruzgon-0020).
-# fmt and the Cassandra job are light, the clippy pair heavy
-# (ADR-aacruzgon-0023); both runners take both labels, so every job runs on
-# either (ADR-aacruzgon-0080). Each runner has one executor, so the jobs on
-# one machine run one after another.
+# fmt and the Cassandra job are light, the clippy pair medium
+# (ADR-aacruzgon-0023, 0082): both runners take light and medium, so every
+# job here runs on either, and must fit sam-7900x's 20G (ADR-aacruzgon-0080).
+# Each runner has one executor, so the jobs on one machine run one after
+# another.
 # Every job that compiles also writes CI reports (.github/scripts/ci-report.py):
 # measured figures in the run's summary page and in an artifact,
 # ci-report-<job>. Reports never fail a job for a figure. Every job reports
@@ -77,7 +78,7 @@ jobs:
       # command that fails the Cassandra job. Here because fmt is the cheapest
       # job and needs no node. A new script's tests are added here by module name.
       - name: Test the CI report script
-        run: PYTHONPATH=.github/scripts python3 -m unittest -v test_ci_report test_cassandra_coverage_rest_summary test_fhir_versions_report
+        run: PYTHONPATH=.github/scripts python3 -m unittest -v test_ci_report test_cassandra_coverage_rest_summary test_fhir_versions_report test_mutants_report test_flaky_tests
 
       # The CI half of the dependency rule (check a dependency's newer
       # releases before working around its bug): each chosen crate's locked
@@ -173,7 +174,9 @@ jobs:
     name: cargo clippy (helios-fhir)
     # Fork guard (ADR-aacruzgon-0018).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, hfs-cassandra-heavy]
+    # Medium (ADR-aacruzgon-0082): more than about 9 GB, within sam-7900x's
+    # 20G, so either runner takes it.
+    runs-on: [self-hosted, hfs-cassandra-medium]
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -311,7 +314,9 @@ jobs:
     needs: clippy-fhir
     # Fork guard (ADR-aacruzgon-0018).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, hfs-cassandra-heavy]
+    # Medium (ADR-aacruzgon-0082): more than about 9 GB, within sam-7900x's
+    # 20G, so either runner takes it.
+    runs-on: [self-hosted, hfs-cassandra-medium]
     timeout-minutes: 60
     steps:
       - name: Checkout

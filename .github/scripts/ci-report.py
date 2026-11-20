@@ -98,10 +98,17 @@ def cgroup() -> Path | None:
 
 
 def context() -> dict:
-    """The job's context, computed once and kept in context.json."""
+    """The job's context, computed once and kept in context.json. The context
+    command's own section is also context.json (its id is "context"), and it
+    replaces the bare context with a section document, so a section read after
+    it is unwrapped: otherwise every later section would nest the whole
+    section as its context, and `build` would miss its keys."""
     path = report_dir() / "context.json"
     try:
-        return json.loads(path.read_text())
+        saved = json.loads(path.read_text())
+        if isinstance(saved, dict) and saved.get("id") == "context" and isinstance(saved.get("context"), dict):
+            return saved["context"]
+        return saved
     except (OSError, ValueError):
         pass
     group = cgroup()

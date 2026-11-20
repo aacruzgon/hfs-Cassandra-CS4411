@@ -680,7 +680,12 @@ impl StatementCounters {
 /// A batch is counted twice over, in fields of its own (IW14, separate
 /// fields): once in `batch`, as the one request it is, and once per
 /// statement it carries in `batched`. `write` counts only statements sent
-/// alone, so a reader sees both the round trips and the rows they carried.
+/// alone, so a reader sees both the requests and the rows they carried.
+///
+/// These are the writer's requests, not wire round trips: when the
+/// coordinator has lost a prepared ID, `cdrs-tokio` prepares it again and
+/// re-sends inside the same call (10.0.0, `cluster/session.rs:567-600`), and
+/// such a request counts once.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StatementCounts {

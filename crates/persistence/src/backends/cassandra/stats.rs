@@ -151,14 +151,18 @@ impl fmt::Display for CasStats {
     }
 }
 
-/// What one write's index phase sent (IW14): the index rows it inserted and
-/// deleted, the batches they went in, and the largest of those batches by
-/// [`wire_bytes`](super::batch::wire_bytes), the measure every batch is
-/// packed by (IW11). One per write, filled by the index writer and returned
-/// with its outcome, so a test or a log line reads one operation's figures.
+/// What one write's index phase packed (IW14): the index rows planned for
+/// insert and for delete, the batches they were packed into, and the largest
+/// of those batches by [`wire_bytes`](super::batch::wire_bytes), the measure
+/// every batch is packed by (IW11). The figures are filled when the batches
+/// are packed, before anything is sent, so they are not what was sent or
+/// applied: a batch that failed is counted here all the same. One per write,
+/// returned with its outcome, so a test or a log line reads one operation's
+/// figures.
 ///
 /// A batch here is one packed group of units, counted once however many
-/// tries it took; [`StatementCounts`](super::StatementCounts) counts the
+/// tries it took; the session's `statement_counts()`
+/// ([`StatementCounts`](super::StatementCounts)) counts what was sent, the
 /// requests, retries included. A group of one statement counts as a batch
 /// here too, although the session sends it as a plain write.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

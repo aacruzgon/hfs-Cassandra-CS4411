@@ -2,7 +2,8 @@
 //! hold, how many bytes one may carry, and what a failed one means.
 //!
 //! Step 5 of the write path sends a version's index rows in logged batches at
-//! `LOCAL_QUORUM`, each under 5 KiB, sent concurrently (design step 5;
+//! `LOCAL_QUORUM`, each under 5 KiB (a unit over the limit is never split and
+//! goes alone, as one batch), sent concurrently (design step 5;
 //! `docs/Cassandra/schema/walkthrough.md` section 2, "Index rows"). The
 //! session sends one batch, [`CassandraSession::batch`]; this module holds
 //! the parts that need no node, each tested on its own. The decisions are
@@ -228,7 +229,8 @@ pub(crate) const MAX_BATCH_BYTES: usize = 5 * 1024 - 256;
 ///   reached fewer than a quorum.
 /// - **A unit over `bound` goes alone**, as a batch of its own. Such a unit
 ///   is one partition, so the node neither size-checks it nor writes it to
-///   the batchlog (`BatchStatement.java:331-367`). No fixture comes near:
+///   the batchlog (`BatchStatement.java:444-445`; the size check it also
+///   skips is `:333-334`). No fixture comes near:
 ///   it takes several values close to 1,024 bytes, the most an index value
 ///   keeps before it is stored as its SHA-256 (G35 as amended by
 ///   ADR-aacruzgon-0079).

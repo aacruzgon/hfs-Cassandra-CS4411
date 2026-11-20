@@ -25,7 +25,8 @@
 //!    key, so a date key both versions have is only re-inserted (IW7);
 //!    insert `K(N+1)`. Every row of one partition goes as one unit; the
 //!    units are packed into logged batches of at most 4,864 wire bytes,
-//!    never splitting a unit, and the batches go at once, at most 8 in
+//!    never splitting a unit (a unit over the limit goes alone, as one
+//!    batch), and the batches go at once, at most 8 in
 //!    flight (IW9 B, IW11, IW12; [`CassandraBackend::write_index_delta`]).
 //! 6. I2, the intent delete.
 //!
@@ -2151,8 +2152,11 @@ impl CassandraBackend {
     ///   [`WriteFailure::TriesExhausted`]: a hung connection then cannot hold
     ///   a client for three request deadlines after its write applied.
     ///
-    /// A batch that fails keeps its partitions' old rows, tagged with an
-    /// older version, which the tag check hides; the others are written.
+    /// A batch that fails is not confirmed: it may or may not have applied
+    /// (after a `BATCH` timeout, or when the deadline dropped it after it was
+    /// sent, it may well have). Its partitions' old rows, tagged with an
+    /// older version, are still there for the tag check to hide, whether or
+    /// not the new ones landed; the others are written.
     /// The result is `Ok` once every batch is confirmed. A failure is
     /// [`WriteFailure::Permanent`] if any batch's was, then
     /// [`WriteFailure::TriesExhausted`], then [`WriteFailure::InBatchlog`];
@@ -2229,8 +2233,7 @@ impl CassandraBackend {
                 version_id = delta.version_id,
                 failed = failures.len(),
                 index = %stats,
-                "index batches failed; their partitions' old index rows are kept for the \
-                 sweeper"
+                "index batches not confirmed; the intent is kept for the sweeper"
             );
             Err([
                 WriteFailure::Permanent,

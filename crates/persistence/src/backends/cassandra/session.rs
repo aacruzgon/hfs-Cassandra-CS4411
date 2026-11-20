@@ -390,7 +390,9 @@ impl CassandraSession {
     }
 
     /// Prepares (on first use) and sends one statement under the request
-    /// deadline, with no counting and no injected fault.
+    /// deadline, with no counting and no injected fault. Only the test fault
+    /// seam sends this way.
+    #[cfg(test)]
     async fn send(
         &self,
         cql: &str,

@@ -59,10 +59,13 @@ permissions:
   # (.github/scripts/job-step-timings.py). Read-only, like contents.
   actions: read
 
-# One run per pull request, or per ref and head for a dispatch; a newer push
-# cancels the run in flight.
+# One run per pull request, or per dispatch of the same ref and inputs; a
+# newer push cancels the run in flight.
 concurrency:
-  group: cassandra-flaky-${{ github.event.pull_request.number || format('{0}-{1}', github.ref, inputs.head) }}
+  group: >-
+    cassandra-flaky-${{ github.event.pull_request.number
+    || format('{0}-{1}-{2}-{3}-{4}', github.ref, inputs.head, inputs.base,
+              inputs.in_diff, inputs.runs) }}
   cancel-in-progress: true
 
 env:

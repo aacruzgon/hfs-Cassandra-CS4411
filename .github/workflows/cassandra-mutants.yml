@@ -73,7 +73,7 @@ permissions:
   # (.github/scripts/job-step-timings.py). Read-only, like contents.
   actions: read
 
-# One run per pull request, or per ref, head and node choice for a dispatch;
+# One run per pull request, or per dispatch of the same ref and inputs;
 # a newer push cancels the run in flight, so pushes do not pile up behind the
 # one runner. Adding any other label also starts a run (which the job skips),
 # so that run gets a group of its own: in the pull request's group it would
@@ -84,7 +84,8 @@ concurrency:
     && (github.event.action == 'labeled' && github.event.label.name != 'mutants'
         && format('other-label-{0}', github.run_id)
         || github.event.pull_request.number)
-    || format('{0}-{1}-{2}', github.ref, inputs.head, inputs.node) }}
+    || format('{0}-{1}-{2}-{3}-{4}-{5}', github.ref, inputs.head, inputs.base,
+              inputs.in_diff, inputs.node, inputs.jobs) }}
   cancel-in-progress: true
 
 env:

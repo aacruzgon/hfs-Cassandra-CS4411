@@ -48,7 +48,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branch, tag or commit of this repository to test (empty: the dispatched ref). Never a fork's refs/pull/N/head nor its commit SHA: it would run that code on a self-hosted runner, so the job refuses refs/pull/ and any SHA no branch here contains."
+        description: "Branch, tag or commit of this repository to test (empty: the dispatched ref). Never a fork's refs/pull/N/head nor its commit SHA: it would run that code on a self-hosted runner, so the job refuses refs/pull/, any whitespace, and any SHA no branch here contains."
         required: false
         default: ""
       test_filter:
@@ -123,7 +123,12 @@ jobs:
     steps:
       # Before any checkout: repeats is a whole number from 1 to 20 (no
       # leading zero: seq 1 00 runs nothing), and the ref is not a pull
-      # request's. Printed with %q, so a newline cannot start a workflow
+      # request's and holds no ASCII whitespace. actions/checkout strips
+      # that whitespace before it decides whether the ref is a SHA
+      # (src/input-helper.ts), so " <sha>" would pass the SHA check below as
+      # a name and still be checked out by commit. Git forbids spaces and
+      # control characters in branch and tag names, so no valid name is
+      # refused. Printed with %q, so a newline cannot start a workflow
       # command.
       - name: Check the dispatch inputs
         env:
@@ -134,8 +139,8 @@ jobs:
             exit 1
           fi
           case "$REF" in
-            *refs/pull/*|pull/*|*$'\n'*)
-              printf '::error::ref must be a branch, tag or commit of this repository, not %q\n' "$REF"
+            *refs/pull/*|pull/*|*[$' \t\n\v\f\r']*)
+              printf '::error::ref must be a branch, tag or commit of this repository, with no whitespace, not %q\n' "$REF"
               exit 1 ;;
           esac
 
@@ -257,6 +262,7 @@ jobs:
       - name: Build tests/cassandra_tests.rs and the --lib tests, and report the memory peak
         id: build
         run: |
+          set -o pipefail
           python3 "$THREE_NODE_JOB_FILES"/.github/scripts/ci-report.py build build-three-node \
             "Build: helios-persistence cassandra_tests and --lib tests" -- \
             nice -n 10 cargo test -p helios-persistence --features cassandra \
@@ -318,6 +324,7 @@ jobs:
       - name: Check whether the runner reaches the nodes' cluster addresses
         continue-on-error: true
         run: |
+          set -o pipefail
           for n in 1 2 3; do
             ip="$CASSANDRA_CLUSTER_SUBNET_PREFIX.1$n"
             if timeout 3 bash -c "exec 3<>/dev/tcp/$ip/9042" 2>/dev/null; then r=reachable; else r="not reachable"; fi

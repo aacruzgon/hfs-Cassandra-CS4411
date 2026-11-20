@@ -1377,7 +1377,7 @@ mod node_tests {
 
     use super::*;
     use crate::backends::cassandra::batch::{BatchFailure, IndexCql, classify_failure};
-    use crate::backends::cassandra::test_support::test_config;
+    use crate::backends::cassandra::test_support::{test_config, test_fhir_version};
     use cdrs_tokio::types::IntoRustByName;
 
     /// X1 and its delete, as the writer sends them (`write.rs`).
@@ -1430,7 +1430,7 @@ mod node_tests {
                 Value::from(at(last_updated)),
                 Value::from(id),
                 Value::from(1_i32),
-                Value::from("4.0"),
+                Value::from(test_fhir_version().as_mime_param()),
                 Value::from(ts),
             ],
         )

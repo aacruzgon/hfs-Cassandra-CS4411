@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -77,9 +78,19 @@ def write_tree(root: Path, files: dict[str, str]) -> None:
         path.write_text(text)
 
 
-def git_diff(old: dict[str, str], new: dict[str, str], context: int = 0) -> tuple[str, Path]:
-    """A real `git diff -U<context>` between two trees, and the new tree's root."""
+def temp_dir(test: unittest.TestCase) -> Path:
+    """A temporary directory that is removed when `test` ends, pass or fail.
+    The fmt job runs these tests on every push, on persistent runners."""
     tmp = Path(tempfile.mkdtemp())
+    test.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+    return tmp
+
+
+def git_diff(test: unittest.TestCase, old: dict[str, str], new: dict[str, str],
+             context: int = 0) -> tuple[str, Path]:
+    """A real `git diff -U<context>` between two trees, and the new tree's
+    root, in a directory removed when `test` ends."""
+    tmp = temp_dir(test)
     subprocess.run(["git", "init", "-q", str(tmp)], check=True)
     run = lambda *a: subprocess.run(["git", "-C", str(tmp), "-c", "user.name=t", "-c", "user.email=t@t", *a],
                                     check=True, capture_output=True, text=True).stdout
@@ -163,7 +174,7 @@ class ChangedLines(unittest.TestCase):
         self.assertEqual(change["removed_at"], {11})
 
     def test_a_new_file_and_a_deleted_one(self):
-        diff, _ = git_diff({"gone.rs": "fn x() {}\n"}, {"new.rs": "fn y() {}\n"})
+        diff, _ = git_diff(self, {"gone.rs": "fn x() {}\n"}, {"new.rs": "fn y() {}\n"})
         change = flaky.changed_lines(diff)
         self.assertEqual(set(change), {"new.rs"})
         self.assertEqual(change["new.rs"]["added"], {1})
@@ -176,7 +187,7 @@ class Find(unittest.TestCase):
     def changed(self, new_source: str, context: int = 0, extra_old=None, extra_new=None) -> dict:
         old = dict(self.old, **(extra_old or {}))
         new = {LIB: new_source, **(extra_new or {})}
-        diff, root = git_diff(old, new, context)
+        diff, root = git_diff(self, old, new, context)
         return {t["name"]: t for t in flaky.find(diff, root)["tests"]}
 
     def test_a_changed_body_counts(self):
@@ -222,13 +233,13 @@ class Find(unittest.TestCase):
         self.assertEqual(found["create_read::reads"]["target"], "cassandra_tests")
 
     def test_a_file_no_test_crate_includes_is_a_warning(self):
-        diff, root = git_diff({LIB: SOURCE}, {LIB: SOURCE, "crates/persistence/tests/cassandra/orphan.rs": "#[test]\nfn t() {}\n"})
+        diff, root = git_diff(self, {LIB: SOURCE}, {LIB: SOURCE, "crates/persistence/tests/cassandra/orphan.rs": "#[test]\nfn t() {}\n"})
         result = flaky.find(diff, root)
         self.assertEqual(result["tests"], [])
         self.assertTrue(any("orphan.rs" in w for w in result["warnings"]))
 
     def test_files_outside_the_scope_are_ignored(self):
-        diff, root = git_diff({"crates/persistence/src/backends/sqlite/x.rs": "fn a() {}\n"},
+        diff, root = git_diff(self, {"crates/persistence/src/backends/sqlite/x.rs": "fn a() {}\n"},
                               {"crates/persistence/src/backends/sqlite/x.rs": "#[test]\nfn a() {}\n"})
         self.assertEqual(flaky.find(diff, root)["tests"], [])
 
@@ -298,7 +309,7 @@ class Classify(unittest.TestCase):
 
 class Run(unittest.TestCase):
     def test_run_counts_each_attempt_with_a_fake_binary(self):
-        tmp = Path(tempfile.mkdtemp())
+        tmp = temp_dir(self)
         counter = tmp / "n"
         counter.write_text("0")
         (tmp / "pass.txt").write_text(PASS)
@@ -326,7 +337,7 @@ class Run(unittest.TestCase):
 
 class Budget(unittest.TestCase):
     def test_runs_past_the_budget_are_not_reached(self):
-        tmp = Path(tempfile.mkdtemp())
+        tmp = temp_dir(self)
         (tmp / "pass.txt").write_text(PASS)
         fake = tmp / "fake-test"
         fake.write_text(f"#!/bin/sh\ncat {tmp}/pass.txt\n")
@@ -372,18 +383,41 @@ class Report(unittest.TestCase):
 
 class Main(unittest.TestCase):
     def test_report_with_no_results_file_exits_0(self):
-        tmp = Path(tempfile.mkdtemp())
+        tmp = temp_dir(self)
         with redirect_stdout(io.StringIO()):
             self.assertEqual(flaky.main(["report", "--results", str(tmp / "missing.json"), "--out", str(tmp / "out")]), 0)
         self.assertIn("No test added or changed", (tmp / "out" / "flaky.md").read_text())
 
     def test_find_writes_its_json(self):
-        diff, root = git_diff({LIB: SOURCE}, {LIB: SOURCE.replace("fn plain()", "fn plain2()")})
+        diff, root = git_diff(self, {LIB: SOURCE}, {LIB: SOURCE.replace("fn plain()", "fn plain2()")})
         (root / "d.diff").write_text(diff)
         with redirect_stdout(io.StringIO()):
             flaky.main(["find", "--diff", str(root / "d.diff"), "--root", str(root), "--out", str(root / "t.json")])
         self.assertEqual([t["name"] for t in json.loads((root / "t.json").read_text())["tests"]],
                          ["backends::cassandra::batch::tests::plain2"])
+
+
+
+class NoTempDirLeft(unittest.TestCase):
+    """The fmt job runs this module on every push, on persistent runners, so
+    every other test here must leave its temporary directory removed."""
+
+    def test_the_other_tests_leave_no_temporary_directory(self):
+        scratch = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        loader = unittest.TestLoader()
+        suite = unittest.TestSuite(
+            loader.loadTestsFromTestCase(case)
+            for case in (Blank, TestsIn, ChangedLines, Find, Bins, Classify, Run, Budget, Report, Main))
+        saved = tempfile.tempdir
+        tempfile.tempdir = str(scratch)
+        try:
+            result = unittest.TestResult()
+            suite.run(result)
+        finally:
+            tempfile.tempdir = saved
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertEqual(sorted(p.name for p in scratch.iterdir()), [])
 
 
 if __name__ == "__main__":

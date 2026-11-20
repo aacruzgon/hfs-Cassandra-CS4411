@@ -249,18 +249,29 @@ async fn pending_version_needs_an_intent_with_the_rows_write_id() {
     let tenant_id = tenant.tenant_id().as_str();
     // `pending_version` reads this hour's and the previous hour's bucket,
     // in the backend's format (`bucket_of`, `write.rs`), and every shard.
-    let bucket = chrono::Utc::now().format("%Y-%m-%dT%H").to_string();
+    let now = chrono::Utc::now();
+    let bucket = now.format("%Y-%m-%dT%H").to_string();
+    let previous_bucket = (now - chrono::Duration::hours(1))
+        .format("%Y-%m-%dT%H")
+        .to_string();
 
     let row_write_id = Uuid::new_v4();
     let loser_write_id = Uuid::new_v4();
-    // (id, write_id of the intent row for version 2, if any, expected)
+    // (id, write_id of the intent row for version 2, if any, its bucket,
+    // expected). `previous-hour` fails if the previous hour is not read.
     let cases = [
-        ("applied", Some(row_write_id), Some(2)),
-        ("loser", Some(loser_write_id), None),
-        ("no-intent", None, None),
+        ("applied", Some(row_write_id), &bucket, Some(2)),
+        (
+            "previous-hour",
+            Some(row_write_id),
+            &previous_bucket,
+            Some(2),
+        ),
+        ("loser", Some(loser_write_id), &bucket, None),
+        ("no-intent", None, &bucket, None),
     ];
 
-    for (id, intent_write_id, _) in &cases {
+    for (id, intent_write_id, bucket, _) in &cases {
         select_values(
             &session,
             &format!(
@@ -300,7 +311,7 @@ async fn pending_version_needs_an_intent_with_the_rows_write_id() {
         }
     }
 
-    for (id, _, expected) in &cases {
+    for (id, _, _, expected) in &cases {
         assert_eq!(
             cassandra_node::pending_version(&session, &tenant, "Patient", id).await,
             Ok(*expected),
@@ -774,7 +785,7 @@ mod step3_suites {
         let rf = cassandra_node::replication_factor(&session)
             .await
             .unwrap_or_else(|error| panic!("replication factor: {error}"));
-        let policy = if rf >= 2 {
+        let policy = if cassandra_node::accepts_504_at(rf) {
             RacePolicy::AcceptTimeouts(Arc::new(IntentProbe(session)))
         } else {
             RacePolicy::strict()
@@ -795,6 +806,17 @@ mod step3_suites {
         async fn pending_version(&self, _tenant: &TenantContext, _id: &str) -> Option<String> {
             None
         }
+    }
+
+    /// The threshold `race_policy` and the concurrent-create test share: a 504
+    /// is accepted from RF 2, and never at RF 1 (ADR-sara-lahourpour-0001).
+    /// Changed to accept RF 1, every race would pass on the single node
+    /// printing `accept_504=true`, with nothing else failing.
+    #[test]
+    fn a_504_is_accepted_from_rf_2() {
+        assert!(!cassandra_node::accepts_504_at(1), "RF 1 stays strict");
+        assert!(cassandra_node::accepts_504_at(2));
+        assert!(cassandra_node::accepts_504_at(3));
     }
 
     /// `RacePolicy::is_unknown`: at RF 2 or more only a 504

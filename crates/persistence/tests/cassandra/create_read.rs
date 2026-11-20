@@ -222,7 +222,7 @@ async fn cassandra_concurrent_creates_of_one_id_make_exactly_one_resource() {
     let (backend, _cql) = setup(node).await;
     let session = node.session().await;
     let rf = cassandra_node::replication_factor(&session).await.unwrap();
-    let accept_504 = rf >= 2;
+    let accept_504 = cassandra_node::accepts_504_at(rf);
     eprintln!(
         "[race policy case=race:cassandra_concurrent_creates_of_one_id_make_exactly_one_resource \
          rf={rf} accept_504={accept_504}]"

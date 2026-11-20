@@ -573,6 +573,15 @@ pub async fn replication_factor(session: &TestSession) -> Result<u32, String> {
         .map_err(|error| format!("keyspace {KEYSPACE}'s factor in {DATA_CENTER}: {error}"))
 }
 
+/// Whether the race checks accept a 504 at replication factor `rf`: from 2,
+/// where a superseded `LOCAL_SERIAL` read answers it by design, and never at
+/// 1, where it is always a bug (issue #77, ADR-sara-lahourpour-0001). The one
+/// place the threshold is written, for `race_policy` and the concurrent-create
+/// test; `a_504_is_accepted_from_rf_2` pins it.
+pub fn accepts_504_at(rf: u32) -> bool {
+    rf >= 2
+}
+
 /// The version of `resource_type/id` whose write applied but whose request
 /// ended before the version row: the `resources` row's version, when the
 /// row's `write_id` matches an intent row kept in `pending_index_writes` for

@@ -80,7 +80,7 @@ class Classes(unittest.TestCase):
         self.log(label, text, run)
         run_file = self.out / "run" / f"{label}.json"
         run = json.loads(run_file.read_text()) if run_file.exists() else None
-        stopped = bool(run and (run.get("timed_out") or run.get("killed")))
+        stopped = "timeout" if run and run.get("timed_out") else "killed" if run and run.get("killed") else None
         return report.parse_log(self.out / "logs" / f"{label}.log", stopped=stopped)["failures"]
 
     def only(self, label: str, text: str, run: dict | None = None) -> dict:
@@ -164,6 +164,57 @@ class Classes(unittest.TestCase):
         self.assertIsNone(f["note"])
         self.assertEqual(f["first_line"], "assertion `left == right` failed: version history has a gap")
 
+    # The delta audit's N1: a test that prints the result it did not expect,
+    # `{other:?}`, prints the 504 inside Err(…) as its subject
+    # (cassandra_tests.rs, "a repeated delete_versioned is NotFound: {other:?}").
+    def test_n1_err_wrapped_timeout_is_issue_77(self) -> None:
+        message = f"a repeated delete_versioned is NotFound: Err(Backend({SERIAL_READ_504}))"
+        f = self.only("N1-err-r1", captured("delete_versioned_twice", "crates/persistence/tests/cassandra_tests.rs:558:14", message))
+        self.assertEqual(f["class"], "504-77")
+        self.assertIsNone(f["note"])
+
+    def test_n1_got_err_unavailable_is_503(self) -> None:
+        message = ('second seed without reset: Err(Backend(Unavailable { backend_name: "cassandra", '
+                   'message: "Cassandra cannot serve the request right now" }))')
+        f = self.only("N1b-r1", captured("seed_twice", "crates/persistence/tests/cassandra_tests.rs:448:14", message))
+        self.assertEqual(f["class"], "503")
+
+    # The `$` anchor: a line that goes on after the error is not about it
+    # (the delta audit's H1), so it is "other", with a note.
+    def test_subject_followed_by_more_text_is_other(self) -> None:
+        message = loser(SERIAL_READ_504) + " instead of a refusal"
+        f = self.only("H1-r1", captured("step3_suites::race_h1", RACE, message))
+        self.assertEqual(f["class"], "other")
+        self.assertIn("#77 504 in its message, not as its subject", f["note"])
+
+    # The delta audit's N4 (a): a 503 or 504 in the configuration test keeps
+    # its class; it is not "other, not the rack assertion".
+    def test_n4_timeout_in_the_configuration_test_keeps_its_class(self) -> None:
+        message = f"called `Result::unwrap()` on an `Err` value: Backend({SERIAL_READ_504})"
+        f = self.only("N4-cfg-504-r1", captured("node_runs_the_docker_cassandra_configuration",
+                                                "crates/persistence/tests/cassandra_tests.rs:178:6", message))
+        self.assertEqual(f["class"], "504-77")
+
+    def test_n4_unavailable_in_the_configuration_test_is_503(self) -> None:
+        message = ('called `Result::unwrap()` on an `Err` value: Backend(Unavailable { backend_name: "cassandra", '
+                   'message: "Cassandra cannot serve the request right now" })')
+        f = self.only("N4-cfg-503-r1", captured("node_runs_the_docker_cassandra_configuration",
+                                                "crates/persistence/tests/cassandra_tests.rs:178:6", message))
+        self.assertEqual(f["class"], "503")
+
+    # The delta audit's N4 (b): a test still running when the binary is
+    # killed (an OOM kill, exit 137) is "killed", not "timed out".
+    def test_n4_test_running_at_an_oom_kill_is_killed(self) -> None:
+        text = """     Running tests/cassandra_tests.rs (/x/cassandra_tests-abc)
+
+running 2 tests
+test ok_test ... ok
+test step3_suites::big has been running for over 60 seconds
+"""
+        f = self.only("N4-oom-r1", text, {"exit_status": 137, "timed_out": False, "killed": True, "oom_kills": 1})
+        self.assertEqual(f["class"], "killed")
+        self.assertIn("killed", f["first_line"])
+
     # G (audit B1): an invariant failure that prints every writer's outcome,
     # one of them a #77 504, is about the invariant.
     def test_g_invariant_failure_listing_a_504_is_other(self) -> None:
@@ -172,7 +223,7 @@ class Classes(unittest.TestCase):
         f = self.only("G-invariant-with-504-r1", captured("step3_suites::race_g",
                                                           "crates/persistence/tests/search/versioned_write_race_suite.rs:240:17", message))
         self.assertEqual(f["class"], "other")
-        self.assertIn("#77 504 among the outcomes", f["note"])
+        self.assertIn("#77 504 in its message, not as its subject", f["note"])
 
     def test_g2_no_write_landed_listing_a_504_is_other(self) -> None:
         message = ("round 1: no write landed, so no writer can have lost to one: "
@@ -211,7 +262,7 @@ Skipping nothing, a line a test printed
 test step3_suites::hangs has been running for over 60 seconds
 """
         self.log("F2-hung-r1", text, {"exit_status": 124, "timed_out": True, "wall_s": 480})
-        suite = report.parse_log(self.out / "logs" / "F2-hung-r1.log", stopped=True)
+        suite = report.parse_log(self.out / "logs" / "F2-hung-r1.log", stopped="timeout")
         found = {f["test"]: f for f in suite["failures"]}
         self.assertEqual(found["step3_suites::race_a"]["class"], "504-77")
         self.assertTrue(found["step3_suites::race_a"]["first_line"].startswith("round 0: a loser"))

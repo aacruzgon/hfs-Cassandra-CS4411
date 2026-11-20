@@ -43,13 +43,16 @@ PANIC_OLD = re.compile(r"^thread '([^']*)' panicked at '(.*)', (\S+)$")
 # A failure is classified from its panic's own message, the first line after
 # "panicked at", and only when that line's subject is a backend error: the
 # line ends with the error, right after "got " or ": " (an assertion's
-# `got {outcome:?}`, an unwrap's "on an `Err` value: "). An invariant panic
+# `got {outcome:?}`, an unwrap's "on an `Err` value: "), bare or inside
+# `Err(…)` or `Failed(…)` (a test that prints the result it did not expect,
+# "a repeated delete_versioned is NotFound: {other:?}"). A line that goes on
+# after the error ("… instead of a refusal") is not about it. An invariant panic
 # that lists every writer's outcome ("nothing is live: [Updated(…),
 # Failed(Backend(Timeout { … }))]", PR #83) is about the invariant, not the
 # 504, so it is "other", with a note.
 SUBJECT_ERROR = re.compile(
-    r"(?:: |got )(?:Failed\()?(?:Backend\()?(?P<kind>Timeout|Unavailable) \{ backend_name: \"[^\"]*\", "
-    r"message: \"(?P<message>(?:[^\"\\]|\\.)*)\" \}\)?\)?$"
+    r"(?:: |got )(?:Err\()?(?:Failed\()?(?:Backend\()?(?P<kind>Timeout|Unavailable) \{ backend_name: \"[^\"]*\", "
+    r"message: \"(?P<message>(?:[^\"\\]|\\.)*)\" \}\)?\)?\)?$"
 )
 # Issue #77: on RF 3 a LOCAL_SERIAL read superseded by a competing Paxos round
 # answers BackendError::Timeout (504), "serial read: CAS operation timed out:
@@ -73,7 +76,8 @@ CLASSES = [
     ("504-other", "504, another timeout"),
     ("503", "503 (Unavailable)"),
     ("expected", "expected on three nodes (README)"),
-    ("timed-out", "timed out (still running when the run was stopped)"),
+    ("timed-out", "timed out (still running when the timeout stopped the run)"),
+    ("killed", "killed (still running when the binary was killed)"),
     ("unknown", "cause unknown (the run was stopped before libtest printed it)"),
     ("other", "other"),
 ]
@@ -100,22 +104,24 @@ def classify(name: str, message: list[str], text: str) -> tuple[str, str | None]
     the first one first), and a note. `text` is the test's whole output, used
     only for the note."""
     first = message[0] if message else ""
-    if name.rsplit("::", 1)[-1] == EXPECTED_ON_CLUSTER:
-        rack = (first == "assertion `left == right` failed" and len(message) >= 3
-                and EXPECTED_RACK_LEFT.match(message[1]) and EXPECTED_RACK_RIGHT.match(message[2]))
-        if rack or EXPECTED_PEERS.match(first):
-            return "expected", None
-        return "other", "not the rack or peers assertion the README expects"
+    # First, for every test, the configuration test included: a 503 or 504
+    # keeps its class wherever it happens.
     if m := SUBJECT_ERROR.search(first):
         if m.group("kind") == "Unavailable":
             return "503", None
         if ISSUE_77.match(m.group("message")):
             return "504-77", None
         return "504-other", None
+    if name.rsplit("::", 1)[-1] == EXPECTED_ON_CLUSTER:
+        rack = (first == "assertion `left == right` failed" and len(message) >= 3
+                and EXPECTED_RACK_LEFT.match(message[1]) and EXPECTED_RACK_RIGHT.match(message[2]))
+        if rack or EXPECTED_PEERS.match(first):
+            return "expected", None
+        return "other", "not the rack or peers assertion the README expects"
     if ANY_77.search(text):
-        return "other", "a #77 504 among the outcomes it prints"
+        return "other", "a #77 504 in its message, not as its subject"
     if ANY_504.search(text):
-        return "other", "a 504 among the outcomes it prints"
+        return "other", "a 504 in its message, not as its subject"
     return "other", None
 
 
@@ -166,11 +172,12 @@ def first_failure_line(lines: list[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
-def parse_log(path: Path, stopped: bool = False) -> dict:
+def parse_log(path: Path, stopped: str | None = None) -> dict:
     """One run's log. Reads the captured blocks after "failures:" (capture
     mode) and every panic in the log (`--nocapture`, where libtest prints a
-    panic as it happens, under the test's thread name). `stopped`: the run
-    was stopped (timeout or kill), so a test without a result is reported."""
+    panic as it happens, under the test's thread name). `stopped`: how the
+    run was stopped, "timeout" or "killed" (run-tests.sh's JSON), or None;
+    a test still running then is reported as timed out or killed."""
     text = ANSI.sub("", path.read_text(errors="replace"))
     lines = [l.rstrip() for l in text.splitlines()]
     suite = {"label": path.stem, "suite": None, "tests": {}, "result": None, "blocks": {},
@@ -229,12 +236,15 @@ def parse_log(path: Path, stopped: bool = False) -> dict:
             "location": source["location"] if source else None,
         })
     if stopped or suite["result"] is None:
+        cls, when = (("killed", "when the binary was killed") if stopped == "killed"
+                     else ("timed-out", "when the timeout stopped the run") if stopped == "timeout"
+                     else ("unknown", "when the run ended without a result"))
         for name in suite["still_running"]:
             if name not in suite["tests"]:
                 failures.append({
                     "label": suite["label"], "suite": suite["suite"] or suite["label"], "test": name,
-                    "class": "timed-out", "note": None,
-                    "first_line": "still running when the run was stopped (libtest: running for over 60 seconds)",
+                    "class": cls, "note": None,
+                    "first_line": f"still running {when} (libtest: running for over 60 seconds)",
                     "location": None,
                 })
     reported = len(suite["tests"]) + sum(1 for n in suite["still_running"] if n not in suite["tests"])
@@ -265,7 +275,8 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
     for log in sorted((out / "logs").glob("*.log")):
         run_file = out / "run" / f"{log.stem}.json"
         run = json.loads(run_file.read_text()) if run_file.exists() else None
-        suite = parse_log(log, stopped=bool(run and (run.get("timed_out") or run.get("killed"))))
+        how = "timeout" if run and run.get("timed_out") else "killed" if run and run.get("killed") else None
+        suite = parse_log(log, stopped=how)
         suite["run"] = run
         suites.append(suite)
     rows, failures, warnings = [], [], []

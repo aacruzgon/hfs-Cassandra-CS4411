@@ -647,7 +647,16 @@ mod tests {
     ///    only in `batch.rs`, once in its declaration and once in `new`;
     /// 3. the driver's batch call and builder appear only in `session.rs`,
     ///    once, behind `CassandraSession::batch`, which takes
-    ///    `IndexStatement`s, so nothing sends a batch around the type.
+    ///    `IndexStatement`s, so nothing sends a batch around the type. That
+    ///    is three rules, each with its needle built from pieces so that
+    ///    this source does not match itself: (a) the driver's parameterised
+    ///    batch call appears once, in `session.rs`; (b) `session.rs` never
+    ///    calls the batch method of the driver session (the field `session`;
+    ///    the node tests' local `session` is a `CassandraSession`, so they
+    ///    are left out of the scan); (c) the builder's constructor appears
+    ///    once in the module, inside `fn index_batch`, and the builder's
+    ///    unprepared add-query call appears nowhere (the prepared one is a
+    ///    different name).
     #[test]
     fn only_index_table_statements_can_reach_a_batch() {
         let files = backend_sources();
@@ -659,13 +668,40 @@ mod tests {
         let constructor = ["IndexCql", "("].concat();
         let driver_batch = ["batch", "_with_params("].concat();
         let builder = ["BatchQuery", "Builder"].concat();
+        let builder_new = [builder.as_str(), "::new("].concat();
+        let driver_session_batch = ["session", ".batch("].concat();
+        let add_query = ["add", "_query("].concat();
+        let index_batch_fn = ["fn ", "index_batch"].concat();
 
         let mut texts = BTreeSet::new();
         let mut problems = Vec::new();
         let mut constructors = Vec::new();
         let mut driver_batches = Vec::new();
+        let mut builders = Vec::new();
         for (path, source) in &files {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            if name == "session.rs" {
+                // The node tests call `CassandraSession::batch` on a local
+                // named `session`; every line before them is production.
+                let production = source.split("mod node_tests").next().unwrap_or(source);
+                if production.contains(&driver_session_batch) {
+                    problems.push(format!("{name} calls the driver session's batch"));
+                }
+            }
+            for (at, _) in source.match_indices(&builder_new) {
+                // The function the call is in: the last `fn` before it.
+                let function = source[..at].rfind("fn ").map(|n| &source[n..at]);
+                let inside = function.is_some_and(|f| f.starts_with(&index_batch_fn));
+                builders.push(format!(
+                    "{name}{}",
+                    if inside { " (index_batch)" } else { "" }
+                ));
+            }
+            if source.contains(&add_query) {
+                problems.push(format!(
+                    "{name} adds a query to a batch without a prepared id"
+                ));
+            }
             for (at, _) in source.match_indices(&call) {
                 // The item the call ends: from the last `;`, `{` or `}`.
                 let item = &source[source[..at].rfind([';', '{', '}']).map_or(0, |n| n + 1)..at];
@@ -705,6 +741,11 @@ mod tests {
             "the tuple constructor outside its declaration and new"
         );
         assert_eq!(driver_batches, vec!["session.rs"], "driver batch calls");
+        assert_eq!(
+            builders,
+            vec!["session.rs (index_batch)"],
+            "batch builders, each with where it is"
+        );
 
         // The scan's own pattern: what it lets through and what it refuses.
         let delete = ["DE", "LETE FROM "].concat();

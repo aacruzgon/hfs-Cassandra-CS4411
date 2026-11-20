@@ -90,9 +90,11 @@ mod counters {
     /// Statements sent so far, by kind (R5): `read`, `serial_read`, `write`
     /// and `cas`, every request counted, paged pages included; and the index
     /// batches, as `batch` (requests) and `batched` (statements inside them),
-    /// so the column shows both the round trips and the rows they carried
+    /// so the column shows both the requests and the rows they carried
     /// (roadmap Step 5; ADR-sam-michaels-0006, IW14). `write` counts only
-    /// statements sent alone.
+    /// statements sent alone. These are the writer's requests, not wire round
+    /// trips: a statement the driver re-prepares and re-sends inside one call
+    /// counts once.
     pub fn statements(backend: &CassandraBackend) -> Option<Counts> {
         let counts = backend.statement_counts();
         Some(

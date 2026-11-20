@@ -2,7 +2,8 @@
 //! hold, how many bytes one may carry, and what a failed one means.
 //!
 //! Step 5 of the write path sends a version's index rows in logged batches at
-//! `LOCAL_QUORUM`, each under 5 KiB, sent concurrently (design step 5;
+//! `LOCAL_QUORUM`, each under 5 KiB (a unit over the limit is never split and
+//! goes alone, as one batch), sent concurrently (design step 5;
 //! `docs/Cassandra/schema/walkthrough.md` section 2, "Index rows"). The
 //! session sends one batch, [`CassandraSession::batch`]; this module holds
 //! the parts that need no node, each tested on its own. The decisions are
@@ -228,7 +229,8 @@ pub(crate) const MAX_BATCH_BYTES: usize = 5 * 1024 - 256;
 ///   reached fewer than a quorum.
 /// - **A unit over `bound` goes alone**, as a batch of its own. Such a unit
 ///   is one partition, so the node neither size-checks it nor writes it to
-///   the batchlog (`BatchStatement.java:331-367`). No fixture comes near:
+///   the batchlog (`BatchStatement.java:444-445`; the size check it also
+///   skips is `:333-334`). No fixture comes near:
 ///   it takes several values close to 1,024 bytes, the most an index value
 ///   keeps before it is stored as its SHA-256 (G35 as amended by
 ///   ADR-aacruzgon-0079).
@@ -647,7 +649,16 @@ mod tests {
     ///    only in `batch.rs`, once in its declaration and once in `new`;
     /// 3. the driver's batch call and builder appear only in `session.rs`,
     ///    once, behind `CassandraSession::batch`, which takes
-    ///    `IndexStatement`s, so nothing sends a batch around the type.
+    ///    `IndexStatement`s, so nothing sends a batch around the type. That
+    ///    is three rules, each with its needle built from pieces so that
+    ///    this source does not match itself: (a) the driver's parameterised
+    ///    batch call appears once, in `session.rs`; (b) `session.rs` never
+    ///    calls the batch method of the driver session (the field `session`;
+    ///    the node tests' local `session` is a `CassandraSession`, so they
+    ///    are left out of the scan); (c) the builder's constructor appears
+    ///    once in the module, inside `fn index_batch`, and the builder's
+    ///    unprepared add-query call appears nowhere (the prepared one is a
+    ///    different name).
     #[test]
     fn only_index_table_statements_can_reach_a_batch() {
         let files = backend_sources();
@@ -659,13 +670,40 @@ mod tests {
         let constructor = ["IndexCql", "("].concat();
         let driver_batch = ["batch", "_with_params("].concat();
         let builder = ["BatchQuery", "Builder"].concat();
+        let builder_new = [builder.as_str(), "::new("].concat();
+        let driver_session_batch = ["session", ".batch("].concat();
+        let add_query = ["add", "_query("].concat();
+        let index_batch_fn = ["fn ", "index_batch"].concat();
 
         let mut texts = BTreeSet::new();
         let mut problems = Vec::new();
         let mut constructors = Vec::new();
         let mut driver_batches = Vec::new();
+        let mut builders = Vec::new();
         for (path, source) in &files {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            if name == "session.rs" {
+                // The node tests call `CassandraSession::batch` on a local
+                // named `session`; every line before them is production.
+                let production = source.split("mod node_tests").next().unwrap_or(source);
+                if production.contains(&driver_session_batch) {
+                    problems.push(format!("{name} calls the driver session's batch"));
+                }
+            }
+            for (at, _) in source.match_indices(&builder_new) {
+                // The function the call is in: the last `fn` before it.
+                let function = source[..at].rfind("fn ").map(|n| &source[n..at]);
+                let inside = function.is_some_and(|f| f.starts_with(&index_batch_fn));
+                builders.push(format!(
+                    "{name}{}",
+                    if inside { " (index_batch)" } else { "" }
+                ));
+            }
+            if source.contains(&add_query) {
+                problems.push(format!(
+                    "{name} adds a query to a batch without a prepared id"
+                ));
+            }
             for (at, _) in source.match_indices(&call) {
                 // The item the call ends: from the last `;`, `{` or `}`.
                 let item = &source[source[..at].rfind([';', '{', '}']).map_or(0, |n| n + 1)..at];
@@ -705,6 +743,11 @@ mod tests {
             "the tuple constructor outside its declaration and new"
         );
         assert_eq!(driver_batches, vec!["session.rs"], "driver batch calls");
+        assert_eq!(
+            builders,
+            vec!["session.rs (index_batch)"],
+            "batch builders, each with where it is"
+        );
 
         // The scan's own pattern: what it lets through and what it refuses.
         let delete = ["DE", "LETE FROM "].concat();

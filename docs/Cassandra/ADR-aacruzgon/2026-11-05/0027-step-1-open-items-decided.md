@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0027: The open items are decided: `count`, date-only paging, stored index keys, the cap, the unread rows, `_sort`, the rejections, the sweeper and the schema's setup
 
 - **Date:** 2026-11-05
-- **Status:** accepted; G38's refusal is retired by ADR-aacruzgon-0079 (a long `param` is hashed instead)
+- **Status:** accepted; G38's refusal is retired by ADR-aacruzgon-0079 (a long `param` is hashed instead); P5 extended and G12's cost changed by ADR-sam-michaels-0006 (IW2, IW3, SW12), see ADR-aacruzgon-0081
 - **Context:**
     - **Why now.** PR #33 (ADR-aacruzgon-0026) fixed the schema audit's findings. It left open the items that the walk-through, the coverage table and the schema README had carried since the Step 1 design sessions, plus older ones. Alan wants none of them left open before the team's sign-off (roadmap row 1.4).
     - **Why each is a decision.** Each item has workable alternatives:

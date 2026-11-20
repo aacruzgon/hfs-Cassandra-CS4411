@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0080: `acruzdebian` has 64 GB: its runner cap goes to 40G, it takes heavy jobs, and `cargo clippy (helios-fhir)` sets its cargo job count from the runner's cap
 
 - **Date:** 2026-11-18
-- **Status:** accepted
+- **Status:** accepted; amended by [ADR-aacruzgon-0082](../2026-11-20/0082-mutation-flakiness-medium-tier.md) (the jobs it called heavy fit 20G and move to `hfs-cassandra-medium`; `hfs-cassandra-heavy` comes off `sam-7900x`, so heavy means `acruzdebian` only)
 - **Context:**
     - **`acruzdebian` now has 64 GB of RAM** (`MemTotal` 65,773,824 kB), up from the 15 GB that ADR-aacruzgon-0023 sized it for. Its runner service was still capped at `MemoryMax=9G`, and it still had only `hfs-cassandra-light`.
     - **The heavy queue still waited for `sam-7900x`.** On 2026-11-18 the two clippy checks and `Cassandra tests (all FHIR versions)` of several runs from 2026-11-17 sat queued for `hfs-cassandra-heavy` while `sam-7900x` was off, and every light job of the same runs had already passed on `acruzdebian`. So no pull request could merge without Sam's rig or an admin bypass (ADR-aacruzgon-0019, 0023).

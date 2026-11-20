@@ -28,8 +28,8 @@ use std::collections::HashSet;
 
 use cassandra_node::{
     DATA_CENTER, KEYSPACE, MAX_FHIR_ID_LEN, RELEASE_VERSION, TABLES, TEST_TENANT_PREFIX, URL_VAR,
-    cql_statements, parse_url, read_schema_file, schema_listing, select, text, unique_id,
-    unique_tenant, unique_tenant_id,
+    cql_statements, parse_url, read_schema_file, schema_listing, select, select_values, text,
+    unique_id, unique_tenant, unique_tenant_id,
 };
 use helios_persistence::tenant::{MAX_TENANT_ID_LEN, TenantId};
 
@@ -164,8 +164,9 @@ async fn node_has_the_signed_off_schema() {
 }
 
 /// The node runs `docker/cassandra`'s configuration: the pinned release,
-/// `paxos_variant: v2` (ADR-aacruzgon-0001) and the DC the keyspace replicates
-/// to (ADR-aacruzgon-0003).
+/// `paxos_variant: v2` (ADR-aacruzgon-0001), the DC the keyspace replicates
+/// to (ADR-aacruzgon-0003), and replication factor 1, which keeps the race
+/// checks strict (issue #77).
 #[tokio::test]
 async fn node_runs_the_docker_cassandra_configuration() {
     let node = node_or_skip!("node_runs_the_docker_cassandra_configuration");
@@ -198,6 +199,15 @@ async fn node_runs_the_docker_cassandra_configuration() {
     };
     assert_eq!(text(paxos, "value").unwrap(), "v2");
 
+    // The race checks accept a 504 only when `replication_factor` reports 2
+    // or more (`race_policy`). If it ever read 3 here, every race test would
+    // still pass, loosened, and only its `[race policy …]` line would show it.
+    assert_eq!(
+        cassandra_node::replication_factor(&session).await,
+        Ok(1),
+        "keyspace {KEYSPACE} on the single node: replication factor 1 in {DATA_CENTER}"
+    );
+
     // The driver keeps the contact point as the node's address: it does not
     // switch to the container IP that system.local reports as rpc_address
     // (docker/cassandra/README.md).
@@ -217,6 +227,97 @@ async fn node_runs_the_docker_cassandra_configuration() {
         "the driver addresses the node as {addresses:?}, not as {} ({contact_point:?})",
         node.contact_point()
     );
+}
+
+/// `pending_version` (issue #77), which lets the race checks at RF 2 or more
+/// accept a history missing its newest version: it reports the `resources`
+/// row's version only when an intent row for that version carries the row's
+/// `write_id`. If it always reported "pending", every race test would still
+/// pass, loosened, so this pins it on the single node.
+///
+/// The state a 504'd writer leaves is written with CQL, under this test's
+/// own tenant, one resource per case. Only the columns `pending_version`
+/// reads are set.
+#[tokio::test]
+async fn pending_version_needs_an_intent_with_the_rows_write_id() {
+    use cdrs_tokio::types::value::Value;
+    use uuid::Uuid;
+
+    let node = node_or_skip!("pending_version_needs_an_intent_with_the_rows_write_id");
+    let session = node.session().await;
+    let tenant = unique_tenant("pending-version");
+    let tenant_id = tenant.tenant_id().as_str();
+    // `pending_version` reads this hour's and the previous hour's bucket,
+    // in the backend's format (`bucket_of`, `write.rs`), and every shard.
+    let now = chrono::Utc::now();
+    let bucket = now.format("%Y-%m-%dT%H").to_string();
+    let previous_bucket = (now - chrono::Duration::hours(1))
+        .format("%Y-%m-%dT%H")
+        .to_string();
+
+    let row_write_id = Uuid::new_v4();
+    let loser_write_id = Uuid::new_v4();
+    // (id, write_id of the intent row for version 2, if any, its bucket,
+    // expected). `previous-hour` fails if the previous hour is not read.
+    let cases = [
+        ("applied", Some(row_write_id), &bucket, Some(2)),
+        (
+            "previous-hour",
+            Some(row_write_id),
+            &previous_bucket,
+            Some(2),
+        ),
+        ("loser", Some(loser_write_id), &bucket, None),
+        ("no-intent", None, &bucket, None),
+    ];
+
+    for (id, intent_write_id, bucket, _) in &cases {
+        select_values(
+            &session,
+            &format!(
+                "INSERT INTO {KEYSPACE}.resources \
+                 (tenant_id, resource_type, id, version_id, write_id) VALUES (?, ?, ?, ?, ?)"
+            ),
+            vec![
+                Value::from(tenant_id),
+                Value::from("Patient"),
+                Value::from(*id),
+                Value::from(2_i32),
+                Value::from(row_write_id),
+            ],
+        )
+        .await
+        .unwrap();
+        if let Some(write_id) = intent_write_id {
+            select_values(
+                &session,
+                &format!(
+                    "INSERT INTO {KEYSPACE}.pending_index_writes \
+                     (bucket, shard, enqueued_at, tenant_id, resource_type, id, write_id, \
+                     version_id) VALUES (?, ?, now(), ?, ?, ?, ?, ?)"
+                ),
+                vec![
+                    Value::from(bucket.as_str()),
+                    Value::from(0_i16),
+                    Value::from(tenant_id),
+                    Value::from("Patient"),
+                    Value::from(*id),
+                    Value::from(*write_id),
+                    Value::from(2_i32),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    for (id, _, _, expected) in &cases {
+        assert_eq!(
+            cassandra_node::pending_version(&session, &tenant, "Patient", id).await,
+            Ok(*expected),
+            "case {id}"
+        );
+    }
 }
 
 #[test]
@@ -594,7 +695,9 @@ mod step3_suites {
 
     use crate::cassandra_node::{self, CassandraNode, TEST_TENANT_PREFIX, URL_VAR};
     use crate::cassandra_testable::CassandraTestBackend;
+    use crate::versioned_write_race_suite::{PendingWrites, RacePolicy};
     use crate::{tenant_existence_suite, tenant_id_fidelity_suite, versioned_write_race_suite};
+    use helios_persistence::tenant::TenantContext;
 
     /// Rounds per race test: PostgreSQL's and MongoDB's 10, not SQLite's 40,
     /// on a node where each round is eight contending Paxos writers.
@@ -657,16 +760,142 @@ mod step3_suites {
         );
     }
 
+    /// The race suite's view of a write that applied but was answered 504
+    /// before its version row: [`cassandra_node::pending_version`].
+    struct IntentProbe(cassandra_node::TestSession);
+
+    #[async_trait::async_trait]
+    impl PendingWrites for IntentProbe {
+        async fn pending_version(&self, tenant: &TenantContext, id: &str) -> Option<String> {
+            cassandra_node::pending_version(&self.0, tenant, "Patient", id)
+                .await
+                .unwrap_or_else(|error| panic!("pending version of Patient/{id}: {error}"))
+                .map(|version| version.to_string())
+        }
+    }
+
+    /// The race checks' policy on this node: a 504 is an accepted outcome at
+    /// RF 2 or more, where a superseded `LOCAL_SERIAL` read answers it by
+    /// design (issue #77, ADR-aacruzgon-0072 decision 4), and fails the test
+    /// at RF 1, where it is always a bug (ADR-sara-lahourpour-0001). Prints
+    /// `[race policy case=race:<test> rf=<n> accept_504=<bool>]` beside the
+    /// `[cas …]` line, so a log shows which check ran.
+    pub(crate) async fn race_policy(node: &CassandraNode, test: &str) -> RacePolicy {
+        let session = node.session().await;
+        let rf = cassandra_node::replication_factor(&session)
+            .await
+            .unwrap_or_else(|error| panic!("replication factor: {error}"));
+        let policy = if cassandra_node::accepts_504_at(rf) {
+            RacePolicy::AcceptTimeouts(Arc::new(IntentProbe(session)))
+        } else {
+            RacePolicy::strict()
+        };
+        eprintln!(
+            "[race policy case=race:{test} rf={rf} accept_504={}]",
+            policy.accepts_timeouts()
+        );
+        policy
+    }
+
+    /// A probe for [`only_a_504_is_an_unknown_outcome`], which never asks it:
+    /// `is_unknown` reads only the error.
+    struct NoPendingWrites;
+
+    #[async_trait::async_trait]
+    impl PendingWrites for NoPendingWrites {
+        async fn pending_version(&self, _tenant: &TenantContext, _id: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// The threshold `race_policy` and the concurrent-create test share: a 504
+    /// is accepted from RF 2, and never at RF 1 (ADR-sara-lahourpour-0001).
+    /// Changed to accept RF 1, every race would pass on the single node
+    /// printing `accept_504=true`, with nothing else failing.
+    #[test]
+    fn a_504_is_accepted_from_rf_2() {
+        assert!(!cassandra_node::accepts_504_at(1), "RF 1 stays strict");
+        assert!(cassandra_node::accepts_504_at(2));
+        assert!(cassandra_node::accepts_504_at(3));
+    }
+
+    /// `RacePolicy::is_unknown`: at RF 2 or more only a 504
+    /// (`BackendError::Timeout`) is an unknown outcome. A 503 from the serial
+    /// read has not been seen in a race and still fails it (issue #77,
+    /// ADR-aacruzgon-0055), but the races alone would notice a loosening only
+    /// in a run where a 503 happened. At RF 1 nothing is unknown.
+    #[test]
+    fn only_a_504_is_an_unknown_outcome() {
+        use helios_persistence::error::{BackendError, ConcurrencyError, StorageError};
+
+        let backend_name = "cassandra".to_string();
+        let message = "test".to_string();
+        let timeout = StorageError::Backend(BackendError::Timeout {
+            backend_name: backend_name.clone(),
+            message: message.clone(),
+        });
+        let not_unknown = [
+            (
+                "503 Unavailable",
+                StorageError::Backend(BackendError::Unavailable {
+                    backend_name: backend_name.clone(),
+                    message: message.clone(),
+                }),
+            ),
+            (
+                "503 ConnectionFailed",
+                StorageError::Backend(BackendError::ConnectionFailed {
+                    backend_name: backend_name.clone(),
+                    message,
+                }),
+            ),
+            (
+                "503 PoolExhausted",
+                StorageError::Backend(BackendError::PoolExhausted { backend_name }),
+            ),
+            (
+                "409 VersionConflict",
+                StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    resource_type: "Patient".to_string(),
+                    id: "p".to_string(),
+                    expected_version: "1".to_string(),
+                    actual_version: "2".to_string(),
+                }),
+            ),
+        ];
+
+        let cluster = RacePolicy::AcceptTimeouts(Arc::new(NoPendingWrites));
+        assert!(cluster.is_unknown(&timeout), "a 504 at RF 2 or more");
+        for (name, error) in &not_unknown {
+            assert!(
+                !cluster.is_unknown(error),
+                "{name} is not an unknown outcome at RF 2 or more"
+            );
+        }
+
+        let single_node = RacePolicy::strict();
+        assert!(!single_node.is_unknown(&timeout), "a 504 at RF 1");
+        for (name, error) in &not_unknown {
+            assert!(!single_node.is_unknown(error), "{name} at RF 1");
+        }
+    }
+
     /// #1404: of eight writers holding the same version, one `update` writes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn cassandra_concurrent_updates_from_the_same_version_admit_one() {
         let node = node_or_skip!("cassandra_concurrent_updates_from_the_same_version_admit_one");
         let backend = race_backend(node, "race-update").await;
+        let policy = race_policy(
+            node,
+            "cassandra_concurrent_updates_from_the_same_version_admit_one",
+        )
+        .await;
         let before = backend.inner().cas_stats();
-        versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one(
+        versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one_with(
             Arc::clone(&backend),
             &unique_base("upd"),
             RACE_ROUNDS,
+            &policy,
         )
         .await;
         print_cas(
@@ -681,11 +910,17 @@ mod step3_suites {
     async fn cassandra_concurrent_update_and_versioned_delete_admit_one() {
         let node = node_or_skip!("cassandra_concurrent_update_and_versioned_delete_admit_one");
         let backend = race_backend(node, "race-vdelete").await;
+        let policy = race_policy(
+            node,
+            "cassandra_concurrent_update_and_versioned_delete_admit_one",
+        )
+        .await;
         let before = backend.inner().cas_stats();
-        versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
+        versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one_with(
             Arc::clone(&backend),
             &unique_base("vdel"),
             RACE_ROUNDS,
+            &policy,
         )
         .await;
         print_cas(
@@ -701,11 +936,17 @@ mod step3_suites {
     async fn cassandra_concurrent_update_and_plain_delete_stay_consistent() {
         let node = node_or_skip!("cassandra_concurrent_update_and_plain_delete_stay_consistent");
         let backend = race_backend(node, "race-pdelete").await;
+        let policy = race_policy(
+            node,
+            "cassandra_concurrent_update_and_plain_delete_stay_consistent",
+        )
+        .await;
         let before = backend.inner().cas_stats();
-        versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+        versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent_with(
             Arc::clone(&backend),
             &unique_base("pdel"),
             RACE_ROUNDS,
+            &policy,
         )
         .await;
         print_cas(
@@ -722,11 +963,17 @@ mod step3_suites {
     async fn cassandra_concurrent_puts_onto_a_tombstone_all_succeed() {
         let node = node_or_skip!("cassandra_concurrent_puts_onto_a_tombstone_all_succeed");
         let backend = race_backend(node, "race-restore").await;
+        let policy = race_policy(
+            node,
+            "cassandra_concurrent_puts_onto_a_tombstone_all_succeed",
+        )
+        .await;
         let before = backend.inner().cas_stats();
-        versioned_write_race_suite::concurrent_puts_onto_a_tombstone_all_succeed(
+        versioned_write_race_suite::concurrent_puts_onto_a_tombstone_all_succeed_with(
             Arc::clone(&backend),
             &unique_base("rest"),
             RACE_ROUNDS,
+            &policy,
         )
         .await;
         print_cas(

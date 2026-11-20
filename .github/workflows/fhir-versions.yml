@@ -14,10 +14,11 @@ name: FHIR versions (report only)
 #
 # Runs on the team's self-hosted runners with the fork guard on every job
 # (ADR-aacruzgon-0018): the two checks are light jobs, on either runner; the
-# test job builds every FHIR version at once, so it is heavy
-# (ADR-aacruzgon-0023); both runners take heavy jobs (ADR-aacruzgon-0080). Each job reports the size of its target directory
-# and where its time went (.github/scripts/ci-report.py), in the run's summary
-# page and in its artifact ci-report-<job>.
+# test job builds every FHIR version at once, so it needs more than a light
+# job's 9 GB and is medium, also on either runner, within sam-7900x's 20G
+# (ADR-aacruzgon-0023, 0080, 0082). Each job reports the size of its target
+# directory and where its time went (.github/scripts/ci-report.py), in the
+# run's summary page and in its artifact ci-report-<job>.
 
 on:
   push:
@@ -274,9 +275,10 @@ jobs:
     name: Cassandra tests (all FHIR versions)
     # Fork guard (ADR-aacruzgon-0018).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # Every FHIR version's generated models in each build: heavy
-    # (ADR-aacruzgon-0023), on either runner (ADR-aacruzgon-0080).
-    runs-on: [self-hosted, hfs-cassandra-heavy]
+    # Every FHIR version's generated models in each build: more than a light
+    # job's 9 GB, within 20G, so medium, on either runner (ADR-aacruzgon-0023,
+    # 0080, 0082).
+    runs-on: [self-hosted, hfs-cassandra-medium]
     timeout-minutes: 60
     env:
       COMPOSE_FILE: docker/cassandra/docker-compose.yml

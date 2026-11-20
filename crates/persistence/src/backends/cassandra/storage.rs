@@ -12,11 +12,9 @@
 //! | `create_or_update` | `upsert.rs`, on the write engine | real (Step 3, L3), including revive |
 //! | `vread`, `list_versions`, `delete_with_match` | `versions.rs` | real (Step 3, L2c; pulled forward from Step 4, D1) |
 //! | `exists`, `read_batch` | `versions.rs` | real (Step 3, L2c): `exists` reads only `deleted_at`, `read_batch` reads concurrently (D10) |
-//! | `update_with_match` | here | stub (Step 4) |
+//! | `update_with_match` | `versions.rs`, then `update` | real (Step 4) |
 //!
-//! A stub returns
-//! [`BackendError::UnsupportedCapability`](crate::error::BackendError), which
-//! the REST layer answers with 501. `count` is pulled forward from Step 3
+//! `count` is pulled forward from Step 3
 //! with the `resources_by_type` row every create writes, so the conformance
 //! seeder, which counts before it creates, works at boot.
 //!
@@ -31,7 +29,7 @@ use helios_fhir::FhirVersion;
 use serde_json::Value;
 
 use super::backend::CassandraBackend;
-use super::errors::{BACKEND_NAME, unsupported};
+use super::errors::BACKEND_NAME;
 use crate::core::{Backend, ResourceStorage, VersionedStorage};
 use crate::error::{BackendError, StorageResult};
 use crate::tenant::TenantContext;
@@ -170,13 +168,14 @@ impl VersionedStorage for CassandraBackend {
 
     async fn update_with_match(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _id: &str,
-        _expected_version: &str,
-        _resource: Value,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+        resource: Value,
     ) -> StorageResult<StoredResource> {
-        Err(unsupported("update_with_match"))
+        self.update_with_match_resource(tenant, resource_type, id, expected_version, resource)
+            .await
     }
 
     async fn delete_with_match(

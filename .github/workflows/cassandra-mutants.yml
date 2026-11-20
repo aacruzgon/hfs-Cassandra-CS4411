@@ -19,13 +19,22 @@ name: Cassandra mutation testing (report only)
 # Heavy (ADR-aacruzgon-0082): cargo-mutants builds one copy of the workspace
 # per job, cold. With 4 jobs it peaked at 15.4 GiB anon on #90, less than
 # 5 GiB under sam-7900x's 20G (ADR-aacruzgon-0080's margin), with up to
-# 22.7 GB of build directories, and it holds its runner for about 40 minutes,
+# 22.7 GB of build directories, and it holds its runner for about 26 minutes,
 # so it runs only on acruzdebian (40G), where the job count can grow. A
 # paths: filter is fine here: no required check lives in this workflow.
+#
+# Only on a pull request labelled `mutants` (ADR-aacruzgon-0082): run on every
+# push, it held acruzdebian for 26 minutes each time, and while sam-7900x is
+# offline every required check queued behind it (14 runs deep on
+# 2026-11-20). Adding the label starts a run; each later push runs it again
+# while the label stays. workflow_dispatch needs no label.
 
 on:
   pull_request:
     branches: [main]
+    # labeled, so adding the `mutants` label starts a run; the job's if:
+    # ignores every other label.
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'crates/persistence/src/backends/cassandra/**'
       # The job's own files, so a change to it runs it (with no backend
@@ -64,9 +73,16 @@ permissions:
 
 # One run per pull request, or per ref, head and node choice for a dispatch;
 # a newer push cancels the run in flight, so pushes do not pile up behind the
-# one runner.
+# one runner. Adding any other label also starts a run (which the job skips),
+# so that run gets a group of its own: in the pull request's group it would
+# cancel a run in flight.
 concurrency:
-  group: cassandra-mutants-${{ github.event.pull_request.number || format('{0}-{1}-{2}', github.ref, inputs.head, inputs.node) }}
+  group: >-
+    cassandra-mutants-${{ github.event_name == 'pull_request'
+    && (github.event.action == 'labeled' && github.event.label.name != 'mutants'
+        && format('other-label-{0}', github.run_id)
+        || github.event.pull_request.number)
+    || format('{0}-{1}-{2}', github.ref, inputs.head, inputs.node) }}
   cancel-in-progress: true
 
 env:
@@ -78,8 +94,13 @@ env:
 jobs:
   mutants:
     name: Cassandra mutants (report only)
-    # Fork guard (ADR-aacruzgon-0018).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Fork guard (ADR-aacruzgon-0018), and on a pull request only with the
+    # `mutants` label; a labeled event for another label runs nothing.
+    if: >-
+      github.event_name != 'pull_request'
+      || (github.event.pull_request.head.repo.full_name == github.repository
+          && contains(github.event.pull_request.labels.*.name, 'mutants')
+          && (github.event.action != 'labeled' || github.event.label.name == 'mutants'))
     runs-on: [self-hosted, hfs-cassandra-heavy]
     # The run itself stops at MUTANTS_MINUTES (below) and keeps what it
     # tested; this leaves room for the install, the node and the reports.

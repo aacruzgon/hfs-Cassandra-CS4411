@@ -636,6 +636,122 @@ mod tests {
         regex::Regex::new(&pattern).unwrap().is_match(cql) && !cql.contains(';')
     }
 
+    /// `source` with comments (doc comments included) and the contents of
+    /// string and char literals removed, so that a scan sees only code.
+    /// Braces and parentheses outside literals are kept.
+    fn code_only(source: &str) -> String {
+        let chars: Vec<char> = source.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            let raw_string = c == 'r' && matches!(next, Some('"' | '#')) && {
+                let mut j = i + 1;
+                while chars.get(j) == Some(&'#') {
+                    j += 1;
+                }
+                chars.get(j) == Some(&'"')
+            };
+            if c == '/' && next == Some('/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            } else if c == '/' && next == Some('*') {
+                let mut depth = 0;
+                while i < chars.len() {
+                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                out.push(' ');
+            } else if raw_string {
+                // r"…" or r#"…"# with any number of hashes.
+                let mut hashes = 0;
+                i += 1;
+                while chars[i] == '#' {
+                    hashes += 1;
+                    i += 1;
+                }
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '"' && (0..hashes).all(|k| chars.get(i + 1 + k) == Some(&'#')) {
+                        i += 1 + hashes;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str("\"\"");
+            } else if c == '"' {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
+                }
+                i += 1;
+                out.push_str("\"\"");
+            } else if c == '\'' && next == Some('\\') {
+                // An escaped char literal such as '\'' or '\n'.
+                i += 3;
+                while i < chars.len() && chars[i] != '\'' {
+                    i += 1;
+                }
+                i += 1;
+                out.push_str("' '");
+            } else if c == '\'' && chars.get(i + 2) == Some(&'\'') {
+                i += 3;
+                out.push_str("' '");
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// `code` (already through [`code_only`]) split into the text before its
+    /// `mod node_tests { … }` block and the text after it. `None` if there is
+    /// no such block or its braces do not close.
+    fn without_node_tests(code: &str) -> Option<(String, String)> {
+        let open = regex::Regex::new(r"\bmod\s+node_tests\s*\{")
+            .expect("a pattern")
+            .find(code)?;
+        let mut depth = 1;
+        for (n, c) in code[open.end()..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = open.end() + n + 1;
+                        return Some((code[..open.start()].to_string(), code[end..].to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The calls of anything named `batch` in `code`, other than the
+    /// definition `fn batch(`: the text from the name on, for a message.
+    fn batch_calls(code: &str) -> Vec<String> {
+        let call = regex::Regex::new(r"\bbatch\s*\(").expect("a pattern");
+        let definition = regex::Regex::new(r"\bfn\s+$").expect("a pattern");
+        call.find_iter(code)
+            .filter(|m| !definition.is_match(&code[..m.start()]))
+            .map(|m| code[m.start()..].chars().take(30).collect())
+            .collect()
+    }
+
     /// IW20, the source half of audit rule (d) (`ci-report.py`): a failed
     /// native batch leaves no statement text in the audit log, so the proof
     /// that none could hold a write to `resources` or `resource_versions`
@@ -647,18 +763,22 @@ mod tests {
     ///    pattern of this test's own;
     /// 2. an `IndexCql` is built nowhere else: its tuple constructor appears
     ///    only in `batch.rs`, once in its declaration and once in `new`;
-    /// 3. the driver's batch call and builder appear only in `session.rs`,
-    ///    once, behind `CassandraSession::batch`, which takes
-    ///    `IndexStatement`s, so nothing sends a batch around the type. That
-    ///    is three rules, each with its needle built from pieces so that
-    ///    this source does not match itself: (a) the driver's parameterised
-    ///    batch call appears once, in `session.rs`; (b) `session.rs` never
-    ///    calls the batch method of the driver session (the field `session`;
-    ///    the node tests' local `session` is a `CassandraSession`, so they
-    ///    are left out of the scan); (c) the builder's constructor appears
-    ///    once in the module, inside `fn index_batch`, and the builder's
-    ///    unprepared add-query call appears nowhere (the prepared one is a
-    ///    different name).
+    /// 3. nothing sends a batch around `IndexStatement`: the driver's batch
+    ///    call and builder are reached only through
+    ///    `CassandraSession::batch`. That is four rules, each with its
+    ///    needle built from pieces so that this source does not match
+    ///    itself: (a) the driver's parameterised batch call appears once, in
+    ///    `session.rs`; (b) the bare builder token appears exactly twice in
+    ///    the module, both in `session.rs` (its `use` and `index_batch`), so
+    ///    no constructor, `Default`, alias or macro can name it elsewhere,
+    ///    and the builder's unprepared add-query call appears nowhere (the
+    ///    prepared one is a different name); (c) the driver's `QueryBatch`
+    ///    is built by hand nowhere (its constructor, a struct literal, or the
+    ///    driver's body type); (d) in `session.rs`, outside the brace-matched
+    ///    `mod node_tests { … }` block, no code calls anything named
+    ///    `batch(` except the definition `fn batch(`, whatever the receiver
+    ///    (comments and string literals are stripped first), and no code
+    ///    follows that block, so an `impl` placed after it is scanned too.
     #[test]
     fn only_index_table_statements_can_reach_a_batch() {
         let files = backend_sources();
@@ -669,11 +789,19 @@ mod tests {
         let call = ["IndexCql", "::new("].concat();
         let constructor = ["IndexCql", "("].concat();
         let driver_batch = ["batch", "_with_params("].concat();
-        let builder = ["BatchQuery", "Builder"].concat();
-        let builder_new = [builder.as_str(), "::new("].concat();
-        let driver_session_batch = ["session", ".batch("].concat();
+        let builder =
+            regex::Regex::new(&[r"\bBatchQuery", r"Builder\b"].concat()).expect("a pattern");
+        let hand_built = regex::Regex::new(
+            &[
+                r"\bQueryBatch\s*::\s*new\s*\(",
+                r"|\bQueryBatch\s*\{",
+                r"|\bBodyReq",
+                r"Batch\b",
+            ]
+            .concat(),
+        )
+        .expect("a pattern");
         let add_query = ["add", "_query("].concat();
-        let index_batch_fn = ["fn ", "index_batch"].concat();
 
         let mut texts = BTreeSet::new();
         let mut problems = Vec::new();
@@ -683,21 +811,24 @@ mod tests {
         for (path, source) in &files {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
             if name == "session.rs" {
-                // The node tests call `CassandraSession::batch` on a local
-                // named `session`; every line before them is production.
-                let production = source.split("mod node_tests").next().unwrap_or(source);
-                if production.contains(&driver_session_batch) {
-                    problems.push(format!("{name} calls the driver session's batch"));
+                match without_node_tests(&code_only(source)) {
+                    None => problems.push(format!("{name}: no closed `mod node_tests` block")),
+                    Some((before, after)) => {
+                        if !after.trim().is_empty() {
+                            problems.push(format!("{name}: code after `mod node_tests`"));
+                        }
+                        for call in batch_calls(&before) {
+                            problems
+                                .push(format!("{name}: a batch call outside the tests: {call}"));
+                        }
+                    }
                 }
             }
-            for (at, _) in source.match_indices(&builder_new) {
-                // The function the call is in: the last `fn` before it.
-                let function = source[..at].rfind("fn ").map(|n| &source[n..at]);
-                let inside = function.is_some_and(|f| f.starts_with(&index_batch_fn));
-                builders.push(format!(
-                    "{name}{}",
-                    if inside { " (index_batch)" } else { "" }
-                ));
+            for _ in builder.find_iter(source) {
+                builders.push(name.to_string());
+            }
+            if hand_built.is_match(source) {
+                problems.push(format!("{name} builds a driver QueryBatch by hand"));
             }
             if source.contains(&add_query) {
                 problems.push(format!(
@@ -731,9 +862,6 @@ mod tests {
             for _ in source.match_indices(&driver_batch) {
                 driver_batches.push(name.to_string());
             }
-            if source.contains(&builder) && name != "session.rs" {
-                problems.push(format!("{name} builds a driver batch"));
-            }
         }
         assert!(problems.is_empty(), "{problems:#?}");
         assert!(!texts.is_empty(), "no IndexCql found");
@@ -745,9 +873,19 @@ mod tests {
         assert_eq!(driver_batches, vec!["session.rs"], "driver batch calls");
         assert_eq!(
             builders,
-            vec!["session.rs (index_batch)"],
-            "batch builders, each with where it is"
+            vec!["session.rs", "session.rs"],
+            "the bare builder token: its `use` and `index_batch`"
         );
+
+        // The scan's own helpers, on small texts.
+        let code = code_only("a // batch(1)\n/// batch(2)\nlet s = \"batch(3) {\"; x.batch(4)");
+        assert_eq!(batch_calls(&code), vec!["batch(4)".to_string()]);
+        assert!(batch_calls("pub(crate) async fn batch(&self)").is_empty());
+        let (before, after) =
+            without_node_tests("fn a() {} mod node_tests { fn b() { c.batch(1) } } impl X {}")
+                .expect("a block");
+        assert!(!before.contains("batch") && after.trim() == "impl X {}");
+        assert!(without_node_tests("mod node_tests { {").is_none());
 
         // The scan's own pattern: what it lets through and what it refuses.
         let delete = ["DE", "LETE FROM "].concat();

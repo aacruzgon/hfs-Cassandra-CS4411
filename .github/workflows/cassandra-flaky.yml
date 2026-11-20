@@ -208,9 +208,13 @@ jobs:
 
       # Each test N times, one test per process, --exact, against this job's
       # node. The tombstone tests are opted in, as in the required job, since
-      # the node is this job's own; the restart tests need a node of their
-      # own (HFS_TEST_CASSANDRA_RESTART_*) and skip. Under ci-report.py build
-      # for the memory peak; never fails the step.
+      # the node is this job's own, and so is the latency report, which
+      # otherwise returns at once without measuring anything (and without a
+      # "skipping:" line); its files go to a scratch directory. The restart
+      # tests need a node of their own (HFS_TEST_CASSANDRA_RESTART_*) and
+      # skip, and the 9 and 17 MiB size probe stays off, as in the required
+      # job. Under ci-report.py build for the memory peak; never fails the
+      # step.
       - name: Re-run each test (report only)
         id: runs
         if: steps.build.outcome == 'success'
@@ -221,6 +225,7 @@ jobs:
           rm -rf "$logs" && mkdir -p "$logs"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
           HFS_TEST_CASSANDRA_TOMBSTONE_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+          HFS_TEST_LATENCY_REPORT="$RUNNER_TEMP/flaky-latency-report" \
             python3 "$CI_SCRIPTS/ci-report.py" build flaky-runs "Re-runs: each test ${FLAKY_RUNS} times" -- \
               python3 -I "$CI_SCRIPTS/flaky-tests.py" run --tests "$out/tests.json" --bins "$out/bins.json" \
                 --runs "$FLAKY_RUNS" --logs "$logs" --timeout 300 --budget-minutes "$FLAKY_BUDGET_MINUTES" \

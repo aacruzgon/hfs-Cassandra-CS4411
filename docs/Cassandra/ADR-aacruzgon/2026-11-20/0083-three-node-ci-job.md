@@ -8,9 +8,15 @@
         - a one-partition logged batch that times out reports `SIMPLE`, `received 1`, `block_for 2`, and has applied on the coordinator;
         - once two replicas are marked down, the same batch gets `Unavailable`;
         - a two-partition logged batch with one replica paused times out as `BATCH_LOG`, and a batchlog replay still applies it.
-    - **Issue #77.** On RF 3 a concurrent write can answer 504 (ADR-aacruzgon-0072, decision 4). The race suites still panic on it. The fix, reading the `helios` keyspace's RF rather than an env var or the node count (my comment on #77, 2026-11-12), is PR #83, still open; `main` at `e5e8ea67f` has neither an env var nor node-count detection. So on `main` every #77 504 is a failing test.
+    - **Issue #77.** On RF 3 a concurrent write can answer 504 (ADR-aacruzgon-0072, decision 4).
+        - **Before PR #83,** the race suites panicked on it: `main` at `e5e8ea67f` had neither an env var nor node-count detection, so every #77 504 on `main` was a failing test. Runs 44680155092 and 44681897890 below are that record.
+        - **PR #83 merged on 2026-11-20** (`0ea8904e9`), and issue #77 is closed. Its race checks read the `helios` keyspace's RF, rather than an env var or the node count (my comment on #77, 2026-11-12), and accept a 504 at RF 2 or more.
+        - **Run 44758590016,** on #83's code, had no #77 504 in 5 passes. The nightly on `main` now measures whether that holds.
     - **The runners' Docker is rootless,** with `slirp4netns` and the `builtin` port driver (ADR-sam-michaels-0004, ADR-aacruzgon-0023). The nodes' addresses on the cluster network live in rootlesskit's network namespace, so the runner reaches only the published ports. The backend's driver learns every node's address from `system.peers_v2` and routes to all three (`session.rs`: `TopologyAwareLoadBalancingStrategy` with `LocalDcOnly`). `docker/cassandra/README.md` already says the same for Docker Desktop.
-    - **The heavy label is changing.** PR #100 (`ci-mutation-flake`) splits the runners into light, medium and heavy, with heavy on `acruzdebian` (40G) only. Until it merges, heavy also matches `sam-7900x`, so a heavy job's build must still fit its 20G (ADR-aacruzgon-0080). The cap covers the build only: this job's containers run in `gh-runner`'s rootless Docker, outside the runner service's cgroup. So #101 merges after #100 and after `hfs-cassandra-heavy` is removed from `sam-7900x`, and the job runs on `acruzdebian` only.
+    - **The runner tiers.** PR #100 (`ci-mutation-flake`, merged 2026-11-20) split the runners into light, medium and heavy, and `hfs-cassandra-heavy` was then removed from `sam-7900x`. Heavy is on `acruzdebian` (40G) only (ADR-aacruzgon-0082).
+        - **This job is heavy,** so it runs on `acruzdebian` only.
+        - **The cap covers the build only.** This job's containers run in `gh-runner`'s rootless Docker, outside the runner service's cgroup.
+        - **Why not medium:** the build alone (about 5 GiB) would fit medium's 20G. But medium also runs on `sam-7900x`, a developer's desktop, where the cluster and the test container would sit beside that cap.
 - **Decision:**
     - **A new workflow, `.github/workflows/cassandra-three-node.yml`, report-only.**
         - **Triggers:** `schedule` daily at 10:37 UTC, and `workflow_dispatch` with inputs `ref`, `test_filter` (for `cassandra_tests`), `lib_filter` (default `node_tests`) and `repeats` (default 5, 1 to 20). No `pull_request` trigger.
@@ -79,7 +85,7 @@
     - **A Rust image, or `cargo test` inside the container:** lost. A Rust image is another pull, and its glibc can differ from the build host's. The Cassandra image is already on the runner and matches Debian 13's glibc; running the built binary directly needs no toolchain in the container.
     - **The base file's limits (768M heap, 2.5 GiB per node, 7.5 GiB):** lost. They fit `acruzdebian`, but 1700 MiB is what the review and #77's twelve runs used, and the nodes peaked at 1,162 to 1,249 MiB (run 44680155092).
     - **A `pull_request` trigger:** lost for this first version. The job holds the heavy runner for about 8 minutes, and it measures rather than gates.
-    - **A job in `fmt-clippy-cassandra.yml`:** lost. That workflow carries four of the five required checks, and PR #100 is changing it.
+    - **A job in `fmt-clippy-cassandra.yml`:** lost. That workflow carries four of the five required checks, and PR #100 was changing it at the time.
     - **The pause scenarios as a backend test (the review's `audit_3n`):** lost. It needed a scratch test in `write.rs`'s `node_tests` and a change to `LocalDcOnly` so every request goes to node 1 (`3n-scratch.diff`). Raw CQL from node 1 gets the same coordinator answers without backend code, and matched the review in every scenario.
     - **Subnet `172.29.x` or port 59542:** lost. `172.29.0.0/16` is inside Docker's default address pools (ADR-aacruzgon-0072), and 59542 is the benchmark harness's default (PR #76). `10.59.142.0/24` is outside the default pools and clear of `slirp4netns`'s own `10.0.2.0/24`, and ports 59642 to 59644 were free on `acruzdebian` (`ss -ltn`, 2026-11-20).
     - **Sharing `target/cassandra-tests`:** lost. It builds the same two binaries, but a nightly run would change what the required job finds warm.
@@ -89,7 +95,10 @@
     - **An `HFS_TEST_CASSANDRA_CLUSTER` variable for the suites:** not added. The job changes no test, and #83 reads the RF instead.
 - **Consequences:**
     - **Easier.**
-        - Every night, the #77 rate on `main` and every other failure on three nodes, with its cause. When #83 merges, those 504s should become passes, and the job will show whether they do.
+        - Every night, every failure on three nodes on `main`, with its cause, including any #77 504.
+            - Runs 1 and 2, before #83, failed on #77 504s.
+            - Run 44758590016, on #83's code, had none.
+            - The nightly shows whether that holds on `main`.
         - The three coordinator answers the review found by hand are checked every night.
         - Steps 4, 5 and 8 have a running cluster job to add their own three-node tests to.
     - **Harder.**
@@ -135,14 +144,16 @@
     - **Intent rows.** Run 1 left 79 intent rows for `test-` tenants. That is Step 5's area (#89), and the job reports it every night.
     - **`ci-report.py node-stats`** says "before the readiness test restarts the node" in every section. That is true of the required job, not of this one; the wording is in my file.
     - **To revisit:**
-        - when #83 merges;
+        - the first nightly runs on `main` after #83 (merged 2026-11-20): whether any #77 504 still fails a test;
         - when Step 8 writes the three-node failure tests (row 8.3);
         - whether to add a `pull_request` trigger;
-        - after PR #100, whether `medium` is enough: the job needs about 5 GiB for the build, with the cluster outside the runner's cap;
+        - whether `medium` would do: the build needs about 5 GiB, but the cluster and the test container run outside any runner's cap, and medium includes `sam-7900x`;
         - when the first scheduled runs really start (`run_started_at` and the job's start), and whether 10:37 UTC still lands in the quiet hours;
-        - after #100 merges, adding `test_cassandra_three_node_report` to the fmt job's unittest step in `fmt-clippy-cassandra.yml`. #100 edits that same line, so #101 runs the tests locally only;
         - linting the new workflow and scripts (`actionlint`, `shellcheck`) in CI, as `fhir-bench-tests.yml` does for the benchmark workflows.
-    - **`CLAUDE.md`** is left to my own session, after #100 merges, because PR #100 rewrites the same CI paragraph. It should say: one more report-only workflow, `cassandra-three-node.yml`, not required, nightly and by dispatch, on heavy; its Compose project `hfs-cassandra-3n`, ports 59642 to 59644 and subnet `10.59.142.0/24` are reserved; and never rename its job to a required check's name.
+    - **`CLAUDE.md` and `AGENTS.md`:** this PR now carries them. The earlier plan was to leave `CLAUDE.md` to my own session until #100 merged, because #100 rewrote the same CI paragraph. After the tier sentence in "Commits and CI", both files say:
+        - the report-only three-node job, `cassandra-three-node.yml` (nightly and by dispatch, heavy), reserves Compose project `hfs-cassandra-3n`, subnet `10.59.142.0/24` and host ports 59642–59644;
+        - no other job gets those;
+        - the job never gets a required check's name.
 - **AI involvement:**
     - **Tool and model:** Claude Code (Opus 5.5), as the Rex worker `ci-three-node`.
     - **What the AI proposed:** everything above:
@@ -152,10 +163,10 @@
         - the repeats and their default of 5;
         - the scenarios' raw-CQL form;
         - the temporary push trigger.
-    - **What the human changed:** After the PR #90 review's hand runs on three nodes, I asked for a CI job that runs the cluster ("should we also do the 3 node one?"), with the scope my session briefed: report-only, nightly and by dispatch, no `pull_request` trigger in this first version, no test changes, and the pause scenarios only if they need no backend test code. I approved the draft's choices as written: the container route, 10:00 UTC, the reserved subnet and ports, and 5 repeats. After the independent audit of #101 (2026-11-20), I had its findings fixed before undraft: the failure classes read from the panic's own first line, a stopped run's hung test and earlier messages, `ref` with two checkouts, the hour picked again from the runs' real start times (10:37 UTC), and its minor findings except M9 (linting in CI), which is under "To revisit". After the delta audit, I had its minors fixed too: a 504 inside `Err(…)`, the configuration test's 503 and 504, an OOM-killed run's tests, a commit SHA on no branch, and the trap's wording. After undraft, I had CodeRabbit's eight threads checked and all eight fixed: the pause scenarios' state checks, missing evidence reported as such, deadline-skipped repeats listed, best-effort fallback writes, whitespace in `ref`, and `pipefail` before `tee`.
+    - **What the human changed:** After the PR #90 review's hand runs on three nodes, I asked for a CI job that runs the cluster ("should we also do the 3 node one?"), with the scope my session briefed: report-only, nightly and by dispatch, no `pull_request` trigger in this first version, no test changes, and the pause scenarios only if they need no backend test code. I approved the draft's choices as written: the container route, 10:00 UTC, the reserved subnet and ports, and 5 repeats. After the independent audit of #101 (2026-11-20), I had its findings fixed before undraft: the failure classes read from the panic's own first line, a stopped run's hung test and earlier messages, `ref` with two checkouts, the hour picked again from the runs' real start times (10:37 UTC), and its minor findings except M9 (linting in CI), which is under "To revisit". After the delta audit, I had its minors fixed too: a 504 inside `Err(…)`, the configuration test's 503 and 504, an OOM-killed run's tests, a commit SHA on no branch, and the trap's wording. After undraft, I had CodeRabbit's eight threads checked and all eight fixed: the pause scenarios' state checks, missing evidence reported as such, deadline-skipped repeats listed, best-effort fallback writes, whitespace in `ref`, and `pipefail` before `tee`. After #100 and #83 merged, I had `main` merged in, the wording brought up to date, the report's tests added to the fmt job, and the `CLAUDE.md` and `AGENTS.md` sentence carried in this PR.
     - **Verified:**
         - **The CI runs above:** their logs and their artifact `ci-report-three-node`.
-        - **`report.py`:** `.github/scripts/test_cassandra_three_node_report.py`, 32 tests, run locally. What it covers:
+        - **`report.py`:** `.github/scripts/test_cassandra_three_node_report.py`, 32 tests. They run locally, and in CI in the `cargo fmt --check` job's unittest step (`fmt-clippy-cassandra.yml`). What it covers:
             - a #77 504, through the race suites and through a `--lib` unwrap;
             - a plain write's 504, a CAS write's 504 and an unknown-outcome 504, each "another 504";
             - a 503;
@@ -204,4 +215,4 @@
     - Runs 44680155092, 44681897890 and 44758590016.
     - `development-roadmap.md`: section 1 "Machines", the CI paragraph (row 0.5's), row 8.3, section 6's first paragraph, and section 8's file lists.
     - `docker/cassandra/README.md`: "Run", the client paragraph, and "Recorded configuration".
-    - ADR-aacruzgon-0002, 0018, 0019, 0021, 0022, 0023, 0070, 0072, 0080, 0081; ADR-sam-michaels-0002, 0004.
+    - ADR-aacruzgon-0002, 0018, 0019, 0021, 0022, 0023, 0070, 0072, 0080, 0081, 0082; ADR-sam-michaels-0002, 0004.

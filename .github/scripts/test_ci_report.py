@@ -503,6 +503,26 @@ class Scratch(unittest.TestCase):
         return status, out.getvalue()
 
 
+class ContextAfterItsSection(Scratch):
+    """The context command writes its section to context.json, the file the
+    context is kept in; a section added after it must still get the bare
+    context, and a build report must still find the runner."""
+
+    def test_a_section_after_the_context_command_gets_the_bare_context(self):
+        os.environ["RUNNER_NAME"] = "test-runner"
+        try:
+            self.quiet(ci_report.cmd_context, SimpleNamespace(cassandra_container=None))
+            section = json.loads((self.dir / "report" / "context.json").read_text())
+            self.assertEqual(section["id"], "context")
+            self.quiet(ci_report.add, "later", "Later", "text", {})
+            later = json.loads((self.dir / "report" / "later.json").read_text())
+            self.assertNotIn("id", later["context"])
+            self.assertEqual(later["context"]["runner"], "test-runner")
+            self.assertEqual(ci_report.context()["runner"], "test-runner")
+        finally:
+            os.environ.pop("RUNNER_NAME", None)
+
+
 class CqlAuditCommand(Scratch):
     def audit(self, text, check=True, name="audit.txt"):
         path = self.write(name, text) if text is not None else self.dir / "missing.txt"

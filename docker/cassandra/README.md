@@ -68,6 +68,7 @@ then stayed healthy for 120 s each.
 | Direct memory | 512M, or 1G with the override | Half the heap. Otherwise `cassandra-env.sh` sizes it from the host's RAM. |
 | GC threads | 4 parallel, 4 concurrent | Otherwise `cassandra-env.sh` uses the host's core count, not the CPU limit |
 | Host port | `127.0.0.1:59042` (`CASSANDRA_HOST_PORT` overrides) | A process already listening on 9042 on the host would answer instead of the container without any error. See ADR-aacruzgon-0007. |
+| CI host ports | `CASSANDRA_HOST_PORT`, one per job: 59142 (the required Cassandra job), 59242 (coverage and FHIR versions), 59442 (`Cassandra flaky tests (report only)`), 59842 (`Cassandra mutants (report only)`) | Rootless Docker publishes on the host itself, so no two of these, the developers' 59042 or the three-node cluster's 59342 to 59344 may be the same; the benchmark harness (PR #76) uses 59542 and the nightly three-node job 59642 to 59644. Pick a new job's port outside all of them. |
 | CPU limit | 4 | Same in both profiles and for PostgreSQL |
 | Memory limit | 3 GiB, or 5 GiB with the override; swap disabled | Indicative, Apple-silicon 18 GB laptop under OrbStack: idle 1.61 GiB (1G heap) and 2.65 GiB (2G heap); peak under a 32-thread write load 1.91 GiB of 3 GiB and 3.31 GiB of 5 GiB; no OOM kill. With the stock yaml a 1.5 GiB limit was OOM-killed at boot. |
 | Unchanged | `commitlog_sync: periodic` (10000ms), `batch_size_warn_threshold` 5KiB, `batch_size_fail_threshold` 50KiB, tombstone warn 1000 / fail 100000, `num_tokens` 16 | The same in both files. Recorded so that a benchmark report can state them |
@@ -184,7 +185,7 @@ through; run it in a container on the cluster's network instead.
 | GC threads | 2 parallel and 2 concurrent, or 4 with the override | Matches the CPU limit. |
 | CPU limit | 2 per node (6 in all), or 4 per node with the override | |
 | Memory limit | 2.5 GiB per node (7.5 GiB in all), or 5 GiB per node with the override; swap disabled | Indicative, Apple-silicon laptop under OrbStack, 768M heap, a 2 GiB limit for the check: 1.31 GiB per node at idle; `memory.peak` 1.47 GiB over the failure procedures and the backend tests; no OOM kill. The 2.5 GiB default then booted from clean and peaked at 1.42 GiB. No sustained load was measured, and the 2G override has not been booted. |
-| Host ports | `127.0.0.1:59342`, `59343`, `59344` (`CASSANDRA_CLUSTER_HOST_PORT_1` to `_3` override) | Not 59042 (developers), 59142 (the required CI job) or 59242 (coverage and FHIR versions). |
+| Host ports | `127.0.0.1:59342`, `59343`, `59344` (`CASSANDRA_CLUSTER_HOST_PORT_1` to `_3` override) | Not 59042 (developers), 59142 (the required CI job), 59242 (coverage and FHIR versions), 59442 (the flakiness job) or 59842 (the mutation job). |
 | Network | Fixed addresses `172.29.59.11` to `.13` (`CASSANDRA_CLUSTER_SUBNET_PREFIX` overrides `172.29.59`) | A node keeps its address over a restart and a reconnect, and the seed list can name addresses. |
 | `stop_grace_period` | 60 s | Long enough for a drain on `SIGTERM`. |
 
@@ -199,26 +200,72 @@ These tests were written for one node, and on three a few fail for reasons
 that are expected today:
 
 - `node_runs_the_docker_cassandra_configuration` always fails. It fails at the
-  rack assertion (`cassandra_tests.rs:185`) if the query reaches another node,
-  and otherwise at `one node, no peers` (`:214`), because on the cluster the
-  driver sees three nodes.
-- The concurrent-write tests fail some of the time with a backend `Timeout`
-  (504) from a `LOCAL_SERIAL` read: `CAS operation timed out: received 0 of 2
-  required responses`. They are the tests in `step3_suites`
-  (`versioned_write_race_suite.rs`) and
-  `create_read::cassandra_concurrent_creates_of_one_id_make_exactly_one_resource`.
-  Cassandra 5.0.9 raises the error when a competing proposal supersedes the
-  read's Paxos round. Raising the CPU limit from 2 to 4 per node did not change
-  the rate in the one test tried, on a host at load 14 to 18 (9 and 12 of 20
-  runs failed at 4 CPUs, 11 of 20 at 2). The answer can reach the writer that
-  won: seven of eight concurrent creates got `AlreadyExists` and the eighth got
-  the 504. These tests panic on the outcomes, before any version-history check,
-  so a failing run does not check the history; the runs that pass do.
+  rack assertion (`cassandra_tests.rs:186`) if the query reaches another node,
+  and otherwise at the replication factor (`:205`), because the cluster's
+  keyspace is RF 3, not the single node's 1.
+The concurrent-write tests, those in `step3_suites`
+(`versioned_write_race_suite.rs`) and
+`create_read::cassandra_concurrent_creates_of_one_id_make_exactly_one_resource`,
+can get a backend `Timeout` (504) from a `LOCAL_SERIAL` read: `CAS operation
+timed out: received 0 of 2 required responses`. Cassandra 5.0.9 raises it when
+a competing proposal supersedes the read's Paxos round, and it can reach the
+writer that won. On RF 3 this is an accepted answer (issue #77,
+ADR-aacruzgon-0072 decision 4), so these tests read the keyspace's replication
+factor and, at RF 2 or more, accept the 504 and check the invariants instead:
+no history gap, one winner per version, no lost write. Each prints its mode,
+`[race policy case=race:<test> rf=3 accept_504=true]`. A 504'd write that
+applied can leave its version out of the history until the sweeper replays its
+intent (Step 5), so the history may lack its newest version only when the
+`resources` row's `write_id` matches a kept intent row for it
+(ADR-sara-lahourpour-0001). The race tests check no `count`: a write that
+applied without its index step, followed by a clean write on top, leaves
+`count` off with nothing pending. Only the concurrent-create test checks it,
+since a create has one version. The exact history and `count` wait for Step 5's
+sweep (issue #89). At RF 1 the 504 still fails the test.
 
-On RF 3 this 504 is an accepted answer. Item 8.3 checks the invariants instead
-(no history gap, one winner per version, no lost write), and the race suites
-need a cluster-aware outcome check, which also verifies the history, before
-Step 8.
+### Docker Desktop with WSL 2
+
+From the host, every test fails after 60 s (the harness's `READY_TIMEOUT`):
+`SELECT table_name FROM system_schema.tables …: no answer within 60s`. The
+driver learns the other nodes' `172.29.59.x` addresses from
+`system.peers_v2`, and Docker Desktop does not route those from the host
+(including WSL 2). Build the test binary on the host and run it in a container
+on the cluster's network instead. From the repository root, on Ubuntu under
+WSL 2, with an image of the same Ubuntu release as the distro, so that its
+glibc matches the binary's (`ubuntu:26.04` here):
+
+```bash
+bin=$(cargo test -p helios-persistence --features cassandra --test cassandra_tests --no-run 2>&1 \
+      | sed -n 's/^ *Executable .* (\(.*\))$/\1/p')
+bin=$(realpath "$bin")
+docker run --rm --network hfs-cassandra-cluster_cluster --user "$(id -u):$(id -g)" \
+  -v /usr/lib/x86_64-linux-gnu/libssl.so.3:/usr/lib/x86_64-linux-gnu/libssl.so.3:ro \
+  -v /usr/lib/x86_64-linux-gnu/libcrypto.so.3:/usr/lib/x86_64-linux-gnu/libcrypto.so.3:ro \
+  -v "$PWD":"$PWD":ro -v "$bin":/t/cassandra_tests:ro -w "$PWD/crates/persistence" \
+  -e HFS_TEST_CASSANDRA_URL=172.29.59.11:9042 ubuntu:26.04 /t/cassandra_tests
+```
+
+`realpath` is needed because cargo prints the executable relative to the
+repository (`target/debug/…`), and `docker run -v` takes a relative path for a
+volume name and refuses it. The repository is mounted at the same path because
+some tests read files by the path compiled into the binary. The two OpenSSL
+libraries come from the host, so the image needs nothing installed. The URL
+and the network name assume the defaults: the subnet prefix `172.29.59`
+(`CASSANDRA_CLUSTER_SUBNET_PREFIX`) and the Compose project name
+`hfs-cassandra-cluster` (`name:` in `docker-compose.cluster.yml`, which makes
+the network `hfs-cassandra-cluster_cluster`). If you changed either, change
+both here too. On 2026-11-12 and 13 (Windows, Docker Desktop with WSL 2, the
+default limits), the tests passed this way except
+`node_runs_the_docker_cassandra_configuration`; one of five runs also had four
+ordinary `LOCAL_QUORUM` timeouts (`received only 1 responses`) in non-race
+tests, while the host was compiling.
+
+This does not work on a Mac: cargo there builds a macOS (Mach-O) binary, which
+a Linux container cannot run, and the mounted libraries are x86_64 Linux ones.
+Use OrbStack instead. It routes the container addresses from the host (see the
+end of the cluster's "Run" section), so the command under "Backend tests
+against the cluster" works as it is. Otherwise the test binary has to be built
+for Linux.
 
 ## Failure procedures
 

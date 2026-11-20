@@ -260,6 +260,21 @@ pub(crate) struct CassandraSession {
     /// The faults tests inject (`cfg(test)` only; see [`Fault`]).
     #[cfg(test)]
     faults: faults::Faults,
+    /// What each plain send used, in order (`cfg(test)` only).
+    #[cfg(test)]
+    plain_sends: parking_lot::Mutex<Vec<PlainSend>>,
+}
+
+/// What one plain send used (`cfg(test)` only): the statement's kind, the
+/// [`Retries`] it asked for, and whether the parameters actually built
+/// carry a retry policy of their own (so, not the session's default). Both
+/// are recorded, since a bug can honour the one and not the other.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlainSend {
+    kind: StatementKind,
+    retries: Retries,
+    own_retry_policy: bool,
 }
 
 impl std::fmt::Debug for CassandraSession {
@@ -301,6 +316,8 @@ impl CassandraSession {
             counts: StatementCounters::default(),
             #[cfg(test)]
             faults: faults::Faults::default(),
+            #[cfg(test)]
+            plain_sends: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -313,6 +330,12 @@ impl CassandraSession {
     /// How many statements of each kind this session has been asked to send.
     pub(crate) fn statement_counts(&self) -> StatementCounts {
         self.counts.snapshot()
+    }
+
+    /// What each plain send used since the session opened (tests only).
+    #[cfg(test)]
+    fn plain_sends(&self) -> Vec<PlainSend> {
+        self.plain_sends.lock().clone()
     }
 
     /// Makes the next statement of `kind` whose CQL contains `cql_contains`
@@ -421,6 +444,12 @@ impl CassandraSession {
             Retries::OfKind => statement_params(kind, values, &self.no_retry),
             Retries::Never => lone_row_params(values, &self.no_retry),
         };
+        #[cfg(test)]
+        self.plain_sends.lock().push(PlainSend {
+            kind,
+            retries,
+            own_retry_policy: params.retry_policy.is_some(),
+        });
         if let Some(paging) = paging {
             params.query_params.page_size = Some(paging.page_size);
             params.query_params.paging_state = paging.state;
@@ -1561,6 +1590,16 @@ mod node_tests {
             (spent.write, spent.batch, spent.batched),
             (1, 0, 0),
             "{spent}"
+        );
+        // The send used no driver retry: it asked for `Never`, and the
+        // parameters it was built with carry a policy of their own.
+        assert_eq!(
+            session.plain_sends(),
+            vec![PlainSend {
+                kind: StatementKind::Write,
+                retries: Retries::Never,
+                own_retry_policy: true,
+            }]
         );
         assert_eq!(
             rows_of(&session, &t, "Patient").await,

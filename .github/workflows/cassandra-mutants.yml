@@ -209,8 +209,15 @@ jobs:
       # Without a node, the node tests skip, so only the pure tests can catch
       # a mutant. Each job is a build directory of its own; one jobserver
       # shares the runner's CPUs between all their builds (cargo-mutants'
-      # default, one task per CPU). --cap-lints keeps a mutant that only adds
-      # a warning viable. Under ci-report.py build, which samples the runner's
+      # default, one task per CPU). A mutant that makes a const fn loop forever
+      # (`+=` into `*=` in batch.rs's const scans) would hold its job for the
+      # whole build timeout: rustc only warns, long_running_const_eval, and
+      # keeps evaluating. -D makes that warning an error, so the mutant is
+      # unviable within seconds; cargo caps lints for registry dependencies,
+      # so they are not affected. No --cap-lints: it would cap this deny too,
+      # and the crate denies no warnings. --build-timeout is the backstop: the
+      # slowest real build on #90, a cold first build in a new build
+      # directory, took 234 s. Under ci-report.py build, which samples the runner's
       # cgroup for the memory peak. timeout -s INT stops it at the budget the
       # way Ctrl-C does, and cargo-mutants keeps every outcome it has; the
       # report counts the rest as untested. Its exit status says how the run
@@ -224,6 +231,7 @@ jobs:
           DIFF: ${{ steps.diff.outputs.diff }}
         run: |
           unset CARGO_TARGET_DIR
+          export RUSTFLAGS="-D long_running_const_eval"
           MUTANTS_SCRATCH="${RUNNER_WORKSPACE:?}/target/${MUTANTS_SCRATCH_NAME:?}"
           rm -rf "$MUTANTS_SCRATCH" && mkdir -p "$MUTANTS_SCRATCH"
           export TMPDIR="$MUTANTS_SCRATCH"
@@ -231,7 +239,7 @@ jobs:
           rm -rf "$out" && mkdir -p "$out"
           args=(mutants --package helios-persistence --features cassandra
                 --file 'crates/persistence/src/backends/cassandra/**'
-                --jobs "$MUTANTS_JOBS" --cap-lints=true --build-timeout 1500
+                --jobs "$MUTANTS_JOBS" --build-timeout 600
                 --output "$out" --colors=never
                 --cargo-test-arg=--lib)
           if [ "$RANGE" != none ]; then args+=(--in-diff "$DIFF"); fi

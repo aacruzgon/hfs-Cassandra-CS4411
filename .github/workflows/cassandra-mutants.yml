@@ -425,12 +425,23 @@ jobs:
       # stays false, and a schema that does not apply leaves the node up.
       - name: Cassandra logs
         if: (failure() || steps.node.outcome == 'failure') && env.MUTANTS_NODE == 'true'
-        run: docker compose -p "$COMPOSE_PROJECT" logs --tail 200
+        # Report only, like the rest: a Docker daemon that is gone fails this
+        # too, and must not turn the job red.
+        continue-on-error: true
+        run: |
+          docker compose -p "$COMPOSE_PROJECT" logs --tail 200 \
+            || echo "::warning title=Mutation testing::docker compose logs failed, so the node's logs are not in this run"
 
       # down -v is safe here only because -p names this job's own project.
       - name: Stop Cassandra and remove this job's volume
         if: always() && env.MUTANTS_NODE == 'true'
-        run: docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
+        # Report only: a failed down (the Docker daemon gone) is a warning,
+        # and the next run's leading down -v removes what it left.
+        continue-on-error: true
+        run: |
+          if ! docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans; then
+            echo "::warning title=Mutation testing::docker compose down failed, so this job's container and volume may be left; the next run's leading down -v removes them"
+          fi
 
       # cargo-mutants deletes its build directories as it exits; a run killed
       # mid-way leaves them, so this empties the directory whatever happened.

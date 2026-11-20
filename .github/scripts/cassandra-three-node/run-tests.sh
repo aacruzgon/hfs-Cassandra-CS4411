@@ -24,6 +24,12 @@
 #   run/LABEL.json          exit status, wall time, the container's memory.peak
 #                           and OOM kills, the timeout; or "skipped": "deadline"
 #                           for a run not started (below)
+#   run/LABEL/coordinator-before.tsv, coordinator-after.tsv
+#                           every node's ClientRequest timeouts, unavailables
+#                           and failures just before and just after the run
+#                           (coordinator-metrics.sh), so report.py can count
+#                           the 504s and 503s the nodes answered during it,
+#                           including those a test accepted and passed on
 #
 # Exits with the test binary's status: 124 when the timeout stopped it, 137
 # when it was killed (the timeout's SIGKILL, 30 s after its SIGINT, or the
@@ -52,6 +58,11 @@ name="hfs-cassandra-3n-tests-$label"
 mkdir -p "$THREE_NODE_OUT/logs" "$THREE_NODE_OUT/run" "$THREE_NODE_OUT/run/$label"
 log="$THREE_NODE_OUT/logs/$label.log"
 run_dir="$THREE_NODE_OUT/run/$label"
+
+# The nodes' counters before the run, ahead of the deadline check so the
+# time they take (three nodetool JVMs per node) is not the run's.
+here=$(cd "$(dirname "$0")" && pwd)
+"$here/coordinator-metrics.sh" "$run_dir/coordinator-before.tsv"
 
 # A repeat not started still gets its log (the "Running" line, so both
 # reports list it) and a run file saying why, so report.py shows it as not
@@ -119,6 +130,7 @@ started=$(date +%s)
 wait "$!"
 docker_status=$(cat "$run_dir/docker_status" 2>/dev/null || echo "")
 wall=$(( $(date +%s) - started ))
+"$here/coordinator-metrics.sh" "$run_dir/coordinator-after.tsv"
 
 status=$(cat "$run_dir/status" 2>/dev/null || echo "$docker_status")
 peak=$(cat "$run_dir/memory.peak" 2>/dev/null || echo "")

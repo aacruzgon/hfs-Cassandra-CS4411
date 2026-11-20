@@ -401,6 +401,49 @@ test ok_test ... ok
         self.assertEqual(data["accepting_uncounted"], ["cassandra_concurrent_creates_of_one_id_make_exactly_one_resource"])
         self.assertIn("print no `[cas]` line", md.read_text())
 
+    # Follow-up 6: the nodes' coordinator meters before and after each run
+    # (coordinator-metrics.sh) count the 504s and 503s the cluster answered,
+    # also those a passing test accepted.
+    def coordinator(self, label: str, before: dict, after: dict, errors: tuple = ()) -> None:
+        run_dir = self.out / "run" / label
+        run_dir.mkdir(parents=True, exist_ok=True)
+        for name, values in (("before", before), ("after", after)):
+            lines = [f"{c}\t{scope}\t{n}\t{v}" for (c, scope, n), v in values.items()]
+            lines += [f"{c}\t-\t{n}\terror" for c, n in errors if name == "after"]
+            (run_dir / f"coordinator-{name}.tsv").write_text("\n".join(lines) + "\n")
+
+    def test_coordinator_timeouts_are_counted_per_run(self) -> None:
+        passing = ("     Running tests/cassandra_tests.rs (/x/cassandra_tests-abc)\n\nrunning 1 test\ntest a ... ok\n\n"
+                   "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n")
+        self.log("cassandra-tests-r1", passing, {"exit_status": 0})
+        n = "hfs-cassandra-3n-cassandra-{}-1".format
+        self.coordinator("cassandra-tests-r1",
+                         {(n(1), "CASWrite", "Timeouts"): 4, (n(2), "CASWrite", "Timeouts"): 0,
+                          (n(1), "CASRead", "Timeouts"): 1, (n(2), "Write", "Unavailables"): 0,
+                          (n(1), "Write-LOCAL_SERIAL", "Timeouts"): 4},
+                         {(n(1), "CASWrite", "Timeouts"): 9, (n(2), "CASWrite", "Timeouts"): 3,
+                          (n(1), "CASRead", "Timeouts"): 1, (n(2), "Write", "Unavailables"): 2,
+                          (n(1), "Write-LOCAL_SERIAL", "Timeouts"): 9})
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        data = json.loads(js.read_text())
+        c = data["coordinator_by_step"]["cassandra-tests"]
+        self.assertEqual((c["CASWrite Timeouts"], c["CASRead Timeouts"], c["Write Unavailables"]), (8, 0, 2))
+        self.assertIn("| cassandra-tests-r1 | 2 | 0 | 0 | – | 8 | 0 | 0 | 0 | 2 | 0 |", md.read_text())
+        self.assertEqual(data["warnings"], [])
+
+    def test_coordinator_counter_not_read_is_a_warning(self) -> None:
+        self.log("cassandra-tests-r1", "     Running tests/cassandra_tests.rs (/x/cassandra_tests-abc)\n\n"
+                 "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n",
+                 {"exit_status": 0})
+        n = "hfs-cassandra-3n-cassandra-1-1"
+        self.coordinator("cassandra-tests-r1", {(n, "CASWrite", "Timeouts"): 1}, {(n, "CASWrite", "Timeouts"): 1},
+                         errors=((n, "Failures"),))
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        self.assertTrue(any("coordinator counters not all read: hfs-cassandra-3n-cassandra-1-1 Failures" in w
+                            for w in json.loads(js.read_text())["warnings"]))
+
     # CodeRabbit on #101: the fallback writes never raise, and main exits 0
     # when the JSON destination cannot be written.
     def test_report_exits_zero_when_a_destination_is_unwritable(self) -> None:

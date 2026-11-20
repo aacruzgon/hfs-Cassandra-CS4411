@@ -280,6 +280,68 @@ def parse_log(path: Path, stopped: str | None = None) -> dict:
     return suite
 
 
+# The nodes' coordinator counters (coordinator-metrics.sh, run-tests.sh):
+# the meters every node keeps for the requests it coordinated. Summed over
+# the nodes, the difference across one run is what the cluster answered
+# during it. What marks which, in Cassandra 5.0.9 with Paxos v2 (the job's
+# nodes, docker/cassandra/entrypoint.sh), from its source:
+# - CASWrite Timeouts: a conditional write that timed out, and also a serial
+#   read that a competing Paxos round superseded, or that ran out of
+#   contention retries (Paxos.java read(), :886-901, through
+#   markAndThrowAsTimeoutOrFailure(true, ...), :563-565). That read is
+#   answered "CAS operation timed out: received 0 of 2 required responses",
+#   which is issue #77's 504. So #77's 504s are in this column, mixed with
+#   the CAS writes' own timeouts; the meters cannot tell them apart.
+# - CASRead Timeouts: a serial read whose own proposal timed out (:878).
+# - Read and Write: the other reads and writes; an LWT marks the CAS meter and
+#   the per-consistency one (Write-LOCAL_SERIAL), not these.
+# A coordinator counts every such answer, including one the backend then
+# settled without returning a 504 (a CAS write timeout its serial read
+# decided, say), so the columns bound what the tests saw from above.
+COORDINATOR_SCOPES = ("CASRead", "CASWrite", "Read", "Write")
+COORDINATOR_NAMES = ("Timeouts", "Unavailables", "Failures")
+
+
+def coordinator_counts(path: Path) -> tuple[dict, list[str]] | None:
+    """{(container, scope, name): count} from one coordinator-metrics.sh
+    file, and the (container, name) pairs it could not read; None if there
+    is no file."""
+    if not path.exists():
+        return None
+    counts, errors = {}, []
+    for line in path.read_text(errors="replace").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        container, scope, name, value = parts
+        if value == "error":
+            errors.append(f"{container} {name}")
+        elif value.isdigit():
+            counts[(container, scope, name)] = int(value)
+    return counts, errors
+
+
+def coordinator_delta(run_dir: Path) -> dict | None:
+    """What the nodes answered during one run: {"CASRead Timeouts": n, …}
+    summed over the nodes, for the base scopes, or None when either file is
+    missing; "unread" lists what one of them could not read."""
+    before = coordinator_counts(run_dir / "coordinator-before.tsv")
+    after = coordinator_counts(run_dir / "coordinator-after.tsv")
+    if before is None or after is None:
+        return None
+    (b, b_errors), (a, a_errors) = before, after
+    delta = {f"{scope} {name}": 0 for scope in COORDINATOR_SCOPES for name in COORDINATOR_NAMES}
+    nodes = sorted({k[0] for k in a} & {k[0] for k in b})
+    for (container, scope, name), value in a.items():
+        key = f"{scope} {name}"
+        if key in delta and (container, scope, name) in b:
+            delta[key] += value - b[(container, scope, name)]
+    unread = sorted(set(b_errors + a_errors))
+    if not nodes:
+        unread.append("no node answered")
+    return {"counts": delta, "nodes": len(nodes), "unread": unread}
+
+
 def ended(run: dict) -> str | None:
     """How the run ended, from run-tests.sh's JSON: an exit, the timeout
     (coreutils timeout's 124), or a kill (137: the timeout's SIGKILL 30 s
@@ -305,6 +367,7 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
         how = "timeout" if run and run.get("timed_out") else "killed" if run and run.get("killed") else None
         suite = parse_log(log, stopped=how)
         suite["run"] = run
+        suite["coordinator"] = coordinator_delta(out / "run" / log.stem)
         suites.append(suite)
     rows, failures, warnings = [], [], []
     for s in suites:
@@ -374,6 +437,40 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
                  "is an upper bound on the #77 504s. Since PR #83 a race test accepts the 504 at RF 2 or more and "
                  "passes, so a 504 a passing test accepted shows only here; a test that panics before it prints "
                  "its `[cas]` line is not counted.\n")
+    coordinator_rows, coordinator_total = [], {}
+    for s_ in ran:
+        c = s_["coordinator"]
+        if c is None:
+            continue
+        if c["unread"]:
+            warnings.append(f"Three-node tests: {s_['label']}'s coordinator counters not all read: "
+                            + ", ".join(c["unread"]))
+        n77 = sum(1 for f in s_["failures"] if f["class"] == "504-77")
+        n504 = sum(1 for f in s_["failures"] if f["class"] in ("504-77", "504-other"))
+        counts = c["counts"]
+        coordinator_rows.append([s_["label"], c["nodes"], n77, n504, s_["serial_read_failures"] if s_["cas_lines"] else None,
+                                 counts["CASWrite Timeouts"], counts["CASRead Timeouts"], counts["Write Timeouts"],
+                                 counts["Read Timeouts"],
+                                 sum(counts[f"{sc} Unavailables"] for sc in COORDINATOR_SCOPES),
+                                 sum(counts[f"{sc} Failures"] for sc in COORDINATOR_SCOPES)])
+        step = coordinator_total.setdefault(step_of(s_["label"]), {k: 0 for k in counts})
+        for k, v in counts.items():
+            step[k] += v
+    if coordinator_rows:
+        md += ("\n**What the nodes answered during each run** (each node's `ClientRequest` meters, read with "
+               "`nodetool sjk` before and after the run, summed over the nodes):\n\n" + table(
+                   ["Run", "Nodes read", "Tests failing on a #77 504", "Tests failing on any 504",
+                    "Failed serial reads (`[cas]`)", "`CASWrite` timeouts (#77's 504 is here)", "`CASRead` timeouts",
+                    "`Write` timeouts", "`Read` timeouts", "Unavailables", "Failures"], coordinator_rows))
+        md += ("\nIssue #77's 504 is a serial read that a competing Paxos round superseded. Cassandra 5.0.9 "
+               "(Paxos v2) answers it \"CAS operation timed out\" and counts it as a **`CASWrite` timeout**, "
+               "together with the conditional writes that timed out; the meters cannot tell the two apart. "
+               "`CASRead` timeouts are serial reads whose own proposal timed out. Since PR #83 a race test "
+               "accepts a 504 at RF 2 or more and passes, so these columns show 504s the failure table cannot. "
+               "A coordinator counts every such answer, including one the backend then settled without "
+               "returning a 504 (a CAS write timeout its serial read decided, say), so the columns are an upper "
+               "bound on what the tests saw. Unavailables (503) and failures are summed over `CASWrite`, "
+               "`CASRead`, `Read` and `Write`.\n")
     uncounted = sorted({name.removeprefix("race:") for s_ in ran for name in s_["accepting_uncounted"]})
     if uncounted:
         md += ("\n**Race tests that accept a 504 but print no `[cas]` line**, so their 504s are in no count: "
@@ -415,6 +512,7 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
     write(md_path, json_path, md, {"suites": suites, "runs": runs, "failures_by_class": counts,
                                    "runs_with_77": runs_with_77, "serial_read_failures": serial,
                                    "accepting_uncounted": uncounted,
+                                   "coordinator_by_step": coordinator_total,
                                    "by_test": list(by_test.values()),
                                    "warnings": warnings})
 

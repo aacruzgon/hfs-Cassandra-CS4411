@@ -1,0 +1,323 @@
+name: Cassandra mutation testing (report only)
+
+# Mutation testing of the Cassandra backend (ADR-aacruzgon-0082): cargo-mutants
+# changes the code a pull request touches under
+# crates/persistence/src/backends/cassandra/, one small change at a time
+# (an operator swapped, a function body replaced by a default value), and
+# runs the backend's --lib tests against each one. A mutant that no test
+# notices is "missed": the summary lists each with its file:line and the
+# replacement, as a lead for the reviewer. Hand review still covers what the
+# tool cannot: mutations specific to the design, bypasses of the source
+# scans, and comments checked against the ADRs.
+#
+# Report only. The job passes whatever survives, and whenever cargo-mutants
+# itself fails it writes a warning instead of failing. Its name is in no
+# ruleset and must never match one of the five required checks
+# (ADR-aacruzgon-0019, 0021), so it is a workflow of its own.
+#
+# Heavy (ADR-aacruzgon-0082): cargo-mutants builds one copy of the workspace
+# per job, cold, and several at once need more than sam-7900x's 20G, so it
+# runs only on acruzdebian (40G). A paths: filter is fine here: no required
+# check lives in this workflow.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/persistence/src/backends/cassandra/**'
+      # The job's own files, so a change to it runs it (with no backend
+      # change, it finds no mutants and says so).
+      - '.github/workflows/cassandra-mutants.yml'
+      - '.github/scripts/mutants-report.py'
+  workflow_dispatch:
+    inputs:
+      head:
+        description: The branch, tag or commit to mutate. Empty mutates the ref the run was started on.
+        required: false
+        default: ''
+      base:
+        description: The base the diff is taken from, as base...head (a branch of origin, a tag or a commit).
+        required: false
+        default: main
+      in_diff:
+        description: A git diff range to use instead of base...head (for example a1b2c3d..e4f5a6b), or "none" to mutate the whole backend, which is about 1,300 mutants and longer than the run's budget.
+        required: false
+        default: ''
+      node:
+        description: Run the --lib tests against a Cassandra node of the job's own, so the node tests can catch mutants too.
+        type: boolean
+        required: false
+        default: false
+      jobs:
+        description: cargo-mutants --jobs, the build directories tested at once.
+        required: false
+        default: '4'
+
+permissions:
+  contents: read
+  # The last report reads the job's own step timings from the Actions API
+  # (.github/scripts/job-step-timings.py). Read-only, like contents.
+  actions: read
+
+# One run per pull request, or per ref and head for a dispatch; a newer push
+# cancels the run in flight, so pushes do not pile up behind the one runner.
+concurrency:
+  group: cassandra-mutants-${{ github.event.pull_request.number || format('{0}-{1}', github.ref, inputs.head) }}
+  cancel-in-progress: true
+
+env:
+  # As in the other workflows: rustup ranks the environment above any
+  # directory override left on the runner.
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    name: Cassandra mutants (report only)
+    # Fork guard (ADR-aacruzgon-0018).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra-heavy]
+    # The run itself stops at MUTANTS_MINUTES (below) and keeps what it
+    # tested; this leaves room for the install, the node and the reports.
+    timeout-minutes: 160
+    env:
+      # Released 2026-06-02 (ADR-aacruzgon-0082).
+      CARGO_MUTANTS_VERSION: 27.1.0
+      # cargo-mutants' build directories, one per job, each a copy of the
+      # workspace (about 1.6 GB) and a cold target directory of its own. Not
+      # kept between runs: cargo-mutants deletes them as it exits, and the
+      # steps below empty the directory before and after. Under
+      # $RUNNER_WORKSPACE/target/, next to the other jobs' target directories
+      # (the runner context is not available in a job's env).
+      MUTANTS_SCRATCH_NAME: mutants-scratch
+      MUTANTS_JOBS: ${{ inputs.jobs || '4' }}
+      MUTANTS_MINUTES: 130
+      MUTANTS_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.node && 'true' || 'false' }}
+      # No debug info: nothing reads it here, and it is most of the link time
+      # and of each build directory's size.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      # Its own node, if any: neither a developer's 59042 nor the other jobs'
+      # 59142 and 59242, and its own Compose project, so down -v can only
+      # remove this job's container and volume.
+      COMPOSE_FILE: docker/cassandra/docker-compose.yml
+      CASSANDRA_HOST_PORT: 59342
+      COMPOSE_PROJECT: hfs-cassandra-mutants
+      CI_REPORT_PROFILE: test (debug=0, incremental; cargo-mutants build directories)
+      CI_REPORT_COMMIT: ${{ inputs.head || github.event.pull_request.head.sha || github.sha }}
+    steps:
+      # The pull request's head, not the merge commit, so every file:line in
+      # the report is the line the pull request shows. Full history, for the
+      # merge base with the base branch.
+      - name: Checkout the code to mutate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head || github.event.pull_request.head.sha || '' }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A dispatch can mutate a branch that does not have this workflow's
+      # scripts (for example one that branched off main before them), so they
+      # come from the commit this workflow file is from, kept outside the tree.
+      - name: Keep this workflow's scripts
+        env:
+          WORKFLOW_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          dir="$RUNNER_TEMP/ci-scripts"
+          rm -rf "$dir" && mkdir -p "$dir"
+          git archive "$WORKFLOW_SHA" .github/scripts | tar -x -C "$dir" --strip-components=2
+          echo "CI_SCRIPTS=$dir" >> "$GITHUB_ENV"
+          echo "Head: $(git rev-parse HEAD); scripts from $WORKFLOW_SHA"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+
+      - name: Report the context
+        continue-on-error: true
+        run: python3 "$CI_SCRIPTS/ci-report.py" context
+
+      # Built from crates.io with its own Cargo.lock (--locked), once per
+      # runner, into the tool cache: cargo-mutants publishes no Linux binary
+      # with a checksum to verify, so it is built rather than downloaded. Into
+      # a directory next to its final place and renamed into it, so a job
+      # killed mid-install never leaves a partial binary that later runs would
+      # trust.
+      - name: Install cargo-mutants
+        run: |
+          dir="${RUNNER_TOOL_CACHE:?}/cargo-mutants/$CARGO_MUTANTS_VERSION"
+          if [ ! -x "$dir/bin/cargo-mutants" ]; then
+            tmp="$dir.partial.$$"
+            rm -rf "$tmp" && mkdir -p "$tmp"
+            CARGO_TARGET_DIR="$tmp/build" nice -n 10 cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION" --root "$tmp/root"
+            rm -rf "$dir" && mv "$tmp/root" "$dir"
+            rm -rf "$tmp"
+          fi
+          "$dir/bin/cargo-mutants" --version | grep -qx "cargo-mutants $CARGO_MUTANTS_VERSION"
+          echo "CARGO_MUTANTS=$dir/bin/cargo-mutants" >> "$GITHUB_ENV"
+
+      # The diff cargo-mutants mutates (--in-diff), limited to the backend:
+      # base...head, which git takes from the merge base, so commits that
+      # reached main after the branch point are not counted; or the
+      # dispatch's own range; or none, the whole backend.
+      - name: Take the diff to mutate
+        id: diff
+        env:
+          BASE: ${{ github.base_ref || inputs.base || 'main' }}
+          RANGE: ${{ inputs.in_diff }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/mutants"
+          mkdir -p "$out"
+          if [ "$RANGE" = none ]; then
+            echo "Whole backend: no --in-diff"
+            echo "range=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$RANGE" ]; then
+            if git rev-parse --verify -q "refs/remotes/origin/$BASE^{commit}" > /dev/null; then base="origin/$BASE"; else base="$BASE"; fi
+            RANGE="$base...HEAD"
+          fi
+          git diff --no-color --no-ext-diff "$RANGE" -- crates/persistence/src/backends/cassandra/ > "$out/pr.diff"
+          echo "Range $RANGE: $(grep -c '^+++ b/' "$out/pr.diff" || true) file(s) under the backend"
+          git diff --stat "$RANGE" -- crates/persistence/src/backends/cassandra/ | tail -n 20
+          {
+            echo "range=$RANGE"
+            echo "diff=$out/pr.diff"
+          } >> "$GITHUB_OUTPUT"
+
+      # Only when asked (input node): the --lib tests' node tests then run
+      # against it too. Started the way the required Cassandra job starts its
+      # own (ADR-aacruzgon-0020); a run killed mid-job skips its cleanup, so
+      # leftovers go first.
+      - name: Start a Cassandra node and apply the schema
+        if: env.MUTANTS_NODE == 'true'
+        run: |
+          docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
+          python3 "$CI_SCRIPTS/ci-report.py" timed node-start "Start and healthcheck (compose up --wait)" -- \
+            docker compose -p "$COMPOSE_PROJECT" up -d --wait --wait-timeout 240
+          cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
+            -f docs/Cassandra/schema/keyspace-single-node.cql
+          cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
+            -k helios -f docs/Cassandra/schema/schema.cql
+          echo "HFS_TEST_CASSANDRA_URL=127.0.0.1:$CASSANDRA_HOST_PORT" >> "$GITHUB_ENV"
+
+      # cargo-mutants on helios-persistence with the cassandra feature, its
+      # --lib tests filtered to backends::cassandra, as in the required job.
+      # Without a node, the node tests skip, so only the pure tests can catch
+      # a mutant. Each job is a build directory of its own; one jobserver
+      # shares the runner's CPUs between all their builds (cargo-mutants'
+      # default, one task per CPU). --cap-lints keeps a mutant that only adds
+      # a warning viable. Under ci-report.py build, which samples the runner's
+      # cgroup for the memory peak. timeout -s INT stops it at the budget the
+      # way Ctrl-C does, and cargo-mutants keeps every outcome it has; the
+      # report counts the rest as untested. Its exit status says how the run
+      # ended and never fails the step.
+      - name: cargo mutants (report only)
+        id: mutants
+        if: steps.diff.outcome == 'success'
+        timeout-minutes: 140
+        env:
+          RANGE: ${{ steps.diff.outputs.range }}
+          DIFF: ${{ steps.diff.outputs.diff }}
+        run: |
+          unset CARGO_TARGET_DIR
+          MUTANTS_SCRATCH="${RUNNER_WORKSPACE:?}/target/${MUTANTS_SCRATCH_NAME:?}"
+          rm -rf "$MUTANTS_SCRATCH" && mkdir -p "$MUTANTS_SCRATCH"
+          export TMPDIR="$MUTANTS_SCRATCH"
+          out="$RUNNER_TEMP/mutants"
+          rm -rf "$out" && mkdir -p "$out"
+          args=(mutants --package helios-persistence --features cassandra
+                --file 'crates/persistence/src/backends/cassandra/**'
+                --jobs "$MUTANTS_JOBS" --cap-lints=true --build-timeout 1500
+                --output "$out" --colors=never
+                --cargo-test-arg=--lib)
+          if [ "$RANGE" != none ]; then args+=(--in-diff "$DIFF"); fi
+          args+=(-- -- backends::cassandra)
+          # The scratch directory's size every 30 s, for the disk report.
+          ( while sleep 30; do du -s --block-size=1M "$MUTANTS_SCRATCH" 2>/dev/null | cut -f1; done ) \
+            > "$RUNNER_TEMP/mutants-scratch-mib.txt" &
+          sampler=$!
+          status=0
+          python3 "$CI_SCRIPTS/ci-report.py" build mutants-run "Mutation run: cargo mutants" -- \
+            timeout -s INT -k 120 "${MUTANTS_MINUTES}m" nice -n 10 "$CARGO_MUTANTS" "${args[@]}" || status=$?
+          kill "$sampler" 2>/dev/null || true
+          echo "cargo mutants exited $status"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [ "$status" = 124 ] || [ "$status" = 130 ]; then
+            echo "::warning title=Mutation testing::stopped at the ${MUTANTS_MINUTES}-minute budget; the report counts the mutants it did not reach"
+          fi
+          exit 0
+
+      # Counts, the missed mutants with their file:line and replacement, the
+      # timed-out ones, per file and per-mutant times (.github/scripts/
+      # mutants-report.py), and the scratch directory's peak size. Report only.
+      - name: Report the mutants
+        if: always() && steps.mutants.outcome != 'skipped'
+        continue-on-error: true
+        env:
+          STATUS: ${{ steps.mutants.outputs.status }}
+          RANGE: ${{ steps.diff.outputs.range }}
+          DIFF: ${{ steps.diff.outputs.diff }}
+          HEAD_NAME: ${{ inputs.head || github.head_ref || github.ref_name }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/mutants"
+          mkdir -p "$out"
+          peak=$(sort -n "$RUNNER_TEMP/mutants-scratch-mib.txt" 2>/dev/null | tail -1)
+          note="Mutated: \`$HEAD_NAME\` at \`$(git rev-parse --short HEAD)\`, range \`${RANGE:-?}\`, --lib tests $([ "$MUTANTS_NODE" = true ] && echo "against a node of this job's own" || echo "without a node (node tests skip)"), $MUTANTS_JOBS jobs. Scratch directory peak: ${peak:-?} MiB (sampled every 30 s)."
+          diff_args=()
+          if [ -n "$DIFF" ]; then diff_args=(--diff "$DIFF"); fi
+          python3 -I "$CI_SCRIPTS/mutants-report.py" "$RUNNER_TEMP/mutants/mutants.out" "$out" \
+            --exit-status "${STATUS:-}" --title-note "$note" "${diff_args[@]}" > /dev/null
+          python3 "$CI_SCRIPTS/ci-report.py" add mutants "Mutation testing (cargo-mutants, report only)" \
+            --markdown "$out/mutants.md" --json "$out/mutants.json"
+
+      - name: Cassandra logs
+        if: failure() && env.MUTANTS_NODE == 'true'
+        run: docker compose -p "$COMPOSE_PROJECT" logs --tail 200
+
+      # down -v is safe here only because -p names this job's own project.
+      - name: Stop Cassandra and remove this job's volume
+        if: always() && env.MUTANTS_NODE == 'true'
+        run: docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
+
+      # cargo-mutants deletes its build directories as it exits; a run killed
+      # mid-way leaves them, so this empties the directory whatever happened.
+      - name: Remove the build directories
+        if: always()
+        run: rm -rf "${RUNNER_WORKSPACE:?}/target/${MUTANTS_SCRATCH_NAME:?}"
+
+      # Where this job's time went (.github/scripts/job-step-timings.py).
+      # Report only.
+      - name: Report where this job's time went
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
+          python3 "$CI_SCRIPTS/job-step-timings.py" "Cassandra mutants (report only)" "$out"
+          python3 "$CI_SCRIPTS/ci-report.py" add step-timings "Where this job's time went" \
+            --markdown "$out/step-timings.md" --json "$out/step-timings.json"
+
+      # The run's own output: outcomes.json, mutants.json, the missed and
+      # caught lists, and a diff and a log per mutant. Report only.
+      - name: Upload mutants.out
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-out
+          path: ${{ runner.temp }}/mutants/mutants.out
+          if-no-files-found: warn
+          overwrite: true
+
+      - name: Upload the CI report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-mutants
+          path: ${{ runner.temp }}/ci-report
+          if-no-files-found: warn
+          overwrite: true

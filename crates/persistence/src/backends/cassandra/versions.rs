@@ -38,6 +38,12 @@
 //!   delete.
 //! - **`exists`**: an R1 that selects only `deleted_at`, so a yes/no answer
 //!   does not ship the resource. No row, or `deleted_at > 0`, is `false`.
+//! - **`current_version`** (roadmap Step 4): an R1 that selects only
+//!   `version_id` and `deleted_at`, as `exists` does. No row, or
+//!   `deleted_at > 0`, is `None`, as the trait documents ("if the resource
+//!   doesn't exist or is deleted"). The trait default reads through `read`,
+//!   which answers `Gone` for a deleted resource, so the default would
+//!   answer `Gone` there too, as it does on every other backend.
 //! - **`read_batch`**: plain `read`s, [`BULK_WRITE_CONCURRENCY`] at a time
 //!   (`buffered`, so the output keeps the input's order). Missing and deleted
 //!   ids are skipped; any other error fails the batch, and dropping the
@@ -79,6 +85,10 @@ const SELECT_VERSION_IDS: &str = "SELECT version_id FROM resource_versions \
 /// R1, reduced to the one column `exists` needs.
 const SELECT_DELETED_AT: &str =
     "SELECT deleted_at FROM resources WHERE tenant_id = ? AND resource_type = ? AND id = ?";
+
+/// R1, reduced to the two columns `current_version` needs.
+const SELECT_VERSION_AND_DELETED_AT: &str = "SELECT version_id, deleted_at FROM resources \
+     WHERE tenant_id = ? AND resource_type = ? AND id = ?";
 
 fn internal(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -310,6 +320,38 @@ impl CassandraBackend {
             Some(row) => Ok(deleted_at_of(row)?.is_none()),
             None => Ok(false),
         }
+    }
+
+    /// `VersionedStorage::current_version`; see the module docs.
+    pub(super) async fn current_version_of(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<String>> {
+        let rows = self
+            .session
+            .rows(
+                SELECT_VERSION_AND_DELETED_AT,
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from(resource_type),
+                    Value::from(id),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .map_err(|error| StorageError::Backend(map_driver_error(&error, "current_version")))?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        if deleted_at_of(row)?.is_some() {
+            return Ok(None);
+        }
+        let version_id: i32 = row
+            .get_r_by_name("version_id")
+            .map_err(|error| internal(format!("current_version: version_id: {error}")))?;
+        Ok(Some(version_id.to_string()))
     }
 
     /// `ResourceStorage::read_batch`; see the module docs.
@@ -1145,6 +1187,72 @@ mod node_tests {
         assert!(backend.exists(&t, "Patient", "gone").await.unwrap());
     }
 
+    /// `current_version`: one R1 of `version_id` and `deleted_at` only. The
+    /// live row's version; `None` for a deleted or unknown resource, as the
+    /// trait documents, where the trait default's `read` would answer
+    /// `Gone`; the new version again once the resource is revived.
+    #[tokio::test]
+    async fn current_version_is_none_for_a_deleted_resource() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant("current");
+        create(&backend, &t, "live", "One").await;
+        assert_eq!(engine_update(&backend, &t, "live", "Two").await, 2);
+        create(&backend, &t, "gone", "Gone").await;
+        assert_eq!(engine_delete(&backend, &t, "gone").await, 2);
+        for (id, expected) in [("live", Some("2")), ("gone", None), ("nobody", None)] {
+            let before = backend.statement_counts();
+            assert_eq!(
+                backend
+                    .current_version(&t, "Patient", id)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                expected,
+                "{id}"
+            );
+            let spent = backend.statement_counts().since(&before);
+            assert_eq!((spent.read, spent.total()), (1, 1), "{id}");
+        }
+        // What the trait default, which reads through `read`, would answer.
+        assert!(matches!(
+            backend.read(&t, "Patient", "gone").await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ));
+        assert_eq!(
+            backend
+                .current_version(&tenant("current-other"), "Patient", "live")
+                .await
+                .unwrap(),
+            None
+        );
+        // Revived through the engine: its new version.
+        let (body, data) = normalized_body(
+            "create_or_update",
+            "Patient",
+            "gone",
+            patient("gone", "Back"),
+        )
+        .unwrap();
+        assert_eq!(
+            through_the_engine(&backend, &t, "gone", |previous| {
+                CasPlan::revive(previous, body, data, vec![IndexKey::ResourcesByType])
+            })
+            .await,
+            3
+        );
+        assert_eq!(
+            backend
+                .current_version(&t, "Patient", "gone")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("3")
+        );
+    }
+
     /// `read_batch` over more ids than it reads at once: the input order,
     /// with unknown and deleted ids left out, duplicates kept, as the trait
     /// default.
@@ -1259,6 +1367,31 @@ mod node_tests {
         unavailable(
             "exists",
             backend.exists(&t, "Patient", "p").await.unwrap_err(),
+        );
+
+        backend.session.inject_fault(
+            StatementKind::Read,
+            "SELECT version_id, deleted_at FROM resources",
+            Fault::TimeOutWithoutApplying,
+        );
+        timed_out(
+            "current_version",
+            backend
+                .current_version(&t, "Patient", "p")
+                .await
+                .unwrap_err(),
+        );
+        backend.session.inject_fault(
+            StatementKind::Read,
+            "SELECT version_id, deleted_at FROM resources",
+            Fault::FailWithUnavailable,
+        );
+        unavailable(
+            "current_version",
+            backend
+                .current_version(&t, "Patient", "p")
+                .await
+                .unwrap_err(),
         );
 
         backend.session.inject_fault(

@@ -13,6 +13,7 @@
 //! | `vread`, `list_versions`, `delete_with_match` | `versions.rs` | real (Step 3, L2c; pulled forward from Step 4, D1) |
 //! | `exists`, `read_batch` | `versions.rs` | real (Step 3, L2c): `exists` reads only `deleted_at`, `read_batch` reads concurrently (D10) |
 //! | `update_with_match` | `versions.rs`, then `update` | real (Step 4) |
+//! | `current_version` | `versions.rs` | real (Step 4): reads only `version_id` and `deleted_at`, and answers `None` for a deleted resource |
 //!
 //! `count` is pulled forward from Step 3
 //! with the `resources_by_type` row every create writes, so the conformance
@@ -22,7 +23,8 @@
 //! overridden here (`cassandra-discussion.md`, "Defaults we must override"):
 //! `readiness_check`, `is_cluster_shared`, `bulk_write_concurrency` and
 //! `delete_versioned`. `create_many` keeps its default, which calls
-//! `create`; `exists` and `read_batch` are overridden too (D10).
+//! `create`; `exists` and `read_batch` are overridden too (D10), and
+//! `current_version` (Step 4).
 
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
@@ -187,6 +189,15 @@ impl VersionedStorage for CassandraBackend {
     ) -> StorageResult<()> {
         self.delete_with_match_resource(tenant, resource_type, id, expected_version)
             .await
+    }
+
+    async fn current_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<String>> {
+        self.current_version_of(tenant, resource_type, id).await
     }
 
     async fn list_versions(

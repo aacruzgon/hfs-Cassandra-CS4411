@@ -360,6 +360,29 @@ test ok_test ... ok
         self.assertIn("No test ran", md.read_text())
         self.assertEqual(json.loads(js.read_text())["runs"], {})
 
+    # CodeRabbit on #101: since PR #83 a race test accepts a #77 504 and
+    # passes, so the report counts the write engine's failed serial reads
+    # from the tests' [cas] lines (run 44758590016's first pass had 6).
+    def test_failed_serial_reads_are_counted_in_passing_runs(self) -> None:
+        cas = ("[cas case=race:cassandra_concurrent_update_and_plain_delete_stay_consistent attempts=95 applied=23 "
+               "unknown_write_timeout_cas=10 serial_reads=11 serial_read_failures=3 undecidable=0]\n"
+               "[cas case=race:cassandra_concurrent_updates_from_the_same_version_admit_one attempts=90 applied=20 "
+               "serial_reads=12 serial_read_failures=1 undecidable=0]\n")
+        passing = ("     Running tests/cassandra_tests.rs (/x/cassandra_tests-abc)\n\nrunning 2 tests\n"
+                   "[race policy case=race:cassandra_concurrent_updates_from_the_same_version_admit_one rf=3 accept_504=true]\n"
+                   + cas + "test a ... ok\ntest b ... ok\n\n"
+                   "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n")
+        self.log("cassandra-tests-r1", passing, {"exit_status": 0})
+        self.log("cassandra-tests-r2", passing.replace("serial_read_failures=3", "serial_read_failures=0"),
+                 {"exit_status": 0})
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        data = json.loads(js.read_text())
+        self.assertEqual(data["serial_read_failures"], {"cassandra-tests": [4, 1]})
+        self.assertEqual(data["runs_with_77"], {})
+        self.assertIn("`cassandra-tests` 4, 1 (5 in 2 runs)", md.read_text())
+        self.assertIn("No test failed", md.read_text())
+
     # CodeRabbit on #101: the fallback writes never raise, and main exits 0
     # when the JSON destination cannot be written.
     def test_report_exits_zero_when_a_destination_is_unwritable(self) -> None:
@@ -428,6 +451,27 @@ class Pause(unittest.TestCase):
         self.assertEqual({sid: s["as_expected"] for sid, s in scenarios.items()},
                          {sid: True for sid in OUT})
         self.assertEqual(warnings, [])
+
+    # CodeRabbit on #101: the answer's counts are compared, not only its
+    # type (s2: one response of two in the review's run).
+    def test_changed_counts_differ(self) -> None:
+        (self.dir / "s2.out").write_text(OUT["s2"].replace("'received_responses': 1", "'received_responses': 0"))
+        scenarios, md, warnings = self.run_pause()
+        self.assertFalse(scenarios["s2"]["as_expected"])
+        self.assertTrue(scenarios["s4a"]["as_expected"])
+        self.assertIn("WriteTimeout SIMPLE, received_responses 1, required_responses 2, applied yes", md)
+        self.assertTrue(any("s2 differs" in w and "received_responses 0" in w for w in warnings))
+
+    # CodeRabbit on #101: a read cut off after a whole row is unread, not
+    # the rows it kept.
+    def test_truncated_read_is_unread(self) -> None:
+        (self.dir / "s1.read").write_text(f"Consistency level set to ALL.\n\n [json]\n---\n {P2}\n {P1[:30]}\n")
+        scenarios, md, warnings = self.run_pause()
+        self.assertEqual(scenarios["s1"]["applied"], "unread")
+        self.assertIsNone(scenarios["s1"]["as_expected"])
+        self.assertTrue(any("s1: its read at ALL is missing or incomplete" in w for w in warnings))
+        self.assertIsNone(report.parse_rows(f" {P2}\n\n(2 rows)\n"))
+        self.assertEqual(report.parse_rows(" [json]\n---\n\n(0 rows)\n"), [])
 
     # CodeRabbit on #101: no output file is unknown, not success.
     def test_missing_output_is_unknown(self) -> None:

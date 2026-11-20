@@ -37,7 +37,9 @@
 # .meta says invalid=. A "DN" batch is sent only once node 1 reports the
 # paused nodes DN; if that is not seen within the wait (or nodetool fails),
 # the batch is not sent and its .meta says not_run=. The CI runs so far sent
-# s4a about 5 s after the pause and saw node 2 DN about 18 s after it.
+# s4a about 5 s after the pause and saw node 2 DN about 18 s after it. So is
+# a scenario whose v1 row was not seeded (s1 to s3), or whose window's
+# docker pause failed.
 #
 # Writes OUT_DIR/<id>.out (cqlsh's output), OUT_DIR/<id>.meta (key=value),
 # OUT_DIR/<id>.read (the read at ALL), OUT_DIR/timeline.log and
@@ -120,6 +122,34 @@ send() {
   log "$id ($desc): $(grep -v '^Consistency level' "$out/$id.out" | grep -v '^$' | head -1 | cut -c1-200) [${took} ms]"
 }
 
+# scenario VERB ID [REASON]: VERB (send or not_sent) with scenario ID's
+# fixed fields.
+scenario() {
+  local verb=$1 id=$2; shift 2
+  case $id in
+    s1) set -- one "node 2" "UN (at once)" "one-partition batch, one replica paused" "success" "$@" ;;
+    s4a) set -- two "node 2" "UN (at once)" "two-partition batch, one replica paused" "WriteTimeout BATCH_LOG, received 1, block_for 2; applied later" "$@" ;;
+    s4b) set -- two "node 2" "DN" "two-partition batch, one replica marked down" "success" "$@" ;;
+    s2) set -- one "nodes 2 and 3" "UN (at once)" "one-partition batch, two replicas paused" "WriteTimeout SIMPLE, received 1, block_for 2; applied on the coordinator" "$@" ;;
+    s3) set -- one "nodes 2 and 3" "DN" "one-partition batch, two replicas marked down" "Unavailable, required 2, alive 1; not applied" "$@" ;;
+  esac
+  "$verb" "$id" "$@"
+}
+
+# run_scenario ID: send ID's batch, unless its v1 row was not seeded.
+run_scenario() {
+  case " $unseeded " in
+    *" $1 "*) scenario not_sent "$1" "its v1 row was not seeded (seed-$(tenant_of "$1").out)" ;;
+    *) scenario send "$1" ;;
+  esac
+}
+
+# seeded ID: cqlsh ran the seed (its consistency line) and printed no error.
+seeded() {
+  local f; f="$out/seed-$(tenant_of "$1").out"
+  grep -q '^Consistency level set' "$f" && ! grep -qE 'Error|Exception|NoHostAvailable' "$f"
+}
+
 # not_sent ID KIND PAUSED STATE DESCRIPTION EXPECTED REASON: the scenario's
 # .meta, without sending its batch.
 not_sent() {
@@ -158,44 +188,60 @@ read_all() { # ID: the scenario's rows at ALL
 echo "=== pause scenarios, run $run_id, $(ts) UTC, write_request_timeout $(docker exec -e MAX_HEAP_SIZE=128m "$N1" nodetool gettimeout write 2>/dev/null | tail -1)" | tee "$out/timeline.log"
 wait_up || { log "the cluster is not three UN nodes; no scenario run"; snapshot start; exit 1; }
 snapshot start
-# The one-partition scenarios' row v1, written while every node is up.
-for id in s1 s2 s3; do seed "$(tenant_of "$id")"; done
-log "seeded v1 for s1, s2 and s3"
+# The one-partition scenarios' row v1, written while every node is up. A
+# scenario whose seed failed is not sent (run_scenario).
+unseeded=""
+for id in s1 s2 s3; do
+  seed "$(tenant_of "$id")"
+  seeded "$id" || { unseeded="$unseeded $id"; log "the seed of $id failed: $(head -c 200 "$out/seed-$(tenant_of "$id").out")"; }
+done
+log "seeded v1 for s1, s2 and s3${unseeded:+, except$unseeded}"
 
 # Window 1: node 2 paused. The status snapshot comes after the two batches
 # sent at once, so it does not delay them, and confirms their state.
-docker pause "$N2" >/dev/null; log "paused node 2 ($IP2)"
-send s1 one "node 2" "UN (at once)" "one-partition batch, one replica paused" "success"
-send s4a two "node 2" "UN (at once)" "two-partition batch, one replica paused" "WriteTimeout BATCH_LOG, received 1, block_for 2; applied later"
-snapshot w1-sent; confirm_un w1-sent "$IP2" s1 s4a
-if d=$(wait_down "$IP2"); then
-  log "node 1 marked node 2 DN after ${d} s more"; snapshot w1-down
-  send s4b two "node 2" "DN" "two-partition batch, one replica marked down" "success"
+if docker pause "$N2" >/dev/null; then
+  log "paused node 2 ($IP2)"
+  run_scenario s1
+  run_scenario s4a
+  snapshot w1-sent; confirm_un w1-sent "$IP2" s1 s4a
+  if d=$(wait_down "$IP2"); then
+    log "node 1 marked node 2 DN after ${d} s more"; snapshot w1-down
+    run_scenario s4b
+  else
+    log "node 1 did not report node 2 DN within the wait"; snapshot w1-down
+    scenario not_sent s4b "node 1 did not report node 2 DN within the wait (or nodetool status failed)"
+  fi
+  echo "w1_down_s=$d" >> "$out/windows.meta"
+  docker unpause "$N2" >/dev/null
 else
-  log "node 1 did not report node 2 DN within the wait"; snapshot w1-down
-  not_sent s4b two "node 2" "DN" "two-partition batch, one replica marked down" "success" \
-    "node 1 did not report node 2 DN within the wait (or nodetool status failed)"
+  log "docker pause of node 2 failed"
+  for id in s1 s4a s4b; do scenario not_sent "$id" "docker pause of node 2 failed"; done
+  echo "w1_down_s=not paused" >> "$out/windows.meta"
 fi
-echo "w1_down_s=$d" >> "$out/windows.meta"
-docker unpause "$N2" >/dev/null
-if wait_up; then log "unpaused node 2, 3 UN"; else log "node 2 did not come back UN"; fi
+if wait_up; then log "node 2 back, 3 UN"; else log "node 2 did not come back UN"; fi
 snapshot w1-up
 
-# Window 2: nodes 2 and 3 paused.
-docker pause "$N2" "$N3" >/dev/null; log "paused nodes 2 and 3 ($IP2, $IP3)"
-send s2 one "nodes 2 and 3" "UN (at once)" "one-partition batch, two replicas paused" "WriteTimeout SIMPLE, received 1, block_for 2; applied on the coordinator"
-snapshot w2-sent; confirm_un w2-sent "$IP2 $IP3" s2
-d3=skipped
-if d2=$(wait_down "$IP2") && d3=$(wait_down "$IP3"); then
-  log "node 1 marked nodes 2 and 3 DN (${d2} s, then ${d3} s more)"; snapshot w2-down
-  send s3 one "nodes 2 and 3" "DN" "one-partition batch, two replicas marked down" "Unavailable, required 2, alive 1; not applied"
+# Window 2: nodes 2 and 3 paused. A pause that failed for one node is undone.
+if docker pause "$N2" "$N3" >/dev/null; then
+  log "paused nodes 2 and 3 ($IP2, $IP3)"
+  run_scenario s2
+  snapshot w2-sent; confirm_un w2-sent "$IP2 $IP3" s2
+  d3=skipped
+  if d2=$(wait_down "$IP2") && d3=$(wait_down "$IP3"); then
+    log "node 1 marked nodes 2 and 3 DN (${d2} s, then ${d3} s more)"; snapshot w2-down
+    run_scenario s3
+  else
+    log "node 1 did not report nodes 2 and 3 DN within the wait"; snapshot w2-down
+    scenario not_sent s3 "node 1 did not report nodes 2 and 3 DN within the wait (or nodetool status failed)"
+  fi
+  echo "w2_down_s=$d2+$d3" >> "$out/windows.meta"
 else
-  log "node 1 did not report nodes 2 and 3 DN within the wait"; snapshot w2-down
-  not_sent s3 one "nodes 2 and 3" "DN" "one-partition batch, two replicas marked down" "Unavailable, required 2, alive 1; not applied" \
-    "node 1 did not report nodes 2 and 3 DN within the wait (or nodetool status failed)"
+  unpause_all
+  log "docker pause of nodes 2 and 3 failed"
+  for id in s2 s3; do scenario not_sent "$id" "docker pause of nodes 2 and 3 failed"; done
+  echo "w2_down_s=not paused" >> "$out/windows.meta"
 fi
-echo "w2_down_s=$d2+$d3" >> "$out/windows.meta"
-docker unpause "$N2" "$N3" >/dev/null
+unpause_all
 ok=0; wait_up && ok=1
 if [ $ok = 1 ]; then log "unpaused nodes 2 and 3, 3 UN"; else log "nodes 2 and 3 did not come back UN"; fi
 snapshot w2-up

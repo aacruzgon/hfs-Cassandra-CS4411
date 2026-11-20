@@ -36,6 +36,15 @@ TEST_LINE = re.compile(r"^test (\S+) \.\.\. (\w+)")
 # libtest's warning for a test still running after 60 s. With the timeout
 # stopping the binary, it is the only line a hung test leaves.
 STILL_RUNNING = re.compile(r"^test (\S+) has been running for over \d+ seconds$")
+# The write engine's counters, one line per race test that prints them
+# (cassandra_tests.rs, "[cas case=race:<test> key=value …]"; ci-report.py cas).
+# serial_read_failures counts serial reads that failed or timed out; a timed
+# out one is issue #77's 504. Since PR #83 a race test accepts that 504 at RF
+# 2 or more and passes, so only this counter shows it; a test that panics
+# before it prints its line is not in it. Only race: cases count: the --lib
+# node tests' cases (c4-r2-timeout, r2-503-…) fail a serial read on purpose.
+CAS_LINE = re.compile(r"\[cas case=(race:\S+) ([^\]]*)\]")
+SERIAL_READ_FAILURES = re.compile(r"(?:^| )serial_read_failures=(\d+)(?= |$)")
 BLOCK = re.compile(r"^---- (\S+) std(?:out|err) ----$")
 PANIC_NEW = re.compile(r"^thread '([^']*)' (?:\(\d+\) )?panicked at (\S+?):?$")
 PANIC_OLD = re.compile(r"^thread '([^']*)' panicked at '(.*)', (\S+)$")
@@ -254,6 +263,12 @@ def parse_log(path: Path, stopped: str | None = None) -> dict:
                            if suite["result"] is None and suite["announced"] is not None else 0)
     suite["failures"] = failures
     suite["ignored"] = sorted(n for n, r in suite["tests"].items() if r == "ignored")
+    suite["cas_lines"] = 0
+    suite["serial_read_failures"] = 0
+    for m in CAS_LINE.finditer(text):
+        suite["cas_lines"] += 1
+        if n := SERIAL_READ_FAILURES.search(m.group(2)):
+            suite["serial_read_failures"] += int(n.group(1))
     del suite["blocks"]
     return suite
 
@@ -337,8 +352,20 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
                 "Exit", "Ended", "Wall time", "Test container memory.peak", "OOM kills"], rows)
     md += ("\n**Failures by cause** (one per failing test per run): "
            + "; ".join(f"{label}: {counts[key]}" for key, label in CLASSES) + ".\n")
-    md += ("\n**Runs with at least one #77 504:** "
+    md += ("\n**Runs with a test failing on a #77 504:** "
            + "; ".join(f"`{step}` {runs_with_77.get(step, 0)} of {n}" for step, n in sorted(runs.items())) + ".\n")
+    serial: dict[str, list[int]] = {}
+    for s_ in ran:
+        if s_["cas_lines"]:
+            serial.setdefault(step_of(s_["label"]), []).append(s_["serial_read_failures"])
+    if serial:
+        md += ("\n**Failed serial reads in the race tests** (`serial_read_failures` in their `[cas case=race:…]` "
+               "lines, per run): "
+               + "; ".join(f"`{step}` {', '.join(map(str, ns))} ({sum(ns)} in {len(ns)} runs)"
+                           for step, ns in sorted(serial.items()))
+               + ". A serial read that timed out is issue #77's 504 (one that failed is a 503). Since PR #83 a "
+                 "race test accepts the 504 at RF 2 or more and passes, so a 504 a passing test accepted shows only "
+                 "here; a test that panics before it prints its `[cas]` line is not counted.\n")
     if by_test:
         md += "\n**Every failing test, over all runs:**\n\n" + table(
             ["Step", "Test", "Failed in", "Cause", "First line of the failure (first run it failed in)", "Where"],
@@ -374,7 +401,8 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
         "The job never fails on a test; this table is the result.\n"
     )
     write(md_path, json_path, md, {"suites": suites, "runs": runs, "failures_by_class": counts,
-                                   "runs_with_77": runs_with_77, "by_test": list(by_test.values()),
+                                   "runs_with_77": runs_with_77, "serial_read_failures": serial,
+                                   "by_test": list(by_test.values()),
                                    "warnings": warnings})
 
 
@@ -383,11 +411,14 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
 # What the PR #90 review measured on acruzdebian (2026-11-19), against which
 # each scenario is compared. applied: "yes", "no".
 EXPECTED = {
-    "s1": {"outcome": "success", "write_type": None, "applied": "yes"},
-    "s2": {"outcome": "WriteTimeout", "write_type": "SIMPLE", "applied": "yes"},
-    "s3": {"outcome": "Unavailable", "write_type": None, "applied": "no"},
-    "s4a": {"outcome": "WriteTimeout", "write_type": "BATCH_LOG", "applied": "yes"},
-    "s4b": {"outcome": "success", "write_type": None, "applied": "yes"},
+    "s1": {"outcome": "success", "write_type": None, "applied": "yes", "counts": {}},
+    "s2": {"outcome": "WriteTimeout", "write_type": "SIMPLE", "applied": "yes",
+           "counts": {"received_responses": 1, "required_responses": 2}},
+    "s3": {"outcome": "Unavailable", "write_type": None, "applied": "no",
+           "counts": {"alive_replicas": 1, "required_replicas": 2}},
+    "s4a": {"outcome": "WriteTimeout", "write_type": "BATCH_LOG", "applied": "yes",
+            "counts": {"received_responses": 1, "required_responses": 2}},
+    "s4b": {"outcome": "success", "write_type": None, "applied": "yes", "counts": {}},
 }
 
 
@@ -426,6 +457,9 @@ def parse_outcome(text: str | None) -> dict:
 
 
 def parse_rows(text: str) -> list[dict] | None:
+    """The rows of a `SELECT JSON` read, or None when the read is missing
+    or incomplete: a row that is not whole JSON, or no `(N rows)` line whose
+    N is the number of rows read."""
     rows = []
     for line in text.splitlines():
         line = line.strip()
@@ -433,8 +467,9 @@ def parse_rows(text: str) -> list[dict] | None:
             try:
                 rows.append(json.loads(line))
             except ValueError:
-                pass
-    if not rows and not re.search(r"\(0 rows\)", text):
+                return None
+    count = re.search(r"^\((\d+) rows\)$", text, re.MULTILINE)
+    if not count or int(count.group(1)) != len(rows):
         return None
     return rows
 
@@ -466,6 +501,12 @@ def meta(path: Path) -> dict:
     return values
 
 
+def seconds(value: str) -> str:
+    """windows.meta's value with " s" where it is a number of seconds
+    ("13", "16+0"), as written otherwise ("timeout", "not paused")."""
+    return f"{value} s" if re.fullmatch(r"\d+(\+\d+)?", value) else value
+
+
 def cmd_pause(directory: str, md_path: str, json_path: str) -> None:
     d = Path(directory)
     scenarios, rows, warnings = [], [], []
@@ -481,8 +522,9 @@ def cmd_pause(directory: str, md_path: str, json_path: str) -> None:
             continue
         m = meta(mpath)
         expected = EXPECTED[sid]
-        expected_text = (f"{expected['outcome']}{' ' + expected['write_type'] if expected['write_type'] else ''}, "
-                         f"applied {expected['applied']}")
+        expected_text = (f"{expected['outcome']}{' ' + expected['write_type'] if expected['write_type'] else ''}"
+                         + "".join(f", {k} {v}" for k, v in expected["counts"].items())
+                         + f", applied {expected['applied']}")
         # pause-scenarios.sh did not send the batch: the state it needs
         # (node 1 marking the paused nodes DN) was never seen.
         if m.get("not_run"):
@@ -500,6 +542,7 @@ def cmd_pause(directory: str, md_path: str, json_path: str) -> None:
         got_applied = applied(m.get("kind", ""), rows_read)
         same = (outcome["outcome"] == expected["outcome"]
                 and (expected["write_type"] is None or outcome.get("write_type") == expected["write_type"])
+                and all(outcome.get(k) == v for k, v in expected["counts"].items())
                 and got_applied == expected["applied"])
         # Not comparable: the batch's state was not established (node 1 no
         # longer saw the paused nodes UN right after it), or its answer is
@@ -510,9 +553,14 @@ def cmd_pause(directory: str, md_path: str, json_path: str) -> None:
             warnings.append(f"Pause scenario {sid} is invalid: {m['invalid']}")
         elif outcome["outcome"] == "unknown":
             same, verdict = None, "unknown"
+        elif got_applied == "unread":
+            same, verdict = None, "unread"
+            warnings.append(f"Pause scenario {sid}: its read at ALL is missing or incomplete")
         elif not same:
             warnings.append(f"Pause scenario {sid} differs from the PR #90 review's run: "
-                            f"{outcome['outcome']} {outcome.get('write_type') or ''}, applied {got_applied}")
+                            f"{outcome['outcome']} {outcome.get('write_type') or ''}"
+                            + "".join(f", {k} {outcome.get(k)}" for k in expected["counts"])
+                            + f", applied {got_applied}")
         detail = ", ".join(f"{k} {outcome[k]}" for k in ("write_type", "consistency", "received_responses",
                                                           "required_responses", "alive_replicas", "required_replicas")
                            if k in outcome)
@@ -527,9 +575,10 @@ def cmd_pause(directory: str, md_path: str, json_path: str) -> None:
     md = table(["Scenario", "Batch", "Paused", "Node 1 saw them", "Answer", "Detail", "Time",
                 "Applied (read at ALL)", "PR #90 review", "Same"], rows)
     md += (
-        f"\nTime until node 1 marked a paused node DN: {windows.get('w1_down_s', '?')} s with node 2 paused "
-        f"(after s1 and s4a), {windows.get('w2_down_s', '?')} s with nodes 2 and 3 (after s2); "
-        "\"timeout\" is not within the script's wait, and the DN scenario of that window is then not run.\n"
+        f"\nTime until node 1 marked a paused node DN: {seconds(windows.get('w1_down_s', '?'))} with node 2 paused "
+        f"(after s1 and s4a), {seconds(windows.get('w2_down_s', '?'))} with nodes 2 and 3 (after s2); "
+        "\"timeout\" is not within the script's wait, and the DN scenario of that window is then not run; "
+        "\"not paused\" is a window whose `docker pause` failed, and none of its scenarios ran.\n"
         "\nRaw CQL from `cqlsh` on node 1 (the coordinator), `LOCAL_QUORUM`, keyspace RF 3, no HFS code. "
         "One-partition: an update's index delta (insert v2, delete v1 of one `(tenant, Patient)` row). "
         "Two-partition: Patient and Observation rows in one LOGGED batch. \"Applied\" is read at `ALL` once every "

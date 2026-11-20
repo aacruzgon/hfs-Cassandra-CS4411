@@ -92,7 +92,6 @@ jobs:
       # with every commit until the size cap wipes the whole directory.
       CARGO_INCREMENTAL: 0
       CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
-      CI_REPORT_COMMIT: ${{ inputs.head || github.event.pull_request.head.sha || github.sha }}
     steps:
       # The pull request's head, not the merge commit, so the tests and lines
       # are the ones the pull request shows. Full history, for the merge base.
@@ -114,6 +113,9 @@ jobs:
           rm -rf "$dir" && mkdir -p "$dir"
           git archive "$WORKFLOW_SHA" .github/scripts | tar -x -C "$dir" --strip-components=2
           echo "CI_SCRIPTS=$dir" >> "$GITHUB_ENV"
+          # The commit the reports name, as a SHA: a dispatch's head input
+          # may be a branch name.
+          echo "CI_REPORT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "Head: $(git rev-parse HEAD); scripts from $WORKFLOW_SHA"
 
       - name: Install Rust toolchain
@@ -271,7 +273,20 @@ jobs:
 
       # One log per test with every run's output, and results.json.
       - name: Upload the re-run logs
+        id: upload-flaky-logs
         if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flaky-logs
+          path: ${{ runner.temp }}/flaky-logs
+          if-no-files-found: warn
+          overwrite: true
+
+      # One retry: an upload once failed on a DNS error (EAI_AGAIN) reaching
+      # GitHub's blob storage, and the artifact was lost.
+      - name: Upload flaky-logs again if the upload failed
+        if: always() && steps.upload-flaky-logs.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

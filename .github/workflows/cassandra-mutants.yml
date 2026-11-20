@@ -110,7 +110,6 @@ jobs:
       CASSANDRA_HOST_PORT: 59342
       COMPOSE_PROJECT: hfs-cassandra-mutants
       CI_REPORT_PROFILE: test (debug=0, incremental; cargo-mutants build directories)
-      CI_REPORT_COMMIT: ${{ inputs.head || github.event.pull_request.head.sha || github.sha }}
     steps:
       # The pull request's head, not the merge commit, so every file:line in
       # the report is the line the pull request shows. Full history, for the
@@ -133,6 +132,9 @@ jobs:
           rm -rf "$dir" && mkdir -p "$dir"
           git archive "$WORKFLOW_SHA" .github/scripts | tar -x -C "$dir" --strip-components=2
           echo "CI_SCRIPTS=$dir" >> "$GITHUB_ENV"
+          # The commit the reports name, as a SHA: a dispatch's head input
+          # may be a branch name.
+          echo "CI_REPORT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "Head: $(git rev-parse HEAD); scripts from $WORKFLOW_SHA"
 
       - name: Install Rust toolchain
@@ -245,6 +247,12 @@ jobs:
         run: |
           unset CARGO_TARGET_DIR
           export RUSTFLAGS="-D long_running_const_eval"
+          # dtolnay/rust-toolchain sets CARGO_INCREMENTAL=0 for the job, so
+          # every mutant rebuilt helios-persistence from scratch (a median
+          # 56 s on #90). The build directories are not kept, so the
+          # incremental cache cannot pile up; within a run it lets each
+          # mutant rebuild only what changed.
+          export CARGO_INCREMENTAL=1
           MUTANTS_SCRATCH="${RUNNER_WORKSPACE:?}/target/${MUTANTS_SCRATCH_NAME:?}"
           rm -rf "$MUTANTS_SCRATCH" && mkdir -p "$MUTANTS_SCRATCH"
           export TMPDIR="$MUTANTS_SCRATCH"
@@ -326,7 +334,20 @@ jobs:
       # The run's own output: outcomes.json, mutants.json, the missed and
       # caught lists, and a diff and a log per mutant. Report only.
       - name: Upload mutants.out
+        id: upload-mutants-out
         if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-out
+          path: ${{ runner.temp }}/mutants/mutants.out
+          if-no-files-found: warn
+          overwrite: true
+
+      # One retry: an upload once failed on a DNS error (EAI_AGAIN) reaching
+      # GitHub's blob storage, and the artifact was lost.
+      - name: Upload mutants-out again if the upload failed
+        if: always() && steps.upload-mutants-out.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

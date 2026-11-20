@@ -37,7 +37,7 @@ on:
   workflow_dispatch:
     inputs:
       head:
-        description: The branch, tag or commit whose tests are re-run. Empty uses the ref the run was started on.
+        description: The branch, tag or full 40-character commit SHA whose tests are re-run (actions/checkout reads a short SHA as a branch name). Empty uses the ref the run was started on.
         required: false
         default: ''
       base:

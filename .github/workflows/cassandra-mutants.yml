@@ -46,7 +46,7 @@ on:
   workflow_dispatch:
     inputs:
       head:
-        description: The branch, tag or commit to mutate. Empty mutates the ref the run was started on.
+        description: The branch, tag or full 40-character commit SHA to mutate (actions/checkout reads a short SHA as a branch name). Empty mutates the ref the run was started on.
         required: false
         default: ''
       base:

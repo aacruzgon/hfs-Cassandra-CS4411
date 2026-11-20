@@ -2250,7 +2250,8 @@ impl CassandraBackend {
     /// Sends one packed batch of an index delta, whole units of it (IW9 B),
     /// through [`CassandraSession::batch`](super::session::CassandraSession::batch)
     /// (IW13): one logged batch at `LOCAL_QUORUM`, or a plain write for a
-    /// lone statement. Up to `tries` tries, 10 ms then 20 ms apart (IW16),
+    /// lone statement; either way the driver never re-sends it, so one try is
+    /// one send. Up to `tries` tries, 10 ms then 20 ms apart (IW16),
     /// each failure read by [`classify_failure`] (IW15):
     ///
     /// - `WriteTimeout`/`BATCH`: the batchlog holds the batch and replays it,

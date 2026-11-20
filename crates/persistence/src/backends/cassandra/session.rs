@@ -24,9 +24,10 @@
 //! `IsBootstrapping` (`:175-182`), whatever its idempotence, so a CAS also
 //! carries [`FallthroughRetryPolicy`], which never retries (`:52-69`). The
 //! other three kinds keep the default session: each of those re-sends is safe
-//! for a read, and for a write with a fixed `USING TIMESTAMP`. An index batch
+//! for a read, and for a write with a fixed `USING TIMESTAMP`. The exception
+//! is an index write sent by [`CassandraSession::batch`]: an index batch
 //! carries [`FallthroughRetryPolicy`] too, so each of the writer's tries is
-//! one send (below). Whether a CAS
+//! one send (below), and so does a lone index row. Whether a CAS
 //! whose outcome is unknown ran is decided by the caller, from a
 //! [`SerialRead`](StatementKind::SerialRead), never by the driver.
 //!
@@ -46,7 +47,8 @@
 //! `ONE` (`cassandra-protocol` 5.0.0, `query/batch_query_builder.rs:41`), so
 //! a batch sent without it would write at `ONE`. It takes only
 //! [`IndexStatement`]s, so it can hold nothing but index-table rows (IW20,
-//! `batch.rs`). A batch of one statement is sent as a plain write. The driver
+//! `batch.rs`). A batch of one statement is sent as a plain write with the
+//! same no-retry policy, so one try is one send either way. The driver
 //! never re-sends a batch by itself: the writer retries it (IW16), and the
 //! driver's default policy would add a hidden second send after a
 //! `BATCH_LOG` timeout (`retry/retry_policy.rs:157-174`).
@@ -358,7 +360,8 @@ impl CassandraSession {
         values: Vec<Value>,
         kind: StatementKind,
     ) -> Result<Envelope, DriverError> {
-        self.execute_with(cql, values, kind, None).await
+        self.execute_with(cql, values, kind, None, Retries::OfKind)
+            .await
     }
 
     /// [`Self::execute`], for one page when `paging` is set.
@@ -368,6 +371,7 @@ impl CassandraSession {
         values: Vec<Value>,
         kind: StatementKind,
         paging: Option<Paging>,
+        retries: Retries,
     ) -> Result<Envelope, DriverError> {
         self.counts.count(kind);
         #[cfg(test)]
@@ -382,7 +386,7 @@ impl CassandraSession {
                 return result;
             }
         }
-        self.send(cql, values, kind, paging).await
+        self.send_with(cql, values, kind, paging, retries).await
     }
 
     /// Prepares (on first use) and sends one statement under the request
@@ -394,9 +398,25 @@ impl CassandraSession {
         kind: StatementKind,
         paging: Option<Paging>,
     ) -> Result<Envelope, DriverError> {
+        self.send_with(cql, values, kind, paging, Retries::OfKind)
+            .await
+    }
+
+    /// [`Self::send`] with the retry policy chosen by `retries`.
+    async fn send_with(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        kind: StatementKind,
+        paging: Option<Paging>,
+        retries: Retries,
+    ) -> Result<Envelope, DriverError> {
         let started = Instant::now();
         let prepared = self.prepared(cql, self.request_timeout).await?;
-        let mut params = statement_params(kind, values, &self.no_retry);
+        let mut params = match retries {
+            Retries::OfKind => statement_params(kind, values, &self.no_retry),
+            Retries::Never => lone_row_params(values, &self.no_retry),
+        };
         if let Some(paging) = paging {
             params.query_params.page_size = Some(paging.page_size);
             params.query_params.paging_state = paging.state;
@@ -475,7 +495,7 @@ impl CassandraSession {
                 state: state.take(),
             };
             let envelope = self
-                .execute_with(cql, values.clone(), kind, Some(paging))
+                .execute_with(cql, values.clone(), kind, Some(paging), Retries::OfKind)
                 .await?;
             let body = envelope.response_body()?;
             let next = body
@@ -500,8 +520,10 @@ impl CassandraSession {
     /// `statements.len()` batched), the test fault seam, and one request
     /// deadline over the prepares and the send. Nothing is sent for no
     /// statements, and one statement goes as a plain [`StatementKind::Write`]
-    /// through [`Self::execute`], counted as a write: a batch of one buys
-    /// nothing, and the node would treat it as a single mutation anyway.
+    /// through [`Self::execute`]'s path, counted as a write, but with the
+    /// no-retry policy a batch has ([`lone_row_params`]): a batch of one buys
+    /// nothing, and the node would treat it as a single mutation anyway. So
+    /// "one try, one send" holds for a batch and for a lone row alike.
     ///
     /// Each statement binds its own `USING TIMESTAMP`, so the batch sets no
     /// timestamp of its own. Cassandra applies the rows of one partition key
@@ -514,7 +536,7 @@ impl CassandraSession {
             return match statements.into_iter().next() {
                 Some(statement) => {
                     let (cql, values) = statement.into_parts();
-                    self.execute(cql, values, StatementKind::Write)
+                    self.execute_with(cql, values, StatementKind::Write, None, Retries::Never)
                         .await
                         .map(|_| ())
                 }
@@ -584,6 +606,29 @@ fn batch_params(no_retry: &Arc<dyn RetryPolicy + Send + Sync>) -> StatementParam
     let mut params = statement_params(StatementKind::Write, Vec::new(), no_retry);
     params.retry_policy = Some(no_retry.clone());
     params
+}
+
+/// The parameters a lone index row is sent with (IW13, IW15): those of a
+/// plain [`StatementKind::Write`], with [`FallthroughRetryPolicy`] in place
+/// of the session's, as a batch has ([`batch_params`]). The default policy
+/// would re-send an idempotent write once after `Unavailable`, a send the
+/// counters never see; with this one, each of the writer's tries is one send.
+fn lone_row_params(
+    values: Vec<Value>,
+    no_retry: &Arc<dyn RetryPolicy + Send + Sync>,
+) -> StatementParams {
+    let mut params = statement_params(StatementKind::Write, values, no_retry);
+    params.retry_policy = Some(no_retry.clone());
+    params
+}
+
+/// Which retry policy a statement is sent with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retries {
+    /// The one its [`StatementKind`] requires ([`statement_params`]).
+    OfKind,
+    /// Never re-sent by the driver: a lone index row.
+    Never,
 }
 
 /// Statements sent, one counter per [`StatementKind`], and the batches.
@@ -1206,6 +1251,35 @@ mod tests {
         assert!(StatementKind::Read.is_idempotent());
         assert!(StatementKind::SerialRead.is_idempotent());
         assert!(StatementKind::Write.is_idempotent());
+    }
+
+    /// IW15: a lone index row is a plain write with the no-retry policy, so
+    /// each writer try is one send; the values and the other parameters are
+    /// those of a [`StatementKind::Write`].
+    #[test]
+    fn a_lone_index_row_is_never_re_sent_by_the_driver() {
+        let no_retry: Arc<dyn RetryPolicy + Send + Sync> = Arc::new(FallthroughRetryPolicy);
+        let values = vec![Value::from("t")];
+        let params = lone_row_params(values.clone(), &no_retry);
+        let policy = params
+            .retry_policy
+            .as_ref()
+            .expect("a lone row carries its own retry policy");
+        assert!(Arc::ptr_eq(policy, &no_retry));
+        let plain = statement_params(StatementKind::Write, values, &no_retry);
+        assert!(
+            plain.retry_policy.is_none(),
+            "a plain write keeps the session's"
+        );
+        assert_eq!(
+            params.query_params.consistency,
+            plain.query_params.consistency
+        );
+        assert_eq!(params.is_idempotent, plain.is_idempotent);
+        assert_eq!(
+            params.query_params.values.is_some(),
+            plain.query_params.values.is_some()
+        );
     }
 
     /// IW13: the batch request itself carries `LOCAL_QUORUM` and the logged

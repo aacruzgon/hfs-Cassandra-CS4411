@@ -4,17 +4,18 @@ These inherited workflows are outside the Cassandra project scope and are
 preserved here for reference. GitHub Actions only loads workflows from
 `.github/workflows/`, so the YAML files in this directory do not run.
 
-Seven workflows are active. Six run on the team's self-hosted runners
+Ten workflows are active. Nine run on the team's self-hosted runners
 (ADR-aacruzgon-0018, ADR-sam-michaels-0001, ADR-aacruzgon-0023):
 `r4b-compile-check.yml` (roadmap item 0.4), `fmt-clippy-cassandra.yml` (0.5),
 `upstream-canary.yml` (0.11), `runner-docker-prune.yml`,
-`cassandra-coverage.yml` and `fhir-versions.yml`. Light jobs use
-`[self-hosted, hfs-cassandra-light]`, the two clippy jobs and
-`fhir-versions.yml`'s all-versions test job
-`[self-hosted, hfs-cassandra-medium]`, and the mutation-testing job, the only
-one that needs more than 20G, `[self-hosted, hfs-cassandra-heavy]`
-(ADR-aacruzgon-0082). The Rust jobs keep a bounded cargo target directory on
-each machine instead of a cache (ADR-sam-michaels-0002).
+`cassandra-coverage.yml`, `fhir-versions.yml`, `benchmark-datasets.yml` (0.7),
+`cassandra-mutants.yml` and `cassandra-flaky.yml` (0.13). Light jobs use
+`[self-hosted, hfs-cassandra-light]`; the two clippy jobs,
+`fhir-versions.yml`'s all-versions test job and the flakiness job
+`[self-hosted, hfs-cassandra-medium]`; and the mutation-testing job, which runs
+only on a pull request labelled `mutants`, `[self-hosted, hfs-cassandra-heavy]`,
+on `acruzdebian` alone (ADR-aacruzgon-0082). The Rust jobs keep a bounded cargo
+target directory on each machine instead of a cache (ADR-sam-michaels-0002).
 
 The standalone `.github/workflows/coverage.yml` workflow runs on standard
 GitHub-hosted Linux runners. It measures the default Rust workspace

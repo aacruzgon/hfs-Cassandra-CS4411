@@ -2154,9 +2154,10 @@ impl CassandraBackend {
     ///
     /// A batch that fails is not confirmed: it may or may not have applied
     /// (after a `BATCH` timeout, or when the deadline dropped it after it was
-    /// sent, it may well have). Its partitions' old rows, tagged with an
-    /// older version, are still there for the tag check to hide, whether or
-    /// not the new ones landed; the others are written.
+    /// sent, it may well have). If it applied, the unit's new rows replaced
+    /// the old; if not, the old rows, tagged with an older version, are
+    /// still there for the tag check to hide. Either way the intent is
+    /// kept; the other batches are written.
     /// The result is `Ok` once every batch is confirmed. A failure is
     /// [`WriteFailure::Permanent`] if any batch's was, then
     /// [`WriteFailure::TriesExhausted`], then [`WriteFailure::InBatchlog`];

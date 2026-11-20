@@ -165,7 +165,14 @@ jobs:
             fi
           }
           [ -z "$HEAD_IN" ] || check head "$HEAD_IN" "$ref"
-          check base "$BASE_IN" "$ref"
+          # actions/checkout looks a short SHA up as a branch or tag and fails
+          # (run 44762833969), so say so here, before anything runs.
+          if [[ $HEAD_IN =~ ^[0-9a-f]{7,39}$ ]]; then
+            echo "::error title=Dispatch input::head $HEAD_IN looks like a short commit SHA, which actions/checkout reads as a branch or tag name; give the full 40-character SHA"
+            bad=1
+          fi
+          # Empty means main, as in the diff step (inputs.base || 'main').
+          [ -z "$BASE_IN" ] || check base "$BASE_IN" "$ref"
           [ -z "$RANGE_IN" ] || [ "$RANGE_IN" = none ] || check in_diff "$RANGE_IN" "$ref"
           check jobs "$JOBS_IN" '[1-6]'
           exit "$bad"

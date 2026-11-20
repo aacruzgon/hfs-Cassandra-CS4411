@@ -32,16 +32,6 @@ on:
     # 3 at 09:00, against 45 to 108 an hour in the evening. Clear of the
     # canary (02:00) and the Saturday prune (20:00).
     - cron: "0 10 * * *"
-  # TEMPORARY, remove before this pull request leaves draft: GitHub refuses
-  # workflow_dispatch for a workflow that is not on the default branch yet
-  # (HTTP 404), so until it is, pushes to this branch that touch the job's
-  # own files run it.
-  push:
-    branches: [cassandra/ci-three-node]
-    paths:
-      - .github/workflows/cassandra-three-node.yml
-      - .github/scripts/cassandra-three-node/**
-      - docker/cassandra/docker-compose.cluster*.yml
   workflow_dispatch:
     inputs:
       ref:

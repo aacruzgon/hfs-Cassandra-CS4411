@@ -2345,8 +2345,9 @@ impl CassandraBackend {
     /// (IW13): one logged batch at `LOCAL_QUORUM`, or a plain write for a
     /// lone statement; either way the driver never re-sends it, so one try is
     /// one send (apart from a re-prepare inside the driver, see
-    /// [`StatementCounts`](super::StatementCounts)). Up to `tries` tries, 10 ms then 20 ms apart (IW16),
-    /// each failure read by [`classify_failure`] (IW15):
+    /// [`StatementCounts`](super::StatementCounts)). Up to `tries` tries,
+    /// 10 ms then 20 ms apart (IW16), each failure read by
+    /// [`classify_failure`] (IW15):
     ///
     /// - `WriteTimeout`/`BATCH`: the batchlog holds the batch and replays it,
     ///   so no other try: [`WriteFailure::InBatchlog`];

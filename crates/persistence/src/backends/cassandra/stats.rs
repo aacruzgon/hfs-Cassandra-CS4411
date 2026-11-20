@@ -12,8 +12,8 @@
 //! ([`StatementCounts`](super::StatementCounts), report R5).
 //!
 //! [`IndexWriteStats`] counts what one write's index phase packed: its
-//! planned rows, its batches and the largest of them (roadmap Step 5; ADR-sam-michaels-0006,
-//! IW14).
+//! planned rows, its batches and the largest of them (roadmap Step 5;
+//! ADR-sam-michaels-0006, IW14).
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};

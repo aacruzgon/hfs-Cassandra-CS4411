@@ -405,7 +405,7 @@ impl CassandraSession {
             if (paging.is_none() || first_page)
                 && let Some(result) = self
                     .faults
-                    .intercept(self, cql, &values, kind, first_page)
+                    .intercept(self, cql, &values, kind, retries, first_page)
                     .await
             {
                 return result;
@@ -415,21 +415,9 @@ impl CassandraSession {
     }
 
     /// Prepares (on first use) and sends one statement under the request
-    /// deadline, with no counting and no injected fault. Only the test fault
-    /// seam sends this way.
-    #[cfg(test)]
-    async fn send(
-        &self,
-        cql: &str,
-        values: Vec<Value>,
-        kind: StatementKind,
-        paging: Option<Paging>,
-    ) -> Result<Envelope, DriverError> {
-        self.send_with(cql, values, kind, paging, Retries::OfKind)
-            .await
-    }
-
-    /// [`Self::send`] with the retry policy chosen by `retries`.
+    /// deadline, with no counting and no injected fault, and with the retry
+    /// policy `retries` chooses. The test fault seam sends this way too, with
+    /// the statement's own `retries`.
     async fn send_with(
         &self,
         cql: &str,
@@ -885,6 +873,7 @@ mod faults {
             cql: String,
             values: Vec<Value>,
             kind: StatementKind,
+            retries: Retries,
         },
         Batch(Vec<IndexStatement>),
     }
@@ -921,9 +910,15 @@ mod faults {
             };
             for deferred in due {
                 match deferred.late {
-                    Late::Statement { cql, values, kind } => {
-                        session.send(&cql, values, kind, None).await.map(|_| ())
-                    }
+                    Late::Statement {
+                        cql,
+                        values,
+                        kind,
+                        retries,
+                    } => session
+                        .send_with(&cql, values, kind, None, retries)
+                        .await
+                        .map(|_| ()),
                     Late::Batch(statements) => session.send_batch(&statements).await,
                 }
                 .expect("the late apply of an injected fault");
@@ -939,6 +934,7 @@ mod faults {
             cql: &str,
             values: &[Value],
             kind: StatementKind,
+            retries: Retries,
             first_page: bool,
         ) -> Option<Result<Envelope, DriverError>> {
             if !first_page {
@@ -953,7 +949,10 @@ mod faults {
             };
             match fault {
                 Fault::ApplyThenTimeOut => {
-                    if let Err(error) = session.send(cql, values.to_vec(), kind, None).await {
+                    if let Err(error) = session
+                        .send_with(cql, values.to_vec(), kind, None, retries)
+                        .await
+                    {
                         return Some(Err(error));
                     }
                 }
@@ -963,6 +962,7 @@ mod faults {
                         cql: cql.to_string(),
                         values: values.to_vec(),
                         kind,
+                        retries,
                     },
                 }),
                 Fault::FailWithWriteFailure => return Some(Err(server_error(write_failure()))),
@@ -976,7 +976,11 @@ mod faults {
                 }
                 Fault::FailWithInvalid => return Some(Err(server_error(ErrorType::Invalid))),
                 Fault::PassThrough => {
-                    return Some(session.send(cql, values.to_vec(), kind, None).await);
+                    return Some(
+                        session
+                            .send_with(cql, values.to_vec(), kind, None, retries)
+                            .await,
+                    );
                 }
                 Fault::TimeOutWithoutApplying | Fault::FailWithCasTimeout => {}
             }

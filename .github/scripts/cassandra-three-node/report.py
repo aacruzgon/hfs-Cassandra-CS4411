@@ -287,59 +287,88 @@ def parse_log(path: Path, stopped: str | None = None) -> dict:
 # nodes, docker/cassandra/entrypoint.sh), from its source:
 # - CASWrite Timeouts: a conditional write that timed out, and also a serial
 #   read that a competing Paxos round superseded, or that ran out of
-#   contention retries (Paxos.java read(), :886-901, through
+#   contention retries (Paxos.java read(), :894 and :901, and in its
+#   prepare phase, begin(), :1039 and :1087, all through
 #   markAndThrowAsTimeoutOrFailure(true, ...), :563-565). That read is
 #   answered "CAS operation timed out: received 0 of 2 required responses",
 #   which is issue #77's 504. So #77's 504s are in this column, mixed with
 #   the CAS writes' own timeouts; the meters cannot tell them apart.
-# - CASRead Timeouts: a serial read whose own proposal timed out (:878).
+# - CASRead Timeouts: a serial read whose own prepare or proposal timed out
+#   (:879, :1019, :1072).
 # - Read and Write: the other reads and writes; an LWT marks the CAS meter and
 #   the per-consistency one (Write-LOCAL_SERIAL), not these.
 # A coordinator counts every such answer, including one the backend then
 # settled without returning a 504 (a CAS write timeout its serial read
-# decided, say), so the columns bound what the tests saw from above.
+# decided, say), so the columns bound from above the 504s the nodes
+# answered, #77's among them. A 504 from the backend's own request deadline
+# (errors.rs, DriverError::Deadline) is in no column, and a node lost or
+# restarted during a run makes its counts unknown (coordinator_delta).
 COORDINATOR_SCOPES = ("CASRead", "CASWrite", "Read", "Write")
 COORDINATOR_NAMES = ("Timeouts", "Unavailables", "Failures")
 
 
-def coordinator_counts(path: Path) -> tuple[dict, list[str]] | None:
+def coordinator_counts(path: Path) -> tuple[dict, dict] | None:
     """{(container, scope, name): count} from one coordinator-metrics.sh
-    file, and the (container, name) pairs it could not read; None if there
-    is no file."""
+    file, and {(container, name): "error" or "timeout"} for the calls it
+    could not read; None if there is no file."""
     if not path.exists():
         return None
-    counts, errors = {}, []
+    counts, errors = {}, {}
     for line in path.read_text(errors="replace").splitlines():
         parts = line.split("\t")
         if len(parts) != 4:
             continue
         container, scope, name, value = parts
-        if value == "error":
-            errors.append(f"{container} {name}")
+        if value in ("error", "timeout"):
+            errors[(container, name)] = value
         elif value.isdigit():
             counts[(container, scope, name)] = int(value)
     return counts, errors
 
 
 def coordinator_delta(run_dir: Path) -> dict | None:
-    """What the nodes answered during one run: {"CASRead Timeouts": n, …}
-    summed over the nodes, for the base scopes, or None when either file is
-    missing; "unread" lists what one of them could not read."""
+    """What the nodes answered during one run: {"CASWrite Timeouts": n, …}
+    summed over the nodes for the base scopes, or None when either file is
+    missing. A count is None ("unknown") when a node has it in one reading
+    only, or could not read its name (an error or a timeout); a node missing from one
+    reading, or one whose counters went down (a reset or a restart), makes
+    every count unknown, since its share of the run is lost. "unread" says
+    why; "nodes" is the number of nodes read in full."""
     before = coordinator_counts(run_dir / "coordinator-before.tsv")
     after = coordinator_counts(run_dir / "coordinator-after.tsv")
     if before is None or after is None:
         return None
     (b, b_errors), (a, a_errors) = before, after
-    delta = {f"{scope} {name}": 0 for scope in COORDINATOR_SCOPES for name in COORDINATOR_NAMES}
-    nodes = sorted({k[0] for k in a} & {k[0] for k in b})
-    for (container, scope, name), value in a.items():
-        key = f"{scope} {name}"
-        if key in delta and (container, scope, name) in b:
-            delta[key] += value - b[(container, scope, name)]
-    unread = sorted(set(b_errors + a_errors))
-    if not nodes:
+    keys = [(scope, name) for scope in COORDINATOR_SCOPES for name in COORDINATOR_NAMES]
+    delta: dict[str, int | None] = {f"{scope} {name}": 0 for scope, name in keys}
+    unread = []
+    for which, errors in (("before", b_errors), ("after", a_errors)):
+        for (container, name), value in sorted(errors.items()):
+            unread.append(f"{container} {name} {'timed out' if value == 'timeout' else 'not read'} {which}")
+    seen = lambda counts, errors: {k[0] for k in counts} | {k[0] for k in errors}
+    nodes_b, nodes_a = seen(b, b_errors), seen(a, a_errors)
+    complete = 0
+    for node in sorted(nodes_b | nodes_a):
+        missing = "after" if node not in nodes_a else "before" if node not in nodes_b else None
+        reset = [f"{sc} {n}" for (c, sc, n), v in a.items() if c == node and (c, sc, n) in b and v < b[(c, sc, n)]]
+        if missing or reset:
+            unread.append(f"{node} not read {missing}" if missing else
+                          f"{node} reset (counters went down: {', '.join(sorted(reset)[:3])})")
+            delta = {k: None for k in delta}
+            continue
+        whole = True
+        for scope, name in keys:
+            key = f"{scope} {name}"
+            in_a, in_b = (node, scope, name) in a, (node, scope, name) in b
+            if (node, name) in a_errors or (node, name) in b_errors or in_a != in_b:
+                delta[key], whole = None, False
+            elif in_a and delta[key] is not None:
+                delta[key] += a[(node, scope, name)] - b[(node, scope, name)]
+        complete += whole
+    if not nodes_b | nodes_a:
         unread.append("no node answered")
-    return {"counts": delta, "nodes": len(nodes), "unread": unread}
+        delta = {k: None for k in delta}
+    return {"counts": delta, "nodes": complete, "unread": unread}
 
 
 def ended(run: dict) -> str | None:
@@ -445,17 +474,20 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
         if c["unread"]:
             warnings.append(f"Three-node tests: {s_['label']}'s coordinator counters not all read: "
                             + ", ".join(c["unread"]))
+        # Not `counts`, which holds the failure classes for the JSON.
+        meters = c["counts"]
         n77 = sum(1 for f in s_["failures"] if f["class"] == "504-77")
+        total = lambda keys: None if any(meters[k] is None for k in keys) else sum(meters[k] for k in keys)
+        cell = lambda v: "unknown" if v is None else v
         n504 = sum(1 for f in s_["failures"] if f["class"] in ("504-77", "504-other"))
-        counts = c["counts"]
-        coordinator_rows.append([s_["label"], c["nodes"], n77, n504, s_["serial_read_failures"] if s_["cas_lines"] else None,
-                                 counts["CASWrite Timeouts"], counts["CASRead Timeouts"], counts["Write Timeouts"],
-                                 counts["Read Timeouts"],
-                                 sum(counts[f"{sc} Unavailables"] for sc in COORDINATOR_SCOPES),
-                                 sum(counts[f"{sc} Failures"] for sc in COORDINATOR_SCOPES)])
-        step = coordinator_total.setdefault(step_of(s_["label"]), {k: 0 for k in counts})
-        for k, v in counts.items():
-            step[k] += v
+        coordinator_rows.append([s_["label"], c["nodes"], n77, n504, s_["serial_read_failures"] if s_["cas_lines"] else None]
+                                + [cell(meters[k]) for k in ("CASWrite Timeouts", "CASRead Timeouts", "Write Timeouts",
+                                                             "Read Timeouts")]
+                                + [cell(total([f"{sc} Unavailables" for sc in COORDINATOR_SCOPES])),
+                                   cell(total([f"{sc} Failures" for sc in COORDINATOR_SCOPES]))])
+        step = coordinator_total.setdefault(step_of(s_["label"]), {k: 0 for k in meters})
+        for k, v in meters.items():
+            step[k] = None if v is None or step[k] is None else step[k] + v
     if coordinator_rows:
         md += ("\n**What the nodes answered during each run** (each node's `ClientRequest` meters, read with "
                "`nodetool sjk` before and after the run, summed over the nodes):\n\n" + table(
@@ -465,12 +497,14 @@ def cmd_tests(out_dir: str, md_path: str, json_path: str) -> None:
         md += ("\nIssue #77's 504 is a serial read that a competing Paxos round superseded. Cassandra 5.0.9 "
                "(Paxos v2) answers it \"CAS operation timed out\" and counts it as a **`CASWrite` timeout**, "
                "together with the conditional writes that timed out; the meters cannot tell the two apart. "
-               "`CASRead` timeouts are serial reads whose own proposal timed out. Since PR #83 a race test "
-               "accepts a 504 at RF 2 or more and passes, so these columns show 504s the failure table cannot. "
-               "A coordinator counts every such answer, including one the backend then settled without "
+               "`CASRead` timeouts are serial reads whose own prepare or proposal timed out. Since PR #83 a race "
+               "test accepts a 504 at RF 2 or more and passes, so these columns show 504s the failure table "
+               "cannot. A coordinator counts every such answer, including one the backend then settled without "
                "returning a 504 (a CAS write timeout its serial read decided, say), so the columns are an upper "
-               "bound on what the tests saw. Unavailables (503) and failures are summed over `CASWrite`, "
-               "`CASRead`, `Read` and `Write`.\n")
+               "bound on the 504s the nodes answered. A 504 from the backend's own request deadline is in no "
+               "column, so \"Tests failing on any 504\" can exceed them. \"unknown\" is a count lost to a node "
+               "missing from a reading, restarted, or not read (see the warnings). Unavailables (503) and "
+               "failures are summed over `CASWrite`, `CASRead`, `Read` and `Write`.\n")
     uncounted = sorted({name.removeprefix("race:") for s_ in ran for name in s_["accepting_uncounted"]})
     if uncounted:
         md += ("\n**Race tests that accept a 504 but print no `[cas]` line**, so their 504s are in no count: "
@@ -669,7 +703,7 @@ def cmd_pause(directory: str, md_path: str, json_path: str) -> None:
             warnings.append(f"Pause scenario {sid}: its read at ALL is missing or incomplete")
         elif not same:
             warnings.append(f"Pause scenario {sid} differs from the PR #90 review's run: "
-                            f"{outcome['outcome']} {outcome.get('write_type') or ''}"
+                            + " ".join(filter(None, [outcome["outcome"], outcome.get("write_type")]))
                             + "".join(f", {k} {outcome.get(k)}" for k in expected["counts"])
                             + f", applied {got_applied}")
         detail = ", ".join(f"{k} {outcome[k]}" for k in ("write_type", "consistency", "received_responses",

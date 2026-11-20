@@ -238,7 +238,8 @@ if docker pause "$N2" "$N3" >/dev/null; then
     log "node 1 did not report nodes 2 and 3 DN within the wait"; snapshot w2-down
     scenario not_sent s3 "node 1 did not report nodes 2 and 3 DN within the wait (or nodetool status failed)"
   fi
-  echo "w2_down_s=$d2+$d3" >> "$out/windows.meta"
+  # "13+16", "timeout" (node 2 never DN, node 3 not waited for) or "13+timeout".
+  if [ "$d3" = skipped ]; then echo "w2_down_s=$d2" >> "$out/windows.meta"; else echo "w2_down_s=$d2+$d3" >> "$out/windows.meta"; fi
 else
   unpause_all
   log "docker pause of nodes 2 and 3 failed"

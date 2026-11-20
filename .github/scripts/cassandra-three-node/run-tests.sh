@@ -38,11 +38,11 @@
 # them.
 #
 # THREE_NODE_DEADLINE (epoch seconds, optional): the step's own deadline. The
-# timeout is cut so the container ends a minute before it, and a run with
-# under two minutes left is not started (exit 125; its log and run file say
-# so), so the step's
-# timeout-minutes never has to kill a docker client and leave its container
-# running.
+# timeout is cut so the container ends a minute before it, less the after-
+# reading's worst case (90 s), and a run with under two minutes left is not
+# started (exit 125; its log and run file say so). So the step's
+# timeout-minutes never has to kill a docker client, or a nodetool reading,
+# and leave a container running or the run file unwritten.
 set -uo pipefail
 
 label=$1 suite=$2 binary=$3
@@ -67,8 +67,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 # A repeat not started still gets its log (the "Running" line, so both
 # reports list it) and a run file saying why, so report.py shows it as not
 # run instead of leaving it out.
+# The after-reading's worst case (coordinator-metrics.sh: 3 nodes x 3 calls x
+# 10 s) is reserved too, so a hung nodetool after the run still ends before
+# the step's own timeout.
+readings_s=90
 if [ -n "${THREE_NODE_DEADLINE:-}" ]; then
-  left=$(( THREE_NODE_DEADLINE - $(date +%s) - 60 ))
+  left=$(( THREE_NODE_DEADLINE - $(date +%s) - 60 - readings_s ))
   if [ "$left" -lt 120 ]; then
     echo "::warning::$label not run: ${left} s left before the step's deadline"
     { echo "     Running $suite ($binary)"
@@ -130,7 +134,6 @@ started=$(date +%s)
 wait "$!"
 docker_status=$(cat "$run_dir/docker_status" 2>/dev/null || echo "")
 wall=$(( $(date +%s) - started ))
-"$here/coordinator-metrics.sh" "$run_dir/coordinator-after.tsv"
 
 status=$(cat "$run_dir/status" 2>/dev/null || echo "$docker_status")
 peak=$(cat "$run_dir/memory.peak" 2>/dev/null || echo "")
@@ -152,4 +155,6 @@ json.dump({
 }, open(out, "w"), indent=2)
 EOF
 echo "$label: exit $status after ${wall} s; container memory.peak ${peak:-unknown} bytes; OOM kills ${oom:-unknown}"
+# After the run file, so a slow reading cannot cost it.
+"$here/coordinator-metrics.sh" "$run_dir/coordinator-after.tsv"
 exit "$status"

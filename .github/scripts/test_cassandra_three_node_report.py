@@ -444,6 +444,183 @@ test ok_test ... ok
         self.assertTrue(any("coordinator counters not all read: hfs-cassandra-3n-cassandra-1-1 Failures" in w
                             for w in json.loads(js.read_text())["warnings"]))
 
+    # The delta audit of #101 (M1): a node lost from the after-reading, or
+    # restarted (its counters went down), gives "unknown", never a negative
+    # or a short sum, and a warning.
+    def test_coordinator_node_lost_or_reset_is_unknown(self) -> None:
+        passing = ("     Running tests/cassandra_tests.rs (/x/cassandra_tests-abc)\n\nrunning 1 test\ntest a ... ok\n\n"
+                   "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n")
+        n = "hfs-cassandra-3n-cassandra-{}-1".format
+        full = lambda node, v: {(node, sc, name): v for sc in report.COORDINATOR_SCOPES for name in report.COORDINATOR_NAMES}
+        self.log("cassandra-tests-r1", passing, {"exit_status": 0})
+        self.coordinator("cassandra-tests-r1", {**full(n(1), 5), **full(n(2), 5), **full(n(3), 5)},
+                         {**full(n(1), 9), **full(n(2), 1)})
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        data = json.loads(js.read_text())
+        self.assertIsNone(data["coordinator_by_step"]["cassandra-tests"]["CASWrite Timeouts"])
+        self.assertIn("| cassandra-tests-r1 | 1 | 0 | 0 | – | unknown | unknown | unknown | unknown | unknown | unknown |",
+                      md.read_text())
+        warning = [w for w in data["warnings"] if "coordinator counters" in w][0]
+        self.assertIn(f"{n(2)} reset", warning)
+        self.assertIn(f"{n(3)} not read after", warning)
+        self.assertNotIn("-", md.read_text().split("What the nodes answered")[1].split("\n\n")[1].replace("–", "")
+                         .replace("cassandra-tests-r1", "").replace("|---", "").replace("---|", ""))
+
+    def test_coordinator_node_only_in_after_reading_is_unknown(self) -> None:
+        self.log("cassandra-tests-r1", "     Running tests/cassandra_tests.rs (/x/cassandra_tests-abc)\n\n"
+                 "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n",
+                 {"exit_status": 0})
+        n = "hfs-cassandra-3n-cassandra-{}-1".format
+        self.coordinator("cassandra-tests-r1", {(n(1), "CASWrite", "Timeouts"): 1},
+                         {(n(1), "CASWrite", "Timeouts"): 2, (n(2), "CASWrite", "Timeouts"): 7})
+        delta = report.coordinator_delta(self.out / "run" / "cassandra-tests-r1")
+        self.assertIsNone(delta["counts"]["CASWrite Timeouts"])
+        self.assertIn(f"{n(2)} not read before", delta["unread"])
+
+    # The delta audit of #101 (M5): one two-node run that failed on a #77 504
+    # and another 504, with 503s in two scopes, failures in two, a key in the
+    # after-reading only, and an error in the before-reading only.
+    def test_coordinator_table_with_two_nodes(self) -> None:
+        text = captured("step3_suites::race_a", RACE, loser(SERIAL_READ_504)).replace(
+            "test ok_test ... ok\n", "test ok_test ... ok\ntest step3_suites::race_b ... FAILED\n").replace(
+            "failures:\n    step3_suites::race_a", "failures:\n    step3_suites::race_a\n    step3_suites::race_b").replace(
+            "---- step3_suites::race_a stdout ----",
+            "---- step3_suites::race_b stdout ----\n\nthread 'step3_suites::race_b' (163) panicked at "
+            + RACE + ":\n" + loser('Timeout { backend_name: "cassandra", message: "create: CAS operation timed out" }')
+            + "\n\n---- step3_suites::race_a stdout ----")
+        self.log("cassandra-tests-r1", text, {"exit_status": 101})
+        n = "hfs-cassandra-3n-cassandra-{}-1".format
+        base = {}
+        for node in (n(1), n(2)):
+            for sc in report.COORDINATOR_SCOPES:
+                for name in report.COORDINATOR_NAMES:
+                    base[(node, sc, name)] = 10
+        after = dict(base)
+        after[(n(1), "CASWrite", "Timeouts")] = 13
+        after[(n(2), "CASWrite", "Timeouts")] = 12
+        after[(n(1), "CASWrite", "Unavailables")] = 11
+        after[(n(2), "Read", "Unavailables")] = 12
+        after[(n(1), "Write", "Failures")] = 11
+        after[(n(2), "CASRead", "Failures")] = 11
+        after[(n(1), "Write-LOCAL_SERIAL", "Timeouts")] = 99
+        self.coordinator("cassandra-tests-r1", base, after)
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        data = json.loads(js.read_text())
+        self.assertEqual(data["failures_by_class"]["504-77"], 1)
+        self.assertEqual(data["failures_by_class"]["504-other"], 1)
+        self.assertIn("| cassandra-tests-r1 | 2 | 1 | 2 | – | 5 | 0 | 0 | 0 | 3 | 2 |", md.read_text())
+        self.assertEqual(data["warnings"], [])
+        # An error in the before-reading only is a warning and an unknown count.
+        (self.out / "run" / "cassandra-tests-r1" / "coordinator-before.tsv").write_text(
+            "\n".join(f"{c}\t{sc}\t{name}\t{v}" for (c, sc, name), v in base.items() if name != "Failures")
+            + f"\n{n(2)}\t-\tFailures\terror\n" + "\n".join(
+                f"{c}\t{sc}\t{name}\t{v}" for (c, sc, name), v in base.items() if name == "Failures" and c == n(1)) + "\n")
+        delta = report.coordinator_delta(self.out / "run" / "cassandra-tests-r1")
+        self.assertIsNone(delta["counts"]["CASRead Failures"])
+        self.assertEqual(delta["counts"]["CASWrite Timeouts"], 5)
+        self.assertEqual(delta["nodes"], 1)
+        self.assertIn(f"{n(2)} Failures not read before", delta["unread"])
+        # No node in either reading.
+        for name in ("before", "after"):
+            (self.out / "run" / "cassandra-tests-r1" / f"coordinator-{name}.tsv").write_text("")
+        delta = report.coordinator_delta(self.out / "run" / "cassandra-tests-r1")
+        self.assertEqual(delta["unread"], ["no node answered"])
+        self.assertIsNone(delta["counts"]["CASWrite Timeouts"])
+
+    # The delta audit of #101 (M5): a base key in one reading only, and a
+    # name one reading could not read while the other has none of it, are
+    # unknown; a run that failed on another 504 only is not a #77 one.
+    def test_coordinator_gaps_are_unknown(self) -> None:
+        self.log("cassandra-tests-r1", captured("step3_suites::race_b", RACE,
+                 loser('Timeout { backend_name: "cassandra", message: "create: CAS operation timed out" }')),
+                 {"exit_status": 101})
+        n = "hfs-cassandra-3n-cassandra-1-1"
+        self.coordinator("cassandra-tests-r1", {(n, "CASWrite", "Timeouts"): 1},
+                         {(n, "CASWrite", "Timeouts"): 2, (n, "Read", "Timeouts"): 3})
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        self.assertIn("| cassandra-tests-r1 | 0 | 0 | 1 | – | 1 | 0 | 0 | unknown |", md.read_text())
+        run_dir = self.out / "run" / "cassandra-tests-r1"
+        for errors_in in ("before", "after"):
+            other = "after" if errors_in == "before" else "before"
+            (run_dir / f"coordinator-{errors_in}.tsv").write_text(f"{n}\tCASWrite\tTimeouts\t1\n{n}\t-\tFailures\terror\n")
+            (run_dir / f"coordinator-{other}.tsv").write_text(f"{n}\tCASWrite\tTimeouts\t1\n")
+            delta = report.coordinator_delta(run_dir)
+            self.assertIsNone(delta["counts"]["Write Failures"], errors_in)
+            self.assertEqual(delta["counts"]["CASWrite Timeouts"], 0)
+            self.assertIn(f"{n} Failures not read {errors_in}", delta["unread"])
+
+    def test_strict_race_without_cas_line_is_not_named(self) -> None:
+        self.log("cassandra-tests-r1", "     Running tests/cassandra_tests.rs (/x/cassandra_tests-abc)\n\nrunning 1 test\n"
+                 "[race policy case=race:cassandra_strict_create rf=1 accept_504=false]\n"
+                 "test a ... ok\n\n"
+                 "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n",
+                 {"exit_status": 0})
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        self.assertEqual(json.loads(js.read_text())["accepting_uncounted"], [])
+
+    # The delta audit of #101 (M5): the [cas] and race-policy regexes count
+    # only race: cases, only accept_504=true, and only the exact key.
+    def test_cas_regexes_count_only_race_cases(self) -> None:
+        text = ("     Running tests/cassandra_tests.rs (/x/cassandra_tests-abc)\n\nrunning 1 test\n"
+                "[race policy case=race:cassandra_strict_one rf=1 accept_504=false]\n"
+                "[cas case=c4-r2-timeout attempts=1 serial_reads=1 serial_read_failures=1]\n"
+                "[cas case=race:cassandra_strict_one attempts=2 post_serial_read_failures=7 serial_read_failures=2]\n"
+                "test a ... ok\n\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n")
+        self.log("cassandra-tests-r1", text, {"exit_status": 0})
+        md, js = self.out / "f.md", self.out / "f.json"
+        report.cmd_tests(str(self.out), str(md), str(js))
+        data = json.loads(js.read_text())
+        self.assertEqual(data["serial_read_failures"], {"cassandra-tests": [2]})
+        self.assertEqual(data["accepting_uncounted"], [])
+
+    # The delta audit of #101 (M6): coordinator-metrics.sh's parse of sjk's
+    # output, through a fake docker: bean and Count pairs, an answer it
+    # cannot parse ("error") and a call that outlasts its timeout.
+    def test_coordinator_metrics_script_parses_sjk_output(self) -> None:
+        import os
+        import subprocess
+        bin_dir = self.out / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "docker"
+        fake.write_text("""#!/usr/bin/env bash
+if [ "$1" = ps ]; then printf 'p-cassandra-1-1\\np-cassandra-2-1\\nother-1\\n' | grep '^p-cassandra-'; exit 0; fi
+c=$4; name=${11##*name=}
+case "$c:$name" in
+  p-cassandra-1-1:Timeouts) printf '%s\\n' \\
+    'org.apache.cassandra.metrics:type=ClientRequest,scope=CASWrite,name=Timeouts' 4 \\
+    'org.apache.cassandra.metrics:type=ClientRequest,scope=Write-LOCAL_SERIAL,name=Timeouts' 4 \\
+    'org.apache.cassandra.metrics:type=ClientRequest,scope=CASRead,name=Timeouts' 0 ;;
+  p-cassandra-1-1:Unavailables) printf '%s\\n' 'org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Unavailables' 2 ;;
+  p-cassandra-1-1:Failures) echo "Ambiguous MBean selection. Use '-all' param for process all matched MBeans" ;;
+  p-cassandra-2-1:Timeouts) sleep 30 ;;
+  *) printf '%s\\n' "org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=$name" 1 ;;
+esac
+""")
+        fake.chmod(0o755)
+        script = HERE / "cassandra-three-node" / "coordinator-metrics.sh"
+        out = self.out / "m.tsv"
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "THREE_NODE_PROJECT": "p",
+               "THREE_NODE_METRICS_CALL_TIMEOUT": "1"}
+        result = subprocess.run(["bash", str(script), str(out)], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(out.read_text().splitlines(), [
+            "p-cassandra-1-1\tCASWrite\tTimeouts\t4",
+            "p-cassandra-1-1\tWrite-LOCAL_SERIAL\tTimeouts\t4",
+            "p-cassandra-1-1\tCASRead\tTimeouts\t0",
+            "p-cassandra-1-1\tWrite\tUnavailables\t2",
+            "p-cassandra-1-1\t-\tFailures\terror",
+            "p-cassandra-2-1\t-\tTimeouts\ttimeout",
+            "p-cassandra-2-1\tRead\tUnavailables\t1",
+            "p-cassandra-2-1\tRead\tFailures\t1",
+        ])
+        counts, errors = report.coordinator_counts(out)
+        self.assertEqual(errors, {("p-cassandra-1-1", "Failures"): "error", ("p-cassandra-2-1", "Timeouts"): "timeout"})
+
     # CodeRabbit on #101: the fallback writes never raise, and main exits 0
     # when the JSON destination cannot be written.
     def test_report_exits_zero_when_a_destination_is_unwritable(self) -> None:
@@ -533,6 +710,24 @@ class Pause(unittest.TestCase):
         self.assertTrue(any("s1: its read at ALL is missing or incomplete" in w for w in warnings))
         self.assertIsNone(report.parse_rows(f" {P2}\n\n(2 rows)\n"))
         self.assertEqual(report.parse_rows(" [json]\n---\n\n(0 rows)\n"), [])
+
+    # The delta audit of #101 (M5): a read with no "(N rows)" line, and one
+    # with a row that is not whole JSON, are unread.
+    def test_read_without_row_count_is_unread(self) -> None:
+        self.assertIsNone(report.parse_rows(f"Consistency level set to ALL.\n\n [json]\n---\n {P2}\n"))
+        self.assertIsNone(report.parse_rows(f" [json]\n---\n {P2}\n {P1[:30]}\n\n(1 rows)\n"))
+        self.assertEqual(report.parse_rows(f" [json]\n---\n {P2}\n\n(1 rows)\n"), [json.loads(P2)])
+
+    def test_seconds_formats_only_numbers(self) -> None:
+        self.assertEqual(report.seconds("13"), "13 s")
+        self.assertEqual(report.seconds("16+0"), "16+0 s")
+        self.assertEqual(report.seconds("timeout"), "timeout")
+        self.assertEqual(report.seconds("13+timeout"), "13+timeout")
+
+    def test_difference_warning_has_no_stray_space(self) -> None:
+        (self.dir / "s3.out").write_text(OUT["s3"].replace("\\'alive_replicas\\': 1", "\\'alive_replicas\\': 2"))
+        _, _, warnings = self.run_pause()
+        self.assertIn("Pause scenario s3 differs from the PR #90 review's run: Unavailable, alive_replicas 2,", warnings[0])
 
     # CodeRabbit on #101: no output file is unknown, not success.
     def test_missing_output_is_unknown(self) -> None:

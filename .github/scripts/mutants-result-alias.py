@@ -23,15 +23,21 @@ cargo-mutants checks that the new side of an `--in-diff` diff matches the
 tree (in_diff.rs, `check_diff_new_text_matches`), so with `--diff FILE` the
 script also replaces each new-side line of that diff (context and added
 lines) with the rewritten file's line of the same number. The removed lines
-and the hunk headers stay as they were.
+and the hunk headers stay as they were. The diff is split on "\n" only, and
+files and diff are read and written with their newlines as they are, so a
+form feed or a CRLF line survives. The realignment trusts that the diff was
+taken from this tree: it would make a stale diff look current, so it must
+run on the checkout the diff came from, as the job does.
 
 Usage: mutants-result-alias.py --alias NAME=ERROR [--alias ...] [--diff FILE]
                                [--summary FILE] <dir>...
 
-Prints what it rewrote; `--summary` writes the same as JSON. Exits 1 if it
-could not rewrite a file it had started on (an unbalanced `<`), having
-changed nothing, so the job can carry on with the tree as it was. Standard
-library only; runs with `python3 -I`. Tests: test_mutants_report.py.
+Prints what it rewrote; `--summary` writes the same as JSON. Exits 1 if the
+rewrite failed. Every file is rewritten in memory first, so an unbalanced
+`<` changes nothing; a write that fails part-way (a read-only file) can leave
+some files rewritten, which the job's step undoes with `git checkout`, so the
+job carries on with the tree as it was. Standard library only; runs with
+`python3 -I`. Tests: test_mutants_report.py.
 """
 
 from __future__ import annotations
@@ -102,20 +108,38 @@ def code_mask(text: str) -> list[bool]:
 
 
 def closing_angle(text: str, mask: list[bool], open_at: int) -> int:
-    """The index of the `>` that closes the `<` at open_at, counting only code; `->` and `=>` are not brackets."""
-    depth = 0
+    """The index of the `>` that closes the `<` at open_at, counting only code.
+
+    `->` and `=>` are not brackets. Inside `()`, `[]` or a const-generic
+    `{}` (one that opens right after `<` or `,`) nothing is counted, so
+    `[u8; 4]` and `Foo<{ N }>` are types; a `;` or another `{` outside
+    them means the `<` never closed (the function's body or the next item).
+    """
+    depth = nest = 0
+    prev = ""
     for k in range(open_at, len(text)):
         if not mask[k]:
             continue
         ch = text[k]
-        if ch == "<":
-            depth += 1
-        elif ch == ">" and text[k - 1] not in "-=":
-            depth -= 1
-            if depth == 0:
-                return k
-        elif ch in ";{" and depth:
-            break
+        if ch in "([":
+            nest += 1
+        elif ch in ")]}":
+            nest = max(nest - 1, 0)
+        elif ch == "{":
+            if not nest and prev not in "<,":
+                break
+            nest += 1
+        elif not nest:
+            if ch == "<":
+                depth += 1
+            elif ch == ">" and text[k - 1] not in "-=":
+                depth -= 1
+                if depth == 0:
+                    return k
+            elif ch == ";":
+                break
+        if not ch.isspace():
+            prev = ch
     raise Unbalanced(f"no closing > for the < at offset {open_at}")
 
 
@@ -145,7 +169,9 @@ def realign_diff(diff_text: str, files: dict[str, list[str]]) -> str:
     out: list[str] = []
     lines: list[str] | None = None
     new_no = old_left = new_left = 0
-    for raw in diff_text.splitlines(keepends=True):
+    # On "\n" only: str.splitlines would also split a line at a form feed,
+    # \x1c-\x1e, \x85, U+2028 or U+2029.
+    for raw in (line for line in re.split(r"(?<=\n)", diff_text) if line):
         body = raw.rstrip("\n")
         end = raw[len(body):]
         if old_left or new_left:
@@ -173,12 +199,23 @@ def realign_diff(diff_text: str, files: dict[str, list[str]]) -> str:
     return "".join(out)
 
 
+def read(path: Path, errors: str = "strict") -> str:
+    """The file's text with its newlines as they are (no CRLF translation)."""
+    with open(path, encoding="utf-8", errors=errors, newline="") as f:
+        return f.read()
+
+
+def write(path: Path, text: str, errors: str = "strict") -> None:
+    with open(path, "w", encoding="utf-8", errors=errors, newline="") as f:
+        f.write(text)
+
+
 def run(dirs: list[Path], aliases: dict[str, str], diff: Path | None, root: Path) -> dict:
     rewritten: dict[str, str] = {}
     counts: dict[str, int] = {}
     for d in dirs:
         for path in sorted(d.rglob("*.rs")):
-            text = path.read_text()
+            text = read(path)
             new, count = rewrite_source(text, aliases)
             if count:
                 if new.count("\n") != text.count("\n"):
@@ -186,13 +223,13 @@ def run(dirs: list[Path], aliases: dict[str, str], diff: Path | None, root: Path
                 rel = path.resolve().relative_to(root.resolve()).as_posix()
                 rewritten[rel] = new
                 counts[rel] = count
-    # Every file is rewritten in memory first, so a failure changes nothing.
-    diff_text = diff.read_text(errors="surrogateescape") if diff is not None else None
+    # Every file is rewritten in memory first, so a file that cannot be
+    # rewritten changes nothing; a failed write is undone by the job's step.
+    diff_text = read(diff, "surrogateescape") if diff is not None else None
     for rel, new in rewritten.items():
-        (root / rel).write_text(new)
+        write(root / rel, new)
     if diff is not None:
-        diff.write_text(realign_diff(diff_text, {rel: new.split("\n") for rel, new in rewritten.items()}),
-                        errors="surrogateescape")
+        write(diff, realign_diff(diff_text, {rel: new.split("\n") for rel, new in rewritten.items()}), "surrogateescape")
     return {"aliases": aliases, "return_types": sum(counts.values()), "files": counts}
 
 
@@ -223,7 +260,7 @@ def main(argv: list[str]) -> int:
     try:
         data = run([Path(a) for a in args], aliases, diff, Path.cwd())
     except (Unbalanced, OSError, ValueError) as error:
-        print(f"mutants-result-alias: nothing rewritten: {error}", file=sys.stderr)
+        print(f"mutants-result-alias: rewrite failed; the job restores the tree: {error}", file=sys.stderr)
         return 1
     for rel, count in sorted(data["files"].items()):
         print(f"{rel}: {count} return type(s)")

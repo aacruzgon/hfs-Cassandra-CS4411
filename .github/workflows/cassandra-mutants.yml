@@ -302,7 +302,14 @@ jobs:
       # (src/in_diff.rs, check_diff_new_text_matches), so the script replaces
       # those lines of the diff with the rewritten ones. Report only: a rewrite
       # that fails puts the tree and the diff back, warns, and the run goes on
-      # as before.
+      # as before. A pull request's scripts come from its head (Keep this
+      # workflow's scripts), so a head that predates ADR-aacruzgon-0084 has no
+      # mutants-result-alias.py: the step says so, and that run gets the old
+      # unviable replacements until main is merged into the branch. Not
+      # covered: a restore that itself fails (warned; cargo-mutants' diff check
+      # then refuses the partly rewritten tree, exit 5), and a rewritten tree
+      # that does not build (the baseline fails, which the report warns about);
+      # neither has happened, since the rewrite is the same type.
       - name: Let cargo-mutants see through StorageResult
         id: alias
         if: steps.diff.outcome == 'success' && steps.diff.outputs.files != '0'
@@ -312,9 +319,14 @@ jobs:
         run: |
           dir=crates/persistence/src/backends/cassandra
           args=(--alias "$MUTANTS_ALIAS" --summary "$RUNNER_TEMP/ci-report/inputs/mutants/alias.json")
+          if [ ! -f "$CI_SCRIPTS/mutants-result-alias.py" ]; then
+            echo "predates=true" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Mutation testing::this head predates ADR-aacruzgon-0084 (it has no .github/scripts/mutants-result-alias.py); merge main to get Ok(…) mutants for functions returning StorageResult<T>"
+            exit 1
+          fi
           if [ -n "$DIFF" ]; then cp "$DIFF" "$DIFF.orig"; args+=(--diff "$DIFF"); fi
           if ! out=$(python3 -I "$CI_SCRIPTS/mutants-result-alias.py" "${args[@]}" "$dir"); then
-            git checkout -- "$dir"
+            git checkout -- "$dir" || echo "::warning title=Mutation testing::git checkout could not restore $dir after the failed rewrite"
             if [ -n "$DIFF" ]; then cp "$DIFF.orig" "$DIFF"; fi
             echo "::warning title=Mutation testing::StorageResult<T> could not be spelled as a Result, so its functions get only body replacements that do not compile; see this step's log"
             exit 1
@@ -441,6 +453,7 @@ jobs:
           HEAD_NAME: ${{ inputs.head || github.head_ref || github.ref_name }}
           ALIAS_OUTCOME: ${{ steps.alias.outcome }}
           ALIAS_SUMMARY: ${{ steps.alias.outputs.summary }}
+          ALIAS_PREDATES: ${{ steps.alias.outputs.predates }}
         run: |
           out="$RUNNER_TEMP/ci-report/inputs/mutants"
           mkdir -p "$out"
@@ -452,6 +465,8 @@ jobs:
           if [ "$ALIAS_OUTCOME" = success ]; then
             alias_args=(--alias "$MUTANTS_ALIAS")
             note+=" \`StorageResult<T>\` return types spelled \`::core::result::Result<T, crate::error::StorageError>\` in this job's checkout, so cargo-mutants tries \`Ok(…)\` (${ALIAS_SUMMARY:-?}); the names below spell them as the source does, the diffs in \`mutants.out/\` do not."
+          elif [ "$ALIAS_PREDATES" = true ]; then
+            note+=" This head predates ADR-aacruzgon-0084, so \`StorageResult<T>\` was not spelled as a Result and its functions' body replacements did not compile; merge main to get \`Ok(…)\` mutants."
           elif [ "$ALIAS_OUTCOME" = failure ]; then
             note+=" \`StorageResult<T>\` could not be spelled as a Result in this run, so its functions' body replacements did not compile."
           fi

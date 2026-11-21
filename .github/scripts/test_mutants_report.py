@@ -349,6 +349,17 @@ class ResultAlias(unittest.TestCase):
                                            "-> ::core::result::Result<&'a str, crate::error::StorageError>"))
         self.assertEqual(alias.rewrite_source("fn f() -> SearchResult<u8> {}", STORAGE), ("fn f() -> SearchResult<u8> {}", 0))
 
+    def test_a_raw_string_with_a_quote_inside_is_not_code(self):
+        # A plain-string scan would end at the inner `"` and read the rest as code.
+        text = 'let r = r#"a " -> StorageResult<u8> b"#;\nlet b = br"-> StorageResult<";\n'
+        self.assertEqual(alias.rewrite_source(text, STORAGE), (text, 0))
+
+    def test_brackets_semicolons_and_const_blocks_inside_the_generics(self):
+        for inner in ("[u8; 4]", "Foo<{ N }>", "Foo<u8, { N + 1 }>", "(Vec<u8>, [u8; 2])", "Box<dyn Fn(u8) -> u8>"):
+            with self.subTest(inner=inner):
+                self.assertEqual(self.rewrite(f"fn f() -> StorageResult<{inner}> {{\n}}\n"),
+                                 f"fn f() -> ::core::result::Result<{inner}, crate::error::StorageError> {{\n}}\n")
+
     def test_an_unbalanced_bracket_is_refused(self):
         with self.assertRaises(alias.Unbalanced):
             alias.rewrite_source("fn f() -> StorageResult<u8 {\n}\n", STORAGE)
@@ -364,12 +375,41 @@ class ResultAlias(unittest.TestCase):
             " fn f() -> StorageResult<u8> {", " fn f() -> ::core::result::Result<u8, crate::error::StorageError> {"))
         self.assertEqual(alias.realign_diff(diff, {}), diff)
 
+    def test_two_files_several_hunks_are_counted_from_their_headers(self):
+        # a.rs: a one-line hunk (`@@ -1 +1 @@`, counts left out), then a hunk with
+        # context, removed and added lines; gone.rs: deleted; b.rs: after them, so
+        # a hunk counted wrongly in a.rs leaves b.rs's lines as they were.
+        a, b = "src/a.rs", "src/b.rs"
+        sig = "fn f() -> StorageResult<u8> {"
+        new_sig = "fn f() -> ::core::result::Result<u8, crate::error::StorageError> {"
+        diff = (f"diff --git a/{a} b/{a}\n--- a/{a}\n+++ b/{a}\n"
+                f"@@ -1 +1 @@\n-fn f() -> u8 {{\n+{sig}\n"
+                f"@@ -5,4 +5,4 @@ fn f\n ctx5\n-old6\n-old7\n+{sig}\n+new7\n ctx8\n"
+                f"diff --git a/src/gone.rs b/src/gone.rs\n--- a/src/gone.rs\n+++ /dev/null\n"
+                f"@@ -1,2 +0,0 @@\n-{sig}\n-}}\n"
+                f"diff --git a/{b} b/{b}\n--- a/{b}\n+++ b/{b}\n"
+                f"@@ -2,3 +2,3 @@\n ctx2\n-x\n+{sig}\n {sig}\n\\ No newline at end of file\n")
+        files = {a: [new_sig, "2", "3", "4", "ctx5", new_sig, "new7", "ctx8"],
+                 b: ["1", "ctx2", new_sig, new_sig]}
+        want = (diff.replace(f"+{sig}\n+new7", f"+{new_sig}\n+new7")
+                .replace(f"@@ -1 +1 @@\n-fn f() -> u8 {{\n+{sig}", f"@@ -1 +1 @@\n-fn f() -> u8 {{\n+{new_sig}")
+                .replace(f" ctx2\n-x\n+{sig}\n {sig}", f" ctx2\n-x\n+{new_sig}\n {new_sig}"))
+        self.assertEqual(want.count(new_sig), 4)
+        self.assertEqual(alias.realign_diff(diff, files), want)
+
+    def test_a_form_feed_or_a_crlf_line_survives_the_realignment(self):
+        diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,3 +1,3 @@\n fn f() -> StorageResult<u8> {\r\n-    0 // a\x0cb\r\n+    1 // a\x0cb\r\n }\r\n"
+        new, _ = alias.rewrite_source("fn f() -> StorageResult<u8> {\r\n    1 // a\x0cb\r\n}\r\n", STORAGE)
+        self.assertEqual(alias.realign_diff(diff, {"x.rs": new.split("\n")}), diff.replace(
+            " fn f() -> StorageResult<u8> {", " fn f() -> ::core::result::Result<u8, crate::error::StorageError> {"))
+
     def test_main_rewrites_the_tree_and_the_diff_or_nothing(self):
         tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         src = tmp / "crates/persistence/src/backends/cassandra"
         src.mkdir(parents=True)
         (src / "a.rs").write_text("fn f() -> StorageResult<u8> {\n    Ok(1)\n}\n")
         (src / "b.rs").write_text("fn g() -> u8 {\n    1\n}\n")
+        (src / "d.rs").write_bytes(b"fn d() -> StorageResult<()> {\r\n    Ok(())\r\n}\r\n")
         diff = tmp / "pr.diff"
         rel = "crates/persistence/src/backends/cassandra/a.rs"
         diff.write_text(f"--- a/{rel}\n+++ b/{rel}\n@@ -1,3 +1,3 @@\n fn f() -> StorageResult<u8> {{\n-    Ok(0)\n+    Ok(1)\n }}\n")
@@ -385,7 +425,11 @@ class ResultAlias(unittest.TestCase):
             self.assertIn("-> ::core::result::Result<u8, crate::error::StorageError> {", (src / "a.rs").read_text())
             self.assertIn(" fn f() -> ::core::result::Result<u8, crate::error::StorageError> {\n", diff.read_text())
             self.assertIn("-    Ok(0)\n", diff.read_text())
-            self.assertEqual(json.loads(summary.read_text())["files"], {rel: 1})
+            # Every rewritten file is written, each with its own newlines.
+            self.assertEqual((src / "d.rs").read_bytes(),
+                             b"fn d() -> ::core::result::Result<(), crate::error::StorageError> {\r\n    Ok(())\r\n}\r\n")
+            self.assertEqual(json.loads(summary.read_text())["files"],
+                             {rel: 1, "crates/persistence/src/backends/cassandra/d.rs": 1})
             # A file it cannot rewrite: nothing changes, and it exits 1.
             (src / "a.rs").write_text("fn f() -> StorageResult<u8> {\n")
             (src / "c.rs").write_text("fn h() -> StorageResult<u8 {\n")

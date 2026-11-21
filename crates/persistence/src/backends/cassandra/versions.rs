@@ -896,8 +896,9 @@ mod node_tests {
 
     /// A matching tag updates exactly the version it named, through L2a's
     /// `update`: every form of the `If-Match` field `delete_with_match`
-    /// accepts, the new body as version 3, `created_at` kept (G13), and the
-    /// same tag refused once it is stale.
+    /// accepts, with exactly the pre-read, `update`'s R1 and one
+    /// compare-and-swap, the new body as version 3, `created_at` kept (G13),
+    /// and the same tag refused once it is stale.
     #[tokio::test]
     async fn update_with_match_updates_the_version_it_compared() {
         let Some(backend) = backend().await else {
@@ -920,10 +921,22 @@ mod node_tests {
                 .unwrap()
                 .unwrap()
                 .created_at();
+            let before = backend.statement_counts();
             let updated = backend
                 .update_with_match(&t, "Patient", id, field, patient(id, "Three"))
                 .await
                 .unwrap_or_else(|error| panic!("{id} {field}: {error:?}"));
+            // Exactly the pre-read and `update`'s own R1, then one CAS. A
+            // second read whose row `update` builds on would reopen the
+            // lost-update window #57 closed in REST, so any extra read fails
+            // here. (The plain writes are not pinned: Step 5's batches, #90
+            // onward, change them.)
+            let spent = backend.statement_counts().since(&before);
+            assert_eq!(
+                (spent.read, spent.serial_read, spent.cas),
+                (2, 0, 1),
+                "{id} {field}: the pre-read, update's R1 and one CAS"
+            );
             assert_eq!(
                 (updated.version_id(), family(&updated)),
                 ("3", "Three"),
@@ -1142,7 +1155,8 @@ mod node_tests {
     }
 
     /// `exists`: one R1 of `deleted_at` only, true for a live row, false for
-    /// a deleted or unknown one, never an error for either.
+    /// a deleted or unknown one, never an error for either; true again once
+    /// revived, and false once deleted again.
     #[tokio::test]
     async fn exists_reads_only_deleted_at() {
         let Some(backend) = backend().await else {
@@ -1185,12 +1199,16 @@ mod node_tests {
             3
         );
         assert!(backend.exists(&t, "Patient", "gone").await.unwrap());
+        // Deleted again after the revive: false again.
+        assert_eq!(engine_delete(&backend, &t, "gone").await, 4);
+        assert!(!backend.exists(&t, "Patient", "gone").await.unwrap());
     }
 
     /// `current_version`: one R1 of `version_id` and `deleted_at` only. The
     /// live row's version; `None` for a deleted or unknown resource, as the
     /// trait documents, where the trait default's `read` would answer
-    /// `Gone`; the new version again once the resource is revived.
+    /// `Gone`; the new version again once the resource is revived, and
+    /// `None` once it is deleted again.
     #[tokio::test]
     async fn current_version_is_none_for_a_deleted_resource() {
         let Some(backend) = backend().await else {
@@ -1250,6 +1268,16 @@ mod node_tests {
                 .unwrap()
                 .as_deref(),
             Some("3")
+        );
+        // Deleted again after the revive: `None` again, as for the first
+        // delete.
+        assert_eq!(engine_delete(&backend, &t, "gone").await, 4);
+        assert_eq!(
+            backend
+                .current_version(&t, "Patient", "gone")
+                .await
+                .unwrap(),
+            None
         );
     }
 

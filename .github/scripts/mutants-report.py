@@ -19,8 +19,24 @@ function, and what was replaced), the timed-out ones, the counts per file and
 the per-mutant build and test times. A missed mutant is a change to the code
 that no test noticed; it is a lead for a reviewer, not a verdict.
 
+For each unviable mutant it reads the first rustc error in the mutant's log
+(`mutants.out/log/`) and groups the mutants by why they did not compile: a
+`Result` type alias cargo-mutants does not see through, a const evaluation
+that rejected the mutant at compile time (a compile-time assertion, as good
+as caught), `Default::default()` for a type with no `Default`, a guessed
+constructor the type does not have, or the rustc error itself. When at least
+TESTED_LITTLE_SHARE of the mutants did not compile for a reason other than a
+const evaluation, so they tested nothing, the report says so at the top and
+warns, with the main reasons (ADR-aacruzgon-0084).
+
+`--alias NAME=ERROR`, given once per alias the job rewrote with
+mutants-result-alias.py, spells the rewritten return types back as the
+source does (`::core::result::Result<T, ERROR>` as `NAME<T>`) in the
+mutants' names.
+
 Usage: mutants-report.py <mutants.out dir> <out-dir> [--exit-status N]
                          [--diff FILE] [--title-note TEXT]
+                         [--alias NAME=ERROR]...
 
 --exit-status is cargo-mutants' own exit status, which says how the run
 ended (book/src/exit-codes.md, cargo-mutants 27.1.0). --diff is the diff the
@@ -59,6 +75,22 @@ OUTCOMES = {
 }
 # "<file>:<line>:<col>: <what>", the mutant names cargo-mutants prints.
 NAME = re.compile(r"^(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+): (?P<what>.*)$")
+# At least this share of a run's mutants did not compile for a reason other
+# than a const evaluation, so they tested nothing: the report warns that the
+# run tested little. On #102 (run 44801901198) the share was 29 of 30, 97 %,
+# all but one a StorageResult alias mutant; on #90 (run 44714518327) it was
+# 22 of 153, 14 % (54 unviable, 32 of them rejected by const evaluation).
+# Half is far from both: below it most mutants were tested.
+TESTED_LITTLE_SHARE = 0.5
+# The return type mutants-result-alias.py writes for an alias.
+REWRITTEN_RESULT = "::core::result::Result<"
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# rustc's own error lines, `error[E0599]: ...` or `error: ...`; the summary
+# lines that follow the real errors are not reasons.
+RUSTC_ERROR = re.compile(r"^error(?:\[(?P<code>E\d{4})\])?: (?P<message>.*)$", re.M)
+NOT_A_REASON = re.compile(r"^(could not compile|aborting due to|Some errors have detailed|For more information)")
+# A constructor cargo-mutants guesses for a generic type it does not know.
+GUESSED_CONSTRUCTOR = re.compile(r"\b(?P<type>[A-Z][A-Za-z0-9_]*)::(?:new|from|from_iter)\b")
 
 
 def cell(text: object) -> str:
@@ -78,6 +110,64 @@ def json_kind(value: object) -> str:
             float: "number", type(None): "null"}.get(type(value), type(value).__name__)
 
 
+def unalias(text: str, aliases: dict[str, str]) -> str:
+    """`::core::result::Result<T, ERROR>`, as mutants-result-alias.py writes an alias, spelled `NAME<T>` again."""
+    if not aliases or REWRITTEN_RESULT not in text:
+        return text
+    by_error = {error: name for name, error in aliases.items()}
+    out, i = "", 0
+    while (start := text.find(REWRITTEN_RESULT, i)) >= 0:
+        open_at = start + len(REWRITTEN_RESULT) - 1
+        depth, close_at = 0, -1
+        for k in range(open_at, len(text)):
+            if text[k] == "<":
+                depth += 1
+            elif text[k] == ">" and text[k - 1] not in "-=":
+                depth -= 1
+                if depth == 0:
+                    close_at = k
+                    break
+        inner = text[open_at + 1:close_at] if close_at >= 0 else ""
+        head, sep, error = inner.rpartition(",")
+        name = by_error.get(error.strip()) if sep else None
+        if name is None:
+            out += text[i:open_at + 1]
+            i = open_at + 1
+            continue
+        out += text[i:start] + f"{name}<{head.rstrip()}>"
+        i = close_at + 1
+    return out + text[i:]
+
+
+def first_rustc_error(log: str) -> tuple[str | None, str] | None:
+    """The first rustc error in a mutant's log, as (code, message), ANSI colours removed."""
+    for match in RUSTC_ERROR.finditer(ANSI.sub("", log)):
+        message = match.group("message").strip()
+        if not NOT_A_REASON.match(message):
+            return match.group("code"), message
+    return None
+
+
+def unviable_reason(replacement: str | None, error: tuple[str | None, str] | None) -> tuple[str, bool]:
+    """Why an unviable mutant did not compile, and whether a const evaluation rejected it (as good as caught)."""
+    code, message = error if error else (None, "")
+    guessed = GUESSED_CONSTRUCTOR.search(replacement or "")
+    if guessed and guessed.group("type").endswith("Result"):
+        return (f"`{guessed.group('type')}::new`, `::from` or `::from_iter`: a `Result` type alias "
+                "cargo-mutants does not see through, so it never tries `Ok(…)`"), False
+    if code == "E0080" or message.startswith("constant evaluation is taking a long time"):
+        return ("rejected at compile time by a const evaluation (a compile-time assertion panicked, or the "
+                "mutated const fn overflowed, went out of bounds or ran too long): as good as caught"), True
+    if code == "E0277" and "Default" in message and "Default::default()" in (replacement or ""):
+        return "`Default::default()` for a type with no `Default` impl", False
+    # E0599 for a missing `new`, E0277, E0271 or E0283 for a `From` or `FromIterator` it does not implement.
+    if code in ("E0599", "E0277", "E0271", "E0283") and guessed:
+        return "a guessed constructor the type does not have (`T::new`, `::from` or `::from_iter`)", False
+    if error is None:
+        return "no rustc error found in the mutant's log", False
+    return f"rustc {code or 'error'}: " + re.sub(r"`[^`]*`", "`…`", message)[:120], False
+
+
 def mutant_of(outcome: dict) -> dict | None:
     scenario = outcome.get("scenario")
     if isinstance(scenario, dict) and isinstance(scenario.get("Mutant"), dict):
@@ -85,9 +175,9 @@ def mutant_of(outcome: dict) -> dict | None:
     return None
 
 
-def describe(mutant: dict) -> dict:
+def describe(mutant: dict, aliases: dict[str, str] | None = None) -> dict:
     """Where a mutant is and what it does, from its JSON (name, file, span, function, replacement)."""
-    name = mutant.get("name") or ""
+    name = unalias(mutant.get("name") or "", aliases or {})
     match = NAME.match(name)
     line = (mutant.get("span") or {}).get("start", {}).get("line")
     if line is None and match:
@@ -102,6 +192,27 @@ def describe(mutant: dict) -> dict:
         "replacement": mutant.get("replacement"),
         "genre": mutant.get("genre"),
     }
+
+
+def log_inside(out_dir: Path, log_path: object) -> Path | None:
+    """The mutant's log file, if outcomes.json names one as a relative path inside mutants.out.
+
+    outcomes.json is the pull request's run output, so its log_path is not
+    trusted: anything but a string, an absolute path or one that leaves the
+    directory (`..`, a symlink) is not read, and its first rustc error never
+    reaches the step summary.
+    """
+    if not isinstance(log_path, str) or not log_path or "\x00" in log_path:
+        return None
+    rel = Path(log_path)
+    if rel.is_absolute() or ".." in rel.parts:
+        return None
+    path = out_dir / rel
+    try:
+        path.resolve().relative_to(out_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return path
 
 
 def phase_seconds(outcome: dict, phase: str) -> float | None:
@@ -129,7 +240,8 @@ def diff_stats(path: Path) -> dict | None:
     return {"files": files, "added_lines": added, "removed_lines": removed}
 
 
-def build(out_dir: Path, exit_status: int | None, diff: Path | None) -> dict:
+def build(out_dir: Path, exit_status: int | None, diff: Path | None,
+          aliases: dict[str, str] | None = None) -> dict:
     warnings: list[str] = []
     data: dict = {"exit_status": exit_status, "exit_meaning": EXIT_MEANING.get(exit_status) if exit_status is not None else None,
                   "warnings": warnings}
@@ -195,9 +307,24 @@ def build(out_dir: Path, exit_status: int | None, diff: Path | None) -> dict:
             warnings.append(f"Mutation testing: unknown outcome {summary!r} for {mutant.get('name')}")
             continue
         counts[kind] += 1
-        info = describe(mutant)
+        info = describe(mutant, aliases)
         info["diff"] = outcome.get("diff_path")
         info["log"] = outcome.get("log_path")
+        if kind == "unviable":
+            log = ""
+            log_file = log_inside(out_dir, info["log"])
+            # Any value but a valid path warns, falsy ones ([], 0, "", missing) too.
+            if log_file is None:
+                warnings.append(f"Mutation testing: the log path of {info['name'] or 'a mutant'} is not a relative "
+                                f"path inside mutants.out ({info['log']!r}), so its log was not read")
+            else:
+                try:
+                    log = log_file.read_text(errors="replace")
+                except OSError:
+                    log = ""
+            error = first_rustc_error(log)
+            info["rustc_error"] = None if error is None else {"code": error[0], "message": error[1]}
+            info["reason"], info["const_eval"] = unviable_reason(info["replacement"], error)
         rows[kind].append(info)
         per_file.setdefault(info["file"] or "?", {key: 0 for key in counts})[kind] += 1
         b, t = phase_seconds(outcome, "Build"), phase_seconds(outcome, "Test")
@@ -225,6 +352,22 @@ def build(out_dir: Path, exit_status: int | None, diff: Path | None) -> dict:
         warnings.append(f"Mutation testing: the baseline (unmutated tree) did not pass ({baseline['summary']}), so no mutant was tested")
     if exit_status is not None and exit_status not in RAN and exit_status != 4:
         warnings.append(f"Mutation testing: cargo-mutants exited {exit_status} ({data['exit_meaning'] or 'unknown status'})")
+    reasons: dict[str, dict] = {}
+    for row in data["unviable"]:
+        entry = reasons.setdefault(row["reason"], {"reason": row["reason"], "count": 0,
+                                                   "const_eval": row["const_eval"], "example": row["name"]})
+        entry["count"] += 1
+    data["unviable_reasons"] = sorted(reasons.values(), key=lambda r: (-r["count"], r["reason"]))
+    total = data.get("generated") or data["tested"]
+    untestable = sum(r["count"] for r in data["unviable_reasons"] if not r["const_eval"])
+    data["untestable"] = untestable
+    data["untestable_share"] = round(untestable / total, 3) if total else None
+    data["tested_little"] = bool(total) and untestable / total >= TESTED_LITTLE_SHARE
+    if data["tested_little"]:
+        main_reasons = "; ".join(f"{r['count']}: {r['reason']}" for r in data["unviable_reasons"]
+                                 if not r["const_eval"])
+        warnings.append(f"Mutation testing tested little: {untestable} of {total} mutants "
+                        f"({untestable / total:.0%}) did not compile, so they tested nothing. {main_reasons}")
     generated = data.get("generated")
     if generated is not None and data["tested"] < generated:
         data["untested"] = generated - data["tested"]
@@ -246,6 +389,12 @@ def markdown(data: dict, title_note: str | None = None) -> str:
         return md
     c = data["counts"]
     score = f"{data['score']:.1%}" if data.get("score") is not None else "–"
+    if data.get("tested_little"):
+        total = data.get("generated") or data["tested"]
+        md += (f"> **Warning: this run tested little.** {data['untestable']} of {total} mutants "
+               f"({data['untestable_share']:.0%}) did not compile for a reason other than a compile-time "
+               "check, so they tested nothing, and the score below rests on the few that did. "
+               "The reasons are under \"Why the unviable mutants did not compile\".\n\n")
     md += table(
         ["Mutants", "Caught", "Missed", "Unviable", "Timed out", "Score (caught / viable)"],
         [[data.get("generated") if data.get("generated") is not None else data["tested"], c["caught"], c["missed"],
@@ -266,6 +415,11 @@ def markdown(data: dict, title_note: str | None = None) -> str:
             ["Where", "Function", "Mutation"],
             [[f"`{r['file']}:{r['line']}`", f"`{r['function']}`" if r["function"] else "–", f"`{r['mutation']}`"]
              for r in data["timeout"]],
+        )
+    if data.get("unviable_reasons"):
+        md += "\n### Why the unviable mutants did not compile\n\n" + table(
+            ["Reason (the first rustc error in each mutant's log)", "Mutants", "Example"],
+            [[r["reason"], r["count"], f"`{r['example']}`"] for r in data["unviable_reasons"]],
         )
     if data.get("per_file"):
         md += "\n### Per file\n\n" + table(
@@ -293,6 +447,13 @@ def fmt_s(value: float | None) -> str:
 def main(argv: list[str]) -> int:
     args = list(argv)
     exit_status = diff = note = None
+    aliases: dict[str, str] = {}
+    while "--alias" in args:
+        i = args.index("--alias")
+        name, _, error = (args[i + 1] if i + 1 < len(args) else "").partition("=")
+        if name and error:
+            aliases[name] = error
+        del args[i:i + 2]
     if "--exit-status" in args:
         i = args.index("--exit-status")
         try:
@@ -313,7 +474,7 @@ def main(argv: list[str]) -> int:
         return 0
     source, out = Path(args[0]), Path(args[1])
     out.mkdir(parents=True, exist_ok=True)
-    data = build(source, exit_status, diff)
+    data = build(source, exit_status, diff, aliases)
     md = markdown(data, note)
     (out / "mutants.md").write_text(md)
     (out / "mutants.json").write_text(json.dumps(data, indent=2) + "\n")

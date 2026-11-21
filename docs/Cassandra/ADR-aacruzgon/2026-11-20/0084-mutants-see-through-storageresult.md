@@ -84,4 +84,6 @@
           | 44826753307 | this branch (after) | #90 `e5e8ea67f..998427a19` | 153 | 91 | 8 | 54 | 0 | 1,430 s (job 25.3 min) | 15,199 MiB |
 
           On #90 the caught, missed and unviable lists are identical before and after; the rewrite step took 1 s in each after run.
+
+          After the audit's fixes (`68a67fd69`), run 44853443170 on #102 `912b7d6c2`, `base=main`, gave the same 10 / 7 / 0 / 3 / 0 as run 44825415773, with identical lists, in 403 s (job 8.2 min) at 14,981 MiB peak `anon`.
 - **Links:** PR #103; ADR-aacruzgon-0082 (amended); run 44801901198 and the PR #102 review (`report-pr102-review.md`, "CI mutation job"); cargo-mutants 27.1.0 `src/fnvalue.rs:77`, `:150-163`, `:263`, `src/in_diff.rs:159`; `crates/persistence/src/error.rs:1068`; `development-roadmap.md` row 0.13 and section 8 (the upstream touch list's CI workflows line).

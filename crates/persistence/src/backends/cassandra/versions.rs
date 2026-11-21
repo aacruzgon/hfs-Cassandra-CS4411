@@ -28,7 +28,8 @@
 //!   `delete_versioned`'s, so a writer landing after the comparison makes
 //!   that CAS miss rather than being deleted with it (#1404).
 //! - **`update_with_match`** (roadmap Step 4) has the same shape. It checks
-//!   `Operation::Update` and, for a SearchParameter, the `code` bound (G38),
+//!   `Operation::Update` (the SearchParameter `code` bound, G38, is
+//!   `update`'s, before any statement there),
 //!   pre-reads the resource with `read` (absent or deleted: `NotFound`),
 //!   compares the field with its version as `delete_with_match` does (a
 //!   mismatch is `VersionConflict`, 409, with nothing written), and then
@@ -65,7 +66,6 @@ use super::errors::{BACKEND_NAME, map_driver_error};
 use super::read::{deleted_at_of, fhir_version_of};
 use super::session::{PAGE_SIZE, StatementKind};
 use super::storage::BULK_WRITE_CONCURRENCY;
-use super::write::check_search_parameter_code;
 use crate::core::{if_match_field_satisfied, normalize_etag};
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
@@ -277,9 +277,11 @@ impl CassandraBackend {
         expected_version: &str,
         resource: Json,
     ) -> StorageResult<StoredResource> {
-        // Both again in `update`, before any statement there too.
+        // Again in `update`, before any statement there too. The
+        // SearchParameter `code` bound (G38) is left to `update`, so this file
+        // does not depend on `write.rs`'s check, which Step 5's extraction
+        // pull request removes (ADR-aacruzgon-0079).
         tenant.check_permission(Operation::Update, resource_type)?;
-        check_search_parameter_code(resource_type, &resource)?;
         let current = match self.read_resource(tenant, resource_type, id).await {
             Ok(Some(current)) => current,
             Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. })) => {
@@ -986,8 +988,10 @@ mod node_tests {
 
     /// What `update_with_match` refuses, each with nothing written, as
     /// `delete_with_match` does: a stale tag (409), an absent or deleted
-    /// resource (`NotFound`), and, before any statement, a tenant without
-    /// update permission and a SearchParameter `code` over 128 bytes (G38).
+    /// resource (`NotFound`); a tenant without update permission, before any
+    /// statement; and a SearchParameter `code` over 128 bytes (G38), which
+    /// `update` refuses after the pre-read and before any statement of its
+    /// own.
     #[tokio::test]
     async fn update_with_match_refuses_without_writing() {
         let Some(backend) = backend().await else {
@@ -1067,22 +1071,59 @@ mod node_tests {
         }
         assert_eq!(backend.statement_counts().since(&before).total(), 0);
 
-        // A SearchParameter `code` over 128 bytes: refused before the
-        // pre-read too, as `update` refuses it (G38).
-        let long_code = json!({
-            "resourceType": "SearchParameter",
-            "id": "sp",
-            "code": "c".repeat(129),
-        });
+        // A SearchParameter `code` over 128 bytes (G38): `update` refuses it
+        // before any statement of its own, so only the pre-read is spent and
+        // nothing is written. The SearchParameter exists, with a short code,
+        // so the pre-read finds it.
+        let search_parameter = |code: String| {
+            json!({
+                "resourceType": "SearchParameter",
+                "id": "sp",
+                "url": "http://example.org/sp",
+                "status": "active",
+                "code": code,
+                "base": ["Patient"],
+                "type": "token",
+                "expression": "Patient.gender"
+            })
+        };
+        backend
+            .create(
+                &t,
+                "SearchParameter",
+                search_parameter("short".to_string()),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
+            .await
+            .expect("create the SearchParameter");
         let before = backend.statement_counts();
         match backend
-            .update_with_match(&t, "SearchParameter", "sp", "*", long_code)
+            .update_with_match(
+                &t,
+                "SearchParameter",
+                "sp",
+                "*",
+                search_parameter("c".repeat(129)),
+            )
             .await
         {
             Err(StorageError::Validation(_)) => {}
             other => panic!("expected a validation refusal, got {other:?}"),
         }
-        assert_eq!(backend.statement_counts().since(&before).total(), 0);
+        let spent = backend.statement_counts().since(&before);
+        assert_eq!(
+            (spent.read, spent.total()),
+            (1, 1),
+            "the pre-read only, nothing written"
+        );
+        assert_eq!(
+            backend
+                .current_version(&t, "SearchParameter", "sp")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
     }
 
     /// Another writer landing between the pre-read and the compare-and-swap,

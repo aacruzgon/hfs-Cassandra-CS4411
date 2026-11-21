@@ -306,10 +306,12 @@ jobs:
       # workflow's scripts), so a head that predates ADR-aacruzgon-0084 has no
       # mutants-result-alias.py: the step says so, and that run gets the old
       # unviable replacements until main is merged into the branch. Not
-      # covered: a restore that itself fails (warned; cargo-mutants' diff check
-      # then refuses the partly rewritten tree, exit 5), and a rewritten tree
-      # that does not build (the baseline fails, which the report warns about);
-      # neither has happened, since the rewrite is the same type.
+      # covered: a restore that itself fails (warned; the run goes on with the
+      # partly rewritten tree, the same type, so it builds and its names keep
+      # the ::core::result::Result<...> spelling; cargo-mutants refuses it,
+      # exit 5, only if a rewritten line is in the diff, and in_diff=none has
+      # no diff check), and a rewritten tree that does not build (the baseline
+      # fails, which the report warns about); neither has happened.
       - name: Let cargo-mutants see through StorageResult
         id: alias
         if: steps.diff.outcome == 'success' && steps.diff.outputs.files != '0'

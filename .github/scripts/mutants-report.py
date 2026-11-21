@@ -194,6 +194,27 @@ def describe(mutant: dict, aliases: dict[str, str] | None = None) -> dict:
     }
 
 
+def log_inside(out_dir: Path, log_path: object) -> Path | None:
+    """The mutant's log file, if outcomes.json names one as a relative path inside mutants.out.
+
+    outcomes.json is the pull request's run output, so its log_path is not
+    trusted: anything but a string, an absolute path or one that leaves the
+    directory (`..`, a symlink) is not read, and its first rustc error never
+    reaches the step summary.
+    """
+    if not isinstance(log_path, str) or not log_path or "\x00" in log_path:
+        return None
+    rel = Path(log_path)
+    if rel.is_absolute() or ".." in rel.parts:
+        return None
+    path = out_dir / rel
+    try:
+        path.resolve().relative_to(out_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return path
+
+
 def phase_seconds(outcome: dict, phase: str) -> float | None:
     for result in outcome.get("phase_results") or []:
         if result.get("phase") == phase and isinstance(result.get("duration"), (int, float)):
@@ -290,10 +311,16 @@ def build(out_dir: Path, exit_status: int | None, diff: Path | None,
         info["diff"] = outcome.get("diff_path")
         info["log"] = outcome.get("log_path")
         if kind == "unviable":
-            try:
-                log = (out_dir / info["log"]).read_text(errors="replace") if info["log"] else ""
-            except OSError:
-                log = ""
+            log = ""
+            log_file = log_inside(out_dir, info["log"])
+            if log_file is None and info["log"]:
+                warnings.append(f"Mutation testing: the log path of {info['name'] or 'a mutant'} is not a relative "
+                                f"path inside mutants.out ({info['log']!r}), so its log was not read")
+            elif log_file is not None:
+                try:
+                    log = log_file.read_text(errors="replace")
+                except OSError:
+                    log = ""
             error = first_rustc_error(log)
             info["rustc_error"] = None if error is None else {"code": error[0], "message": error[1]}
             info["reason"], info["const_eval"] = unviable_reason(info["replacement"], error)

@@ -327,10 +327,21 @@ jobs:
             exit 1
           fi
           if [ -n "$DIFF" ]; then cp "$DIFF" "$DIFF.orig"; args+=(--diff "$DIFF"); fi
-          if ! out=$(python3 -I "$CI_SCRIPTS/mutants-result-alias.py" "${args[@]}" "$dir"); then
+          status=0
+          out=$(python3 -I "$CI_SCRIPTS/mutants-result-alias.py" "${args[@]}" "$dir") || status=$?
+          if [ "$status" != 0 ]; then
             git checkout -- "$dir" || echo "::warning title=Mutation testing::git checkout could not restore $dir after the failed rewrite"
             if [ -n "$DIFF" ]; then cp "$DIFF.orig" "$DIFF"; fi
-            echo "::warning title=Mutation testing::StorageResult<T> could not be spelled as a Result, so its functions get only body replacements that do not compile; see this step's log"
+            if [ "$status" = 3 ]; then
+              # The diff's new side is not this tree (a dispatch's in_diff
+              # range that does not end at head): realigning it would hide
+              # that, so nothing is rewritten and cargo-mutants refuses the
+              # diff itself (exit 5).
+              echo "stale=true" >> "$GITHUB_OUTPUT"
+              echo "::warning title=Mutation testing::the diff does not match the checked-out tree (an in_diff range that does not end at head?), so StorageResult<T> was not rewritten and cargo-mutants will refuse the diff; see this step's log"
+            else
+              echo "::warning title=Mutation testing::StorageResult<T> could not be spelled as a Result, so its functions get only body replacements that do not compile; see this step's log"
+            fi
             exit 1
           fi
           echo "$out"
@@ -456,6 +467,7 @@ jobs:
           ALIAS_OUTCOME: ${{ steps.alias.outcome }}
           ALIAS_SUMMARY: ${{ steps.alias.outputs.summary }}
           ALIAS_PREDATES: ${{ steps.alias.outputs.predates }}
+          ALIAS_STALE: ${{ steps.alias.outputs.stale }}
         run: |
           out="$RUNNER_TEMP/ci-report/inputs/mutants"
           mkdir -p "$out"
@@ -469,6 +481,8 @@ jobs:
             note+=" \`StorageResult<T>\` return types spelled \`::core::result::Result<T, crate::error::StorageError>\` in this job's checkout, so cargo-mutants tries \`Ok(…)\` (${ALIAS_SUMMARY:-?}); the names below spell them as the source does, the diffs in \`mutants.out/\` do not."
           elif [ "$ALIAS_PREDATES" = true ]; then
             note+=" This head predates ADR-aacruzgon-0084, so \`StorageResult<T>\` was not spelled as a Result and its functions' body replacements did not compile; merge main to get \`Ok(…)\` mutants."
+          elif [ "$ALIAS_STALE" = true ]; then
+            note+=" The diff did not match the checked-out tree, so \`StorageResult<T>\` was not rewritten (see the step's warning)."
           elif [ "$ALIAS_OUTCOME" = failure ]; then
             note+=" \`StorageResult<T>\` could not be spelled as a Result in this run, so its functions' body replacements did not compile."
           fi

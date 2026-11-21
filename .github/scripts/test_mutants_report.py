@@ -289,6 +289,24 @@ class Unviable(Run):
         })
         self.assertFalse(data["tested_little"])
 
+    def test_a_log_path_that_is_not_a_relative_path_inside_mutants_out_is_not_read(self):
+        # outcomes.json is the pull request's run output: a log_path that is not a
+        # string, or that leaves mutants.out, must neither crash the report nor
+        # bring another file's first error line into the step summary.
+        for bad in (["log/x.log"], 7, "/etc/passwd", "../secret.log", "log/../../secret.log"):
+            with self.subTest(log_path=bad):
+                item, _ = unviable(438, "replace f -> u8 with Default::default()", "Default::default()", None)
+                item["log_path"] = bad
+                out = self.write(outcomes(item), None)
+                (out.parent / "secret.log").write_text("error[E0001]: SECRET\n")
+                data = report.build(out, 0, None)
+                self.assertIsNone(data["unviable"][0]["rustc_error"])
+                self.assertTrue(any("is not a relative path inside mutants.out" in w for w in data["warnings"]))
+                dest = out.parent / "report"
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(report.main([str(out), str(dest)]), 0)
+                self.assertNotIn("SECRET", (dest / "mutants.md").read_text())
+
     def test_first_rustc_error_skips_the_summary_lines(self):
         log = ("\x1b[91merror\x1b[0m: aborting due to 2 previous errors\n"
                "\x1b[1m\x1b[91merror[E0283]\x1b[0m\x1b[1m: type annotations needed\x1b[0m\n")
@@ -360,6 +378,14 @@ class ResultAlias(unittest.TestCase):
                 self.assertEqual(self.rewrite(f"fn f() -> StorageResult<{inner}> {{\n}}\n"),
                                  f"fn f() -> ::core::result::Result<{inner}, crate::error::StorageError> {{\n}}\n")
 
+    def test_a_comment_after_or_ending_with_a_comma_is_not_the_trailing_comma(self):
+        self.assertEqual(self.rewrite("fn f() -> StorageResult<u8, /* note */> {}"),
+                         "fn f() -> ::core::result::Result<u8, /* note */ crate::error::StorageError> {}")
+        self.assertEqual(self.rewrite("fn f() -> StorageResult<\n    u8 // a note,\n> {}"),
+                         "fn f() -> ::core::result::Result<\n    u8 // a note,\n, crate::error::StorageError> {}")
+        self.assertEqual(self.rewrite("fn f() -> StorageResult<u8 /* a, */> {}"),
+                         "fn f() -> ::core::result::Result<u8 /* a, */, crate::error::StorageError> {}")
+
     def test_an_unbalanced_bracket_is_refused(self):
         with self.assertRaises(alias.Unbalanced):
             alias.rewrite_source("fn f() -> StorageResult<u8 {\n}\n", STORAGE)
@@ -396,6 +422,18 @@ class ResultAlias(unittest.TestCase):
                 .replace(f" ctx2\n-x\n+{sig}\n {sig}", f" ctx2\n-x\n+{new_sig}\n {new_sig}"))
         self.assertEqual(want.count(new_sig), 4)
         self.assertEqual(alias.realign_diff(diff, files), want)
+
+    def test_a_diff_whose_new_side_is_not_the_tree_is_refused(self):
+        # An in_diff range that does not end at the checked-out head: its line
+        # numbers point at other code, so realigning it would hide the mismatch.
+        diff = "--- a/x.rs\n+++ b/x.rs\n@@ -4,2 +4,2 @@\n-    2\n+    2 + 0\n }\n"
+        tree = ["fn f() -> StorageResult<u8> {", "    Ok(1)", "}", "    0", "}", ""]
+        rewritten = [tree[0].replace("StorageResult<u8>", "::core::result::Result<u8, E>")] + tree[1:]
+        with self.assertRaises(alias.StaleDiff):
+            alias.realign_diff(diff, {"x.rs": rewritten}, {"x.rs": tree})
+        matching = "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n fn f() -> StorageResult<u8> {\n-    Ok(0)\n+    Ok(1)\n"
+        self.assertIn(" fn f() -> ::core::result::Result<u8, E> {",
+                      alias.realign_diff(matching, {"x.rs": rewritten}, {"x.rs": tree}))
 
     def test_a_form_feed_or_a_crlf_line_survives_the_realignment(self):
         diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,3 +1,3 @@\n fn f() -> StorageResult<u8> {\r\n-    0 // a\x0cb\r\n+    1 // a\x0cb\r\n }\r\n"
@@ -439,6 +477,16 @@ class ResultAlias(unittest.TestCase):
                                              str(diff), "crates/persistence/src/backends/cassandra"]), 1)
             self.assertEqual((src / "a.rs").read_text(), "fn f() -> StorageResult<u8> {\n")
             self.assertEqual(diff.read_text(), before)
+            # A diff that does not match the tree: nothing is written, exit 3.
+            (src / "c.rs").unlink()
+            a_before = (src / "a.rs").read_text()
+            diff.write_text(f"--- a/{rel}\n+++ b/{rel}\n@@ -1,1 +1,1 @@\n-fn f() -> u8 {{\n+fn f() -> StorageResult<u16> {{\n")
+            stale = diff.read_text()
+            with redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(alias.main(["--alias", "StorageResult=crate::error::StorageError", "--diff",
+                                             str(diff), "crates/persistence/src/backends/cassandra"]), 3)
+            self.assertEqual((src / "a.rs").read_text(), a_before)
+            self.assertEqual(diff.read_text(), stale)
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(alias.main(["--alias", "bad", "x"]), 2)
         finally:

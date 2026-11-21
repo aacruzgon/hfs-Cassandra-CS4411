@@ -25,15 +25,17 @@ script also replaces each new-side line of that diff (context and added
 lines) with the rewritten file's line of the same number. The removed lines
 and the hunk headers stay as they were. The diff is split on "\n" only, and
 files and diff are read and written with their newlines as they are, so a
-form feed or a CRLF line survives. The realignment trusts that the diff was
-taken from this tree: it would make a stale diff look current, so it must
-run on the checkout the diff came from, as the job does.
+form feed or a CRLF line survives. Realigning would make a stale diff look
+current (a dispatch's in_diff range whose new side is not the checked-out
+head), so first each new-side line of every file to be rewritten is checked
+against that file as it is, and a mismatch stops the script before it
+writes anything (exit 3): cargo-mutants then refuses the stale diff itself.
 
 Usage: mutants-result-alias.py --alias NAME=ERROR [--alias ...] [--diff FILE]
                                [--summary FILE] <dir>...
 
 Prints what it rewrote; `--summary` writes the same as JSON. Exits 1 if the
-rewrite failed. Every file is rewritten in memory first, so an unbalanced
+rewrite failed, 3 if the diff does not match the tree, 2 on a usage error. Every file is rewritten in memory first, so an unbalanced
 `<` changes nothing; a write that fails part-way (a read-only file) can leave
 some files rewritten, which the job's step undoes with `git checkout`, so the
 job carries on with the tree as it was. Standard library only; runs with
@@ -53,6 +55,10 @@ IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 
 class Unbalanced(ValueError):
     """A `NAME<` with no matching `>` in the code that follows it."""
+
+
+class StaleDiff(ValueError):
+    """A new-side line of the diff that is not the tree's line of the same number."""
 
 
 def code_mask(text: str) -> list[bool]:
@@ -156,7 +162,10 @@ def rewrite_source(text: str, aliases: dict[str, str]) -> tuple[str, int]:
         open_at = m.end() - 1
         close_at = closing_angle(text, mask, open_at)
         # After a trailing comma (rustfmt's multi-line style) the error type needs none of its own.
-        sep = " " if text[open_at + 1:close_at].rstrip().endswith(",") else ", "
+        # The last character of code before the `>`, so a comment after a
+        # trailing comma, or one that ends with a comma, is not misread.
+        last = next((text[k] for k in range(close_at - 1, open_at, -1) if mask[k] and not text[k].isspace()), "")
+        sep = " " if last == "," else ", "
         edits.append((m.start("path"), m.end("path"), RESULT))
         edits.append((close_at, close_at, sep + aliases[m.group("alias")]))
     for start, end, new in sorted(edits, reverse=True):
@@ -164,10 +173,17 @@ def rewrite_source(text: str, aliases: dict[str, str]) -> tuple[str, int]:
     return text, len(found)
 
 
-def realign_diff(diff_text: str, files: dict[str, list[str]]) -> str:
-    """The diff with each new-side line of a file in `files` replaced by that file's line of the same number."""
+def realign_diff(diff_text: str, files: dict[str, list[str]],
+                 originals: dict[str, list[str]] | None = None) -> str:
+    """The diff with each new-side line of a file in `files` replaced by that file's line of the same number.
+
+    With `originals` (the same files before the rewrite), each such line must
+    first be the original file's line of that number, or StaleDiff is raised.
+    """
     out: list[str] = []
     lines: list[str] | None = None
+    before: list[str] | None = None
+    path = ""
     new_no = old_left = new_left = 0
     # On "\n" only: str.splitlines would also split a line at a form feed,
     # \x1c-\x1e, \x85, U+2028 or U+2029.
@@ -179,6 +195,10 @@ def realign_diff(diff_text: str, files: dict[str, list[str]]) -> str:
             # starts with "++ " is never read as a file header.
             tag = raw[:1]
             if tag in (" ", "+"):
+                if lines is not None and before is not None:
+                    was = before[new_no - 1] if 0 < new_no <= len(before) else ""
+                    if body[1:] != was:
+                        raise StaleDiff(f"{path} line {new_no}: the diff has {body[1:]!r}, the tree has {was!r}")
                 if lines is not None and 0 < new_no <= len(lines):
                     body = tag + lines[new_no - 1]
                 new_no += 1
@@ -190,7 +210,9 @@ def realign_diff(diff_text: str, files: dict[str, list[str]]) -> str:
             continue
         if raw.startswith("+++ "):
             path = body[4:].split("\t")[0]
-            lines = files.get(path[2:] if path.startswith("b/") else path)
+            path = path[2:] if path.startswith("b/") else path
+            lines = files.get(path)
+            before = (originals or {}).get(path) if originals is not None else None
         elif hunk := re.match(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", body):
             old_left = int(hunk.group(1) or 1)
             new_no = int(hunk.group(2))
@@ -212,6 +234,7 @@ def write(path: Path, text: str, errors: str = "strict") -> None:
 
 def run(dirs: list[Path], aliases: dict[str, str], diff: Path | None, root: Path) -> dict:
     rewritten: dict[str, str] = {}
+    originals: dict[str, str] = {}
     counts: dict[str, int] = {}
     for d in dirs:
         for path in sorted(d.rglob("*.rs")):
@@ -221,15 +244,21 @@ def run(dirs: list[Path], aliases: dict[str, str], diff: Path | None, root: Path
                 if new.count("\n") != text.count("\n"):
                     raise Unbalanced(f"{path}: the rewrite changed the number of lines")
                 rel = path.resolve().relative_to(root.resolve()).as_posix()
+                originals[rel] = text
                 rewritten[rel] = new
                 counts[rel] = count
     # Every file is rewritten in memory first, so a file that cannot be
     # rewritten changes nothing; a failed write is undone by the job's step.
-    diff_text = read(diff, "surrogateescape") if diff is not None else None
+    # The diff is checked against the tree and realigned before any file is written.
+    realigned = None
+    if diff is not None:
+        realigned = realign_diff(read(diff, "surrogateescape"),
+                                 {rel: new.split("\n") for rel, new in rewritten.items()},
+                                 {rel: old.split("\n") for rel, old in originals.items()})
     for rel, new in rewritten.items():
         write(root / rel, new)
-    if diff is not None:
-        write(diff, realign_diff(diff_text, {rel: new.split("\n") for rel, new in rewritten.items()}), "surrogateescape")
+    if realigned is not None:
+        write(diff, realigned, "surrogateescape")
     return {"aliases": aliases, "return_types": sum(counts.values()), "files": counts}
 
 
@@ -259,6 +288,9 @@ def main(argv: list[str]) -> int:
         return 2
     try:
         data = run([Path(a) for a in args], aliases, diff, Path.cwd())
+    except StaleDiff as error:
+        print(f"mutants-result-alias: nothing rewritten, the diff does not match the tree: {error}", file=sys.stderr)
+        return 3
     except (Unbalanced, OSError, ValueError) as error:
         print(f"mutants-result-alias: rewrite failed; the job restores the tree: {error}", file=sys.stderr)
         return 1

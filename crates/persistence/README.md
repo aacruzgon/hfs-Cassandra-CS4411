@@ -616,7 +616,7 @@ Backends can serve as primary (CRUD, versioning, and — where the backend suppo
 | PostgreSQL alone           | PostgreSQL | —                      | ✓ Implemented                   | Production OLTP                         |
 | PostgreSQL + Elasticsearch | PostgreSQL | Elasticsearch (search) | ✓ Implemented                   | OLTP + advanced search                  |
 | PostgreSQL + Neo4j         | PostgreSQL | Neo4j (graph)          | Planned                         | Graph-heavy queries                     |
-| Cassandra alone            | Cassandra  | —                      | In development (CRUD, vread)    | High write throughput                   |
+| Cassandra alone            | Cassandra  | —                      | In development (CRUD, versioning) | High write throughput                 |
 | Cassandra + Elasticsearch  | Cassandra  | Elasticsearch (search) | Planned                         | Write-heavy + search                    |
 | MongoDB alone              | MongoDB    | —                      | ✓ Implemented                   | Document-centric                        |
 | MongoDB + Elasticsearch    | MongoDB    | Elasticsearch (search) | ✓ Implemented                   | Document-centric + offloaded search     |
@@ -3166,7 +3166,7 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 
 ### Phase 5+: Additional Backends (Planned)
 
-- [ ] Cassandra backend (wide-column, partition keys): in development; CRUD, vread and batch done (roadmap Step 3), versioning, index writes and search next (`docs/Cassandra/development-roadmap.md`)
+- [ ] Cassandra backend (wide-column, partition keys): in development; CRUD, vread and batch done (roadmap Step 3), versioning done (Step 4), index writes and search next (`docs/Cassandra/development-roadmap.md`)
 - [x] MongoDB Phase 1 scaffold (module wiring, config, Backend trait baseline)
 - [x] MongoDB Phase 2 core storage parity (CRUD/count/read_batch/create_or_update, tenant isolation, soft-delete, schema bootstrap)
 - [x] MongoDB Phase 3 versioning/history plus best-effort session-backed consistency

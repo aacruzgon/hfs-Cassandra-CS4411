@@ -313,10 +313,11 @@ def build(out_dir: Path, exit_status: int | None, diff: Path | None,
         if kind == "unviable":
             log = ""
             log_file = log_inside(out_dir, info["log"])
-            if log_file is None and info["log"]:
+            # Any value but a valid path warns, falsy ones ([], 0, "", missing) too.
+            if log_file is None:
                 warnings.append(f"Mutation testing: the log path of {info['name'] or 'a mutant'} is not a relative "
                                 f"path inside mutants.out ({info['log']!r}), so its log was not read")
-            elif log_file is not None:
+            else:
                 try:
                     log = log_file.read_text(errors="replace")
                 except OSError:

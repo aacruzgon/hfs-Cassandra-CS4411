@@ -293,10 +293,13 @@ class Unviable(Run):
         # outcomes.json is the pull request's run output: a log_path that is not a
         # string, or that leaves mutants.out, must neither crash the report nor
         # bring another file's first error line into the step summary.
-        for bad in (["log/x.log"], 7, "/etc/passwd", "../secret.log", "log/../../secret.log"):
+        for bad in (["log/x.log"], 7, [], 0, "", "missing", "/etc/passwd", "../secret.log", "log/../../secret.log"):
             with self.subTest(log_path=bad):
                 item, _ = unviable(438, "replace f -> u8 with Default::default()", "Default::default()", None)
-                item["log_path"] = bad
+                if bad == "missing":
+                    del item["log_path"]
+                else:
+                    item["log_path"] = bad
                 out = self.write(outcomes(item), None)
                 (out.parent / "secret.log").write_text("error[E0001]: SECRET\n")
                 data = report.build(out, 0, None)

@@ -90,13 +90,16 @@ impl Checkpoints {
         }
     }
 
-    /// Called at each point: takes the first matching armed hold (removing
-    /// it), signals `reached`, then waits for `release` (or for the `Hold` to
-    /// be dropped). Without a match it returns at once. The lock is never
-    /// held across the await.
+    /// Called at each point: takes the first matching armed hold that is still
+    /// held (a hold whose `Hold` was dropped is skipped, so arming the same
+    /// point and key again works), removing it, signals `reached`, then waits
+    /// for `release` (or for the `Hold` to be dropped). Without a match it
+    /// returns at once. The lock is never held across the await.
     pub(crate) async fn pass(&self, point: Checkpoint, tenant_id: &str, id: &str, version_id: i32) {
         let taken = {
             let mut armed = self.armed.lock();
+            // A `Hold` that was dropped closed its `reached` receiver.
+            armed.retain(|a| !a.reached.is_closed());
             armed
                 .iter()
                 .position(|a| {
@@ -210,6 +213,19 @@ mod tests {
         let hold = checkpoints.arm(Checkpoint::AfterIndex, "t", "p", 2);
         drop(hold);
         within(checkpoints.pass(Checkpoint::AfterIndex, "t", "p", 2)).await;
+
+        // Dropping a hold and arming the same point and key again: the new
+        // hold sees the request.
+        let dropped = checkpoints.arm(Checkpoint::AfterIndex, "t", "p", 3);
+        drop(dropped);
+        let mut rearmed = checkpoints.arm(Checkpoint::AfterIndex, "t", "p", 3);
+        let task = tokio::spawn({
+            let checkpoints = checkpoints.clone();
+            async move { checkpoints.pass(Checkpoint::AfterIndex, "t", "p", 3).await }
+        });
+        rearmed.reached().await;
+        rearmed.release();
+        within(task).await.expect("the request goes on");
     }
 
     #[tokio::test]

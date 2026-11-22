@@ -21,7 +21,7 @@ use axum::{
 };
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
-    BundleProvider, ConditionalStorage, ResourceStorage, SearchProvider,
+    BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
 };
 use helios_persistence::search::SearchParameterRegistry;
 use helios_persistence::types::SearchParamType;
@@ -81,6 +81,7 @@ where
         + SearchProvider
         + BundleProvider
         + ConditionalStorage
+        + InstanceHistoryProvider
         + Send
         + Sync
         + 'static,
@@ -131,6 +132,7 @@ where
         + SearchProvider
         + BundleProvider
         + ConditionalStorage
+        + InstanceHistoryProvider
         + Send
         + Sync
         + 'static,
@@ -151,6 +153,14 @@ where
     // answers every search `501` (its `search` returns `UnsupportedCapability`),
     // so the statement promised an interaction no request could use (#514).
     let supports_search = state.storage().supports_search();
+
+    // The history interactions are the storage's to declare too: a backend
+    // whose history methods are stubs answers them `501`, and GET /metadata
+    // "SHALL" say which interactions are supported
+    // (https://hl7.org/fhir/R4/http.html#capabilities). `vread`, `versioning`
+    // and `readHistory` stay: `readHistory` is about vread of past versions
+    // (https://hl7.org/fhir/R4/capabilitystatement-definitions.html#CapabilityStatement.rest.resource.readHistory).
+    let supports_history = state.storage().supports_history();
 
     // Per-parameter-type modifier sets the backend actually honors. Used to
     // advertise supported modifiers (as `valueCode` extensions) on each
@@ -191,6 +201,7 @@ where
                 &conditionals,
                 &registry,
                 supports_search,
+                supports_history,
                 supports_contained,
                 &modifier_map,
                 &revinclude_by_target,
@@ -219,7 +230,9 @@ where
         system_interactions.push(serde_json::json!({ "code": "transaction" }));
     }
     system_interactions.push(serde_json::json!({ "code": "batch" }));
-    system_interactions.push(serde_json::json!({ "code": "history-system" }));
+    if supports_history {
+        system_interactions.push(serde_json::json!({ "code": "history-system" }));
+    }
     // No `search-system`: `GET [base]?params` and `POST [base]/_search` are
     // refused with `501` (`search_system_not_supported_handler`). It was listed
     // here unconditionally while no route served it (#1338).
@@ -429,38 +442,45 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
 /// When it is `false` the entry carries no `search-type` interaction and no
 /// `searchParam`, `searchInclude` or `searchRevInclude`, for every type
 /// (#514); everything else is unchanged.
+///
+/// `supports_history` is the storage's
+/// [`InstanceHistoryProvider::supports_history`]. When it is `false` the entry
+/// carries no `history-instance` or `history-type` interaction, for every type
+/// (`AuditEvent` included); `vread`, `versioning: versioned` and
+/// `readHistory: true` stay.
 #[allow(clippy::too_many_arguments)]
 fn build_resource_capability(
     resource_type: &str,
     conditionals: &serde_json::Map<String, serde_json::Value>,
     registry: &SearchParameterRegistry,
     supports_search: bool,
+    supports_history: bool,
     supports_contained: bool,
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
     revinclude_by_target: &std::collections::HashMap<String, std::collections::BTreeSet<String>>,
     version: FhirVersion,
 ) -> serde_json::Value {
-    let mut interactions = if resource_type == "AuditEvent" {
-        serde_json::json!([
-            { "code": "read" },
-            { "code": "vread" },
-            { "code": "history-instance" },
-            { "code": "history-type" }
-        ])
+    let codes: &[&str] = if resource_type == "AuditEvent" {
+        &["read", "vread", "history-instance", "history-type"]
     } else {
-        serde_json::json!([
-            { "code": "read" },
-            { "code": "vread" },
-            { "code": "update" },
-            { "code": "patch" },
-            { "code": "delete" },
-            { "code": "history-instance" },
-            { "code": "history-type" },
-            { "code": "create" }
-        ])
+        &[
+            "read",
+            "vread",
+            "update",
+            "patch",
+            "delete",
+            "history-instance",
+            "history-type",
+            "create",
+        ]
     };
-    if supports_search && let Some(list) = interactions.as_array_mut() {
-        list.push(serde_json::json!({ "code": "search-type" }));
+    let mut interactions: Vec<serde_json::Value> = codes
+        .iter()
+        .filter(|code| supports_history || !code.starts_with("history-"))
+        .map(|code| serde_json::json!({ "code": code }))
+        .collect();
+    if supports_search {
+        interactions.push(serde_json::json!({ "code": "search-type" }));
     }
 
     let mut entry = serde_json::json!({
@@ -977,6 +997,15 @@ mod tests {
     /// (`Patient:general-practitioner`) and a `_revinclude` source
     /// (`Observation:subject`).
     fn resource_entry(resource_type: &str, supports_search: bool) -> serde_json::Value {
+        resource_entry_with(resource_type, supports_search, true)
+    }
+
+    /// [`resource_entry`], with the storage's `supports_history` answer too.
+    fn resource_entry_with(
+        resource_type: &str,
+        supports_search: bool,
+        supports_history: bool,
+    ) -> serde_json::Value {
         use helios_persistence::search::{SearchParameterDefinition, SearchParameterRegistry};
 
         let mut reg = SearchParameterRegistry::new();
@@ -1013,6 +1042,7 @@ mod tests {
             &conditionals,
             &reg,
             supports_search,
+            supports_history,
             false,
             &std::collections::HashMap::new(),
             &build_revinclude_index(&reg),
@@ -1123,6 +1153,58 @@ mod tests {
         );
     }
 
+    /// With a storage whose history is a stub, no resource type, the
+    /// `AuditEvent` branch included, lists `history-instance` or
+    /// `history-type`; `vread`, `versioning: versioned` and `readHistory: true`
+    /// stay (ADR-aacruzgon-0025: `readHistory` is about vread), and so does
+    /// everything else, search included.
+    #[test]
+    fn no_history_is_advertised_when_the_storage_has_none() {
+        for resource_type in ["Patient", "Observation", "Practitioner", "AuditEvent"] {
+            let entry = resource_entry_with(resource_type, true, false);
+            let codes = interaction_codes(&entry);
+            for code in ["history-instance", "history-type"] {
+                assert!(!codes.contains(&code), "{resource_type}: {code} in {entry}");
+            }
+            assert!(codes.contains(&"vread"), "{resource_type}: {entry}");
+            assert!(codes.contains(&"search-type"), "{resource_type}: {entry}");
+            assert_eq!(entry["versioning"], "versioned");
+            assert_eq!(entry["readHistory"], true);
+            assert!(entry["searchParam"].is_array(), "{resource_type}");
+        }
+
+        assert_eq!(
+            interaction_codes(&resource_entry_with("Patient", true, false)),
+            [
+                "read",
+                "vread",
+                "update",
+                "patch",
+                "delete",
+                "create",
+                "search-type"
+            ]
+        );
+        assert_eq!(
+            interaction_codes(&resource_entry_with("AuditEvent", false, false)),
+            ["read", "vread"]
+        );
+        // The entry is otherwise the one a storage with history gets (the
+        // registry's parameter order is not stable across builds, so the
+        // parameters are compared by name).
+        let mut with = resource_entry_with("Patient", true, true);
+        let mut without = resource_entry_with("Patient", true, false);
+        let names = |entry: &mut serde_json::Value| {
+            let mut names = param_names(entry["searchParam"].as_array().expect("searchParam"));
+            names.sort();
+            entry["searchParam"] = serde_json::Value::Null;
+            entry["interaction"] = serde_json::Value::Null;
+            names
+        };
+        assert_eq!(names(&mut with), names(&mut without));
+        assert_eq!(with, without);
+    }
+
     /// A storage that searches yields the same statement for the whole server:
     /// every resource entry lists `search-type` and a non-empty `searchParam`.
     #[cfg(feature = "sqlite")]
@@ -1136,6 +1218,8 @@ mod tests {
         let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
         backend.init_schema().expect("init schema");
         assert!(backend.supports_search());
+        let backend_supports_history =
+            helios_persistence::core::InstanceHistoryProvider::supports_history(&*backend);
         let state = AppState::new(backend, ServerConfig::default());
         let tenant = TenantContext::new(
             TenantId::new("test-tenant"),
@@ -1152,7 +1236,21 @@ mod tests {
             .as_array()
             .expect("resources");
         assert!(!resources.is_empty());
+        // SQLite serves history (the trait default), so all three history
+        // interactions are listed.
+        assert!(backend_supports_history);
+        assert!(
+            interaction_codes(&statement["rest"][0]).contains(&"history-system"),
+            "{}",
+            statement["rest"][0]["interaction"]
+        );
         for resource in resources {
+            assert!(
+                interaction_codes(resource).contains(&"history-instance")
+                    && interaction_codes(resource).contains(&"history-type"),
+                "{}",
+                resource["type"]
+            );
             assert!(
                 interaction_codes(resource).contains(&"search-type"),
                 "{}",

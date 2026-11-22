@@ -1813,6 +1813,7 @@ impl SearchProvider for CompositeStorage {
             .unwrap_or_default()
     }
 
+
     /// A composite's search lags its primary on two axes, and this closes
     /// both: writes still sitting in the asynchronous sync queue, and writes
     /// the search backend has accepted but not yet made searchable (#1047).
@@ -2256,6 +2257,20 @@ impl VersionedStorage for CompositeStorage {
 
 #[async_trait]
 impl InstanceHistoryProvider for CompositeStorage {
+    /// The answer of the providers the history methods reach: instance history
+    /// goes to `history_provider`, type and system history to
+    /// `system_history_provider`. Without either, its methods answer
+    /// `UnsupportedCapability`, so `false`.
+    fn supports_history(&self) -> bool {
+        self.history_provider
+            .as_ref()
+            .is_some_and(|provider| provider.supports_history())
+            && self
+                .system_history_provider
+                .as_ref()
+                .is_some_and(|provider| provider.supports_history())
+    }
+
     async fn history_instance(
         &self,
         tenant: &TenantContext,
@@ -5104,6 +5119,45 @@ mod tests {
         primary.unsupported.store(true, Ordering::Relaxed);
         assert!(!composite.supports_search());
         assert!(is_unsupported(composite.search(&tenant, &query).await));
+    }
+
+    /// `supports_history` is the history providers' answer, and `false` when
+    /// the composite has none, which is when every history method answers
+    /// `UnsupportedCapability`.
+    #[tokio::test]
+    async fn supports_history_follows_the_history_providers() {
+        let tenant = make_tenant();
+        let without = make_composite_no_secondary();
+        assert!(!without.supports_history());
+        assert!(matches!(
+            without
+                .history_type(&tenant, "Patient", &HistoryParams::new())
+                .await,
+            Err(StorageError::Backend(
+                BackendError::UnsupportedCapability { .. }
+            ))
+        ));
+
+        #[cfg(feature = "sqlite")]
+        {
+            let primary = Arc::new(crate::backends::sqlite::SqliteBackend::in_memory().unwrap());
+            primary.init_schema().unwrap();
+            let config = CompositeConfig::builder()
+                .primary("primary", BackendKind::Sqlite)
+                .build()
+                .unwrap();
+            let mut backends = HashMap::new();
+            backends.insert("primary".to_string(), primary.clone() as DynStorage);
+            let with = CompositeStorage::new(config, backends)
+                .unwrap()
+                .with_full_primary(primary);
+            assert!(with.supports_history());
+            assert!(
+                with.history_type(&tenant, "Patient", &HistoryParams::new())
+                    .await
+                    .is_ok()
+            );
+        }
     }
 
     #[test]

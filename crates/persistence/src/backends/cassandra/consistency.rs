@@ -1408,8 +1408,9 @@ mod tests {
     const PLANT_X5: &str = "INSERT INTO date_index (tenant_id, resource_type, param, start, id, end, version_id) VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_X6: &str = "INSERT INTO date_index_by_end (tenant_id, resource_type, param, end, id, start, version_id) VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_X7: &str = "INSERT INTO uri_index (tenant_id, resource_type, param, uri, last_updated, id, version_id) VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
-    /// A live current row with no `write_ts` column.
-    const PLANT_RESOURCE_NO_TS: &str = "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, created_at, fhir_version, index_keys, deleted_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0)";
+    /// A live current row with no `write_ts` column. A CAS, like every write
+    /// to `resources` (the CQL audit warns on a plain one).
+    const PLANT_RESOURCE_NO_TS: &str = "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, created_at, fhir_version, index_keys, deleted_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0) IF NOT EXISTS";
     /// Its version row, with no `write_ts` column.
     const PLANT_VERSION_NO_TS: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version, index_keys) VALUES (?, ?, ?, 1, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_VERSION_KEYS: &str = "UPDATE resource_versions USING TIMESTAMP ? SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
@@ -1433,6 +1434,17 @@ mod tests {
             .execute(cql, values, StatementKind::Write)
             .await
             .expect("plant");
+    }
+
+    /// Sends a CAS plant and asserts it applied.
+    async fn plant_cas(backend: &CassandraBackend, cql: &str, values: Vec<Value>) {
+        let rows = backend
+            .session
+            .rows(cql, values, StatementKind::Cas)
+            .await
+            .expect("plant");
+        let applied: bool = column(&rows[0], "[applied]").expect("[applied]");
+        assert!(applied, "the CAS plant applied");
     }
 
     async fn plant_resource_keys(
@@ -1781,7 +1793,7 @@ mod tests {
                 .to_string();
             let blob = Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType])));
             let fhir = Value::from(version.as_mime_param());
-            plant(
+            plant_cas(
                 &backend,
                 PLANT_RESOURCE_NO_TS,
                 vec![

@@ -604,6 +604,13 @@ pub trait SearchProvider: ResourceStorage {
     /// support and/or make use of"
     /// (<https://hl7.org/fhir/R4/capabilitystatement-definitions.html#CapabilityStatement.rest.resource.searchParam>),
     /// so a parameter every request for which is refused does not belong in it.
+    ///
+    /// A common `_` parameter is asked about with the type `/metadata`
+    /// advertises for it, which is not always the registry's: `_text` and
+    /// `_content` are asked as `special`, though R4's registry types them
+    /// `string`. `_list` and `_in` are asked about as `_id` of type token,
+    /// since the REST layer resolves both into an `_id` filter before
+    /// [`search`](Self::search) is called.
     fn serves_search_param(
         &self,
         resource_type: &str,

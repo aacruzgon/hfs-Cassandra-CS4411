@@ -6,9 +6,14 @@
 //! the writer's own helper (RV13). Reading only the partitions the stored
 //! keys name would miss a row written to a partition no key set names, the
 //! bug class the check exists for (D2).
+//!
+//! What the check sends is reads only: the scans and the per-resource reads
+//! run at `LOCAL_QUORUM` (`StatementKind::Read`). On a replication factor of
+//! 3 a quorum read can trigger read repair, so the node may write replicas
+//! in response; the check itself never writes.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -251,6 +256,10 @@ fn decode_scanned(table: &'static str, row: &Row) -> Result<ScannedRow, String> 
 }
 
 impl IndexScan {
+    /// `keep` must be a pure function of the tenant id: `covers` calls it
+    /// again after the scan. Recording the tenants seen while scanning would
+    /// not do, because a tenant with no rows must still count as covered.
+    ///
     /// Scans the tables in `SCANS` order, one at a time, through
     /// `rows_paged_keeping` at `SCAN_PAGE_SIZE`, `StatementKind::Read`.
     /// Counts every row read (a `Cell` in the keep closure) and holds only
@@ -861,11 +870,13 @@ async fn run(
                 .push(row);
         }
     }
+    let subject_ids: HashSet<(&str, &str)> = subjects
+        .iter()
+        .map(|s| (s.resource_type.as_str(), s.id.as_str()))
+        .collect();
     let known = |t: &str, i: &str| {
         let pair = (t.to_string(), i.to_string());
-        absent.contains(&pair)
-            || skipped.contains(&pair)
-            || subjects.iter().any(|s| s.resource_type == t && s.id == i)
+        absent.contains(&pair) || skipped.contains(&pair) || subject_ids.contains(&(t, i))
     };
     let mut strays: Vec<&ScannedRow> = Vec::new();
     for (&(t, i), rows) in &by_resource {
@@ -2102,6 +2113,33 @@ mod tests {
         assert_eq!(what, "scan resources_by_type");
         assert!(catch_unwind(AssertUnwindSafe(|| assert_consistent(&report))).is_err());
         assert_consistent(&check(&backend, &t).await);
+    }
+
+    #[tokio::test]
+    async fn a_shared_scan_that_does_not_cover_the_tenant_is_refused() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("consistency-uncovered");
+        let other = tenant_id("consistency-other");
+        let scan = IndexScan::take(&backend, move |x| x == other).await;
+        assert!(!scan.covers(&t));
+        let refused = futures::FutureExt::catch_unwind(AssertUnwindSafe(index_consistency(
+            &backend,
+            &t,
+            Scope::Tenant,
+            ScanMode::Shared(&scan),
+            Registry::Fixed,
+        )))
+        .await;
+        let payload = refused.expect_err("an uncovered tenant must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(message.contains("does not cover tenant"), "{message}");
     }
 
     #[tokio::test]

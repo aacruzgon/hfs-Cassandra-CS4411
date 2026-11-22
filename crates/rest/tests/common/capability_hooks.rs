@@ -3,7 +3,8 @@
 //!
 //! [`HookStub`] forwards every storage call to an in-memory SQLite backend, so
 //! the statement is built over the full spec SearchParameter registry, and
-//! answers [`InstanceHistoryProvider::supports_history`] from its own field. It is served by
+//! answers [`InstanceHistoryProvider::supports_history`] and
+//! [`SearchProvider::serves_search_param`] from its own fields. It is served by
 //! [`metadata_server`], a router with only the capabilities route: the handler's
 //! bound is all the stub has to meet, so no history, export or include trait is
 //! implemented here.
@@ -36,17 +37,42 @@ use serde_json::Value;
 
 const X_TENANT_ID: HeaderName = HeaderName::from_static("x-tenant-id");
 
-/// SQLite behind the hook.
+/// Which search parameters a [`HookStub`] serves: `(resource_type, code,
+/// param_type)`, as [`SearchProvider::serves_search_param`] takes them.
+pub type Serves = fn(&str, &str, SearchParamType) -> bool;
+
+/// Serves every parameter: the trait default.
+pub fn serves_all(_: &str, _: &str, _: SearchParamType) -> bool {
+    true
+}
+
+/// Serves only token, date and URI parameters.
+pub fn serves_token_date_uri(_: &str, _: &str, param_type: SearchParamType) -> bool {
+    matches!(
+        param_type,
+        SearchParamType::Token | SearchParamType::Date | SearchParamType::Uri
+    )
+}
+
+/// SQLite behind both hooks.
 pub struct HookStub {
     inner: Arc<SqliteBackend>,
     history: bool,
+    serves: Serves,
 }
 
 impl HookStub {
+    /// The history hook as given, every search parameter served.
     pub fn new(history: bool) -> Self {
+        Self::with_params(history, serves_all)
+    }
+
+    /// Both hooks as given.
+    pub fn with_params(history: bool, serves: Serves) -> Self {
         Self {
             inner: Arc::new(sqlite()),
             history,
+            serves,
         }
     }
 }
@@ -220,6 +246,15 @@ impl SearchProvider for HookStub {
 
     fn modifiers_for_param_type(&self, param_type: SearchParamType) -> Vec<&'static str> {
         self.inner.modifiers_for_param_type(param_type)
+    }
+
+    fn serves_search_param(
+        &self,
+        resource_type: &str,
+        code: &str,
+        param_type: SearchParamType,
+    ) -> bool {
+        (self.serves)(resource_type, code, param_type)
     }
 }
 

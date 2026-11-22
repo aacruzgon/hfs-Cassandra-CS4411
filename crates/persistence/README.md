@@ -527,7 +527,7 @@ The S3 backend is intentionally storage-focused (CRUD/version/history and the fu
 - **○ means no backend implements it today.** Unwired SQL generators for these topologies (shared-schema + RLS, schema-per-tenant `search_path`, database-per-tenant pools) once lived in `src/strategy/`; they were removed in issue #370. Do not read a `○` cell as a deployable isolation guarantee.
 - **✗ for PostgreSQL is a decision, not a gap.** Design discussion #28 chose shared-schema for PostgreSQL and declined the per-schema and per-database topologies; advertising them anyway was the defect issue #369 corrected.
 - **— Neo4j has no backend in this tree** (`src/backends/mod.rs`), so it has no tenant placement to report. **Cassandra** declares exactly one placement, *Shared Schema*: every table's partition key starts with `tenant_id` (`docs/Cassandra/schema/schema.cql`), and the keyspace is shared by all tenants.
-- **◐ Versioning on Cassandra** means `vread` and `list_versions` are real (roadmap Step 3), and `update_with_match` and the versioning tests are Step 4's (`docs/Cassandra/development-roadmap.md`). Search, history, transactions and conditional interactions answer `501` until their step, or for good where the column says ✗.
+- **◐ Versioning on Cassandra** means `vread` and `list_versions` are real (roadmap Step 3), and `update_with_match` and the versioning tests are Step 4's (`docs/Cassandra/development-roadmap.md`). Search, history, transactions and conditional interactions answer `501` until their step, or for good where the column says ✗. `/metadata` says so: `InstanceHistoryProvider::supports_history` is `false`, so it lists no `history-instance`, `history-type` or `history-system`, and `SearchProvider::supports_search` follows the undeclared `BasicSearch`, as on S3, so it lists no `search-type`, `searchParam`, `searchInclude` or `searchRevInclude` until Step 6; `vread`, `versioning: versioned` and `readHistory: true` stay (ADR-aacruzgon-0025, 0085).
 - **Row-Level Security has no `BackendCapability` counterpart**, so the contract test cannot police it. PostgreSQL is `○` because no backend issues `ALTER TABLE … ENABLE ROW LEVEL SECURITY`; a database-enforced layer is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
 
 ### Polling `_history` with `_since`
@@ -1939,7 +1939,7 @@ let composite = CompositeStorage::new(composite_config, backends)?
 
 ### Cassandra
 
-In development: create, read, update, delete (soft, with revive), PATCH, vread and batch work, and every write is a compare-and-swap; search, history, transactions and conditional interactions answer `501` (`docs/Cassandra/development-roadmap.md`). Standalone only; there is no Cassandra + Elasticsearch mode.
+In development: create, read, update, delete (soft, with revive), PATCH, vread and batch work, and every write is a compare-and-swap; search, history, transactions and conditional interactions answer `501`, and `/metadata` advertises none of them (`docs/Cassandra/development-roadmap.md`, Step 7). Standalone only; there is no Cassandra + Elasticsearch mode.
 
 ```bash
 # Build with Cassandra support

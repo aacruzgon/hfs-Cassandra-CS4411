@@ -1268,7 +1268,10 @@ async fn batch_if_match_through_rest(rest: &Rest<'_>, suffix: &str) {
 /// `transaction`. Step 7 (ADR-aacruzgon-0085): no history interaction on any
 /// resource or at system level, since the backend refuses all three, while
 /// `vread`, `readHistory: true` and `versioning: versioned` stay
-/// (ADR-aacruzgon-0025; https://hl7.org/fhir/R4/http.html#capabilities).
+/// (ADR-aacruzgon-0025; https://hl7.org/fhir/R4/http.html#capabilities); and,
+/// until Step 6 declares `BasicSearch`, no `search-type`, `searchParam`,
+/// `searchInclude` or `searchRevInclude` on any type, since every search
+/// answers 501.
 async fn metadata_through_rest(rest: &Rest<'_>) {
     let hfs = rest.hfs;
     let metadata = rest.get("metadata").await;
@@ -1332,6 +1335,30 @@ async fn metadata_through_rest(rest: &Rest<'_>) {
         hfs,
     );
     spec("CS-2:readHistory", true, text(&patient["readHistory"]), hfs);
+    spec(
+        "CS-4:no-search-type",
+        false,
+        interactions.contains(&"search-type"),
+        hfs,
+    );
+    let with_search: Vec<&str> = types
+        .iter()
+        .filter(|t| {
+            t["interaction"]
+                .as_array()
+                .is_some_and(|list| list.iter().any(|i| i["code"] == "search-type"))
+                || ["searchParam", "searchInclude", "searchRevInclude"]
+                    .iter()
+                    .any(|key| t.get(key).is_some())
+        })
+        .filter_map(|t| t["type"].as_str())
+        .collect();
+    spec(
+        "CS-4:no-search-on-any-type",
+        "[]",
+        format!("{with_search:?}"),
+        hfs,
+    );
     spec(
         "CS-3:updateCreate",
         true,

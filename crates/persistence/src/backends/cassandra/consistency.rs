@@ -23,6 +23,7 @@ use super::backend::{CassandraBackend, SELECT_RESOURCE_KEYS};
 use super::index_keys::{self, IndexKey, RowId};
 use super::read::{ResourceRow, deleted_at_of};
 use super::session::StatementKind;
+use super::write::write_ts_of;
 
 /// Rows per page of every scan: small pages keep the tombstones one page
 /// reads far below `tombstone_failure_threshold`; a refused page is a
@@ -596,6 +597,7 @@ struct VersionRow {
     /// `deleted_at` set or `data` unset.
     marker: bool,
     write_ts: Option<i64>,
+    last_updated: Option<DateTime<Utc>>,
     blob: Option<Vec<u8>>,
 }
 
@@ -614,6 +616,9 @@ fn decode_version_row(row: &Row) -> Result<VersionRow, String> {
         write_ts: row
             .get_by_name("write_ts")
             .map_err(|error| format!("write_ts: {error:?}"))?,
+        last_updated: row
+            .get_by_name("last_updated")
+            .map_err(|error| format!("last_updated: {error:?}"))?,
         blob,
     })
 }
@@ -964,16 +969,26 @@ fn check_subject(
                 });
             }
             // Rule 6.
-            let version_ts = subject
+            let tagged = subject
                 .versions
                 .iter()
-                .find(|v| v.version_id == row.version_id)
-                .and_then(|v| v.write_ts);
-            let want = version_ts.or_else(|| {
-                (row.version_id == current)
-                    .then_some(subject.row.write_ts)
-                    .flatten()
-            });
+                .find(|v| v.version_id == row.version_id);
+            let version_ts = tagged.and_then(|v| v.write_ts);
+            // When neither `write_ts` is set, the writer's own derivation from
+            // `last_updated` (`write_ts_of`); with no `last_updated` either,
+            // nothing is expected and the row is not checked.
+            let want = version_ts
+                .or_else(|| {
+                    (row.version_id == current)
+                        .then_some(subject.row.write_ts)
+                        .flatten()
+                })
+                .or_else(|| {
+                    tagged
+                        .and_then(|v| v.last_updated)
+                        .or_else(|| (row.version_id == current).then_some(subject.row.last_updated))
+                        .map(write_ts_of)
+                });
             if let Some(want) = want
                 && want != row.written
             {
@@ -1382,6 +1397,10 @@ mod tests {
     const PLANT_X5: &str = "INSERT INTO date_index (tenant_id, resource_type, param, start, id, end, version_id) VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_X6: &str = "INSERT INTO date_index_by_end (tenant_id, resource_type, param, end, id, start, version_id) VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_X7: &str = "INSERT INTO uri_index (tenant_id, resource_type, param, uri, last_updated, id, version_id) VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
+    /// A live current row with no `write_ts` column.
+    const PLANT_RESOURCE_NO_TS: &str = "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, created_at, fhir_version, index_keys, deleted_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0)";
+    /// Its version row, with no `write_ts` column.
+    const PLANT_VERSION_NO_TS: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version, index_keys) VALUES (?, ?, ?, 1, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_VERSION_KEYS: &str = "UPDATE resource_versions USING TIMESTAMP ? SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
     /// A CAS: asserts `[applied]`.
     const PLANT_RESOURCE_KEYS: &str = "UPDATE resources SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
@@ -1525,6 +1544,7 @@ mod tests {
             "missing-version-row",
             "undecodable",
             "no-type-key",
+            "no-write-ts",
         ];
         let version = test_fhir_version();
 
@@ -1739,6 +1759,50 @@ mod tests {
         )
         .await;
 
+        // no-write-ts: R1 and the version row carry no `write_ts` column.
+        // `p`'s type row is one millisecond off `write_ts_of(last_updated)`;
+        // `q`'s is exact.
+        let t = tenant_of("no-write-ts");
+        let lu = ms(1_700_000_000_000);
+        let unset_ts = write_ts_of(lu);
+        for (id, written) in [("p", unset_ts + 1000), ("q", unset_ts)] {
+            let body = serde_json::json!({"resourceType": "Patient", "id": id, "active": true})
+                .to_string();
+            let blob = Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType])));
+            let fhir = Value::from(version.as_mime_param());
+            plant(
+                &backend,
+                PLANT_RESOURCE_NO_TS,
+                vec![
+                    Value::from(t.as_str()),
+                    Value::from("Patient"),
+                    Value::from(id),
+                    Value::from(body.as_str()),
+                    Value::from(lu),
+                    Value::from(lu),
+                    fhir.clone(),
+                    blob.clone(),
+                ],
+            )
+            .await;
+            plant(
+                &backend,
+                PLANT_VERSION_NO_TS,
+                vec![
+                    Value::from(t.as_str()),
+                    Value::from("Patient"),
+                    Value::from(id),
+                    Value::from(body.as_str()),
+                    Value::from(lu),
+                    fhir,
+                    blob,
+                    Value::from(unset_ts),
+                ],
+            )
+            .await;
+            plant_x1(&backend, &t, lu, id, 1, written).await;
+        }
+
         // One shared scan for every case.
         let scan = {
             let run = run.clone();
@@ -1917,6 +1981,18 @@ mod tests {
         assert_eq!(report.kinds(), ["wrong_tag"], "{report}");
         let report = check("wrong-write-time", Registry::Changed).await;
         assert_eq!(report.kinds(), ["wrong_write_time"], "{report}");
+
+        // Only `p`'s type row is off; the expected time is derived from
+        // `last_updated`.
+        for registry in [Registry::Fixed, Registry::Changed] {
+            let report = check("no-write-ts", registry).await;
+            assert_eq!(report.kinds(), ["wrong_write_time"], "{report}");
+            let Defect::WrongWriteTime { row, expected } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!(*expected, write_ts_of(ms(1_700_000_000_000)));
+            assert_eq!((row.id.as_str(), row.written), ("p", *expected + 1000));
+        }
 
         // The resources row and the version row both lack the type key.
         for registry in [Registry::Fixed, Registry::Changed] {

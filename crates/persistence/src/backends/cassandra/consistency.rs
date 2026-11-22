@@ -1903,6 +1903,17 @@ mod tests {
         };
         assert_eq!(*version_id, None);
 
+        // A changed registry silences rules 3 and 4 only: the stray scan, the
+        // tag rule and the write-time rule still run.
+        let report = check("stray-ghost", Registry::Changed).await;
+        assert_eq!(report.kinds(), ["stray_row"], "{report}");
+        let report = check("stray-every-table", Registry::Changed).await;
+        assert_eq!(report.kinds(), vec!["stray_row"; 6], "{report}");
+        let report = check("wrong-tag", Registry::Changed).await;
+        assert_eq!(report.kinds(), ["wrong_tag"], "{report}");
+        let report = check("wrong-write-time", Registry::Changed).await;
+        assert_eq!(report.kinds(), ["wrong_write_time"], "{report}");
+
         // The resources row and the version row both lack the type key.
         for registry in [Registry::Fixed, Registry::Changed] {
             let report = check("no-type-key", registry).await;

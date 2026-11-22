@@ -580,6 +580,11 @@ fn build_resource_capability(
 /// registry. Control/common params (those starting with `_`) and duplicates are
 /// skipped, and so is every parameter `serves` (the storage's
 /// [`SearchProvider::serves_search_param`]) refuses, common ones included.
+///
+/// A common parameter is asked about with the type `/metadata` advertises for
+/// it, except `_list` and `_in`: REST resolves both into an `_id` filter before
+/// the storage is called (reading the List or Group itself), so they are asked
+/// about as what the storage actually receives, `_id` of type token.
 fn build_search_params(
     resource_type: &str,
     registry: &SearchParameterRegistry,
@@ -591,6 +596,9 @@ fn build_search_params(
     let mut params = build_common_search_params(supports_contained, version);
     params.retain(|param| {
         let name = param["name"].as_str().unwrap_or_default();
+        if matches!(name, "_list" | "_in") {
+            return serves(resource_type, "_id", SearchParamType::Token);
+        }
         param["type"]
             .as_str()
             .and_then(search_param_type_from_code)
@@ -730,10 +738,11 @@ fn build_search_includes(
 /// Builds common search parameters supported by all resources.
 ///
 /// `_contained` / `_containedType` are only included when `supports_contained`
-/// is set (the backend can evaluate contained search). `_list` is always
-/// advertised (resolved application-side on every backend). `_in` (List/Group
-/// membership) exists only in R5 and later, so it is advertised only there; it
-/// is likewise resolved application-side.
+/// is set (the backend can evaluate contained search). `_list` is resolved
+/// application-side into an `_id` filter, so [`build_search_params`] keeps it
+/// wherever the storage serves `_id`. `_in` (List/Group membership) exists only
+/// in R5 and later, so it is listed only there; it is likewise resolved into an
+/// `_id` filter and kept on the same terms.
 fn build_common_search_params(
     supports_contained: bool,
     version: FhirVersion,
@@ -1302,9 +1311,10 @@ mod tests {
 
     /// `serves` filters `searchParam`, common parameters included, and the
     /// include lists: a storage that serves only token, date and URI keeps
-    /// `_id` (token), `_lastUpdated` (date) and `_profile` (uri), drops `name`
-    /// (string), `_text` and `_list` (special), and lists no include, because
-    /// every include names a reference parameter.
+    /// `_id` (token), `_lastUpdated` (date) and `_profile` (uri), keeps `_list`,
+    /// which REST turns into an `_id` filter, drops `name` (string) and `_text`
+    /// and `_content` (special), and lists no include, because every include
+    /// names a reference parameter.
     #[test]
     fn unserved_params_and_their_includes_are_left_out() {
         fn token_date_uri(_: &str, _: &str, t: SearchParamType) -> bool {
@@ -1315,10 +1325,17 @@ mod tests {
         }
         let patient = resource_entry_serving("Patient", true, true, &token_date_uri);
         let names = param_names(patient["searchParam"].as_array().expect("searchParam"));
-        for kept in ["_id", "_lastUpdated", "_tag", "_profile", "_security"] {
+        for kept in [
+            "_id",
+            "_lastUpdated",
+            "_tag",
+            "_profile",
+            "_security",
+            "_list",
+        ] {
             assert!(names.contains(&kept.to_string()), "{kept}: {names:?}");
         }
-        for dropped in ["name", "_text", "_content", "_list"] {
+        for dropped in ["name", "_text", "_content"] {
             assert!(
                 !names.contains(&dropped.to_string()),
                 "{dropped}: {names:?}"
@@ -1343,6 +1360,20 @@ mod tests {
             param_names(patient["searchParam"].as_array().expect("searchParam"))
                 .contains(&"name".to_string())
         );
+
+        // `_list` reaches the storage as `_id`, so it goes with `_id`.
+        fn not_id(_: &str, code: &str, _: SearchParamType) -> bool {
+            code != "_id"
+        }
+        let patient = resource_entry_serving("Patient", true, true, &not_id);
+        let names = param_names(patient["searchParam"].as_array().expect("searchParam"));
+        for dropped in ["_id", "_list"] {
+            assert!(
+                !names.contains(&dropped.to_string()),
+                "{dropped}: {names:?}"
+            );
+        }
+        assert!(names.contains(&"_lastUpdated".to_string()), "{names:?}");
     }
 
     /// A storage that searches yields the same statement for the whole server:

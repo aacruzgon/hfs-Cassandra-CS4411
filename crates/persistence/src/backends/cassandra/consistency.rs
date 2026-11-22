@@ -160,7 +160,11 @@ pub(crate) struct IndexScan {
     scanned: usize,
     /// The first read that failed, `(what, error)`; the scan stops there.
     failed: Option<(String, String)>,
-    /// `Utc::now()` in microseconds, read before the first table. A shared
+    /// `Utc::now()` in whole milliseconds, as microseconds, read before the
+    /// first table. A write's `write_ts` is `last_updated` floored to the
+    /// millisecond (`write_ts_of`), so a write that starts in the scan's
+    /// first millisecond has a `write_ts` equal to this value, and the
+    /// strict `<` guard refuses that tie. A shared
     /// check refuses a resource whose `write_ts` is at or after it: a
     /// resource written after the scan was taken. It cannot catch a write
     /// in flight at that moment (earlier `write_ts`, index rows landing
@@ -261,7 +265,7 @@ impl IndexScan {
             rows: BTreeMap::new(),
             scanned: 0,
             failed: None,
-            taken_at: Utc::now().timestamp_micros(),
+            taken_at: Utc::now().timestamp_millis() * 1000,
         };
         for (table, cql) in SCANS {
             let seen = Cell::new(0usize);
@@ -2040,6 +2044,7 @@ mod tests {
         let own = t.clone();
         let scan = IndexScan::take(&backend, move |x| x == own).await;
         assert!(scan.failed.is_none(), "{:?}", scan.failed);
+        assert_eq!(scan.taken_at % 1000, 0, "taken_at is a whole millisecond");
         backend
             .update(&tenant, &p, changed())
             .await

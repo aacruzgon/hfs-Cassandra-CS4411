@@ -19,7 +19,7 @@
   2. **RV13's `scan_mode` becomes `Full` or `Shared(&IndexScan)`.**
      - `Full` scans the seven index tables now, for this one tenant.
      - `Shared` reuses one full scan for many tenants: the planted-defects test now, and roadmap 5.4's post-suite step later.
-     - Both modes report the same defects.
+     - Both modes report the same defects, as long as no write to the tenant was in flight when the shared scan was taken (see Consequences).
      - A `Shared` check panics in two cases: the scan didn't keep its tenant, or a resource it checks was written at or after the scan was taken.
   3. **RV13's golden test of the walkthrough's worked example moves to pull request 5.** It needs real extraction.
 

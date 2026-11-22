@@ -67,7 +67,7 @@ const SELECT_VERSION_ROWS: &str = "SELECT version_id, data, last_updated, delete
      WHERE tenant_id = ? AND resource_type = ? AND id = ?";
 
 /// The defects' `kind()` names, in the report line's order.
-const DEFECT_KINDS: [&str; 11] = [
+const DEFECT_KINDS: [&str; 12] = [
     "missing_row",
     "stray_row",
     "wrong_tag",
@@ -79,6 +79,7 @@ const DEFECT_KINDS: [&str; 11] = [
     "missing_version_row",
     "undecodable",
     "read_failed",
+    "no_type_key",
 ];
 
 /// Which resources of the tenant are checked.
@@ -385,13 +386,23 @@ pub(crate) enum Defect {
     },
     /// Rule 8: a read the check needed failed.
     ReadFailed { what: String, error: String },
+    /// IW5, either registry: the stored key set of a live version (the
+    /// `resources` row's when the current version is live, or a
+    /// `resource_versions` row that is not a delete marker) lacks
+    /// `IndexKey::ResourcesByType`.
+    NoTypeKey {
+        resource_type: String,
+        id: String,
+        version_id: i32,
+    },
 }
 
 impl Defect {
     /// The defect's name in the log line and in tests: `missing_row`,
     /// `stray_row`, `wrong_tag`, `wrong_write_time`, `stale_extraction`,
     /// `version_reextraction`, `marker_not_empty`, `blob_mismatch`,
-    /// `missing_version_row`, `undecodable`, `read_failed` (this order is
+    /// `missing_version_row`, `undecodable`, `read_failed`, `no_type_key`
+    /// (this order is
     /// `DEFECT_KINDS`, the line's order).
     pub(crate) fn kind(&self) -> &'static str {
         match self {
@@ -406,6 +417,7 @@ impl Defect {
             Defect::MissingVersionRow { .. } => DEFECT_KINDS[8],
             Defect::Undecodable { .. } => DEFECT_KINDS[9],
             Defect::ReadFailed { .. } => DEFECT_KINDS[10],
+            Defect::NoTypeKey { .. } => DEFECT_KINDS[11],
         }
     }
 }
@@ -490,6 +502,14 @@ impl fmt::Display for Defect {
                 "{resource_type}/{id} version {version_id:?}: stored key set unreadable: {error}"
             ),
             Defect::ReadFailed { what, error } => write!(f, "{what}: {error}"),
+            Defect::NoTypeKey {
+                resource_type,
+                id,
+                version_id,
+            } => write!(
+                f,
+                "{resource_type}/{id} v{version_id}: the stored key set of a live version lacks ResourcesByType"
+            ),
         }
     }
 }
@@ -898,6 +918,18 @@ fn check_subject(
         }
     }
 
+    // IW5: a live version's stored set holds the type key. This does not
+    // depend on extraction, so it runs under either registry.
+    if let Some(stored) = &stored
+        && !stored.contains(&IndexKey::ResourcesByType)
+    {
+        report.defects.push(Defect::NoTypeKey {
+            resource_type: resource_type.clone(),
+            id: id.clone(),
+            version_id: current,
+        });
+    }
+
     // Rows (rules 1, 2 and 6).
     if !scan_ok {
         // Rules 1, 2 and 6 need the scan; the `ReadFailed` already says so.
@@ -1001,6 +1033,16 @@ fn check_subject(
             continue;
         }
         if version.version_id == current {
+            // Its blob is `resources.index_keys` (rule 5); only IW5 applies here.
+            if let Ok(keys) = index_keys::decode(blob)
+                && !keys.contains(&IndexKey::ResourcesByType)
+            {
+                report.defects.push(Defect::NoTypeKey {
+                    resource_type: resource_type.clone(),
+                    id: id.clone(),
+                    version_id: version.version_id,
+                });
+            }
             continue;
         }
         let keys: BTreeSet<IndexKey> = match index_keys::decode(blob) {
@@ -1015,6 +1057,14 @@ fn check_subject(
                 continue;
             }
         };
+        // IW5.
+        if !keys.contains(&IndexKey::ResourcesByType) {
+            report.defects.push(Defect::NoTypeKey {
+                resource_type: resource_type.clone(),
+                id: id.clone(),
+                version_id: version.version_id,
+            });
+        }
         if !fixed {
             continue;
         }
@@ -1278,6 +1328,11 @@ mod tests {
                 what: "w".to_string(),
                 error: "e".to_string(),
             },
+            Defect::NoTypeKey {
+                resource_type: "Patient".to_string(),
+                id: "p".to_string(),
+                version_id: 1,
+            },
         ]
     }
 
@@ -1302,9 +1357,9 @@ mod tests {
             report.to_string(),
             "[index-consistency tenant=test-line scope=tenant scan=full registry=fixed \
              resources=3 live=2 deleted=1 absent=0 versions=5 rows_scanned=40 rows_checked=4 \
-             defects=11 missing_row=1 stray_row=1 wrong_tag=1 wrong_write_time=1 \
+             defects=12 missing_row=1 stray_row=1 wrong_tag=1 wrong_write_time=1 \
              stale_extraction=1 version_reextraction=1 marker_not_empty=1 blob_mismatch=1 \
-             missing_version_row=1 undecodable=1 read_failed=1 took_ms=12]"
+             missing_version_row=1 undecodable=1 read_failed=1 no_type_key=1 took_ms=12]"
         );
         let mut names = DEFECT_KINDS.to_vec();
         names.sort_unstable();
@@ -1465,6 +1520,7 @@ mod tests {
             "marker-not-empty",
             "missing-version-row",
             "undecodable",
+            "no-type-key",
         ];
         let version = test_fhir_version();
 
@@ -1660,6 +1716,25 @@ mod tests {
         plant_resource_keys(&backend, &t, vec![0x02, 0x00], 1).await;
         plant_version_keys(&backend, &t, 1, vec![0x02, 0x00], ts1 + 1).await;
 
+        // no-type-key: a live resource whose stored sets are empty, and
+        // whose type row is gone.
+        let t = tenant_of("no-type-key");
+        let (_, lu1, ts1, _) = seeded(&backend, &t).await;
+        plant_resource_keys(&backend, &t, index_keys::EMPTY.to_vec(), 1).await;
+        plant_version_keys(&backend, &t, 1, index_keys::EMPTY.to_vec(), ts1 + 1).await;
+        plant(
+            &backend,
+            UNPLANT_X1,
+            vec![
+                Value::from(ts1 + 1),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from(lu1),
+                Value::from("p"),
+            ],
+        )
+        .await;
+
         // One shared scan for every case.
         let scan = {
             let run = run.clone();
@@ -1827,6 +1902,20 @@ mod tests {
             unreachable!()
         };
         assert_eq!(*version_id, None);
+
+        // The resources row and the version row both lack the type key.
+        for registry in [Registry::Fixed, Registry::Changed] {
+            let report = check("no-type-key", registry).await;
+            let mut want = vec![("no_type_key", 2)];
+            if registry == Registry::Fixed {
+                want.push(("stale_extraction", 1));
+            }
+            assert_eq!(report.kinds(), expect(&want), "{report}");
+            assert!(report.defects.iter().all(|d| match d {
+                Defect::NoTypeKey { version_id, .. } => *version_id == 1,
+                _ => true,
+            }));
+        }
     }
 
     #[tokio::test]

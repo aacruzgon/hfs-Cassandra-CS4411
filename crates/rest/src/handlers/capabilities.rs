@@ -1236,8 +1236,10 @@ mod tests {
     /// With a storage whose history is a stub, no resource type, the
     /// `AuditEvent` branch included, lists `history-instance` or
     /// `history-type`; `vread`, `versioning: versioned` and `readHistory: true`
-    /// stay (ADR-aacruzgon-0025: `readHistory` is about vread), and so does
-    /// everything else, search included.
+    /// stay, and so does everything else, search included. `readHistory` is
+    /// "able to return past versions as part of the vRead operation"
+    /// (<https://hl7.org/fhir/R4/capabilitystatement-definitions.html#CapabilityStatement.rest.resource.readHistory>),
+    /// not the history interactions.
     #[test]
     fn no_history_is_advertised_when_the_storage_has_none() {
         for resource_type in ["Patient", "Observation", "Practitioner", "AuditEvent"] {

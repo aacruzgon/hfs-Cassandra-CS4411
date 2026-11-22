@@ -528,8 +528,8 @@ fn build_resource_capability(
     }
 
     // Advertise real `_include` targets: one "Type:code" per reference param on
-    // this type. Omitted entirely when the type has no reference params, and
-    // when the storage does not search (#514).
+    // this type that the storage serves. Omitted entirely when there is none,
+    // and when the storage does not search (#514).
     if supports_search {
         let search_include = build_search_includes(resource_type, registry, serves);
         if !search_include.is_empty() {
@@ -538,8 +538,9 @@ fn build_resource_capability(
     }
 
     // Advertise real `_revinclude` targets: "Source:code" tokens from other
-    // types' reference params that point at this type. Omitted when the
-    // storage does not search (#514).
+    // types' reference params that point at this type and that the storage
+    // serves. Omitted when there is none, and when the storage does not search
+    // (#514).
     if supports_search && let Some(rev) = revinclude_by_target.get(resource_type) {
         if !rev.is_empty() {
             entry["searchRevInclude"] = serde_json::Value::Array(

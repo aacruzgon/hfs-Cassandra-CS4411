@@ -347,7 +347,7 @@ Every write first calls `tenant.check_permission(Operation::…, resource_type)`
 
 **Payload bound** (ADR-aacruzgon-0053). Before step 2, the serialized `data` plus the `index_keys` blob of the version being written must be at most 8 MiB (`MAX_CAS_PAYLOAD_BYTES`), on every CAS. Over that, the write is refused with `StorageError::Validation(ValidationError::InvalidResource { … })`, 400, before any statement. The node itself refuses a CQL message over 16 MiB as `Invalid` (`native_transport_max_message_size`, measured on 5.0.9), and a CAS whose Paxos proposal exceeds `max_mutation_size` fails only at the replicas, as `WriteFailure`/CAS, an unknown outcome. The 8 MiB bound keeps every CAS clear of both.
 
-**SearchParameter `code`** (ADR-aacruzgon-0027, G38; ADR-aacruzgon-0079). In the design, a SearchParameter is no longer refused for a long `code`: the code becomes `param` in every index key under it, and `param` goes through the same mapping as the values. Until Step 5's extraction pull request removes `check_search_parameter_code` (`crates/persistence/src/backends/cassandra/write.rs:474-497`, called at `write.rs:1916`, `update.rs:112` and `upsert.rs:191`), `main` still answers 400 over 128 bytes. The FHIR `code` datatype has no length limit; the longest code in the spec data is 46 bytes (R6).
+**SearchParameter `code`** (ADR-aacruzgon-0027, G38; ADR-aacruzgon-0079). In the design, a SearchParameter is no longer refused for a long `code`: the code becomes `param` in every index key under it, and `param` goes through the same mapping as the values. Roadmap row 5.1 removed `check_search_parameter_code`, which answered 400 over 128 bytes until then. The FHIR `code` datatype has no length limit; the longest code in the spec data is 46 bytes (R6).
 
 **Timestamps** (ADR-aacruzgon-0016). `lu(1) = now_ms`; `lu(N+1) = max(now_ms, lu(N) + 1 ms)`; `ts(V) = lu(V) · 1000`. `lu(N)` comes from R1 on every operation (on update it equals `current.last_modified()` whenever R1 shows `N`), so V3's timestamp is exact with no extra read. `K(N)` comes from R1's `index_keys`; only `update` runs an R1 for it (G22). `w(N+1)` is a fresh uuid per CAS attempt (ADR-aacruzgon-0024), and `lu` and `ts` are computed from that attempt's R1.
 
@@ -739,7 +739,7 @@ Extraction gives three parameters: `identifier` (token, system `http://hospital.
 
 ### Version 1: create
 
-I1 inserts `(tu(1), acme, Patient, p1)` with `w1` and `version_id 1` into `('2026-10-14T10', 7)`. C1 applies: `version_id 1`, `last_updated` and `created_at` `lu(1)`, `fhir_version '4.0'`, `write_ts ts(1)`, `write_id w1`, `data`, and `index_keys` `K(1)`, the 8 rows below, which encode to 289 bytes (format 1, `schema.cql`). V1 writes version 1 at `ts(1)`, with `write_id w1` and the same `index_keys`. The `resources_by_type` row carries `fhir_version '4.0'`. Then 8 index inserts, all `USING TIMESTAMP 1791972000123000`, tag 1; then I2. The `token_system_index (gender, IMPLICIT)` row is not written (P5).
+I1 inserts `(tu(1), acme, Patient, p1)` with `w1` and `version_id 1` into `('2026-10-14T10', 7)`. C1 applies: `version_id 1`, `last_updated` and `created_at` `lu(1)`, `fhir_version '4.0'`, `write_ts ts(1)`, `write_id w1`, `data`, and `index_keys` `K(1)`, the 10 rows below, which encode to 323 bytes (format 1, `schema.cql`). V1 writes version 1 at `ts(1)`, with `write_id w1` and the same `index_keys`. The `resources_by_type` row carries `fhir_version '4.0'`. Then 10 index inserts, all `USING TIMESTAMP 1791972000123000`, tag 1; then I2. The `token_system_index (gender, IMPLICIT)` row is not written (P5).
 
 | Table | Partition key (after `acme, Patient`) | Clustering key |
 | --- | --- | --- |
@@ -751,8 +751,10 @@ I1 inserts `(tu(1), acme, Patient, p1)` with `w1` and `version_id 1` into `('202
 | `token_system_code_index` | `(gender, IMPLICIT, male)` | `(lu(1), p1)` |
 | `date_index` | `(birthdate)` | `(B0, p1, B1)` |
 | `date_index_by_end` | `(birthdate)` | `(B1, p1, B0)` |
+| `token_code_index` | `(deceased, false)` | `(lu(1), p1, '')` |
+| `token_system_code_index` | `(deceased, '', false)` | `(lu(1), p1)` |
 
-Eight partitions, eight rows; at an estimated 150 to 250 bytes per row, one batch under 5 KiB.
+Ten partitions, ten rows; at an estimated 150 to 250 bytes per row, one batch under 5 KiB. The two `deceased` rows are there because the `deceased` parameter's expression (`Patient.deceased.exists() and Patient.deceased != false`) evaluates to `false` for every Patient without `deceased[x]`, so each such Patient gets `deceased = false` rows; the example's three parameters above are the ones that carry a value.
 
 ### Version 2: update (gender `male` → `female`)
 

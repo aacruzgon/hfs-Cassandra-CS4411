@@ -32,6 +32,12 @@
 //!   version's rows carry a higher timestamp and win over this repair's:
 //!   its writes are confirmed and change nothing visible (RV4).
 //!
+//! - **One deadline.** The whole repair phase is bounded by one request
+//!   deadline (`request_timeout_ms`), so a search waits at most that long
+//!   for its repairs. A repair unfinished by then is reported
+//!   [`WriteFailure::TriesExhausted`] and counted as failed; the next search
+//!   or the sweeper repeats it.
+//!
 //! Repair never writes `resources`, `resource_versions` or an intent row,
 //! and never sends a CAS. Its only statements are the index writer's
 //! batches ([`CassandraBackend::write_index_delta`], one try, IW17).
@@ -52,8 +58,12 @@
 
 #![allow(dead_code)] // Step 6's search calls it; until then only its tests do (RV6). Step 6 removes this.
 
+use std::future::Future;
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use parking_lot::Mutex;
 
 use super::backend::CassandraBackend;
 use super::index_keys::{self, IndexKey, RowId};
@@ -288,6 +298,16 @@ struct QueuedRepair {
     stale: Vec<StaleIndexRow>,
 }
 
+impl QueuedRepair {
+    fn key<'a>(&'a self, tenant_id: &'a str) -> RowKey<'a> {
+        RowKey {
+            tenant_id,
+            resource_type: &self.resource_type,
+            id: &self.id,
+        }
+    }
+}
+
 impl RepairContext {
     pub(crate) fn new(tenant_id: &str) -> Self {
         Self {
@@ -338,22 +358,35 @@ impl RepairContext {
     }
 
     /// Plans, admits, writes; outcomes in queue order. Never fails.
+    ///
+    /// The whole phase gets one request deadline (`request_timeout_ms`, the
+    /// budget a request's index phase gets), so a search waits at most that
+    /// long for its repairs. A repair that has not finished by then is
+    /// reported [`WriteFailure::TriesExhausted`]: safe, since every repair
+    /// write has a fixed timestamp and the next search or the sweeper
+    /// repeats it.
     pub(crate) async fn run(self, backend: &CassandraBackend) -> Vec<RepairOutcome> {
+        let deadline = Duration::from_millis(backend.config.request_timeout_ms);
+        self.run_within(backend, deadline).await
+    }
+
+    /// [`Self::run`] with the phase's deadline given, so a test can make it short.
+    async fn run_within(
+        self,
+        backend: &CassandraBackend,
+        deadline: Duration,
+    ) -> Vec<RepairOutcome> {
+        let ends_at = tokio::time::Instant::now() + deadline;
         let counters = &backend.repair_counters;
         counters.queued(self.queued.len() as u64);
         counters.undecodable_rows(self.undecodable_rows);
 
         let tenant_id = self.tenant_id.as_str();
-        let mut outcomes: Vec<Option<RepairOutcome>> = vec![None; self.queued.len()];
         let mut budget = Budget::default();
-        let mut admitted: Vec<(usize, &QueuedRepair, &ResourceRow, RepairPlan)> = Vec::new();
-        for (at, queued) in self.queued.iter().enumerate() {
-            let key = RowKey {
-                tenant_id,
-                resource_type: &queued.resource_type,
-                id: &queued.id,
-            };
-            let skip = match queued.row.as_ref() {
+        let mut prepared: Vec<Result<(&ResourceRow, RepairPlan), SkipReason>> =
+            Vec::with_capacity(self.queued.len());
+        for queued in &self.queued {
+            let planned = match queued.row.as_ref() {
                 None => Err(SkipReason::NoRow),
                 Some(row) => plan_repair(row, &queued.stale).and_then(|plan| {
                     if budget.admit(plan.rows(row)) {
@@ -363,41 +396,81 @@ impl RepairContext {
                     }
                 }),
             };
-            match skip {
-                Ok((row, plan)) => admitted.push((at, queued, row, plan)),
-                Err(reason) => {
-                    let version_id = queued.row.as_ref().map(|row| row.version_id);
-                    backend.note_repair_skip(&key, version_id, reason);
-                    outcomes[at] = Some(RepairOutcome::Skipped(reason));
-                }
+            if let Err(reason) = planned {
+                let version_id = queued.row.as_ref().map(|row| row.version_id);
+                backend.note_repair_skip(&queued.key(tenant_id), version_id, reason);
             }
+            prepared.push(planned);
         }
 
-        // Built into a Vec first so the stream's items are plain futures
-        // (the same `Send` reason as in `write_index_delta_within`).
-        let futures: Vec<_> = admitted
+        // One future per entry, a skip's ready at once, so the stream yields
+        // exactly one outcome per entry, in queue order. Each repair also
+        // leaves its outcome in `done`, which is how one that finished
+        // behind a stalled one is still reported as it was when the deadline
+        // cuts the stream. Built into a Vec first so the stream's items are
+        // plain futures (the same `Send` reason as in
+        // `write_index_delta_within`).
+        let done: Vec<Mutex<Option<RepairOutcome>>> =
+            self.queued.iter().map(|_| Mutex::new(None)).collect();
+        let futures: Vec<_> = self
+            .queued
             .iter()
-            .map(|(_, queued, row, plan)| async move {
-                let key = RowKey {
-                    tenant_id,
-                    resource_type: &queued.resource_type,
-                    id: &queued.id,
+            .zip(&prepared)
+            .zip(&done)
+            .map(|((queued, prepared), done)| async move {
+                let outcome = match prepared {
+                    Ok((row, plan)) => backend.send_repair(&queued.key(tenant_id), row, plan).await,
+                    Err(reason) => RepairOutcome::Skipped(*reason),
                 };
-                backend.send_repair(&key, row, plan).await
+                *done.lock() = Some(outcome);
+                outcome
             })
             .collect();
-        let sent: Vec<RepairOutcome> = futures::stream::iter(futures)
-            .buffered(REPAIR_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
-        for ((at, ..), outcome) in admitted.iter().zip(sent) {
-            outcomes[*at] = Some(outcome);
-        }
-        outcomes
-            .into_iter()
-            .map(|outcome| outcome.unwrap_or(RepairOutcome::Skipped(SkipReason::NotStale)))
+        let mut finished = collect_within(futures, REPAIR_CONCURRENCY, ends_at)
+            .await
+            .into_iter();
+        self.queued
+            .iter()
+            .zip(&done)
+            .map(|(queued, done)| {
+                finished
+                    .next()
+                    .or_else(|| *done.lock())
+                    .unwrap_or_else(|| {
+                        let key = queued.key(tenant_id);
+                        tracing::warn!(
+                            tenant = %key.tenant_id,
+                            resource_type = key.resource_type,
+                            id = key.id,
+                            deadline_ms = deadline.as_millis() as u64,
+                            "repair on read passed its deadline; the repair is left for the next search or the sweeper"
+                        );
+                        let index = IndexWriteStats::default();
+                        counters.failed(&index);
+                        RepairOutcome::Failed {
+                            failure: WriteFailure::TriesExhausted,
+                            index,
+                        }
+                    })
+            })
             .collect()
     }
+}
+
+/// The outputs of `futures`, in order, at most `concurrency` running at once,
+/// up to `ends_at`: the ones still unfinished then are dropped and have no
+/// output.
+async fn collect_within<F: Future>(
+    futures: Vec<F>,
+    concurrency: usize,
+    ends_at: tokio::time::Instant,
+) -> Vec<F::Output> {
+    let mut stream = futures::stream::iter(futures).buffered(concurrency);
+    let mut outputs = Vec::new();
+    while let Ok(Some(output)) = tokio::time::timeout_at(ends_at, stream.next()).await {
+        outputs.push(output);
+    }
+    outputs
 }
 
 impl CassandraBackend {
@@ -1329,5 +1402,82 @@ mod tests {
         )
         .await;
         assert_consistent(&report);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_within_returns_the_outputs_finished_in_order_at_its_deadline() {
+        let futures: Vec<std::pin::Pin<Box<dyn Future<Output = i32>>>> = vec![
+            Box::pin(async { 1 }),
+            Box::pin(async { 2 }),
+            Box::pin(std::future::pending()),
+            Box::pin(async { 4 }),
+        ];
+        let started = tokio::time::Instant::now();
+        let outputs = collect_within(futures, 2, started + Duration::from_secs(10)).await;
+        assert_eq!(outputs, [1, 2]);
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
+
+    /// The whole phase has one deadline: with the clock jumped past it, a repair
+    /// that needs the node cannot finish, so every one is `Failed`, counted,
+    /// and `run` returns at once. The writes that were in flight may have
+    /// applied, so a second, ordinary run repeats them and ends consistent.
+    #[tokio::test]
+    async fn repair_returns_at_its_deadline_with_the_unfinished_failed() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-deadline");
+        let tenant = context(&t);
+        let rows = [
+            ("p", updated(&backend, &tenant, &t, "p").await),
+            ("q", updated(&backend, &tenant, &t, "q").await),
+        ];
+        let queue = || {
+            let mut context = RepairContext::new(&t);
+            for (id, (row, stale)) in &rows {
+                context.queue("Patient", id, Some(row.clone()), stale.clone());
+            }
+            context
+        };
+
+        let before = backend.repair_stats();
+        let started = std::time::Instant::now();
+        // Paused after the backend is up: while the runtime waits for the
+        // node, the clock jumps to the phase's deadline, so no repair can
+        // finish, whatever the node's speed.
+        tokio::time::pause();
+        let paused_at = tokio::time::Instant::now();
+        let outcomes = queue().run_within(&backend, Duration::from_secs(1)).await;
+        // The deadline ended the phase, not a statement's own timeout (10 s).
+        assert!(paused_at.elapsed() < Duration::from_secs(5));
+        tokio::time::resume();
+        let stats = backend.repair_stats().since(&before);
+        eprintln!("[repair case=deadline {stats}]");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(outcomes.len(), 2);
+        for outcome in &outcomes {
+            assert!(
+                matches!(
+                    outcome,
+                    RepairOutcome::Failed {
+                        failure: WriteFailure::TriesExhausted,
+                        ..
+                    }
+                ),
+                "{outcomes:?}"
+            );
+        }
+        assert_eq!((stats.queued, stats.failed, stats.repaired), (2, 2, 0));
+
+        let outcomes = queue().run(&backend).await;
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, RepairOutcome::Repaired { full: true, .. })),
+            "{outcomes:?}"
+        );
+        assert_consistent(&check(&backend, &t).await);
     }
 }

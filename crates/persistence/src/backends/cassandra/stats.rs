@@ -8,6 +8,9 @@
 //! before and after what it measures, and prints [`CasStats::since`] as
 //! `key=value` pairs (its `Display`).
 //!
+//! [`RepairStats`] counts repair on read (`repair.rs`), read with
+//! [`CassandraBackend::repair_stats`](super::CassandraBackend::repair_stats).
+//!
 //! The statements themselves are counted per kind in `session.rs`
 //! ([`StatementCounts`](super::StatementCounts), report R5).
 //!
@@ -21,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cdrs_tokio::error::Error as CdrsError;
 use cdrs_tokio::frame::message_error::{ErrorType, WriteType};
 
+use super::repair::SkipReason;
 use super::session::DriverError;
 
 macro_rules! cas_counters {
@@ -326,6 +330,135 @@ impl CasCounters {
     }
 }
 
+macro_rules! repair_counters {
+    ($($(#[doc = $doc:literal])* $name:ident,)*) => {
+        /// Repair on read's counters, one atomic per field of [`RepairStats`].
+        #[derive(Debug, Default)]
+        pub(crate) struct RepairCounters {
+            $($name: AtomicU64,)*
+        }
+
+        impl RepairCounters {
+            /// A snapshot of every counter.
+            pub(crate) fn snapshot(&self) -> RepairStats {
+                RepairStats {
+                    $($name: self.$name.load(Ordering::Relaxed),)*
+                }
+            }
+        }
+
+        /// A snapshot of repair on read's counters since the backend was
+        /// built. Every field only grows, so two snapshots subtract
+        /// ([`RepairStats::since`]).
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+        #[non_exhaustive]
+        pub struct RepairStats {
+            $($(#[doc = $doc])* pub $name: u64,)*
+        }
+
+        impl RepairStats {
+            /// What happened between `earlier` and `self`.
+            pub fn since(&self, earlier: &RepairStats) -> RepairStats {
+                RepairStats {
+                    $($name: self.$name.saturating_sub(earlier.$name),)*
+                }
+            }
+
+            /// Every counter as `(name, value)`, in declaration order.
+            pub fn pairs(&self) -> Vec<(&'static str, u64)> {
+                vec![$((stringify!($name), self.$name),)*]
+            }
+        }
+    };
+}
+
+repair_counters! {
+    /// Resources a repair run was given.
+    queued,
+    /// Repairs whose every batch was confirmed.
+    repaired,
+    /// Of `repaired`, those that wrote only the found rows.
+    repaired_partial,
+    /// Repairs the writer did not confirm, or the phase's deadline cut.
+    failed,
+    /// Index rows packed (sent) for insert by every repair sent, confirmed or not.
+    rows_inserted,
+    /// Index rows packed (sent) for delete by every repair sent, confirmed or not.
+    rows_deleted,
+    /// Skipped: a found row is tagged above the current version.
+    skipped_tag_ahead,
+    /// Skipped: the tag check found no `resources` row.
+    skipped_no_row,
+    /// Skipped: the current row's `write_ts` is not its `last_updated`'s.
+    skipped_write_ts,
+    /// Skipped: the current row's key set is unset or not decodable.
+    skipped_undecodable_keys,
+    /// Skipped: no found row is below the current version.
+    skipped_not_stale,
+    /// Skipped: past the search's repair budget.
+    skipped_budget,
+    /// Index rows given to `RepairContext::skip_undecodable`.
+    undecodable_rows,
+}
+
+impl fmt::Display for RepairStats {
+    /// `queued=3 repaired=2 …`, every counter, space-separated.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for (name, value) in self.pairs() {
+            if !first {
+                f.write_str(" ")?;
+            }
+            first = false;
+            write!(f, "{name}={value}")?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)] // Called by repair.rs, which Step 6's search calls (RV6).
+impl RepairCounters {
+    pub(crate) fn queued(&self, resources: u64) {
+        self.queued.fetch_add(resources, Ordering::Relaxed);
+    }
+
+    pub(crate) fn repaired(&self, full: bool, index: &IndexWriteStats) {
+        self.repaired.fetch_add(1, Ordering::Relaxed);
+        if !full {
+            self.repaired_partial.fetch_add(1, Ordering::Relaxed);
+        }
+        self.rows(index);
+    }
+
+    pub(crate) fn failed(&self, index: &IndexWriteStats) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        self.rows(index);
+    }
+
+    fn rows(&self, index: &IndexWriteStats) {
+        self.rows_inserted
+            .fetch_add(index.rows_inserted, Ordering::Relaxed);
+        self.rows_deleted
+            .fetch_add(index.rows_deleted, Ordering::Relaxed);
+    }
+
+    pub(crate) fn skipped(&self, reason: SkipReason) {
+        let counter = match reason {
+            SkipReason::TagAhead => &self.skipped_tag_ahead,
+            SkipReason::NoRow => &self.skipped_no_row,
+            SkipReason::WriteTsMismatch => &self.skipped_write_ts,
+            SkipReason::UndecodableKeys => &self.skipped_undecodable_keys,
+            SkipReason::NotStale => &self.skipped_not_stale,
+            SkipReason::Budget => &self.skipped_budget,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn undecodable_rows(&self, rows: u64) {
+        self.undecodable_rows.fetch_add(rows, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +504,41 @@ mod tests {
             stats.to_string(),
             "rows_inserted=4 rows_deleted=6 batches=3 largest_batch_bytes=4800"
         );
+    }
+
+    #[test]
+    fn repair_stats_subtract_and_print_every_counter() {
+        let counters = RepairCounters::default();
+        let before = counters.snapshot();
+        counters.queued(3);
+        let index = IndexWriteStats {
+            rows_inserted: 4,
+            rows_deleted: 1,
+            batches: 2,
+            largest_batch_bytes: 100,
+        };
+        counters.repaired(true, &index);
+        counters.repaired(false, &index);
+        counters.failed(&index);
+        counters.skipped(SkipReason::Budget);
+        counters.skipped(SkipReason::TagAhead);
+        counters.undecodable_rows(2);
+        let delta = counters.snapshot().since(&before);
+        assert_eq!(
+            (
+                delta.queued,
+                delta.repaired,
+                delta.repaired_partial,
+                delta.failed
+            ),
+            (3, 2, 1, 1)
+        );
+        assert_eq!((delta.rows_inserted, delta.rows_deleted), (12, 3));
+        assert_eq!((delta.skipped_budget, delta.skipped_tag_ahead), (1, 1));
+        assert_eq!(delta.undecodable_rows, 2);
+        let printed = delta.to_string();
+        assert!(printed.starts_with("queued=3 repaired=2 repaired_partial=1 failed=1 "));
+        assert_eq!(printed.split(' ').count(), delta.pairs().len());
+        assert_eq!(delta.pairs().len(), 13);
     }
 }

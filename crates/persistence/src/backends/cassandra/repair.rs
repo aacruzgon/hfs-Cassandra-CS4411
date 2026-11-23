@@ -480,9 +480,22 @@ impl CassandraBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::backends::cassandra::test_support::test_fhir_version;
+    use std::sync::Arc;
+
+    use cdrs_tokio::types::IntoRustByName;
+    use cdrs_tokio::types::value::Value;
     use chrono::TimeZone;
+    use serde_json::Value as Json;
+
+    use super::*;
+    use crate::backends::cassandra::checkpoint::Checkpoint;
+    use crate::backends::cassandra::consistency::harness::*;
+    use crate::backends::cassandra::consistency::version_ids;
+    use crate::backends::cassandra::session::StatementKind;
+    use crate::backends::cassandra::test_support::test_fhir_version;
+    use crate::core::ResourceStorage;
+    use crate::tenant::TenantContext;
+    use crate::types::StoredResource;
 
     fn lu(n: i64) -> DateTime<Utc> {
         Utc.timestamp_millis_opt(1_700_000_000_000 + n * 1000)
@@ -698,5 +711,233 @@ mod tests {
         assert_eq!(context.queued[0].row.as_ref().unwrap().version_id, 2);
         assert_eq!(context.queued[0].stale, vec![s1, s3]);
         assert_eq!(context.undecodable_rows, 1);
+    }
+
+    /// A read of the `(tenant, Patient)` partition of `resources_by_type`:
+    /// the unfiltered type search, as `(id, last_updated, version_id)`.
+    async fn type_search(backend: &CassandraBackend, t: &str) -> Vec<(String, DateTime<Utc>, i32)> {
+        let rows = backend
+            .session
+            .rows_paged(
+                "SELECT last_updated, id, version_id FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?",
+                vec![Value::from(t), Value::from("Patient")],
+                StatementKind::Read,
+            )
+            .await
+            .expect("type search");
+        rows.iter()
+            .map(|row| {
+                let id: String = row.get_r_by_name("id").expect("id");
+                let at: DateTime<Utc> = row.get_r_by_name("last_updated").expect("last_updated");
+                let tag: i32 = row.get_r_by_name("version_id").expect("version_id");
+                (id, at, tag)
+            })
+            .collect()
+    }
+
+    /// The rows of `id` tagged below `below`, as the search hands them over.
+    fn found(rows: &[(String, DateTime<Utc>, i32)], id: &str, below: i32) -> Vec<StaleIndexRow> {
+        rows.iter()
+            .filter(|(row_id, _, tag)| row_id == id && *tag < below)
+            .map(|(_, at, tag)| {
+                StaleIndexRow::new(IndexKey::ResourcesByType, Some(*at), *tag).unwrap()
+            })
+            .collect()
+    }
+
+    fn keys_of(row: &ResourceRow) -> Vec<IndexKey> {
+        index_keys::decode(row.index_keys.as_deref().expect("index_keys")).expect("K")
+    }
+
+    /// The keys of `old` whose row is not the row of any key of `new`.
+    fn not_produced(
+        old: &[IndexKey],
+        old_lu: DateTime<Utc>,
+        new: &[IndexKey],
+        new_lu: DateTime<Utc>,
+    ) -> usize {
+        old.iter()
+            .filter(|k| {
+                let row = k.row_at(old_lu);
+                !new.iter().any(|n| n.row_at(new_lu) == row)
+            })
+            .count()
+    }
+
+    /// An update of `p` that stops after its version row: the CAS applied,
+    /// the index rows were not written.
+    async fn crash_update(
+        backend: &Arc<CassandraBackend>,
+        tenant: &TenantContext,
+        t: &str,
+        p: &StoredResource,
+        body: Json,
+    ) {
+        let mut hold = backend.hold_at(Checkpoint::AfterVersionRow, t, "p", 2);
+        let task = tokio::spawn({
+            let (backend, tenant, p) = (backend.clone(), tenant.clone(), p.clone());
+            async move { backend.update(&tenant, &p, body).await }
+        });
+        hold.reached().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    async fn r1_of(backend: &CassandraBackend, t: &str, id: &str) -> ResourceRow {
+        backend
+            .read_resource_row(t, "Patient", id)
+            .await
+            .expect("R1")
+            .expect("a row")
+    }
+
+    fn key<'a>(t: &'a str, id: &'a str) -> RowKey<'a> {
+        RowKey {
+            tenant_id: t,
+            resource_type: "Patient",
+            id,
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_heals_a_crashed_update_at_the_first_search() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-heal");
+        let tenant = context(&t);
+        let p = backend
+            .create(&tenant, "Patient", patient(), test_fhir_version())
+            .await
+            .expect("create p");
+        let since = Utc::now();
+        let r1_first = r1_of(&backend, &t, "p").await;
+        let (lu1, k1) = (r1_first.last_updated, keys_of(&r1_first));
+        crash_update(&backend, &tenant, &t, &p, changed()).await;
+        let row = r1_of(&backend, &t, "p").await;
+        assert_eq!(row.version_id, 2);
+        let (lu2, k2) = (row.last_updated, keys_of(&row));
+
+        let stale = found(&type_search(&backend, &t).await, "p", 2);
+        assert_eq!(stale.len(), 1);
+        let report = check(&backend, &t).await;
+        assert_eq!(
+            report.kinds(),
+            expect(&[
+                ("missing_row", k2.len()),
+                ("stray_row", not_produced(&k1, lu1, &k2, lu2)),
+            ]),
+            "{report}"
+        );
+
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "p", Some(row.clone()), stale);
+        let (before, at) = (backend.repair_stats(), backend.statement_counts());
+        let outcomes = context.run(&backend).await;
+        let stats = backend.repair_stats().since(&before);
+        let spent = backend.statement_counts().since(&at);
+        eprintln!("[repair case=heal {stats}]");
+
+        let [RepairOutcome::Repaired { full: true, index }] = outcomes[..] else {
+            panic!("{outcomes:?}");
+        };
+        assert_eq!(index.rows_inserted, k2.len() as u64);
+        assert_eq!(index.rows_deleted, 1);
+        assert_eq!(spent.batch + spent.write, index.batches);
+        assert_eq!((spent.read, spent.serial_read, spent.cas), (0, 0, 0));
+        assert_eq!((stats.queued, stats.repaired, stats.failed), (1, 1, 0));
+        assert_eq!(
+            (stats.rows_inserted, stats.rows_deleted),
+            (k2.len() as u64, 1)
+        );
+        let rows: Vec<_> = type_search(&backend, &t)
+            .await
+            .into_iter()
+            .filter(|(id, ..)| id == "p")
+            .map(|(_, at, tag)| (at, tag))
+            .collect();
+        assert_eq!(rows, [(lu2, 2)]);
+        assert_eq!(r1_of(&backend, &t, "p").await, row);
+        assert_eq!(version_ids(&backend, &t, "Patient", "p").await, [1, 2]);
+        assert_eq!(
+            backend.intent_versions(&t, "Patient", "p", since).await,
+            [2]
+        );
+        let report = check(&backend, &t).await;
+        assert_eq!(
+            report.kinds(),
+            expect(&[("stray_row", not_produced(&k1, lu1, &k2, lu2) - 1)]),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_with_an_older_r1_loses_to_a_newer_version() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-older-r1");
+        let tenant = context(&t);
+        let p = backend
+            .create(&tenant, "Patient", patient(), test_fhir_version())
+            .await
+            .expect("create p");
+        let since = Utc::now();
+        let r1_first = r1_of(&backend, &t, "p").await;
+        let (lu1, k1) = (r1_first.last_updated, keys_of(&r1_first));
+        crash_update(&backend, &tenant, &t, &p, changed()).await;
+        let r1_old = r1_of(&backend, &t, "p").await;
+        assert_eq!(r1_old.version_id, 2);
+        let k2 = keys_of(&r1_old);
+        let stale = found(&type_search(&backend, &t).await, "p", 2);
+
+        let v2 = backend
+            .read(&tenant, "Patient", "p")
+            .await
+            .expect("read")
+            .expect("p");
+        let v3 = backend
+            .update(&tenant, &v2, patient())
+            .await
+            .expect("update to 3");
+        assert_eq!(v3.version_id(), "3");
+        let r1_new = r1_of(&backend, &t, "p").await;
+        let (lu3, k3) = (r1_new.last_updated, keys_of(&r1_new));
+
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "p", Some(r1_old), stale);
+        let before = backend.repair_stats();
+        let outcomes = context.run(&backend).await;
+        eprintln!(
+            "[repair case=older-r1 {}]",
+            backend.repair_stats().since(&before)
+        );
+
+        let [RepairOutcome::Repaired { full: true, index }] = outcomes[..] else {
+            panic!("{outcomes:?}");
+        };
+        assert_eq!(index.rows_inserted, k2.len() as u64);
+        assert_eq!(index.rows_deleted, 1);
+        let rows: Vec<_> = type_search(&backend, &t)
+            .await
+            .into_iter()
+            .filter(|(id, ..)| id == "p")
+            .map(|(_, at, tag)| (at, tag))
+            .collect();
+        assert_eq!(rows, [(lu3, 3)]);
+        assert_eq!(r1_of(&backend, &t, "p").await, r1_new);
+        assert_eq!(version_ids(&backend, &t, "Patient", "p").await, [1, 2, 3]);
+        assert_eq!(
+            backend.intent_versions(&t, "Patient", "p", since).await,
+            [2]
+        );
+        let report = check(&backend, &t).await;
+        assert_eq!(
+            report.kinds(),
+            expect(&[("stray_row", not_produced(&k1, lu1, &k3, lu3) - 1)]),
+            "{report}"
+        );
     }
 }

@@ -34,6 +34,9 @@ Commands:
                                     output); --check fails on a CQL DELETE
                                     against resources or resource_versions
   cas ID TITLE LOG...               the `[cas case=… key=value …]` lines
+  consistency ID TITLE LOG...       the `[index-consistency …]` lines, by log, and the
+                                    post-suite step's `[post-suite …]` and verdict lines
+  repair ID TITLE LOG...            the `[repair case=… key=value …]` lines
   intents ID TITLE CONTAINER        intent rows left in pending_index_writes
   spec ID TITLE LOG                 the `[spec row=… expected=… got=…]` lines
 
@@ -888,6 +891,13 @@ CRUD_TOMBSTONE_TABLES = [
     ("resources", "1 or less: soft delete writes cells, never a tombstone (G39)"),
     ("resource_versions", "1 or less: history rows are never deleted (G39)"),
     ("resources_by_type", "above 1 from Step 3: update and delete remove the X1 row"),
+    ("token_code_index", "above 1 from Step 5: an update or delete removes its version's rows"),
+    ("token_system_code_index", "above 1 from Step 5: an update or delete removes its version's rows"),
+    ("token_system_index", "above 1 from Step 5: an update or delete removes its version's rows"),
+    ("uri_index", "above 1 from Step 5: an update or delete removes its version's rows"),
+    ("date_index", "above 1 from Step 5: a date its new version drops is deleted"),
+    ("date_index_by_end", "above 1 from Step 5: a date its new version drops is deleted"),
+    ("pending_index_writes", "above 1: every finished write deletes its intent (I2)"),
 ]
 
 
@@ -899,9 +909,9 @@ def crud_tombstone_rows(tombstones: dict) -> tuple[list[dict], str, list[str]]:
         row = tombstones.get(name, {})
         entry = {"table": name, "reads": row.get("count"), "max": row.get("max"), "p99": row.get("p99th"), "expected": expected}
         rows.append(entry)
-        if name != "resources_by_type" and (row.get("max") or 0) > TOMBSTONE_FLOOR:
+        if name in ("resources", "resource_versions") and (row.get("max") or 0) > TOMBSTONE_FLOOR:
             warnings.append(f"Node statistics: a read of {name} scanned up to {row['max']:.0f} tombstones; it should never hold one (G39)")
-    md = ("\n**Tombstones on the tables Step 3 writes** (`system_views.tombstones_per_read`, a recent, decaying "
+    md = ("\n**Tombstones on the tables the write path writes** (`system_views.tombstones_per_read`, a recent, decaying "
           "histogram; it shows tombstones that reads scanned, not every one written. Its lowest bucket is 1, so 1 also means "
           "none: only a figure above 1 shows a tombstone):\n\n")
     md += table(["Table", "Reads", "Tombstones per read (max)", "(p99)", "Expected"],
@@ -1235,6 +1245,18 @@ def audit_violation(entry: dict, keyspace: str) -> str | None:
     return None
 
 
+# The CQL audit step's own timeout (its timeout-minutes: 5). A parse that uses more than half of it is warned on
+# (ADR-sam-michaels-0006, RV21): the post-suite sweep's writes are audited too.
+AUDIT_STEP_TIMEOUT_S = 300
+
+
+def audit_parse_warning(took: float) -> str | None:
+    """`CQL audit: the parse took N s, over half of the step's 300 s timeout` when `took` > 150, else None."""
+    if took > AUDIT_STEP_TIMEOUT_S / 2:
+        return f"CQL audit: the parse took {took:.0f} s, over half of the step's {AUDIT_STEP_TIMEOUT_S} s timeout"
+    return None
+
+
 def cmd_cql_audit(args) -> int:
     path = Path(args.file)
     started = time.monotonic()
@@ -1276,6 +1298,9 @@ def cmd_cql_audit(args) -> int:
         warnings.append(f"CQL audit: {len(filtering)} prepared or DML statement(s) with ALLOW FILTERING (schema/README.md: never)")
     if failures:
         warnings.append(f"CQL audit: {len(failures)} failed statement(s) (REQUEST_FAILURE) in keyspace {args.keyspace} or with none")
+    slow = audit_parse_warning(took)
+    if slow:
+        warnings.append(slow)
     if not args.check:
         warnings += problems
 
@@ -1291,7 +1316,7 @@ def cmd_cql_audit(args) -> int:
            "a `REQUEST_FAILURE`. A `TRUNCATE` or `DROP TABLE` of either table is one too. A failed native-protocol batch "
            "fails the check as well: its entry holds no statement text, and a logged batch that timed out may still "
            "apply. `resources_by_type` (X1) and "
-           f"`pending_index_writes` (I2) are deleted from legitimately. Parsed in {took:.1f} s.\n\n")
+           f"`pending_index_writes` (I2) are deleted from legitimately. Parsed in {took:.1f} s, of the step's {AUDIT_STEP_TIMEOUT_S} s timeout.\n\n")
     md += "**DML by table and type** (R7; `UPDATE` is an INSERT or an UPDATE; the driver may re-send an idempotent statement, so a count can exceed one per operation):\n\n"
     tables = sorted({scope for scope, _ in counts})
     types = sorted({kind for _, kind in counts})
@@ -1310,7 +1335,8 @@ def cmd_cql_audit(args) -> int:
         "prepares": prepares, "failures": len(failures), "plain_writes_to_resources": len(plain_writes),
         "allow_filtering": len(filtering), "violations": violations, "unverifiable": unverifiable,
         "check": bool(args.check),
-        "check_passed": not problems, "parse_seconds": round(took, 2), "warnings": warnings,
+        "check_passed": not problems, "parse_seconds": round(took, 2), "timeout_seconds": AUDIT_STEP_TIMEOUT_S,
+        "warnings": warnings,
     }
     add(args.id, args.title, md, data)
     if args.check and problems:
@@ -1402,6 +1428,100 @@ def cmd_cas(args) -> int:
     else:
         md = ("No `[cas case=…]` line in the logs: no test printed the backend's `cas_stats()`, "
               "or no test printed them.\n")
+    if missing:
+        md += "\nNo log for: " + ", ".join(f"`{m}`" for m in missing) + ".\n"
+    add(args.id, args.title, md, {"rows": rows, "keys": keys, "missing_logs": missing, "warnings": warnings})
+    return 0
+
+
+# The fixed fields of an `[index-consistency …]` line: every other key is a defect kind and its count.
+CONSISTENCY_FIXED = {"tenant", "scope", "scan", "registry", "resources", "live", "deleted", "absent", "versions",
+                     "rows_scanned", "rows_checked", "defects", "took_ms"}
+
+
+def _count(value) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def cmd_consistency(args) -> int:
+    logs, defects, missing, warnings = [], [], [], []
+    post_suite, verdict = {}, None
+    for log in args.logs:
+        path = Path(log)
+        if not path.exists():
+            missing.append(path.name)
+            warnings.append(f"Consistency checks: no log {path.name}")
+            continue
+        text = path.read_text(errors="replace")
+        lines = tagged_lines(text, "index-consistency")
+        row = {"log": path.stem, "checks": len(lines),
+               "changed": sum(1 for p in lines if p.get("registry") == "changed"),
+               "shared": sum(1 for p in lines if p.get("scan") == "shared"),
+               "with_defects": sum(1 for p in lines if _count(p.get("defects")) > 0),
+               "took_ms": sum(_count(p.get("took_ms")) for p in lines)}
+        logs.append(row)
+        for pairs in lines:
+            if _count(pairs.get("defects")) > 0 and len(defects) < 50:
+                tenant = pairs.get("tenant", "?")
+                match = TEST_TENANT.match(tenant)
+                kinds = " ".join(f"{k}={v}" for k, v in pairs.items()
+                                 if k not in CONSISTENCY_FIXED and _count(v) > 0)
+                defects.append({"log": path.stem, "tenant": match.group(1) if match else tenant, "kinds": kinds})
+        if path.stem == "post-suite":
+            suite = tagged_lines(text, "post-suite")
+            if suite:
+                post_suite = suite[0]
+            else:
+                warnings.append("Consistency checks: the post-suite step printed no [post-suite] line")
+            verdicts = tagged_lines(text, "post-suite-verdict")
+            if verdicts:
+                verdict = verdicts[-1]
+                if verdict.get("pass") == "false":
+                    warnings.append(f"Post-suite check: {verdict.get('reason', 'no reason given')}")
+    md = table(["Log", "Checks", "registry=changed", "scan=shared", "With defects", "Time (s)"],
+               [[f"`{r['log']}`", r["checks"], r["changed"], r["shared"], r["with_defects"], round(r["took_ms"] / 1000, 1)]
+                for r in logs]) if logs else "No log to read.\n"
+    if post_suite:
+        fields = " ".join(f"{k}={post_suite.get(k, '?')}" for k in
+                          ("tenants", "changed", "excluded", "defects", "left", "scan_failed", "took_ms"))
+        md += f"\nPost-suite: `{fields}`; verdict: " + (
+            f"`pass={verdict.get('pass')}`" if verdict else "none printed") + ".\n"
+    if defects:
+        md += "\n**Checks with defects:**\n\n" + table(["Log", "Tenant", "Kinds"],
+                                                         [[f"`{d['log']}`", f"`{d['tenant']}`", d["kinds"]] for d in defects])
+    md += ("\n`registry=changed` checks skip rules 3 and 4, the comparison with a fresh extraction "
+           "(ADR-sam-michaels-0006, RV14), so they prove less; their count is shown so that a rise is seen. "
+           "Checks with defects in `persistence-lib-tests` are the planted-defect tests' own. In `post-suite`, "
+           "a defect fails the step once it is required (RV22).\n")
+    if missing:
+        md += "\nNo log for: " + ", ".join(f"`{m}`" for m in missing) + ".\n"
+    add(args.id, args.title, md, {"logs": logs, "post_suite": post_suite, "verdict": verdict, "defects": defects,
+                                  "missing_logs": missing, "warnings": warnings})
+    return 0
+
+
+def cmd_repair(args) -> int:
+    rows, missing = [], []
+    for log in args.logs:
+        path = Path(log)
+        if not path.exists():
+            missing.append(path.name)
+            continue
+        for pairs in tagged_lines(path.read_text(errors="replace"), "repair"):
+            pairs.setdefault("case", "?")
+            rows.append({"log": path.stem, **{k: number(v) if k != "case" else v for k, v in pairs.items()}})
+    keys = []
+    for row in rows:
+        keys += [k for k in row if k not in ("log", "case") and k not in keys]
+    warnings = [f"Repair counters: no log {m}" for m in missing]
+    if rows:
+        md = table(["Log", "Case"] + [f"`{k}`" for k in keys], [[r["log"], f"`{r['case']}`"] + [r.get(k) for k in keys] for r in rows])
+        md += "\nOne row per `[repair case=… key=value …]` line: the backend's `repair_stats()` over what that case did.\n"
+    else:
+        md = "No `[repair case=…]` line in the logs: no repair test printed its `repair_stats()`.\n"
     if missing:
         md += "\nNo log for: " + ", ".join(f"`{m}`" for m in missing) + ".\n"
     add(args.id, args.title, md, {"rows": rows, "keys": keys, "missing_logs": missing, "warnings": warnings})
@@ -1546,7 +1666,7 @@ def main() -> int:
     c.add_argument("command", nargs=argparse.REMAINDER)
     c.set_defaults(func=cmd_timed)
     for name, func in [("add", cmd_add), ("build", cmd_build), ("tests", cmd_tests), ("readiness", cmd_readiness), ("node-stats", cmd_node_stats), ("node-start", cmd_node_start),
-                       ("cql-audit", cmd_cql_audit), ("cas", cmd_cas), ("intents", cmd_intents), ("spec", cmd_spec)]:
+                       ("cql-audit", cmd_cql_audit), ("cas", cmd_cas), ("consistency", cmd_consistency), ("repair", cmd_repair), ("intents", cmd_intents), ("spec", cmd_spec)]:
         c = commands.add_parser(name)
         c.add_argument("id")
         c.add_argument("title")
@@ -1571,7 +1691,7 @@ def main() -> int:
             c.add_argument("--keyspace", default="helios")
             c.add_argument("--check", action="store_true",
                            help="exit 1 on a CQL DELETE against resources or resource_versions, or an empty log")
-        elif name == "cas":
+        elif name in ("cas", "consistency", "repair"):
             c.add_argument("logs", nargs="+")
         elif name == "intents":
             c.add_argument("container")

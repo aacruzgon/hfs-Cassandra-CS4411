@@ -529,6 +529,15 @@ class CqlAuditCommand(Scratch):
         args = SimpleNamespace(id="cql-audit", title="CQL audit", file=str(path), keyspace="helios", check=check)
         return self.quiet(ci_report.cmd_cql_audit, args)
 
+    def test_the_parse_time_is_shown_against_the_step_timeout(self):
+        status, _ = self.audit(CLEAN)
+        self.assertEqual(status, 0)
+        self.assertEqual(self.report("cql-audit")["timeout_seconds"], 300)
+        markdown = (self.dir / "report" / "cql-audit.md").read_text()
+        self.assertIn("of the step's 300 s timeout", markdown)
+        self.assertIn("over half of the step's 300 s timeout", ci_report.audit_parse_warning(151.0))
+        self.assertIsNone(ci_report.audit_parse_warning(150.0))
+
     def test_clean_log_passes(self):
         status, _ = self.audit(CLEAN)
         self.assertEqual(status, 0)
@@ -850,6 +859,66 @@ class IntentsCommand(Scratch):
         self.assertEqual(failed, [f"p{k:04d}" for k in range(100, 200)], "the second chunk of the sorted keys")
 
 
+def consistency_line(tenant, registry, scan, defects, kinds=""):
+    return (f"[index-consistency tenant={tenant} scope=tenant scan={scan} registry={registry} resources=1 live=1 "
+            f"deleted=0 absent=0 versions=1 rows_scanned=5 rows_checked=5 defects={defects} took_ms=10{kinds}]\n")
+
+
+class ConsistencyCommand(Scratch):
+    def run_command(self, logs):
+        args = SimpleNamespace(id="consistency", title="Consistency", logs=[str(p) for p in logs])
+        return self.quiet(ci_report.cmd_consistency, args)
+
+    def test_counts_changed_shared_and_defects(self):
+        lib = self.write("persistence-lib-tests.log",
+                         consistency_line("test-a-" + "0" * 32, "fixed", "full", 0)
+                         + consistency_line("test-b-" + "1" * 32, "changed", "full", 0)
+                         + consistency_line("test-planted-x-" + "2" * 32, "fixed", "shared", 2,
+                                            " missing_row=1 stray_row=1 wrong_tag=0"))
+        post = self.write("post-suite.log",
+                          consistency_line("test-c-" + "3" * 32, "changed", "shared", 0)
+                          + '[post-suite prefix=test- tenants=1 changed=1 excluded=1 defects=0 failing=- left=0 '
+                            'left_errors=0 scan_failed=- rows_scanned=9 took_ms=5] [sweep-pass slices=1]\n'
+                            '[post-suite-verdict pass=true]\n')
+        status, _ = self.run_command([lib, post])
+        self.assertEqual(status, 0)
+        data = self.report("consistency")
+        by_log = {r["log"]: r for r in data["logs"]}
+        got = lambda r: (r["checks"], r["changed"], r["shared"], r["with_defects"])
+        self.assertEqual(got(by_log["persistence-lib-tests"]), (3, 1, 1, 1))
+        self.assertEqual(got(by_log["post-suite"]), (1, 1, 1, 0))
+        self.assertEqual(data["defects"], [{"log": "persistence-lib-tests", "tenant": "planted-x",
+                                            "kinds": "missing_row=1 stray_row=1"}])
+        self.assertEqual(data["post_suite"]["excluded"], "1")
+        self.assertEqual(data["warnings"], [])
+
+    def test_a_failed_verdict_a_missing_line_and_a_missing_log_warn(self):
+        lib = self.write("persistence-lib-tests.log", consistency_line("test-a-" + "0" * 32, "fixed", "full", 0))
+        post = self.write("post-suite.log",
+                          '[post-suite-verdict pass=false reason="2 defects in 1 tenants: test-a"]\n')
+        status, _ = self.run_command([lib, post, self.dir / "absent-tests.log"])
+        self.assertEqual(status, 0)
+        warnings = self.report("consistency")["warnings"]
+        self.assertIn("Post-suite check: 2 defects in 1 tenants: test-a", warnings)
+        self.assertIn("Consistency checks: the post-suite step printed no [post-suite] line", warnings)
+        self.assertIn("Consistency checks: no log absent-tests.log", warnings)
+
+
+class RepairCommand(Scratch):
+    def test_rows_per_line_and_a_missing_log(self):
+        log = self.write("persistence-lib-tests.log",
+                         "[repair case=heal repaired=1 skipped=0]\n[repair case=budget repaired=0 skipped=3]\n"
+                         "[repair-other case=x a=1]\n")
+        args = SimpleNamespace(id="repair", title="Repair", logs=[str(log), str(self.dir / "absent.log")])
+        status, _ = self.quiet(ci_report.cmd_repair, args)
+        self.assertEqual(status, 0)
+        data = self.report("repair")
+        self.assertEqual(len(data["rows"]), 2)
+        self.assertEqual(data["keys"], ["repaired", "skipped"])
+        self.assertEqual(data["rows"][1]["skipped"], 3)
+        self.assertEqual(data["missing_logs"], ["absent.log"])
+
+
 class CrudTombstones(unittest.TestCase):
     def test_soft_delete_tables_warn_and_resources_by_type_does_not(self):
         rows, md, warnings = ci_report.crud_tombstone_rows({
@@ -857,10 +926,17 @@ class CrudTombstones(unittest.TestCase):
             "resource_versions": {"count": 5, "max": 2.0, "p99th": 1.0},
             "resources_by_type": {"count": 9, "max": 40.0, "p99th": 30.0},
         })
-        self.assertEqual([r["table"] for r in rows], ["resources", "resource_versions", "resources_by_type"])
+        self.assertEqual([r["table"] for r in rows][:3], ["resources", "resource_versions", "resources_by_type"])
+        self.assertEqual(len(rows), 10)
         self.assertEqual(len(warnings), 1)
         self.assertIn("resource_versions", warnings[0])
         self.assertIn("`resources_by_type`", md)
+
+    def test_index_tables_and_the_outbox_never_warn(self):
+        names = ["resources_by_type", "token_code_index", "token_system_code_index", "token_system_index",
+                 "uri_index", "date_index", "date_index_by_end", "pending_index_writes"]
+        _, _, warnings = ci_report.crud_tombstone_rows({n: {"count": 5, "max": 500, "p99th": 400} for n in names})
+        self.assertEqual(warnings, [])
 
     def test_the_histogram_floor_of_1_is_not_a_tombstone(self):
         # Recorded on CI run 42336353732: no DELETE in the audit log, yet both

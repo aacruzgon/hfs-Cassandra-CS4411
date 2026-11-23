@@ -858,6 +858,51 @@ jobs:
         timeout-minutes: 3
         run: python3 .github/scripts/ci-report.py intents intents "Intent rows left in pending_index_writes" hfs-cassandra-ci-cassandra-1
 
+      # The post-suite check (ADR-sam-michaels-0006, RV22), report only until
+      # it is made required: after every suite has exited, one grace-0 sweep
+      # of every test- tenant, the consistency check over every test- tenant
+      # but the test-planted- ones (one shared scan, ADR-sam-michaels-0007),
+      # the intent rows left after the sweep (R4b) and the outbox's
+      # tablestats. It never runs on a shared node: the test refuses 59042.
+      - name: Post-suite sweep and consistency check (report only)
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/ci-report/inputs/post-suite"
+          mkdir -p "$dir" "$RUNNER_TEMP/ci-report/logs"
+          log="$RUNNER_TEMP/ci-report/logs/post-suite.log"
+          HFS_TEST_POST_SUITE_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+            cargo test -p helios-persistence --features cassandra --lib -- \
+              --ignored --exact backends::cassandra::sweeper::post_suite::post_suite_sweep_and_check \
+              --nocapture 2>&1 \
+            | tee "$log" || true
+          python3 .github/scripts/ci-report.py intents post-suite-intents \
+            "Intent rows left after the post-suite sweep (R4b)" hfs-cassandra-ci-cassandra-1
+          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 \
+            nodetool tablestats helios.pending_index_writes > "$dir/outbox-tablestats.txt" \
+            || echo "nodetool tablestats failed" > "$dir/outbox-tablestats.txt"
+          clean="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
+          {
+            echo "Report only (ADR-sam-michaels-0006, RV22)."
+            echo
+            echo '```'
+            grep -E '\[(post-suite|sweep-pass) ' <<<"$clean" || echo "no [post-suite] line"
+            grep -E '\[index-consistency .* defects=[1-9]' <<<"$clean" || true
+            echo '```'
+            echo
+            echo '`pending_index_writes` tablestats:'
+            echo
+            echo '```'
+            cat "$dir/outbox-tablestats.txt"
+            echo '```'
+          } > "$dir/post-suite.md"
+          python3 .github/scripts/ci-report.py add post-suite \
+            "Post-suite sweep and consistency check (report only)" --markdown "$dir/post-suite.md"
+          grep -Eq '^test result: ok\. 1 passed;' <<<"$clean" \
+            || { echo "::warning title=Post-suite check::post_suite_sweep_and_check did not run exactly once"; exit 1; }
+
       # Before the readiness test, which restarts the node and so resets these
       # metrics: tablestats, tpstats, the per-table latency and tombstone
       # histograms of system_views, and the lightweight-transaction counts,

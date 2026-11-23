@@ -3213,3 +3213,227 @@ mod node_tests {
         assert_eq!(delta.tombstone_warnings, 0);
     }
 }
+
+/// The post-suite step (ADR-sam-michaels-0006, RV22): after every suite has exited, one grace-0 sweep of
+/// every `test-` tenant and the consistency check over every one of them but the `test-planted-` ones.
+#[cfg(test)]
+pub(crate) mod post_suite {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::backends::cassandra::backend::SELECT_RESOURCE_KEYS;
+    use crate::backends::cassandra::consistency::{
+        IndexScan, Registry, ScanMode, Scope, index_consistency,
+    };
+    use crate::backends::cassandra::test_support::test_config;
+
+    /// RV22's exclusion: the tenants that plant defects on purpose are swept but not checked.
+    pub(crate) fn checked(tenant_id: &str) -> bool {
+        tenant_id.starts_with("test-") && !tenant_id.starts_with("test-planted-")
+    }
+
+    /// What the post-suite step did.
+    pub(crate) struct PostSuiteReport {
+        pub(crate) prefix: String,
+        pub(crate) sweep: SweepReport,
+        pub(crate) tenants: usize,
+        pub(crate) changed: usize,
+        pub(crate) defects: usize,
+        pub(crate) failing: Vec<String>,
+        pub(crate) rows_scanned: usize,
+        pub(crate) took: Duration,
+    }
+
+    impl fmt::Display for PostSuiteReport {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let failing = if self.failing.is_empty() {
+                "-".to_string()
+            } else {
+                self.failing.join(",")
+            };
+            write!(
+                f,
+                "[post-suite prefix={} tenants={} changed={} defects={} failing={failing} \
+                 rows_scanned={} took_ms={}] {}",
+                self.prefix,
+                self.tenants,
+                self.changed,
+                self.defects,
+                self.rows_scanned,
+                self.took.as_millis(),
+                self.sweep
+            )
+        }
+    }
+
+    /// One grace-0 sweep of every tenant under `prefix`, then one shared scan and a check per checked tenant.
+    pub(crate) async fn post_suite_report(
+        backend: &CassandraBackend,
+        prefix: &str,
+        since: DateTime<Utc>,
+    ) -> PostSuiteReport {
+        let started = Instant::now();
+        let sweep = backend
+            .sweep_pass(SweepOptions {
+                scope: SweepScope::TenantPrefix(prefix.to_string()),
+                grace: Duration::ZERO,
+                now: Utc::now(),
+                since,
+                allow_short_grace: true,
+            })
+            .await
+            .expect("a grace-0 pass is allowed here");
+
+        // Every tenant with a resource, marked changed when it has a SearchParameter (RV14).
+        let keys = backend
+            .session
+            .rows_paged(SELECT_RESOURCE_KEYS, Vec::new(), StatementKind::Read)
+            .await
+            .expect("the resource keys");
+        let mut registries: BTreeMap<String, Registry> = BTreeMap::new();
+        for row in &keys {
+            let tenant: String = row.get_r_by_name("tenant_id").expect("tenant_id");
+            if !tenant.starts_with(prefix) || !checked(&tenant) {
+                continue;
+            }
+            let resource_type: String = row.get_r_by_name("resource_type").expect("resource_type");
+            let entry = registries.entry(tenant).or_insert(Registry::Fixed);
+            if resource_type == "SearchParameter" {
+                *entry = Registry::Changed;
+            }
+        }
+
+        let own = prefix.to_string();
+        let scan = IndexScan::take(backend, move |tenant| {
+            tenant.starts_with(&own) && checked(tenant)
+        })
+        .await;
+        let mut tenants: Vec<String> = registries.keys().cloned().collect();
+        tenants.extend(scan.tenants().map(str::to_string));
+        tenants.sort();
+        tenants.dedup();
+
+        let (mut defects, mut changed, mut failing) = (0, 0, Vec::new());
+        for tenant in &tenants {
+            let registry = registries.get(tenant).copied().unwrap_or(Registry::Fixed);
+            if registry == Registry::Changed {
+                changed += 1;
+            }
+            let report = index_consistency(
+                backend,
+                tenant,
+                Scope::Tenant,
+                ScanMode::Shared(&scan),
+                registry,
+            )
+            .await;
+            if !report.defects.is_empty() {
+                defects += report.defects.len();
+                failing.push(tenant.clone());
+            }
+        }
+        PostSuiteReport {
+            prefix: prefix.to_string(),
+            sweep,
+            tenants: tenants.len(),
+            changed,
+            defects,
+            failing,
+            rows_scanned: scan.scanned(),
+            took: started.elapsed(),
+        }
+    }
+
+    /// RV22: the CI entry point, run alone after every suite. Opt-in, and never on the shared dev node.
+    #[tokio::test]
+    #[ignore = "the post-suite CI step runs it alone, after every suite (RV22)"]
+    async fn post_suite_sweep_and_check() {
+        let Ok(url) = std::env::var("HFS_TEST_POST_SUITE_URL") else {
+            eprintln!("skipping: HFS_TEST_POST_SUITE_URL is not set");
+            return;
+        };
+        assert!(
+            !url.trim().ends_with(":59042"),
+            "a grace-0 sweep of every test- tenant would delete the intents of tests still running there"
+        );
+        let backend = CassandraBackend::connect(crate::backends::cassandra::CassandraConfig {
+            contact_points: vec![url],
+            ..test_config()
+        })
+        .await
+        .expect("connect");
+        let report = post_suite_report(&backend, "test-", Utc::now() - startup_window()).await;
+        eprintln!("{report}");
+        if std::env::var("HFS_TEST_POST_SUITE_STRICT").as_deref() == Ok("1") {
+            assert!(
+                report.defects == 0 && report.sweep.is_complete(),
+                "{report}"
+            );
+        }
+    }
+
+    /// P10: the planted tenants are swept but not checked.
+    #[test]
+    fn the_post_suite_check_skips_planted_tenants() {
+        assert!(checked("test-a"));
+        assert!(!checked("test-planted-x"));
+        assert!(!checked("acme"));
+    }
+
+    /// N16 (RV22): the report sweeps and checks one prefix.
+    #[tokio::test]
+    async fn the_post_suite_report_sweeps_and_checks_one_prefix() {
+        use crate::backends::cassandra::checkpoint::Checkpoint;
+        use crate::backends::cassandra::consistency::harness::{self, changed, context, patient};
+        use crate::backends::cassandra::test_support::test_fhir_version;
+        use crate::core::ResourceStorage;
+
+        let Some(backend) = harness::backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let since = Utc::now() - chrono::Duration::seconds(5);
+        let prefix = format!("test-postsuite-{}-", Uuid::new_v4().simple());
+        let version = test_fhir_version();
+        let clean = context(&format!("{prefix}clean"));
+        let p = backend
+            .create(&clean, "Patient", patient(), version)
+            .await
+            .unwrap();
+        backend.update(&clean, &p, changed()).await.unwrap();
+
+        let crashed_id = format!("{prefix}crashed");
+        let crashed = context(&crashed_id);
+        let p = backend
+            .create(&crashed, "Patient", patient(), version)
+            .await
+            .unwrap();
+        let mut hold = backend.hold_at(Checkpoint::AfterCas, &crashed_id, "p", 2);
+        let task = tokio::spawn({
+            let (backend, crashed) = (backend.clone(), crashed.clone());
+            async move { backend.update(&crashed, &p, changed()).await }
+        });
+        hold.reached().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let report = post_suite_report(&backend, &prefix, since).await;
+        eprintln!("{report}");
+        assert_eq!(
+            (report.sweep.current, report.sweep.done),
+            (1, 1),
+            "{report}"
+        );
+        assert!(report.sweep.is_complete(), "{report}");
+        assert_eq!(
+            (report.tenants, report.changed, report.defects),
+            (2, 0, 0),
+            "{report}"
+        );
+        assert!(report.failing.is_empty(), "{report}");
+        assert!(
+            format!("{report}").starts_with("[post-suite prefix=test-postsuite-"),
+            "{report}"
+        );
+    }
+}

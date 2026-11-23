@@ -726,7 +726,7 @@ A background task in each Helios process (ADR-aacruzgon-0013 to 0015). It never 
   "birthDate": "1980-05-01" }
 ```
 
-Extraction gives three parameters: `identifier` (token, system `http://hospital.example/mrn`, written `MRN`, code `12345`); `gender` (token on a `code` element, system `IMPLICIT`, code `male`); `birthdate` (date, `[1980-05-01T00:00:00.000Z, 1980-05-02T00:00:00.000Z)`, written `[B0, B1)`). The id is `p1` (really a UUID string), the intent shard is 7, and all four writes fall in bucket `'2026-10-14T10'`. `tu(V)` is each intent's `enqueued_at` timeuuid, from the writer's clock.
+Extraction gives four parameters: `identifier` (token, system `http://hospital.example/mrn`, written `MRN`, code `12345`); `gender` (token on a `code` element, system `IMPLICIT`, code `male`); `birthdate` (date, `[1980-05-01T00:00:00.000Z, 1980-05-02T00:00:00.000Z)`, written `[B0, B1)`); and `deceased` (token, system `''`, code `false`, because its expression is `false` for a Patient without `deceased[x]`). The id is `p1` (really a UUID string), the intent shard is 7, and all four writes fall in bucket `'2026-10-14T10'`. `tu(V)` is each intent's `enqueued_at` timeuuid, from the writer's clock.
 
 | Version | Operation | `ts(V)` (µs) | `lu(V)` | `write_id` |
 | --- | --- | --- | --- | --- |
@@ -956,7 +956,7 @@ The CAS had already applied when step 5 failed, so no retry, sweep or repair cou
 - `token_system_index` rows for system `''`: no query form asks for "system is empty" with a pipe after it.
 - Token rows with an empty code are display-only: the converter emits an empty code only for `CodeableConcept.text` with no coding, with no system (`IndexValue::token_display_only`, `search/converters.rs:189-197`). It skips a Coding without a code and an Identifier without a value (`converters.rs:444-445`, `502`). They are dropped.
 - URI rows with an empty URI.
-- Decided: the `IMPLICIT` and `''` rows in `token_system_index`, the display-only tokens, the empty URIs and the extractor's `_id` and `_lastUpdated` rows are dropped before `K(V)` is computed. Dropping the `IMPLICIT` rows saves one row in three for every `code`-typed element (8 rows per version in the worked example, not 9). The converter writes an empty URI for an empty string (`convert_to_uri`, `search/converters.rs:670-678`), which FHIR does not allow but a client can send; no query can match it. The `''` rows and the empty URIs were added after P5's first wording, which did not name them.
+- Decided: the `IMPLICIT` and `''` rows in `token_system_index`, the display-only tokens, the empty URIs and the extractor's `_id` and `_lastUpdated` rows are dropped before `K(V)` is computed. Dropping the `IMPLICIT` rows saves one row in three for every `code`-typed element (10 rows per version in the worked example, not 11). The converter writes an empty URI for an empty string (`convert_to_uri`, `search/converters.rs:670-678`), which FHIR does not allow but a client can send; no query can match it. The `''` rows and the empty URIs were added after P5's first wording, which did not name them.
 
 **G20. Date-only searches read their whole candidate set on every page.** *Resolved in the design (ADR-aacruzgon-0027).*
 

@@ -1056,8 +1056,8 @@ mod tests {
         assert_eq!(index_keys_from(&values), keys);
     }
 
-    /// Walkthrough section 7's Patient gives the worked example's eight rows,
-    /// and two more: `deceased`, whose spec expression
+    /// The golden test: the walkthrough's 8 rows plus `deceased`'s 2. Section
+    /// 7's Patient gives the worked example's eight rows, and two more: `deceased`, whose spec expression
     /// (`Patient.deceased.exists() and Patient.deceased != false`) is `false`
     /// for a Patient without `deceased[x]`, so every such Patient gets
     /// `deceased = false` rows (roadmap row 5.1, RV13).

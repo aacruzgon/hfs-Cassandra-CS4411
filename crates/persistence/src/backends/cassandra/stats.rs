@@ -144,13 +144,14 @@ cas_counters! {
     /// Microseconds those extractions took, summed (IW22).
     extract_us,
     /// Search parameters skipped because their extraction failed; the write
-    /// went ahead without their rows (IW1).
+    /// went ahead without their rows (IW1). A consistency check's
+    /// re-extractions count too.
     extraction_failures,
     /// Extractions that failed for the whole resource, so the version kept
     /// only its `resources_by_type` row (IW1, D6).
     extraction_fallbacks,
-    /// Bytes of `data` and `index_keys` the compare-and-swaps sent carried,
-    /// summed over every attempt (IW21).
+    /// Bytes of `data` and of `index_keys` that the compare-and-swaps sent
+    /// carried, added up over every attempt (IW21).
     cas_payload_bytes,
 }
 

@@ -179,12 +179,12 @@ impl CassandraBackend {
     /// with the attempt's values, or the definite miss, which the caller maps
     /// (`update`) or answers with its next turn (`create_or_update`).
     ///
-    /// The caller has already checked the permission, and has run [`check_earlier_attempts`](Self::check_earlier_attempts) on
-    /// `row`.
+    /// The caller has already checked the permission, and has run
+    /// [`check_earlier_attempts`](Self::check_earlier_attempts) on `row`.
     ///
     /// The plan's V3 is `row` itself: `N`'s `data`, `lu(N)`, `w(N)` and
     /// `K(N)` (D5, G22, G40), and its `fhir_version` is `row`'s (G13). `K(N+1)`
-    /// is the `resources_by_type` row until Step 5.
+    /// comes from the shared extractor ([`CassandraBackend::index_keys_of`]).
     pub(crate) async fn update_attempt(
         &self,
         request: &mut CasRequest<'_>,

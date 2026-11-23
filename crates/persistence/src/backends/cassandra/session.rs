@@ -1815,7 +1815,11 @@ mod node_tests {
         );
 
         // Applied late after a `BATCH_LOG` timeout, which the writer retries:
-        // the batchlog's replay, applied before the next read.
+        // the batchlog's replay, applied before the next read. This exercises
+        // the seam's write-type mapping on a one-partition batch, not a
+        // timeout a node can send for it; the node test
+        // `a_batchlog_timeout_applied_late_is_retried_and_confirmed` is the
+        // realistic case.
         session.inject_fault(
             StatementKind::Write,
             "INSERT INTO resources_by_type",

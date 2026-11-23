@@ -368,7 +368,7 @@ mod node_tests {
 
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
-    use crate::backends::cassandra::index_keys::{self, IndexKey};
+    use crate::backends::cassandra::index_keys;
     use crate::backends::cassandra::session::{Fault, TimeoutWriteType};
     use crate::backends::cassandra::write::{
         PreviousVersion, SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, write_ts_of,
@@ -506,6 +506,7 @@ mod node_tests {
     /// C2's bind values for moving `Patient/p` from `from` to `from + 1`
     /// with `write_id`, outside the engine (another writer).
     fn c2_values(
+        backend: &CassandraBackend,
         tenant: &TenantContext,
         from: i32,
         write_id: Uuid,
@@ -520,7 +521,11 @@ mod node_tests {
             ),
             Value::from(write_ts_of(lu)),
             Value::from(write_id),
-            Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+            Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                tenant.tenant_id().as_str(),
+                "Patient",
+                &patient("Other"),
+            )))),
             Value::from(tenant.tenant_id().as_str()),
             Value::from("Patient"),
             Value::from("p"),
@@ -551,7 +556,7 @@ mod node_tests {
             .session
             .rows(
                 UPDATE_RESOURCE_IF_VERSION,
-                c2_values(tenant, from, write_id, lu),
+                c2_values(backend, tenant, from, write_id, lu),
                 StatementKind::Cas,
             )
             .await;
@@ -765,7 +770,11 @@ mod node_tests {
                     ),
                     Value::from(write_ts_of(lu)),
                     Value::from(writer),
-                    Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+                    Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                        tenant.tenant_id().as_str(),
+                        "Patient",
+                        &patient("Smith"),
+                    )))),
                 ],
                 StatementKind::Cas,
             )

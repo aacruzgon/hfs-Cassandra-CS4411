@@ -529,12 +529,8 @@ mod node_tests {
         let row = r1(backend, tenant).await.expect("a row to update");
         let (json, data) = normalized_body("update", "Patient", "p", patient("p")).unwrap();
         let mut request = backend.cas_request("update", key(tenant));
-        let plan = CasPlan::update(
-            PreviousVersion::from_row(&row).unwrap(),
-            json,
-            data,
-            vec![IndexKey::ResourcesByType],
-        );
+        let keys = backend.index_keys_of(tenant, "Patient", &json);
+        let plan = CasPlan::update(PreviousVersion::from_row(&row).unwrap(), json, data, keys);
         match backend.run_cas(&mut request, plan).await.unwrap() {
             CasOutcome::Applied(_) => {}
             other => panic!("the other writer's update: {other:?}"),

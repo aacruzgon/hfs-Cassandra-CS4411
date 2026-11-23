@@ -366,7 +366,7 @@ mod node_tests {
 
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
-    use crate::backends::cassandra::index_keys::{self, IndexKey};
+    use crate::backends::cassandra::index_keys;
     use crate::backends::cassandra::session::{Fault, StatementKind, TimeoutWriteType};
     use crate::backends::cassandra::write::{
         INSERT_VERSION, PreviousVersion, REVIVE_RESOURCE_IF_VERSION,
@@ -583,7 +583,11 @@ mod node_tests {
             ),
             Value::from(write_ts_of(lu)),
             Value::from(write_id),
-            Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+            Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                tenant.tenant_id().as_str(),
+                "Patient",
+                &patient("Theirs"),
+            )))),
             Value::from(tenant.tenant_id().as_str()),
             Value::from("Patient"),
             Value::from("p"),
@@ -1077,7 +1081,11 @@ mod node_tests {
                     ),
                     Value::from(write_ts_of(lu)),
                     Value::from(theirs),
-                    Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+                    Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                        tenant.tenant_id().as_str(),
+                        "Patient",
+                        &patient("Theirs"),
+                    )))),
                     Value::from(write_ts_of(lu)),
                 ],
                 StatementKind::Write,

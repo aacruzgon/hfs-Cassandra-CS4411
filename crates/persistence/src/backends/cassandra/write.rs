@@ -5698,9 +5698,9 @@ mod node_tests {
                     &mut request,
                     CasPlan::update(
                         PreviousVersion::from_row(&row1).unwrap(),
-                        json,
+                        json.clone(),
                         data,
-                        vec![IndexKey::ResourcesByType],
+                        backend.index_keys_of(tenant.tenant_id().as_str(), "Patient", &json),
                     ),
                 )
                 .await
@@ -5966,12 +5966,8 @@ mod node_tests {
             .unwrap();
         let row1 = current(&backend, &tenant).await;
         let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
-        let plan = CasPlan::update(
-            PreviousVersion::from_row(&row1).unwrap(),
-            json,
-            data,
-            vec![IndexKey::ResourcesByType],
-        );
+        let keys = backend.index_keys_of(tenant.tenant_id().as_str(), "Patient", &json);
+        let plan = CasPlan::update(PreviousVersion::from_row(&row1).unwrap(), json, data, keys);
         // V3 (step 2) shares V1's text, so it passes; then V1 fails every try.
         backend.session.inject_fault(
             StatementKind::Write,
@@ -7057,12 +7053,13 @@ mod node_tests {
             .await
             .unwrap();
         let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let keys = backend.index_keys_of(tenant.tenant_id().as_str(), "Patient", &json);
         let update = |row: &ResourceRow| {
             CasPlan::update(
                 PreviousVersion::from_row(row).unwrap(),
                 json.clone(),
                 data.clone(),
-                vec![IndexKey::ResourcesByType],
+                keys.clone(),
             )
         };
         // Version 2, written by the engine.
@@ -7485,12 +7482,8 @@ mod node_tests {
         // Another request's C2 of v1, held back until just before our R2.
         let row = current(&backend, &tenant).await;
         let (body, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
-        let plan = CasPlan::update(
-            PreviousVersion::from_row(&row).unwrap(),
-            body,
-            data,
-            vec![IndexKey::ResourcesByType],
-        );
+        let keys = backend.index_keys_of(tenant.tenant_id().as_str(), "Patient", &body);
+        let plan = CasPlan::update(PreviousVersion::from_row(&row).unwrap(), body, data, keys);
         backend.session.inject_fault(
             StatementKind::Cas,
             "SET version_id = ?, data = ?",

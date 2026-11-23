@@ -422,12 +422,14 @@ impl CassandraBackend {
     /// with the tenant in every partition key), plus `Crud` (create, read,
     /// update and delete; every write to `resources` a compare-and-swap, the
     /// delete soft) and `OptimisticLocking` (`If-Match` through `update`'s and
-    /// `delete_versioned`'s compare-and-swap). A capability must never be
-    /// declared for behaviour that is planned or stubbed (`core/backend.rs`),
-    /// so each other one is added here, and to the golden list in
+    /// `delete_versioned`'s compare-and-swap). Step 4 adds `Versioning`
+    /// (`vread`, `list_versions`, `update_with_match` and `delete_with_match`;
+    /// ADR-sara-lahourpour-0002). A capability must never be declared for
+    /// behaviour that is planned or stubbed (`core/backend.rs`), so each other
+    /// one is added here, and to the golden list in
     /// `tests/backend_capability_contract.rs`, in the commit of the step that
-    /// implements it: `Versioning` at Step 4, `BasicSearch`, `DateSearch` and
-    /// `CursorPagination` at Steps 6a to 6d (ADR-aacruzgon-0037). Those seven
+    /// implements it: `BasicSearch`, `DateSearch` and `CursorPagination` at
+    /// Steps 6a to 6d (ADR-aacruzgon-0037). Those seven
     /// are the end state (design, "Structs and enums": `BackendCapability`);
     /// there is no `TokenSearch` or `UriSearch` variant, and `BasicSearch`
     /// covers both. The CapabilityStatement reads this list (ADR-aacruzgon-0085):
@@ -440,6 +442,7 @@ impl CassandraBackend {
     pub fn declared_capabilities() -> Vec<BackendCapability> {
         vec![
             BackendCapability::Crud,
+            BackendCapability::Versioning,
             BackendCapability::OptimisticLocking,
             BackendCapability::SharedSchema,
         ]
@@ -1285,18 +1288,19 @@ mod tests {
     #[test]
     fn declared_capabilities_are_exactly_those_implemented() {
         let declared = CassandraBackend::declared_capabilities();
-        // Step 3's two and the placement; the other four of the design's list
-        // arrive with their steps (ADR-aacruzgon-0037).
+        // Step 3's two, Step 4's `Versioning` and the placement; the other
+        // three of the design's list arrive with their steps
+        // (ADR-aacruzgon-0037).
         assert_eq!(
             declared,
             vec![
                 BackendCapability::Crud,
+                BackendCapability::Versioning,
                 BackendCapability::OptimisticLocking,
                 BackendCapability::SharedSchema,
             ]
         );
         for absent in [
-            BackendCapability::Versioning,
             BackendCapability::BasicSearch,
             BackendCapability::DateSearch,
             BackendCapability::CursorPagination,

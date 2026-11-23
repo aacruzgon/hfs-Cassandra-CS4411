@@ -3661,12 +3661,13 @@ pub(crate) mod post_suite {
         pub(crate) tenants: usize,
         pub(crate) changed: usize,
         /// Tenants with the prefix that the planted rule skips (`checked` is false): excluded from the check and from `left`.
+        /// A lower bound: it counts them from the `resources` listing only, so a planted tenant with only index or outbox rows is not counted.
         pub(crate) excluded: usize,
         pub(crate) defects: usize,
         pub(crate) failing: Vec<String>,
         /// Intents of checked tenants still in the outbox after the sweep: R4b, re-read in Rust.
         pub(crate) left: usize,
-        /// Slices the re-read for `left` could not read; any makes `left` unknown.
+        /// Slices the re-read for `left` could not read, plus outbox rows it could not decode; any makes `left` unknown.
         pub(crate) left_errors: u64,
         /// The shared scan's failure, `"<what>: <error>"`, when it stopped early: every check is then void (ADR-sam-michaels-0007).
         pub(crate) scan_failed: Option<String>,
@@ -3757,6 +3758,8 @@ pub(crate) mod post_suite {
             .map(|slice| backend.read_slice(slice, Rank::Normal));
         let mut outcomes = futures::stream::iter(reads).buffer_unordered(16);
         let (mut left, mut failed) = (0usize, 0u64);
+        // `read_slice` drops a row it cannot decode and counts it, so a rise here is a slice read in part.
+        let invalid_before = backend.sweeper_stats().invariant_violations;
         while let Some(outcome) = outcomes.next().await {
             match outcome {
                 Ok((intents, _)) => {
@@ -3770,6 +3773,10 @@ pub(crate) mod post_suite {
                 Err(_) => failed += 1,
             }
         }
+        failed += backend
+            .sweeper_stats()
+            .invariant_violations
+            .saturating_sub(invalid_before);
         (left, failed)
     }
 
@@ -3869,6 +3876,10 @@ pub(crate) mod post_suite {
     #[ignore = "the post-suite CI step runs it alone, after every suite (RV22)"]
     async fn post_suite_sweep_and_check() {
         let Ok(url) = std::env::var("HFS_TEST_POST_SUITE_URL") else {
+            assert!(
+                std::env::var("HFS_TEST_POST_SUITE_STRICT").as_deref() != Ok("1"),
+                "HFS_TEST_POST_SUITE_STRICT=1 but HFS_TEST_POST_SUITE_URL is not set: strict mode must not pass without checking"
+            );
             eprintln!("skipping: HFS_TEST_POST_SUITE_URL is not set");
             return;
         };

@@ -1638,7 +1638,6 @@ mod node_tests {
         );
     }
 
-    /// Fresh `test-` tenants for the hardening tests (ADR-aacruzgon-0020).
     /// Like `hardening_tenant`, for a case that plants an undecodable key
     /// set by raw CQL (RV22).
     fn planted_hardening_tenant(case: &str) -> TenantContext {
@@ -1651,6 +1650,7 @@ mod node_tests {
         )
     }
 
+    /// Fresh `test-` tenants for the hardening tests (ADR-aacruzgon-0020).
     fn hardening_tenant(case: &str) -> TenantContext {
         TenantContext::new(
             TenantId::new(format!(

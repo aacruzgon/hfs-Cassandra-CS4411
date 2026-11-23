@@ -867,7 +867,7 @@ jobs:
           python3 .github/scripts/ci-report.py add post-suite \
             "Post-suite sweep and consistency check (report only)" --markdown "$dir/post-suite.md"
           if grep -q 'scan_failed="' <<<"$clean"; then
-            echo "::warning title=Post-suite check::the shared index scan failed, so every tenant's check is void: $(grep -o 'scan_failed="[^"]*"' <<<"$clean" | head -1)"
+            echo "::warning title=Post-suite check::the shared index scan failed, so every tenant's check is void: $(grep -oE 'scan_failed="([^"\\]|\\.)*"' <<<"$clean" | head -1)"
           fi
           grep -Eq '^test result: ok\. 1 passed;' <<<"$clean" \
             || { echo "::warning title=Post-suite check::post_suite_sweep_and_check did not run exactly once"; exit 1; }

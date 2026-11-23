@@ -902,7 +902,7 @@ CRUD_TOMBSTONE_TABLES = [
 
 
 def crud_tombstone_rows(tombstones: dict) -> tuple[list[dict], str, list[str]]:
-    """R6: `tombstones_per_read` for the three tables Step 3 writes, with what
+    """R6: `tombstones_per_read` for the tables the write path writes, with what
     each should show, and a warning when a soft-delete table read one."""
     rows, warnings = [], []
     for name, expected in CRUD_TOMBSTONE_TABLES:

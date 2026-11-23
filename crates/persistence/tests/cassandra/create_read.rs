@@ -398,11 +398,24 @@ async fn cassandra_create_writes_every_cell_and_no_null() {
     assert_eq!(col::<i64>(row, "write_ts"), ts);
     let write_id: uuid::Uuid = row.get_r_by_name("write_id").unwrap();
     let index_keys = col::<Blob>(row, "index_keys").into_vec();
-    assert_eq!(
-        index_keys,
-        vec![0x01, 0x01, 0x01],
-        "K(1) = {{resources_by_type}}"
+    // Format 1 (`schema.cql`): the format byte, a one-byte row count, then
+    // rows each led by a table tag. The set holds the `resources_by_type`
+    // key (tag 1, first as the set is sorted) and the extracted keys of the
+    // body's `gender` and `birthDate`, so how many there are depends on the
+    // FHIR version's search parameters.
+    assert_eq!(index_keys[0], 0x01, "format 1");
+    assert!(
+        (2..0x80).contains(&index_keys[1]),
+        "K(1) holds more than the resources_by_type key: {index_keys:?}"
     );
+    assert_eq!(index_keys[2], 0x01, "K(1) holds the resources_by_type key");
+    let holds = |text: &str| {
+        index_keys
+            .windows(text.len())
+            .any(|window| window == text.as_bytes())
+    };
+    assert!(holds("gender"), "K(1) holds the gender keys");
+    assert!(holds("birthdate"), "K(1) holds the birthdate keys");
 
     // `resource_versions` row 1: V1 at ts(1), deleted_at unset (not null).
     let mut version_key = key(&tenant, "Patient", "cells");

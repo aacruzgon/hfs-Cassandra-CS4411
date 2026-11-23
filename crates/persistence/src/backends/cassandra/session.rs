@@ -263,6 +263,39 @@ pub(crate) struct CassandraSession {
     /// What each plain send used, in order (`cfg(test)` only).
     #[cfg(test)]
     plain_sends: parking_lot::Mutex<Vec<PlainSend>>,
+    /// `batch` calls in flight, and the most at once (IW12; `cfg(test)` only).
+    #[cfg(test)]
+    batches_in_flight: InFlight,
+}
+
+/// A count of calls in flight and the highest it reached (`cfg(test)` only).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct InFlight {
+    now: std::sync::atomic::AtomicUsize,
+    max: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl InFlight {
+    /// Counts one more call in flight until the guard is dropped.
+    fn enter(&self) -> InFlightGuard<'_> {
+        use std::sync::atomic::Ordering;
+        let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max.fetch_max(now, Ordering::SeqCst);
+        InFlightGuard(self)
+    }
+}
+
+/// Takes one call off [`InFlight`] when dropped.
+#[cfg(test)]
+struct InFlightGuard<'a>(&'a InFlight);
+
+#[cfg(test)]
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.now.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// What one plain send used (`cfg(test)` only): the statement's kind, the
@@ -318,6 +351,8 @@ impl CassandraSession {
             faults: faults::Faults::default(),
             #[cfg(test)]
             plain_sends: parking_lot::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            batches_in_flight: InFlight::default(),
         })
     }
 
@@ -574,6 +609,8 @@ impl CassandraSession {
     /// section 2, "Index rows"). What a failure means is
     /// [`classify_failure`](super::batch::classify_failure)'s to say.
     pub(crate) async fn batch(&self, statements: Vec<IndexStatement>) -> Result<(), DriverError> {
+        #[cfg(test)]
+        let _in_flight = (!statements.is_empty()).then(|| self.batches_in_flight.enter());
         if statements.len() <= 1 {
             return match statements.into_iter().next() {
                 Some(statement) => {
@@ -591,6 +628,14 @@ impl CassandraSession {
             return result;
         }
         self.send_batch(&statements).await
+    }
+
+    /// The most `batch` calls this session has had in flight at once (IW12).
+    #[cfg(test)]
+    pub(crate) fn max_batches_in_flight(&self) -> usize {
+        self.batches_in_flight
+            .max
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Prepares (on first use) and sends one batch under the request
@@ -785,6 +830,30 @@ impl std::fmt::Display for StatementCounts {
     }
 }
 
+/// The write type a fault's `WriteTimeout` reports. Not the driver's
+/// `WriteType`, which is not `Copy`.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeoutWriteType {
+    Simple,
+    Batch,
+    BatchLog,
+    Cas,
+}
+
+#[cfg(test)]
+impl From<TimeoutWriteType> for cdrs_tokio::frame::message_error::WriteType {
+    fn from(write_type: TimeoutWriteType) -> Self {
+        use cdrs_tokio::frame::message_error::WriteType;
+        match write_type {
+            TimeoutWriteType::Simple => WriteType::Simple,
+            TimeoutWriteType::Batch => WriteType::Batch,
+            TimeoutWriteType::BatchLog => WriteType::BatchLog,
+            TimeoutWriteType::Cas => WriteType::Cas,
+        }
+    }
+}
+
 /// A fault a test injects into the next matching statement, so that the
 /// engine's unknown-outcome paths run on one healthy node (Step 3 plan,
 /// section 6). Compiled only under `cfg(test)`: there is no Cargo feature, so
@@ -804,7 +873,7 @@ impl std::fmt::Display for StatementCounts {
 /// | --- | --- |
 /// | `ApplyThenTimeOut` | applied, then `WriteTimeout`/`BATCH`: the batchlog was written and the replicas were too slow to answer |
 /// | `TimeOutWithoutApplying` | `WriteTimeout`/`BATCH_LOG`, not applied: the batchlog write timed out, and the batch never reached it |
-/// | `ApplyLate` | `WriteTimeout`/`BATCH` now, applied just before the next statement of kind `before`: the batchlog's replay |
+/// | `ApplyLate` | `WriteTimeout` with its `write_type` now, applied just before the next statement of kind `before`: the batchlog's replay (`BatchLog`, then applied, is what a three-node cluster showed, IW15) |
 /// | `PassThrough` | sent as usual |
 /// | every other fault | the same error as for one statement, not applied |
 ///
@@ -817,12 +886,10 @@ impl std::fmt::Display for StatementCounts {
 /// node.** The node applies it as one mutation, without the batchlog
 /// (`BatchStatement.java:444-445`: a logged batch goes through the batchlog
 /// only across more than one mutation) and times it out as `SIMPLE`
-/// (`StorageProxy.java:885`), which the writer retries. The seam does not know a batch's partitions, so a test
-/// that fails such a batch with `ApplyThenTimeOut` or `ApplyLate` drives the
-/// writer's `BATCH` path with a timeout the node would not send for it. With
-/// the key set `[ResourcesByType]`, every write's batch is one partition, so
-/// until pull request 5 adds the token, date and URI rows, those tests check
-/// the writer's handling of `BATCH`, not a case a node can produce.
+/// (`StorageProxy.java:885`), which the writer retries. The seam does not
+/// know a batch's partitions. A test that fails a batch of one partition
+/// should give `ApplyLate` the type `Simple`; a write's index batches span
+/// several partitions once it has token, date or URI keys.
 ///
 /// A batch of one statement is a plain write, and a fault acts on it as on
 /// any statement.
@@ -834,12 +901,18 @@ pub(crate) enum Fault {
     ApplyThenTimeOut,
     /// Report `WriteTimeout`/CAS without executing it: not applied.
     TimeOutWithoutApplying,
-    /// Report `WriteTimeout`/CAS now, and execute the statement just before
-    /// the next statement of kind `before`: an attempt that applies late,
-    /// after the serial read said it had not (ADR-aacruzgon-0051).
+    /// Report `WriteTimeout` with `write_type` now, and send the statement or
+    /// batch just before the next statement of kind `before`: an attempt that
+    /// applies late, after the serial read said it had not
+    /// (ADR-aacruzgon-0051), or a batch the batchlog replays after a `BATCH`
+    /// or `BATCH_LOG` timeout (IW15).
     ApplyLate {
         /// The kind of statement the late apply runs just before.
         before: StatementKind,
+        /// What the timeout reports: `Cas` for a compare-and-swap, `Batch` or
+        /// `BatchLog` for a batch of several partitions, `Simple` for a plain
+        /// write or a one-partition batch.
+        write_type: TimeoutWriteType,
     },
     /// Fail with `WriteTimeout`/CAS without executing: what a serial read
     /// can raise on Paxos v2 (`Paxos.java:893-901`).
@@ -980,7 +1053,7 @@ mod faults {
                         return Some(Err(error));
                     }
                 }
-                Fault::ApplyLate { before } => self.deferred.lock().push(Deferred {
+                Fault::ApplyLate { before, .. } => self.deferred.lock().push(Deferred {
                     before,
                     late: Late::Statement {
                         cql: cql.to_string(),
@@ -1008,8 +1081,14 @@ mod faults {
                 }
                 Fault::TimeOutWithoutApplying | Fault::FailWithCasTimeout => {}
             }
+            let (consistency, write_type) = match fault {
+                Fault::ApplyLate { write_type, .. } if write_type != TimeoutWriteType::Cas => {
+                    (Consistency::LocalQuorum, write_type.into())
+                }
+                _ => (Consistency::LocalSerial, WriteType::Cas),
+            };
             Some(Err(server_error(ErrorType::WriteTimeout(
-                WriteTimeoutError::new(Consistency::LocalSerial, 0, 1, WriteType::Cas, None),
+                WriteTimeoutError::new(consistency, 0, 1, write_type, None),
             ))))
         }
 
@@ -1049,12 +1128,12 @@ mod faults {
                     Err(error) => Err(error),
                 },
                 Fault::TimeOutWithoutApplying => Err(timeout(WriteType::BatchLog)),
-                Fault::ApplyLate { before } => {
+                Fault::ApplyLate { before, write_type } => {
                     self.deferred.lock().push(Deferred {
                         before,
                         late: Late::Batch(statements.to_vec()),
                     });
-                    Err(timeout(WriteType::Batch))
+                    Err(timeout(write_type.into()))
                 }
                 Fault::PassThrough => session.send_batch(statements).await,
                 Fault::FailWithCasTimeout => Err(server_error(ErrorType::WriteTimeout(
@@ -1187,6 +1266,18 @@ async fn within<F: std::future::Future>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timeout_write_type_maps_to_the_drivers() {
+        use cdrs_tokio::frame::message_error::WriteType;
+        assert_eq!(WriteType::from(TimeoutWriteType::Simple), WriteType::Simple);
+        assert_eq!(WriteType::from(TimeoutWriteType::Batch), WriteType::Batch);
+        assert_eq!(
+            WriteType::from(TimeoutWriteType::BatchLog),
+            WriteType::BatchLog
+        );
+        assert_eq!(WriteType::from(TimeoutWriteType::Cas), WriteType::Cas);
+    }
 
     #[test]
     fn every_kind_sets_its_consistency_explicitly() {
@@ -1725,6 +1816,7 @@ mod node_tests {
             "INSERT INTO resources_by_type",
             Fault::ApplyLate {
                 before: StatementKind::Read,
+                write_type: TimeoutWriteType::Batch,
             },
         );
         let error = session
@@ -1742,6 +1834,31 @@ mod node_tests {
             "applied before the read"
         );
 
+        // Applied late after a `BATCH_LOG` timeout, which the writer retries:
+        // the batchlog's replay, applied before the next read. This exercises
+        // the seam's write-type mapping on a one-partition batch, not a
+        // timeout a node can send for it; the node test
+        // `a_batchlog_timeout_applied_late_is_retried_and_confirmed` is the
+        // realistic case.
+        session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::ApplyLate {
+                before: StatementKind::Read,
+                write_type: TimeoutWriteType::BatchLog,
+            },
+        );
+        let error = session
+            .batch(move_p1(3_000, 5_000, 5_000_001))
+            .await
+            .expect_err("the injected timeout");
+        assert_eq!(classify_failure(&error), BatchFailure::Retry, "{error:?}");
+        assert_eq!(
+            rows_of(&session, &t, "Patient").await,
+            vec![("p1".to_string(), 5_000_001)],
+            "applied before the read"
+        );
+
         // A fault for another kind of statement never matches a batch.
         session.inject_fault(
             StatementKind::Cas,
@@ -1749,12 +1866,17 @@ mod node_tests {
             Fault::TimeOutWithoutApplying,
         );
         session
-            .batch(move_p1(3_000, 4_000, 4_000_001))
+            .batch(move_p1(5_000, 6_000, 6_000_001))
             .await
             .expect("no write fault pending");
         assert_eq!(
             rows_of(&session, &t, "Patient").await,
-            vec![("p1".to_string(), 4_000_001)]
+            vec![("p1".to_string(), 6_000_001)]
+        );
+        assert_eq!(
+            session.max_batches_in_flight(),
+            1,
+            "one call at a time, a lone statement counted too"
         );
     }
 }

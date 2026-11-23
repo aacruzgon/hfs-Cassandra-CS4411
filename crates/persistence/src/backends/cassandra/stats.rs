@@ -11,6 +11,9 @@
 //! [`RepairStats`] counts repair on read (`repair.rs`), read with
 //! [`CassandraBackend::repair_stats`](super::CassandraBackend::repair_stats).
 //!
+//! The five extraction and payload counters at the end of [`CasStats`] are
+//! the writer's step 1 (roadmap row 5.1).
+//!
 //! The statements themselves are counted per kind in `session.rs`
 //! ([`StatementCounts`](super::StatementCounts), report R5).
 //!
@@ -20,6 +23,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use cdrs_tokio::error::Error as CdrsError;
 use cdrs_tokio::frame::message_error::{ErrorType, WriteType};
@@ -138,6 +142,21 @@ cas_counters! {
     /// Writes refused before any statement because what the CAS would carry
     /// is over the size bound.
     too_large,
+    /// Extractions run for a new key set: one per plan built, and one per
+    /// live resource a consistency check re-extracts (IW8).
+    extractions,
+    /// Microseconds those extractions took, summed (IW22).
+    extract_us,
+    /// Search parameters skipped because their extraction failed; the write
+    /// went ahead without their rows (IW1). A consistency check's
+    /// re-extractions count too.
+    extraction_failures,
+    /// Extractions that failed for the whole resource, so the version kept
+    /// only its `resources_by_type` row (IW1, D6).
+    extraction_fallbacks,
+    /// Bytes of `data` and of `index_keys` that the compare-and-swaps sent
+    /// carried, added up over every attempt (IW21).
+    cas_payload_bytes,
 }
 
 impl fmt::Display for CasStats {
@@ -328,6 +347,25 @@ impl CasCounters {
     pub(crate) fn too_large(&self) {
         Self::bump(&self.too_large);
     }
+
+    /// One extraction for a new key set (IW1, IW22).
+    pub(crate) fn extraction(&self, took: Duration, failed_params: u64, failed_resource: bool) {
+        Self::bump(&self.extractions);
+        self.extract_us.fetch_add(
+            u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.extraction_failures
+            .fetch_add(failed_params, Ordering::Relaxed);
+        if failed_resource {
+            Self::bump(&self.extraction_fallbacks);
+        }
+    }
+
+    /// What one compare-and-swap carried, `data` plus `index_keys` (IW21).
+    pub(crate) fn cas_payload(&self, bytes: u64) {
+        self.cas_payload_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 macro_rules! repair_counters {
@@ -475,8 +513,20 @@ mod tests {
             after: std::time::Duration::from_secs(1),
             sent: true,
         });
+        counters.extraction(Duration::from_micros(130), 2, true);
+        counters.cas_payload(900);
         let delta = counters.snapshot().since(&before);
         assert_eq!(delta.attempts, 2);
+        assert_eq!(
+            (
+                delta.extractions,
+                delta.extract_us,
+                delta.extraction_failures,
+                delta.extraction_fallbacks,
+                delta.cas_payload_bytes
+            ),
+            (1, 130, 2, 1, 900)
+        );
         assert_eq!((delta.applied, delta.applied_late), (1, 1));
         assert_eq!(delta.miss_version_conflict, 1);
         assert_eq!(delta.unknown_deadline, 1);

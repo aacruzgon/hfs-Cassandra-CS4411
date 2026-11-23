@@ -5,9 +5,7 @@
 //! plain `update`'s V3 built from R1 (Step 3 plan D5):
 //!
 //! 1. **Step 1, the operation's own.** `tenant.check_permission(
-//!    Operation::Update, type)`, then the G38 bound on a SearchParameter's
-//!    `code` ([`check_search_parameter_code`]): either refusal comes before
-//!    any statement.
+//!    Operation::Update, type)`, which refuses before any statement.
 //! 2. **R1** ([`CassandraBackend::read_resource_row`]) of `resources`, for
 //!    `K(N)` (G22) and for V3's `data` and `w(N)` (D5). Its version decides
 //!    what happens next ([`r1_case`], walkthrough `:176-180`):
@@ -43,9 +41,7 @@ use super::backend::CassandraBackend;
 use super::errors::map_driver_error;
 use super::read::{ResourceRow, SELECT_RESOURCE};
 use super::session::StatementKind;
-use super::write::{
-    CasMiss, CasOutcome, CasPlan, CasRequest, RowKey, check_search_parameter_code, normalized_body,
-};
+use super::write::{CasMiss, CasOutcome, CasPlan, CasRequest, RowKey, normalized_body};
 use crate::error::{ConcurrencyError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
@@ -108,7 +104,6 @@ impl CassandraBackend {
 
         // Step 1.
         tenant.check_permission(Operation::Update, resource_type)?;
-        check_search_parameter_code(resource_type, &resource)?;
 
         let tenant_id = tenant.tenant_id().as_str();
         let Ok(expected) = current.version_id().parse::<i32>() else {
@@ -184,13 +179,12 @@ impl CassandraBackend {
     /// with the attempt's values, or the definite miss, which the caller maps
     /// (`update`) or answers with its next turn (`create_or_update`).
     ///
-    /// The caller has already checked the permission and the G38 bound, and
-    /// has run [`check_earlier_attempts`](Self::check_earlier_attempts) on
-    /// `row`.
+    /// The caller has already checked the permission, and has run
+    /// [`check_earlier_attempts`](Self::check_earlier_attempts) on `row`.
     ///
     /// The plan's V3 is `row` itself: `N`'s `data`, `lu(N)`, `w(N)` and
     /// `K(N)` (D5, G22, G40), and its `fhir_version` is `row`'s (G13). `K(N+1)`
-    /// is the `resources_by_type` row until Step 5.
+    /// comes from the shared extractor ([`CassandraBackend::index_keys_of`]).
     pub(crate) async fn update_attempt(
         &self,
         request: &mut CasRequest<'_>,
@@ -375,7 +369,7 @@ mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
     use crate::backends::cassandra::index_keys::{self, IndexKey};
-    use crate::backends::cassandra::session::Fault;
+    use crate::backends::cassandra::session::{Fault, TimeoutWriteType};
     use crate::backends::cassandra::write::{
         PreviousVersion, SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, write_ts_of,
     };
@@ -546,7 +540,10 @@ mod node_tests {
         backend.session.inject_fault(
             StatementKind::Cas,
             "UPDATE resources",
-            Fault::ApplyLate { before },
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
         );
         let lu = super::super::write::next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50);
@@ -576,7 +573,10 @@ mod node_tests {
         backend.session.inject_fault(
             StatementKind::Cas,
             "UPDATE resources",
-            Fault::ApplyLate { before },
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
         );
         let lu = super::super::write::next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50);
@@ -675,14 +675,23 @@ mod node_tests {
             .expect("update");
         let spent = backend.statement_counts().since(&before);
         eprintln!("[statements op=update {spent}]");
-        // R1; V3, I1, V1, I2 sent alone; the X1 insert and delete in one
-        // batch, since both rows sit in the `(tenant, Patient)` partition
-        // (IW9 B, IW14); one C2.
+        // R1; V3, I1, V1, I2 sent alone; one C2. K(2) and K(1) hold `k` keys
+        // each (the same content, so the same rows), so the index step is one
+        // batch of `k` inserts and `k` deletes: every row's `last_updated`
+        // changed, and the batch is small enough to hold them all (IW9 B,
+        // IW14).
+        let k = row1.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
         assert_eq!(
             (spent.read, spent.serial_read, spent.write, spent.cas),
             (1, 0, 4, 1)
         );
-        assert_eq!((spent.batch, spent.batched), (1, 2), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (1, 2 * k), "{spent}");
+        assert_eq!(
+            current_row(&backend, &tenant).await.keys().unwrap().len() as u64,
+            k,
+            "K(2) has as many keys as K(1)"
+        );
         assert_eq!(spent.total(), 7, "requests: {spent}");
 
         assert_eq!(updated.version_id(), "2");
@@ -907,7 +916,7 @@ mod node_tests {
         );
     }
 
-    /// Step 1 refuses before any statement: the permission, and G38's bound.
+    /// Step 1 refuses before any statement: the permission.
     #[tokio::test]
     async fn step_one_refuses_before_any_statement() {
         let backend = backend_or_skip!();
@@ -922,32 +931,6 @@ mod node_tests {
             Err(StorageError::Tenant(
                 TenantError::OperationNotPermitted { .. }
             ))
-        ));
-        let long_code = serde_json::json!({
-            "resourceType": "SearchParameter",
-            "id": "sp",
-            "url": "http://example.org/sp",
-            "status": "active",
-            "code": "c".repeat(129),
-            "base": ["Patient"],
-            "type": "token",
-            "expression": "Patient.gender"
-        });
-        let sp = claimed(&tenant, 1);
-        let sp = StoredResource::from_storage(
-            "SearchParameter",
-            "sp",
-            "1",
-            tenant.tenant_id().clone(),
-            long_code.clone(),
-            sp.created_at(),
-            sp.last_modified(),
-            None,
-            crate::backends::cassandra::test_support::test_fhir_version(),
-        );
-        assert!(matches!(
-            backend.update(&tenant, &sp, long_code).await,
-            Err(StorageError::Validation(_))
         ));
         let spent = backend.statement_counts().since(&before);
         assert_eq!(spent.total(), 0, "{spent}");
@@ -1104,6 +1087,7 @@ mod node_tests {
             "UPDATE resources",
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();

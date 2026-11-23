@@ -273,9 +273,10 @@ mod serves_search_param_tests {
     }
 
     /// A storage that serves token, date and URI parameters only: every listed
-    /// parameter has one of those types, the common ones included, and no type
-    /// lists an include, since every include names a reference parameter.
-    /// `search-type` and the rest of the entry stay.
+    /// parameter has one of those types, the common ones included, apart from
+    /// `_list` and `_in`, which REST resolves into an `_id` filter (token), and
+    /// no type lists an include, since every include names a reference
+    /// parameter. `search-type` and the rest of the entry stay.
     #[tokio::test]
     async fn only_served_types_are_listed_and_no_include_without_reference_params() {
         let server = metadata_server(HookStub::with_params(true, serves_token_date_uri));
@@ -288,7 +289,8 @@ mod serves_search_param_tests {
                 let ty = &resource["type"];
                 for param in resource["searchParam"].as_array().expect("searchParam") {
                     assert!(
-                        matches!(param["type"].as_str(), Some("token" | "date" | "uri")),
+                        matches!(param["type"].as_str(), Some("token" | "date" | "uri"))
+                            || matches!(param["name"].as_str(), Some("_list" | "_in")),
                         "{version:?} {ty}: {param}"
                     );
                 }
@@ -301,8 +303,19 @@ mod serves_search_param_tests {
                 );
             }
             let patient = param_names(entry(&statement, "Patient"));
-            for kept in ["_id", "_lastUpdated", "_tag", "_profile", "_security"] {
+            for kept in [
+                "_id",
+                "_lastUpdated",
+                "_tag",
+                "_profile",
+                "_security",
+                "_list",
+            ] {
                 assert!(patient.contains(&kept.to_string()), "{version:?}: {kept}");
+            }
+            // `_in` exists from R5 on.
+            if matches!(version.as_mime_param(), "5.0" | "6.0") {
+                assert!(patient.contains(&"_in".to_string()), "{version:?}: _in");
             }
             for kept in ["identifier", "birthdate", "gender"] {
                 assert!(patient.contains(&kept.to_string()), "{version:?}: {kept}");
@@ -313,8 +326,6 @@ mod serves_search_param_tests {
                 "general-practitioner",
                 "_text",
                 "_content",
-                "_list",
-                "_in",
             ] {
                 assert!(
                     !patient.contains(&dropped.to_string()),

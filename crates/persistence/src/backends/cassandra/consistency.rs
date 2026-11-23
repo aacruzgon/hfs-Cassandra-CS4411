@@ -1846,7 +1846,16 @@ mod tests {
             .expect("update p");
         plant_version_keys(&backend, &t, 1, index_keys::EMPTY.to_vec(), ts1 + 1).await;
 
-        // One shared scan for every case.
+        // One shared scan for every case, taken after every `write_ts` above.
+        // emptied-older-version's update comes last, and a scan in its
+        // millisecond would be refused as stale. A second version's
+        // `last_updated` can be one millisecond ahead of the clock
+        // (`next_last_updated`), and no planted resource has more than two
+        // versions, so every `write_ts` is at most `written_by + 1` ms.
+        let written_by = Utc::now().timestamp_millis();
+        while Utc::now().timestamp_millis() <= written_by + 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         let scan = {
             let run = run.clone();
             IndexScan::take(&backend, move |t| t.ends_with(&run)).await

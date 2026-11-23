@@ -432,8 +432,13 @@ impl CassandraBackend {
     /// Steps 6a to 6d (ADR-aacruzgon-0037). Those seven
     /// are the end state (design, "Structs and enums": `BackendCapability`);
     /// there is no `TokenSearch` or `UriSearch` variant, and `BasicSearch`
-    /// covers both. The CapabilityStatement does not read this list, so
-    /// `/metadata` does not change with it.
+    /// covers both. The CapabilityStatement reads this list (ADR-aacruzgon-0085):
+    /// `supports_search()` follows `BasicSearch` and `supports_history()`
+    /// follows `InstanceHistory`, so declaring either adds `search-type` and
+    /// the search parameters, or the history interactions, to `/metadata`.
+    /// `BasicSearch` is therefore declared only in Step 6's last commit,
+    /// together with the `serves_search_param` override (Step 7, phase 4),
+    /// not when Step 6a lands.
     pub fn declared_capabilities() -> Vec<BackendCapability> {
         vec![
             BackendCapability::Crud,

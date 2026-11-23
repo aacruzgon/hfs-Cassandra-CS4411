@@ -207,6 +207,87 @@ const DELETE_RESOURCES_BY_TYPE: IndexCql = IndexCql::new(
      WHERE tenant_id = ? AND resource_type = ? AND last_updated = ? AND id = ?",
 );
 
+/// X2: the `token_code_index` row (`token_code_index` in `schema.cql`).
+const INSERT_TOKEN_CODE: IndexCql = IndexCql::new(
+    "INSERT INTO token_code_index \
+     (tenant_id, resource_type, param, code, last_updated, id, system, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X2's delete, from `token_code_index`.
+const DELETE_TOKEN_CODE: IndexCql = IndexCql::new(
+    "DELETE FROM token_code_index USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND code = ? \
+     AND last_updated = ? AND id = ? AND system = ?",
+);
+
+/// X3: the `token_system_code_index` row.
+const INSERT_TOKEN_SYSTEM_CODE: IndexCql = IndexCql::new(
+    "INSERT INTO token_system_code_index \
+     (tenant_id, resource_type, param, system, code, last_updated, id, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X3's delete, from `token_system_code_index`.
+const DELETE_TOKEN_SYSTEM_CODE: IndexCql = IndexCql::new(
+    "DELETE FROM token_system_code_index USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND system = ? AND code = ? \
+     AND last_updated = ? AND id = ?",
+);
+
+/// X4: the `token_system_index` row.
+const INSERT_TOKEN_SYSTEM: IndexCql = IndexCql::new(
+    "INSERT INTO token_system_index \
+     (tenant_id, resource_type, param, system, last_updated, id, code, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X4's delete, from `token_system_index`.
+const DELETE_TOKEN_SYSTEM: IndexCql = IndexCql::new(
+    "DELETE FROM token_system_index USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND system = ? \
+     AND last_updated = ? AND id = ? AND code = ?",
+);
+
+/// X5: the `date_index` row. It has no `last_updated` column (IW7).
+const INSERT_DATE: IndexCql = IndexCql::new(
+    "INSERT INTO date_index \
+     (tenant_id, resource_type, param, start, id, end, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X5's delete, from `date_index`.
+const DELETE_DATE: IndexCql = IndexCql::new(
+    "DELETE FROM date_index USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND start = ? AND id = ? AND end = ?",
+);
+
+/// X6: the `date_index_by_end` row, the same range keyed by its end.
+const INSERT_DATE_BY_END: IndexCql = IndexCql::new(
+    "INSERT INTO date_index_by_end \
+     (tenant_id, resource_type, param, end, id, start, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X6's delete, from `date_index_by_end`.
+const DELETE_DATE_BY_END: IndexCql = IndexCql::new(
+    "DELETE FROM date_index_by_end USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND end = ? AND id = ? AND start = ?",
+);
+
+/// X7: the `uri_index` row.
+const INSERT_URI: IndexCql = IndexCql::new(
+    "INSERT INTO uri_index \
+     (tenant_id, resource_type, param, uri, last_updated, id, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X7's delete, from `uri_index`.
+const DELETE_URI: IndexCql = IndexCql::new(
+    "DELETE FROM uri_index USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND uri = ? AND last_updated = ? AND id = ?",
+);
+
 /// Re-runs per request after an unknown outcome that the serial read showed
 /// unchanged (ADR-aacruzgon-0024): separate from the retries after definite
 /// misses.
@@ -1119,14 +1200,13 @@ pub(crate) fn index_delta<'a>(previous: &[IndexRow<'a>], next: VersionKeys<'a>) 
 }
 
 /// The statements of one unit, every one `USING TIMESTAMP ts`: the inserts,
-/// then the deletes. A row kind with no statement yet fails the unit before
-/// anything is sent.
+/// then the deletes.
 fn unit_statements(
     key: &RowKey<'_>,
     delta: &IndexDelta<'_>,
     unit: &IndexUnit<'_>,
     ts: i64,
-) -> Result<Vec<IndexStatement>, WriteFailure> {
+) -> Vec<IndexStatement> {
     let inserts = unit.inserts.iter().map(|row| (row, true));
     let deletes = unit.deletes.iter().map(|row| (row, false));
     inserts
@@ -1136,7 +1216,10 @@ fn unit_statements(
 }
 
 /// One row of a delta as a statement: an insert of `index_key` at
-/// `last_updated`, tagged with the delta's version, or its delete.
+/// `last_updated`, tagged with the delta's version, or its delete. Every
+/// statement binds `USING TIMESTAMP ts`; the bind order is each table's
+/// column order in the `INSERT_…` and `DELETE_…` constants (walkthrough
+/// section 2, "Index rows").
 fn index_statement(
     key: &RowKey<'_>,
     delta: &IndexDelta<'_>,
@@ -1144,36 +1227,235 @@ fn index_statement(
     last_updated: DateTime<Utc>,
     ts: i64,
     insert: bool,
-) -> Result<IndexStatement, WriteFailure> {
-    match (index_key, insert) {
-        (IndexKey::ResourcesByType, true) => Ok(IndexStatement::new(
+) -> IndexStatement {
+    let (t, r, i) = (key.tenant_id, key.resource_type, key.id);
+    let (lu, v) = (last_updated, delta.version_id);
+    let (cql, values) = match (index_key, insert) {
+        (IndexKey::ResourcesByType, true) => (
             INSERT_RESOURCES_BY_TYPE,
             vec![
-                Value::from(key.tenant_id),
-                Value::from(key.resource_type),
-                Value::from(last_updated),
-                Value::from(key.id),
-                Value::from(delta.version_id),
+                Value::from(t),
+                Value::from(r),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(v),
                 Value::from(delta.fhir_version.as_mime_param()),
                 Value::from(ts),
             ],
-        )),
-        (IndexKey::ResourcesByType, false) => Ok(IndexStatement::new(
+        ),
+        (IndexKey::ResourcesByType, false) => (
             DELETE_RESOURCES_BY_TYPE,
             vec![
                 Value::from(ts),
-                Value::from(key.tenant_id),
-                Value::from(key.resource_type),
-                Value::from(last_updated),
-                Value::from(key.id),
+                Value::from(t),
+                Value::from(r),
+                Value::from(lu),
+                Value::from(i),
             ],
-        )),
-        (other, _) => {
-            // Step 5 adds these rows; Steps 2 to 4 never have them.
-            tracing::error!(key = ?other, "index row kind not written before Step 5");
-            Err(WriteFailure::Permanent)
-        }
-    }
+        ),
+        (
+            IndexKey::TokenCode {
+                param,
+                code,
+                system,
+            },
+            true,
+        ) => (
+            INSERT_TOKEN_CODE,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(code.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(system.as_str()),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (
+            IndexKey::TokenCode {
+                param,
+                code,
+                system,
+            },
+            false,
+        ) => (
+            DELETE_TOKEN_CODE,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(code.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(system.as_str()),
+            ],
+        ),
+        (
+            IndexKey::TokenSystemCode {
+                param,
+                system,
+                code,
+            },
+            true,
+        ) => (
+            INSERT_TOKEN_SYSTEM_CODE,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(system.as_str()),
+                Value::from(code.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (
+            IndexKey::TokenSystemCode {
+                param,
+                system,
+                code,
+            },
+            false,
+        ) => (
+            DELETE_TOKEN_SYSTEM_CODE,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(system.as_str()),
+                Value::from(code.as_str()),
+                Value::from(lu),
+                Value::from(i),
+            ],
+        ),
+        (
+            IndexKey::TokenSystem {
+                param,
+                system,
+                code,
+            },
+            true,
+        ) => (
+            INSERT_TOKEN_SYSTEM,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(system.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(code.as_str()),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (
+            IndexKey::TokenSystem {
+                param,
+                system,
+                code,
+            },
+            false,
+        ) => (
+            DELETE_TOKEN_SYSTEM,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(system.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(code.as_str()),
+            ],
+        ),
+        // The date tables have no `last_updated` column (IW7), and the
+        // bounds are bound as `i64` milliseconds, the bytes a `timestamp`
+        // column holds.
+        (IndexKey::Date { param, start, end }, true) => (
+            INSERT_DATE,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(*start),
+                Value::from(i),
+                Value::from(*end),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (IndexKey::Date { param, start, end }, false) => (
+            DELETE_DATE,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(*start),
+                Value::from(i),
+                Value::from(*end),
+            ],
+        ),
+        (IndexKey::DateByEnd { param, end, start }, true) => (
+            INSERT_DATE_BY_END,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(*end),
+                Value::from(i),
+                Value::from(*start),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (IndexKey::DateByEnd { param, end, start }, false) => (
+            DELETE_DATE_BY_END,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(*end),
+                Value::from(i),
+                Value::from(*start),
+            ],
+        ),
+        (IndexKey::Uri { param, uri }, true) => (
+            INSERT_URI,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(uri.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (IndexKey::Uri { param, uri }, false) => (
+            DELETE_URI,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(uri.as_str()),
+                Value::from(lu),
+                Value::from(i),
+            ],
+        ),
+    };
+    IndexStatement::new(cql, values)
 }
 
 /// The pause after try `attempt` of a plain write after the CAS: 10 ms after
@@ -1189,26 +1471,18 @@ struct IndexBatches {
     batches: Vec<Vec<IndexStatement>>,
     /// What the batches hold (IW14).
     stats: IndexWriteStats,
-    /// One [`WriteFailure::Permanent`] per unit with a row kind this build
-    /// has no statement for; those units are left out of the batches.
-    failures: Vec<WriteFailure>,
 }
 
 /// Packs `delta`'s units into batches (IW11): each unit's statements at
 /// `ts`, sized by [`wire_bytes`], then [`pack`]ed in order under
 /// [`MAX_BATCH_BYTES`]. A unit is never split, so one over the limit on its
-/// own goes alone, as one batch over it. A unit whose statements
-/// cannot be built fails alone, as it did when each unit was sent on its
-/// own, and the others are still packed.
+/// own goes alone, as one batch over it.
 fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatches {
-    let mut failures = Vec::new();
-    let mut units = Vec::with_capacity(delta.units.len());
-    for unit in &delta.units {
-        match unit_statements(key, delta, unit, ts) {
-            Ok(statements) => units.push((unit, statements)),
-            Err(failure) => failures.push(failure),
-        }
-    }
+    let units: Vec<_> = delta
+        .units
+        .iter()
+        .map(|unit| (unit, unit_statements(key, delta, unit, ts)))
+        .collect();
     let sizes: Vec<usize> = units
         .iter()
         .map(|(_, statements)| wire_bytes(statements))
@@ -1237,11 +1511,7 @@ fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatc
                 .collect()
         })
         .collect();
-    IndexBatches {
-        batches,
-        stats,
-        failures,
-    }
+    IndexBatches { batches, stats }
 }
 
 /// Why a plain write after the CAS (a version row or an index batch) was not
@@ -1254,8 +1524,7 @@ pub(crate) enum WriteFailure {
     /// an unavailable replica, a lost connection.
     TriesExhausted,
     /// No try can succeed: the node refused the statement as `Invalid`
-    /// (IW17: "an `Invalid` error is permanent"), or this build has no
-    /// statement for the row. Not retried.
+    /// (IW17: "an `Invalid` error is permanent"). Not retried.
     Permanent,
     /// An index batch timed out with write type `BATCH`: the coordinator had
     /// written it to the batchlog, which replays it, so it is not retried
@@ -2278,11 +2547,8 @@ impl CassandraBackend {
         tries: u32,
         deadline: Duration,
     ) -> IndexOutcome {
-        let IndexBatches {
-            batches,
-            stats,
-            mut failures,
-        } = index_batches(key, delta, ts);
+        let IndexBatches { batches, stats } = index_batches(key, delta, ts);
+        let mut failures = Vec::new();
         // The futures are built first and only then streamed: a stream holding
         // the closure that builds them is not `Send` for every lifetime, which
         // the storage traits' futures must be.
@@ -3459,10 +3725,8 @@ mod tests {
         );
     }
 
-    /// A unit's statements, as the writer sends them until pull request 3
-    /// batches them: its inserts, then its deletes, every one at the one
-    /// timestamp `ts`, the insert tagged with the delta's version. A row kind
-    /// with no statement yet fails the unit before anything is sent.
+    /// A unit's statements: its inserts, then its deletes, every one at the
+    /// one timestamp `ts`, the insert tagged with the delta's version.
     #[test]
     fn a_unit_sends_its_inserts_then_its_deletes_at_one_timestamp() {
         let lu1 = at("2026-11-16T10:00:00.000Z");
@@ -3472,7 +3736,7 @@ mod tests {
         let delta = index_delta(&previous, version_keys(&x1, lu2));
         assert_eq!(delta.units.len(), 1);
         let ts = write_ts_of(lu2);
-        let statements = unit_statements(&key(), &delta, &delta.units[0], ts).unwrap();
+        let statements = unit_statements(&key(), &delta, &delta.units[0], ts);
         let (insert, delete) = (&statements[0], &statements[1]);
         assert_eq!(statements.len(), 2);
         assert_eq!(insert.cql(), INSERT_RESOURCES_BY_TYPE.as_str());
@@ -3490,22 +3754,31 @@ mod tests {
 
         let t = [gender("male")];
         let delta = index_delta(&[], version_keys(&t, lu2));
+        let statements = unit_statements(&key(), &delta, &delta.units[0], ts);
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0].cql(), INSERT_TOKEN_CODE.as_str());
+        assert_eq!(statements[0].values()[6], Value::from(IMPLICIT), "system");
         assert_eq!(
-            unit_statements(&key(), &delta, &delta.units[0], ts).unwrap_err(),
-            WriteFailure::Permanent
+            statements[0].values()[7],
+            Value::from(2_i32),
+            "tagged with V"
+        );
+        assert_eq!(
+            statements[0].values()[8],
+            Value::from(ts),
+            "USING TIMESTAMP"
         );
     }
 
     /// IW11 and IW14: a delta's units become packed batches, whole units of
-    /// them, with what they hold counted; a unit whose rows have no
-    /// statement yet fails alone and the others are still packed.
+    /// them, with what they hold counted.
     #[test]
     fn a_delta_is_packed_into_batches_of_whole_units() {
         let lu1 = at("2026-11-16T10:00:00.000Z");
         let lu2 = at("2026-11-16T10:00:00.001Z");
         let ts = write_ts_of(lu2);
         let empty = index_batches(&key(), &index_delta(&[], version_keys(&[], lu2)), ts);
-        assert!(empty.batches.is_empty() && empty.failures.is_empty());
+        assert!(empty.batches.is_empty());
         assert_eq!(empty.stats, IndexWriteStats::default());
 
         let next = [IndexKey::ResourcesByType, gender("female")];
@@ -3513,21 +3786,21 @@ mod tests {
         let delta = index_delta(&previous, version_keys(&next, lu2));
         assert_eq!(delta.units.len(), 2, "resources_by_type, and the token");
         let packed = index_batches(&key(), &delta, ts);
-        assert_eq!(packed.failures, vec![WriteFailure::Permanent], "the token");
         assert_eq!(packed.batches.len(), 1);
         let batch = &packed.batches[0];
         assert_eq!(
             batch.iter().map(IndexStatement::cql).collect::<Vec<_>>(),
             vec![
                 INSERT_RESOURCES_BY_TYPE.as_str(),
-                DELETE_RESOURCES_BY_TYPE.as_str()
+                DELETE_RESOURCES_BY_TYPE.as_str(),
+                INSERT_TOKEN_CODE.as_str(),
             ],
-            "the unit whole, its insert first"
+            "the units whole in partition order, each insert first"
         );
         let stats = packed.stats;
         assert_eq!(
             (stats.rows_inserted, stats.rows_deleted, stats.batches),
-            (1, 1, 1)
+            (2, 1, 1)
         );
         assert_eq!(stats.largest_batch_bytes, wire_bytes(batch) as u64);
     }
@@ -3554,7 +3827,6 @@ mod tests {
             "one partition, an insert and a delete"
         );
         let packed = index_batches(&big, &delta, ts);
-        assert!(packed.failures.is_empty());
         assert_eq!(packed.batches.len(), 1, "the unit is not split");
         let batch = &packed.batches[0];
         assert!(wire_bytes(batch) > MAX_BATCH_BYTES, "over the limit");
@@ -3565,6 +3837,360 @@ mod tests {
                 DELETE_RESOURCES_BY_TYPE.as_str()
             ]
         );
+    }
+
+    /// Every row kind has an insert and a delete, each with the statement's
+    /// own bind order (walkthrough section 2, "Index rows"), every value set,
+    /// and a date row binds no `last_updated` (IW7).
+    #[test]
+    fn every_row_kind_has_its_insert_and_delete() {
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let ts = write_ts_of(lu2);
+        let s = |text: &str| Value::from(text);
+        let tenant_row = || [s("acme"), s("Patient")];
+        let fhir = Value::from(
+            crate::backends::cassandra::test_support::test_fhir_version().as_mime_param(),
+        );
+        /// A key, its insert and delete statements, and their bound values.
+        type Case = (IndexKey, IndexCql, IndexCql, Vec<Value>, Vec<Value>);
+        let cases: Vec<Case> = vec![
+            (
+                IndexKey::ResourcesByType,
+                INSERT_RESOURCES_BY_TYPE,
+                DELETE_RESOURCES_BY_TYPE,
+                [
+                    &tenant_row()[..],
+                    &[
+                        Value::from(lu2),
+                        s("p"),
+                        Value::from(2_i32),
+                        fhir,
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[Value::from(lu1), s("p")],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::TokenCode {
+                    param: "gender".into(),
+                    code: "male".into(),
+                    system: "sys".into(),
+                },
+                INSERT_TOKEN_CODE,
+                DELETE_TOKEN_CODE,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("gender"),
+                        s("male"),
+                        Value::from(lu2),
+                        s("p"),
+                        s("sys"),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[s("gender"), s("male"), Value::from(lu1), s("p"), s("sys")],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::TokenSystemCode {
+                    param: "identifier".into(),
+                    system: "sys".into(),
+                    code: "c1".into(),
+                },
+                INSERT_TOKEN_SYSTEM_CODE,
+                DELETE_TOKEN_SYSTEM_CODE,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("identifier"),
+                        s("sys"),
+                        s("c1"),
+                        Value::from(lu2),
+                        s("p"),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[s("identifier"), s("sys"), s("c1"), Value::from(lu1), s("p")],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::TokenSystem {
+                    param: "identifier".into(),
+                    system: "sys".into(),
+                    code: "c1".into(),
+                },
+                INSERT_TOKEN_SYSTEM,
+                DELETE_TOKEN_SYSTEM,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("identifier"),
+                        s("sys"),
+                        Value::from(lu2),
+                        s("p"),
+                        s("c1"),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[s("identifier"), s("sys"), Value::from(lu1), s("p"), s("c1")],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::Date {
+                    param: "birthdate".into(),
+                    start: B0,
+                    end: B1,
+                },
+                INSERT_DATE,
+                DELETE_DATE,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("birthdate"),
+                        Value::from(B0),
+                        s("p"),
+                        Value::from(B1),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[s("birthdate"), Value::from(B0), s("p"), Value::from(B1)],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::DateByEnd {
+                    param: "birthdate".into(),
+                    end: B1,
+                    start: B0,
+                },
+                INSERT_DATE_BY_END,
+                DELETE_DATE_BY_END,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("birthdate"),
+                        Value::from(B1),
+                        s("p"),
+                        Value::from(B0),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[s("birthdate"), Value::from(B1), s("p"), Value::from(B0)],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::Uri {
+                    param: "_profile".into(),
+                    uri: "http://example.org/profile".into(),
+                },
+                INSERT_URI,
+                DELETE_URI,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("_profile"),
+                        s("http://example.org/profile"),
+                        Value::from(lu2),
+                        s("p"),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[
+                        s("_profile"),
+                        s("http://example.org/profile"),
+                        Value::from(lu1),
+                        s("p"),
+                    ],
+                ]
+                .concat(),
+            ),
+        ];
+        for (index_key, insert_cql, delete_cql, insert_values, delete_values) in cases {
+            let keys = [index_key.clone()];
+            let previous = [(&keys[0], lu1)];
+            // The insert alone (a create), then the delete alone (a delete),
+            // so each statement is built from its own delta.
+            let created = index_delta(&[], version_keys(&keys, lu2));
+            let insert = unit_statements(&key(), &created, &created.units[0], ts);
+            let deleted = index_delta(&previous, version_keys(&[], lu2));
+            let delete = unit_statements(&key(), &deleted, &deleted.units[0], ts);
+            assert_eq!((insert.len(), delete.len()), (1, 1), "{index_key:?}");
+            for (statement, cql, values) in [
+                (&insert[0], insert_cql, &insert_values),
+                (&delete[0], delete_cql, &delete_values),
+            ] {
+                assert_eq!(statement.cql(), cql.as_str(), "{index_key:?}");
+                assert_eq!(
+                    statement.values().len(),
+                    cql.as_str().matches('?').count(),
+                    "{index_key:?}"
+                );
+                assert!(
+                    statement
+                        .values()
+                        .iter()
+                        .all(|value| matches!(value, Value::Some(_)))
+                );
+                assert_eq!(statement.values(), values.as_slice(), "{index_key:?}");
+            }
+            if matches!(
+                index_key,
+                IndexKey::Date { .. } | IndexKey::DateByEnd { .. }
+            ) {
+                assert!(
+                    !insert[0].values().contains(&Value::from(lu2)),
+                    "a date row binds no last_updated"
+                );
+            }
+        }
+    }
+
+    /// The units of a delta in a packed result: each batch is a run of whole
+    /// units (no unit split, every unit packed), and a batch of several units
+    /// is within [`MAX_BATCH_BYTES`]. Returns the batches that are over it.
+    fn assert_packs_whole_units(key: &RowKey<'_>, delta: &IndexDelta<'_>) -> Vec<usize> {
+        let packed = index_batches(key, delta, 1);
+        let mut units = delta
+            .units
+            .iter()
+            .map(|unit| unit.inserts.len() + unit.deletes.len())
+            .peekable();
+        let mut over = Vec::new();
+        for batch in &packed.batches {
+            let (mut taken, mut whole) = (0, 0);
+            while taken < batch.len() {
+                taken += units.next().expect("a unit left for this batch");
+                whole += 1;
+            }
+            assert_eq!(taken, batch.len(), "a unit was split across batches");
+            if wire_bytes(batch) > MAX_BATCH_BYTES {
+                assert_eq!(whole, 1, "only a lone unit may be over the bound");
+                over.push(wire_bytes(batch));
+            }
+        }
+        assert!(units.peek().is_none(), "a unit was not packed");
+        over
+    }
+
+    /// The create, the same-content update and the delete of `keys`, each
+    /// packed by [`assert_packs_whole_units`]; the number of batches over the
+    /// bound in each.
+    fn packs_create_update_and_delete(key: &RowKey<'_>, keys: &[IndexKey]) -> [Vec<usize>; 3] {
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let previous: Vec<IndexRow<'_>> = keys.iter().map(|k| (k, lu1)).collect();
+        [
+            assert_packs_whole_units(key, &index_delta(&[], version_keys(keys, lu2))),
+            assert_packs_whole_units(key, &index_delta(&previous, version_keys(keys, lu2))),
+            assert_packs_whole_units(key, &index_delta(&previous, version_keys(&[], lu2))),
+        ]
+    }
+
+    /// IW11 (gate): the packer never splits a partition's rows, and with the
+    /// 1,024-byte mapping every batch of several units stays within the
+    /// bound, in the worst case (a 64-byte tenant): six long identifiers, and
+    /// one row whose param, system and code are each 1,024 bytes, which goes
+    /// alone because its own delete and insert are over the bound.
+    #[test]
+    fn the_packer_never_splits_a_pair_and_stays_under_the_bound() {
+        let tenant = format!("test-{}", "x".repeat(59));
+        let key = RowKey {
+            tenant_id: &tenant,
+            resource_type: "Patient",
+            id: "p",
+        };
+        let mut keys = vec![
+            IndexKey::ResourcesByType,
+            IndexKey::Date {
+                param: "birthdate".into(),
+                start: B0,
+                end: B1,
+            },
+            IndexKey::DateByEnd {
+                param: "birthdate".into(),
+                end: B1,
+                start: B0,
+            },
+        ];
+        for i in 0..6 {
+            let value = format!("{i}{}", "v".repeat(999));
+            keys.push(IndexKey::TokenCode {
+                param: "identifier".into(),
+                code: value.clone(),
+                system: "http://example.org/ids".into(),
+            });
+            keys.push(IndexKey::TokenSystemCode {
+                param: "identifier".into(),
+                system: "http://example.org/ids".into(),
+                code: value.clone(),
+            });
+            keys.push(IndexKey::TokenSystem {
+                param: "identifier".into(),
+                system: "http://example.org/ids".into(),
+                code: value,
+            });
+        }
+        keys.sort();
+        // The six `token_system_index` rows share one partition (same param
+        // and system), so that unit alone is over the bound and goes alone;
+        // `assert_packs_whole_units` checks that no other batch is.
+        let [create, update, delete] = packs_create_update_and_delete(&key, &keys);
+        assert_eq!((create.len(), update.len(), delete.len()), (1, 1, 1));
+
+        let widest = [
+            IndexKey::ResourcesByType,
+            IndexKey::TokenSystemCode {
+                param: "p".repeat(1_024),
+                system: "s".repeat(1_024),
+                code: "c".repeat(1_024),
+            },
+        ];
+        let [create, update, delete] = packs_create_update_and_delete(&key, &widest);
+        assert!(create.is_empty(), "an insert alone fits");
+        assert_eq!(update.len(), 1, "the delete and the insert of one row");
+        assert_eq!(delete.len(), 0, "a delete alone fits");
     }
 
     /// D4: the miss mapping from the returned columns (spike A1). A missing

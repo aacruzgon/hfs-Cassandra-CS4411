@@ -117,6 +117,14 @@ pub(crate) enum ScanMode<'a> {
     /// whose `write_ts` is earlier but whose index rows land later, nor an
     /// index row planted by hand after the scan. Callers take the scan only
     /// after every writer has returned, as T5 does.
+    ///
+    /// The guard compares the writers' clock-derived `write_ts` with
+    /// `taken_at`, so it also assumes the clock does not step back between
+    /// the scan and the check. If it does, a write made after the scan can
+    /// carry a `write_ts` below `taken_at` and pass the guard: the check then
+    /// reports false `missing_row` or `stray_row` defects for that resource
+    /// instead of panicking. That is loud but misattributed, and never a
+    /// clean report.
     Shared(&'a IndexScan),
 }
 
@@ -172,7 +180,8 @@ pub(crate) struct IndexScan {
     /// first millisecond has a `write_ts` equal to this value, and the
     /// strict `<` guard refuses that tie. A shared
     /// check refuses a resource whose `write_ts` is at or after it: a
-    /// resource written after the scan was taken. It cannot catch a write
+    /// resource written after the scan was taken, as long as the clock has
+    /// not stepped back since (`ScanMode::Shared`). It cannot catch a write
     /// in flight at that moment (earlier `write_ts`, index rows landing
     /// later) or an index row planted by hand after the scan; callers take
     /// the scan only after every writer has returned.

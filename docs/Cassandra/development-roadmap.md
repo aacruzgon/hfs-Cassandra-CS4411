@@ -112,7 +112,7 @@ One row per checkable item, grouped by step; the milestone column says which gat
 | 8.5 | Measure-first triggers in section 7 evaluated and the outcome recorded | C | X | ☐ | | |
 | 8.6 | Demonstration script passes on Cassandra and on PostgreSQL in CI | C | all | ☐ | | |
 | 8.7 | Inferno test kit (`utils/inferno-test-kit/`): capability-truth, CRUD and versioning, supported-search and declared-rejection groups; every test passes against Cassandra, in the UI and headless in CI | C | X | ☐ | | |
-| 8.8 | The same kit against PostgreSQL: capability-truth, CRUD and supported-search groups pass; the rejection group fails as expected and the contrast is recorded for the report | C | X | ☐ | | |
+| 8.8 | The same kit against PostgreSQL: the CRUD and supported-search groups pass; the capability-truth and rejection groups fail as expected, and the contrast is recorded for the report | C | X | ☐ | | |
 | 8.9 | One-off US Core v3.1.1 server-suite run against Cassandra, headless, pinned kit version; results JSON kept; every failure mapped to a declared rejection or a CapabilityStatement line | C | X | ☐ | | |
 | 8.10 | README Cassandra column and the upstream touch list updated | C | W | ☐ | | |
 | 8.11 | Report draft reviewed by all five | C | all | ☐ | | |

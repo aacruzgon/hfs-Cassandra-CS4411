@@ -16,7 +16,7 @@
 //!       request's success, so the body is never written twice (D13);
 //!    3. the branch R1 picks ([`Branch::of`]), then its own step 1: the
 //!       permission, as SQLite checks it inside `create`, `update` and
-//!       `restore_deleted`, then the G38 bound on a SearchParameter's `code`:
+//!       `restore_deleted`:
 //!       - **a**, no row: C1 ([`CasPlan::create`]) with the request's
 //!         `fhir_version`, permission `Create`;
 //!       - **b**, a live row: C2 through [`CassandraBackend::update_attempt`]
@@ -51,7 +51,7 @@ use super::errors::BACKEND_NAME;
 use super::read::ResourceRow;
 use super::write::{
     Applied, CasKind, CasMiss, CasOutcome, CasPlan, RowKey, UPSERT_MISS_RETRIES, check_id,
-    check_search_parameter_code, normalized_body,
+    normalized_body,
 };
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
@@ -187,7 +187,6 @@ impl CassandraBackend {
 
                 let branch = Branch::of(row.as_ref());
                 tenant.check_permission(branch.operation(), resource_type)?;
-                check_search_parameter_code(resource_type, &resource)?;
                 seam.before_cas(turn).await;
 
                 let body = resource.clone();
@@ -368,7 +367,7 @@ mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
     use crate::backends::cassandra::index_keys::{self, IndexKey};
-    use crate::backends::cassandra::session::{Fault, StatementKind};
+    use crate::backends::cassandra::session::{Fault, StatementKind, TimeoutWriteType};
     use crate::backends::cassandra::write::{
         INSERT_VERSION, PreviousVersion, REVIVE_RESOURCE_IF_VERSION,
         SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, next_last_updated,
@@ -553,9 +552,14 @@ mod node_tests {
         } else {
             C2
         };
-        backend
-            .session
-            .inject_fault(StatementKind::Cas, marker, Fault::ApplyLate { before });
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            marker,
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
+        );
         let lu = next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50 * i64::from(from));
         let values = vec![
@@ -733,8 +737,7 @@ mod node_tests {
     }
 
     /// Each branch checks its own permission after R1 and before writing:
-    /// `Create` on a, `Update` on b and c. G38 refuses a long
-    /// SearchParameter `code` the same way, with nothing written.
+    /// `Create` on a, `Update` on b and c.
     #[tokio::test]
     async fn each_branch_checks_its_own_permission() {
         let backend = backend_or_skip!();
@@ -797,32 +800,6 @@ mod node_tests {
         assert_eq!((revived.version_id(), created), ("3", true));
         let (updated, created) = put(&backend, &update_only, patient("Again")).await.unwrap();
         assert_eq!((updated.version_id(), created), ("4", false));
-
-        // G38, before any write.
-        let long_code = serde_json::json!({
-            "resourceType": "SearchParameter",
-            "url": "http://example.org/sp",
-            "status": "active",
-            "code": "c".repeat(129),
-            "base": ["Patient"],
-            "type": "token",
-            "expression": "Patient.gender"
-        });
-        let counts = backend.statement_counts();
-        assert!(matches!(
-            backend
-                .create_or_update(
-                    &full,
-                    "SearchParameter",
-                    "sp",
-                    long_code,
-                    crate::backends::cassandra::test_support::test_fhir_version()
-                )
-                .await,
-            Err(StorageError::Validation(_))
-        ));
-        let spent = backend.statement_counts().since(&counts);
-        assert_eq!((spent.read, spent.write, spent.cas), (1, 0, 0), "{spent}");
     }
 
     /// The loop budget (walkthrough 3.5; plan §6): another writer wins
@@ -1179,6 +1156,7 @@ mod node_tests {
             C4,
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();
@@ -1292,6 +1270,7 @@ mod node_tests {
                         C2,
                         Fault::ApplyLate {
                             before: StatementKind::Cas,
+                            write_type: TimeoutWriteType::Cas,
                         },
                     ),
                     _ => panic!("a third turn"),
@@ -1468,7 +1447,10 @@ mod node_tests {
         backend.session.inject_fault(
             StatementKind::Cas,
             "deleted_at = ?, last_updated",
-            Fault::ApplyLate { before },
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
         );
         let lu = next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50 * i64::from(from));
@@ -1508,6 +1490,7 @@ mod node_tests {
             "index_keys = 0xff",
             Fault::ApplyLate {
                 before: StatementKind::Read,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let sent = backend

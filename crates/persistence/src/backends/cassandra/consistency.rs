@@ -1771,7 +1771,9 @@ mod tests {
         // no-type-key: a live resource whose stored sets are empty, and
         // whose type row is gone.
         let t = tenant_of("no-type-key");
-        let (_, lu1, ts1, _) = seeded(&backend, &t).await;
+        let (_, lu1, ts1, seeded_keys) = seeded(&backend, &t).await;
+        // The type row is removed, so every other row of the seeded set is a stray.
+        let strays = seeded_keys.len() - 1;
         plant_resource_keys(&backend, &t, index_keys::EMPTY.to_vec(), 1).await;
         plant_version_keys(&backend, &t, 1, index_keys::EMPTY.to_vec(), ts1 + 1).await;
         plant(
@@ -2014,7 +2016,13 @@ mod tests {
         // `last_updated`.
         for registry in [Registry::Fixed, Registry::Changed] {
             let report = check("no-write-ts", registry).await;
-            assert_eq!(report.kinds(), ["wrong_write_time"], "{report}");
+            // The plant stores `[ResourcesByType]`, and a fresh extraction of
+            // its body gives more keys, so `Fixed` also reports both rows stale.
+            let mut want = vec![("wrong_write_time", 1)];
+            if registry == Registry::Fixed {
+                want.push(("stale_extraction", 2));
+            }
+            assert_eq!(report.kinds(), expect(&want), "{report}");
             let Defect::WrongWriteTime { row, expected } = &report.defects[0] else {
                 unreachable!()
             };
@@ -2025,7 +2033,9 @@ mod tests {
         // The resources row and the version row both lack the type key.
         for registry in [Registry::Fixed, Registry::Changed] {
             let report = check("no-type-key", registry).await;
-            let mut want = vec![("no_type_key", 2)];
+            // `seeded` created real index rows; the plant empties the stored
+            // sets, so every row of the seeded set but the type row is a stray.
+            let mut want = vec![("no_type_key", 2), ("stray_row", strays)];
             if registry == Registry::Fixed {
                 want.push(("stale_extraction", 1));
             }

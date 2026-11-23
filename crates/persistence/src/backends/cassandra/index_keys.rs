@@ -25,9 +25,10 @@
 //! signed milliseconds. A delete marker's K(V) is empty: 0x01 0x00.
 //! ```
 //!
-//! Step 2 writes only the `resources_by_type` row (roadmap Step 2, pulled
-//! forward so `count` works); Step 5 adds the token, date and URI rows. The
-//! encoding is complete now, so Step 5 extends the key set, not the format.
+//! Every live version's key set comes from the shared extractor
+//! ([`extract_index_keys`]), its long texts mapped once by [`index_text`]
+//! (ADR-aacruzgon-0079); a key read back from `index_keys` is never mapped
+//! again.
 //!
 //! **Which row a key names** is decided here and nowhere else
 //! ([`IndexKey::row_at`], [`IndexKey::partition`]), from each index table's
@@ -36,9 +37,18 @@
 //! two functions, so a rule written once cannot drift between them (IW7,
 //! IW9, ADR-sam-michaels-0006).
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use chrono::{DateTime, Utc};
+use serde_json::Value as Json;
+use sha2::{Digest, Sha256};
+
+use crate::search::{
+    ExtractedValue, IMPLICIT_TOKEN_SYSTEM, IndexValue, SearchParameterExtractor, StorageResolution,
+    indexed_range,
+};
+use crate::types::SearchParamType;
 
 /// The format byte this module writes.
 pub(crate) const FORMAT_1: u8 = 0x01;
@@ -46,9 +56,15 @@ pub(crate) const FORMAT_1: u8 = 0x01;
 /// The empty key set, `0x01 0x00`: a delete marker's.
 pub(crate) const EMPTY: [u8; 2] = [FORMAT_1, 0x00];
 
+/// The longest indexed text stored as it is, in UTF-8 bytes (ADR-aacruzgon-0079).
+pub(crate) const MAX_INDEX_TEXT_BYTES: usize = 1024;
+/// What a hashed indexed text starts with (ADR-aacruzgon-0079).
+pub(crate) const HASHED_TEXT_PREFIX: &str = "sha256:";
+/// Parameters no key is made for: `resources` and `resources_by_type` serve them (P5, G18).
+const UNINDEXED_PARAMS: [&str; 2] = ["_id", "_lastUpdated"];
+
 /// One index row, by the key columns the version row does not imply.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[allow(dead_code)] // The token, date and URI rows are written from Step 5 on.
 pub(crate) enum IndexKey {
     /// `resources_by_type`, keyed by the version's own `last_updated` and id.
     ResourcesByType,
@@ -397,14 +413,140 @@ impl Reader<'_> {
     }
 }
 
+/// ADR-aacruzgon-0079's mapping (IW6): `value` itself when it is at most
+/// [`MAX_INDEX_TEXT_BYTES`] bytes and does not start with
+/// [`HASHED_TEXT_PREFIX`]; otherwise the prefix and the 64 lowercase hex
+/// digits of SHA-256 over its UTF-8 bytes. No other normalisation. Not
+/// idempotent (a digest starts with the prefix), so it is applied once, to
+/// fresh extractions, never to keys decoded from `index_keys`.
+pub(crate) fn index_text(value: &str) -> String {
+    if value.len() <= MAX_INDEX_TEXT_BYTES && !value.starts_with(HASHED_TEXT_PREFIX) {
+        return value.to_string();
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    let mut text = String::with_capacity(HASHED_TEXT_PREFIX.len() + 2 * digest.len());
+    text.push_str(HASHED_TEXT_PREFIX);
+    for byte in digest {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
+}
+
+/// `K(V)` of a live version from its extracted values (IW2 to IW6, P5),
+/// sorted and deduplicated, with the `resources_by_type` key (IW5).
+pub(crate) fn index_keys_from(values: &[ExtractedValue]) -> Vec<IndexKey> {
+    let mut keys = BTreeSet::from([IndexKey::ResourcesByType]);
+    for extracted in values {
+        // A composite's components are not indexed on their own (IW3).
+        if extracted.composite_group.is_some()
+            || UNINDEXED_PARAMS.contains(&extracted.param_name.as_str())
+        {
+            continue;
+        }
+        let param = index_text(&extracted.param_name);
+        match (&extracted.param_type, &extracted.value) {
+            (SearchParamType::Token, IndexValue::Token { system, code, .. }) => {
+                if code.is_empty() {
+                    continue;
+                }
+                let code = index_text(code);
+                let system = index_text(system.as_deref().unwrap_or(""));
+                keys.insert(IndexKey::TokenCode {
+                    param: param.clone(),
+                    code: code.clone(),
+                    system: system.clone(),
+                });
+                keys.insert(IndexKey::TokenSystemCode {
+                    param: param.clone(),
+                    system: system.clone(),
+                    code: code.clone(),
+                });
+                if !system.is_empty() && system != IMPLICIT_TOKEN_SYSTEM {
+                    keys.insert(IndexKey::TokenSystem {
+                        param,
+                        system,
+                        code,
+                    });
+                }
+            }
+            (SearchParamType::Date, value @ IndexValue::Date { .. }) => {
+                // A value the date grammar does not accept has no range (IW4).
+                let Some((start, end)) = indexed_range(value, StorageResolution::Millis) else {
+                    continue;
+                };
+                let (start, end) = (start.timestamp_millis(), end.timestamp_millis());
+                keys.insert(IndexKey::Date {
+                    param: param.clone(),
+                    start,
+                    end,
+                });
+                keys.insert(IndexKey::DateByEnd { param, end, start });
+            }
+            (SearchParamType::Uri, IndexValue::Uri(uri)) => {
+                if uri.is_empty() {
+                    continue;
+                }
+                keys.insert(IndexKey::Uri {
+                    param,
+                    uri: index_text(uri),
+                });
+            }
+            _ => {}
+        }
+    }
+    keys.into_iter().collect()
+}
+
+/// What one extraction gave a write (IW1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Extraction {
+    /// `K(V)`: [`index_keys_from`], or `[ResourcesByType]` alone when the whole resource failed.
+    pub(crate) keys: Vec<IndexKey>,
+    /// The codes of the parameters the extractor skipped because they failed.
+    pub(crate) failed_params: Vec<String>,
+    /// Why the whole resource could not be extracted (D6), if it could not.
+    pub(crate) failed_resource: Option<String>,
+}
+
+/// Runs `extractor.extract_with_missing(body, resource_type)` and maps it (IW1, D6).
+/// Never panics and never returns an error: a resource that cannot be
+/// extracted keeps only its `resources_by_type` key.
+pub(crate) fn extract_index_keys(
+    extractor: &SearchParameterExtractor,
+    resource_type: &str,
+    body: &Json,
+) -> Extraction {
+    match extractor.extract_with_missing(body, resource_type) {
+        Ok(extraction) => Extraction {
+            keys: index_keys_from(&extraction.values),
+            failed_params: extraction
+                .failures
+                .into_iter()
+                .map(|failure| failure.code)
+                .collect(),
+            failed_resource: None,
+        },
+        Err(error) => Extraction {
+            keys: vec![IndexKey::ResourcesByType],
+            failed_params: Vec::new(),
+            failed_resource: Some(error.to_string()),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::cassandra::test_support::{test_extractor, test_registry};
+    use crate::search::registry::SearchParameterDefinition;
+    use crate::search::{DateEnd, OPEN_START};
+    use crate::types::DatePrecision;
+    use serde_json::json;
 
     const MRN: &str = "http://hospital.example/mrn";
     const IMPLICIT: &str = "urn:x-helios:implicit code system";
-    const B0: i64 = 326_073_600_000; // 1980-05-01T00:00:00Z
-    const B1: i64 = 326_160_000_000; // 1980-05-02T00:00:00Z
+    const B0: i64 = 325_987_200_000; // 1980-05-01T00:00:00Z
+    const B1: i64 = 326_073_600_000; // 1980-05-02T00:00:00Z
 
     /// The worked example's K(1), walkthrough section 7.
     fn worked_example() -> Vec<IndexKey> {
@@ -698,6 +840,299 @@ mod tests {
             vec![0x01, 0x00, 0x00],
         ] {
             assert!(decode(&blob).is_err(), "{blob:?}");
+        }
+    }
+
+    /// `"sha256:"` and the lowercase hex of SHA-256 over `value`'s bytes,
+    /// computed here and not by [`index_text`].
+    fn digest(value: &str) -> String {
+        let hex: String = Sha256::digest(value.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("sha256:{hex}")
+    }
+
+    fn long(n: usize, c: char) -> String {
+        c.to_string().repeat(n)
+    }
+
+    #[test]
+    fn index_text_keeps_short_values_and_hashes_long_or_marked_ones() {
+        assert_eq!(index_text(""), "");
+        assert_eq!(index_text(&long(1024, 'a')), long(1024, 'a'));
+        let hashed = index_text(&long(1025, 'a'));
+        assert_eq!(hashed, digest(&long(1025, 'a')));
+        assert_eq!(hashed.len(), 71);
+        assert!(
+            hashed[7..]
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        let two_bytes = "é".repeat(512);
+        assert_eq!(two_bytes.len(), 1_024);
+        assert_eq!(index_text(&two_bytes), two_bytes);
+        let too_long = "é".repeat(513);
+        assert_eq!(index_text(&too_long), digest(&too_long));
+        assert_eq!(index_text("sha256:short"), digest("sha256:short"));
+        assert_eq!(index_text("Male "), "Male ");
+        // Not idempotent: a digest starts with the prefix, so it is hashed again.
+        assert_ne!(index_text(&hashed), hashed);
+        assert_eq!(index_text(&hashed), digest(&hashed));
+    }
+
+    fn value(name: &str, ty: SearchParamType, value: IndexValue) -> ExtractedValue {
+        ExtractedValue::new(name, format!("http://example.org/sp/{name}"), ty, value)
+    }
+
+    fn token(name: &str, system: Option<&str>, code: &str) -> ExtractedValue {
+        value(
+            name,
+            SearchParamType::Token,
+            IndexValue::token(system.map(str::to_string), code),
+        )
+    }
+
+    fn ev_date(name: &str, text: &str) -> ExtractedValue {
+        value(name, SearchParamType::Date, IndexValue::date(text))
+    }
+
+    fn ev_uri(name: &str, text: &str) -> ExtractedValue {
+        value(name, SearchParamType::Uri, IndexValue::uri(text))
+    }
+
+    /// IW2 to IW5 and P5 (gate): each value form maps to its rows.
+    #[test]
+    fn token_forms_map_to_the_three_tables() {
+        let values = vec![
+            token("identifier", Some(MRN), "12345"),
+            token("identifier", Some(MRN), "12345"),
+            value(
+                "gender",
+                SearchParamType::Token,
+                IndexValue::token_implicit_system("male"),
+            ),
+            token("active", None, "true"),
+            token("code", Some("http://loinc.org"), ""),
+            value(
+                "code",
+                SearchParamType::Token,
+                IndexValue::token_display_only("BP"),
+            ),
+            value(
+                "_id",
+                SearchParamType::Token,
+                IndexValue::token_implicit_system("p1"),
+            ),
+            ev_date("_lastUpdated", "2026-11-22T10:00:00Z"),
+            ev_uri("_profile", "http://example.org/profile"),
+            ev_uri("_source", ""),
+            token("code-value-quantity", Some("http://loinc.org"), "8480-6")
+                .with_composite_group(1),
+            ev_date("birthdate", "1980-05-01"),
+            ev_date("death-date", "not a date"),
+            value("name", SearchParamType::String, IndexValue::string("Smith")),
+            value(
+                "general-practitioner",
+                SearchParamType::Reference,
+                IndexValue::reference("Practitioner/1"),
+            ),
+            value(
+                "period",
+                SearchParamType::Date,
+                IndexValue::Date {
+                    value: OPEN_START.into(),
+                    precision: DatePrecision::Second,
+                    end: DateEnd::Open,
+                },
+            ),
+        ];
+        let mut expected = vec![
+            IndexKey::ResourcesByType,
+            token_code("identifier", "12345", MRN),
+            token_system_code("identifier", MRN, "12345"),
+            token_system("identifier", MRN, "12345"),
+            token_code("gender", "male", IMPLICIT),
+            token_system_code("gender", IMPLICIT, "male"),
+            token_code("active", "true", ""),
+            token_system_code("active", "", "true"),
+            IndexKey::Uri {
+                param: "_profile".into(),
+                uri: "http://example.org/profile".into(),
+            },
+            IndexKey::Date {
+                param: "birthdate".into(),
+                start: B0,
+                end: B1,
+            },
+            IndexKey::DateByEnd {
+                param: "birthdate".into(),
+                end: B1,
+                start: B0,
+            },
+            IndexKey::Date {
+                param: "period".into(),
+                start: -62_135_596_800_000,
+                end: 253_402_300_799_999,
+            },
+            IndexKey::DateByEnd {
+                param: "period".into(),
+                end: 253_402_300_799_999,
+                start: -62_135_596_800_000,
+            },
+        ];
+        expected.sort();
+        let keys = index_keys_from(&values);
+        assert_eq!(keys, expected);
+        assert_eq!(keys.len(), 13);
+        assert_eq!(keys[0], IndexKey::ResourcesByType);
+        assert!(
+            !keys.iter().any(|key| matches!(key,
+                IndexKey::TokenSystem { system, .. } if system.is_empty() || system == IMPLICIT)),
+            "no token_system_index row for the implicit or empty system"
+        );
+    }
+
+    #[test]
+    fn long_texts_are_hashed_once_when_a_key_set_is_made() {
+        let (p, s, c) = (long(1025, 'p'), long(1025, 's'), long(1025, 'c'));
+        let (u, d) = (long(2000, 'u'), long(1025, 'd'));
+        let values = vec![
+            value(
+                &p,
+                SearchParamType::Token,
+                IndexValue::token(Some(s.clone()), c.clone()),
+            ),
+            ev_uri("_source", &u),
+            ev_date(&d, "1980-05-01"),
+            token("identifier", Some("http://example.org/ids"), "sha256:short"),
+        ];
+        let keys = index_keys_from(&values);
+        let (hp, hs, hc) = (index_text(&p), index_text(&s), index_text(&c));
+        for expected in [
+            token_code(&hp, &hc, &hs),
+            token_system_code(&hp, &hs, &hc),
+            token_system(&hp, &hs, &hc),
+            IndexKey::Uri {
+                param: "_source".into(),
+                uri: index_text(&u),
+            },
+            IndexKey::Date {
+                param: index_text(&d),
+                start: B0,
+                end: B1,
+            },
+            IndexKey::DateByEnd {
+                param: index_text(&d),
+                end: B1,
+                start: B0,
+            },
+            token_code(
+                "identifier",
+                &digest("sha256:short"),
+                "http://example.org/ids",
+            ),
+        ] {
+            assert!(keys.contains(&expected), "{expected:?}");
+        }
+        assert_eq!(hp, digest(&p), "hashed once, not twice");
+        let texts = |key: &IndexKey| -> Vec<String> {
+            match key {
+                IndexKey::ResourcesByType | IndexKey::Date { .. } | IndexKey::DateByEnd { .. } => {
+                    vec![]
+                }
+                IndexKey::TokenCode { code, system, .. }
+                | IndexKey::TokenSystemCode { code, system, .. }
+                | IndexKey::TokenSystem { code, system, .. } => {
+                    vec![code.clone(), system.clone()]
+                }
+                IndexKey::Uri { uri, .. } => vec![uri.clone()],
+            }
+        };
+        for key in &keys {
+            assert!(texts(key).iter().all(|t| t.len() <= MAX_INDEX_TEXT_BYTES));
+        }
+        assert_eq!(decode(&encode(&keys)).unwrap(), keys);
+        assert_eq!(index_keys_from(&values), keys);
+    }
+
+    /// The golden test: the walkthrough's 8 rows plus `deceased`'s 2. Section
+    /// 7's Patient gives the worked example's eight rows, and two more: `deceased`, whose spec expression
+    /// (`Patient.deceased.exists() and Patient.deceased != false`) is `false`
+    /// for a Patient without `deceased[x]`, so every such Patient gets
+    /// `deceased = false` rows (roadmap row 5.1, RV13).
+    #[test]
+    fn the_worked_example_extracts_its_eight_rows() {
+        let body = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "identifier": [{"system": MRN, "value": "12345"}],
+            "gender": "male",
+            "birthDate": "1980-05-01"
+        });
+        let extraction = extract_index_keys(&test_extractor(), "Patient", &body);
+        assert!(extraction.failed_params.is_empty());
+        assert_eq!(extraction.failed_resource, None);
+        let mut expected = worked_example();
+        expected.push(token_code("deceased", "false", ""));
+        expected.push(token_system_code("deceased", "", "false"));
+        expected.sort();
+        for key in worked_example() {
+            assert!(extraction.keys.contains(&key), "{key:?}");
+        }
+        assert_eq!(extraction.keys, expected);
+        assert_eq!(encode(&extraction.keys).len(), 323);
+    }
+
+    /// IW1 and D6: a parameter that fails is skipped and named; a resource
+    /// that cannot be extracted keeps only its type key.
+    #[test]
+    fn a_failed_parameter_is_skipped_and_a_failed_resource_keeps_its_type_key() {
+        let registry = test_registry();
+        registry
+            .write()
+            .register(
+                SearchParameterDefinition::new(
+                    "http://example.org/SearchParameter/broken",
+                    "broken",
+                    SearchParamType::Token,
+                    "Patient.name.single()",
+                )
+                .with_base(vec!["Patient"]),
+            )
+            .unwrap();
+        let extractor = SearchParameterExtractor::new(registry);
+        let body = json!({
+            "resourceType": "Patient", "id": "p", "gender": "male",
+            "name": [{"family": "One"}, {"family": "Two"}]
+        });
+        let extraction = extract_index_keys(&extractor, "Patient", &body);
+        assert_eq!(extraction.failed_params, vec!["broken".to_string()]);
+        assert_eq!(extraction.failed_resource, None);
+        assert!(
+            extraction
+                .keys
+                .contains(&token_code("gender", "male", IMPLICIT))
+        );
+        let has_broken = extraction.keys.iter().any(|key| match key {
+            IndexKey::TokenCode { param, .. }
+            | IndexKey::TokenSystemCode { param, .. }
+            | IndexKey::TokenSystem { param, .. }
+            | IndexKey::Date { param, .. }
+            | IndexKey::DateByEnd { param, .. }
+            | IndexKey::Uri { param, .. } => param == "broken",
+            IndexKey::ResourcesByType => false,
+        });
+        assert!(!has_broken);
+
+        for (body, resource_type) in [
+            (json!(["x"]), "Patient"),
+            (json!({"resourceType": "Observation", "id": "p"}), "Patient"),
+        ] {
+            let extraction = extract_index_keys(&extractor, resource_type, &body);
+            assert_eq!(extraction.keys, vec![IndexKey::ResourcesByType]);
+            assert!(extraction.failed_resource.is_some(), "{body}");
+            assert!(extraction.failed_params.is_empty());
         }
     }
 }

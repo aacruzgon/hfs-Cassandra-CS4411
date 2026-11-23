@@ -224,7 +224,7 @@ pub(crate) const PLAIN_DELETE_MISS_RETRIES: usize = 1;
 const POST_CAS_WRITE_TRIES: u32 = 3;
 /// Index batches of one write in flight at once (IW12): futures inside the
 /// request's task, never `tokio::spawn`.
-const INDEX_BATCHES_IN_FLIGHT: usize = 8;
+pub(super) const INDEX_BATCHES_IN_FLIGHT: usize = 8;
 /// The most a CAS may carry, `data` plus `index_keys`, in bytes (ADR-aacruzgon-0053): half
 /// of the node's default `max_mutation_size` (16 MiB, half of the default
 /// 32 MiB `commitlog_segment_size`), which leaves room for the rest of the
@@ -235,11 +235,11 @@ const MAX_SEARCH_PARAMETER_CODE_BYTES: usize = 128;
 /// Longest FHIR id (`[A-Za-z0-9\-\.]{1,64}`, R4 datatypes.html#id).
 const MAX_ID_LEN: usize = 64;
 /// Number of intent shards (`schema.cql`, `pending_index_writes`).
-const INTENT_SHARDS: u32 = 16;
+pub(super) const INTENT_SHARDS: u32 = 16;
 
 /// The full key of an intent row, kept by the request so I2 finds it even
 /// after the hour rolls over.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct IntentKey {
     bucket: String,
     shard: i16,
@@ -255,10 +255,31 @@ impl IntentKey {
             enqueued_at: timeuuid(now),
         }
     }
+
+    /// An intent's key as I3 read it: the slice's bucket and shard, the row's `enqueued_at`.
+    pub(super) fn from_parts(bucket: String, shard: i16, enqueued_at: Uuid) -> Self {
+        Self {
+            bucket,
+            shard,
+            enqueued_at,
+        }
+    }
+
+    pub(super) fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub(super) fn shard(&self) -> i16 {
+        self.shard
+    }
+
+    pub(super) fn enqueued_at(&self) -> Uuid {
+        self.enqueued_at
+    }
 }
 
 /// `bucket`: the UTC hour of `enqueued_at`, `'YYYY-MM-DDTHH'`.
-fn bucket_of(at: DateTime<Utc>) -> String {
+pub(super) fn bucket_of(at: DateTime<Utc>) -> String {
     at.format("%Y-%m-%dT%H").to_string()
 }
 
@@ -2169,7 +2190,7 @@ impl CassandraBackend {
     }
 
     /// I1.
-    async fn write_intent(
+    pub(super) async fn write_intent(
         &self,
         intent: &IntentKey,
         key: &RowKey<'_>,
@@ -2196,7 +2217,7 @@ impl CassandraBackend {
     }
 
     /// I2, best effort: a failure leaves the intent for the sweeper.
-    async fn delete_intent(&self, intent: &IntentKey, key: &RowKey<'_>) {
+    pub(super) async fn delete_intent(&self, intent: &IntentKey, key: &RowKey<'_>) {
         let result = self
             .session
             .execute(

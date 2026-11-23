@@ -508,7 +508,22 @@ impl CassandraSession {
         page_size: i32,
         keep: impl Fn(&Row) -> bool,
     ) -> Result<Vec<Row>, DriverError> {
+        self.rows_paged_counting(cql, values, kind, page_size, keep)
+            .await
+            .map(|(rows, _)| rows)
+    }
+
+    /// [`Self::rows_paged_keeping`], also counting the node's warnings that mention tombstones, over every page (SW10).
+    pub(crate) async fn rows_paged_counting(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        kind: StatementKind,
+        page_size: i32,
+        keep: impl Fn(&Row) -> bool,
+    ) -> Result<(Vec<Row>, u64), DriverError> {
         let mut all = Vec::new();
+        let mut tombstone_warnings = 0u64;
         let mut state = None;
         loop {
             let paging = Paging {
@@ -518,6 +533,11 @@ impl CassandraSession {
             let envelope = self
                 .execute_with(cql, values.clone(), kind, Some(paging), Retries::OfKind)
                 .await?;
+            tombstone_warnings += envelope
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("tombstone"))
+                .count() as u64;
             let body = envelope.response_body()?;
             let next = body
                 .as_rows_metadata()
@@ -530,7 +550,7 @@ impl CassandraSession {
             );
             match next {
                 Some(next) => state = Some(next),
-                None => return Ok(all),
+                None => return Ok((all, tombstone_warnings)),
             }
         }
     }

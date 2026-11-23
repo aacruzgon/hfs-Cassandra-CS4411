@@ -164,7 +164,6 @@ impl ResourceRow {
     }
 
     /// The text a replay writes: the stored cell verbatim, or `fhir_version.as_mime_param()` when it is unset (RW8).
-    #[allow(dead_code)]
     pub(crate) fn fhir_version_text(&self) -> &str {
         self.stored_fhir_version
             .as_deref()

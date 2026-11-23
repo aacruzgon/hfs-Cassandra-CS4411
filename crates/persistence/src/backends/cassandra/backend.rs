@@ -302,6 +302,8 @@ pub struct CassandraBackend {
     note_seq: AtomicU64,
     /// The write engine's outcome counters ([`Self::cas_stats`]).
     pub(super) cas_counters: Arc<CasCounters>,
+    /// The sweeper's counters and load limit (sweeper.rs).
+    pub(super) sweeper: super::sweeper::SweeperShared,
     /// Crash checkpoints a test arms in the write path (ADR-sam-michaels-0006, RV15).
     #[cfg(test)]
     pub(super) checkpoints: super::checkpoint::Checkpoints,
@@ -389,6 +391,7 @@ impl CassandraBackend {
             stored_by_tenant,
             note_seq: AtomicU64::new(0),
             cas_counters: Arc::new(CasCounters::default()),
+            sweeper: Default::default(),
             #[cfg(test)]
             checkpoints: Default::default(),
         })

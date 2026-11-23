@@ -151,6 +151,15 @@ impl fmt::Display for CasStats {
     }
 }
 
+impl CasStats {
+    /// Unknown outcomes the node did not answer: HFS's own deadline after the CAS was sent, or a dropped
+    /// connection after it may have left. A grace-0 `sweep_pass` is safe only when, for every writer of the swept
+    /// tenants, this did not move (SW28, RV19, issue #89).
+    pub fn client_side_unknowns(&self) -> u64 {
+        self.unknown_deadline + self.unknown_connection
+    }
+}
+
 /// What one write's index phase packed (IW14): the index rows planned for
 /// insert and for delete, the batches they were packed into, and the largest
 /// of those batches by [`wire_bytes`](super::batch::wire_bytes), the measure

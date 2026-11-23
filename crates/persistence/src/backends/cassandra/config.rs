@@ -282,13 +282,11 @@ impl CassandraConfig {
     }
 
     /// The pause between two polls of the outbox.
-    #[allow(dead_code)]
     pub(crate) fn sweeper_poll_interval(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.sweeper_poll_interval_ms)
     }
 
     /// How old an intent must be before the sweeper takes it.
-    #[allow(dead_code)]
     pub(crate) fn sweeper_grace(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.sweeper_grace_ms)
     }

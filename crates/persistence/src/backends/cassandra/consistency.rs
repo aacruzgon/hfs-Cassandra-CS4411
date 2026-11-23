@@ -1577,6 +1577,7 @@ mod tests {
             "undecodable",
             "no-type-key",
             "no-write-ts",
+            "emptied-older-version",
         ];
         let version = test_fhir_version();
 
@@ -1835,6 +1836,16 @@ mod tests {
             plant_x1(&backend, &t, lu, id, 1, written).await;
         }
 
+        // emptied-older-version: v1 is a live older version whose stored set
+        // lost the type key after the update.
+        let t = tenant_of("emptied-older-version");
+        let (stored, _, ts1, _) = seeded(&backend, &t).await;
+        backend
+            .update(&context(&t), &stored, changed())
+            .await
+            .expect("update p");
+        plant_version_keys(&backend, &t, 1, index_keys::EMPTY.to_vec(), ts1 + 1).await;
+
         // One shared scan for every case.
         let scan = {
             let run = run.clone();
@@ -1844,7 +1855,9 @@ mod tests {
         for case in all {
             assert!(scan.covers(&tenant_of(case)), "{case}");
         }
+        let checked = std::cell::RefCell::new(Vec::new());
         let check = |case: &'static str, registry: Registry| {
+            checked.borrow_mut().push((case, registry));
             let backend = backend.clone();
             let t = tenant_of(case);
             let scan = &scan;
@@ -1860,184 +1873,207 @@ mod tests {
             }
         };
 
-        let report = check("missing-row", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["missing_row"], "{report}");
-        let Defect::MissingRow {
-            key, last_updated, ..
-        } = &report.defects[0]
-        else {
-            unreachable!()
-        };
-        assert_eq!(key, &IndexKey::ResourcesByType);
-        let lu1 = backend
-            .read_resource_row(&tenant_of("missing-row"), "Patient", "p")
-            .await
-            .unwrap()
-            .unwrap()
-            .last_updated;
-        assert_eq!(*last_updated, Some(lu1));
-
-        let report = check("stray-ghost", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["stray_row"], "{report}");
-        let Defect::StrayRow { row } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(row.id, "ghost");
-
-        let report = check("stray-every-table", Registry::Fixed).await;
-        assert_eq!(report.kinds(), vec!["stray_row"; 6], "{report}");
-        let mut seen: Vec<(&str, IndexKey, Option<DateTime<Utc>>)> = report
-            .defects
-            .iter()
-            .map(|d| match d {
-                Defect::StrayRow { row } => (row.table, row.key.clone(), row.last_updated),
-                other => panic!("{other}"),
-            })
-            .collect();
-        seen.sort_by_key(|(table, ..)| *table);
-        let tables: Vec<&str> = seen.iter().map(|(t, ..)| *t).collect();
-        let mut want_tables = vec![
-            "date_index",
-            "date_index_by_end",
-            "token_code_index",
-            "token_system_code_index",
-            "token_system_index",
-            "uri_index",
-        ];
-        want_tables.sort_unstable();
-        assert_eq!(tables, want_tables);
-        let mut keys: Vec<IndexKey> = seen.iter().map(|(_, k, _)| k.clone()).collect();
-        keys.sort();
-        let (param, s, c) = ("planted".to_string(), "s".to_string(), "c".to_string());
-        let mut want_keys = vec![
-            IndexKey::TokenCode {
-                param: param.clone(),
-                code: c.clone(),
-                system: s.clone(),
-            },
-            IndexKey::TokenSystemCode {
-                param: param.clone(),
-                system: s.clone(),
-                code: c.clone(),
-            },
-            IndexKey::TokenSystem {
-                param: param.clone(),
-                system: s,
-                code: c,
-            },
-            IndexKey::Date {
-                param: param.clone(),
-                start: 1000,
-                end: 2000,
-            },
-            IndexKey::DateByEnd {
-                param,
-                end: 2000,
-                start: 1000,
-            },
-            planted_uri(),
-        ];
-        want_keys.sort();
-        assert_eq!(keys, want_keys);
-        for (table, _, last_updated) in &seen {
-            assert_eq!(
-                last_updated.is_none(),
-                table.starts_with("date_index"),
-                "{table}"
-            );
-        }
-
-        let report = check("wrong-tag", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["wrong_tag"], "{report}");
-        let Defect::WrongTag { row, current } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!((*current, row.version_id), (1, 0));
-
-        let report = check("wrong-write-time", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["wrong_write_time"], "{report}");
-        let Defect::WrongWriteTime { row, expected } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(row.written, *expected + 5);
-
-        let report = check("blob-mismatch", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["blob_mismatch"], "{report}");
-        let Defect::BlobMismatch { version_id, .. } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(*version_id, 1);
-
-        let report = check("stale-extraction", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["stale_extraction"], "{report}");
-        let report = check("stale-extraction", Registry::Changed).await;
-        assert_consistent(&report);
-
-        let report = check("version-reextraction", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["version_reextraction"], "{report}");
-        let Defect::VersionReextraction { version_id, .. } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(*version_id, 1);
-        let report = check("version-reextraction", Registry::Changed).await;
-        assert_consistent(&report);
-
-        let report = check("marker-not-empty", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["marker_not_empty"], "{report}");
-        let Defect::MarkerNotEmpty { version_id, .. } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(*version_id, 2);
-
-        let report = check("missing-version-row", Registry::Fixed).await;
-        assert_eq!(
-            report.kinds(),
-            expect(&[("missing_row", k_missing.len()), ("missing_version_row", 1)]),
-            "{report}"
-        );
-
-        let report = check("undecodable", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["undecodable"], "{report}");
-        let Defect::Undecodable { version_id, .. } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(*version_id, None);
-
-        // A changed registry silences rules 3 and 4 only: the stray scan, the
-        // tag rule and the write-time rule still run.
-        let report = check("stray-ghost", Registry::Changed).await;
-        assert_eq!(report.kinds(), ["stray_row"], "{report}");
-        let report = check("stray-every-table", Registry::Changed).await;
-        assert_eq!(report.kinds(), vec!["stray_row"; 6], "{report}");
-        let report = check("wrong-tag", Registry::Changed).await;
-        assert_eq!(report.kinds(), ["wrong_tag"], "{report}");
-        let report = check("wrong-write-time", Registry::Changed).await;
-        assert_eq!(report.kinds(), ["wrong_write_time"], "{report}");
-
-        // Only `p`'s type row is off; the expected time is derived from
-        // `last_updated`.
+        // Every planted tenant runs under both registries. A changed registry
+        // skips only the two fresh-extraction comparisons, rules 3 and 4
+        // (RV14), so it reports the same kinds as an unchanged one, less
+        // `stale_extraction` and `version_reextraction`.
         for registry in [Registry::Fixed, Registry::Changed] {
+            let fixed = registry == Registry::Fixed;
+            let under = |kinds: &[&'static str]| -> Vec<&'static str> {
+                kinds
+                    .iter()
+                    .copied()
+                    .filter(|k| fixed || !matches!(*k, "stale_extraction" | "version_reextraction"))
+                    .collect()
+            };
+
+            let report = check("missing-row", registry).await;
+            assert_eq!(report.kinds(), under(&["missing_row"]), "{report}");
+            let Defect::MissingRow {
+                key, last_updated, ..
+            } = &report.defects[0]
+            else {
+                unreachable!()
+            };
+            assert_eq!(key, &IndexKey::ResourcesByType);
+            let lu1 = backend
+                .read_resource_row(&tenant_of("missing-row"), "Patient", "p")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_updated;
+            assert_eq!(*last_updated, Some(lu1));
+
+            let report = check("stray-ghost", registry).await;
+            assert_eq!(report.kinds(), under(&["stray_row"]), "{report}");
+            let Defect::StrayRow { row } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!(row.id, "ghost");
+
+            let report = check("stray-every-table", registry).await;
+            assert_eq!(report.kinds(), under(&["stray_row"; 6]), "{report}");
+            let mut seen: Vec<(&str, IndexKey, Option<DateTime<Utc>>)> = report
+                .defects
+                .iter()
+                .map(|d| match d {
+                    Defect::StrayRow { row } => (row.table, row.key.clone(), row.last_updated),
+                    other => panic!("{other}"),
+                })
+                .collect();
+            seen.sort_by_key(|(table, ..)| *table);
+            let tables: Vec<&str> = seen.iter().map(|(t, ..)| *t).collect();
+            let mut want_tables = vec![
+                "date_index",
+                "date_index_by_end",
+                "token_code_index",
+                "token_system_code_index",
+                "token_system_index",
+                "uri_index",
+            ];
+            want_tables.sort_unstable();
+            assert_eq!(tables, want_tables);
+            let mut keys: Vec<IndexKey> = seen.iter().map(|(_, k, _)| k.clone()).collect();
+            keys.sort();
+            let (param, s, c) = ("planted".to_string(), "s".to_string(), "c".to_string());
+            let mut want_keys = vec![
+                IndexKey::TokenCode {
+                    param: param.clone(),
+                    code: c.clone(),
+                    system: s.clone(),
+                },
+                IndexKey::TokenSystemCode {
+                    param: param.clone(),
+                    system: s.clone(),
+                    code: c.clone(),
+                },
+                IndexKey::TokenSystem {
+                    param: param.clone(),
+                    system: s,
+                    code: c,
+                },
+                IndexKey::Date {
+                    param: param.clone(),
+                    start: 1000,
+                    end: 2000,
+                },
+                IndexKey::DateByEnd {
+                    param,
+                    end: 2000,
+                    start: 1000,
+                },
+                planted_uri(),
+            ];
+            want_keys.sort();
+            assert_eq!(keys, want_keys);
+            for (table, _, last_updated) in &seen {
+                assert_eq!(
+                    last_updated.is_none(),
+                    table.starts_with("date_index"),
+                    "{table}"
+                );
+            }
+
+            let report = check("wrong-tag", registry).await;
+            assert_eq!(report.kinds(), under(&["wrong_tag"]), "{report}");
+            let Defect::WrongTag { row, current } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!((*current, row.version_id), (1, 0));
+
+            let report = check("wrong-write-time", registry).await;
+            assert_eq!(report.kinds(), under(&["wrong_write_time"]), "{report}");
+            let Defect::WrongWriteTime { row, expected } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!(row.written, *expected + 5);
+
+            let report = check("blob-mismatch", registry).await;
+            assert_eq!(report.kinds(), under(&["blob_mismatch"]), "{report}");
+            let Defect::BlobMismatch { version_id, .. } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!(*version_id, 1);
+
+            let report = check("stale-extraction", registry).await;
+            assert_eq!(report.kinds(), under(&["stale_extraction"]), "{report}");
+
+            let report = check("version-reextraction", registry).await;
+            assert_eq!(report.kinds(), under(&["version_reextraction"]), "{report}");
+            if fixed {
+                let Defect::VersionReextraction { version_id, .. } = &report.defects[0] else {
+                    unreachable!()
+                };
+                assert_eq!(*version_id, 1);
+            }
+
+            let report = check("marker-not-empty", registry).await;
+            assert_eq!(report.kinds(), under(&["marker_not_empty"]), "{report}");
+            let Defect::MarkerNotEmpty { version_id, .. } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!(*version_id, 2);
+
+            let report = check("missing-version-row", registry).await;
+            assert_eq!(
+                report.kinds(),
+                under(&expect(&[
+                    ("missing_row", k_missing.len()),
+                    ("missing_version_row", 1)
+                ])),
+                "{report}"
+            );
+
+            let report = check("undecodable", registry).await;
+            assert_eq!(report.kinds(), under(&["undecodable"]), "{report}");
+            let Defect::Undecodable { version_id, .. } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!(*version_id, None);
+
+            // Only `p`'s type row is off; the expected time is derived from
+            // `last_updated`.
             let report = check("no-write-ts", registry).await;
-            assert_eq!(report.kinds(), ["wrong_write_time"], "{report}");
+            assert_eq!(report.kinds(), under(&["wrong_write_time"]), "{report}");
             let Defect::WrongWriteTime { row, expected } = &report.defects[0] else {
                 unreachable!()
             };
             assert_eq!(*expected, write_ts_of(ms(1_700_000_000_000)));
             assert_eq!((row.id.as_str(), row.written), ("p", *expected + 1000));
-        }
 
-        // The resources row and the version row both lack the type key.
-        for registry in [Registry::Fixed, Registry::Changed] {
+            // The resources row and the version row both lack the type key.
             let report = check("no-type-key", registry).await;
-            let mut want = vec![("no_type_key", 2)];
-            if registry == Registry::Fixed {
-                want.push(("stale_extraction", 1));
-            }
-            assert_eq!(report.kinds(), expect(&want), "{report}");
+            assert_eq!(
+                report.kinds(),
+                under(&expect(&[("no_type_key", 2), ("stale_extraction", 1)])),
+                "{report}"
+            );
             assert!(report.defects.iter().all(|d| match d {
                 Defect::NoTypeKey { version_id, .. } => *version_id == 1,
                 _ => true,
             }));
+
+            // Only the older version row lacks the type key.
+            let report = check("emptied-older-version", registry).await;
+            assert_eq!(
+                report.kinds(),
+                under(&["no_type_key", "version_reextraction"]),
+                "{report}"
+            );
+            assert!(report.defects.iter().all(|d| match d {
+                Defect::NoTypeKey { version_id, .. }
+                | Defect::VersionReextraction { version_id, .. } => *version_id == 1,
+                _ => true,
+            }));
+        }
+        let checked = checked.into_inner();
+        for case in all {
+            for registry in [Registry::Fixed, Registry::Changed] {
+                assert!(
+                    checked.contains(&(case, registry)),
+                    "{case} is checked under {registry:?}"
+                );
+            }
         }
     }
 

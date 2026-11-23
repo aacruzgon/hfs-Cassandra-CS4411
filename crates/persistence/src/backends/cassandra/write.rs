@@ -2218,8 +2218,24 @@ impl CassandraBackend {
 
     /// I2, best effort: a failure leaves the intent for the sweeper.
     pub(super) async fn delete_intent(&self, intent: &IntentKey, key: &RowKey<'_>) {
-        let result = self
-            .session
+        if let Err(error) = self.try_delete_intent(intent, key).await {
+            tracing::debug!(
+                resource_type = key.resource_type,
+                id = key.id,
+                error = ?error,
+                "intent delete failed; the sweeper deletes it"
+            );
+        }
+    }
+
+    /// I2 with its result, for the sweeper, which counts an intent as finished only once I2 is confirmed.
+    /// It is a delete at the server's time, not at a fixed timestamp.
+    pub(super) async fn try_delete_intent(
+        &self,
+        intent: &IntentKey,
+        key: &RowKey<'_>,
+    ) -> Result<(), DriverError> {
+        self.session
             .execute(
                 DELETE_INTENT,
                 vec![
@@ -2232,15 +2248,8 @@ impl CassandraBackend {
                 ],
                 StatementKind::Write,
             )
-            .await;
-        if let Err(error) = result {
-            tracing::debug!(
-                resource_type = key.resource_type,
-                id = key.id,
-                error = ?error,
-                "intent delete failed; the sweeper deletes it"
-            );
-        }
+            .await
+            .map(|_| ())
     }
 
     /// Step 4 on plain inputs (IW17 = SW14, ADR-sam-michaels-0006): `row`
@@ -5263,6 +5272,27 @@ mod node_tests {
                 .intent_versions(tenant.tenant_id().as_str(), "Patient", "p", since)
                 .await,
             vec![2]
+        );
+
+        // The sweep writes the row and the index rows, and leaves no intent of its own.
+        let report = backend
+            .sweep_pass(crate::backends::cassandra::SweepOptions {
+                scope: crate::backends::cassandra::SweepScope::Tenants(vec![
+                    tenant.tenant_id().as_str().to_string(),
+                ]),
+                grace: Duration::ZERO,
+                now: Utc::now(),
+                since,
+                allow_short_grace: true,
+            })
+            .await
+            .unwrap();
+        assert!(report.is_complete(), "{report}");
+        assert!(
+            backend
+                .intent_versions(tenant.tenant_id().as_str(), "Patient", "p", since)
+                .await
+                .is_empty()
         );
     }
 

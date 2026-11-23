@@ -12,9 +12,11 @@
 //!
 //! For an intent of version `V`, the sweeper reads the `resources` row at
 //! `LOCAL_QUORUM`, and only when that showed no row or a version below `V` it
-//! reads it again at `LOCAL_SERIAL` (SW12: a CAS still in flight is completed
-//! or cancelled by the serial read, so the answer is final). The version the
-//! row shows decides the case:
+//! reads it again at `LOCAL_SERIAL` (SW12: the serial read completes a
+//! proposal the replicas already accepted, but one still running at its
+//! coordinator can apply after it, so the answer is not final: the grace is
+//! what protects a request in flight, SW28). The version the row shows
+//! decides the case:
 //!
 //! - **no row** or **never applied** (a version below `V`): the CAS did not
 //!   apply, so nothing was written; the intent row is deleted (I2).
@@ -83,10 +85,13 @@
 //!
 //! # Duplicate work is harmless (SW22)
 //!
-//! Every write the sweeper makes is at the version's own timestamp,
-//! `write_ts_of(last_updated)`, with the cells the version already has, so two
-//! sweepers, or a sweeper and a request, on one intent end in the same state.
-//! There is no lease and no coordination.
+//! Every version and index write the sweeper makes is at the version's own
+//! timestamp, `write_ts_of(last_updated)`, with the cells the version already
+//! has, so two sweepers, or a sweeper and a request, on one intent end in the
+//! same state. The one exception is I2, the delete of the intent row, which is
+//! a delete at the server's time: an intent counts as finished only once I2 is
+//! confirmed, and one that was not stays and is tried again. There is no lease
+//! and no coordination.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -105,7 +110,7 @@ use uuid::Uuid;
 
 use super::backend::CassandraBackend;
 use super::index_keys::{self, IndexKey};
-use super::read::ResourceRow;
+use super::read::{ResourceRow, SELECT_RESOURCE};
 use super::session::{DriverError, StatementKind};
 #[cfg(test)]
 use super::stats::CasStats;
@@ -273,6 +278,8 @@ pub(crate) enum Invariant {
     UnreadableKeys,
     /// A stored `write_ts` that is not `write_ts_of(last_updated)` (SW11, RW10).
     WriteTsMismatch,
+    /// A `resources` or `resource_versions` row whose columns do not decode.
+    UnreadableRow,
     /// The version row or the index delta failed as `WriteFailure::Permanent`: no try can succeed.
     PermanentWrite,
 }
@@ -284,6 +291,7 @@ impl Invariant {
             Self::MissingVersionRow => "missing_version_row",
             Self::UnreadableKeys => "unreadable_keys",
             Self::WriteTsMismatch => "write_ts",
+            Self::UnreadableRow => "unreadable_row",
             Self::PermanentWrite => "permanent_write",
         }
     }
@@ -1453,24 +1461,14 @@ impl CassandraBackend {
             id: &intent.id,
         };
         let version = intent.version_id;
-        let quorum = {
-            let _permit = self.sweeper.permits(rank, 1).await;
-            self.read_resource_row(&intent.tenant_id, &intent.resource_type, &intent.id)
-                .await
-        };
-        let mut row = match quorum {
+        let mut row = match self.read_row(intent, StatementKind::Read, rank).await {
             Ok(row) => row,
-            Err(_) => return self.stopped(intent, None, Failure::Transient("read")),
+            Err((failure, detail)) => return self.stopped(intent, failure, &detail),
         };
         if needs_serial_read(version, row.as_ref().map(|row| row.version_id)) {
-            let serial = {
-                let _permit = self.sweeper.permits(rank, 1).await;
-                self.serial_read_resource_row(&intent.tenant_id, &intent.resource_type, &intent.id)
-                    .await
-            };
-            row = match serial {
+            row = match self.read_row(intent, StatementKind::SerialRead, rank).await {
                 Ok(row) => row,
-                Err(_) => return self.stopped(intent, None, Failure::Transient("serial read")),
+                Err((failure, detail)) => return self.stopped(intent, failure, &detail),
             };
         }
         let case = IntentCase::of(version, row.as_ref().map(|row| row.version_id));
@@ -1513,9 +1511,26 @@ impl CassandraBackend {
             self.follow_stored_search_parameter(&intent.tenant_id, &intent.id, row.as_ref());
             self.sweeper.counters.followed();
         }
-        {
+        let deleted = {
             let _permit = self.sweeper.permits(rank, 1).await;
-            self.delete_intent(&intent.key, &key).await;
+            self.try_delete_intent(&intent.key, &key).await
+        };
+        if let Err(error) = deleted {
+            // I2 is a delete at server time; until it is confirmed the intent is not finished.
+            tracing::debug!(
+                tenant_id = %intent.tenant_id,
+                resource_type = %intent.resource_type,
+                id = %intent.id,
+                version_id = version,
+                error = ?error,
+                "an intent's row could not be deleted; it is tried again"
+            );
+            return IntentResult {
+                case: Some(case),
+                result: Err(Failure::Transient("intent delete")),
+                index: replay.index,
+                noop: replay.noop,
+            };
         }
         self.sweeper.counters.finished(replay.noop);
         IntentResult {
@@ -1526,17 +1541,70 @@ impl CassandraBackend {
         }
     }
 
+    /// R1 (`Read`) or R2 (`SerialRead`) for an intent's resource. A driver error is transient; a row that
+    /// does not decode is a bug (SW13). The error comes back with its text.
+    async fn read_row(
+        &self,
+        intent: &Intent,
+        kind: StatementKind,
+        rank: Rank,
+    ) -> Result<Option<ResourceRow>, (Failure, String)> {
+        let step = if kind == StatementKind::SerialRead {
+            "serial read"
+        } else {
+            "read"
+        };
+        let rows = {
+            let _permit = self.sweeper.permits(rank, 1).await;
+            self.session
+                .rows(
+                    SELECT_RESOURCE,
+                    vec![
+                        Value::from(intent.tenant_id.as_str()),
+                        Value::from(intent.resource_type.as_str()),
+                        Value::from(intent.id.as_str()),
+                    ],
+                    kind,
+                )
+                .await
+                .map_err(|error| (Failure::Transient(step), format!("{error:?}")))?
+        };
+        rows.first()
+            .map(ResourceRow::decode)
+            .transpose()
+            .map_err(|error| {
+                (
+                    Failure::Invariant(Invariant::UnreadableRow),
+                    format!("{error:?}"),
+                )
+            })
+    }
+
     /// An intent that stopped before a case was known.
-    fn stopped(&self, intent: &Intent, case: Option<IntentCase>, failure: Failure) -> IntentResult {
-        tracing::debug!(
-            tenant_id = %intent.tenant_id,
-            resource_type = %intent.resource_type,
-            id = %intent.id,
-            version_id = intent.version_id,
-            "an intent's row could not be read"
-        );
+    fn stopped(&self, intent: &Intent, failure: Failure, detail: &str) -> IntentResult {
+        if let Failure::Invariant(invariant) = failure {
+            self.sweeper.counters.invariant();
+            tracing::error!(
+                tenant_id = %intent.tenant_id,
+                resource_type = %intent.resource_type,
+                id = %intent.id,
+                version_id = intent.version_id,
+                invariant = invariant.as_str(),
+                error = detail,
+                "an intent's row does not decode; its row is kept in the outbox"
+            );
+        } else {
+            tracing::debug!(
+                tenant_id = %intent.tenant_id,
+                resource_type = %intent.resource_type,
+                id = %intent.id,
+                version_id = intent.version_id,
+                error = detail,
+                "an intent's row could not be read"
+            );
+        }
         IntentResult {
-            case,
+            case: None,
             result: Err(failure),
             index: IndexWriteStats::default(),
             noop: false,
@@ -1572,7 +1640,7 @@ impl CassandraBackend {
         let unreadable = || Failure::Invariant(Invariant::UnreadableKeys);
         let last_updated: DateTime<Utc> = row
             .get_r_by_name("last_updated")
-            .map_err(|_| unreadable())?;
+            .map_err(|_| Failure::Invariant(Invariant::UnreadableRow))?;
         let index_keys = IntoRustByName::<Blob>::get_by_name(row, "index_keys")
             .map_err(|_| unreadable())?
             .map(Blob::into_vec);
@@ -3035,6 +3103,56 @@ mod node_tests {
         assert!(intents(&backend, &t, "p", since).await.is_empty());
         assert_consistent(&check(&backend, &t).await);
         say("transient", &backend, &before);
+    }
+
+    /// IW24 on the replay: when the version row is not written, no index statement is sent and the
+    /// intent stays.
+    #[tokio::test]
+    async fn a_replay_whose_version_row_failed_sends_no_index_row() {
+        let Some((backend, t, tenant, since)) = start("sweeper-replay-iw24").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 1, async move {
+            b.create(&ten, "Patient", patient(), version).await
+        })
+        .await;
+        let lu1 = row_of(&backend, &t, "p").await.last_updated;
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resource_versions",
+            Fault::TimeOutWithoutApplying,
+        );
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "resources_by_type",
+            Fault::TimeOutWithoutApplying,
+        );
+        let found = pending(&backend, &t, "p", since).await;
+        let result = backend.process_intent(&found[0], Rank::Normal).await;
+        assert_eq!(result.case, Some(IntentCase::Current));
+        assert_eq!(result.result, Err(Failure::Transient("version row")));
+        assert_eq!(result.index, IndexWriteStats::default());
+        let error = backend
+            .session
+            .rows(
+                "SELECT id FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?",
+                vec![Value::from(t.as_str()), Value::from("Patient")],
+                StatementKind::Write,
+            )
+            .await
+            .expect_err("the tripwire is still armed: no index statement was sent");
+        assert!(format!("{error:?}").contains("injected fault"), "{error:?}");
+        assert!(version_ids(&backend, &t, "Patient", "p").await.is_empty());
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+
+        let again = backend.process_intent(&found[0], Rank::Normal).await;
+        assert_eq!(again.result, Ok(()));
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu1, 1)]);
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        say("replay-iw24", &backend, &before);
     }
 
     /// N13 (SW13): bugs are invariants, never an empty set. The planted rows' tenant is `test-planted-`.

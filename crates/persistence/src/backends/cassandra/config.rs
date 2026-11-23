@@ -258,7 +258,7 @@ impl CassandraConfig {
                 "HFS_CASSANDRA_SWEEPER_POLL_INTERVAL_MS must be at least 1".to_string(),
             ));
         }
-        if self.sweeper_grace_ms < 2 * self.request_timeout_ms {
+        if self.sweeper_grace_ms < self.request_timeout_ms.saturating_mul(2) {
             return Err(CassandraConfigError(format!(
                 "HFS_CASSANDRA_SWEEPER_GRACE_MS ({}) must be at least twice \
                  HFS_CASSANDRA_REQUEST_TIMEOUT_MS ({})",
@@ -424,6 +424,8 @@ mod tests {
             let error = config.validate().unwrap_err();
             assert!(error.to_string().contains(name), "{error}");
         }
+        // A request timeout of u64::MAX must not overflow the twice-the-timeout check.
+        assert!(with(5_000, 20_000, u64::MAX).validate().is_err());
         assert!(with(5_000, 20_000, 10_000).validate().is_ok());
         assert!(with(5_000, 3_599_999, 10_000).validate().is_ok());
     }

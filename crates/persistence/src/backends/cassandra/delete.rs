@@ -449,7 +449,7 @@ mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
     use crate::backends::cassandra::index_keys::{self, IndexKey};
-    use crate::backends::cassandra::session::{Fault, StatementKind};
+    use crate::backends::cassandra::session::{Fault, StatementKind, TimeoutWriteType};
     use crate::backends::cassandra::write::{PreviousVersion, normalized_body};
     use crate::core::{ResourceStorage, SearchProvider};
     use crate::error::BackendError;
@@ -1302,6 +1302,7 @@ mod node_tests {
             C3_ONLY,
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();

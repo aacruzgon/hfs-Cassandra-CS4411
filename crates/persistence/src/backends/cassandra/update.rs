@@ -368,7 +368,7 @@ mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
     use crate::backends::cassandra::index_keys::{self, IndexKey};
-    use crate::backends::cassandra::session::Fault;
+    use crate::backends::cassandra::session::{Fault, TimeoutWriteType};
     use crate::backends::cassandra::write::{
         PreviousVersion, SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, write_ts_of,
     };
@@ -527,7 +527,10 @@ mod node_tests {
         backend.session.inject_fault(
             StatementKind::Cas,
             "UPDATE resources",
-            Fault::ApplyLate { before },
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
         );
         let lu = super::super::write::next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50);
@@ -557,7 +560,10 @@ mod node_tests {
         backend.session.inject_fault(
             StatementKind::Cas,
             "UPDATE resources",
-            Fault::ApplyLate { before },
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
         );
         let lu = super::super::write::next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50);
@@ -1068,6 +1074,7 @@ mod node_tests {
             "UPDATE resources",
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();

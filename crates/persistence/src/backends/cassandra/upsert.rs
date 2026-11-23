@@ -366,7 +366,7 @@ mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
     use crate::backends::cassandra::index_keys::{self, IndexKey};
-    use crate::backends::cassandra::session::{Fault, StatementKind};
+    use crate::backends::cassandra::session::{Fault, StatementKind, TimeoutWriteType};
     use crate::backends::cassandra::write::{
         INSERT_VERSION, PreviousVersion, REVIVE_RESOURCE_IF_VERSION,
         SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, next_last_updated,
@@ -551,9 +551,14 @@ mod node_tests {
         } else {
             C2
         };
-        backend
-            .session
-            .inject_fault(StatementKind::Cas, marker, Fault::ApplyLate { before });
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            marker,
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
+        );
         let lu = next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50 * i64::from(from));
         let values = vec![
@@ -1150,6 +1155,7 @@ mod node_tests {
             C4,
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();
@@ -1263,6 +1269,7 @@ mod node_tests {
                         C2,
                         Fault::ApplyLate {
                             before: StatementKind::Cas,
+                            write_type: TimeoutWriteType::Cas,
                         },
                     ),
                     _ => panic!("a third turn"),
@@ -1439,7 +1446,10 @@ mod node_tests {
         backend.session.inject_fault(
             StatementKind::Cas,
             "deleted_at = ?, last_updated",
-            Fault::ApplyLate { before },
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
         );
         let lu = next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50 * i64::from(from));
@@ -1479,6 +1489,7 @@ mod node_tests {
             "index_keys = 0xff",
             Fault::ApplyLate {
                 before: StatementKind::Read,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let sent = backend

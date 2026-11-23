@@ -5069,7 +5069,7 @@ mod tests {
 mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
-    use crate::backends::cassandra::session::Fault;
+    use crate::backends::cassandra::session::{Fault, TimeoutWriteType};
     use crate::core::ResourceStorage;
     use crate::tenant::{TenantId, TenantPermissions};
 
@@ -5579,6 +5579,7 @@ mod node_tests {
             "INSERT INTO resources",
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let created = backend
@@ -5628,6 +5629,7 @@ mod node_tests {
             "UPDATE resources",
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();
@@ -6528,7 +6530,10 @@ mod node_tests {
         backend.session.inject_fault(
             StatementKind::Cas,
             "deleted_at = ?, last_updated",
-            Fault::ApplyLate { before },
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
         );
         let lu = next_last_updated(Utc::now(), Some(row.last_updated));
         let held = backend
@@ -6664,6 +6669,7 @@ mod node_tests {
             "INSERT INTO resources",
             Fault::ApplyLate {
                 before: StatementKind::Write,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();
@@ -6760,6 +6766,7 @@ mod node_tests {
             "SET version_id = ?, data = ?",
             Fault::ApplyLate {
                 before: StatementKind::SerialRead,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let lu = next_last_updated(Utc::now(), Some(row.last_updated));
@@ -6810,6 +6817,7 @@ mod node_tests {
             "INSERT INTO resources",
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         backend.session.inject_fault(

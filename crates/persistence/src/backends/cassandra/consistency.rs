@@ -349,6 +349,11 @@ impl IndexScan {
         self.scanned
     }
 
+    /// The kept rows of `tenant_id`, in scan order; empty when it has none.
+    pub(crate) fn rows_of(&self, tenant_id: &str) -> &[ScannedRow] {
+        self.rows.get(tenant_id).map_or(&[], Vec::as_slice)
+    }
+
     /// The first read that failed, `(what, error)`, when the scan stopped early.
     pub(crate) fn failed(&self) -> Option<(&str, &str)> {
         self.failed

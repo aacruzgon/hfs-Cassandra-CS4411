@@ -78,6 +78,8 @@ mod checkpoint;
 mod config;
 #[cfg(test)]
 mod consistency;
+#[cfg(test)]
+mod crash_tests;
 mod delete;
 mod errors;
 mod index_keys;

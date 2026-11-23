@@ -370,11 +370,11 @@ repair_counters! {
     repaired,
     /// Of `repaired`, those that wrote only the found rows.
     repaired_partial,
-    /// Repairs the writer did not confirm.
+    /// Repairs the writer did not confirm, or the phase's deadline cut.
     failed,
-    /// Index rows planned for insert by every repair sent, confirmed or not.
+    /// Index rows packed (sent) for insert by every repair sent, confirmed or not.
     rows_inserted,
-    /// Index rows planned for delete by every repair sent, confirmed or not.
+    /// Index rows packed (sent) for delete by every repair sent, confirmed or not.
     rows_deleted,
     /// Skipped: a found row is tagged above the current version.
     skipped_tag_ahead,

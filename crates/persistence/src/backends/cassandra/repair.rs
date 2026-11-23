@@ -9,7 +9,8 @@
 //! `version_id` (R1, a `LOCAL_QUORUM` read of `resources`); a row with
 //! another tag is hidden. A row below R1's version is stale: a write that
 //! crashed after its CAS left it, and the sweeper has not finished the
-//! write yet. Repair finishes it, from R1's own `index_keys`, K(current),
+//! write yet; or the search read the row just before an update landed.
+//! Repair finishes it, from R1's own `index_keys`, K(current),
 //! without reading anything else (RV4).
 //!
 //! - **Full replay (RV1).** When K(current) has at most
@@ -53,8 +54,9 @@
 //!   `index_keys`, so repair needs no other read (RV4).
 //! - Send a row the search cannot decode, or one [`StaleIndexRow::new`]
 //!   refuses, to [`RepairContext::skip_undecodable`].
-//! - Remove the `#![allow(dead_code)]` below when the search calls this
-//!   module.
+//! - Remove both `allow(dead_code)`s when the search calls this module: the
+//!   inner attribute below, and the one on `impl RepairCounters` in
+//!   `stats.rs`.
 
 #![allow(dead_code)] // Step 6's search calls it; until then only its tests do (RV6). Step 6 removes this.
 

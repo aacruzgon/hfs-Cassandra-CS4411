@@ -82,10 +82,20 @@ pub(crate) fn test_config() -> CassandraConfig {
 
 /// The registry a test backend loads (`initialize_search_registry` with
 /// [`test_config`]), for tests that extract without a node.
+///
+/// The loaded registry is built once per test binary and cloned for each call,
+/// so a test that registers a parameter changes its own copy only.
 pub(crate) fn test_registry() -> Arc<RwLock<SearchParameterRegistry>> {
-    let registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
-    initialize_search_registry(&registry, &test_config());
-    registry
+    static LOADED: OnceLock<SearchParameterRegistry> = OnceLock::new();
+    let loaded = LOADED.get_or_init(|| {
+        let registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
+        initialize_search_registry(&registry, &test_config());
+        // Bound first so the read guard is dropped before `registry` is.
+        #[allow(clippy::let_and_return)]
+        let loaded = registry.read().clone();
+        loaded
+    });
+    Arc::new(RwLock::new(loaded.clone()))
 }
 
 /// [`SearchParameterExtractor`] over [`test_registry`].

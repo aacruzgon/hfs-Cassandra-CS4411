@@ -29,6 +29,7 @@ use helios_persistence::core::ResourceStorage;
 use helios_persistence::error::{BackendError, ResourceError, StorageError, TenantError};
 use helios_persistence::tenant::{TenantContext, TenantPermissions};
 use serde_json::json;
+use sha2::Digest;
 
 use crate::backend_skeleton::backend;
 use crate::cassandra_node::{
@@ -583,7 +584,7 @@ async fn cassandra_create_checks_permission_before_writing() {
 #[tokio::test]
 async fn cassandra_search_parameter_code_is_not_refused_for_its_length() {
     let node = node_or_skip!("cassandra_search_parameter_code_is_not_refused_for_its_length");
-    let (backend, _cql) = setup(node).await;
+    let (backend, cql) = setup(node).await;
     let tenant = unique_tenant("sp-code");
     let search_parameter = |id: &str, code: String| {
         json!({
@@ -618,4 +619,26 @@ async fn cassandra_search_parameter_code_is_not_refused_for_its_length() {
             .expect("the SearchParameter is stored");
         assert_eq!(stored.content()["code"], code, "{length} bytes, unchanged");
     }
+
+    // The 2,000-byte code is the `code` parameter's value in its own index
+    // row, stored as `sha256:` and the hex of its SHA-256 (ADR-aacruzgon-0079).
+    let hex: String = sha2::Sha256::digest("c".repeat(2_000).as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let rows = query(
+        &cql,
+        "SELECT id FROM token_code_index \
+         WHERE tenant_id = ? AND resource_type = ? AND param = ? AND code = ?",
+        vec![
+            Value::from(tenant.tenant_id().as_str()),
+            Value::from("SearchParameter"),
+            Value::from("code"),
+            Value::from(format!("sha256:{hex}")),
+        ],
+        Consistency::LocalQuorum,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "the hashed code's own index row");
+    assert_eq!(col::<String>(&rows[0], "id"), "c2000");
 }

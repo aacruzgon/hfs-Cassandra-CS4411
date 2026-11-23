@@ -1766,7 +1766,9 @@ mod tests {
         // no-type-key: a live resource whose stored sets are empty, and
         // whose type row is gone.
         let t = tenant_of("no-type-key");
-        let (_, lu1, ts1, _) = seeded(&backend, &t).await;
+        let (_, lu1, ts1, seeded_keys) = seeded(&backend, &t).await;
+        // The type row is removed, so every other row of the seeded set is a stray.
+        let strays = seeded_keys.len() - 1;
         plant_resource_keys(&backend, &t, index_keys::EMPTY.to_vec(), 1).await;
         plant_version_keys(&backend, &t, 1, index_keys::EMPTY.to_vec(), ts1 + 1).await;
         plant(
@@ -2027,8 +2029,8 @@ mod tests {
         for registry in [Registry::Fixed, Registry::Changed] {
             let report = check("no-type-key", registry).await;
             // `seeded` created real index rows; the plant empties the stored
-            // sets, so the 4 token rows of `active` and `deceased` are strays.
-            let mut want = vec![("no_type_key", 2), ("stray_row", 4)];
+            // sets, so every row of the seeded set but the type row is a stray.
+            let mut want = vec![("no_type_key", 2), ("stray_row", strays)];
             if registry == Registry::Fixed {
                 want.push(("stale_extraction", 1));
             }

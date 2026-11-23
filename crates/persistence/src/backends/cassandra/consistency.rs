@@ -2240,4 +2240,67 @@ mod tests {
         );
         assert_consistent(&check(&backend, &t).await);
     }
+
+    /// The guard's boundary, with no race. A scan whose `taken_at` equals a
+    /// resource's `write_ts` is stale for it; one whose `taken_at` is the
+    /// next whole millisecond is not. `write_ts` and `taken_at` are in
+    /// microseconds, so `+ 1000` is one millisecond, the smallest step
+    /// `taken_at` takes. The test sets `taken_at` on a real scan, a field
+    /// this module can reach, so it needs no test-only seam.
+    #[tokio::test]
+    async fn a_shared_scan_taken_at_a_write_ts_is_refused_and_one_ms_later_is_not() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("consistency-tie");
+        backend
+            .create(&context(&t), "Patient", patient(), test_fhir_version())
+            .await
+            .expect("create p");
+        let write_ts = backend
+            .read_resource_row(&t, "Patient", "p")
+            .await
+            .unwrap()
+            .unwrap()
+            .write_ts
+            .expect("write_ts");
+        let own = t.clone();
+        let mut scan = IndexScan::take(&backend, move |x| x == own).await;
+        assert!(scan.failed.is_none(), "{:?}", scan.failed);
+
+        scan.taken_at = write_ts;
+        let tie = futures::FutureExt::catch_unwind(AssertUnwindSafe(index_consistency(
+            &backend,
+            &t,
+            Scope::Tenant,
+            ScanMode::Shared(&scan),
+            Registry::Fixed,
+        )))
+        .await;
+        let payload = tie.expect_err("a write_ts equal to taken_at must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains(&format!(
+                "shared scan is stale for Patient/p: written at write_ts {write_ts}, scan taken_at {write_ts}"
+            )),
+            "{message}"
+        );
+
+        scan.taken_at = write_ts + 1000;
+        let report = index_consistency(
+            &backend,
+            &t,
+            Scope::Tenant,
+            ScanMode::Shared(&scan),
+            Registry::Fixed,
+        )
+        .await;
+        assert_consistent(&report);
+        assert_eq!(report.resources, 1, "{report}");
+    }
 }

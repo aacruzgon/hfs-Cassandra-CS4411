@@ -3227,19 +3227,32 @@ pub(crate) mod post_suite {
     };
     use crate::backends::cassandra::test_support::test_config;
 
+    /// How long the CI entry point waits before its grace-0 sweep (SW28): above `native_transport_timeout` (12 s), so a
+    /// CAS still queued at the coordinator when its writer's process exited has applied by then.
+    const POST_SUITE_SETTLE: Duration = Duration::from_secs(15);
+
     /// RV22's exclusion: the tenants that plant defects on purpose are swept but not checked.
     pub(crate) fn checked(tenant_id: &str) -> bool {
         tenant_id.starts_with("test-") && !tenant_id.starts_with("test-planted-")
     }
 
     /// What the post-suite step did.
+    #[derive(Clone)]
     pub(crate) struct PostSuiteReport {
         pub(crate) prefix: String,
         pub(crate) sweep: SweepReport,
         pub(crate) tenants: usize,
         pub(crate) changed: usize,
+        /// Tenants with the prefix that the planted rule skips (`checked` is false): excluded from the check and from `left`.
+        pub(crate) excluded: usize,
         pub(crate) defects: usize,
         pub(crate) failing: Vec<String>,
+        /// Intents of checked tenants still in the outbox after the sweep: R4b, re-read in Rust.
+        pub(crate) left: usize,
+        /// Slices the re-read for `left` could not read; any makes `left` unknown.
+        pub(crate) left_errors: u64,
+        /// The shared scan's failure, `"<what>: <error>"`, when it stopped early: every check is then void (ADR-sam-michaels-0007).
+        pub(crate) scan_failed: Option<String>,
         pub(crate) rows_scanned: usize,
         pub(crate) took: Duration,
     }
@@ -3251,19 +3264,96 @@ pub(crate) mod post_suite {
             } else {
                 self.failing.join(",")
             };
+            let scan_failed = match &self.scan_failed {
+                None => "-".to_string(),
+                Some(text) => format!("{text:?}"),
+            };
             write!(
                 f,
-                "[post-suite prefix={} tenants={} changed={} defects={} failing={failing} \
-                 rows_scanned={} took_ms={}] {}",
+                "[post-suite prefix={} tenants={} changed={} excluded={} defects={} failing={failing} \
+                 left={} left_errors={} scan_failed={scan_failed} rows_scanned={} took_ms={}] {}",
                 self.prefix,
                 self.tenants,
                 self.changed,
+                self.excluded,
                 self.defects,
+                self.left,
+                self.left_errors,
                 self.rows_scanned,
                 self.took.as_millis(),
                 self.sweep
             )
         }
+    }
+
+    /// RV22's strict condition. `Err` carries the first reason, in this order: a failed scan, no tenant checked,
+    /// defects, a failed re-read, intents left. `sweep.is_complete()` is not part of it: a planted tenant may leave
+    /// intents the sweep cannot finish, by design.
+    pub(crate) fn verdict(report: &PostSuiteReport) -> Result<(), String> {
+        if let Some(s) = &report.scan_failed {
+            return Err(format!(
+                "the shared index scan failed ({s}), so every checked tenant's check is void: the {} failing tenants are this one failure",
+                report.failing.len()
+            ));
+        }
+        if report.tenants == 0 {
+            return Err("no tenant was checked: no checked tenant has the prefix".to_string());
+        }
+        if report.defects > 0 {
+            return Err(format!(
+                "{} defects in {} tenants: {}",
+                report.defects,
+                report.failing.len(),
+                report.failing.join(",")
+            ));
+        }
+        if report.left_errors > 0 {
+            return Err(format!(
+                "the outbox re-read failed on {} slices, so the intents left are unknown",
+                report.left_errors
+            ));
+        }
+        if report.left > 0 {
+            return Err(format!(
+                "{} intents of checked tenants are left after the sweep (R4b)",
+                report.left
+            ));
+        }
+        Ok(())
+    }
+
+    /// R4b over `[since, now)`: every shard's one-minute slices (`plan_slices`, as `sweep_pass` reads them) through
+    /// `read_slice`, 16 at a time, counting intents whose tenant starts with `prefix` and passes `keep`.
+    /// Returns `(intents, slices that failed)`.
+    pub(crate) async fn intents_left(
+        backend: &CassandraBackend,
+        prefix: &str,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+        keep: impl Fn(&str) -> bool,
+    ) -> (usize, u64) {
+        let slices: Vec<Slice> = (0..INTENT_SHARDS as i16)
+            .flat_map(|shard| plan_slices(shard, since, now, chrono::Duration::minutes(1)))
+            .collect();
+        let reads = slices
+            .iter()
+            .map(|slice| backend.read_slice(slice, Rank::Normal));
+        let mut outcomes = futures::stream::iter(reads).buffer_unordered(16);
+        let (mut left, mut failed) = (0usize, 0u64);
+        while let Some(outcome) = outcomes.next().await {
+            match outcome {
+                Ok((intents, _)) => {
+                    left += intents
+                        .iter()
+                        .filter(|intent| {
+                            intent.tenant_id.starts_with(prefix) && keep(&intent.tenant_id)
+                        })
+                        .count();
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        (left, failed)
     }
 
     /// One grace-0 sweep of every tenant under `prefix`, then one shared scan and a check per checked tenant.
@@ -3273,11 +3363,12 @@ pub(crate) mod post_suite {
         since: DateTime<Utc>,
     ) -> PostSuiteReport {
         let started = Instant::now();
+        let now = Utc::now();
         let sweep = backend
             .sweep_pass(SweepOptions {
                 scope: SweepScope::TenantPrefix(prefix.to_string()),
                 grace: Duration::ZERO,
-                now: Utc::now(),
+                now,
                 since,
                 allow_short_grace: true,
             })
@@ -3291,9 +3382,14 @@ pub(crate) mod post_suite {
             .await
             .expect("the resource keys");
         let mut registries: BTreeMap<String, Registry> = BTreeMap::new();
+        let mut skipped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for row in &keys {
             let tenant: String = row.get_r_by_name("tenant_id").expect("tenant_id");
-            if !tenant.starts_with(prefix) || !checked(&tenant) {
+            if !tenant.starts_with(prefix) {
+                continue;
+            }
+            if !checked(&tenant) {
+                skipped.insert(tenant);
                 continue;
             }
             let resource_type: String = row.get_r_by_name("resource_type").expect("resource_type");
@@ -3332,13 +3428,20 @@ pub(crate) mod post_suite {
                 failing.push(tenant.clone());
             }
         }
+        let (left, left_errors) = intents_left(backend, prefix, since, now, checked).await;
         PostSuiteReport {
             prefix: prefix.to_string(),
             sweep,
             tenants: tenants.len(),
             changed,
+            excluded: skipped.len(),
             defects,
             failing,
+            left,
+            left_errors,
+            scan_failed: scan
+                .failed()
+                .map(|(what, error)| format!("{what}: {error}")),
             rows_scanned: scan.scanned(),
             took: started.elapsed(),
         }
@@ -3362,13 +3465,18 @@ pub(crate) mod post_suite {
         })
         .await
         .expect("connect");
+        tokio::time::sleep(POST_SUITE_SETTLE).await;
         let report = post_suite_report(&backend, "test-", Utc::now() - startup_window()).await;
         eprintln!("{report}");
-        if std::env::var("HFS_TEST_POST_SUITE_STRICT").as_deref() == Ok("1") {
-            assert!(
-                report.defects == 0 && report.sweep.is_complete(),
-                "{report}"
-            );
+        let verdict = verdict(&report);
+        match &verdict {
+            Ok(()) => eprintln!("[post-suite-verdict pass=true]"),
+            Err(reason) => eprintln!("[post-suite-verdict pass=false reason={reason:?}]"),
+        }
+        if std::env::var("HFS_TEST_POST_SUITE_STRICT").as_deref() == Ok("1")
+            && let Err(reason) = verdict
+        {
+            panic!("post-suite check failed: {reason}");
         }
     }
 
@@ -3435,5 +3543,171 @@ pub(crate) mod post_suite {
             format!("{report}").starts_with("[post-suite prefix=test-postsuite-"),
             "{report}"
         );
+        assert_eq!(
+            (
+                report.excluded,
+                report.left,
+                report.left_errors,
+                report.scan_failed.as_deref()
+            ),
+            (0, 0, 0, None),
+            "{report}"
+        );
+        assert_eq!(verdict(&report), Ok(()), "{report}");
+    }
+
+    /// PS1 (rule 11): a failed scan is the verdict's first reason.
+    #[test]
+    fn the_post_suite_verdict_names_a_failed_scan_first() {
+        let ok = PostSuiteReport {
+            prefix: "test-".to_string(),
+            sweep: SweepReport {
+                invariant: 1,
+                failed: 2,
+                ..Default::default()
+            },
+            tenants: 3,
+            changed: 1,
+            excluded: 2,
+            defects: 0,
+            failing: vec![],
+            left: 0,
+            left_errors: 0,
+            scan_failed: None,
+            rows_scanned: 10,
+            took: Duration::ZERO,
+        };
+        let scan = "scan uri_index: test-a-1/Patient/p: version_id: x";
+        assert!(!ok.sweep.is_complete());
+        assert_eq!(verdict(&ok), Ok(()));
+
+        let scan_failed = PostSuiteReport {
+            defects: 3,
+            failing: vec!["test-a-1".into(), "test-b-2".into(), "test-c-3".into()],
+            left: 4,
+            scan_failed: Some(scan.to_string()),
+            ..ok.clone()
+        };
+        let reason = verdict(&scan_failed).unwrap_err();
+        assert!(
+            reason.starts_with("the shared index scan failed (scan uri_index: test-a-1/Patient/p"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("the 3 failing tenants are this one failure"),
+            "{reason}"
+        );
+
+        assert_eq!(
+            verdict(&PostSuiteReport {
+                tenants: 0,
+                ..ok.clone()
+            }),
+            Err("no tenant was checked: no checked tenant has the prefix".to_string())
+        );
+        assert_eq!(
+            verdict(&PostSuiteReport {
+                defects: 2,
+                failing: vec!["test-a-1".into()],
+                ..ok.clone()
+            }),
+            Err("2 defects in 1 tenants: test-a-1".to_string())
+        );
+        let reason = verdict(&PostSuiteReport {
+            left_errors: 1,
+            ..ok.clone()
+        })
+        .unwrap_err();
+        assert!(reason.contains("re-read failed on 1 slices"), "{reason}");
+        assert_eq!(
+            verdict(&PostSuiteReport {
+                left: 2,
+                ..ok.clone()
+            }),
+            Err("2 intents of checked tenants are left after the sweep (R4b)".to_string())
+        );
+
+        let line = format!("{ok}");
+        assert!(
+            line.contains(
+                " changed=1 excluded=2 defects=0 failing=- left=0 left_errors=0 scan_failed=- rows_scanned=10 "
+            ),
+            "{line}"
+        );
+        let line = format!("{scan_failed}");
+        assert!(line.contains(&format!("scan_failed=\"{scan}\"")), "{line}");
+    }
+
+    /// PS2 (rule 9): what a planted tenant leaves is swept but neither checked nor counted as left.
+    #[tokio::test]
+    async fn the_post_suite_check_ignores_what_a_planted_tenant_leaves() {
+        use crate::backends::cassandra::consistency::harness;
+        use crate::backends::cassandra::test_support::test_fhir_version;
+
+        let Some(backend) = harness::backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let since = Utc::now() - chrono::Duration::seconds(5);
+        let prefix = format!("test-planted-postsuite-{}-", Uuid::new_v4().simple());
+        let t = format!("{prefix}a");
+        let lu = whole_ms(Utc::now());
+        let write_id = Uuid::new_v4();
+        backend
+            .session
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, \
+                 last_updated, created_at, fhir_version, write_ts, write_id, index_keys, \
+                 deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0) IF NOT EXISTS",
+                vec![
+                    Value::from(t.as_str()),
+                    Value::from("Patient"),
+                    Value::from("q"),
+                    Value::from(1i32),
+                    Value::from("{\"resourceType\":\"Patient\"}"),
+                    Value::from(lu),
+                    Value::from(lu),
+                    Value::from(test_fhir_version().as_mime_param()),
+                    Value::from(write_ts_of(lu)),
+                    Value::from(write_id),
+                    Value::from(Blob::from(vec![0x02, 0x00])),
+                ],
+                StatementKind::Cas,
+            )
+            .await
+            .expect("plant");
+        let key_i = IntentKey::new(&t, "q", Utc::now());
+        let row_key = RowKey {
+            tenant_id: &t,
+            resource_type: "Patient",
+            id: "q",
+        };
+        backend
+            .write_intent(&key_i, &row_key, write_id, 1)
+            .await
+            .expect("the intent");
+
+        let report = post_suite_report(&backend, &prefix, since).await;
+        eprintln!("{report}");
+        let counted = intents_left(&backend, &prefix, since, Utc::now(), |_| true).await;
+        backend.delete_intent(&key_i, &row_key).await;
+        assert_eq!(
+            (report.sweep.current, report.sweep.invariant),
+            (1, 1),
+            "{report}"
+        );
+        assert!(!report.sweep.is_complete(), "{report}");
+        assert_eq!(
+            (
+                report.tenants,
+                report.excluded,
+                report.left,
+                report.left_errors
+            ),
+            (0, 1, 0, 0),
+            "{report}"
+        );
+        assert_eq!(report.scan_failed, None, "{report}");
+        assert_eq!(counted, (1, 0));
     }
 }

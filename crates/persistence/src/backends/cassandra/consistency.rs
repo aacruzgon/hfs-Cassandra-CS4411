@@ -188,6 +188,16 @@ where
         .map_err(|error| format!("{name}: {error:?}"))
 }
 
+/// `tenant/type/id` of a row the scan could not decode, `?` for each column that could not be read either.
+fn row_identity(
+    tenant_id: Result<String, String>,
+    resource_type: Result<String, String>,
+    id: Result<String, String>,
+) -> String {
+    let part = |column: Result<String, String>| column.unwrap_or_else(|_| "?".to_string());
+    format!("{}/{}/{}", part(tenant_id), part(resource_type), part(id))
+}
+
 /// An index row of `table`, decoded.
 fn decode_scanned(table: &'static str, row: &Row) -> Result<ScannedRow, String> {
     let text = |name: &str| column::<String>(row, name);
@@ -265,7 +275,8 @@ impl IndexScan {
     /// Counts every row read (a `Cell` in the keep closure) and holds only
     /// rows whose tenant starts with `test-` and passes `keep`. A failed
     /// page or an undecodable kept row ends the scan with `failed` set,
-    /// `what` = `"scan <table>"`, `error` = the error's `{:?}`.
+    /// `what` = `"scan <table>"`, `error` = the error's `{:?}`; for an
+    /// undecodable row the error names the row (`tenant/type/id`).
     pub(crate) async fn take(
         backend: &CassandraBackend,
         keep: impl Fn(&str) -> bool + Send + Sync + 'static,
@@ -313,7 +324,13 @@ impl IndexScan {
                         .or_default()
                         .push(scanned),
                     Err(error) => {
-                        scan.failed = Some((format!("scan {table}"), error));
+                        let identity = row_identity(
+                            column(row, "tenant_id"),
+                            column(row, "resource_type"),
+                            column(row, "id"),
+                        );
+                        scan.failed =
+                            Some((format!("scan {table}"), format!("{identity}: {error}")));
                         return scan;
                     }
                 }
@@ -330,6 +347,13 @@ impl IndexScan {
     /// Rows read from all seven tables, every tenant's.
     pub(crate) fn scanned(&self) -> usize {
         self.scanned
+    }
+
+    /// The first read that failed, `(what, error)`, when the scan stopped early.
+    pub(crate) fn failed(&self) -> Option<(&str, &str)> {
+        self.failed
+            .as_ref()
+            .map(|(what, error)| (what.as_str(), error.as_str()))
     }
 
     /// The kept tenants with at least one scanned row, sorted.
@@ -1290,6 +1314,19 @@ mod tests {
     use crate::backends::cassandra::session::Fault;
     use crate::backends::cassandra::test_support::test_fhir_version;
     use crate::core::ResourceStorage;
+
+    /// RI1: a failed scan names the row.
+    #[test]
+    fn a_failed_scan_names_the_row() {
+        assert_eq!(
+            row_identity(Ok("test-a".into()), Ok("Patient".into()), Ok("p".into())),
+            "test-a/Patient/p"
+        );
+        assert_eq!(
+            row_identity(Ok("test-a".into()), Err("e".into()), Err("e".into())),
+            "test-a/?/?"
+        );
+    }
 
     fn row(version_id: i32) -> ScannedRow {
         ScannedRow {

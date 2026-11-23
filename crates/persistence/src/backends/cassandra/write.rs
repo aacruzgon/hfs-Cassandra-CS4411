@@ -4490,7 +4490,7 @@ mod node_tests {
     }
 
     fn tenant(case: &str) -> String {
-        format!("test-resolve-{case}-{}", Uuid::new_v4().simple())
+        format!("test-planted-resolve-{case}-{}", Uuid::new_v4().simple())
     }
 
     fn tenant_context(case: &str) -> TenantContext {
@@ -5944,6 +5944,19 @@ mod node_tests {
         )
     }
 
+    /// Like `hardening_tenant`, for a case that plants another request's
+    /// delete by raw CQL: its row ends deleted with no version row and no
+    /// intent, which the sweep cannot finish (RV22).
+    fn planted_hardening_tenant(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-planted-s3-hardening-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
+    }
+
     /// Another request's C3 of the current version, sent now but held back
     /// by the fault seam until just before the next statement of `before`:
     /// a delete that lands in a chosen gap of the request that follows.
@@ -5998,7 +6011,7 @@ mod node_tests {
         };
 
         // (a) update: the delete lands just before our C2, which misses.
-        let tenant = hardening_tenant("gap-update-c2");
+        let tenant = planted_hardening_tenant("gap-update-c2");
         let stored = backend
             .create(&tenant, "Patient", patient(), version)
             .await
@@ -6031,7 +6044,7 @@ mod node_tests {
         assert!(not_found(&b), "(b) after an unknown outcome: {b:?}");
 
         // (c) delete_versioned: the delete lands just before our C3.
-        let tenant = hardening_tenant("gap-delete-c3");
+        let tenant = planted_hardening_tenant("gap-delete-c3");
         backend
             .create(&tenant, "Patient", patient(), version)
             .await

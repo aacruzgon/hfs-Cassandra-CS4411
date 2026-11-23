@@ -480,9 +480,11 @@ impl CassandraBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use cdrs_tokio::types::IntoRustByName;
+    use cdrs_tokio::types::blob::Blob;
     use cdrs_tokio::types::value::Value;
     use chrono::TimeZone;
     use serde_json::{Value as Json, json};
@@ -490,7 +492,9 @@ mod tests {
     use super::*;
     use crate::backends::cassandra::checkpoint::Checkpoint;
     use crate::backends::cassandra::consistency::harness::*;
-    use crate::backends::cassandra::consistency::{assert_consistent, version_ids};
+    use crate::backends::cassandra::consistency::{
+        Registry, ScanMode, Scope, assert_consistent, index_consistency, version_ids,
+    };
     use crate::backends::cassandra::session::{Fault, StatementKind};
     use crate::backends::cassandra::test_support::test_fhir_version;
     use crate::core::ResourceStorage;
@@ -711,6 +715,75 @@ mod tests {
         assert_eq!(context.queued[0].row.as_ref().unwrap().version_id, 2);
         assert_eq!(context.queued[0].stale, vec![s1, s3]);
         assert_eq!(context.undecodable_rows, 1);
+    }
+
+    const PLANT_X5: &str = "INSERT INTO date_index (tenant_id, resource_type, param, start, id, end, version_id) VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
+    const PLANT_X6: &str = "INSERT INTO date_index_by_end (tenant_id, resource_type, param, end, id, start, version_id) VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
+    const PLANT_VERSION_KEYS: &str = "UPDATE resource_versions USING TIMESTAMP ? SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
+    /// A CAS: asserts `[applied]`.
+    const PLANT_RESOURCE_KEYS: &str = "UPDATE resources SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
+
+    fn date_by_end(param: &str) -> IndexKey {
+        IndexKey::DateByEnd {
+            param: param.to_string(),
+            end: 978_393_600_000,
+            start: 978_307_200_000,
+        }
+    }
+
+    async fn plant(backend: &CassandraBackend, cql: &str, values: Vec<Value>) {
+        backend
+            .session
+            .execute(cql, values, StatementKind::Write)
+            .await
+            .expect("plant");
+    }
+
+    async fn plant_resource_keys(
+        backend: &CassandraBackend,
+        tenant: &str,
+        blob: Vec<u8>,
+        version_id: i32,
+    ) {
+        let rows = backend
+            .session
+            .rows(
+                PLANT_RESOURCE_KEYS,
+                vec![
+                    Value::from(Blob::from(blob)),
+                    Value::from(tenant),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                    Value::from(version_id),
+                ],
+                StatementKind::Cas,
+            )
+            .await
+            .expect("plant the stored key set");
+        let applied: bool = rows[0].get_r_by_name("[applied]").expect("[applied]");
+        assert!(applied, "the CAS that plants resources.index_keys applied");
+    }
+
+    async fn plant_version_keys(
+        backend: &CassandraBackend,
+        tenant: &str,
+        version_id: i32,
+        blob: Vec<u8>,
+        ts: i64,
+    ) {
+        plant(
+            backend,
+            PLANT_VERSION_KEYS,
+            vec![
+                Value::from(ts),
+                Value::from(Blob::from(blob)),
+                Value::from(tenant),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(version_id),
+            ],
+        )
+        .await;
     }
 
     /// A read of the `(tenant, Patient)` partition of `resources_by_type`:
@@ -1131,5 +1204,130 @@ mod tests {
             (5, 2, 0)
         );
         assert_eq!(backend.statement_counts().since(&at).total(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "the index writer has no date_index statement yet: index_statement refuses date keys"]
+    async fn repair_retags_a_date_row_the_current_version_still_produces() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("planted-repair-retag");
+        let tenant = context(&t);
+        let p = backend
+            .create(&tenant, "Patient", patient(), test_fhir_version())
+            .await
+            .expect("create p");
+        let ts1 = r1_of(&backend, &t, "p").await.write_ts.expect("write_ts");
+        backend
+            .update(&tenant, &p, changed())
+            .await
+            .expect("update p");
+        let row = r1_of(&backend, &t, "p").await;
+        assert_eq!(row.version_id, 2);
+        let ts2 = row.write_ts.expect("write_ts");
+
+        let (d, de) = (date("repair-date"), date_by_end("repair-date"));
+        let head = |param: &str| {
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from(param),
+            ]
+        };
+        let (start, end) = (
+            DateTime::from_timestamp_millis(978_307_200_000).unwrap(),
+            DateTime::from_timestamp_millis(978_393_600_000).unwrap(),
+        );
+        let mut x5 = head("repair-date");
+        x5.extend([
+            Value::from(start),
+            Value::from("p"),
+            Value::from(end),
+            Value::from(1),
+            Value::from(ts1),
+        ]);
+        plant(&backend, PLANT_X5, x5).await;
+        let mut x6 = head("repair-date");
+        x6.extend([
+            Value::from(end),
+            Value::from("p"),
+            Value::from(start),
+            Value::from(1),
+            Value::from(ts1),
+        ]);
+        plant(&backend, PLANT_X6, x6).await;
+
+        let mut planted: BTreeSet<IndexKey> = keys_of(&row).into_iter().collect();
+        planted.insert(d.clone());
+        planted.insert(de);
+        let blob = index_keys::encode(&planted.iter().cloned().collect::<Vec<_>>());
+        plant_resource_keys(&backend, &t, blob.clone(), 2).await;
+        plant_version_keys(&backend, &t, 2, blob, ts2 + 1).await;
+
+        let row = r1_of(&backend, &t, "p").await;
+        let report = index_consistency(
+            &backend,
+            &t,
+            Scope::Tenant,
+            ScanMode::Full,
+            Registry::Changed,
+        )
+        .await;
+        assert_eq!(report.kinds(), expect(&[("wrong_tag", 2)]), "{report}");
+
+        let before = backend.repair_stats();
+        let outcome = backend
+            .repair_index(
+                &key(&t, "p"),
+                &row,
+                &[StaleIndexRow::new(d, None, 1).unwrap()],
+            )
+            .await;
+        eprintln!(
+            "[repair case=retag {}]",
+            backend.repair_stats().since(&before)
+        );
+        let RepairOutcome::Repaired { full: true, index } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(index.rows_inserted, planted.len() as u64);
+        assert_eq!(index.rows_deleted, 0);
+        for table in ["date_index", "date_index_by_end"] {
+            let rows = backend
+                .session
+                .rows_paged(
+                    &format!("SELECT id, version_id, WRITETIME(version_id) AS written FROM {table} WHERE tenant_id = ? AND resource_type = ? AND param = ?"),
+                    vec![
+                        Value::from(t.as_str()),
+                        Value::from("Patient"),
+                        Value::from("repair-date"),
+                    ],
+                    StatementKind::Read,
+                )
+                .await
+                .expect("read the date rows");
+            let got: Vec<(String, i32, i64)> = rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.get_r_by_name("id").unwrap(),
+                        r.get_r_by_name("version_id").unwrap(),
+                        r.get_r_by_name("written").unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(got, [("p".to_string(), 2, ts2)], "{table}");
+        }
+        let report = index_consistency(
+            &backend,
+            &t,
+            Scope::Tenant,
+            ScanMode::Full,
+            Registry::Changed,
+        )
+        .await;
+        assert_consistent(&report);
     }
 }

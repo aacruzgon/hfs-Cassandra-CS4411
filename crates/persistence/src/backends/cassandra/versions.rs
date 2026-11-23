@@ -27,8 +27,24 @@
 //!   is `VersionConflict` with nothing written. The compare-and-swap is
 //!   `delete_versioned`'s, so a writer landing after the comparison makes
 //!   that CAS miss rather than being deleted with it (#1404).
+//! - **`update_with_match`** (roadmap Step 4) has the same shape. It checks
+//!   `Operation::Update` (the SearchParameter `code` bound, G38, is
+//!   `update`'s, before any statement there),
+//!   pre-reads the resource with `read` (absent or deleted: `NotFound`),
+//!   compares the field with its version as `delete_with_match` does (a
+//!   mismatch is `VersionConflict`, 409, with nothing written), and then
+//!   hands the write to `update`, which runs the whole update path itself.
+//!   A writer landing between the pre-read and `update`'s compare-and-swap
+//!   is `update`'s miss: `VersionConflict` for an update, `NotFound` for a
+//!   delete.
 //! - **`exists`**: an R1 that selects only `deleted_at`, so a yes/no answer
 //!   does not ship the resource. No row, or `deleted_at > 0`, is `false`.
+//! - **`current_version`** (roadmap Step 4): an R1 that selects only
+//!   `version_id` and `deleted_at`, as `exists` does. No row, or
+//!   `deleted_at > 0`, is `None`, as the trait documents ("if the resource
+//!   doesn't exist or is deleted"). The trait default reads through `read`,
+//!   which answers `Gone` for a deleted resource, so the default would
+//!   answer `Gone` there too, as it does on every other backend.
 //! - **`read_batch`**: plain `read`s, [`BULK_WRITE_CONCURRENCY`] at a time
 //!   (`buffered`, so the output keeps the input's order). Missing and deleted
 //!   ids are skipped; any other error fails the batch, and dropping the
@@ -43,6 +59,7 @@ use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
+use serde_json::Value as Json;
 
 use super::backend::CassandraBackend;
 use super::errors::{BACKEND_NAME, map_driver_error};
@@ -68,6 +85,10 @@ const SELECT_VERSION_IDS: &str = "SELECT version_id FROM resource_versions \
 /// R1, reduced to the one column `exists` needs.
 const SELECT_DELETED_AT: &str =
     "SELECT deleted_at FROM resources WHERE tenant_id = ? AND resource_type = ? AND id = ?";
+
+/// R1, reduced to the two columns `current_version` needs.
+const SELECT_VERSION_AND_DELETED_AT: &str = "SELECT version_id, deleted_at FROM resources \
+     WHERE tenant_id = ? AND resource_type = ? AND id = ?";
 
 fn internal(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -247,6 +268,35 @@ impl CassandraBackend {
             .await
     }
 
+    /// `VersionedStorage::update_with_match`; see the module docs.
+    pub(super) async fn update_with_match_resource(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+        resource: Json,
+    ) -> StorageResult<StoredResource> {
+        // Again in `update`, before any statement there too. The
+        // SearchParameter `code` bound (G38) is left to `update`, so this file
+        // does not depend on `write.rs`'s check, which Step 5's extraction
+        // pull request removes (ADR-aacruzgon-0079).
+        tenant.check_permission(Operation::Update, resource_type)?;
+        let current = match self.read_resource(tenant, resource_type, id).await {
+            Ok(Some(current)) => current,
+            Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                return Err(not_found(resource_type, id));
+            }
+            Err(error) => return Err(error),
+        };
+        let version = current
+            .version_id()
+            .parse::<i32>()
+            .map_err(|error| internal(format!("update_with_match: version_id: {error}")))?;
+        matched_version(resource_type, id, expected_version, version)?;
+        self.update_resource(tenant, &current, resource).await
+    }
+
     /// `ResourceStorage::exists`; see the module docs. A deleted resource is
     /// `false`, never an error.
     pub(super) async fn exists_resource(
@@ -272,6 +322,38 @@ impl CassandraBackend {
             Some(row) => Ok(deleted_at_of(row)?.is_none()),
             None => Ok(false),
         }
+    }
+
+    /// `VersionedStorage::current_version`; see the module docs.
+    pub(super) async fn current_version_of(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<String>> {
+        let rows = self
+            .session
+            .rows(
+                SELECT_VERSION_AND_DELETED_AT,
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from(resource_type),
+                    Value::from(id),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .map_err(|error| StorageError::Backend(map_driver_error(&error, "current_version")))?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        if deleted_at_of(row)?.is_some() {
+            return Ok(None);
+        }
+        let version_id: i32 = row
+            .get_r_by_name("version_id")
+            .map_err(|error| internal(format!("current_version: version_id: {error}")))?;
+        Ok(Some(version_id.to_string()))
     }
 
     /// `ResourceStorage::read_batch`; see the module docs.
@@ -359,9 +441,11 @@ mod tests {
 /// through the write engine itself ([`CassandraBackend::run_cas`] with
 /// [`CasPlan::update`] and [`CasPlan::delete`]), as `write.rs`'s
 /// `the_engine_updates_deletes_and_revives_through_c2_c3_and_c4` does, so
-/// these tests need neither L2a's `update` nor L2b's `delete`. The one
-/// exception is `delete_with_match_deletes_the_version_it_compared`, which
-/// goes through L2b's `delete_versioned`.
+/// these tests need neither L2a's `update` nor L2b's `delete`. The
+/// exceptions go through what the method under test hands its write to:
+/// `delete_with_match_deletes_the_version_it_compared` through L2b's
+/// `delete_versioned`, and Step 4's `update_with_match` tests through L2a's
+/// `update`.
 #[cfg(test)]
 mod node_tests {
     use serde_json::{Value as Json, json};
@@ -766,8 +850,354 @@ mod node_tests {
         }
     }
 
+    /// Another writer's compare-and-swap of `Patient/{id}` from version
+    /// `from`, outside the engine: it writes `resources` only, with no
+    /// version row, as `upsert.rs`'s `another_writer_late` does, and
+    /// `deleting` makes it a delete. The fault seam holds it back and applies
+    /// it just before the next plain write, which in `update` and
+    /// `delete_versioned` is the rewrite of row `N` (V3, G40): after their
+    /// reads and before their own compare-and-swap.
+    async fn another_writer_before_the_next_write(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        id: &str,
+        from: i32,
+        deleting: bool,
+    ) {
+        const ANOTHER_WRITER: &str = "UPDATE resources SET version_id = ?, deleted_at = ? \
+             WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            ANOTHER_WRITER,
+            Fault::ApplyLate {
+                before: StatementKind::Write,
+            },
+        );
+        let deleted_at = if deleting {
+            Utc::now()
+        } else {
+            DateTime::<Utc>::UNIX_EPOCH
+        };
+        let values = vec![
+            Value::from(from + 1),
+            Value::from(deleted_at),
+            Value::from(tenant.tenant_id().as_str()),
+            Value::from("Patient"),
+            Value::from(id),
+            Value::from(from),
+        ];
+        let sent = backend
+            .session
+            .rows(ANOTHER_WRITER, values, StatementKind::Cas)
+            .await;
+        assert!(
+            sent.is_err(),
+            "the seam answers the held-back CAS with a timeout"
+        );
+    }
+
+    /// A matching tag updates exactly the version it named, through L2a's
+    /// `update`: every form of the `If-Match` field `delete_with_match`
+    /// accepts, with exactly the pre-read, `update`'s R1 and one
+    /// compare-and-swap, the new body as version 3, `created_at` kept (G13),
+    /// and the same tag refused once it is stale.
+    #[tokio::test]
+    async fn update_with_match_updates_the_version_it_compared() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant("uwm-match");
+        for (id, field) in [
+            ("a", "W/\"2\""),
+            ("b", "\"2\""),
+            ("c", "2"),
+            ("d", "W/\"1\", W/\"2\""),
+            ("e", "*"),
+        ] {
+            create(&backend, &t, id, "One").await;
+            assert_eq!(engine_update(&backend, &t, id, "Two").await, 2);
+            let created_at = backend
+                .read(&t, "Patient", id)
+                .await
+                .unwrap()
+                .unwrap()
+                .created_at();
+            let before = backend.statement_counts();
+            let updated = backend
+                .update_with_match(&t, "Patient", id, field, patient(id, "Three"))
+                .await
+                .unwrap_or_else(|error| panic!("{id} {field}: {error:?}"));
+            // Exactly the pre-read and `update`'s own R1, then one CAS. A
+            // second read whose row `update` builds on would reopen the
+            // lost-update window #57 closed in REST, so any extra read fails
+            // here. (The plain writes are not pinned: Step 5's batches, #90
+            // onward, change them.)
+            let spent = backend.statement_counts().since(&before);
+            assert_eq!(
+                (spent.read, spent.serial_read, spent.cas),
+                (2, 0, 1),
+                "{id} {field}: the pre-read, update's R1 and one CAS"
+            );
+            assert_eq!(
+                (updated.version_id(), family(&updated)),
+                ("3", "Three"),
+                "{id}"
+            );
+            assert_eq!(updated.created_at(), created_at, "{id}");
+            let live = backend.read(&t, "Patient", id).await.unwrap().unwrap();
+            assert_eq!((live.version_id(), family(&live)), ("3", "Three"), "{id}");
+            assert_eq!(
+                backend.list_versions(&t, "Patient", id).await.unwrap(),
+                ["1", "2", "3"],
+                "{id}"
+            );
+            let three = backend
+                .vread(&t, "Patient", id, "3")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(family(&three), "Three", "{id}");
+
+            // The same tag again is stale now (`*` always matches): 409,
+            // and no fourth version.
+            if field != "*" {
+                assert!(
+                    matches!(
+                        backend
+                            .update_with_match(&t, "Patient", id, field, patient(id, "Four"))
+                            .await,
+                        Err(StorageError::Concurrency(
+                            ConcurrencyError::VersionConflict { .. }
+                        ))
+                    ),
+                    "{id} {field}"
+                );
+                assert_eq!(
+                    backend
+                        .list_versions(&t, "Patient", id)
+                        .await
+                        .unwrap()
+                        .len(),
+                    3,
+                    "{id}"
+                );
+            }
+        }
+    }
+
+    /// What `update_with_match` refuses, each with nothing written, as
+    /// `delete_with_match` does: a stale tag (409), an absent or deleted
+    /// resource (`NotFound`); a tenant without update permission, before any
+    /// statement; and a SearchParameter `code` over 128 bytes (G38), which
+    /// `update` refuses after the pre-read and before any statement of its
+    /// own.
+    #[tokio::test]
+    async fn update_with_match_refuses_without_writing() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant("uwm-refuse");
+        create(&backend, &t, "p", "One").await;
+        assert_eq!(engine_update(&backend, &t, "p", "Two").await, 2);
+
+        let before = backend.statement_counts();
+        for stale in ["W/\"1\"", "\"1\"", "1", "W/\"3\"", "W/\"1\", W/\"3\""] {
+            match backend
+                .update_with_match(&t, "Patient", "p", stale, patient("p", "Three"))
+                .await
+            {
+                Err(StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    expected_version,
+                    actual_version,
+                    ..
+                })) => {
+                    assert_eq!(expected_version, normalize_etag(stale));
+                    assert_eq!(actual_version, "2");
+                }
+                other => panic!("{stale}: expected a version conflict, got {other:?}"),
+            }
+        }
+        let spent = backend.statement_counts().since(&before);
+        assert_eq!(
+            (spent.write, spent.cas, spent.read),
+            (0, 0, 5),
+            "the pre-read each, nothing else"
+        );
+        let live = backend.read(&t, "Patient", "p").await.unwrap().unwrap();
+        assert_eq!((live.version_id(), family(&live)), ("2", "Two"));
+        assert_eq!(
+            backend.list_versions(&t, "Patient", "p").await.unwrap(),
+            ["1", "2"]
+        );
+
+        // Absent, and deleted: NotFound, never a CAS (G9).
+        assert_eq!(engine_delete(&backend, &t, "p").await, 3);
+        let before = backend.statement_counts();
+        for (id, field) in [
+            ("nobody", "W/\"1\""),
+            ("p", "W/\"2\""),
+            ("p", "W/\"3\""),
+            ("p", "*"),
+        ] {
+            match backend
+                .update_with_match(&t, "Patient", id, field, patient(id, "Three"))
+                .await
+            {
+                Err(StorageError::Resource(ResourceError::NotFound { .. })) => {}
+                other => panic!("{id} {field}: expected NotFound, got {other:?}"),
+            }
+        }
+        let spent = backend.statement_counts().since(&before);
+        assert_eq!((spent.write, spent.cas), (0, 0));
+        assert_eq!(
+            backend.list_versions(&t, "Patient", "p").await.unwrap(),
+            ["1", "2", "3"]
+        );
+
+        // No update permission: refused before the pre-read, so the answer
+        // says nothing about whether the resource exists.
+        let read_only = TenantContext::new(t.tenant_id().clone(), TenantPermissions::read_only());
+        let before = backend.statement_counts();
+        for id in ["p", "nobody"] {
+            match backend
+                .update_with_match(&read_only, "Patient", id, "*", patient(id, "Three"))
+                .await
+            {
+                Err(StorageError::Tenant(TenantError::OperationNotPermitted { .. })) => {}
+                other => panic!("{id}: expected a permission refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(backend.statement_counts().since(&before).total(), 0);
+
+        // A SearchParameter `code` over 128 bytes (G38): `update` refuses it
+        // before any statement of its own, so only the pre-read is spent and
+        // nothing is written. The SearchParameter exists, with a short code,
+        // so the pre-read finds it.
+        let search_parameter = |code: String| {
+            json!({
+                "resourceType": "SearchParameter",
+                "id": "sp",
+                "url": "http://example.org/sp",
+                "status": "active",
+                "code": code,
+                "base": ["Patient"],
+                "type": "token",
+                "expression": "Patient.gender"
+            })
+        };
+        backend
+            .create(
+                &t,
+                "SearchParameter",
+                search_parameter("short".to_string()),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
+            .await
+            .expect("create the SearchParameter");
+        let before = backend.statement_counts();
+        match backend
+            .update_with_match(
+                &t,
+                "SearchParameter",
+                "sp",
+                "*",
+                search_parameter("c".repeat(129)),
+            )
+            .await
+        {
+            Err(StorageError::Validation(_)) => {}
+            other => panic!("expected a validation refusal, got {other:?}"),
+        }
+        let spent = backend.statement_counts().since(&before);
+        assert_eq!(
+            (spent.read, spent.total()),
+            (1, 1),
+            "the pre-read only, nothing written"
+        );
+        assert_eq!(
+            backend
+                .current_version(&t, "SearchParameter", "sp")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    /// Another writer landing between the pre-read and the compare-and-swap,
+    /// for both `_with_match` methods: their compare-and-swap misses, so
+    /// nothing of theirs is written. Another update is 409; a delete is
+    /// `NotFound`, the answer for a deleted resource. The resource is left
+    /// at the other writer's version 3, with no version 4.
+    #[tokio::test]
+    async fn with_match_loses_to_a_writer_between_its_read_and_its_write() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant("wm-between");
+        for (method, deleting) in [
+            ("update", false),
+            ("update", true),
+            ("delete", false),
+            ("delete", true),
+        ] {
+            let id = format!("{method}-{}", if deleting { "deleted" } else { "updated" });
+            let context = format!("{method}_with_match, another writer's {}", {
+                if deleting { "delete" } else { "update" }
+            });
+            create(&backend, &t, &id, "One").await;
+            assert_eq!(engine_update(&backend, &t, &id, "Two").await, 2);
+            another_writer_before_the_next_write(&backend, &t, &id, 2, deleting).await;
+
+            let before = backend.statement_counts();
+            let result = if method == "update" {
+                backend
+                    .update_with_match(&t, "Patient", &id, "W/\"2\"", patient(&id, "Ours"))
+                    .await
+                    .map(|_| ())
+            } else {
+                backend
+                    .delete_with_match(&t, "Patient", &id, "W/\"2\"")
+                    .await
+            };
+            match (deleting, &result) {
+                (
+                    false,
+                    Err(StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })),
+                )
+                | (true, Err(StorageError::Resource(ResourceError::NotFound { .. }))) => {}
+                _ => panic!("{context}: {result:?}"),
+            }
+            // Its own compare-and-swap was sent, so the other writer landed
+            // after the reads, not before them: a pre-read that saw it
+            // would have refused with no CAS at all.
+            assert!(
+                backend.statement_counts().since(&before).cas >= 1,
+                "{context}: the compare-and-swap ran and missed"
+            );
+
+            // The other writer's version 3 stands, and ours never landed.
+            let row = current(&backend, &t, &id).await;
+            assert_eq!(row.version_id, 3, "{context}");
+            assert_eq!(row.is_deleted(), deleting, "{context}");
+            if !deleting {
+                let live = backend.read(&t, "Patient", &id).await.unwrap().unwrap();
+                assert_eq!(family(&live), "Two", "{context}");
+            }
+            assert_eq!(
+                backend.list_versions(&t, "Patient", &id).await.unwrap(),
+                ["1", "2"],
+                "{context}: the other writer wrote no version row, and ours none"
+            );
+        }
+    }
+
     /// `exists`: one R1 of `deleted_at` only, true for a live row, false for
-    /// a deleted or unknown one, never an error for either.
+    /// a deleted or unknown one, never an error for either; true again once
+    /// revived, and false once deleted again.
     #[tokio::test]
     async fn exists_reads_only_deleted_at() {
         let Some(backend) = backend().await else {
@@ -810,6 +1240,86 @@ mod node_tests {
             3
         );
         assert!(backend.exists(&t, "Patient", "gone").await.unwrap());
+        // Deleted again after the revive: false again.
+        assert_eq!(engine_delete(&backend, &t, "gone").await, 4);
+        assert!(!backend.exists(&t, "Patient", "gone").await.unwrap());
+    }
+
+    /// `current_version`: one R1 of `version_id` and `deleted_at` only. The
+    /// live row's version; `None` for a deleted or unknown resource, as the
+    /// trait documents, where the trait default's `read` would answer
+    /// `Gone`; the new version again once the resource is revived, and
+    /// `None` once it is deleted again.
+    #[tokio::test]
+    async fn current_version_is_none_for_a_deleted_resource() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant("current");
+        create(&backend, &t, "live", "One").await;
+        assert_eq!(engine_update(&backend, &t, "live", "Two").await, 2);
+        create(&backend, &t, "gone", "Gone").await;
+        assert_eq!(engine_delete(&backend, &t, "gone").await, 2);
+        for (id, expected) in [("live", Some("2")), ("gone", None), ("nobody", None)] {
+            let before = backend.statement_counts();
+            assert_eq!(
+                backend
+                    .current_version(&t, "Patient", id)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                expected,
+                "{id}"
+            );
+            let spent = backend.statement_counts().since(&before);
+            assert_eq!((spent.read, spent.total()), (1, 1), "{id}");
+        }
+        // What the trait default, which reads through `read`, would answer.
+        assert!(matches!(
+            backend.read(&t, "Patient", "gone").await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ));
+        assert_eq!(
+            backend
+                .current_version(&tenant("current-other"), "Patient", "live")
+                .await
+                .unwrap(),
+            None
+        );
+        // Revived through the engine: its new version.
+        let (body, data) = normalized_body(
+            "create_or_update",
+            "Patient",
+            "gone",
+            patient("gone", "Back"),
+        )
+        .unwrap();
+        assert_eq!(
+            through_the_engine(&backend, &t, "gone", |previous| {
+                CasPlan::revive(previous, body, data, vec![IndexKey::ResourcesByType])
+            })
+            .await,
+            3
+        );
+        assert_eq!(
+            backend
+                .current_version(&t, "Patient", "gone")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("3")
+        );
+        // Deleted again after the revive: `None` again, as for the first
+        // delete.
+        assert_eq!(engine_delete(&backend, &t, "gone").await, 4);
+        assert_eq!(
+            backend
+                .current_version(&t, "Patient", "gone")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     /// `read_batch` over more ids than it reads at once: the input order,
@@ -926,6 +1436,31 @@ mod node_tests {
         unavailable(
             "exists",
             backend.exists(&t, "Patient", "p").await.unwrap_err(),
+        );
+
+        backend.session.inject_fault(
+            StatementKind::Read,
+            "SELECT version_id, deleted_at FROM resources",
+            Fault::TimeOutWithoutApplying,
+        );
+        timed_out(
+            "current_version",
+            backend
+                .current_version(&t, "Patient", "p")
+                .await
+                .unwrap_err(),
+        );
+        backend.session.inject_fault(
+            StatementKind::Read,
+            "SELECT version_id, deleted_at FROM resources",
+            Fault::FailWithUnavailable,
+        );
+        unavailable(
+            "current_version",
+            backend
+                .current_version(&t, "Patient", "p")
+                .await
+                .unwrap_err(),
         );
 
         backend.session.inject_fault(

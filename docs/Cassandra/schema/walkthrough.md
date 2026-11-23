@@ -193,8 +193,8 @@ Each version row stores `K(V)`, the index rows that version wrote, and the `reso
 | --- | --- | --- | --- |
 | `create` | 0 | 0 | `K(0)` is empty; no V3 |
 | `update` | 1 (R1 of `resources`) | 1 (V3) | its `StoredResource` has no blob; `resources`, not row `N`, as above |
-| `update_with_match` | 0 | 1 (V3) | its R1 already reads `resources` |
-| `delete`, `delete_versioned` | 0 | 1 (V3) | the same |
+| `update_with_match` | 1 (`update`'s R1 of `resources`) | 1 (V3) | V3 and `K(N)` come from `update`'s R1, not the pre-read, which gives `update` its `current` (Step 4, ADR-sara-lahourpour-0002) |
+| `delete`, `delete_versioned` | 0 | 1 (V3) | its R1 already reads `resources` |
 | `create_or_update` | 0 | 1 (V3) per turn on a live row (b) or a delete marker (c); 0 on an absent id (a) | each turn's R1 already reads `resources`; a delete marker's set is empty |
 | sweeper, `V` current | 0 | 0 | its R2 of `resources` already returns `K(V)`; R3 for `V-1` as before |
 | sweeper, `V` superseded | 0 | 0 | it already reads rows `V` and `V-1` |
@@ -336,7 +336,7 @@ Every write first calls `tenant.check_permission(Operation::…, resource_type)`
 
 | Step | Statement | Partition | On failure |
 | --- | --- | --- | --- |
-| 1 | permission check; extract `K(N+1)`, its long values mapped (below); `K(N)` is the `index_keys` of the `resources` row read at version `N`: the pre-read R1 of `delete`, `update_with_match` and `create_or_update`, or `update`'s own R1 (G22, section 2); the payload bound (below) | `resources (T,P,id)` for `update`'s R1 | `TenantError`; a CAS payload over 8 MiB is `ValidationError::InvalidResource`, 400 (a long index value or SearchParameter `code` is hashed, never refused for its length, ADR-aacruzgon-0079); `update`'s R1 timed out is 504, failed is 503; nothing written |
+| 1 | permission check; extract `K(N+1)`, its long values mapped (below); `K(N)` is the `index_keys` of the `resources` row read at version `N`: the pre-read R1 of `delete` and `create_or_update`, or `update`'s own R1, also under `update_with_match` (G22, section 2); the payload bound (below) | `resources (T,P,id)` for `update`'s R1, also under `update_with_match` | `TenantError`; a CAS payload over 8 MiB is `ValidationError::InvalidResource`, 400 (a long index value or SearchParameter `code` is hashed, never refused for its length, ADR-aacruzgon-0079); `update`'s R1 timed out is 504, failed is 503; nothing written |
 | 2 | on update, delete and revive (`update`, `update_with_match`, `delete`, `delete_versioned`, and `create_or_update` on a live row or a delete marker): V3 for `N` at `ts(N) − 1`, from R1, with R1's `write_id` and `K(N)` (G40, ADR-aacruzgon-0061); then I1, with `version_id = N+1` | `resource_versions (T,P,id)` for V3, then `(bucket, shard)` | V3 timed out: 504; failed: 503; nothing changed, since V3 only rewrites row `N` at an older timestamp. I1 `Unavailable`: 503, nothing changed. I1 `WriteTimeout`: an unused intent is swept, so harmless; 504 (`BackendError::Timeout`, G26) |
 | 3 | C1 to C4 | `resources (T,P,id)` | not applied: I2, then the mapped error; unknown outcome below |
 | 4 | V1 or V2 for `N+1` at `ts(N+1)` (V3 for `N` already ran at step 2) | `resource_versions (T,P,id)` | retry with the same timestamps. Retries exhausted: return success, with I1 left for the sweeper (G23, ADR-aacruzgon-0034), on every operation (ADR-aacruzgon-0050) |
@@ -414,9 +414,9 @@ REST has already read the row, checked `If-Match` (412 on a mismatch, before sto
 | `deleted_at > 0` | soft-deleted after REST's read | `NotFound`, 404 (design step 3; the race suite also accepts `Gone`, G9) |
 | `version_id ≠ N`, `deleted_at` 0 | lost the race | `ConcurrencyError::VersionConflict`, 409 |
 
-`update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `OptimisticLockFailure` (412) without a CAS; a CAS miss after that is 409. Its V3, at step 2, is built from that R1, so it carries R1's `write_id`, as plain `update`'s does (ADR-aacruzgon-0061).
+`update_with_match(…, expected_version, …)` adds a pre-read R1: a different current version is `VersionConflict` (409) without a CAS; a CAS miss after that is 409 for another update and `NotFound` for a delete, as `update`'s. That R1 stands in for REST's read: it gives `update` its `current` (version `N`, `created_at`, `fhir_version`), but V3 is built from `update`'s own R1, with R1's `write_id` (ADR-aacruzgon-0061), so a matching call reads `resources` twice, as `delete_with_match` does.
 
-*Open for Step 4.* Until Step 4, `update_with_match` is a stub that answers `UnsupportedCapability` (501) (`crates/persistence/src/backends/cassandra/storage.rs:171-180`); this paragraph is its design. Which error the mismatch answers is Step 4's to decide, in its ADR, which updates this paragraph. Step 4's handover (roadmap Step 4, "Open for the Step 4 group") recommends `VersionConflict` (409): `versioning_suite`'s `test_update_with_match_etag_mismatch` asserts it, SQLite, PostgreSQL, MongoDB and this backend's `delete_with_match` (4.4) answer it, and REST answers an `If-Match` mismatch with 412 from its own read and never calls this method.
+*Decided at Step 4* (ADR-sara-lahourpour-0002), which replaced this paragraph's 412 with 409: `versioning_suite`'s `test_update_with_match_etag_mismatch` asserts it, SQLite, PostgreSQL, MongoDB and this backend's `delete_with_match` (4.4) answer it, and REST answers an `If-Match` mismatch with 412 from its own read and never calls this method. `update_with_match` hands its write to `update` after the comparison (`crates/persistence/src/backends/cassandra/versions.rs`).
 
 ### 3.4 Delete (`delete` and `delete_versioned`, `DELETE /Patient/id`)
 

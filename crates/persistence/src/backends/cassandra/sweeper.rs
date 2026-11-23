@@ -2001,3 +2001,1215 @@ mod tests {
         backend.run_sweeper(cancel)
     }
 }
+
+#[cfg(test)]
+mod node_tests {
+    use std::collections::HashSet;
+    use std::future::Future;
+
+    use super::*;
+    use crate::backends::cassandra::checkpoint::Checkpoint;
+    use crate::backends::cassandra::consistency::harness::{
+        self, changed, check, context, patient, stored_keys, tenant_id,
+    };
+    use crate::backends::cassandra::consistency::{assert_consistent, version_ids};
+    use crate::backends::cassandra::session::Fault;
+    use crate::backends::cassandra::test_support::test_fhir_version;
+    use crate::core::{ResourceStorage, SearchProvider};
+    use crate::error::StorageResult;
+    use crate::tenant::TenantContext;
+
+    const SKIP: &str = "skipping: HFS_TEST_CASSANDRA_URL is not set";
+
+    /// A backend, a fresh tenant, and `since`, taken before the first write.
+    async fn start(
+        prefix: &str,
+    ) -> Option<(Arc<CassandraBackend>, String, TenantContext, DateTime<Utc>)> {
+        let Some(backend) = harness::backend().await else {
+            eprintln!("{SKIP}");
+            return None;
+        };
+        let t = tenant_id(prefix);
+        let tenant = context(&t);
+        Some((
+            backend,
+            t,
+            tenant,
+            Utc::now() - chrono::Duration::seconds(5),
+        ))
+    }
+
+    /// RV15/RV16: the request reaches `point` for `(t, id)` at `version` and is aborted there.
+    async fn crash<T: Send + 'static>(
+        backend: &CassandraBackend,
+        point: Checkpoint,
+        t: &str,
+        id: &str,
+        version: i32,
+        write: impl Future<Output = StorageResult<T>> + Send + 'static,
+    ) {
+        let mut hold = backend.hold_at(point, t, id, version);
+        let task = tokio::spawn(write);
+        hold.reached().await;
+        task.abort();
+        match task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("the aborted request finished"),
+        }
+    }
+
+    async fn pass(
+        backend: &CassandraBackend,
+        tenants: &[&str],
+        since: DateTime<Utc>,
+    ) -> SweepReport {
+        backend
+            .sweep_pass(SweepOptions {
+                scope: SweepScope::Tenants(tenants.iter().map(|t| t.to_string()).collect()),
+                grace: Duration::ZERO,
+                now: Utc::now(),
+                since,
+                allow_short_grace: true,
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn pending(
+        backend: &CassandraBackend,
+        t: &str,
+        id: &str,
+        since: DateTime<Utc>,
+    ) -> Vec<Intent> {
+        let shard = IntentKey::new(t, id, since).shard();
+        let to = Utc::now() + chrono::Duration::milliseconds(1);
+        let mut found = Vec::new();
+        for slice in plan_slices(shard, since, to, startup_slice()) {
+            let (intents, _) = backend.read_slice(&slice, Rank::Normal).await.unwrap();
+            found.extend(
+                intents
+                    .into_iter()
+                    .filter(|intent| intent.tenant_id == t && intent.id == id),
+            );
+        }
+        found
+    }
+
+    async fn intents(
+        backend: &CassandraBackend,
+        t: &str,
+        id: &str,
+        since: DateTime<Utc>,
+    ) -> Vec<i32> {
+        backend.intent_versions(t, "Patient", id, since).await
+    }
+
+    async fn rbt_rows(backend: &CassandraBackend, t: &str, id: &str) -> Vec<(DateTime<Utc>, i32)> {
+        let rows = backend
+            .session
+            .rows(
+                "SELECT last_updated, id, version_id FROM resources_by_type \
+                 WHERE tenant_id = ? AND resource_type = ?",
+                vec![Value::from(t), Value::from("Patient")],
+                StatementKind::Read,
+            )
+            .await
+            .expect("resources_by_type");
+        let mut found: Vec<(DateTime<Utc>, i32)> = rows
+            .iter()
+            .filter(|row| {
+                let found: String = row.get_r_by_name("id").unwrap();
+                found == id
+            })
+            .map(|row| {
+                (
+                    row.get_r_by_name("last_updated").unwrap(),
+                    row.get_r_by_name("version_id").unwrap(),
+                )
+            })
+            .collect();
+        found.sort_by(|a, b| b.cmp(a));
+        found
+    }
+
+    async fn row_of(backend: &CassandraBackend, t: &str, id: &str) -> ResourceRow {
+        backend
+            .read_resource_row(t, "Patient", id)
+            .await
+            .expect("R1")
+            .expect("a row")
+    }
+
+    fn keys(row: &ResourceRow) -> Vec<IndexKey> {
+        index_keys::decode(row.index_keys.as_deref().expect("index_keys")).expect("K")
+    }
+
+    fn not_produced(
+        old: &[IndexKey],
+        old_lu: DateTime<Utc>,
+        new: &[IndexKey],
+        new_lu: DateTime<Utc>,
+    ) -> usize {
+        let produced: HashSet<_> = new.iter().map(|key| key.row_at(new_lu)).collect();
+        old.iter()
+            .filter(|key| !produced.contains(&key.row_at(old_lu)))
+            .count()
+    }
+
+    async fn count(backend: &CassandraBackend, tenant: &TenantContext) -> u64 {
+        backend.count(tenant, Some("Patient")).await.unwrap()
+    }
+
+    fn say(name: &str, backend: &CassandraBackend, before: &SweeperStats) {
+        eprintln!(
+            "[sweeper case={name} {}]",
+            backend.sweeper_stats().since(before)
+        );
+    }
+
+    /// One version row's columns, for N3, N9 and N10.
+    async fn version_row_of(
+        backend: &CassandraBackend,
+        t: &str,
+        version: i32,
+    ) -> (
+        Option<String>,
+        Option<Uuid>,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<DateTime<Utc>>,
+    ) {
+        let rows = backend
+            .session
+            .rows(
+                "SELECT data, write_id, index_keys, fhir_version, deleted_at \
+                 FROM resource_versions WHERE tenant_id = ? AND resource_type = ? \
+                 AND id = ? AND version_id = ?",
+                vec![
+                    Value::from(t),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                    Value::from(version),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("version row");
+        let row = rows.first().expect("the version row exists");
+        (
+            row.get_by_name("data").unwrap(),
+            row.get_by_name("write_id").unwrap(),
+            IntoRustByName::<Blob>::get_by_name(row, "index_keys")
+                .unwrap()
+                .map(Blob::into_vec),
+            row.get_by_name("fhir_version").unwrap(),
+            row.get_by_name("deleted_at").unwrap(),
+        )
+    }
+
+    /// N1 (gate): a slice is half open, so an intent at the edge is in exactly one.
+    #[tokio::test]
+    async fn slice_edges_are_half_open() {
+        let Some((backend, t, _, _)) = start("sweeper-edges").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let edge = whole_ms(Utc::now())
+            .with_second(0)
+            .unwrap()
+            .with_nanosecond(0)
+            .unwrap()
+            - chrono::Duration::minutes(10);
+        use chrono::Timelike;
+        let mut ids = Vec::new();
+        let mut want = None;
+        let mut n = 0;
+        while ids.len() < 3 {
+            let id = format!("e{n}");
+            n += 1;
+            let shard = IntentKey::new(&t, &id, edge).shard();
+            if *want.get_or_insert(shard) == shard {
+                ids.push(id);
+            }
+        }
+        let shard = want.unwrap();
+        let ms = chrono::Duration::milliseconds(1);
+        for (id, at) in ids.iter().zip([edge - ms, edge, edge + ms]) {
+            let key = RowKey {
+                tenant_id: &t,
+                resource_type: "Patient",
+                id,
+            };
+            backend
+                .write_intent(&IntentKey::new(&t, id, at), &key, Uuid::new_v4(), 1)
+                .await
+                .unwrap();
+        }
+        let minute = chrono::Duration::minutes(1);
+        let slices = plan_slices(shard, edge - minute, edge + minute, startup_slice());
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].to, edge);
+        assert_eq!(slices[1].from, edge);
+        let mut found = Vec::new();
+        for slice in &slices {
+            let (read, _) = backend.read_slice(slice, Rank::Normal).await.unwrap();
+            found.push(
+                read.into_iter()
+                    .filter(|intent| intent.tenant_id == t)
+                    .map(|intent| intent.id)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(found[0], vec![ids[0].clone()]);
+        let mut second = found[1].clone();
+        second.sort();
+        assert_eq!(second, vec![ids[1].clone(), ids[2].clone()]);
+
+        let report = backend
+            .sweep_pass(SweepOptions {
+                scope: SweepScope::Tenants(vec![t.clone()]),
+                grace: Duration::ZERO,
+                now: edge + chrono::Duration::minutes(2),
+                since: edge - chrono::Duration::minutes(2),
+                allow_short_grace: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!((report.no_row, report.done), (3, 3), "{report}");
+        for slice in &slices {
+            let (read, _) = backend.read_slice(slice, Rank::Normal).await.unwrap();
+            assert!(read.iter().all(|intent| intent.tenant_id != t));
+        }
+        say("edges", &backend, &before);
+    }
+
+    /// N2: a CAS that never ran is deleted after a serial read, and writes nothing else.
+    #[tokio::test]
+    async fn an_intent_whose_cas_never_ran_is_deleted_after_a_serial_read() {
+        let Some((backend, t, tenant, since)) = start("sweeper-never-applied").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let p = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterIntent, &t, "p", 2, async move {
+            b.update(&ten, &p, changed()).await
+        })
+        .await;
+        let found = pending(&backend, &t, "p", since).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].version_id, 2);
+        let at = backend.statement_counts();
+        let result = backend.process_intent(&found[0], Rank::Normal).await;
+        let spent = backend.statement_counts().since(&at);
+        assert_eq!(result.case, Some(IntentCase::NeverApplied));
+        assert_eq!(result.result, Ok(()));
+        assert_eq!(result.index, IndexWriteStats::default());
+        assert_eq!(
+            (
+                spent.read,
+                spent.serial_read,
+                spent.write,
+                spent.batch,
+                spent.cas
+            ),
+            (1, 1, 1, 0, 0),
+            "{spent}"
+        );
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_eq!(row_of(&backend, &t, "p").await.version_id, 1);
+        assert_eq!(version_ids(&backend, &t, "Patient", "p").await, vec![1]);
+        assert_consistent(&check(&backend, &t).await);
+        say("never-applied", &backend, &before);
+    }
+
+    /// N3: a crash after the CAS is replayed as the current version.
+    #[tokio::test]
+    async fn a_crash_after_the_cas_is_replayed_as_the_current_version() {
+        let Some((backend, t, tenant, since)) = start("sweeper-current").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let p = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        let r1 = row_of(&backend, &t, "p").await;
+        let k1 = stored_keys(&backend, &t, "p").await;
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 2, async move {
+            b.update(&ten, &p, changed()).await
+        })
+        .await;
+        let r2 = row_of(&backend, &t, "p").await;
+        let k2 = keys(&r2);
+        let found = pending(&backend, &t, "p", since).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].version_id, 2);
+        let at = backend.statement_counts();
+        let result = backend.process_intent(&found[0], Rank::Normal).await;
+        let spent = backend.statement_counts().since(&at);
+        assert_eq!(result.case, Some(IntentCase::Current));
+        assert_eq!(result.result, Ok(()));
+        assert_eq!(result.index.rows_inserted, k2.len() as u64);
+        assert_eq!(
+            result.index.rows_deleted,
+            not_produced(&k1, r1.last_updated, &k2, r2.last_updated) as u64
+        );
+        assert_eq!(
+            (spent.read, spent.serial_read, spent.cas),
+            (2, 0, 0),
+            "{spent}"
+        );
+        assert_eq!(
+            spent.write + spent.batch,
+            result.index.batches + 2,
+            "{spent}"
+        );
+        let (data, write_id, blob, fhir, _) = version_row_of(&backend, &t, 2).await;
+        assert_eq!(data, r2.data);
+        assert_eq!(write_id, r2.write_id);
+        assert_eq!(blob, r2.index_keys);
+        assert_eq!(fhir, r2.stored_fhir_version);
+        assert_eq!(version_ids(&backend, &t, "Patient", "p").await, vec![1, 2]);
+        assert_eq!(
+            rbt_rows(&backend, &t, "p").await,
+            vec![(r2.last_updated, 2)]
+        );
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+        say("current", &backend, &before);
+    }
+
+    /// N4: a superseded intent deletes only the rows of the version before it.
+    #[tokio::test]
+    async fn a_superseded_intent_deletes_only_the_rows_of_the_version_before_it() {
+        let Some((backend, t, tenant, since)) = start("sweeper-superseded").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let p = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        let k1 = stored_keys(&backend, &t, "p").await;
+        let lu1 = row_of(&backend, &t, "p").await.last_updated;
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 2, async move {
+            b.update(&ten, &p, changed()).await
+        })
+        .await;
+        let v2 = backend
+            .read(&tenant, "Patient", "p")
+            .await
+            .unwrap()
+            .unwrap();
+        backend.update(&tenant, &v2, patient()).await.unwrap();
+        let lu3 = row_of(&backend, &t, "p").await.last_updated;
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu3, 3), (lu1, 1)]);
+        assert_eq!(count(&backend, &tenant).await, 2);
+        assert_eq!(
+            version_ids(&backend, &t, "Patient", "p").await,
+            vec![1, 2, 3]
+        );
+        let found = pending(&backend, &t, "p", since).await;
+        assert_eq!(
+            found.iter().map(|i| i.version_id).collect::<Vec<_>>(),
+            vec![2]
+        );
+        let at = backend.statement_counts();
+        let result = backend.process_intent(&found[0], Rank::Normal).await;
+        let spent = backend.statement_counts().since(&at);
+        assert_eq!(result.case, Some(IntentCase::Superseded));
+        assert_eq!(result.result, Ok(()));
+        assert!(!result.noop);
+        assert_eq!(result.index.rows_inserted, 0);
+        assert_eq!(result.index.rows_deleted, k1.len() as u64);
+        assert_eq!(
+            (spent.read, spent.serial_read, spent.cas),
+            (3, 0, 0),
+            "{spent}"
+        );
+        assert_eq!(
+            spent.write + spent.batch,
+            result.index.batches + 1,
+            "{spent}"
+        );
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu3, 3)]);
+        assert_eq!(count(&backend, &tenant).await, 1);
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_eq!(
+            version_ids(&backend, &t, "Patient", "p").await,
+            vec![1, 2, 3]
+        );
+        assert_consistent(&check(&backend, &t).await);
+        say("superseded", &backend, &before);
+    }
+
+    /// N5: the IW24 skip, a later update, and the sweep that settles `count`.
+    #[tokio::test]
+    async fn the_iw24_skip_and_a_later_update_count_twice_until_the_sweep() {
+        let Some((backend, t, tenant, since)) = start("sweeper-iw24").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let p = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        let lu1 = row_of(&backend, &t, "p").await.last_updated;
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resource_versions",
+            Fault::PassThrough,
+        );
+        for _ in 0..3 {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resource_versions",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        let cas = backend.cas_stats();
+        let v2 = backend.update(&tenant, &p, changed()).await.unwrap();
+        let stats = backend.cas_stats().since(&cas);
+        assert_eq!(v2.version_id(), "2");
+        assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu1, 1)]);
+        assert_eq!(count(&backend, &tenant).await, 1);
+        assert_eq!(version_ids(&backend, &t, "Patient", "p").await, vec![1]);
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![2]);
+
+        let v3 = backend.update(&tenant, &v2, patient()).await.unwrap();
+        assert_eq!(v3.version_id(), "3");
+        let lu3 = row_of(&backend, &t, "p").await.last_updated;
+        assert_eq!(
+            version_ids(&backend, &t, "Patient", "p").await,
+            vec![1, 2, 3]
+        );
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu3, 3), (lu1, 1)]);
+        assert_eq!(count(&backend, &tenant).await, 2);
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![2]);
+
+        let report = pass(&backend, &[&t], since).await;
+        assert_eq!((report.superseded, report.done), (1, 1), "{report}");
+        assert!(report.is_complete());
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu3, 3)]);
+        assert_eq!(count(&backend, &tenant).await, 1);
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+        say("iw24", &backend, &before);
+    }
+
+    /// N6 (exit criterion): the running loop heals a crash within poll + grace.
+    #[tokio::test]
+    async fn a_crash_after_the_cas_heals_within_poll_plus_grace() {
+        let Some((backend, t, tenant, since)) = start("sweeper-loop").await else {
+            return;
+        };
+        let url = std::env::var("HFS_TEST_CASSANDRA_URL").unwrap();
+        let looped = Arc::new(
+            CassandraBackend::connect(crate::backends::cassandra::CassandraConfig {
+                contact_points: vec![url],
+                request_timeout_ms: 2_500,
+                sweeper_poll_interval_ms: 1_000,
+                sweeper_grace_ms: 5_000,
+                ..crate::backends::cassandra::test_support::test_config()
+            })
+            .await
+            .expect("connect"),
+        );
+        let version = test_fhir_version();
+        let p = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 2, async move {
+            b.update(&ten, &p, changed()).await
+        })
+        .await;
+        let lu2 = row_of(&backend, &t, "p").await.last_updated;
+        let crashed = std::time::Instant::now();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(looped.clone().run_sweeper_with(
+            cancel.clone(),
+            SweepScope::Tenants(vec![t.clone()]),
+            false,
+        ));
+        let limit = Duration::from_secs(16);
+        loop {
+            if intents(&backend, &t, "p", since).await.is_empty()
+                && rbt_rows(&backend, &t, "p").await == vec![(lu2, 2)]
+            {
+                break;
+            }
+            assert!(
+                crashed.elapsed() < limit,
+                "not healed after {:?}",
+                crashed.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        eprintln!(
+            "[sweeper case=loop healed_ms={}]",
+            crashed.elapsed().as_millis()
+        );
+        let stats = looped.sweeper_stats();
+        assert!(
+            stats.polls >= 1 && stats.case_current >= 1 && stats.done >= 1,
+            "{stats}"
+        );
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the sweeper stops within 5 s")
+            .unwrap();
+        assert_eq!(version_ids(&backend, &t, "Patient", "p").await, vec![1, 2]);
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// N7 (gate): two sweepers on one intent end in the same state (SW22).
+    #[tokio::test]
+    async fn two_sweepers_on_one_intent_end_in_the_same_state() {
+        let Some((backend, t, tenant, since)) = start("sweeper-two").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let p = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 2, async move {
+            b.update(&ten, &p, changed()).await
+        })
+        .await;
+        let lu2 = row_of(&backend, &t, "p").await.last_updated;
+        let other = harness::backend().await.expect("a second backend");
+        let options = SweepOptions {
+            scope: SweepScope::Tenants(vec![t.clone()]),
+            grace: Duration::ZERO,
+            now: Utc::now(),
+            since,
+            allow_short_grace: true,
+        };
+        let (a, b) = tokio::join!(
+            backend.sweep_pass(options.clone()),
+            other.sweep_pass(options)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(
+            a.done + b.done >= 1 && a.current + b.current >= 1,
+            "{a} {b}"
+        );
+        assert_eq!(
+            a.failed + b.failed + a.invariant + b.invariant,
+            0,
+            "{a} {b}"
+        );
+        assert_eq!(version_ids(&backend, &t, "Patient", "p").await, vec![1, 2]);
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu2, 2)]);
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+        let third = pass(&backend, &[&t], since).await;
+        assert_eq!((third.current, third.done), (0, 0), "{third}");
+        say("two-sweepers", &backend, &before);
+    }
+
+    fn search_parameter(url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "resourceType": "SearchParameter",
+            "id": "sp",
+            "url": url,
+            "name": "sp",
+            "status": "active",
+            "description": "a stored SearchParameter for the sweeper's node tests",
+            "code": "sweeper-sp",
+            "base": ["Patient"],
+            "type": "token",
+            "expression": "Patient.active",
+        })
+    }
+
+    fn expression_of(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        url: &str,
+    ) -> Option<String> {
+        backend
+            .search_param_registry(tenant)
+            .read()
+            .get_by_url(url)
+            .map(|definition| definition.expression.clone())
+    }
+
+    /// N8 (gate): a replayed SearchParameter is put back in the overlay and survives a reload (SW19).
+    #[tokio::test]
+    async fn a_searchparameter_replay_puts_it_back_in_the_overlay_and_the_reload() {
+        let Some((backend, t, tenant, since)) = start("sweeper-sp").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let url = format!("http://example.org/SearchParameter/{t}");
+        for _ in 0..3 {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resources_by_type",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        let cas = backend.cas_stats();
+        backend
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter(&url),
+                test_fhir_version(),
+            )
+            .await
+            .expect("create");
+        assert_eq!(backend.cas_stats().since(&cas).post_cas_failures, 1);
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.active")
+        );
+        assert_eq!(backend.load_stored_search_parameters(&t).await.unwrap(), 0);
+        assert_eq!(expression_of(&backend, &tenant, &url), None);
+
+        let report = pass(&backend, &[&t], since).await;
+        assert_eq!((report.current, report.done), (1, 1), "{report}");
+        let delta = backend.sweeper_stats().since(&before);
+        assert_eq!(delta.search_parameters_followed, 1);
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.active")
+        );
+        assert_eq!(backend.load_stored_search_parameters(&t).await.unwrap(), 1);
+        assert_eq!(
+            expression_of(&backend, &tenant, &url).as_deref(),
+            Some("Patient.active")
+        );
+        let fresh = harness::backend().await.expect("a fresh backend");
+        assert_eq!(fresh.load_stored_search_parameters(&t).await.unwrap(), 1);
+        assert_eq!(
+            expression_of(&fresh, &tenant, &url).as_deref(),
+            Some("Patient.active")
+        );
+        say("search-parameter", &backend, &before);
+    }
+
+    /// N9: a replayed delete writes its marker, and a revive only inserts (SW16).
+    #[tokio::test]
+    async fn a_replayed_delete_writes_its_marker_and_a_revive_inserts_only() {
+        let Some((backend, t, tenant, since)) = start("sweeper-delete").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        let k1 = stored_keys(&backend, &t, "p").await;
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 2, async move {
+            b.delete(&ten, "Patient", "p").await
+        })
+        .await;
+        let lu2 = row_of(&backend, &t, "p").await.last_updated;
+        let found = pending(&backend, &t, "p", since).await;
+        assert_eq!(found.len(), 1);
+        let result = backend.process_intent(&found[0], Rank::Normal).await;
+        assert_eq!(result.case, Some(IntentCase::Current));
+        assert_eq!(result.result, Ok(()));
+        assert_eq!(result.index.rows_inserted, 0);
+        assert_eq!(result.index.rows_deleted, k1.len() as u64);
+        let (data, _, blob, _, deleted_at) = version_row_of(&backend, &t, 2).await;
+        assert_eq!(data, None);
+        assert_eq!(deleted_at, Some(lu2));
+        assert_eq!(blob.as_deref(), Some(&index_keys::EMPTY[..]));
+        assert!(rbt_rows(&backend, &t, "p").await.is_empty());
+        assert_eq!(count(&backend, &tenant).await, 0);
+
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 3, async move {
+            b.create_or_update(&ten, "Patient", "p", patient(), version)
+                .await
+        })
+        .await;
+        let r3 = row_of(&backend, &t, "p").await;
+        let k3 = keys(&r3);
+        let found = pending(&backend, &t, "p", since).await;
+        assert_eq!(found.len(), 1);
+        let result = backend.process_intent(&found[0], Rank::Normal).await;
+        assert_eq!(result.case, Some(IntentCase::Current));
+        assert_eq!(result.result, Ok(()));
+        assert_eq!(result.index.rows_deleted, 0);
+        assert_eq!(result.index.rows_inserted, k3.len() as u64);
+        assert_eq!(
+            rbt_rows(&backend, &t, "p").await,
+            vec![(r3.last_updated, 3)]
+        );
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+        say("delete-revive", &backend, &before);
+    }
+
+    /// N10: a replay writes the stored `fhir_version` text back verbatim (RW8).
+    #[tokio::test]
+    async fn a_replay_writes_the_stored_fhir_version_text_back_verbatim() {
+        let Some((backend, t, tenant, since)) = start("sweeper-fhir-version").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let p = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 2, async move {
+            b.update(&ten, &p, changed()).await
+        })
+        .await;
+        let alias = match version.as_mime_param() {
+            "4.0" => "R4",
+            "4.3" => "R4B",
+            "5.0" => "R5",
+            _ => "R6",
+        };
+        backend
+            .session
+            .execute(
+                "UPDATE resources SET fhir_version = ? WHERE tenant_id = ? AND resource_type = ? \
+                 AND id = ? IF version_id = 2",
+                vec![
+                    Value::from(alias),
+                    Value::from(t.as_str()),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                ],
+                StatementKind::Cas,
+            )
+            .await
+            .expect("alias the stored text");
+        let r2 = row_of(&backend, &t, "p").await;
+        assert_eq!(r2.stored_fhir_version.as_deref(), Some(alias));
+        assert_eq!(r2.fhir_version, version);
+        let report = pass(&backend, &[&t], since).await;
+        assert_eq!(report.done, 1, "{report}");
+        let (_, _, _, fhir, _) = version_row_of(&backend, &t, 2).await;
+        assert_eq!(fhir.as_deref(), Some(alias));
+        let rows = backend
+            .session
+            .rows(
+                "SELECT last_updated, id, fhir_version FROM resources_by_type \
+                 WHERE tenant_id = ? AND resource_type = ?",
+                vec![Value::from(t.as_str()), Value::from("Patient")],
+                StatementKind::Read,
+            )
+            .await
+            .unwrap();
+        let text: Vec<String> = rows
+            .iter()
+            .filter(|row| {
+                let at: DateTime<Utc> = row.get_r_by_name("last_updated").unwrap();
+                at == r2.last_updated
+            })
+            .map(|row| row.get_r_by_name("fhir_version").unwrap())
+            .collect();
+        assert_eq!(text, vec![alias.to_string()]);
+        assert_consistent(&check(&backend, &t).await);
+        say("fhir-version", &backend, &before);
+    }
+
+    /// N11: a permanent index failure keeps the intent and counts as an invariant.
+    #[tokio::test]
+    async fn a_permanent_index_failure_keeps_the_intent_and_counts_as_an_invariant() {
+        let Some((backend, t, tenant, since)) = start("sweeper-permanent").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 1, async move {
+            b.create(&ten, "Patient", patient(), version).await
+        })
+        .await;
+        let lu1 = row_of(&backend, &t, "p").await.last_updated;
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::FailWithInvalid,
+        );
+        let found = pending(&backend, &t, "p", since).await;
+        assert_eq!(found.len(), 1);
+        let result = backend.process_intent(&found[0], Rank::Normal).await;
+        assert_eq!(result.case, Some(IntentCase::Current));
+        assert_eq!(
+            result.result,
+            Err(Failure::Invariant(Invariant::PermanentWrite))
+        );
+        assert_eq!(version_ids(&backend, &t, "Patient", "p").await, vec![1]);
+        assert!(rbt_rows(&backend, &t, "p").await.is_empty());
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+        let delta = backend.sweeper_stats().since(&before);
+        assert_eq!((delta.invariant_violations, delta.done), (1, 0));
+        let again = backend.process_intent(&found[0], Rank::Normal).await;
+        assert_eq!(again.result, Ok(()));
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu1, 1)]);
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+        say("permanent", &backend, &before);
+    }
+
+    /// N12: a transient failure keeps the intent for the next try.
+    #[tokio::test]
+    async fn a_transient_failure_keeps_the_intent_for_the_next_try() {
+        let Some((backend, t, tenant, since)) = start("sweeper-transient").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 1, async move {
+            b.create(&ten, "Patient", patient(), version).await
+        })
+        .await;
+        let lu1 = row_of(&backend, &t, "p").await.last_updated;
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::FailWithUnavailable,
+        );
+        let found = pending(&backend, &t, "p", since).await;
+        let at = backend.statement_counts();
+        let result = backend.process_intent(&found[0], Rank::Normal).await;
+        let spent = backend.statement_counts().since(&at);
+        assert_eq!(result.result, Err(Failure::Transient("index")));
+        assert_eq!(
+            spent.write + spent.batch,
+            result.index.batches + 1,
+            "{spent}"
+        );
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+        let report = pass(&backend, &[&t], since).await;
+        assert_eq!(report.done, 1, "{report}");
+        assert!(report.is_complete());
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu1, 1)]);
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+        say("transient", &backend, &before);
+    }
+
+    /// N13 (SW13): bugs are invariants, never an empty set. The planted rows' tenant is `test-planted-`.
+    #[tokio::test]
+    async fn missing_version_rows_and_unreadable_keys_are_invariants_never_empty_sets() {
+        let Some((backend, t, _, since)) = start("planted-sweeper-invariants").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let lu = whole_ms(Utc::now());
+        let plant = |id: &'static str, version: i32, blob: Vec<u8>| {
+            let (backend, t) = (backend.clone(), t.clone());
+            async move {
+                backend
+                    .session
+                    .execute(
+                        "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, \
+                         last_updated, created_at, fhir_version, write_ts, write_id, index_keys, \
+                         deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0) IF NOT EXISTS",
+                        vec![
+                            Value::from(t.as_str()),
+                            Value::from("Patient"),
+                            Value::from(id),
+                            Value::from(version),
+                            Value::from("{\"resourceType\":\"Patient\"}"),
+                            Value::from(lu),
+                            Value::from(lu),
+                            Value::from(test_fhir_version().as_mime_param()),
+                            Value::from(write_ts_of(lu)),
+                            Value::from(Uuid::new_v4()),
+                            Value::from(Blob::from(blob)),
+                        ],
+                        StatementKind::Cas,
+                    )
+                    .await
+                    .expect("plant")
+            }
+        };
+        plant("p", 2, index_keys::encode(&[IndexKey::ResourcesByType])).await;
+        plant("q", 1, vec![0x02, 0x00]).await;
+        for (id, version) in [("p", 2), ("q", 1)] {
+            let key = RowKey {
+                tenant_id: &t,
+                resource_type: "Patient",
+                id,
+            };
+            backend
+                .write_intent(
+                    &IntentKey::new(&t, id, Utc::now()),
+                    &key,
+                    Uuid::new_v4(),
+                    version,
+                )
+                .await
+                .unwrap();
+        }
+        let p = pending(&backend, &t, "p", since).await;
+        let q = pending(&backend, &t, "q", since).await;
+        let at = backend.statement_counts();
+        let rp = backend.process_intent(&p[0], Rank::Normal).await;
+        let rq = backend.process_intent(&q[0], Rank::Normal).await;
+        let spent = backend.statement_counts().since(&at);
+        assert_eq!(rp.case, Some(IntentCase::Current));
+        assert_eq!(
+            rp.result,
+            Err(Failure::Invariant(Invariant::MissingVersionRow))
+        );
+        assert_eq!(rq.case, Some(IntentCase::Current));
+        assert_eq!(
+            rq.result,
+            Err(Failure::Invariant(Invariant::UnreadableKeys))
+        );
+        assert_eq!((spent.write, spent.batch), (0, 0), "{spent}");
+        assert_eq!(
+            backend.sweeper_stats().since(&before).invariant_violations,
+            2
+        );
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![2]);
+        assert_eq!(intents(&backend, &t, "q", since).await, vec![1]);
+        for (id, intent) in [("p", &p[0]), ("q", &q[0])] {
+            let key = RowKey {
+                tenant_id: &t,
+                resource_type: "Patient",
+                id,
+            };
+            backend.delete_intent(&intent.key, &key).await;
+        }
+        say("invariants", &backend, &before);
+    }
+
+    /// N14: a scoped pass leaves other tenants' intents alone (SW28).
+    #[tokio::test]
+    async fn a_scoped_pass_leaves_other_tenants_intents() {
+        let Some((backend, a, tenant_a, since)) = start("sweeper-scope-a").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let b = tenant_id("sweeper-scope-b");
+        let tenant_b = context(&b);
+        let version = test_fhir_version();
+        for (t, tenant) in [(&a, &tenant_a), (&b, &tenant_b)] {
+            let (backend2, ten) = (backend.clone(), tenant.clone());
+            crash(&backend, Checkpoint::AfterCas, t, "p", 1, async move {
+                backend2.create(&ten, "Patient", patient(), version).await
+            })
+            .await;
+        }
+        let report = pass(&backend, &[&a], since).await;
+        assert_eq!((report.intents, report.done), (1, 1), "{report}");
+        assert!(intents(&backend, &a, "p", since).await.is_empty());
+        assert_eq!(intents(&backend, &b, "p", since).await, vec![1]);
+        let report = pass(&backend, &[&b], since).await;
+        assert_eq!(report.done, 1, "{report}");
+        assert_consistent(&check(&backend, &a).await);
+        assert_consistent(&check(&backend, &b).await);
+        say("scope", &backend, &before);
+    }
+
+    /// N15: the startup scan reads old buckets in minute slices (SW9, SW10).
+    #[tokio::test]
+    async fn the_startup_scan_reads_old_buckets_in_minute_slices() {
+        let Some((backend, t, tenant, since)) = start("sweeper-startup").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 1, async move {
+            b.create(&ten, "Patient", patient(), version).await
+        })
+        .await;
+        let lu1 = row_of(&backend, &t, "p").await.last_updated;
+        let old = whole_ms(Utc::now() - chrono::Duration::hours(2));
+        let key = RowKey {
+            tenant_id: &t,
+            resource_type: "Patient",
+            id: "p",
+        };
+        let old_key = IntentKey::new(&t, "p", old);
+        backend
+            .write_intent(&old_key, &key, Uuid::new_v4(), 1)
+            .await
+            .unwrap();
+        let state = SweepState::new(Utc::now(), CancellationToken::new());
+        let minute = chrono::Duration::minutes(1);
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        let report = backend
+            .startup_scan(&state, old - minute, old + minute, &scope)
+            .await;
+        let expected: usize = (0..INTENT_SHARDS as i16)
+            .map(|shard| plan_slices(shard, old - minute, old + minute, startup_slice()).len())
+            .sum();
+        assert_eq!(report.slices, expected as u64, "{report}");
+        assert_eq!(
+            (report.intents, report.current, report.done),
+            (1, 1, 1),
+            "{report}"
+        );
+        assert_eq!(
+            backend.sweeper_stats().since(&before).startup_slices,
+            expected as u64
+        );
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu1, 1)]);
+        let slice = &plan_slices(old_key.shard(), old - minute, old + minute, startup_slice())[0];
+        let mut left = 0;
+        for slice in plan_slices(slice.shard, old - minute, old + minute, startup_slice()) {
+            let (read, _) = backend.read_slice(&slice, Rank::Normal).await.unwrap();
+            left += read.iter().filter(|intent| intent.tenant_id == t).count();
+        }
+        assert_eq!(left, 0, "the old intent row is gone");
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+        let report = pass(&backend, &[&t], since).await;
+        assert_eq!(report.done, 1, "{report}");
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+        say("startup", &backend, &before);
+    }
+
+    /// N17: a poll moves a mark only once its slices are read (SW8).
+    #[tokio::test]
+    async fn a_poll_moves_a_mark_only_once_its_slices_are_read() {
+        let Some((backend, t, _, _)) = start("sweeper-marks").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let now = Utc::now();
+        let start = now - chrono::Duration::minutes(2);
+        let state = SweepState::new(start, CancellationToken::new());
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        backend.session.inject_fault_on_first_page(
+            StatementKind::Read,
+            "FROM pending_index_writes",
+            Fault::FailWithUnavailable,
+        );
+        let report = backend.poll_once(&state, now, &scope).await;
+        assert_eq!(report.slice_errors, 1, "{report}");
+        let to = whole_ms(now - chrono::Duration::seconds(30));
+        let moved = (0..16).filter(|s| state.mark(*s) == to).count();
+        let held = (0..16)
+            .filter(|s| state.mark(*s) == whole_ms(start))
+            .count();
+        assert_eq!((moved, held), (15, 1));
+        let report = backend.poll_once(&state, now, &scope).await;
+        assert_eq!(report.slice_errors, 0, "{report}");
+        assert!((0..16).all(|s| state.mark(s) == to));
+        say("marks", &backend, &before);
+    }
+
+    /// R1 (SW26): the outbox's tombstones stay under the node's warning threshold under load.
+    /// Run by hand; the 10-minute run is the CI node's.
+    #[tokio::test]
+    #[ignore = "the 10-minute outbox tombstone run (SW26); run by hand"]
+    async fn outbox_tombstones_stay_under_the_warning_threshold_under_load() {
+        let Ok(url) = std::env::var("HFS_TEST_CASSANDRA_URL") else {
+            eprintln!("{SKIP}");
+            return;
+        };
+        let secs: u64 = std::env::var("HFS_TEST_SWEEPER_LOAD_SECS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(600);
+        assert!(
+            !(url.trim().ends_with(":59042") && secs > 60),
+            "the shared dev node takes at most 60 s of load"
+        );
+        let backend = harness::backend().await.expect("backend");
+        let t = tenant_id("sweeper-load");
+        let started = Utc::now();
+        let state = SweepState::new(started, CancellationToken::new());
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        let before = backend.sweeper_stats();
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let (mut n, mut tick) = (0u64, 0u64);
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            ticker.tick().await;
+            tick += 1;
+            let work: Vec<_> = (0..20)
+                .map(|_| {
+                    n += 1;
+                    let id = format!("p{n}");
+                    let (backend, t) = (backend.clone(), t.clone());
+                    async move {
+                        let intent = IntentKey::new(&t, &id, Utc::now());
+                        let key = RowKey {
+                            tenant_id: &t,
+                            resource_type: "Patient",
+                            id: &id,
+                        };
+                        backend
+                            .write_intent(&intent, &key, Uuid::new_v4(), 1)
+                            .await
+                            .expect("write intent");
+                        backend.delete_intent(&intent, &key).await;
+                    }
+                })
+                .collect();
+            futures::stream::iter(work)
+                .buffer_unordered(32)
+                .collect::<Vec<_>>()
+                .await;
+            if tick % 50 == 0 {
+                backend.poll_once(&state, Utc::now(), &scope).await;
+            }
+        }
+        let delta = backend.sweeper_stats().since(&before);
+        let tombstones = backend
+            .session
+            .rows(
+                "SELECT count, max, p99th FROM system_views.tombstones_per_read \
+                 WHERE keyspace_name = ? AND table_name = 'pending_index_writes'",
+                vec![Value::from(backend.config.keyspace.as_str())],
+                StatementKind::Read,
+            )
+            .await
+            .ok()
+            .and_then(|rows| {
+                rows.first().map(|row| {
+                    let number = |name: &str| {
+                        IntoRustByName::<i64>::get_by_name(row, name)
+                            .ok()
+                            .flatten()
+                            .map(|v| v.to_string())
+                            .or_else(|| {
+                                IntoRustByName::<f64>::get_by_name(row, name)
+                                    .ok()
+                                    .flatten()
+                                    .map(|v| v.to_string())
+                            })
+                            .unwrap_or_else(|| "unavailable".into())
+                    };
+                    (number("max"), number("p99th"))
+                })
+            })
+            .unwrap_or_else(|| ("unavailable".into(), "unavailable".into()));
+        eprintln!(
+            "[sweeper-load secs={secs} intents={n} polls={} slices={} tombstone_warnings={} \
+             tombstones_max={} tombstones_p99={}]",
+            delta.polls, delta.slices_read, delta.tombstone_warnings, tombstones.0, tombstones.1
+        );
+        assert_eq!(delta.tombstone_warnings, 0);
+    }
+}

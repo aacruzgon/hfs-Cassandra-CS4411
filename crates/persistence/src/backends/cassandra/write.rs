@@ -5069,9 +5069,14 @@ mod tests {
 mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
+    use crate::backends::cassandra::consistency::harness::{check, expect};
+    use crate::backends::cassandra::consistency::{
+        Registry, ScanMode, Scope, assert_consistent, index_consistency,
+    };
     use crate::backends::cassandra::session::{Fault, TimeoutWriteType};
     use crate::core::ResourceStorage;
     use crate::tenant::{TenantId, TenantPermissions};
+    use serde_json::json;
 
     async fn backend() -> Option<CassandraBackend> {
         let url = std::env::var("HFS_TEST_CASSANDRA_URL")
@@ -6202,6 +6207,539 @@ mod node_tests {
             .await
             .expect("pending_index_writes");
         assert_eq!(intents.len(), 1, "the intent is kept for the sweeper");
+    }
+
+    fn version() -> FhirVersion {
+        crate::backends::cassandra::test_support::test_fhir_version()
+    }
+
+    const SYS: &str = "http://example.org/ids";
+    const B0: i64 = 325_987_200_000; // 1980-05-01T00:00:00Z
+    const B1: i64 = 326_073_600_000; // 1980-05-02T00:00:00Z
+
+    /// `"sha256:"` and the lowercase hex of SHA-256 over `value`'s bytes.
+    fn digest(value: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let hex: String = Sha256::digest(value.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("sha256:{hex}")
+    }
+
+    /// `n` bytes of `c`.
+    fn long(n: usize, c: char) -> String {
+        c.to_string().repeat(n)
+    }
+
+    /// Rows of `cql` for `(tenant, Patient, param, …)`, as `(id, version_id)`.
+    async fn tag_rows(
+        backend: &CassandraBackend,
+        cql: &str,
+        values: Vec<Value>,
+    ) -> Vec<(String, i32)> {
+        backend
+            .session
+            .rows(cql, values, StatementKind::Read)
+            .await
+            .expect("index rows")
+            .iter()
+            .map(|row| {
+                (
+                    row.get_r_by_name("id").unwrap(),
+                    row.get_r_by_name("version_id").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// IW7 with real keys (gate): an update that keeps the birth date leaves
+    /// its `date_index` and `date_index_by_end` rows, re-tagged with the new
+    /// version at the new write time, and moves the token rows.
+    #[tokio::test]
+    async fn a_kept_birth_date_survives_an_update() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("birthdate");
+        let t = tenant.tenant_id().as_str();
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"p","gender":"male","birthDate":"1980-05-01"}),
+                version(),
+            )
+            .await
+            .unwrap();
+        backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType":"Patient","id":"p","gender":"female","birthDate":"1980-05-01"}),
+            )
+            .await
+            .unwrap();
+        let r1 = current(&backend, &tenant).await;
+        assert_eq!(r1.version_id, 2);
+        let ts2 = write_ts_of(r1.last_updated);
+
+        let date_rows = |table: &'static str, first: &'static str, second: &'static str| {
+            let backend = &backend;
+            async move {
+                let rows = backend
+                    .session
+                    .rows(
+                        &format!(
+                            "SELECT id, {first}, {second}, version_id, \
+                             WRITETIME(version_id) AS written FROM {table} \
+                             WHERE tenant_id = ? AND resource_type = ? AND param = ?"
+                        ),
+                        vec![
+                            Value::from(t),
+                            Value::from("Patient"),
+                            Value::from("birthdate"),
+                        ],
+                        StatementKind::Read,
+                    )
+                    .await
+                    .expect("date rows");
+                rows.iter()
+                    .map(|row| {
+                        let at = |name: &str| {
+                            let at: DateTime<Utc> = row.get_r_by_name(name).unwrap();
+                            at.timestamp_millis()
+                        };
+                        let id: String = row.get_r_by_name("id").unwrap();
+                        let version_id: i32 = row.get_r_by_name("version_id").unwrap();
+                        let written: i64 = row.get_r_by_name("written").unwrap();
+                        (id, at(first), at(second), version_id, written)
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            date_rows("date_index", "start", "end").await,
+            vec![("p".to_string(), B0, B1, 2, ts2)]
+        );
+        assert_eq!(
+            date_rows("date_index_by_end", "end", "start").await,
+            vec![("p".to_string(), B1, B0, 2, ts2)]
+        );
+
+        let token = |code: &'static str| {
+            tag_rows(
+                &backend,
+                "SELECT id, version_id FROM token_code_index \
+                 WHERE tenant_id = ? AND resource_type = ? AND param = ? AND code = ?",
+                vec![
+                    Value::from(t),
+                    Value::from("Patient"),
+                    Value::from("gender"),
+                    Value::from(code),
+                ],
+            )
+        };
+        assert_eq!(token("male").await, vec![], "the old token row is gone");
+        assert_eq!(token("female").await, vec![("p".to_string(), 2)]);
+        assert_consistent(&check(&backend, t).await);
+    }
+
+    /// IW9 B (gate): when one index batch fails every try, only its units are
+    /// missing; the old `resources_by_type` row is kept, the other batches are
+    /// written, and the intent stays for the sweeper.
+    #[tokio::test]
+    async fn a_failed_pair_batch_keeps_the_old_row_and_the_intent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("pair-batch");
+        let t = tenant.tenant_id().as_str();
+        let body = json!({
+            "resourceType": "Patient", "id": "p", "active": true,
+            "identifier": (0..4)
+                .map(|i| json!({"system": SYS, "value": format!("{i}{}", long(999, 'v'))}))
+                .collect::<Vec<_>>(),
+        });
+        backend
+            .create(&tenant, "Patient", body.clone(), version())
+            .await
+            .unwrap();
+        let row1 = current(&backend, &tenant).await;
+        let (json, data) = normalized_body("update", "Patient", "p", body).unwrap();
+        let keys = backend.index_keys_of(t, "Patient", &json);
+        let plan = CasPlan::update(PreviousVersion::from_row(&row1).unwrap(), json, data, keys);
+        // The packing the writer will use; byte sizes do not depend on the
+        // timestamp's value.
+        let packed = index_batches(
+            &key_of(&tenant),
+            &index_delta(
+                &plan.previous_rows(),
+                plan.version_keys(row1.last_updated + chrono::Duration::milliseconds(1)),
+            ),
+            1,
+        );
+        let batches = packed.batches.len() as u64;
+        assert!(batches >= 2, "{batches} batches");
+        let n1 = packed
+            .batches
+            .iter()
+            .find(|batch| {
+                batch
+                    .iter()
+                    .any(|statement| statement.cql() == INSERT_RESOURCES_BY_TYPE.as_str())
+            })
+            .expect("the batch holding X1")
+            .iter()
+            .filter(|statement| statement.cql().starts_with("INSERT"))
+            .count();
+        for _ in 0..POST_CAS_WRITE_TRIES {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resources_by_type",
+                Fault::FailWithUnavailable,
+            );
+        }
+        let since = Utc::now();
+        let (before, counted) = (backend.cas_stats(), backend.statement_counts());
+        let mut request = backend.cas_request("update", key_of(&tenant));
+        let applied = applied_of(backend.run_cas(&mut request, plan).await.unwrap());
+        let stats = backend.cas_stats().since(&before);
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(applied.version_id, 2);
+        assert!(!applied.post_cas_complete);
+        assert_eq!(applied.index.batches, batches);
+        assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
+        assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
+        assert_eq!(
+            spent.batch,
+            batches - 1 + u64::from(POST_CAS_WRITE_TRIES),
+            "{spent}"
+        );
+        assert_eq!(
+            by_type_versions(&backend, &tenant).await,
+            vec![1],
+            "the old row is kept"
+        );
+        assert_eq!(
+            check(&backend, t).await.kinds(),
+            expect(&[("missing_row", n1), ("stray_row", n1)]),
+            "only the failed batch's units"
+        );
+        assert_eq!(backend.intent_versions(t, "Patient", "p", since).await, [2]);
+    }
+
+    /// IW6 on every write path (ADR-aacruzgon-0079): a long value is hashed
+    /// once when a key set is made, and a later write deletes the stored
+    /// digests as they are.
+    #[tokio::test]
+    async fn a_long_value_is_hashed_once_on_every_write_path() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("hashed-once");
+        let t = tenant.tenant_id().as_str();
+        let long_value = |n: usize| format!("{n:x<1025}");
+        let body = |id: &str, n: usize| {
+            json!({
+                "resourceType": "Patient", "id": id, "active": true,
+                "identifier": [
+                    {"system": SYS, "value": long_value(n)},
+                    {"system": SYS, "value": "sha256:short"},
+                ],
+            })
+        };
+        let hashed_ok = |keys: &[IndexKey], n: usize| {
+            let raw = long_value(n);
+            let id = |code: &str| {
+                [
+                    IndexKey::TokenCode {
+                        param: "identifier".into(),
+                        code: code.into(),
+                        system: SYS.into(),
+                    },
+                    IndexKey::TokenSystemCode {
+                        param: "identifier".into(),
+                        system: SYS.into(),
+                        code: code.into(),
+                    },
+                    IndexKey::TokenSystem {
+                        param: "identifier".into(),
+                        system: SYS.into(),
+                        code: code.into(),
+                    },
+                ]
+            };
+            for expected in id(&digest(&raw))
+                .into_iter()
+                .chain(id(&digest("sha256:short")))
+            {
+                assert!(keys.contains(&expected), "{expected:?}");
+            }
+            for key in keys {
+                let texts: Vec<&str> = match key {
+                    IndexKey::TokenCode { code, system, .. }
+                    | IndexKey::TokenSystemCode { code, system, .. }
+                    | IndexKey::TokenSystem { code, system, .. } => vec![code, system],
+                    _ => vec![],
+                };
+                assert!(
+                    texts
+                        .iter()
+                        .all(|text| *text != raw && *text != "sha256:short"),
+                    "{key:?}"
+                );
+            }
+        };
+        let row_of = |id: &'static str| {
+            let (backend, t) = (&backend, t);
+            async move {
+                backend
+                    .read_resource_row(t, "Patient", id)
+                    .await
+                    .expect("R1")
+                    .expect("a row")
+            }
+        };
+
+        // 1. create.
+        let before = backend.cas_stats();
+        let a = backend
+            .create(&tenant, "Patient", body("a", 1), version())
+            .await
+            .unwrap();
+        let stats = backend.cas_stats().since(&before);
+        let r1 = row_of("a").await;
+        assert_eq!(stats.extractions, 1);
+        assert_eq!(
+            stats.cas_payload_bytes as usize,
+            r1.data.as_deref().map_or(0, str::len) + r1.index_keys.as_ref().map_or(0, Vec::len)
+        );
+        hashed_ok(&r1.keys().unwrap(), 1);
+
+        // 2. update.
+        let before = backend.cas_stats();
+        backend.update(&tenant, &a, body("a", 2)).await.unwrap();
+        assert_eq!(backend.cas_stats().since(&before).extractions, 1);
+        hashed_ok(&row_of("a").await.keys().unwrap(), 2);
+
+        // 3. create_or_update creates, 4. updates.
+        let before = backend.cas_stats();
+        let (_, created) = backend
+            .create_or_update(&tenant, "Patient", "b", body("b", 3), version())
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(backend.cas_stats().since(&before).extractions, 1);
+        hashed_ok(&row_of("b").await.keys().unwrap(), 3);
+        let before = backend.cas_stats();
+        let (_, created) = backend
+            .create_or_update(&tenant, "Patient", "b", body("b", 4), version())
+            .await
+            .unwrap();
+        assert!(!created);
+        assert_eq!(backend.cas_stats().since(&before).extractions, 1);
+        hashed_ok(&row_of("b").await.keys().unwrap(), 4);
+
+        // 5. delete, then revive.
+        backend.delete(&tenant, "Patient", "b").await.unwrap();
+        let before = backend.cas_stats();
+        let (_, created) = backend
+            .create_or_update(&tenant, "Patient", "b", body("b", 5), version())
+            .await
+            .unwrap();
+        assert!(created, "a revive reports a create");
+        assert_eq!(backend.cas_stats().since(&before).extractions, 1);
+        hashed_ok(&row_of("b").await.keys().unwrap(), 5);
+
+        assert_consistent(&check(&backend, t).await);
+    }
+
+    /// IW15: a batch the batchlog replays after a `BATCH_LOG` timeout, applied
+    /// late, is tried again and confirmed; the late apply is not counted.
+    #[tokio::test]
+    async fn a_batchlog_timeout_applied_late_is_retried_and_confirmed() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("batchlog-late");
+        let t = tenant.tenant_id().as_str();
+        backend
+            .create(&tenant, "Patient", patient(), version())
+            .await
+            .unwrap();
+        let row1 = current(&backend, &tenant).await;
+        let k = row1.keys().unwrap().len() as u64;
+        let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let keys = backend.index_keys_of(t, "Patient", &json);
+        let plan = CasPlan::update(PreviousVersion::from_row(&row1).unwrap(), json, data, keys);
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::ApplyLate {
+                before: StatementKind::Write,
+                write_type: TimeoutWriteType::BatchLog,
+            },
+        );
+        let since = Utc::now();
+        let (before, counted) = (backend.cas_stats(), backend.statement_counts());
+        let mut request = backend.cas_request("update", key_of(&tenant));
+        let applied = applied_of(backend.run_cas(&mut request, plan).await.unwrap());
+        let stats = backend.cas_stats().since(&before);
+        let spent = backend.statement_counts().since(&counted);
+        assert!(applied.post_cas_complete);
+        assert_eq!(stats.post_cas_failures, 0);
+        // V3, I1, V1, I2; two tries of the batch, the seam's late send not counted.
+        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (2, 4 * k), "{spent}");
+        assert_eq!(by_type_versions(&backend, &tenant).await, vec![2]);
+        assert_eq!(
+            backend.intent_versions(t, "Patient", "p", since).await,
+            Vec::<i32>::new()
+        );
+        assert_consistent(&check(&backend, t).await);
+    }
+
+    /// IW12: a write's index batches are never more than
+    /// [`INDEX_BATCHES_IN_FLIGHT`] at once.
+    #[tokio::test]
+    async fn index_batches_in_flight_never_exceed_eight() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("in-flight");
+        let t = tenant.tenant_id().as_str();
+        let body = json!({
+            "resourceType": "Patient", "id": "p", "active": true,
+            "identifier": (0..20)
+                .map(|i| json!({"system": SYS, "value": format!("{i:02}{}", long(998, 'v'))}))
+                .collect::<Vec<_>>(),
+        });
+        let counted = backend.statement_counts();
+        backend
+            .create(&tenant, "Patient", body, version())
+            .await
+            .unwrap();
+        let spent = backend.statement_counts().since(&counted);
+        eprintln!("[index-batches-in-flight batches={}]", spent.batch);
+        assert!(spent.batch >= 9, "{spent}");
+        assert_eq!(
+            backend.session.max_batches_in_flight(),
+            INDEX_BATCHES_IN_FLIGHT
+        );
+        assert_consistent(&check(&backend, t).await);
+    }
+
+    /// IW1: a stored SearchParameter whose expression fails at run time is
+    /// skipped and counted; the write goes ahead without its rows.
+    #[tokio::test]
+    async fn a_failing_search_parameter_is_skipped_and_counted() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("failing-param");
+        let t = tenant.tenant_id().as_str();
+        let url = format!(
+            "http://example.org/SearchParameter/broken-{}",
+            Uuid::new_v4()
+        );
+        backend
+            .create(
+                &tenant,
+                "SearchParameter",
+                json!({
+                    "resourceType": "SearchParameter", "id": "broken", "url": url,
+                    "name": "broken", "status": "active", "description": "fails at run time",
+                    "code": "broken", "base": ["Patient"], "type": "token",
+                    "expression": "Patient.name.single()"
+                }),
+                version(),
+            )
+            .await
+            .unwrap();
+        let before = backend.cas_stats();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient", "id": "p", "gender": "male",
+                    "name": [{"family": "One"}, {"family": "Two"}]
+                }),
+                version(),
+            )
+            .await
+            .unwrap();
+        let stats = backend.cas_stats().since(&before);
+        assert_eq!(
+            (
+                stats.extractions,
+                stats.extraction_failures,
+                stats.extraction_fallbacks
+            ),
+            (1, 1, 0),
+            "{stats}"
+        );
+        let keys = backend
+            .read_resource_row(t, "Patient", "p")
+            .await
+            .unwrap()
+            .unwrap()
+            .keys()
+            .unwrap();
+        assert!(keys.contains(&IndexKey::TokenCode {
+            param: "gender".into(),
+            code: "male".into(),
+            system: crate::search::IMPLICIT_TOKEN_SYSTEM.into(),
+        }));
+        assert!(!keys.iter().any(|key| matches!(key,
+            IndexKey::TokenCode { param, .. } if param == "broken")));
+        assert_consistent(
+            &index_consistency(
+                &backend,
+                t,
+                Scope::Tenant,
+                ScanMode::Full,
+                Registry::Changed,
+            )
+            .await,
+        );
+    }
+
+    /// D6: a resource that cannot be extracted keeps only its type key, and
+    /// nothing is sent to the node.
+    #[tokio::test]
+    async fn a_resource_that_cannot_be_extracted_keeps_only_its_type_key() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (before, counted) = (backend.cas_stats(), backend.statement_counts());
+        for body in [
+            json!(["x"]),
+            json!({"resourceType": "Observation", "id": "p"}),
+        ] {
+            assert_eq!(
+                backend.index_keys_of("test-engine-fallback", "Patient", &body),
+                vec![IndexKey::ResourcesByType]
+            );
+        }
+        let stats = backend.cas_stats().since(&before);
+        assert_eq!(
+            (
+                stats.extractions,
+                stats.extraction_fallbacks,
+                stats.extraction_failures
+            ),
+            (2, 2, 0)
+        );
+        assert_eq!(backend.statement_counts().since(&counted).total(), 0);
     }
 
     /// IW16: the index phase has one deadline over its tries and pauses.

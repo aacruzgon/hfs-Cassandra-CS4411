@@ -166,7 +166,7 @@ Partition: `(T, P, id)` of `resource_versions`, a different table from `resource
 Each version row stores `K(V)`, the index rows that version wrote, and the `resources` row holds the current version's copy, written by the CAS (ADR-aacruzgon-0027). Old keys are read back, not re-extracted, because the registry changes at runtime per tenant: a `SearchParameter` write invalidates the tenant's registry (`crates/persistence/src/backends/sqlite/storage.rs:520-529` in SQLite; the design gives Cassandra the same per-tenant `TenantSearchRegistries`). Re-extracting `K(N)` with today's registry would miss rows `N` wrote, and those orphans would cost point reads, count against the candidate cap, and never be cleaned.
 
 - **Encoding.** Format 1, documented in `schema.cql` above `resource_versions`: a format byte `0x01`, a varint row count, then per row a table tag and the key columns the version row does not imply (`tenant_id`, `resource_type`, `id` and `last_updated` are the row's own). Strings are varint-length-prefixed UTF-8, timestamps 8-byte milliseconds. A later format gets a new first byte, and readers keep reading format 1.
-- **Size.** The worked example's `K(1)`, 8 rows, is 289 bytes; `K(2)` is 293 (`female` for `male`); a marker's empty set is 2 bytes (computed from the encoding, section 7). The `index_text` mapping bounds each `param`, `system`, `code` and `uri` at 1,024 bytes (ADR-aacruzgon-0079), so a blob grows by at most 3,079 bytes per row: a tag byte, then three such strings, each with a 2-byte length prefix. The blob is in a single-partition write, which the batch thresholds do not check (`spike-findings.md`, B1).
+- **Size.** The worked example's `K(1)`, 10 rows, is 323 bytes; `K(2)` is 327 (`female` for `male`); a marker's empty set is 2 bytes (computed from the encoding, section 7). The `index_text` mapping bounds each `param`, `system`, `code` and `uri` at 1,024 bytes (ADR-aacruzgon-0079), so a blob grows by at most 3,079 bytes per row: a tag byte, then three such strings, each with a 2-byte length prefix. The blob is in a single-partition write, which the batch thresholds do not check (`spike-findings.md`, B1).
 - **Written** with the version, in statements that already run, so no extra write:
     - in `resources`, by every CAS: C1, C2 and C4 write `K(N+1)`, and C3 the empty set;
     - in `resource_versions`, in the same row and statement as the version: V1 and V2 at step 4, V3 at step 2, and the sweeper's replay.
@@ -184,7 +184,7 @@ Each version row stores `K(V)`, the index rows that version wrote, and the `reso
     4. A resumes and inserts `K_A(N+1)` at `ts(N+1)`. Keys in `K_A(N+1)` but not in `K_B(N+1)` or `K(N+2)` were never deleted: orphans tagged `N+1`. The sweeper did not help: it deletes `K(N)` for a superseded intent, never `K(N+1)`.
 
     Now B's R1 reads `resources` at `N+1`, whose `index_keys` is exactly `K_A(N+1)`, because A's CAS wrote it. B's CAS is conditioned on `version_id = N+1`, so B deletes `K_A(N+1) \ K(N+2)` at `ts(N+2)` and inserts `K(N+2)` at `ts(N+2)`. Each of A's late inserts at `ts(N+1)` is then either deleted by a newer tombstone or overwritten by B's newer insert, and A's late V1 for row `N+1` writes the same blob B's V3 wrote. No orphan is left. Checked on a 5.0.9 node, 2026-11-05: a key only in `K_A` stayed deleted after A's late insert, a key in both kept tag `N+2`, and row `N+1` held A's 289-byte blob. Carrying `K(N+1)` in A's intent row instead would not close it: B cannot find A's intent, whose key includes A's `enqueued_at`, and A deletes its intent when it resumes.
-- **Cost.** The blob travels in every CAS's Paxos proposal and commit, and makes the `resources` row larger by the same amount: 289 bytes for the worked example's `K(1)`, and 2 for a delete's empty set (section 7). That example's `data` is about 140 bytes of JSON, without `meta`, so on that Patient the blob doubles what the CAS carries. A fixture resource's `data` is usually larger; the fixture sizes are measured in Step 8 (roadmap section 7). The CAS is already one partition and one statement, so its round trips do not change.
+- **Cost.** The blob travels in every CAS's Paxos proposal and commit, and makes the `resources` row larger by the same amount: 323 bytes for the worked example's `K(1)`, and 2 for a delete's empty set (section 7). That example's `data` is about 140 bytes of JSON, without `meta`, so on that Patient the blob more than doubles what the CAS carries. A fixture resource's `data` is usually larger; the fixture sizes are measured in Step 8 (roadmap section 7). The CAS is already one partition and one statement, so its round trips do not change.
 - **Why both copies are kept.** `resources` holds only the current version's set. The sweeper needs `K(V-1)` once `V` is current, from row `V-1`. Every version row keeps its own set, so a row V3 restores is complete and any version's keys can be checked against what it wrote (roadmap Step 5's exit criterion).
 - **Versions written before the column.** None exist: no Cassandra data predates this schema, so every `resources` and version row has `index_keys`.
 - **Extra reads and round trips per operation.** "Extra round trips" counts V3 at step 2 (G40). It used to share a single-partition batch with V1 at step 4; now it is its own sequential write before the CAS. The statement count is unchanged.
@@ -758,24 +758,24 @@ Ten partitions, ten rows; at an estimated 150 to 250 bytes per row, one batch un
 
 ### Version 2: update (gender `male` → `female`)
 
-`current` is version 1. R1 reads `resources` at version 1, whose `index_keys` is `K(1)`, the table above (G22). V3 rewrites version 1 from R1 at `ts(1) − 1`, with its `write_id` `w1`, with the `K(1)` R1 returned, so the original wins and nothing changes. I1 `(tu(2), acme, Patient, p1)`, `w2`, `version_id 2`. C2 `IF version_id = 1 AND deleted_at = 0` applies: `version_id 2`, `lu(2)`, `ts(2)`, `w2`, new `data`, `index_keys` `K(2)`, 293 bytes. V1 writes version 2 at `ts(2)`, with the same `K(2)`. Index changes, all `USING TIMESTAMP 1791972300456000`:
+`current` is version 1. R1 reads `resources` at version 1, whose `index_keys` is `K(1)`, the table above (G22). V3 rewrites version 1 from R1 at `ts(1) − 1`, with its `write_id` `w1`, with the `K(1)` R1 returned, so the original wins and nothing changes. I1 `(tu(2), acme, Patient, p1)`, `w2`, `version_id 2`. C2 `IF version_id = 1 AND deleted_at = 0` applies: `version_id 2`, `lu(2)`, `ts(2)`, `w2`, new `data`, `index_keys` `K(2)`, 327 bytes. V1 writes version 2 at `ts(2)`, with the same `K(2)`. Index changes, all `USING TIMESTAMP 1791972300456000`:
 
-- **6 deletes:** every non-date row of `K(1)`.
-- **8 inserts, tag 2:** `K(2)`, which is `K(1)` with `lu(2)` for `lu(1)` and `female` for `male`. The two date keys are unchanged, so they are only re-inserted (tag 1 → 2).
+- **8 deletes:** every non-date row of `K(1)`, the two `deceased` rows included.
+- **10 inserts, tag 2:** `K(2)`, which is `K(1)` with `lu(2)` for `lu(1)` and `female` for `male`. The two date keys are unchanged, so they are only re-inserted (tag 1 → 2).
 
-Then I2. Six row tombstones, one in each of six partitions. The identifier did not change, but its rows move, because `last_updated` is in the key.
+Then I2. Eight row tombstones, one in each of eight partitions. The identifier did not change, but its rows move, because `last_updated` is in the key.
 
 **Between C2 and the index writes** (the in-flight window), `resources` is at version 2 while every index row has tag 1. `identifier=MRN|12345` reads `(lu(1), p1)` tag 1, R1 says 2, so the patient is hidden; `gender=female` finds nothing yet. Afterwards both work and `gender=male` is empty.
 
 ### Version 3: delete
 
-REST read version 2 and, with no `If-Match`, called `delete`. R1 gives version 2, `data`, `lu(2)` and `K(2)`. V3 rewrites version 2 from R1's `data` at `ts(2) − 1`. I1 `(tu(3), acme, Patient, p1)`, `w3`, `version_id 3`. C3 `IF version_id = 2 AND deleted_at = 0` applies: `version_id 3`, `deleted_at` and `last_updated` `lu(3)`, `ts(3)`, `w3`, `index_keys` the empty set (`data` kept, G29). V2 writes the marker, version 3, no `data`, with the empty key set (2 bytes), at `ts(3)`. Then 8 deletes at `ts(3)` (`USING TIMESTAMP 1791972600789000`), every key of `K(2)`, including the two date rows; then I2.
+REST read version 2 and, with no `If-Match`, called `delete`. R1 gives version 2, `data`, `lu(2)` and `K(2)`. V3 rewrites version 2 from R1's `data` at `ts(2) − 1`. I1 `(tu(3), acme, Patient, p1)`, `w3`, `version_id 3`. C3 `IF version_id = 2 AND deleted_at = 0` applies: `version_id 3`, `deleted_at` and `last_updated` `lu(3)`, `ts(3)`, `w3`, `index_keys` the empty set (`data` kept, G29). V2 writes the marker, version 3, no `data`, with the empty key set (2 bytes), at `ts(3)`. Then 10 deletes at `ts(3)` (`USING TIMESTAMP 1791972600789000`), every key of `K(2)`, including the two date rows; then I2.
 
 Now `read` and vread 3 return 410; vread 2 returns version 2's content with 200; every search misses the patient.
 
 ### Version 4: revive
 
-`PUT /Patient/p1` with the version 2 content. REST's read returned `Gone`, so it called `create_or_update`. R1: version 3, `deleted_at > 0`, so branch c, and R1's `index_keys`, `K(3)`, is empty. V3 rewrites the version 3 marker at `ts(3) − 1`, `deleted_at` set, `data` unset. I1 `(tu(4), acme, Patient, p1)`, `w4`, `version_id 4`. C4 `IF version_id = 3` applies: `version_id 4`, `lu(4)`, `ts(4)`, `w4`, `data`, `index_keys` `K(4)`, `deleted_at = 0` (an ordinary cell, newer than the delete's; no tombstone, G39). V1 writes version 4 at `ts(4)`, with the same `K(4)` (293 bytes: `last_updated` is implied by the row, so `K(4)` encodes as `K(2)` does). `K(3)` is empty, so 8 inserts and no deletes, at `ts(4)` (`USING TIMESTAMP 1791972900012000`), tag 4: `K(2)` with `lu(4)` for `lu(2)`. Then I2. Returned: 201 (`created = true`), `ETag: W/"4"`.
+`PUT /Patient/p1` with the version 2 content. REST's read returned `Gone`, so it called `create_or_update`. R1: version 3, `deleted_at > 0`, so branch c, and R1's `index_keys`, `K(3)`, is empty. V3 rewrites the version 3 marker at `ts(3) − 1`, `deleted_at` set, `data` unset. I1 `(tu(4), acme, Patient, p1)`, `w4`, `version_id 4`. C4 `IF version_id = 3` applies: `version_id 4`, `lu(4)`, `ts(4)`, `w4`, `data`, `index_keys` `K(4)`, `deleted_at = 0` (an ordinary cell, newer than the delete's; no tombstone, G39). V1 writes version 4 at `ts(4)`, with the same `K(4)` (327 bytes: `last_updated` is implied by the row, so `K(4)` encodes as `K(2)` does). `K(3)` is empty, so 10 inserts and no deletes, at `ts(4)` (`USING TIMESTAMP 1791972900012000`), tag 4: `K(2)` with `lu(4)` for `lu(2)`. Then I2. Returned: 201 (`created = true`), `ETag: W/"4"`.
 
 The two date keys are the ones version 3 deleted. They come back because the insert at `ts(4)` is newer than the delete at `ts(3)`. With equal timestamps the delete would win, which is why `ts` must strictly increase per resource.
 
@@ -783,26 +783,27 @@ The two date keys are the ones version 3 deleted. They come back because the ins
 
 | Table | Live rows for `p1` | Row tombstones left by `p1` |
 | --- | --- | --- |
-| `resources` | 1 row, version 4, with the 293-byte `K(4)` as `index_keys`, `deleted_at` 0 | 0 |
-| `resource_versions` | versions 1, 2, 3 (marker), 4, with 289 + 293 + 2 + 293 = 877 bytes of `index_keys` | 0 |
+| `resources` | 1 row, version 4, with the 327-byte `K(4)` as `index_keys`, `deleted_at` 0 | 0 |
+| `resource_versions` | versions 1, 2, 3 (marker), 4, with 323 + 327 + 2 + 327 = 979 bytes of `index_keys` | 0 |
 | `pending_index_writes` `('2026-10-14T10', 7)` | 0 | 4 |
 | `resources_by_type` | `(lu(4), p1)` tag 4 | 2 (`lu(1)`, `lu(2)`) |
 | identifier, 3 token partitions | one row each at `lu(4)`, tag 4 | 2 each (`lu(1)`, `lu(2)`) |
+| `deceased` `false`: `token_code_index`, `token_system_code_index` | one row each at `lu(4)`, tag 4 | 2 each (`lu(1)`, `lu(2)`) |
 | gender `male`: `token_code_index`, `token_system_code_index` | 0 | 1 each |
 | gender `female`: `token_code_index`, `token_system_code_index` | one row each at `lu(4)`, tag 4 | 1 each |
 | `date_index`, `date_index_by_end` | one row each, tag 4 | the `ts(3)` delete, shadowed by the `ts(4)` insert until compaction |
 
-`list_versions` returns `["1", "2", "3", "4"]`. Four writes left 14 index row tombstones (6 from the update, 8 from the delete; the two date ones are shadowed by version 4) and 4 intent tombstones, for one resource. The three V3 rewrites changed nothing and left no tombstones.
+`list_versions` returns `["1", "2", "3", "4"]`. Four writes left 18 index row tombstones (8 from the update, 10 from the delete; the two date ones are shadowed by version 4) and 4 intent tombstones, for one resource. The three V3 rewrites changed nothing and left no tombstones.
 
 ### What a crash would change
 
 - **Killed after I1 of version 2** (no CAS): after 30 s the sweeper reads `resources` at `LOCAL_QUORUM` and sees version 1, below the intent's 2. A compare-and-swap could still be in flight, so it reads again at `LOCAL_SERIAL`, still sees version 1, and deletes the intent. Nothing else changes.
 - **Killed after C2 of version 2** (no version row, no index writes): `read` returns version 2 at once, but vread 2 is 404 until the sweep (G2). Search hides the patient. The sweeper's quorum read finds version 2 current and returns `K(2)`, which C2 wrote; `K(1)` is row 1's `index_keys`. It writes row 2 from the `resources` row, with that `K(2)` as `index_keys`, deletes `K(1) \ K(2)`, inserts `K(2)` at `ts(2)`, and deletes the intent.
 - **Same crash, but version 3 (the delete) lands before the sweeper runs.**
-    - The delete's R1 gives version 2's content and `K(2)`, which C2 wrote (G22). Its V3, before C3, restores row 2 at `ts(2) − 1`, with that `K(2)` as `index_keys`. It deletes `K(2)` at `ts(3)`; of those 8 keys only the two date keys exist (equal to `K(1)`'s, tag 1), so the date rows go.
-    - Left behind: the 6 non-date rows of `K(1)`, tag 1: `resources_by_type (lu(1), p1)`, three identifier rows and two gender `male` rows. The tag check hides them; `count` is 1 for a deleted patient (G7).
-    - The sweeper finds `resources` at 3, above the intent's 2: version 2 is superseded. It reads `ts(2)` from row 2 and `K(1)` from row 1's `index_keys`, deletes all 8 keys of `K(1)` at `ts(2)` (the 6 orphans, and the two date keys version 3 already deleted), inserts nothing, then runs I2.
-    - After the sweep: vread 2 is 200, `list_versions` is `["1", "2", "3"]`, `count` is 0. As in the crash-free run there are 14 index row tombstones (the two date keys carry both deletes, merged into one each); only the shadowed `K(2)` inserts are missing.
+    - The delete's R1 gives version 2's content and `K(2)`, which C2 wrote (G22). Its V3, before C3, restores row 2 at `ts(2) − 1`, with that `K(2)` as `index_keys`. It deletes `K(2)` at `ts(3)`; of those 10 keys only the two date keys exist (equal to `K(1)`'s, tag 1), so the date rows go.
+    - Left behind: the 8 non-date rows of `K(1)`, tag 1: `resources_by_type (lu(1), p1)`, three identifier rows, two gender `male` rows and two `deceased` rows. The tag check hides them; `count` is 1 for a deleted patient (G7).
+    - The sweeper finds `resources` at 3, above the intent's 2: version 2 is superseded. It reads `ts(2)` from row 2 and `K(1)` from row 1's `index_keys`, deletes all 10 keys of `K(1)` at `ts(2)` (the 8 orphans, and the two date keys version 3 already deleted), inserts nothing, then runs I2.
+    - After the sweep: vread 2 is 200, `list_versions` is `["1", "2", "3"]`, `count` is 0. As in the crash-free run there are 18 index row tombstones (the two date keys carry both deletes, merged into one each); only the shadowed `K(2)` inserts are missing.
 
 ## 8. Gaps and questions for the session
 

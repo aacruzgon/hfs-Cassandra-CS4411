@@ -106,6 +106,8 @@ pub(crate) struct ResourceRow {
     /// The FHIR version the resource was created with, falling back to the
     /// build's default as [`fhir_version_of`] does.
     pub(crate) fhir_version: FhirVersion,
+    /// The stored `fhir_version` cell, verbatim; `None` when unset. A replay writes this text back (RW8).
+    pub(crate) stored_fhir_version: Option<String>,
     /// `write_ts(N)`, in microseconds.
     pub(crate) write_ts: Option<i64>,
     /// `w(N)`, the `write_id` of the CAS that wrote `N`.
@@ -146,6 +148,9 @@ impl ResourceRow {
                 .map_err(|error| internal(format!("pre-read: created_at: {error}")))?,
             deleted_at: deleted_at_of(row)?,
             fhir_version: fhir_version_of(row),
+            stored_fhir_version: IntoRustByName::<String>::get_by_name(row, "fhir_version")
+                .ok()
+                .flatten(),
             write_ts: row
                 .get_by_name("write_ts")
                 .map_err(|error| internal(format!("pre-read: write_ts: {error}")))?,
@@ -156,6 +161,14 @@ impl ResourceRow {
                 .map_err(|error| internal(format!("pre-read: index_keys: {error}")))?
                 .map(Blob::into_vec),
         })
+    }
+
+    /// The text a replay writes: the stored cell verbatim, or `fhir_version.as_mime_param()` when it is unset (RW8).
+    #[allow(dead_code)]
+    pub(crate) fn fhir_version_text(&self) -> &str {
+        self.stored_fhir_version
+            .as_deref()
+            .unwrap_or_else(|| self.fhir_version.as_mime_param())
     }
 
     /// Whether the row is a delete marker (`deleted_at > 0`).

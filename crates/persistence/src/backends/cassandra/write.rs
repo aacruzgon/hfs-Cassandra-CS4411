@@ -893,7 +893,7 @@ impl CasPlan {
             last_updated,
             deleted_at: marker.then_some(last_updated),
             data: self.data(),
-            fhir_version: self.fhir_version,
+            fhir_version: self.fhir_version.as_mime_param(),
             write_id: Some(write_id),
             keys_blob: if marker {
                 &index_keys::EMPTY
@@ -925,7 +925,7 @@ impl CasPlan {
         VersionKeys {
             version_id: self.target_version(),
             last_updated,
-            fhir_version: self.fhir_version,
+            fhir_version: self.fhir_version.as_mime_param(),
             keys: &self.keys,
         }
     }
@@ -960,8 +960,8 @@ pub(crate) struct VersionRow<'a> {
     pub(crate) deleted_at: Option<DateTime<Utc>>,
     /// The version's content; left unset when `None`, never null.
     pub(crate) data: Option<&'a str>,
-    /// The resource's FHIR version, fixed at create (G13).
-    pub(crate) fhir_version: FhirVersion,
+    /// The `fhir_version` text written: the request's `FhirVersion::as_mime_param`, or a replay's stored text, verbatim (RW8).
+    pub(crate) fhir_version: &'a str,
     /// The `write_id` of the CAS that wrote the version; left unset when
     /// `None` (a V3 whose `w(N)` R1 did not have), never null.
     pub(crate) write_id: Option<Uuid>,
@@ -985,7 +985,7 @@ pub(crate) fn version_row(key: &RowKey<'_>, row: &VersionRow<'_>, ts: i64) -> St
         Value::from(row.version_id),
     ];
     let tail = [
-        Value::from(row.fhir_version.as_mime_param()),
+        Value::from(row.fhir_version),
         Value::from(write_ts_of(row.last_updated)),
         row.write_id.map_or(Value::NotSet, Value::from),
         Value::from(Blob::from(row.keys_blob.to_vec())),
@@ -1022,7 +1022,7 @@ fn previous_version_row(key: &RowKey<'_>, previous: &PreviousVersion) -> Stateme
         last_updated: previous.last_updated,
         deleted_at: previous.deleted_at,
         data: previous.data.as_deref(),
-        fhir_version: previous.fhir_version,
+        fhir_version: previous.fhir_version.as_mime_param(),
         write_id: previous.write_id,
         keys_blob: &previous.keys_blob,
     };
@@ -1037,7 +1037,8 @@ fn previous_version_row(key: &RowKey<'_>, previous: &PreviousVersion) -> Stateme
 pub(crate) struct VersionKeys<'a> {
     pub(crate) version_id: i32,
     pub(crate) last_updated: DateTime<Utc>,
-    pub(crate) fhir_version: FhirVersion,
+    /// The `fhir_version` text written: the request's `FhirVersion::as_mime_param`, or a replay's stored text, verbatim (RW8).
+    pub(crate) fhir_version: &'a str,
     pub(crate) keys: &'a [IndexKey],
 }
 
@@ -1064,8 +1065,8 @@ pub(crate) struct IndexUnit<'a> {
 pub(crate) struct IndexDelta<'a> {
     /// The tag every inserted row carries.
     pub(crate) version_id: i32,
-    /// The `fhir_version` the `resources_by_type` row carries (G34).
-    pub(crate) fhir_version: FhirVersion,
+    /// The `resources_by_type` row carries it (G34). The `fhir_version` text written: the request's `FhirVersion::as_mime_param`, or a replay's stored text, verbatim (RW8).
+    pub(crate) fhir_version: &'a str,
     /// One unit per partition the delta touches, in partition order.
     pub(crate) units: Vec<IndexUnit<'a>>,
 }
@@ -1156,7 +1157,7 @@ fn index_statement(
                 Value::from(last_updated),
                 Value::from(key.id),
                 Value::from(delta.version_id),
-                Value::from(delta.fhir_version.as_mime_param()),
+                Value::from(delta.fhir_version),
                 Value::from(ts),
             ],
         )),
@@ -3261,7 +3262,8 @@ mod tests {
         VersionKeys {
             version_id: 2,
             last_updated,
-            fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                .as_mime_param(),
             keys,
         }
     }
@@ -3901,6 +3903,7 @@ mod tests {
             created_at: None,
             deleted_at: None,
             fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            stored_fhir_version: None,
             write_ts: None,
             write_id: None,
             index_keys: None,
@@ -5269,7 +5272,8 @@ mod node_tests {
             VersionKeys {
                 version_id: 2,
                 last_updated: lu2,
-                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                    .as_mime_param(),
                 keys: std::slice::from_ref(&x1),
             },
         );
@@ -5350,7 +5354,8 @@ mod node_tests {
             VersionKeys {
                 version_id: 1,
                 last_updated: Utc::now(),
-                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                    .as_mime_param(),
                 keys: &keys,
             },
         );
@@ -5592,7 +5597,8 @@ mod node_tests {
             VersionKeys {
                 version_id: 2,
                 last_updated: lu2,
-                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                    .as_mime_param(),
                 keys: &x1,
             },
         );
@@ -5651,7 +5657,8 @@ mod node_tests {
             VersionKeys {
                 version_id: 2,
                 last_updated: lu2,
-                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                    .as_mime_param(),
                 keys: &x1,
             },
         );

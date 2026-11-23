@@ -335,7 +335,14 @@ fn retry_key(intent: &Intent) -> RetryKey {
 pub(crate) struct RetryList {
     entries: BTreeMap<RetryKey, Entry>,
     cap: usize,
+    /// Keys of intents that hit an invariant three times, with each intent's `enqueued`: a later read
+    /// of the same row does not try it again until it passes the retry horizon (SW13).
+    gave_up: BTreeMap<RetryKey, DateTime<Utc>>,
+    gave_up_order: std::collections::VecDeque<RetryKey>,
 }
+
+/// Most keys of intents that gave up the retry list remembers; the oldest is forgotten first.
+const GAVE_UP_CAP: usize = 10_000;
 
 struct Entry {
     intent: Intent,
@@ -361,6 +368,25 @@ impl RetryList {
         Self {
             entries: BTreeMap::new(),
             cap,
+            gave_up: BTreeMap::new(),
+            gave_up_order: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Whether the list already owns `intent`'s row: it is waiting for its `next_at`, or it gave up and
+    /// is still inside the retry horizon. A slice read does not try such an intent again.
+    pub(crate) fn owns(&mut self, intent: &Intent, now: DateTime<Utc>) -> bool {
+        let key = retry_key(intent);
+        if self.entries.contains_key(&key) {
+            return true;
+        }
+        match self.gave_up.get(&key) {
+            Some(enqueued) if now < *enqueued + retry_horizon() => true,
+            Some(_) => {
+                self.gave_up.remove(&key);
+                false
+            }
+            None => false,
         }
     }
 
@@ -394,7 +420,19 @@ impl RetryList {
             Failure::Invariant(_) => {
                 entry.invariant_failures += 1;
                 if entry.invariant_failures >= INVARIANT_TRIES {
+                    let enqueued = entry.intent.enqueued;
                     self.entries.remove(&key);
+                    if self.gave_up.insert(key.clone(), enqueued).is_none() {
+                        self.gave_up_order.push_back(key);
+                    }
+                    while self.gave_up.len() > GAVE_UP_CAP {
+                        match self.gave_up_order.pop_front() {
+                            Some(oldest) => {
+                                self.gave_up.remove(&oldest);
+                            }
+                            None => break,
+                        }
+                    }
                     return Queued::GaveUp;
                 }
                 entry.next_at = now + retry_first();
@@ -1067,7 +1105,9 @@ impl CassandraBackend {
             .map(|shard| async move {
                 let mut report = SweepReport::default();
                 let mut advance = true;
-                for slice in plan_slices(shard, state.mark(shard), to, poll_slice()) {
+                // Nothing older than the outbox's TTL is still there to read.
+                let from = state.mark(shard).max(to - retry_horizon());
+                for slice in plan_slices(shard, from, to, poll_slice()) {
                     if state.cancel.is_cancelled() {
                         advance = false;
                         break;
@@ -1278,10 +1318,15 @@ impl CassandraBackend {
         };
         self.sweeper.counters.tombstones(warnings);
         outcome.report.tombstone_warnings = warnings;
-        let intents: Vec<Intent> = intents
+        let mut intents: Vec<Intent> = intents
             .into_iter()
             .filter(|intent| scope.covers(&intent.tenant_id))
             .collect();
+        // The retry list owns an intent it holds, or gave up on: its backoff, not this read, decides.
+        if let Some(state) = state {
+            let mut retry = state.retry.lock();
+            intents.retain(|intent| !retry.owns(intent, now));
+        }
         outcome.report.intents = intents.len() as u64;
         self.sweeper.counters.seen(intents.len() as u64);
         outcome.overflow = self
@@ -3166,6 +3211,133 @@ mod node_tests {
         assert!(intents(&backend, &t, "p", since).await.is_empty());
         assert_consistent(&check(&backend, &t).await);
         say("startup", &backend, &before);
+    }
+
+    /// A resource row planted through a CAS, with `blob` as its `index_keys` and no version rows.
+    async fn plant_resource(
+        backend: &CassandraBackend,
+        t: &str,
+        id: &str,
+        version: i32,
+        blob: Vec<u8>,
+    ) {
+        let lu = whole_ms(Utc::now());
+        backend
+            .session
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, \
+                 last_updated, created_at, fhir_version, write_ts, write_id, index_keys, \
+                 deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0) IF NOT EXISTS",
+                vec![
+                    Value::from(t),
+                    Value::from("Patient"),
+                    Value::from(id),
+                    Value::from(version),
+                    Value::from("{\"resourceType\":\"Patient\"}"),
+                    Value::from(lu),
+                    Value::from(lu),
+                    Value::from(test_fhir_version().as_mime_param()),
+                    Value::from(write_ts_of(lu)),
+                    Value::from(Uuid::new_v4()),
+                    Value::from(Blob::from(blob)),
+                ],
+                StatementKind::Cas,
+            )
+            .await
+            .expect("plant");
+    }
+
+    /// Puts every mark back at `to`, as if a failed slice had held them.
+    fn rewind(state: &SweepState, to: DateTime<Utc>) {
+        *state.marks.lock() = [whole_ms(to); 16];
+    }
+
+    /// With a held mark, every poll re-reads the same slices; an intent the retry list holds is not run again before its backoff.
+    #[tokio::test]
+    async fn a_held_mark_does_not_rerun_an_intent_the_retry_list_holds() {
+        let Some((backend, t, tenant, since)) = start("sweeper-held").await else {
+            return;
+        };
+        let version = test_fhir_version();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 1, async move {
+            b.create(&ten, "Patient", patient(), version).await
+        })
+        .await;
+        let start_mark = Utc::now() - chrono::Duration::minutes(2);
+        let state = SweepState::new(start_mark, CancellationToken::new());
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::FailWithUnavailable,
+        );
+        let now = Utc::now() + chrono::Duration::seconds(40);
+        let first = backend.poll_once(&state, now, &scope).await;
+        assert_eq!((first.failed, first.done), (1, 0), "{first}");
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+
+        rewind(&state, start_mark);
+        let at = backend.sweeper_stats();
+        let second = backend
+            .poll_once(&state, now + chrono::Duration::seconds(1), &scope)
+            .await;
+        assert!(second.slices > 0, "{second}");
+        assert_eq!((second.intents, second.current), (0, 0), "{second}");
+        assert_eq!(backend.sweeper_stats().since(&at).case_current, 0);
+
+        rewind(&state, start_mark);
+        let third = backend
+            .poll_once(&state, now + chrono::Duration::seconds(6), &scope)
+            .await;
+        assert_eq!((third.current, third.done), (1, 1), "{third}");
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// An intent that hits an invariant is tried three times however many polls re-read its slice (SW13).
+    #[tokio::test]
+    async fn an_invariant_intent_stops_after_three_tries_across_polls() {
+        let Some((backend, t, _, since)) = start("planted-sweeper-held").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        plant_resource(
+            &backend,
+            &t,
+            "p",
+            2,
+            index_keys::encode(&[IndexKey::ResourcesByType]),
+        )
+        .await;
+        let key = RowKey {
+            tenant_id: &t,
+            resource_type: "Patient",
+            id: "p",
+        };
+        let intent_key = IntentKey::new(&t, "p", Utc::now());
+        backend
+            .write_intent(&intent_key, &key, Uuid::new_v4(), 2)
+            .await
+            .unwrap();
+        let start_mark = Utc::now() - chrono::Duration::minutes(2);
+        let state = SweepState::new(start_mark, CancellationToken::new());
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        let now = Utc::now() + chrono::Duration::seconds(40);
+        let mut gave_up = 0;
+        for step in [0, 6, 12, 18, 24] {
+            rewind(&state, start_mark);
+            let report = backend
+                .poll_once(&state, now + chrono::Duration::seconds(step), &scope)
+                .await;
+            gave_up += report.gave_up;
+        }
+        let delta = backend.sweeper_stats().since(&before);
+        assert_eq!(delta.invariant_violations, 3, "{delta}");
+        assert_eq!((delta.invariant_gave_up, gave_up), (1, 1));
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![2]);
+        backend.delete_intent(&intent_key, &key).await;
+        say("held-invariant", &backend, &before);
     }
 
     /// A startup slice whose read failed is read again by a later poll: the marks start after the

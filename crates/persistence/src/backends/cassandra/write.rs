@@ -1814,7 +1814,7 @@ impl CassandraBackend {
         let operation = request.operation;
         loop {
             let lu_n = plan.previous.as_ref().map(|p| p.last_updated);
-            let attempt = Attempt {
+            let mut attempt = Attempt {
                 write_id: Uuid::new_v4(),
                 last_updated: next_last_updated(Utc::now(), lu_n),
                 intent: IntentKey::new(key.tenant_id, key.id, Utc::now()),
@@ -1833,6 +1833,9 @@ impl CassandraBackend {
                     .await
                     .map_err(|error| request.statement_error(&error, "previous version row"))?;
             }
+            // SW6 = IW18 (ADR-sam-michaels-0006): stamped after V3, just before I1, so the grace covers only I1's latency and clock skew.
+            attempt.intent = IntentKey::new(key.tenant_id, key.id, Utc::now());
+            request.attempts[index].intent = attempt.intent.clone();
             self.write_intent(
                 &attempt.intent,
                 &key,

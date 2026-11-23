@@ -1967,6 +1967,9 @@ The connection settings are read by `CassandraConfig::from_env` (`src/backends/c
 | `HFS_CASSANDRA_POOL_SIZE` | `2` | Connections per local node |
 | `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection |
 | `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` | `10000` | The backend's own deadline for one statement |
+| `HFS_CASSANDRA_SWEEPER_ENABLED` | `true` | Whether hfs runs the index sweeper (one per process). |
+| `HFS_CASSANDRA_SWEEPER_POLL_INTERVAL_MS` | `5000` | Pause between two polls of pending_index_writes. |
+| `HFS_CASSANDRA_SWEEPER_GRACE_MS` | `30000` | How old an intent must be before the sweeper takes it: at least twice the request timeout, under one hour, and not under the poll interval. |
 
 The Cassandra backend stores no AuditEvents, so `HFS_AUDIT_BACKEND=database` fails at startup; use `file` or `cloudwatch`. It has no per-user settings or login-session store, and no bulk export, bulk submit, `$purge` or `$reindex`; those answer `501`, and web login sessions are held in process. It has no SQL-on-FHIR runner either: the server turns SQL-on-FHIR off at startup with a warning (`$viewdefinition-run` and `$sql-run` answer `501`), and an explicit `HFS_SOF_ENABLED=true` fails startup.
 

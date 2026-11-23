@@ -19,7 +19,7 @@
 //!    C3 soft delete `IF version_id = N AND deleted_at = 0`, C4 revive
 //!    `IF version_id = N`, setting `deleted_at = 0` (G39).
 //! 4. V1 (content) or V2 (delete marker) for the new version,
-//!    `USING TIMESTAMP ts(N+1)`.
+//!    `USING TIMESTAMP ts(N+1)`, acknowledged before step 5 starts (IW24).
 //! 5. The index delta at `ts(N+1)` ([`index_delta`]): delete the rows of
 //!    `K(N)` that `K(N+1)` does not have, compared by each table's primary
 //!    key, so a date key both versions have is only re-inserted (IW7);
@@ -94,7 +94,9 @@
 //!   the node refuses as `Invalid`, which no retry changes; when the retries
 //!   run out the write still succeeds and its intent row is left for the
 //!   sweeper (G23), on every operation: a 5xx after an applied CAS would make
-//!   a client's retried request write twice.
+//!   a client's retried request write twice. When step 4 fails, step 5 is not
+//!   sent at all (IW24), so search never finds a version whose row vread and
+//!   `_history` cannot open; the sweeper writes both.
 //! - Step 6 fails: ignored; the sweeper deletes the intent.
 
 use std::collections::{BTreeMap, HashSet};
@@ -2079,6 +2081,13 @@ impl CassandraBackend {
     /// Steps 4 to 6 for attempt `n`, which applied, with its own values and
     /// intent; skipped when superseded, leaving the intent for the sweeper,
     /// whose superseded case deletes `K(V-1)`.
+    ///
+    /// **The version row first** (IW24, ADR-sam-michaels-0006): step 5 starts
+    /// only once step 4's row is acknowledged, so any version a search finds
+    /// through an index row is one vread and `_history` can open. When the
+    /// version row fails all its tries, the index rows are not sent at all:
+    /// the intent stays and the sweeper writes both, so search shows the old
+    /// state until then rather than a version vread answers 404 for.
     async fn finish(&self, request: &mut CasRequest<'_>, n: usize, superseded: bool) -> Applied {
         let target = request.attempts[n].plan.target_version();
         request.settle(target);
@@ -2107,17 +2116,24 @@ impl CassandraBackend {
             #[cfg(test)]
             self.checkpoint(Checkpoint::AfterVersionRow, &key, version_id)
                 .await;
-            let previous = plan.previous_rows();
-            let delta = index_delta(&previous, plan.version_keys(attempt.last_updated));
-            let indexed = self
-                .write_index_delta(&key, &delta, ts, POST_CAS_WRITE_TRIES)
-                .await;
+            // IW24 (ADR-sam-michaels-0006): no index row for a version whose row is missing.
+            let indexed = match &version_written {
+                Ok(()) => {
+                    let previous = plan.previous_rows();
+                    let delta = index_delta(&previous, plan.version_keys(attempt.last_updated));
+                    let outcome = self
+                        .write_index_delta(&key, &delta, ts, POST_CAS_WRITE_TRIES)
+                        .await;
+                    index = outcome.stats;
+                    outcome.result
+                }
+                Err(failure) => Err(*failure),
+            };
             // RV15/RV16 (ADR-sam-michaels-0006): a test can hold or crash the request here.
             #[cfg(test)]
             self.checkpoint(Checkpoint::AfterIndex, &key, version_id)
                 .await;
-            index = indexed.stats;
-            if version_written.is_ok() && indexed.result.is_ok() {
+            if indexed.is_ok() {
                 self.delete_intent(&attempt.intent, &key).await;
                 true
             } else {
@@ -2127,6 +2143,7 @@ impl CassandraBackend {
                     resource_type = key.resource_type,
                     id = %key.id,
                     version_id,
+                    index_rows_skipped = version_written.is_err(),
                     "write applied, but its version or index rows could not be written; \
                      the sweeper finishes it from the intent row"
                 );
@@ -5083,7 +5100,10 @@ mod node_tests {
 
     /// G23 on every operation (ADR-aacruzgon-0034, 0050): the CAS applied,
     /// the version row fails all three tries, and the write still succeeds,
-    /// with the intent row left for the sweeper (no I2).
+    /// with the intent row left for the sweeper (no I2). Its index rows are
+    /// not sent (IW24, ADR-sam-michaels-0006), so the new resource is not
+    /// counted until the sweeper writes its version row and its
+    /// `resources_by_type` row together.
     #[tokio::test]
     async fn a_post_cas_failure_still_succeeds_and_leaves_the_intent() {
         let Some(backend) = backend().await else {
@@ -5112,11 +5132,111 @@ mod node_tests {
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(created.version_id(), "1");
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        // I1, three tries of V1, X1; no I2. X1 is the only row of its unit,
-        // so it goes as a plain write, not as a batch (IW13).
-        assert_eq!((spent.write, spent.cas), (5, 1), "{spent}");
+        // I1, three tries of V1; no index statement (IW24), no I2.
+        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
         assert_eq!((spent.batch, spent.batched), (0, 0), "{spent}");
+        assert_eq!(
+            backend.count(&tenant, Some("Patient")).await.unwrap(),
+            0,
+            "the resources_by_type row waits for the sweeper (IW24)"
+        );
+    }
+
+    /// IW24, version row first (ADR-sam-michaels-0006): an update whose
+    /// version row fails all three tries sends no index statement at all, so
+    /// no index row points at a version that vread and `_history` cannot
+    /// open. A tripwire on every `resources_by_type` write is still armed
+    /// afterwards, so neither X1's insert nor its delete was sent: the old
+    /// row stays, and `count` still sees the resource once. The intent is
+    /// kept for the sweeper, and the write still answers success (G23).
+    #[tokio::test]
+    async fn a_failed_version_row_sends_no_index_row_and_keeps_the_intent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let since = Utc::now();
+        let tenant = tenant_context("version-row-first");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
+            .await
+            .unwrap();
+        let row1 = current(&backend, &tenant).await;
+        let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let plan = CasPlan::update(
+            PreviousVersion::from_row(&row1).unwrap(),
+            json,
+            data,
+            vec![IndexKey::ResourcesByType],
+        );
+        // V3 (step 2) shares V1's text, so it passes; then V1 fails every try.
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resource_versions",
+            Fault::PassThrough,
+        );
+        for _ in 0..POST_CAS_WRITE_TRIES {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resource_versions",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "resources_by_type",
+            Fault::TimeOutWithoutApplying,
+        );
+
+        let (before, counted) = (backend.cas_stats(), backend.statement_counts());
+        let mut request = backend.cas_request("update", key_of(&tenant));
+        let applied = applied_of(backend.run_cas(&mut request, plan).await.unwrap());
+        assert_eq!(applied.version_id, 2);
+        assert!(!applied.post_cas_complete && !applied.superseded);
+        let stats = backend.cas_stats().since(&before);
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
+        // V3, I1 and three tries of V1; no index statement, no I2.
+        assert_eq!((spent.write, spent.batch, spent.cas), (5, 0, 1), "{spent}");
+
+        let error = backend
+            .session
+            .rows(
+                "SELECT id FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect_err("the tripwire is still armed: no index statement was sent");
+        assert!(format!("{error:?}").contains("injected fault"), "{error:?}");
+
+        // The CAS applied; row 2 of resource_versions is the sweeper's to
+        // write, and the index still shows version 1.
+        assert_eq!(current(&backend, &tenant).await.version_id, 2);
+        let versions: Vec<i32> = version_rows(&backend, &tenant)
+            .await
+            .into_iter()
+            .map(|(version, _, _)| version)
+            .collect();
+        assert_eq!(versions, vec![1]);
+        assert_eq!(by_type_versions(&backend, &tenant).await, vec![1]);
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+
+        // I1 is left for the sweeper.
+        assert_eq!(
+            backend
+                .intent_versions(tenant.tenant_id().as_str(), "Patient", "p", since)
+                .await,
+            vec![2]
+        );
     }
 
     /// IW15, IW17: an index batch the node refuses as `Invalid` is tried

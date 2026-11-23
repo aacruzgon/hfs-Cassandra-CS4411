@@ -7,6 +7,8 @@
 //! - HEAD requests
 //! - Content negotiation
 
+#[path = "common/capability_hooks.rs"]
+mod capability_hooks;
 mod common;
 
 use std::path::PathBuf;
@@ -1557,6 +1559,77 @@ mod capabilities {
         let body: Value = response.json();
         assert_eq!(body["resourceType"], "CapabilityStatement");
         assert!(body["fhirVersion"].is_string());
+    }
+
+    /// A storage whose `supports_history()` is `false` advertises no history
+    /// interaction anywhere: no `history-instance` or `history-type` on any
+    /// resource (the `AuditEvent` entry included) and no `history-system` at
+    /// system level. It keeps `vread`, `versioning: versioned` and
+    /// `readHistory: true`, which are about vread of past versions
+    /// (https://hl7.org/fhir/R4/capabilitystatement-definitions.html#CapabilityStatement.rest.resource.readHistory),
+    /// for every FHIR version the build describes.
+    #[tokio::test]
+    async fn test_metadata_omits_history_when_the_storage_has_none() {
+        let server = capability_hooks::metadata_server(capability_hooks::HookStub::new(false));
+        for version in FhirVersion::enabled_versions() {
+            let statement = capability_hooks::statement(&server, *version).await;
+            let rest = &statement["rest"][0];
+            let system = capability_hooks::interaction_codes(&rest["interaction"]);
+            assert!(
+                !system.contains(&"history-system".to_string()),
+                "{version:?}: {system:?}"
+            );
+            assert!(
+                system.contains(&"batch".to_string()),
+                "{version:?}: {system:?}"
+            );
+            let resources = rest["resource"].as_array().expect("resources");
+            assert!(resources.iter().any(|r| r["type"] == "AuditEvent"));
+            for resource in resources {
+                let ty = &resource["type"];
+                let codes = capability_hooks::interaction_codes(&resource["interaction"]);
+                assert!(
+                    !codes.iter().any(|c| c.starts_with("history-")),
+                    "{version:?} {ty}: {codes:?}"
+                );
+                assert!(codes.contains(&"vread".to_string()), "{version:?} {ty}");
+                assert!(codes.contains(&"read".to_string()), "{version:?} {ty}");
+                assert_eq!(resource["versioning"], "versioned", "{version:?} {ty}");
+                assert_eq!(resource["readHistory"], true, "{version:?} {ty}");
+            }
+        }
+    }
+
+    /// The default path: the same stub with `supports_history()` `true` (the
+    /// trait default every existing backend keeps) lists all three history
+    /// interactions, as SQLite's statement does.
+    #[tokio::test]
+    async fn test_metadata_lists_history_when_the_storage_serves_it() {
+        let server = capability_hooks::metadata_server(capability_hooks::HookStub::new(true));
+        for version in FhirVersion::enabled_versions() {
+            let statement = capability_hooks::statement(&server, *version).await;
+            let rest = &statement["rest"][0];
+            let system = capability_hooks::interaction_codes(&rest["interaction"]);
+            assert!(
+                system.contains(&"history-system".to_string()),
+                "{version:?}: {system:?}"
+            );
+            for resource in rest["resource"].as_array().expect("resources") {
+                let codes = capability_hooks::interaction_codes(&resource["interaction"]);
+                for code in ["vread", "history-instance", "history-type"] {
+                    assert!(
+                        codes.contains(&code.to_string()),
+                        "{version:?} {}: {code}",
+                        resource["type"]
+                    );
+                }
+            }
+        }
+
+        let (sqlite, _backend) = create_test_server().await;
+        let body: Value = sqlite.get("/metadata").await.json();
+        let system = capability_hooks::interaction_codes(&body["rest"][0]["interaction"]);
+        assert!(system.contains(&"history-system".to_string()), "{system:?}");
     }
 
     #[tokio::test]

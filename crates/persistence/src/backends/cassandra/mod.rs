@@ -82,6 +82,7 @@ mod delete;
 mod errors;
 mod index_keys;
 mod read;
+mod repair;
 mod schema;
 mod search;
 mod session;
@@ -102,4 +103,4 @@ pub use config::{
 };
 pub use schema::TABLES;
 pub use session::StatementCounts;
-pub use stats::CasStats;
+pub use stats::{CasStats, RepairStats};

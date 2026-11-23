@@ -26,9 +26,7 @@ use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, Utc};
 use helios_persistence::backends::cassandra::CassandraBackend;
 use helios_persistence::core::ResourceStorage;
-use helios_persistence::error::{
-    BackendError, ResourceError, StorageError, TenantError, ValidationError,
-};
+use helios_persistence::error::{BackendError, ResourceError, StorageError, TenantError};
 use helios_persistence::tenant::{TenantContext, TenantPermissions};
 use serde_json::json;
 
@@ -570,8 +568,8 @@ async fn cassandra_create_checks_permission_before_writing() {
 }
 
 #[tokio::test]
-async fn cassandra_search_parameter_code_is_bounded_at_128_bytes() {
-    let node = node_or_skip!("cassandra_search_parameter_code_is_bounded_at_128_bytes");
+async fn cassandra_search_parameter_code_is_not_refused_for_its_length() {
+    let node = node_or_skip!("cassandra_search_parameter_code_is_not_refused_for_its_length");
     let (backend, _cql) = setup(node).await;
     let tenant = unique_tenant("sp-code");
     let search_parameter = |id: &str, code: String| {
@@ -589,34 +587,22 @@ async fn cassandra_search_parameter_code_is_bounded_at_128_bytes() {
         })
     };
     let version = crate::cassandra_node::test_fhir_version();
-    match backend
-        .create(
-            &tenant,
-            "SearchParameter",
-            search_parameter("long", "c".repeat(129)),
-            version,
-        )
-        .await
-    {
-        Err(StorageError::Validation(ValidationError::InvalidResource { details, .. })) => {
-            assert_eq!(details[0].path, "SearchParameter.code");
-        }
-        other => panic!("expected InvalidResource, got {other:?}"),
-    }
-    assert!(
+    for (id, length) in [("c129", 129), ("c2000", 2_000)] {
+        let code = "c".repeat(length);
         backend
-            .read(&tenant, "SearchParameter", "long")
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter(id, code.clone()),
+                version,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("a {length}-byte code is stored: {error:?}"));
+        let stored = backend
+            .read(&tenant, "SearchParameter", id)
             .await
             .unwrap()
-            .is_none()
-    );
-    backend
-        .create(
-            &tenant,
-            "SearchParameter",
-            search_parameter("max", "c".repeat(128)),
-            version,
-        )
-        .await
-        .expect("a 128-byte code is stored");
+            .expect("the SearchParameter is stored");
+        assert_eq!(stored.content()["code"], code, "{length} bytes, unchanged");
+    }
 }

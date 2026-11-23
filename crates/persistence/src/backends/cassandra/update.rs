@@ -5,9 +5,7 @@
 //! plain `update`'s V3 built from R1 (Step 3 plan D5):
 //!
 //! 1. **Step 1, the operation's own.** `tenant.check_permission(
-//!    Operation::Update, type)`, then the G38 bound on a SearchParameter's
-//!    `code` ([`check_search_parameter_code`]): either refusal comes before
-//!    any statement.
+//!    Operation::Update, type)`, which refuses before any statement.
 //! 2. **R1** ([`CassandraBackend::read_resource_row`]) of `resources`, for
 //!    `K(N)` (G22) and for V3's `data` and `w(N)` (D5). Its version decides
 //!    what happens next ([`r1_case`], walkthrough `:176-180`):
@@ -43,9 +41,7 @@ use super::backend::CassandraBackend;
 use super::errors::map_driver_error;
 use super::read::{ResourceRow, SELECT_RESOURCE};
 use super::session::StatementKind;
-use super::write::{
-    CasMiss, CasOutcome, CasPlan, CasRequest, RowKey, check_search_parameter_code, normalized_body,
-};
+use super::write::{CasMiss, CasOutcome, CasPlan, CasRequest, RowKey, normalized_body};
 use crate::error::{ConcurrencyError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
@@ -108,7 +104,6 @@ impl CassandraBackend {
 
         // Step 1.
         tenant.check_permission(Operation::Update, resource_type)?;
-        check_search_parameter_code(resource_type, &resource)?;
 
         let tenant_id = tenant.tenant_id().as_str();
         let Ok(expected) = current.version_id().parse::<i32>() else {
@@ -184,8 +179,7 @@ impl CassandraBackend {
     /// with the attempt's values, or the definite miss, which the caller maps
     /// (`update`) or answers with its next turn (`create_or_update`).
     ///
-    /// The caller has already checked the permission and the G38 bound, and
-    /// has run [`check_earlier_attempts`](Self::check_earlier_attempts) on
+    /// The caller has already checked the permission, and has run [`check_earlier_attempts`](Self::check_earlier_attempts) on
     /// `row`.
     ///
     /// The plan's V3 is `row` itself: `N`'s `data`, `lu(N)`, `w(N)` and
@@ -903,7 +897,7 @@ mod node_tests {
         );
     }
 
-    /// Step 1 refuses before any statement: the permission, and G38's bound.
+    /// Step 1 refuses before any statement: the permission.
     #[tokio::test]
     async fn step_one_refuses_before_any_statement() {
         let backend = backend_or_skip!();
@@ -918,32 +912,6 @@ mod node_tests {
             Err(StorageError::Tenant(
                 TenantError::OperationNotPermitted { .. }
             ))
-        ));
-        let long_code = serde_json::json!({
-            "resourceType": "SearchParameter",
-            "id": "sp",
-            "url": "http://example.org/sp",
-            "status": "active",
-            "code": "c".repeat(129),
-            "base": ["Patient"],
-            "type": "token",
-            "expression": "Patient.gender"
-        });
-        let sp = claimed(&tenant, 1);
-        let sp = StoredResource::from_storage(
-            "SearchParameter",
-            "sp",
-            "1",
-            tenant.tenant_id().clone(),
-            long_code.clone(),
-            sp.created_at(),
-            sp.last_modified(),
-            None,
-            crate::backends::cassandra::test_support::test_fhir_version(),
-        );
-        assert!(matches!(
-            backend.update(&tenant, &sp, long_code).await,
-            Err(StorageError::Validation(_))
         ));
         let spent = backend.statement_counts().since(&before);
         assert_eq!(spent.total(), 0, "{spent}");

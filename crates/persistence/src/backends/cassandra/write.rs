@@ -8,7 +8,8 @@
 //! [`CasPlan`]:
 //!
 //! 1. The operation's own: `tenant.check_permission`; for a SearchParameter,
-//!    the 128-byte bound on `code` (G38); `K(N+1)`; `K(N)` from R1's
+//!    `K(N+1)` from the shared extractor ([`CassandraBackend::index_keys_of`],
+//!    IW1 to IW6), its long texts hashed once (ADR-aacruzgon-0079); `K(N)` from R1's
 //!    `index_keys` (G22). The engine adds the size bound on what the CAS
 //!    carries ([`MAX_CAS_PAYLOAD_BYTES`], ADR-aacruzgon-0053) before anything is written.
 //! 2. On update, delete and revive, V3: row `N` rewritten at `ts(N) − 1`,
@@ -310,8 +311,6 @@ const INDEX_BATCHES_IN_FLIGHT: usize = 8;
 /// 32 MiB `commitlog_segment_size`), which leaves room for the rest of the
 /// row and for Paxos's own copy of the update.
 pub(crate) const MAX_CAS_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
-/// Longest custom SearchParameter `code` the backend stores (G38).
-const MAX_SEARCH_PARAMETER_CODE_BYTES: usize = 128;
 /// Longest FHIR id (`[A-Za-z0-9\-\.]{1,64}`, R4 datatypes.html#id).
 const MAX_ID_LEN: usize = 64;
 /// Number of intent shards (`schema.cql`, `pending_index_writes`).
@@ -631,38 +630,6 @@ pub(super) fn check_id(id: &str) -> StorageResult<()> {
             }],
         }))
     }
-}
-
-/// The 128-byte bound on a stored SearchParameter's `code` (G38,
-/// ADR-aacruzgon-0027): every index key under it carries the code as its
-/// `param`, and FHIR sets no limit.
-pub(super) fn check_search_parameter_code(
-    resource_type: &str,
-    resource: &Json,
-) -> StorageResult<()> {
-    if resource_type != "SearchParameter" {
-        return Ok(());
-    }
-    let Some(code) = resource.get("code").and_then(Json::as_str) else {
-        return Ok(());
-    };
-    if code.len() <= MAX_SEARCH_PARAMETER_CODE_BYTES {
-        return Ok(());
-    }
-    Err(StorageError::Validation(ValidationError::InvalidResource {
-        message: format!(
-            "SearchParameter.code is longer than {MAX_SEARCH_PARAMETER_CODE_BYTES} bytes"
-        ),
-        details: vec![ValidationDetail {
-            path: "SearchParameter.code".to_string(),
-            message: format!(
-                "the code is {} bytes in UTF-8; this server stores at most \
-                 {MAX_SEARCH_PARAMETER_CODE_BYTES}",
-                code.len()
-            ),
-            severity: ValidationSeverity::Error,
-        }],
-    }))
 }
 
 /// Sets `resourceType` and `id` on a resource about to be stored, and
@@ -2753,7 +2720,6 @@ impl CassandraBackend {
     ) -> StorageResult<StoredResource> {
         // Step 1.
         tenant.check_permission(Operation::Create, resource_type)?;
-        check_search_parameter_code(resource_type, &resource)?;
 
         let id = match resource.get("id").and_then(Json::as_str) {
             Some(id) => {
@@ -3381,22 +3347,12 @@ mod tests {
     }
 
     #[test]
-    fn ids_and_search_parameter_codes_are_bounded() {
+    fn ids_are_bounded() {
         assert!(check_id("p1").is_ok());
         assert!(check_id(&"a".repeat(64)).is_ok());
         for bad in ["", "a/b", "a b", "ä", &"a".repeat(65)] {
             assert!(check_id(bad).is_err(), "{bad:?}");
         }
-        let code =
-            |n| serde_json::json!({"resourceType": "SearchParameter", "code": "c".repeat(n)});
-        assert!(check_search_parameter_code("SearchParameter", &code(128)).is_ok());
-        assert!(matches!(
-            check_search_parameter_code("SearchParameter", &code(129)),
-            Err(StorageError::Validation(
-                ValidationError::InvalidResource { .. }
-            ))
-        ));
-        assert!(check_search_parameter_code("Patient", &code(500)).is_ok());
     }
 
     /// D14: what a CAS carries is bounded before anything is written.

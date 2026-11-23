@@ -45,7 +45,12 @@
 //! and none of its intents was refused by a full retry list. A startup scan
 //! covers `[start - 24 h 1 min, start - grace)` in one-minute slices, beside
 //! the loop, at a lower rank for statement permits, so intents older than the
-//! marks' start are not forgotten after a restart.
+//! marks' start are not forgotten after a restart. The marks start at
+//! `start - grace`, so a startup slice whose read failed, or whose intents
+//! overflowed the retry list, is never reached by a poll: it goes on a list of
+//! pending slices, and each poll reads the due ones again with the retry
+//! list's backoff, dropping a slice once it is wholly older than 24 hours,
+//! when the outbox's TTL has removed its rows.
 //!
 //! # The retry list (SW18, SW13)
 //!
@@ -159,6 +164,11 @@ fn retry_max() -> chrono::Duration {
 /// SW18: an entry is dropped this long after its intent was enqueued.
 fn retry_horizon() -> chrono::Duration {
     chrono::Duration::hours(24)
+}
+/// SW18: the delay after the `failures`-th failure, `min(RETRY_FIRST x 2^(k-1), RETRY_MAX)`.
+fn backoff(failures: u32) -> chrono::Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    (retry_first() * 2i32.pow(doublings)).min(retry_max())
 }
 
 /// `at` truncated to whole milliseconds.
@@ -379,9 +389,7 @@ impl RetryList {
         match failure {
             Failure::Transient(_) => {
                 entry.failures += 1;
-                let doublings = (entry.failures - 1).min(16);
-                let delay = (retry_first() * 2i32.pow(doublings)).min(retry_max());
-                entry.next_at = now + delay;
+                entry.next_at = now + backoff(entry.failures);
             }
             Failure::Invariant(_) => {
                 entry.invariant_failures += 1;
@@ -422,6 +430,7 @@ impl RetryList {
 pub(crate) struct SweepState {
     marks: parking_lot::Mutex<[DateTime<Utc>; 16]>,
     retry: parking_lot::Mutex<RetryList>,
+    pending: parking_lot::Mutex<Vec<PendingSlice>>,
     cancel: CancellationToken,
 }
 
@@ -431,6 +440,7 @@ impl SweepState {
         Self {
             marks: parking_lot::Mutex::new([whole_ms(mark); 16]),
             retry: parking_lot::Mutex::new(RetryList::new(RETRY_LIST_CAP)),
+            pending: parking_lot::Mutex::new(Vec::new()),
             cancel,
         }
     }
@@ -445,6 +455,37 @@ impl SweepState {
         if to > *mark {
             *mark = to;
         }
+    }
+
+    /// Keeps a startup slice to be read again after its `failures`-th failed or overflowed read.
+    fn hold_slice(&self, slice: Slice, failures: u32, now: DateTime<Utc>) {
+        self.pending.lock().push(PendingSlice {
+            slice,
+            failures,
+            next_at: now + backoff(failures),
+        });
+    }
+
+    /// Takes the pending slices due at `now`; those wholly older than the retry horizon are dropped.
+    fn take_due_slices(&self, now: DateTime<Utc>) -> Vec<PendingSlice> {
+        let mut pending = self.pending.lock();
+        let (due, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(|held| held.next_at <= now);
+        *pending = kept;
+        due.into_iter()
+            .filter(|held| {
+                let expired = held.slice.to <= now - retry_horizon();
+                if expired {
+                    tracing::error!(
+                        bucket = %held.slice.bucket,
+                        shard = held.slice.shard,
+                        "an outbox slice was not read within 24 hours; its rows are past their TTL"
+                    );
+                }
+                !expired
+            })
+            .collect()
     }
 
     fn oldest_mark(&self) -> DateTime<Utc> {
@@ -855,8 +896,16 @@ impl Replay {
     }
 }
 
+/// A startup slice that must be read again (see the module doc).
+struct PendingSlice {
+    slice: Slice,
+    failures: u32,
+    next_at: DateTime<Utc>,
+}
+
 /// What one slice did.
 struct SliceOutcome {
+    slice: Slice,
     report: SweepReport,
     read_ok: bool,
     overflow: bool,
@@ -942,6 +991,8 @@ impl CassandraBackend {
             self.sweeper.counters.set_startup_scan_ms(took_ms);
             tracing::info!(
                 slices = report.slices,
+                slice_errors = report.slice_errors,
+                overflow = report.overflow,
                 intents = report.intents,
                 done = report.done,
                 took_ms,
@@ -1056,6 +1107,30 @@ impl CassandraBackend {
             );
         }
 
+        let pending = state.take_due_slices(now);
+        if !pending.is_empty() {
+            let reads: Vec<_> = pending
+                .iter()
+                .map(|held| self.handle_slice(&held.slice, Rank::Normal, scope, Some(state), now))
+                .collect();
+            let mut outcomes = futures::stream::iter(reads).buffer_unordered(SLICES_AT_ONCE);
+            let mut redo = Vec::new();
+            while let Some(outcome) = outcomes.next().await {
+                report.absorb(&outcome.report);
+                if !outcome.read_ok || outcome.overflow {
+                    redo.push(outcome.slice);
+                }
+            }
+            drop(outcomes);
+            for slice in redo {
+                let failures = pending
+                    .iter()
+                    .find(|held| held.slice == slice)
+                    .map_or(1, |held| held.failures + 1);
+                state.hold_slice(slice, failures, now);
+            }
+        }
+
         let due = { state.retry.lock().due(now) };
         if !due.is_empty() {
             let mut retried = SweepReport::default();
@@ -1095,7 +1170,6 @@ impl CassandraBackend {
         cancel: &CancellationToken,
     ) -> SweepReport {
         let mut report = SweepReport::default();
-        let now = Utc::now();
         for minute in plan_slices(0, from, to, startup_slice()) {
             if cancel.is_cancelled() {
                 break;
@@ -1110,11 +1184,17 @@ impl CassandraBackend {
                 .collect();
             let reads: Vec<_> = slices
                 .iter()
-                .map(|slice| self.handle_slice(slice, rank, scope, retry, now))
+                .map(|slice| self.handle_slice(slice, rank, scope, retry, Utc::now()))
                 .collect();
             let mut outcomes = futures::stream::iter(reads).buffer_unordered(SLICES_AT_ONCE);
             while let Some(outcome) = outcomes.next().await {
                 report.absorb(&outcome.report);
+                // A poll never reaches a startup slice (the marks start at `start - grace`).
+                if let Some(state) = retry
+                    && (!outcome.read_ok || outcome.overflow)
+                {
+                    state.hold_slice(outcome.slice, 1, Utc::now());
+                }
             }
         }
         report
@@ -1172,6 +1252,7 @@ impl CassandraBackend {
         now: DateTime<Utc>,
     ) -> SliceOutcome {
         let mut outcome = SliceOutcome {
+            slice: slice.clone(),
             report: SweepReport {
                 slices: 1,
                 ..SweepReport::default()
@@ -3085,6 +3166,52 @@ mod node_tests {
         assert!(intents(&backend, &t, "p", since).await.is_empty());
         assert_consistent(&check(&backend, &t).await);
         say("startup", &backend, &before);
+    }
+
+    /// A startup slice whose read failed is read again by a later poll: the marks start after the
+    /// startup window, so nothing else would reach it.
+    #[tokio::test]
+    async fn a_failed_startup_slice_is_read_again_by_the_next_poll() {
+        let Some((backend, t, tenant, since)) = start("sweeper-startup-retry").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 1, async move {
+            b.create(&ten, "Patient", patient(), version).await
+        })
+        .await;
+        let lu1 = row_of(&backend, &t, "p").await.last_updated;
+        let state = SweepState::new(Utc::now(), CancellationToken::new());
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        let (from, to) = (since, Utc::now() + chrono::Duration::seconds(1));
+        let slices = 16 * plan_slices(0, from, to, startup_slice()).len();
+        for _ in 0..slices {
+            backend.session.inject_fault_on_first_page(
+                StatementKind::Read,
+                "FROM pending_index_writes",
+                Fault::FailWithUnavailable,
+            );
+        }
+        let report = backend.startup_scan(&state, from, to, &scope).await;
+        assert_eq!(report.slice_errors, slices as u64, "{report}");
+        assert_eq!(report.intents, 0, "{report}");
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+
+        // Before its backoff the slice is not read again.
+        let early = backend
+            .poll_once(&state, Utc::now() + chrono::Duration::seconds(2), &scope)
+            .await;
+        assert_eq!(early.slices, 0, "{early}");
+        let later = backend
+            .poll_once(&state, Utc::now() + chrono::Duration::seconds(10), &scope)
+            .await;
+        assert_eq!((later.current, later.done), (1, 1), "{later}");
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu1, 1)]);
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+        say("startup-retry", &backend, &before);
     }
 
     /// N17: a poll moves a mark only once its slices are read (SW8).

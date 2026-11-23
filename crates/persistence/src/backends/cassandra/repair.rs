@@ -766,6 +766,28 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_write_ts_and_keys_skip_in_rule_4_order() {
+        let rbt = IndexKey::ResourcesByType;
+        let mut row = r1(2, lu(2), &[]);
+        row.write_ts = None;
+        assert_eq!(
+            plan_repair(&row, &[s(rbt.clone(), Some(lu(2)), 2)]),
+            Err(SkipReason::NotStale)
+        );
+        row.index_keys = Some(vec![0x02, 0x00]);
+        assert_eq!(
+            plan_repair(&row, &[s(rbt, Some(lu(1)), 1)]),
+            Err(SkipReason::WriteTsMismatch)
+        );
+    }
+
+    /// Compile-time: `run`'s future is `Send`, as the storage traits' futures must be.
+    fn run_is_send(context: RepairContext, backend: &CassandraBackend) {
+        fn assert_send<T: Send>(_: T) {}
+        assert_send(context.run(backend));
+    }
+
+    #[test]
     fn queue_merges_the_rows_of_one_resource_and_keeps_its_first_row() {
         let rbt = IndexKey::ResourcesByType;
         let (s1, s2, s3) = (
@@ -919,7 +941,8 @@ mod tests {
         p: &StoredResource,
         body: Json,
     ) {
-        let mut hold = backend.hold_at(Checkpoint::AfterVersionRow, t, "p", 2);
+        let target: i32 = p.version_id().parse::<i32>().expect("a numeric version") + 1;
+        let mut hold = backend.hold_at(Checkpoint::AfterVersionRow, t, "p", target);
         let task = tokio::spawn({
             let (backend, tenant, p) = (backend.clone(), tenant.clone(), p.clone());
             async move { backend.update(&tenant, &p, body).await }
@@ -1054,8 +1077,10 @@ mod tests {
 
         let mut context = RepairContext::new(&t);
         context.queue("Patient", "p", Some(r1_old), stale);
-        let before = backend.repair_stats();
+        let (before, at) = (backend.repair_stats(), backend.statement_counts());
         let outcomes = context.run(&backend).await;
+        let spent = backend.statement_counts().since(&at);
+        assert_eq!((spent.read, spent.serial_read, spent.cas), (0, 0, 0));
         eprintln!(
             "[repair case=older-r1 {}]",
             backend.repair_stats().since(&before)
@@ -1123,15 +1148,45 @@ mod tests {
         let t = tenant_id("repair-budget");
         let tenant = context(&t);
         let mut context = RepairContext::new(&t);
+        // Entries that are skipped before the budget: they use none of it.
+        let current = r1(2, lu(2), &[]);
+        context.queue(
+            "Patient",
+            "skip-not-stale",
+            Some(current.clone()),
+            vec![s(IndexKey::ResourcesByType, Some(lu(1)), 2)],
+        );
+        context.queue(
+            "Patient",
+            "skip-tag-ahead",
+            Some(current),
+            vec![s(IndexKey::ResourcesByType, Some(lu(1)), 3)],
+        );
+        let skipped = 2;
         let mut k2_len = 0;
+        let mut deletes = Vec::new();
         for i in 0..34 {
             let id = format!("r{i:02}");
-            let (row, stale) = updated(&backend, &tenant, &t, &id).await;
+            let (row, mut stale) = updated(&backend, &tenant, &t, &id).await;
+            // Made-up rows tagged 1 before the real one: deleting each only
+            // writes a tombstone, and they make every repair's size differ.
+            let lu1 = stale[0].last_updated.expect("lu1");
+            let extra = i % 3;
+            for k in 1..=extra {
+                stale.push(
+                    StaleIndexRow::new(
+                        IndexKey::ResourcesByType,
+                        Some(lu1 - chrono::Duration::milliseconds(k)),
+                        1,
+                    )
+                    .unwrap(),
+                );
+            }
             k2_len = keys_of(&row).len();
+            deletes.push(1 + extra as u64);
             context.queue("Patient", &id, Some(row), stale);
         }
-        let rows_each = k2_len + 1;
-        let n = MAX_REPAIRS_PER_SEARCH.min(MAX_REPAIR_ROWS_PER_SEARCH / rows_each);
+        let n = MAX_REPAIRS_PER_SEARCH.min(MAX_REPAIR_ROWS_PER_SEARCH / (k2_len + 3));
 
         let (before, at) = (backend.repair_stats(), backend.statement_counts());
         let outcomes = context.run(&backend).await;
@@ -1139,15 +1194,24 @@ mod tests {
         let spent = backend.statement_counts().since(&at);
         eprintln!("[repair case=budget {stats}]");
 
-        assert_eq!(outcomes.len(), 34);
-        for outcome in &outcomes[..n] {
+        assert_eq!(outcomes.len(), skipped + 34);
+        assert_eq!(
+            outcomes[..skipped],
+            [
+                RepairOutcome::Skipped(SkipReason::NotStale),
+                RepairOutcome::Skipped(SkipReason::TagAhead),
+            ]
+        );
+        let mut batches = 0;
+        for (at, outcome) in outcomes[skipped..skipped + n].iter().enumerate() {
             let RepairOutcome::Repaired { full: true, index } = outcome else {
                 panic!("{outcome:?}");
             };
-            assert_eq!(index.rows_inserted, k2_len as u64);
-            assert_eq!(index.rows_deleted, 1);
+            assert_eq!(index.rows_inserted, k2_len as u64, "position {at}");
+            assert_eq!(index.rows_deleted, deletes[at], "position {at}");
+            batches += index.batches;
         }
-        for outcome in &outcomes[n..] {
+        for outcome in &outcomes[skipped + n..] {
             assert_eq!(*outcome, RepairOutcome::Skipped(SkipReason::Budget));
         }
         assert_eq!(
@@ -1155,10 +1219,13 @@ mod tests {
                 stats.queued,
                 stats.repaired,
                 stats.skipped_budget,
+                stats.skipped_not_stale,
+                stats.skipped_tag_ahead,
                 stats.failed
             ),
-            (34, n as u64, 34 - n as u64, 0)
+            (36, n as u64, 34 - n as u64, 1, 1, 0)
         );
+        assert_eq!(spent.batch + spent.write, batches);
         assert_eq!((spent.read, spent.serial_read, spent.cas), (0, 0, 0));
         assert_consistent(&check(&backend, &t).await);
     }
@@ -1350,7 +1417,7 @@ mod tests {
         .await;
         assert_eq!(report.kinds(), expect(&[("wrong_tag", 2)]), "{report}");
 
-        let before = backend.repair_stats();
+        let (before, at) = (backend.repair_stats(), backend.statement_counts());
         let outcome = backend
             .repair_index(
                 &key(&t, "p"),
@@ -1358,6 +1425,8 @@ mod tests {
                 &[StaleIndexRow::new(d, None, 1).unwrap()],
             )
             .await;
+        let spent = backend.statement_counts().since(&at);
+        assert_eq!((spent.read, spent.serial_read, spent.cas), (0, 0, 0));
         eprintln!(
             "[repair case=retag {}]",
             backend.repair_stats().since(&before)

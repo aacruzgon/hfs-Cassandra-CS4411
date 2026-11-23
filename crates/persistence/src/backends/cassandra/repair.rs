@@ -1350,7 +1350,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the index writer has no date_index statement yet: index_statement refuses date keys"]
     async fn repair_retags_a_date_row_the_current_version_still_produces() {
         let Some(backend) = backend().await else {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");

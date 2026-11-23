@@ -485,13 +485,13 @@ mod tests {
     use cdrs_tokio::types::IntoRustByName;
     use cdrs_tokio::types::value::Value;
     use chrono::TimeZone;
-    use serde_json::Value as Json;
+    use serde_json::{Value as Json, json};
 
     use super::*;
     use crate::backends::cassandra::checkpoint::Checkpoint;
     use crate::backends::cassandra::consistency::harness::*;
-    use crate::backends::cassandra::consistency::version_ids;
-    use crate::backends::cassandra::session::StatementKind;
+    use crate::backends::cassandra::consistency::{assert_consistent, version_ids};
+    use crate::backends::cassandra::session::{Fault, StatementKind};
     use crate::backends::cassandra::test_support::test_fhir_version;
     use crate::core::ResourceStorage;
     use crate::tenant::TenantContext;
@@ -939,5 +939,197 @@ mod tests {
             expect(&[("stray_row", not_produced(&k1, lu1, &k3, lu3) - 1)]),
             "{report}"
         );
+    }
+
+    /// Creates and updates `id`, so that the old `resources_by_type` row is
+    /// what a search that read just before the update would find. Returns
+    /// R1 (version 2) and the found row.
+    async fn updated(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        t: &str,
+        id: &str,
+    ) -> (ResourceRow, Vec<StaleIndexRow>) {
+        let body = |active: bool| json!({"resourceType": "Patient", "id": id, "active": active});
+        let created = backend
+            .create(tenant, "Patient", body(true), test_fhir_version())
+            .await
+            .expect("create");
+        let lu1 = r1_of(backend, t, id).await.last_updated;
+        backend
+            .update(tenant, &created, body(false))
+            .await
+            .expect("update");
+        let row = r1_of(backend, t, id).await;
+        assert_eq!(row.version_id, 2);
+        (
+            row,
+            vec![StaleIndexRow::new(IndexKey::ResourcesByType, Some(lu1), 1).unwrap()],
+        )
+    }
+
+    #[tokio::test]
+    async fn repairs_beyond_the_budget_are_skipped_not_failed() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-budget");
+        let tenant = context(&t);
+        let mut context = RepairContext::new(&t);
+        let mut k2_len = 0;
+        for i in 0..34 {
+            let id = format!("r{i:02}");
+            let (row, stale) = updated(&backend, &tenant, &t, &id).await;
+            k2_len = keys_of(&row).len();
+            context.queue("Patient", &id, Some(row), stale);
+        }
+        let rows_each = k2_len + 1;
+        let n = MAX_REPAIRS_PER_SEARCH.min(MAX_REPAIR_ROWS_PER_SEARCH / rows_each);
+
+        let (before, at) = (backend.repair_stats(), backend.statement_counts());
+        let outcomes = context.run(&backend).await;
+        let stats = backend.repair_stats().since(&before);
+        let spent = backend.statement_counts().since(&at);
+        eprintln!("[repair case=budget {stats}]");
+
+        assert_eq!(outcomes.len(), 34);
+        for outcome in &outcomes[..n] {
+            let RepairOutcome::Repaired { full: true, index } = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(index.rows_inserted, k2_len as u64);
+            assert_eq!(index.rows_deleted, 1);
+        }
+        for outcome in &outcomes[n..] {
+            assert_eq!(*outcome, RepairOutcome::Skipped(SkipReason::Budget));
+        }
+        assert_eq!(
+            (
+                stats.queued,
+                stats.repaired,
+                stats.skipped_budget,
+                stats.failed
+            ),
+            (34, n as u64, 34 - n as u64, 0)
+        );
+        assert_eq!((spent.read, spent.serial_read, spent.cas), (0, 0, 0));
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    #[tokio::test]
+    async fn a_failed_repair_is_counted_and_never_fails_the_run() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-failed");
+        let tenant = context(&t);
+        let mut context = RepairContext::new(&t);
+        for id in ["p", "q"] {
+            let (row, stale) = updated(&backend, &tenant, &t, id).await;
+            context.queue("Patient", id, Some(row), stale);
+        }
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::FailWithUnavailable,
+        );
+
+        let (before, at) = (backend.repair_stats(), backend.statement_counts());
+        let outcomes = context.run(&backend).await;
+        let stats = backend.repair_stats().since(&before);
+        let spent = backend.statement_counts().since(&at);
+        eprintln!("[repair case=failed {stats}]");
+
+        assert_eq!(outcomes.len(), 2);
+        let failed: Vec<_> = outcomes
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    RepairOutcome::Failed {
+                        failure: WriteFailure::TriesExhausted,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        let repaired: Vec<_> = outcomes
+            .iter()
+            .filter(|o| matches!(o, RepairOutcome::Repaired { full: true, .. }))
+            .collect();
+        assert_eq!((failed.len(), repaired.len()), (1, 1), "{outcomes:?}");
+        assert_eq!((stats.queued, stats.repaired, stats.failed), (2, 1, 1));
+        let batches: u64 = outcomes
+            .iter()
+            .map(|o| match o {
+                RepairOutcome::Repaired { index, .. } | RepairOutcome::Failed { index, .. } => {
+                    index.batches
+                }
+                RepairOutcome::Skipped(_) => 0,
+            })
+            .sum();
+        assert_eq!(spent.batch + spent.write, batches);
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    #[tokio::test]
+    async fn skips_and_undecodable_rows_send_nothing_and_never_fail_the_run() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-skips");
+        let rbt = IndexKey::ResourcesByType;
+        let stale = |tag: i32| vec![s(rbt.clone(), Some(lu(1)), tag)];
+        let mut bad_keys = r1(2, lu(2), &[]);
+        bad_keys.index_keys = Some(vec![0x02, 0x00]);
+        let mut bad_ts = r1(2, lu(2), &[]);
+        bad_ts.write_ts = Some(write_ts_of(lu(2)) + 1);
+
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "none", None, stale(1));
+        context.queue("Patient", "ahead", Some(r1(2, lu(2), &[])), stale(3));
+        context.queue("Patient", "keys", Some(bad_keys), stale(1));
+        context.queue("Patient", "write-ts", Some(bad_ts), stale(1));
+        context.queue("Patient", "current", Some(r1(2, lu(2), &[])), stale(2));
+        context.skip_undecodable("date_index", "version_id: unset");
+        context.skip_undecodable(
+            "token_code_index",
+            &StaleIndexRow::new(token("t", "a"), None, 1).unwrap_err(),
+        );
+
+        let (before, at) = (backend.repair_stats(), backend.statement_counts());
+        let outcomes = context.run(&backend).await;
+        let stats = backend.repair_stats().since(&before);
+        eprintln!("[repair case=skips {stats}]");
+
+        assert_eq!(
+            outcomes,
+            [
+                RepairOutcome::Skipped(SkipReason::NoRow),
+                RepairOutcome::Skipped(SkipReason::TagAhead),
+                RepairOutcome::Skipped(SkipReason::UndecodableKeys),
+                RepairOutcome::Skipped(SkipReason::WriteTsMismatch),
+                RepairOutcome::Skipped(SkipReason::NotStale),
+            ]
+        );
+        assert_eq!(
+            (
+                stats.skipped_no_row,
+                stats.skipped_tag_ahead,
+                stats.skipped_undecodable_keys,
+                stats.skipped_write_ts,
+                stats.skipped_not_stale,
+                stats.skipped_budget,
+            ),
+            (1, 1, 1, 1, 1, 0)
+        );
+        assert_eq!(
+            (stats.queued, stats.undecodable_rows, stats.repaired),
+            (5, 2, 0)
+        );
+        assert_eq!(backend.statement_counts().since(&at).total(), 0);
     }
 }

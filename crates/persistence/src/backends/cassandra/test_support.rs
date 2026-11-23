@@ -13,11 +13,14 @@
 //! they are another crate and cannot reach this `cfg(test)` module.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use helios_fhir::FhirVersion;
+use parking_lot::RwLock;
 
 use super::CassandraConfig;
+use super::backend::initialize_search_registry;
+use crate::search::{SearchParameterExtractor, SearchParameterRegistry};
 
 /// The variable that chooses the tests' FHIR version.
 pub(crate) const TEST_FHIR_VERSION_VAR: &str = "HFS_TEST_FHIR_VERSION";
@@ -75,6 +78,19 @@ pub(crate) fn test_config() -> CassandraConfig {
         fhir_version: test_fhir_version(),
         ..CassandraConfig::default()
     }
+}
+
+/// The registry a test backend loads (`initialize_search_registry` with
+/// [`test_config`]), for tests that extract without a node.
+pub(crate) fn test_registry() -> Arc<RwLock<SearchParameterRegistry>> {
+    let registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
+    initialize_search_registry(&registry, &test_config());
+    registry
+}
+
+/// [`SearchParameterExtractor`] over [`test_registry`].
+pub(crate) fn test_extractor() -> SearchParameterExtractor {
+    SearchParameterExtractor::new(test_registry())
 }
 
 #[cfg(test)]

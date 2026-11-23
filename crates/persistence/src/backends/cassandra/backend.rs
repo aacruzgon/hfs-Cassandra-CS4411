@@ -1163,7 +1163,7 @@ async fn verify_local_dc(session: &CassandraSession, local_dc: &str) -> Result<(
 /// Fills the shared base registry: the embedded fallbacks, the spec bundle for
 /// `config.fhir_version`, and any custom SearchParameters in the data
 /// directory, the order every other backend uses.
-fn initialize_search_registry(
+pub(super) fn initialize_search_registry(
     registry: &Arc<RwLock<SearchParameterRegistry>>,
     config: &CassandraConfig,
 ) {

@@ -2009,7 +2009,13 @@ mod tests {
         // `last_updated`.
         for registry in [Registry::Fixed, Registry::Changed] {
             let report = check("no-write-ts", registry).await;
-            assert_eq!(report.kinds(), ["wrong_write_time"], "{report}");
+            // The plant stores `[ResourcesByType]`, and a fresh extraction of
+            // its body gives more keys, so `Fixed` also reports both rows stale.
+            let mut want = vec![("wrong_write_time", 1)];
+            if registry == Registry::Fixed {
+                want.push(("stale_extraction", 2));
+            }
+            assert_eq!(report.kinds(), expect(&want), "{report}");
             let Defect::WrongWriteTime { row, expected } = &report.defects[0] else {
                 unreachable!()
             };
@@ -2020,7 +2026,9 @@ mod tests {
         // The resources row and the version row both lack the type key.
         for registry in [Registry::Fixed, Registry::Changed] {
             let report = check("no-type-key", registry).await;
-            let mut want = vec![("no_type_key", 2)];
+            // `seeded` created real index rows; the plant empties the stored
+            // sets, so the 4 token rows of `active` and `deceased` are strays.
+            let mut want = vec![("no_type_key", 2), ("stray_row", 4)];
             if registry == Registry::Fixed {
                 want.push(("stale_extraction", 1));
             }

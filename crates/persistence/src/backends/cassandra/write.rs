@@ -128,6 +128,7 @@ use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, ValidationDetail,
     ValidationError, ValidationSeverity,
 };
+use crate::search::SearchParameterExtractor;
 use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
@@ -685,19 +686,46 @@ pub(super) fn normalized_body(
 }
 
 impl CassandraBackend {
-    /// `K(V)` for a live version whose normalized body is `body`: the writer's
-    /// extraction (IW8, ADR-sam-michaels-0006), called wherever a plan gets a
-    /// body, and the one the consistency check compares stored key sets with
-    /// (RV13), so the check tests the writer, not a second extractor. Until
-    /// pull request 5 switches extraction on (IW1), it is the
-    /// `resources_by_type` row alone, as on `main` since Step 2.
+    /// `K(V)` for a live version whose normalized body is `body` (IW1 to
+    /// IW6, IW8): the shared extractor with the tenant's registry, mapped by
+    /// [`index_keys::extract_index_keys`], long texts hashed once
+    /// ([`index_keys::index_text`], ADR-aacruzgon-0079). A parameter that
+    /// fails is skipped; a resource that fails whole keeps only its
+    /// `resources_by_type` row (D6). Both are logged at `warn` and counted,
+    /// with the time it took (IW22). Called at the four plan sites and by the
+    /// consistency check (RV13), never on a stored key set.
     pub(crate) fn index_keys_of(
         &self,
-        _tenant_id: &str,
-        _resource_type: &str,
-        _body: &Json,
+        tenant_id: &str,
+        resource_type: &str,
+        body: &Json,
     ) -> Vec<IndexKey> {
-        vec![IndexKey::ResourcesByType]
+        let started = std::time::Instant::now();
+        let extractor = SearchParameterExtractor::new(self.registries.for_tenant(tenant_id));
+        let extraction = index_keys::extract_index_keys(&extractor, resource_type, body);
+        self.cas_counters.extraction(
+            started.elapsed(),
+            extraction.failed_params.len() as u64,
+            extraction.failed_resource.is_some(),
+        );
+        if let Some(error) = &extraction.failed_resource {
+            tracing::warn!(
+                tenant_id,
+                resource_type,
+                error = %error,
+                "extraction failed for the whole resource; the version keeps only its \
+                 resources_by_type row"
+            );
+        } else if !extraction.failed_params.is_empty() {
+            tracing::warn!(
+                tenant_id,
+                resource_type,
+                failed = ?extraction.failed_params,
+                "search parameters skipped: their extraction failed; the write goes ahead \
+                 without their index rows"
+            );
+        }
+        extraction.keys
     }
 }
 
@@ -2114,6 +2142,7 @@ impl CassandraBackend {
 
             // Step 3.
             request.stats.attempt();
+            request.stats.cas_payload(plan.payload_bytes() as u64);
             let failure = match self
                 .session
                 .rows(
@@ -2775,6 +2804,8 @@ impl CassandraBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::{ExtractedValue, IndexValue};
+    use crate::types::SearchParamType;
     use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::frame::Version;
     use cdrs_tokio::frame::message_error::{
@@ -3545,9 +3576,9 @@ mod tests {
 
     const IMPLICIT: &str = "urn:x-helios:implicit code system";
     const MRN: &str = "http://hospital.example/mrn";
-    const B0: i64 = 326_073_600_000; // 1980-05-01T00:00:00Z
-    const B1: i64 = 326_160_000_000; // 1980-05-02T00:00:00Z
-    const B2: i64 = 326_246_400_000; // 1980-05-03T00:00:00Z
+    const B0: i64 = 325_987_200_000; // 1980-05-01T00:00:00Z
+    const B1: i64 = 326_073_600_000; // 1980-05-02T00:00:00Z
+    const B2: i64 = 326_160_000_000; // 1980-05-03T00:00:00Z
 
     fn gender(code: &str) -> IndexKey {
         IndexKey::TokenCode {
@@ -4141,38 +4172,24 @@ mod tests {
             resource_type: "Patient",
             id: "p",
         };
-        let mut keys = vec![
-            IndexKey::ResourcesByType,
-            IndexKey::Date {
-                param: "birthdate".into(),
-                start: B0,
-                end: B1,
-            },
-            IndexKey::DateByEnd {
-                param: "birthdate".into(),
-                end: B1,
-                start: B0,
-            },
-        ];
-        for i in 0..6 {
-            let value = format!("{i}{}", "v".repeat(999));
-            keys.push(IndexKey::TokenCode {
-                param: "identifier".into(),
-                code: value.clone(),
-                system: "http://example.org/ids".into(),
-            });
-            keys.push(IndexKey::TokenSystemCode {
-                param: "identifier".into(),
-                system: "http://example.org/ids".into(),
-                code: value.clone(),
-            });
-            keys.push(IndexKey::TokenSystem {
-                param: "identifier".into(),
-                system: "http://example.org/ids".into(),
-                code: value,
-            });
-        }
-        keys.sort();
+        let sys = "http://example.org/ids";
+        let mut values: Vec<ExtractedValue> = (0..6)
+            .map(|i| {
+                ExtractedValue::new(
+                    "identifier",
+                    "http://hl7.org/fhir/SearchParameter/Patient-identifier",
+                    SearchParamType::Token,
+                    IndexValue::token(Some(sys.to_string()), format!("{i}{}", "v".repeat(999))),
+                )
+            })
+            .collect();
+        values.push(ExtractedValue::new(
+            "birthdate",
+            "http://hl7.org/fhir/SearchParameter/individual-birthdate",
+            SearchParamType::Date,
+            IndexValue::date("1980-05-01"),
+        ));
+        let keys = index_keys::index_keys_from(&values);
         // The six `token_system_index` rows share one partition (same param
         // and system), so that unit alone is over the bound and goes alone;
         // `assert_packs_whole_units` checks that no other batch is.
@@ -4191,6 +4208,162 @@ mod tests {
         assert!(create.is_empty(), "an insert alone fits");
         assert_eq!(update.len(), 1, "the delete and the insert of one row");
         assert_eq!(delete.len(), 0, "a delete alone fits");
+
+        // Every fixture resource's create, same-content update and delete.
+        for fixture in fixture_resources() {
+            let extraction = fixture.extract();
+            let [create, update, delete] = packs_create_update_and_delete(&key, &extraction.keys);
+            assert!(
+                create.is_empty() && update.is_empty() && delete.is_empty(),
+                "{}: {create:?} {update:?} {delete:?}",
+                fixture.name()
+            );
+        }
+    }
+
+    /// One resource of `tests/fixtures`, with its normalized body.
+    struct Fixture {
+        file: &'static str,
+        resource_type: String,
+        id: String,
+        body: Json,
+        data: String,
+    }
+
+    impl Fixture {
+        fn name(&self) -> String {
+            format!("{}/{}", self.file, self.id)
+        }
+
+        fn extract(&self) -> index_keys::Extraction {
+            let extraction = index_keys::extract_index_keys(
+                &crate::backends::cassandra::test_support::test_extractor(),
+                &self.resource_type,
+                &self.body,
+            );
+            assert!(extraction.failed_params.is_empty(), "{}", self.name());
+            assert_eq!(extraction.failed_resource, None, "{}", self.name());
+            extraction
+        }
+    }
+
+    /// The 16 resources of `tests/fixtures/{patients,observations,organizations}.json`.
+    fn fixture_resources() -> Vec<Fixture> {
+        let mut all = Vec::new();
+        for file in ["patients", "observations", "organizations"] {
+            let path = format!("{}/tests/fixtures/{file}.json", env!("CARGO_MANIFEST_DIR"));
+            let text = std::fs::read_to_string(&path).unwrap();
+            let parsed: Json = serde_json::from_str(&text).unwrap();
+            for resource in parsed[file].as_array().unwrap() {
+                let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+                let id = resource["id"].as_str().unwrap().to_string();
+                let (body, data) =
+                    normalized_body("create", &resource_type, &id, resource.clone()).unwrap();
+                all.push(Fixture {
+                    file,
+                    resource_type,
+                    id,
+                    body,
+                    data,
+                });
+            }
+        }
+        assert_eq!(all.len(), 16);
+        all
+    }
+
+    /// The texts a key holds, `param` included.
+    fn key_texts(key: &IndexKey) -> Vec<&str> {
+        match key {
+            IndexKey::ResourcesByType => vec![],
+            IndexKey::TokenCode {
+                param,
+                code,
+                system,
+            }
+            | IndexKey::TokenSystemCode {
+                param,
+                system,
+                code,
+            }
+            | IndexKey::TokenSystem {
+                param,
+                system,
+                code,
+            } => vec![param, code, system],
+            IndexKey::Date { param, .. } | IndexKey::DateByEnd { param, .. } => vec![param],
+            IndexKey::Uri { param, uri } => vec![param, uri],
+        }
+    }
+
+    /// IW11 (gate, the size report): every fixture's batches, in the worst
+    /// case (a 64-byte tenant), stay within the bound and none of their texts
+    /// is hashed; prints the figures the report compares with the bench.
+    #[test]
+    fn largest_batch_and_index_keys_per_fixture() {
+        let tenant = format!("test-{}", "x".repeat(59));
+        let key = RowKey {
+            tenant_id: &tenant,
+            resource_type: "",
+            id: "",
+        };
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let (mut keys_max, mut blob_max, mut largest_all, mut hashed_all) = (0, 0, 0, 0);
+        for fixture in fixture_resources() {
+            let keys = fixture.extract().keys;
+            let blob = index_keys::encode(&keys);
+            let hashed = keys
+                .iter()
+                .flat_map(key_texts)
+                .filter(|text| text.starts_with(index_keys::HASHED_TEXT_PREFIX))
+                .count();
+            let key = RowKey {
+                resource_type: &fixture.resource_type,
+                id: &fixture.id,
+                ..key
+            };
+            let previous: Vec<IndexRow<'_>> = keys.iter().map(|k| (k, lu1)).collect();
+            let deltas = [
+                index_delta(&[], version_keys(&keys, lu2)),
+                index_delta(&previous, version_keys(&keys, lu2)),
+                index_delta(&previous, version_keys(&[], lu2)),
+            ];
+            let mut counts = [0; 3];
+            let mut largest = 0;
+            for (n, delta) in deltas.iter().enumerate() {
+                assert_packs_whole_units(&key, delta);
+                let packed = index_batches(&key, delta, 1);
+                counts[n] = packed.batches.len();
+                for batch in &packed.batches {
+                    assert!(wire_bytes(batch) <= MAX_BATCH_BYTES, "{}", fixture.name());
+                    largest = largest.max(wire_bytes(batch));
+                }
+            }
+            assert_eq!(hashed, 0, "{}", fixture.name());
+            println!(
+                "[index-keys fixture={} type={} keys={} data_bytes={} index_keys_bytes={} \
+                 hashed={hashed} create_batches={} update_batches={} delete_batches={} \
+                 largest_batch_bytes={largest}]",
+                fixture.name(),
+                fixture.resource_type,
+                keys.len(),
+                fixture.data.len(),
+                blob.len(),
+                counts[0],
+                counts[1],
+                counts[2],
+            );
+            keys_max = keys_max.max(keys.len());
+            blob_max = blob_max.max(blob.len());
+            largest_all = largest_all.max(largest);
+            hashed_all += hashed;
+        }
+        println!(
+            "[index-keys fixtures=16 keys_max={keys_max} index_keys_bytes_max={blob_max} \
+             largest_batch_bytes={largest_all} hashed={hashed_all}]"
+        );
+        assert_eq!(hashed_all, 0);
     }
 
     /// D4: the miss mapping from the returned columns (spike A1). A missing
@@ -5206,38 +5379,38 @@ mod node_tests {
         let row1 = current(&backend, &tenant).await;
         let previous = PreviousVersion::from_row(&row1).unwrap();
         let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let t = tenant.tenant_id().as_str();
+        let keys = backend.index_keys_of(t, "Patient", &json);
+        let k = row1.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
+        assert_eq!(keys.len() as u64, k, "the same content, the same rows");
         let before = backend.statement_counts();
         let mut request = backend.cas_request("update", key_of(&tenant));
         let applied = applied_of(
             backend
                 .run_cas(
                     &mut request,
-                    CasPlan::update(
-                        previous.clone(),
-                        json.clone(),
-                        data.clone(),
-                        vec![IndexKey::ResourcesByType],
-                    ),
+                    CasPlan::update(previous.clone(), json.clone(), data.clone(), keys.clone()),
                 )
                 .await
                 .unwrap(),
         );
         let spent = backend.statement_counts().since(&before);
         eprintln!("[statements op=c2 {spent}]");
-        // V3, I1, V1, I2 sent alone; the X1 insert and delete in one batch
-        // (IW9 B, IW14); one CAS; no read.
+        // V3, I1, V1, I2 sent alone; the `k` inserts and `k` deletes of the
+        // moved rows in one batch (IW9 B, IW14); one CAS; no read.
         assert_eq!(
             (spent.write, spent.cas, spent.read, spent.serial_read),
             (4, 1, 0, 0)
         );
-        assert_eq!((spent.batch, spent.batched), (1, 2), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (1, 2 * k), "{spent}");
         assert_eq!(applied.version_id, 2);
         assert!(applied.post_cas_complete && !applied.superseded);
-        // IW14: what step 5 sent, one row moved in one batch.
+        // IW14: what step 5 sent, every row moved, in one batch.
         let index = applied.index;
         assert_eq!(
             (index.rows_inserted, index.rows_deleted, index.batches),
-            (1, 1, 1),
+            (k, k, 1),
             "{index}"
         );
         assert!((1..=MAX_BATCH_BYTES as u64).contains(&index.largest_batch_bytes));
@@ -5321,7 +5494,7 @@ mod node_tests {
                         PreviousVersion::from_row(&row3).unwrap(),
                         json.clone(),
                         data.clone(),
-                        vec![IndexKey::ResourcesByType],
+                        backend.index_keys_of(t, "Patient", &json),
                     ),
                 )
                 .await
@@ -5738,10 +5911,12 @@ mod node_tests {
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(created.version_id(), "1");
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        // I1, three tries of V1, X1; no I2. X1 is the only row of its unit,
-        // so it goes as a plain write, not as a batch (IW13).
-        assert_eq!((spent.write, spent.cas), (5, 1), "{spent}");
-        assert_eq!((spent.batch, spent.batched), (0, 0), "{spent}");
+        // I1 and three tries of V1; no I2. The `k` index rows of the new
+        // version go as one batch (IW9 B, IW14).
+        let k = current(&backend, &tenant).await.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
+        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (1, k), "{spent}");
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
     }
 
@@ -5895,12 +6070,10 @@ mod node_tests {
             .unwrap();
         let row1 = current(&backend, &tenant).await;
         let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
-        let plan = CasPlan::update(
-            PreviousVersion::from_row(&row1).unwrap(),
-            json,
-            data,
-            vec![IndexKey::ResourcesByType],
-        );
+        let keys = backend.index_keys_of(tenant.tenant_id().as_str(), "Patient", &json);
+        let k = row1.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
+        let plan = CasPlan::update(PreviousVersion::from_row(&row1).unwrap(), json, data, keys);
         for _ in 0..POST_CAS_WRITE_TRIES {
             backend.session.inject_fault(
                 StatementKind::Write,
@@ -5916,10 +6089,11 @@ mod node_tests {
         let stats = backend.cas_stats().since(&before);
         let spent = backend.statement_counts().since(&counted);
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        // V3, I1, V1 sent alone; three tries of the batch holding X1's insert
-        // and delete, none applied (IW16); no I2.
+        // V3, I1, V1 sent alone; three tries of the one batch holding the
+        // `k` inserts and `k` deletes, X1's among them, none applied (IW16);
+        // no I2.
         assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
-        assert_eq!((spent.batch, spent.batched), (3, 6), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (3, 6 * k), "{spent}");
 
         // The old row is still there, at version 1's `last_updated`.
         let by_type = backend
@@ -6003,11 +6177,9 @@ mod node_tests {
     /// as a node does when the replicas answer late: the row has moved, in
     /// one try.
     ///
-    /// The update's batch holds one partition, `(tenant, Patient)`, which a
-    /// real node applies without the batchlog and would time out as `SIMPLE`
-    /// (see `Fault`, "On a batch"). So this checks the writer's handling of
-    /// `BATCH`; a node first sends `BATCH` for a write's batch once pull
-    /// request 5 spreads a write's rows over several partitions.
+    /// The update's batch spans `k` partitions (the type row's, and those of
+    /// its token rows), so a real node can answer `BATCH` for it (see
+    /// `Fault`, "On a batch").
     #[tokio::test]
     async fn a_batch_timeout_after_the_batchlog_is_not_retried_and_keeps_the_intent() {
         let Some(backend) = backend().await else {
@@ -6026,12 +6198,10 @@ mod node_tests {
             .unwrap();
         let row1 = current(&backend, &tenant).await;
         let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
-        let plan = CasPlan::update(
-            PreviousVersion::from_row(&row1).unwrap(),
-            json,
-            data,
-            vec![IndexKey::ResourcesByType],
-        );
+        let keys = backend.index_keys_of(tenant.tenant_id().as_str(), "Patient", &json);
+        let k = row1.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
+        let plan = CasPlan::update(PreviousVersion::from_row(&row1).unwrap(), json, data, keys);
         backend.session.inject_fault(
             StatementKind::Write,
             "INSERT INTO resources_by_type",
@@ -6047,7 +6217,7 @@ mod node_tests {
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
         // V3, I1, V1 sent alone; one try of the batch; no I2.
         assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
-        assert_eq!((spent.batch, spent.batched), (1, 2), "one try: {spent}");
+        assert_eq!((spent.batch, spent.batched), (1, 2 * k), "one try: {spent}");
         assert_eq!(
             by_type_versions(&backend, &tenant).await,
             vec![2],

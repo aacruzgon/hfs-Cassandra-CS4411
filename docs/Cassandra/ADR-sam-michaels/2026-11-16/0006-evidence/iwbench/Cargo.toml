@@ -1,0 +1,25 @@
+[package]
+name = "iwbench"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+helios-persistence = { path = "../../../../../../crates/persistence", default-features = false, features = ["R4"] }
+helios-fhir = { path = "../../../../../../crates/fhir", default-features = false, features = ["R4"] }
+serde_json = "1"
+parking_lot = "0.12"
+chrono = "0.4"
+cdrs-tokio = "10.0.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+futures = "0.3"
+
+# Optimise the hot crates for the timing run; helios-fhir (generated models)
+# stays at opt-level 0 to keep the build small.
+[profile.dev.package."*"]
+opt-level = 2
+[profile.dev.package.helios-fhir]
+opt-level = 0
+[profile.dev.package.iwbench]
+opt-level = 2

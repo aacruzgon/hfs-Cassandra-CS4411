@@ -818,15 +818,15 @@ mod cassandra {
     use super::*;
     use helios_persistence::backends::cassandra::{CassandraBackend, CassandraConfig};
 
-    /// The golden list at Step 3: `SharedSchema` (roadmap item 2.4), and
-    /// `Crud` and `OptimisticLocking` (roadmap rows 3.3 and 3.4,
-    /// ADR-aacruzgon-0037), declared in the commit where the CRUD and race
-    /// suites run.
+    /// The golden list at Step 4: `SharedSchema` (roadmap item 2.4), `Crud`
+    /// and `OptimisticLocking` (roadmap rows 3.3 and 3.4, ADR-aacruzgon-0037),
+    /// declared in the commit where the CRUD and race suites run, and
+    /// `Versioning` (roadmap row 4.1, ADR-sara-lahourpour-0002), declared in
+    /// Step 4's last commit, after the adapted versioning suite.
     ///
     /// Each step moves its capability from [`LATER`] to here, and adds it to
     /// `declared_capabilities()`, in the same commit, once it is implemented:
-    /// `Versioning` at Step 4, `BasicSearch`, `DateSearch` and
-    /// `CursorPagination` at Steps 6a to 6d.
+    /// `BasicSearch`, `DateSearch` and `CursorPagination` at Steps 6a to 6d.
     /// Those seven are the design's end state ("Structs and enums", the
     /// `BackendKind::Cassandra` and `BackendCapability` row). There is no
     /// `TokenSearch` or `UriSearch` variant: `BasicSearch` covers token search,
@@ -836,17 +836,17 @@ mod cassandra {
     /// and the bulk-submit REST worker are ✗ in the design's scope (not
     /// implemented); bulk export and bulk-submit ingest are out of scope for
     /// this project.
-    const GOLDEN: [BackendCapability; 3] = [
+    const GOLDEN: [BackendCapability; 4] = [
         BackendCapability::Crud,
+        BackendCapability::Versioning,
         BackendCapability::OptimisticLocking,
         BackendCapability::SharedSchema,
     ];
 
-    /// The design's other four, which later steps declare as they land
+    /// The design's other three, which later steps declare as they land
     /// (ADR-aacruzgon-0037). Until then the instance must not report them.
     /// Delete this list, and its loop below, when Step 6d empties it.
-    const LATER: [BackendCapability; 4] = [
-        BackendCapability::Versioning,
+    const LATER: [BackendCapability; 3] = [
         BackendCapability::BasicSearch,
         BackendCapability::DateSearch,
         BackendCapability::CursorPagination,

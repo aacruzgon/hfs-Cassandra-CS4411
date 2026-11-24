@@ -808,11 +808,13 @@ mod node_tests {
         let stats = backend.cas_stats().since(&before.1);
         eprintln!("[statements op=delete {spent}]");
         eprintln!("[cas case=delete {stats}]");
-        // R1; V3, I1, V2, the X1 delete, I2; one C3.
+        // R1; V3, I1, V2, the X1 delete, I2; one C3. The delete is the only
+        // row of its unit, so it goes as a plain write, not as a batch (IW13).
         assert_eq!(
             (spent.read, spent.write, spent.cas, spent.serial_read),
             (1, 5, 1, 0)
         );
+        assert_eq!((spent.batch, spent.batched), (0, 0), "{spent}");
         assert_eq!(
             (stats.attempts, stats.applied, stats.post_cas_failures),
             (1, 1, 0)
@@ -1597,6 +1599,7 @@ mod node_tests {
             write_id: applied.write_id,
             superseded: true,
             post_cas_complete: false,
+            index: Default::default(),
             plan: applied.plan.clone(),
         };
         backend.deleted(t, "SearchParameter", "s", &superseded);

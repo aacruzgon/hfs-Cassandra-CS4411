@@ -112,8 +112,10 @@ See [Environment Variables](#environment-variables) for all available configurat
 
     Linux (Ubuntu/Debian):
     ```bash
-    sudo apt install clang lld
+    sudo apt install clang lld pkg-config libssl-dev
     ```
+
+    `pkg-config` and `libssl-dev` are for `openssl-sys`, which `reqwest`'s `native-tls` pulls in on Linux only; without them the build fails at `openssl-sys`.
 
     Windows:
 

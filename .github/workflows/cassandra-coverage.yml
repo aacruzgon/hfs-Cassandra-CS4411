@@ -16,9 +16,11 @@ name: Cassandra coverage
 # 0021).
 #
 # The job starts its own single-node Cassandra, with its own Compose project
-# (hfs-cassandra-cov) and host port (59242), the way the required Cassandra
-# job does with hfs-cassandra-ci and 59142 (ADR-sam-michaels-0001,
-# ADR-aacruzgon-0020); down -v at the end removes only that project.
+# (hfs-cassandra-cov) and host port (29242), the way the required Cassandra
+# job does with hfs-cassandra-ci and 29142 (ADR-sam-michaels-0001,
+# ADR-aacruzgon-0020); down -v at the end removes only that project. A second
+# runner instance on the same machine adds its slot to both (HFS_CI_SLOT,
+# ADR-aacruzgon-0086): hfs-cassandra-cov-s1 and 29252 on slot 1.
 #
 # Its sections go through the CI report helper (.github/scripts/ci-report.py)
 # into the job summary and the artifact ci-report-coverage, with the HTML
@@ -51,15 +53,18 @@ jobs:
     # Light (ADR-aacruzgon-0023): the cold instrumented build peaked at
     # 4821 MiB anon on acruzdebian (run 42254248131) and 4709 MiB on
     # sam-7900x (run 42253148327), more than 2 GiB under the 9 GiB a light
-    # job must fit (ADR-aacruzgon-0080), and light keeps it off the heavy
-    # queue the required clippy pair waits in.
+    # job must fit (ADR-aacruzgon-0080), and light keeps it off the medium
+    # queue the required clippy pair waits in (ADR-aacruzgon-0082).
     runs-on: [self-hosted, hfs-cassandra-light]
     timeout-minutes: 60
     env:
       COMPOSE_FILE: docker/cassandra/docker-compose.yml
-      # Neither a developer's 59042 nor the required job's 59142. Every
-      # compose command below names this job's own project, hfs-cassandra-cov.
-      CASSANDRA_HOST_PORT: 59242
+      # Neither a developer's 59042 nor the required job's 29142, and below
+      # the ephemeral range (59242 before ADR-aacruzgon-0086). Every
+      # compose command below names this job's own project. Both are the
+      # bases of this runner instance's slot (the first step).
+      CASSANDRA_BASE_PORT: 29242
+      COMPOSE_PROJECT_BASE: hfs-cassandra-cov
       # No incremental cache in the persistent target dir below.
       CARGO_INCREMENTAL: 0
       LLVM_COV_VERSION: 0.9.1
@@ -68,6 +73,44 @@ jobs:
       CI_REPORT_PROFILE: test (debug, -C instrument-coverage, CARGO_INCREMENTAL=0)
       CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
+      # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
+      # the runner's own .env. Two instances on one machine share gh-runner's
+      # rootless Docker and the host's ports, so each needs its own Compose
+      # project and host port. Unset or 0 keeps the base project and port
+      # above; slot N (1 to 9) adds -sN to the project and 10 x N to the port,
+      # which stays clear of every other job's port in every slot
+      # (docker/cassandra/README.md). Every port stays below Linux's
+      # ephemeral range (32768-60999), where no client socket is placed, so
+      # none can hold it in TIME-WAIT; the step refuses one that does not.
+      # The derived names go to $GITHUB_ENV and are never in the job's env:,
+      # and every command below reads them as ${NAME:?}, so a missing slot
+      # step fails rather than reaching the Compose file's default project.
+      # First, so the always() clean-up has them however early the job fails.
+      # The same step is in each job that starts a single node.
+      - name: Pick this runner's Compose project and host port
+        run: |
+          slot=${HFS_CI_SLOT:-0}
+          if ! [[ $slot =~ ^[0-9]$ ]]; then
+            echo "::error title=HFS_CI_SLOT::must be one digit (0 to 9) or unset, got $(printf %q "$slot")"
+            exit 1
+          fi
+          project=$COMPOSE_PROJECT_BASE port=$CASSANDRA_BASE_PORT
+          if ! [[ $port =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error title=HFS_CI_SLOT::base port must be a positive whole number with no leading zero, got $(printf %q "$port")"
+            exit 1
+          fi
+          if [ "$slot" != 0 ]; then project=$project-s$slot port=$((port + 10 * slot)); fi
+          if [ "$port" -ge 32768 ]; then
+            echo "::error title=HFS_CI_SLOT::host port $port is inside Linux's ephemeral range (32768-60999)"
+            exit 1
+          fi
+          {
+            echo "COMPOSE_PROJECT=$project"
+            echo "CASSANDRA_HOST_PORT=$port"
+            echo "CASSANDRA_CONTAINER=$project-cassandra-1"
+          } >> "$GITHUB_ENV"
+          echo "Runner ${RUNNER_NAME:-?}, slot $slot: Compose project $project, host port 127.0.0.1:$port"
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -81,8 +124,18 @@ jobs:
 
       # Prebuilt binary, checksum-verified by the action; the same action pin
       # as coverage.yml (ADR-aacruzgon-0022), whose manifest lists 0.9.1.
+      # The action downloads and unpacks into $HOME/.install-action/tmp, one
+      # fixed directory, and deletes it at the end (its main.sh), so two jobs
+      # installing at once under one user, as acruzdebian's two runner
+      # instances do (ADR-aacruzgon-0086), would overwrite or delete each
+      # other's download. HOME is this job's own for the step only: the binary
+      # still goes to $CARGO_HOME/bin, which the toolchain step exported as
+      # gh-runner's ~/.cargo, and lands there with mv, a rename, so a job
+      # already running the old copy keeps it.
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        env:
+          HOME: ${{ runner.temp }}/install-action-home
         with:
           tool: cargo-llvm-cov@${{ env.LLVM_COV_VERSION }}
 
@@ -176,19 +229,19 @@ jobs:
 
       # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
       - name: Remove leftovers of an earlier run
-        run: docker compose -p hfs-cassandra-cov down -v --remove-orphans
+        run: docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
 
       - name: Start Cassandra and wait for its healthcheck
         run: |
           start=$(date +%s)
-          docker compose -p hfs-cassandra-cov up -d --wait --wait-timeout 240
+          docker compose -p "${COMPOSE_PROJECT:?}" up -d --wait --wait-timeout 240
           echo "Healthy after $(( $(date +%s) - start )) s"
 
       # The context every later report section carries, with the node's
       # Cassandra version. Report only.
       - name: Report the context
         continue-on-error: true
-        run: python3 .github/scripts/ci-report.py context --cassandra-container hfs-cassandra-cov-cassandra-1
+        run: python3 .github/scripts/ci-report.py context --cassandra-container "${CASSANDRA_CONTAINER:?}"
 
       # The schema checks belong to the required job; this one only applies it.
       - name: Apply keyspace-single-node.cql, then schema.cql
@@ -292,7 +345,7 @@ jobs:
         run: |
           set -o pipefail
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
-          HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER=hfs-cassandra-cov-cassandra-1 \
+          HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER="${CASSANDRA_CONTAINER:?}" \
           LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%.profraw}%c.profraw" \
             cargo test -p helios-hfs --no-default-features --features R4,cassandra \
               --test cassandra_milestone_a -- --exact readiness_reports_down_while_cassandra_is_stopped \
@@ -385,12 +438,12 @@ jobs:
 
       - name: Cassandra logs
         if: failure()
-        run: docker compose -p hfs-cassandra-cov logs --tail 200
+        run: docker compose -p "${COMPOSE_PROJECT:?}" logs --tail 200
 
       # down -v is safe here only because -p names this job's own project.
       - name: Stop Cassandra and remove this job's volume
         if: always()
-        run: docker compose -p hfs-cassandra-cov down -v --remove-orphans
+        run: docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
 
       # Every report section of this job, as JSON and Markdown, the raw test
       # logs, the HTML report and lcov.info. Report only: an upload failure

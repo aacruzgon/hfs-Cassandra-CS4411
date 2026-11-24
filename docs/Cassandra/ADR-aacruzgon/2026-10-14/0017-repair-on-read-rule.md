@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0017: Repair on read deletes only keys the current version does not produce
 
 - **Date:** 2026-10-14
-- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Status:** accepted (team review at the schema session, roadmap item 1.4); when repair acts and its bounds are set by ADR-sam-michaels-0006 (RV1, RV3 to RV5), see ADR-aacruzgon-0081
 - **Context:**
     - **What the design said.** Repair on read "deletes the stale key it found".
     - **The race.** During the normal window between a writer's CAS and its index writes, a key the new version keeps (for example an unchanged date) still carries the old tag.

@@ -14,6 +14,8 @@
 //!   is in `search()` (Step 6). These exist so the server compiles.
 //! - **History** (✗): instance, type and system history, and the two
 //!   history-deletion operations whose defaults name no backend.
+//!   `supports_history` answers `false`, from the declared capabilities, so
+//!   `/metadata` lists no history interaction (roadmap Step 7).
 //! - **Transaction Bundles** (✗): batch Bundles do not use this trait; REST
 //!   runs each entry against `ResourceStorage`.
 //! - **Bulk export** (out of scope).
@@ -105,6 +107,16 @@ impl RevincludeProvider for CassandraBackend {
 
 #[async_trait]
 impl InstanceHistoryProvider for CassandraBackend {
+    /// `false`: Cassandra does not declare
+    /// [`BackendCapability::InstanceHistory`](crate::core::BackendCapability::InstanceHistory),
+    /// and every history method here refuses. `/metadata` therefore omits
+    /// `history-instance`, `history-type` and `history-system`, and keeps
+    /// `vread`, `versioning: versioned` and `readHistory: true`, which
+    /// `vread` serves (ADR-aacruzgon-0025).
+    fn supports_history(&self) -> bool {
+        crate::core::Backend::supports(self, crate::core::BackendCapability::InstanceHistory)
+    }
+
     async fn history_instance(
         &self,
         _tenant: &TenantContext,

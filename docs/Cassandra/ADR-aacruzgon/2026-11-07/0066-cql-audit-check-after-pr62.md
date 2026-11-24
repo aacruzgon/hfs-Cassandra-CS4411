@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0066: The CQL audit check after PR #62: each rule also reads the CQL text, across keyspaces, and the audit dump is read fail-closed
 
 - **Date:** 2026-11-07
-- **Status:** accepted (Alan chose a new entry over 0058's Status line on 2026-11-07, as recommended, accepted its three fail-closed false failures the same day, and approved this entry on 2026-11-07). It amends ADR-aacruzgon-0058's matching rules and its known limits.
+- **Status:** accepted (Alan chose a new entry over 0058's Status line on 2026-11-07, as recommended, accepted its three fail-closed false failures the same day, and approved this entry on 2026-11-07). It amends ADR-aacruzgon-0058's matching rules and its known limits. Rule (d) is kept strict, with a source scan and one recorded re-run added by ADR-sam-michaels-0006 (IW20), see ADR-aacruzgon-0081.
 - **Context:**
     - **What ADR-0058 decided.** The required Cassandra job turns the node's audit log on, dumps it with `auditlogviewer`, and `ci-report.py cql-audit --check` fails the job on any of these:
         - **(a)** a `type:DELETE` entry scoped exactly to `resources` or `resource_versions`;

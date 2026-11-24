@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0014: The sweeper scans every live bucket when it starts
 
 - **Date:** 2026-10-14
-- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Status:** accepted (team review at the schema session, roadmap item 1.4); the scan runs in the background, not first (ADR-sam-michaels-0006, SW9), see ADR-aacruzgon-0081
 - **Context:**
     - **The mismatch.** The design polled only the current and previous hour bucket, but intent rows live for 24 h.
     - **How it fails.** After a sweeper outage of more than about an hour, older intents are never processed.

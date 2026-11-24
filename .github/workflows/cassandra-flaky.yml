@@ -1,0 +1,431 @@
+name: Cassandra flaky tests (report only)
+
+# Flakiness of the Cassandra tests a pull request adds or changes
+# (ADR-aacruzgon-0082). The job finds them from the diff
+# (.github/scripts/flaky-tests.py: every #[test] and #[tokio::test] function
+# whose attributes, signature or body the diff touches, in the backend's
+# --lib tests and in tests/cassandra/), builds the two test binaries once,
+# and runs each test N times on a node of its own, one test per process with
+# --exact, so a test that passes once by luck shows up before review.
+#
+# Report only. The job passes whatever the runs find: the summary has one row
+# per test (runs, passes, failures, timeouts, the first failure's message),
+# and a test that failed some of its runs is a warning annotation. Only a
+# dispatch whose inputs do not look like a ref, a range or a run count fails,
+# before anything runs. Its name is
+# in no ruleset and must never match one of the five required checks
+# (ADR-aacruzgon-0019, 0021), so it is a workflow of its own.
+#
+# Medium, not heavy (ADR-aacruzgon-0082): its only build is the required
+# Cassandra job's helios-persistence --lib and cassandra_tests build, which
+# peaked at 4,103 MiB anon (run 44655683717), and the re-runs are one test
+# process at a time, so it fits sam-7900x's 20G with room to spare and either
+# runner can take it; nothing here needs more than 20G. A paths: filter
+# is fine here: no required check lives in this workflow.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/persistence/src/backends/cassandra/**'
+      - 'crates/persistence/tests/cassandra/**'
+      - 'crates/persistence/tests/cassandra_tests.rs'
+      # The job's own files, so a change to it runs it (with no test
+      # changed, it re-runs nothing and says so).
+      - '.github/workflows/cassandra-flaky.yml'
+      - '.github/scripts/flaky-tests.py'
+  workflow_dispatch:
+    inputs:
+      head:
+        description: The branch, tag or full 40-character commit SHA whose tests are re-run (actions/checkout reads a short SHA as a branch name). Empty uses the ref the run was started on.
+        required: false
+        default: ''
+      base:
+        description: The base the diff is taken from, as base...head (a branch of origin, a tag or a commit).
+        required: false
+        default: main
+      in_diff:
+        description: A git diff range to use instead of base...head (for example a1b2c3d..e4f5a6b).
+        required: false
+        default: ''
+      runs:
+        description: Runs per test.
+        required: false
+        default: '20'
+
+permissions:
+  contents: read
+  # The last report reads the job's own step timings from the Actions API
+  # (.github/scripts/job-step-timings.py). Read-only, like contents.
+  actions: read
+
+# One run per pull request, or per dispatch of the same ref and inputs; a
+# newer push cancels the run in flight.
+concurrency:
+  group: >-
+    cassandra-flaky-${{ github.event.pull_request.number
+    || format('{0}-{1}-{2}-{3}-{4}', github.ref, inputs.head, inputs.base,
+              inputs.in_diff, inputs.runs) }}
+  cancel-in-progress: true
+
+env:
+  # As in the other workflows: rustup ranks the environment above any
+  # directory override left on the runner.
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+
+jobs:
+  flaky:
+    name: Cassandra flaky tests (report only)
+    # Fork guard (ADR-aacruzgon-0018).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra-medium]
+    timeout-minutes: 120
+    env:
+      FLAKY_RUNS: ${{ inputs.runs || '20' }}
+      # The runs stop starting here, and the report counts the rest as not
+      # reached; this leaves the job room for the build, the node and the
+      # reports.
+      FLAKY_BUDGET_MINUTES: 80
+      # Its own node, on a port nothing else publishes: not a developer's
+      # 59042, the required job's 29142, coverage's and FHIR versions' 29242,
+      # the three-node Compose file's 59342 to 59344, the benchmark harness's
+      # 59542, the nightly three-node job's 29642 to 29644 or the mutation
+      # job's 29842 (docker/cassandra/README.md), and below the ephemeral
+      # range (59442 before ADR-aacruzgon-0086). Rootless Docker publishes on
+      # the host itself. Its own Compose project, so down -v can only remove
+      # this job's container and volume. Both are the bases of this runner
+      # instance's slot (the first step, ADR-aacruzgon-0086).
+      COMPOSE_FILE: docker/cassandra/docker-compose.yml
+      CASSANDRA_BASE_PORT: 29442
+      COMPOSE_PROJECT_BASE: hfs-cassandra-flaky
+      # No incremental cache in the persistent target dir below: it would grow
+      # with every commit until the size cap wipes the whole directory.
+      CARGO_INCREMENTAL: 0
+      CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
+    steps:
+      # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
+      # the runner's own .env. Two instances on one machine share gh-runner's
+      # rootless Docker and the host's ports, so each needs its own Compose
+      # project and host port. Unset or 0 keeps the base project and port
+      # above; slot N (1 to 9) adds -sN to the project and 10 x N to the port,
+      # which stays clear of every other job's port in every slot
+      # (docker/cassandra/README.md). Every port stays below Linux's
+      # ephemeral range (32768-60999), where no client socket is placed, so
+      # none can hold it in TIME-WAIT; the step refuses one that does not.
+      # The derived names go to $GITHUB_ENV and are never in the job's env:,
+      # and every command below reads them as ${NAME:?}, so a missing slot
+      # step fails rather than reaching the Compose file's default project.
+      # First, so the always() clean-up has them however early the job fails.
+      # The same step is in each job that starts a single node.
+      - name: Pick this runner's Compose project and host port
+        run: |
+          slot=${HFS_CI_SLOT:-0}
+          if ! [[ $slot =~ ^[0-9]$ ]]; then
+            echo "::error title=HFS_CI_SLOT::must be one digit (0 to 9) or unset, got $(printf %q "$slot")"
+            exit 1
+          fi
+          project=$COMPOSE_PROJECT_BASE port=$CASSANDRA_BASE_PORT
+          if ! [[ $port =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error title=HFS_CI_SLOT::base port must be a positive whole number with no leading zero, got $(printf %q "$port")"
+            exit 1
+          fi
+          if [ "$slot" != 0 ]; then project=$project-s$slot port=$((port + 10 * slot)); fi
+          if [ "$port" -ge 32768 ]; then
+            echo "::error title=HFS_CI_SLOT::host port $port is inside Linux's ephemeral range (32768-60999)"
+            exit 1
+          fi
+          {
+            echo "COMPOSE_PROJECT=$project"
+            echo "CASSANDRA_HOST_PORT=$port"
+            echo "CASSANDRA_CONTAINER=$project-cassandra-1"
+          } >> "$GITHUB_ENV"
+          echo "Runner ${RUNNER_NAME:-?}, slot $slot: Compose project $project, host port 127.0.0.1:$port"
+
+      # A dispatch's inputs reach git and actions/checkout as arguments. A
+      # value that starts with - would be read as an option (git diff
+      # --output=<file> writes that file), so each input must look like what
+      # it is. A pull request has no inputs: its refs come from GitHub.
+      - name: Check the dispatch inputs
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          HEAD_IN: ${{ inputs.head }}
+          BASE_IN: ${{ inputs.base }}
+          RANGE_IN: ${{ inputs.in_diff }}
+          RUNS_IN: ${{ inputs.runs }}
+        run: |
+          # A ref, a commit or a revision such as main~3; a range (a..b,
+          # a...b) is made of the same characters.
+          ref='[A-Za-z0-9_][A-Za-z0-9._/@{}~^+-]*'
+          bad=0
+          check() { # input name, value, pattern
+            if ! [[ $2 =~ ^($3)$ ]]; then
+              echo "::error title=Dispatch input::$1 must match ^($3)\$, got $(printf %q "$2")"
+              bad=1
+            fi
+          }
+          [ -z "$HEAD_IN" ] || check head "$HEAD_IN" "$ref"
+          # actions/checkout looks a short SHA up as a branch or tag and fails
+          # (run 44762833969), so say so here, before anything runs.
+          if [[ $HEAD_IN =~ ^[0-9a-f]{7,39}$ ]]; then
+            echo "::error title=Dispatch input::head $HEAD_IN looks like a short commit SHA, which actions/checkout reads as a branch or tag name; give the full 40-character SHA"
+            bad=1
+          fi
+          # Empty means main, as in the diff step (inputs.base || 'main').
+          [ -z "$BASE_IN" ] || check base "$BASE_IN" "$ref"
+          [ -z "$RANGE_IN" ] || check in_diff "$RANGE_IN" "$ref"
+          # 1 to 200 runs per test.
+          check runs "$RUNS_IN" '[1-9][0-9]?|1[0-9][0-9]|200'
+          exit "$bad"
+
+      # The pull request's head, not the merge commit, so the tests and lines
+      # are the ones the pull request shows. Full history, for the merge base.
+      - name: Checkout the code under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head || github.event.pull_request.head.sha || '' }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A dispatch can test a branch that does not have this workflow's
+      # scripts, so they come from the commit this workflow file is from,
+      # kept outside the tree.
+      - name: Keep this workflow's scripts
+        env:
+          WORKFLOW_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          dir="$RUNNER_TEMP/ci-scripts"
+          rm -rf "$dir" && mkdir -p "$dir"
+          git archive "$WORKFLOW_SHA" .github/scripts | tar -x -C "$dir" --strip-components=2
+          echo "CI_SCRIPTS=$dir" >> "$GITHUB_ENV"
+          # The commit the reports name, as a SHA: a dispatch's head input
+          # may be a branch name.
+          echo "CI_REPORT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "Head: $(git rev-parse HEAD); scripts from $WORKFLOW_SHA"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+
+      - name: Report the context
+        continue-on-error: true
+        run: python3 "$CI_SCRIPTS/ci-report.py" context
+
+      # The tests the diff adds or changes, from base...head (git takes it
+      # from the merge base) or the dispatch's own range, as JSON.
+      - name: Find the tests the diff adds or changes
+        id: find
+        env:
+          BASE: ${{ github.base_ref || inputs.base || 'main' }}
+          RANGE: ${{ inputs.in_diff }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/flaky"
+          mkdir -p "$out"
+          if [ -z "$RANGE" ]; then
+            if git rev-parse --verify -q "refs/remotes/origin/$BASE^{commit}" > /dev/null; then base="origin/$BASE"; else base="$BASE"; fi
+            RANGE="$base...HEAD"
+          fi
+          # --end-of-options: whatever the range holds, git reads it as a
+          # revision, never as an option.
+          git diff -U0 --no-color --no-ext-diff --end-of-options "$RANGE" -- \
+            crates/persistence/src/backends/cassandra/ crates/persistence/tests/cassandra/ \
+            crates/persistence/tests/cassandra_tests.rs > "$out/pr.diff"
+          echo "Range $RANGE"
+          python3 -I "$CI_SCRIPTS/flaky-tests.py" find --diff "$out/pr.diff" --root . --out "$out/tests.json"
+          count=$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["tests"]))' "$out/tests.json")
+          echo "$count test(s) to re-run"
+          {
+            echo "range=$RANGE"
+            echo "count=$count"
+            echo "tests=$out/tests.json"
+          } >> "$GITHUB_OUTPUT"
+
+      # Same bounded, persistent target directory as the other jobs
+      # (ADR-sam-michaels-0002), of its own.
+      - name: Reset the target dir if it is stale or over its cap
+        if: steps.find.outputs.count != '0'
+        env:
+          TARGET_DIR: ${{ runner.workspace }}/target/cassandra-flaky
+          CAP_GB: 15
+        run: |
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
+          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp)"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          # The tag cargo writes only into a target dir it creates itself; see
+          # cassandra-coverage.yml's reset step.
+          printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+            '# This file is a cache directory tag created by cargo.' \
+            '# For information about cache directory tags see https://bford.info/cachedir/' \
+            > "$TARGET_DIR/CACHEDIR.TAG"
+          echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+
+      # The two binaries, before the node starts, so the build's memory peak
+      # and the 3 GiB container never overlap. Under ci-report.py build, which
+      # samples the runner's cgroup. The JSON messages name each executable.
+      - name: Build the --lib and cassandra_tests binaries
+        id: build
+        if: steps.find.outputs.count != '0'
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/flaky"
+          # $1 is expanded by the inner bash, which gets the path as its argument.
+          # shellcheck disable=SC2016
+          python3 "$CI_SCRIPTS/ci-report.py" build build-flaky "Build: helios-persistence --lib and cassandra_tests" -- \
+            bash -c 'nice -n 10 cargo test -p helios-persistence --features cassandra --lib --test cassandra_tests --no-run --message-format=json-render-diagnostics > "$1"' _ "$out/cargo.json"
+          python3 -I "$CI_SCRIPTS/flaky-tests.py" bins --cargo-json "$out/cargo.json" --out "$out/bins.json"
+
+      # Started the way the required Cassandra job starts its own
+      # (ADR-aacruzgon-0020); a run killed mid-job skips its cleanup, so
+      # leftovers go first.
+      - name: Start a Cassandra node and apply the schema
+        id: node
+        if: steps.build.outcome == 'success'
+        # Report only: a node that does not start skips the re-runs, with a
+        # warning, rather than failing the job.
+        continue-on-error: true
+        run: |
+          docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
+          # Up to three tries, 35 s apart, so the third comes about 70 s after
+          # the first. Added when every CI port was even and inside Linux's
+          # ephemeral range (32768-60999): connect() takes even ports first, so
+          # the client side of the previous job's loopback test connections
+          # could sit on this port in TIME-WAIT for 60 s, which no listener can
+          # bind over, SO_REUSEADDR or not. Run 44765908091 hit it: its bind on
+          # 59842 came 17-46 s after the previous job's tests against 59242.
+          # Since ADR-aacruzgon-0086 every CI port is below that range, where
+          # no client socket is ever placed, so that cause is gone; the tries
+          # stay, as they cost nothing when the first one works.
+          for try in 1 2 3; do
+            if python3 "$CI_SCRIPTS/ci-report.py" timed node-start "Start and healthcheck (compose up --wait), try $try" -- \
+              docker compose -p "${COMPOSE_PROJECT:?}" up -d --wait --wait-timeout 240; then
+              break
+            fi
+            docker compose -p "${COMPOSE_PROJECT:?}" logs --tail 50 || true
+            docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
+            if [ "$try" = 3 ]; then
+              echo "::warning title=Flaky tests::the Cassandra node did not start in 3 tries, so nothing was run; see this step's log"
+              exit 1
+            fi
+            sleep 35
+          done
+          cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
+            -f docs/Cassandra/schema/keyspace-single-node.cql
+          cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
+            -k helios -f docs/Cassandra/schema/schema.cql
+
+      # Each test N times, one test per process, --exact, against this job's
+      # node. The tombstone tests are opted in, as in the required job, since
+      # the node is this job's own, and so is the latency report, which
+      # otherwise returns at once without measuring anything (and without a
+      # "skipping:" line); its files go to a scratch directory. The restart
+      # tests need a node of their own (HFS_TEST_CASSANDRA_RESTART_*) and
+      # skip, and the 9 and 17 MiB size probe stays off, as in the required
+      # job. Under ci-report.py build for the memory peak; never fails the
+      # step.
+      - name: Re-run each test (report only)
+        id: runs
+        if: steps.build.outcome == 'success' && steps.node.outcome == 'success'
+        timeout-minutes: 90
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/flaky"
+          logs="$RUNNER_TEMP/flaky-logs"
+          rm -rf "$logs" && mkdir -p "$logs"
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+          HFS_TEST_CASSANDRA_TOMBSTONE_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+          HFS_TEST_LATENCY_REPORT="$RUNNER_TEMP/flaky-latency-report" \
+            python3 "$CI_SCRIPTS/ci-report.py" build flaky-runs "Re-runs: each test ${FLAKY_RUNS} times" -- \
+              python3 -I "$CI_SCRIPTS/flaky-tests.py" run --tests "$out/tests.json" --bins "$out/bins.json" \
+                --runs "$FLAKY_RUNS" --logs "$logs" --timeout 300 --budget-minutes "$FLAKY_BUDGET_MINUTES" \
+            || echo "::warning title=Flaky tests::the re-run script exited $?"
+
+      # One row per test: runs, passes, failures, timeouts, status and the
+      # first failure's message (.github/scripts/flaky-tests.py report).
+      # Report only.
+      - name: Report the re-runs
+        if: always() && steps.find.outcome == 'success'
+        continue-on-error: true
+        env:
+          RANGE: ${{ steps.find.outputs.range }}
+          HEAD_NAME: ${{ inputs.head || github.head_ref || github.ref_name }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/flaky"
+          python3 -I "$CI_SCRIPTS/flaky-tests.py" report --results "$RUNNER_TEMP/flaky-logs/results.json" \
+            --found "$out/tests.json" --out "$out" > /dev/null
+          { echo "Tested: \`$HEAD_NAME\` at \`$(git rev-parse --short HEAD)\`, range \`$RANGE\`."; echo; cat "$out/flaky.md"; } > "$out/flaky-section.md"
+          python3 "$CI_SCRIPTS/ci-report.py" add flaky "Flaky tests (re-runs of the added and changed tests, report only)" \
+            --markdown "$out/flaky-section.md" --json "$out/flaky.json"
+
+      # Also when the node step failed: it is continue-on-error, so failure()
+      # stays false, and a schema that does not apply leaves the node up.
+      - name: Cassandra logs
+        if: (failure() || steps.node.outcome == 'failure') && steps.build.outcome == 'success'
+        # Report only, like the rest: a Docker daemon that is gone fails this
+        # too, and must not turn the job red.
+        continue-on-error: true
+        run: |
+          docker compose -p "${COMPOSE_PROJECT:?}" logs --tail 200 \
+            || echo "::warning title=Flaky tests::docker compose logs failed, so the node's logs are not in this run"
+
+      # down -v is safe here only because -p names this job's own project.
+      - name: Stop Cassandra and remove this job's volume
+        if: always()
+        # Report only: a failed down (the Docker daemon gone) is a warning,
+        # and the next run's leading down -v removes what it left.
+        continue-on-error: true
+        run: |
+          if ! docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans; then
+            echo "::warning title=Flaky tests::docker compose down failed, so this job's container and volume may be left; the next run's leading down -v removes them"
+          fi
+
+      # Where this job's time went (.github/scripts/job-step-timings.py).
+      # Report only.
+      - name: Report where this job's time went
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/ci-report/inputs/step-timings"
+          python3 "$CI_SCRIPTS/job-step-timings.py" "Cassandra flaky tests (report only)" "$out"
+          python3 "$CI_SCRIPTS/ci-report.py" add step-timings "Where this job's time went" \
+            --markdown "$out/step-timings.md" --json "$out/step-timings.json"
+
+      # One log per test with every run's output, and results.json.
+      - name: Upload the re-run logs
+        id: upload-flaky-logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flaky-logs
+          path: ${{ runner.temp }}/flaky-logs
+          if-no-files-found: warn
+          overwrite: true
+
+      # One retry: an upload once failed on a DNS error (EAI_AGAIN) reaching
+      # GitHub's blob storage, and the artifact was lost.
+      - name: Upload flaky-logs again if the upload failed
+        if: always() && steps.upload-flaky-logs.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flaky-logs
+          path: ${{ runner.temp }}/flaky-logs
+          if-no-files-found: warn
+          overwrite: true
+
+      - name: Upload the CI report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-flaky
+          path: ${{ runner.temp }}/ci-report
+          if-no-files-found: warn
+          overwrite: true

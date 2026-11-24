@@ -144,6 +144,28 @@ pub type HistoryPage = Page<HistoryEntry>;
 /// ```
 #[async_trait]
 pub trait InstanceHistoryProvider: VersionedStorage {
+    /// Whether the history interactions are really implemented, as opposed to
+    /// answering `UnsupportedCapability`: instance history
+    /// ([`history_instance`](Self::history_instance)), type history
+    /// ([`TypeHistoryProvider`]) and system history ([`SystemHistoryProvider`]).
+    ///
+    /// Defaults to `true`: a type that implements the required methods serves
+    /// them. A storage whose history methods are stubs overrides this, and a
+    /// wrapper that forwards history to an inner storage forwards this too;
+    /// `CompositeStorage` answers for its history provider.
+    ///
+    /// The REST layer builds `GET /metadata` from this: `history-instance` and
+    /// `history-type` on each resource, and `history-system` at system level,
+    /// are advertised only where it is `true`, so the statement and the `501` a
+    /// history request gets from a stub cannot disagree. `vread`, `versioning`
+    /// and `readHistory` do not depend on it: `readHistory` is "able to return
+    /// past versions as part of the vRead operation"
+    /// (<https://hl7.org/fhir/R4/capabilitystatement-definitions.html#CapabilityStatement.rest.resource.readHistory>),
+    /// which is [`VersionedStorage::vread`], not the history interactions.
+    fn supports_history(&self) -> bool {
+        true
+    }
+
     /// Gets the history for a specific resource instance.
     ///
     /// # Arguments

@@ -585,11 +585,13 @@ where
 pub fn create_minimal_routes<S>(state: AppState<S>) -> Router
 where
     // `ConditionalStorage`: `/metadata` reads which conditional interactions
-    // the storage serves (#1384).
+    // the storage serves (#1384). `InstanceHistoryProvider`: it reads whether
+    // the storage serves the history interactions too.
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
         + BundleProvider
+        + InstanceHistoryProvider
         + Send
         + Sync
         + 'static,

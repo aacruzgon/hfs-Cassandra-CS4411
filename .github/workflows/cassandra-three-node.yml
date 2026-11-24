@@ -70,7 +70,12 @@ permissions:
   actions: read
 
 # One run at a time across every ref: the ports, the subnet and the Compose
-# project are fixed. cancel-in-progress: false never cancels the run in
+# project are fixed. The group is also what lets them stay fixed on
+# acruzdebian, whose two runner instances share gh-runner's Docker and the
+# host's ports: no two runs overlap on any runner, so this job takes no
+# HFS_CI_SLOT (the single-node jobs do, ADR-aacruzgon-0086), and the leading
+# down -v finds a killed run's cluster whichever instance ran it.
+# cancel-in-progress: false never cancels the run in
 # flight, but GitHub keeps at most one pending run per group: a third run
 # (a dispatch while the nightly is queued, say) cancels the pending one and
 # takes its place.
@@ -89,8 +94,9 @@ jobs:
     name: Cassandra three-node tests (report only)
     # Fork guard (ADR-aacruzgon-0018); schedule and dispatch always pass it.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # Heavy, so acruzdebian only, within its 40G cap (ADR-aacruzgon-0023,
-    # 0080, 0082). The cap covers the build only (the required Cassandra
+    # Heavy, so acruzdebian only, within its instance's 20G cap
+    # (ADR-aacruzgon-0023, 0080, 0082, 0086; 40G before 0086, for its single
+    # instance). The cap covers the build only (the required Cassandra
     # job's two persistence binaries, 4.0 to 4.7 GiB anon measured): the
     # three nodes (3 x 1700 MiB limits) and the test container (6 GiB limit)
     # run in gh-runner's rootless Docker, outside the runner service's

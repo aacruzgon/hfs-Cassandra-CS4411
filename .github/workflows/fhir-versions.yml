@@ -283,12 +283,16 @@ jobs:
     env:
       COMPOSE_FILE: docker/cassandra/docker-compose.yml
       # Not the developers' default 59042 (ADR-sam-michaels-0001). It is also
-      # cassandra-coverage.yml's port, which is safe because each machine is
-      # one runner instance and runs one job at a time.
-      # Every compose command below names this job's own project,
-      # hfs-cassandra-fhir-versions, so down -v can only ever remove this
-      # job's containers and volume.
-      CASSANDRA_HOST_PORT: 59242
+      # cassandra-coverage.yml's base port, which is safe because a runner
+      # instance runs one job at a time, and two instances on one machine
+      # have different slots (the first step, ADR-aacruzgon-0086): slot N
+      # publishes base + 10 x N, so this job and coverage never share a port
+      # across instances either.
+      # Every compose command below names this job's own project
+      # (hfs-cassandra-fhir-versions, plus -sN on slot N), so down -v can only
+      # ever remove this job's containers and volume.
+      CASSANDRA_BASE_PORT: 59242
+      COMPOSE_PROJECT_BASE: hfs-cassandra-fhir-versions
       # No incremental cache in the persistent target dir below: it would grow
       # with every commit until the size cap wipes the whole directory.
       CARGO_INCREMENTAL: 0
@@ -299,6 +303,34 @@ jobs:
       CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
       CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
+      # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
+      # the runner's own .env. Two instances on one machine share gh-runner's
+      # rootless Docker and the host's ports, so each needs its own Compose
+      # project and host port. Unset or 0 keeps the base project and port
+      # above; slot N (1 to 9) adds -sN to the project and 10 x N to the port,
+      # which stays clear of every other job's port in every slot
+      # (docker/cassandra/README.md). The derived names go to $GITHUB_ENV and
+      # are never in the job's env:, and every command below reads them as
+      # ${NAME:?}, so a missing slot step fails rather than reaching the
+      # Compose file's default project. First, so the always() clean-up has
+      # them however early the job fails. The same step is in each job that
+      # starts a single node.
+      - name: Pick this runner's Compose project and host port
+        run: |
+          slot=${HFS_CI_SLOT:-0}
+          if ! [[ $slot =~ ^[0-9]$ ]]; then
+            echo "::error title=HFS_CI_SLOT::must be one digit (0 to 9) or unset, got $(printf %q "$slot")"
+            exit 1
+          fi
+          project=$COMPOSE_PROJECT_BASE port=$CASSANDRA_BASE_PORT
+          if [ "$slot" != 0 ]; then project=$project-s$slot port=$((port + 10 * slot)); fi
+          {
+            echo "COMPOSE_PROJECT=$project"
+            echo "CASSANDRA_HOST_PORT=$port"
+            echo "CASSANDRA_CONTAINER=$project-cassandra-1"
+          } >> "$GITHUB_ENV"
+          echo "Runner ${RUNNER_NAME:-?}, slot $slot: Compose project $project, host port 127.0.0.1:$port"
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -367,7 +399,7 @@ jobs:
 
       # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
       - name: Remove leftovers of an earlier run
-        run: docker compose -p hfs-cassandra-fhir-versions down -v --remove-orphans
+        run: docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
 
       # First boot takes about 60 s; the healthcheck allows a 90 s start
       # period and then 12 retries 10 s apart. Timed with ci-report.py timed,
@@ -375,13 +407,13 @@ jobs:
       - name: Start Cassandra and wait for its healthcheck
         run: |
           python3 .github/scripts/ci-report.py timed node-start "Start and healthcheck (compose up --wait)" -- \
-            docker compose -p hfs-cassandra-fhir-versions up -d --wait --wait-timeout 240
+            docker compose -p "${COMPOSE_PROJECT:?}" up -d --wait --wait-timeout 240
 
       # The context every later report section carries, now with the node's
       # Cassandra version. Report only.
       - name: Report the context
         continue-on-error: true
-        run: python3 .github/scripts/ci-report.py context --cassandra-container hfs-cassandra-fhir-versions-cassandra-1
+        run: python3 .github/scripts/ci-report.py context --cassandra-container "${CASSANDRA_CONTAINER:?}"
 
       # The schema the tests expect. Whether it matches the design is the
       # required job's check, not repeated here.
@@ -511,12 +543,12 @@ jobs:
 
       - name: Cassandra logs
         if: failure()
-        run: docker compose -p hfs-cassandra-fhir-versions logs --tail 200
+        run: docker compose -p "${COMPOSE_PROJECT:?}" logs --tail 200
 
       # down -v is safe here only because -p names this job's own project.
       - name: Stop Cassandra and remove this job's volume
         if: always()
-        run: docker compose -p hfs-cassandra-fhir-versions down -v --remove-orphans
+        run: docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
 
       # The target directory before and after, whether the reset step reset
       # it, and the size of every binary the build step made: its two cargo

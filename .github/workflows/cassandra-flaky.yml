@@ -20,7 +20,7 @@ name: Cassandra flaky tests (report only)
 # Cassandra job's helios-persistence --lib and cassandra_tests build, which
 # peaked at 4,103 MiB anon (run 44655683717), and the re-runs are one test
 # process at a time, so it fits sam-7900x's 20G with room to spare and either
-# runner can take it; nothing here needs acruzdebian's 40G. A paths: filter
+# runner can take it; nothing here needs more than 20G. A paths: filter
 # is fine here: no required check lives in this workflow.
 
 on:
@@ -93,15 +93,44 @@ jobs:
       # 59542, the nightly three-node job's 59642 to 59644 or the mutation
       # job's 59842 (docker/cassandra/README.md). Rootless Docker publishes on
       # the host itself. Its own Compose project, so down -v can only remove
-      # this job's container and volume.
+      # this job's container and volume. Both are the bases of this runner
+      # instance's slot (the first step, ADR-aacruzgon-0086).
       COMPOSE_FILE: docker/cassandra/docker-compose.yml
-      CASSANDRA_HOST_PORT: 59442
-      COMPOSE_PROJECT: hfs-cassandra-flaky
+      CASSANDRA_BASE_PORT: 59442
+      COMPOSE_PROJECT_BASE: hfs-cassandra-flaky
       # No incremental cache in the persistent target dir below: it would grow
       # with every commit until the size cap wipes the whole directory.
       CARGO_INCREMENTAL: 0
       CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
     steps:
+      # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
+      # the runner's own .env. Two instances on one machine share gh-runner's
+      # rootless Docker and the host's ports, so each needs its own Compose
+      # project and host port. Unset or 0 keeps the base project and port
+      # above; slot N (1 to 9) adds -sN to the project and 10 x N to the port,
+      # which stays clear of every other job's port in every slot
+      # (docker/cassandra/README.md). The derived names go to $GITHUB_ENV and
+      # are never in the job's env:, and every command below reads them as
+      # ${NAME:?}, so a missing slot step fails rather than reaching the
+      # Compose file's default project. First, so the always() clean-up has
+      # them however early the job fails. The same step is in each job that
+      # starts a single node.
+      - name: Pick this runner's Compose project and host port
+        run: |
+          slot=${HFS_CI_SLOT:-0}
+          if ! [[ $slot =~ ^[0-9]$ ]]; then
+            echo "::error title=HFS_CI_SLOT::must be one digit (0 to 9) or unset, got $(printf %q "$slot")"
+            exit 1
+          fi
+          project=$COMPOSE_PROJECT_BASE port=$CASSANDRA_BASE_PORT
+          if [ "$slot" != 0 ]; then project=$project-s$slot port=$((port + 10 * slot)); fi
+          {
+            echo "COMPOSE_PROJECT=$project"
+            echo "CASSANDRA_HOST_PORT=$port"
+            echo "CASSANDRA_CONTAINER=$project-cassandra-1"
+          } >> "$GITHUB_ENV"
+          echo "Runner ${RUNNER_NAME:-?}, slot $slot: Compose project $project, host port 127.0.0.1:$port"
+
       # A dispatch's inputs reach git and actions/checkout as arguments. A
       # value that starts with - would be read as an option (git diff
       # --output=<file> writes that file), so each input must look like what
@@ -250,7 +279,7 @@ jobs:
         # warning, rather than failing the job.
         continue-on-error: true
         run: |
-          docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
+          docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
           # Up to three tries, 35 s apart, so the third comes about 70 s after
           # the first. Every CI port is even and inside Linux's ephemeral range
           # (32768-60999), and connect() takes even ports first, so the client
@@ -261,11 +290,11 @@ jobs:
           # reaches its node with no build first, so it is the most exposed.
           for try in 1 2 3; do
             if python3 "$CI_SCRIPTS/ci-report.py" timed node-start "Start and healthcheck (compose up --wait), try $try" -- \
-              docker compose -p "$COMPOSE_PROJECT" up -d --wait --wait-timeout 240; then
+              docker compose -p "${COMPOSE_PROJECT:?}" up -d --wait --wait-timeout 240; then
               break
             fi
-            docker compose -p "$COMPOSE_PROJECT" logs --tail 50 || true
-            docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
+            docker compose -p "${COMPOSE_PROJECT:?}" logs --tail 50 || true
+            docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
             if [ "$try" = 3 ]; then
               echo "::warning title=Flaky tests::the Cassandra node did not start in 3 tries, so nothing was run; see this step's log"
               exit 1
@@ -327,7 +356,7 @@ jobs:
         # too, and must not turn the job red.
         continue-on-error: true
         run: |
-          docker compose -p "$COMPOSE_PROJECT" logs --tail 200 \
+          docker compose -p "${COMPOSE_PROJECT:?}" logs --tail 200 \
             || echo "::warning title=Flaky tests::docker compose logs failed, so the node's logs are not in this run"
 
       # down -v is safe here only because -p names this job's own project.
@@ -337,7 +366,7 @@ jobs:
         # and the next run's leading down -v removes what it left.
         continue-on-error: true
         run: |
-          if ! docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans; then
+          if ! docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans; then
             echo "::warning title=Flaky tests::docker compose down failed, so this job's container and volume may be left; the next run's leading down -v removes them"
           fi
 

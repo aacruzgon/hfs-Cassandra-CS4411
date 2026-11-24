@@ -7,9 +7,11 @@ name: fmt, clippy and Cassandra schema
 # against (ADR-aacruzgon-0020).
 # fmt and the Cassandra job are light, the clippy pair medium
 # (ADR-aacruzgon-0023, 0082): both runners take light and medium, so every
-# job here runs on either, and must fit sam-7900x's 20G (ADR-aacruzgon-0080).
-# Each runner has one executor, so the jobs on one machine run one after
-# another.
+# job here runs on either, and must fit 20G: sam-7900x's cap, and since
+# ADR-aacruzgon-0086 the cap of each of acruzdebian's two runner instances
+# (ADR-aacruzgon-0080). Each instance has one executor, so sam-7900x runs
+# these jobs one after another and acruzdebian two at a time; the Cassandra
+# job takes its Compose project and host port from its instance's slot.
 # Every job that compiles also writes CI reports (.github/scripts/ci-report.py):
 # measured figures in the run's summary page and in an artifact,
 # ci-report-<job>. Reports never fail a job for a figure. Every job reports
@@ -231,8 +233,10 @@ jobs:
       # How many units cargo builds at once, from this runner's own memory
       # cap: the runner service's cgroup memory.max, which every job process
       # inherits (ADR-aacruzgon-0080). helios-fhir's lib and lib-test units
-      # need about 12.8 GB each: under sam-7900x's 20G they build one at a
-      # time (1 job), under acruzdebian's 40G both at once (2 jobs).
+      # need about 12.8 GB each: under a 20G cap, sam-7900x's and since
+      # ADR-aacruzgon-0086 each acruzdebian instance's, they build one at a
+      # time (1 job); under a cap of 32 GiB or more, as acruzdebian's single
+      # instance had at 40G, both at once (2 jobs).
       # Unreadable, unlimited or under 32 GiB keeps 1.
       - name: Pick the build job count for this runner's memory cap
         id: jobs
@@ -451,9 +455,12 @@ jobs:
       COMPOSE_FILE: docker/cassandra/docker-compose.yml
       # CI's own host port, never the default 59042 that a developer's
       # Cassandra uses (ADR-sam-michaels-0001). Every compose command below
-      # also names CI's own project, hfs-cassandra-ci, so down -v can only
-      # ever remove CI's containers and volume.
-      CASSANDRA_HOST_PORT: 59142
+      # also names CI's own project, so down -v can only ever remove CI's
+      # containers and volume. Both are the bases of this runner instance's
+      # slot (the first step): hfs-cassandra-ci and 59142 when HFS_CI_SLOT is
+      # unset, hfs-cassandra-ci-s1 and 59152 on slot 1.
+      CASSANDRA_BASE_PORT: 59142
+      COMPOSE_PROJECT_BASE: hfs-cassandra-ci
       # No incremental cache in the persistent target dir below: it would grow
       # with every commit until the size cap wipes the whole directory.
       CARGO_INCREMENTAL: 0
@@ -463,6 +470,34 @@ jobs:
       CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
       CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
+      # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
+      # the runner's own .env. Two instances on one machine share gh-runner's
+      # rootless Docker and the host's ports, so each needs its own Compose
+      # project and host port. Unset or 0 keeps the base project and port
+      # above; slot N (1 to 9) adds -sN to the project and 10 x N to the port,
+      # which stays clear of every other job's port in every slot
+      # (docker/cassandra/README.md). The derived names go to $GITHUB_ENV and
+      # are never in the job's env:, and every command below reads them as
+      # ${NAME:?}, so a missing slot step fails rather than reaching the
+      # Compose file's default project. First, so the always() clean-up has
+      # them however early the job fails. The same step is in each job that
+      # starts a single node.
+      - name: Pick this runner's Compose project and host port
+        run: |
+          slot=${HFS_CI_SLOT:-0}
+          if ! [[ $slot =~ ^[0-9]$ ]]; then
+            echo "::error title=HFS_CI_SLOT::must be one digit (0 to 9) or unset, got $(printf %q "$slot")"
+            exit 1
+          fi
+          project=$COMPOSE_PROJECT_BASE port=$CASSANDRA_BASE_PORT
+          if [ "$slot" != 0 ]; then project=$project-s$slot port=$((port + 10 * slot)); fi
+          {
+            echo "COMPOSE_PROJECT=$project"
+            echo "CASSANDRA_HOST_PORT=$port"
+            echo "CASSANDRA_CONTAINER=$project-cassandra-1"
+          } >> "$GITHUB_ENV"
+          echo "Runner ${RUNNER_NAME:-?}, slot $slot: Compose project $project, host port 127.0.0.1:$port"
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -546,7 +581,7 @@ jobs:
 
       # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
       - name: Remove leftovers of an earlier run
-        run: docker compose -p hfs-cassandra-ci down -v --remove-orphans
+        run: docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
 
       # First boot takes about 60 s; the healthcheck allows a 90 s start
       # period and then 12 retries 10 s apart.
@@ -555,13 +590,13 @@ jobs:
       - name: Start Cassandra and wait for its healthcheck
         run: |
           python3 .github/scripts/ci-report.py timed node-start "Start and healthcheck (compose up --wait)" -- \
-            docker compose -p hfs-cassandra-ci up -d --wait --wait-timeout 240
+            docker compose -p "${COMPOSE_PROJECT:?}" up -d --wait --wait-timeout 240
 
       # The context every later report section carries, now with the node's
       # Cassandra version. Report only.
       - name: Report the context
         continue-on-error: true
-        run: python3 .github/scripts/ci-report.py context --cassandra-container hfs-cassandra-ci-cassandra-1
+        run: python3 .github/scripts/ci-report.py context --cassandra-container "${CASSANDRA_CONTAINER:?}"
 
       - name: Apply keyspace-single-node.cql, then schema.cql
         run: |
@@ -633,10 +668,10 @@ jobs:
       - name: Turn on the CQL audit log (Step 3 exit criterion)
         id: cql-audit-on
         run: |
-          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool enableauditlog \
+          docker exec -e MAX_HEAP_SIZE=128m "${CASSANDRA_CONTAINER:?}" nodetool enableauditlog \
             --excluded-keyspaces system,system_schema,system_auth,system_distributed,system_traces,system_views,system_virtual_schema \
             --included-categories DML,ERROR,PREPARE,DDL --blocking true
-          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool getauditlog
+          docker exec -e MAX_HEAP_SIZE=128m "${CASSANDRA_CONTAINER:?}" nodetool getauditlog
 
       # The start and apply times above, and the container's start to its CQL
       # line from its own log timestamps, which the 10 s healthcheck interval
@@ -646,7 +681,7 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         continue-on-error: true
         timeout-minutes: 2
-        run: python3 .github/scripts/ci-report.py node-start node-start "Cassandra start and schema apply" hfs-cassandra-ci-cassandra-1 node-start
+        run: python3 .github/scripts/ci-report.py node-start node-start "Cassandra start and schema apply" "${CASSANDRA_CONTAINER:?}" node-start
 
       # ADR-aacruzgon-0020, Rule 1: the tests use this job's node, with the
       # schema just applied, through its published port, as cqlsh does above.
@@ -836,13 +871,13 @@ jobs:
           # Written to the file first, then grepped: grep -q exits at its
           # first match, so behind a tee under pipefail the tee could die of
           # SIGPIPE (141) and fail the check although the log was enabled.
-          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool getauditlog \
+          docker exec -e MAX_HEAP_SIZE=128m "${CASSANDRA_CONTAINER:?}" nodetool getauditlog \
             > "$dir/getauditlog.txt"
           cat "$dir/getauditlog.txt"
           grep -Eq '^enabled[[:space:]]+true' "$dir/getauditlog.txt" \
             || { echo "::error title=CQL audit (Step 3 exit criterion)::the audit log was not enabled at the end of the tests"; exit 1; }
-          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 nodetool disableauditlog
-          docker exec -e MAX_HEAP_SIZE=256M hfs-cassandra-ci-cassandra-1 /opt/cassandra/tools/bin/auditlogviewer /opt/cassandra/logs/audit \
+          docker exec -e MAX_HEAP_SIZE=128m "${CASSANDRA_CONTAINER:?}" nodetool disableauditlog
+          docker exec -e MAX_HEAP_SIZE=256M "${CASSANDRA_CONTAINER:?}" /opt/cassandra/tools/bin/auditlogviewer /opt/cassandra/logs/audit \
             | gzip > "$dir/auditlogviewer.txt.gz"
           python3 .github/scripts/ci-report.py cql-audit cql-audit \
             "CQL audit log: no DELETE on resources or resource_versions (Step 3 exit criterion)" \
@@ -856,7 +891,7 @@ jobs:
         if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
         continue-on-error: true
         timeout-minutes: 3
-        run: python3 .github/scripts/ci-report.py intents intents "Intent rows left in pending_index_writes" hfs-cassandra-ci-cassandra-1
+        run: python3 .github/scripts/ci-report.py intents intents "Intent rows left in pending_index_writes" "${CASSANDRA_CONTAINER:?}"
 
       # Before the readiness test, which restarts the node and so resets these
       # metrics: tablestats, tpstats, the per-table latency and tombstone
@@ -866,7 +901,7 @@ jobs:
         if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
         continue-on-error: true
         timeout-minutes: 5
-        run: python3 .github/scripts/ci-report.py node-stats node-stats "Cassandra node statistics" hfs-cassandra-ci-cassandra-1
+        run: python3 .github/scripts/ci-report.py node-stats node-stats "Cassandra node statistics" "${CASSANDRA_CONTAINER:?}"
 
       # Step 2's exit criterion: /_readiness reports down while Cassandra is
       # stopped, and up once it is back. The test stops and starts this job's
@@ -883,7 +918,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
           log="$RUNNER_TEMP/ci-report/logs/readiness.log"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
-          HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER=hfs-cassandra-ci-cassandra-1 \
+          HFS_TEST_CASSANDRA_STOPPABLE_CONTAINER="${CASSANDRA_CONTAINER:?}" \
             cargo test -p helios-hfs --no-default-features --features R4,cassandra \
               --test cassandra_milestone_a -- --exact readiness_reports_down_while_cassandra_is_stopped \
               --nocapture 2>&1 \
@@ -926,12 +961,12 @@ jobs:
 
       - name: Cassandra logs
         if: failure()
-        run: docker compose -p hfs-cassandra-ci logs --tail 200
+        run: docker compose -p "${COMPOSE_PROJECT:?}" logs --tail 200
 
       # down -v is safe here only because -p names CI's own project.
       - name: Stop Cassandra and remove CI's volume
         if: always()
-        run: docker compose -p hfs-cassandra-ci down -v --remove-orphans
+        run: docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
 
       # The target directory before and after, whether the reset step reset
       # it, and the size of every binary the build step made: its two cargo

@@ -10,7 +10,7 @@
 //!
 //! - **`HFS_TEST_CASSANDRA_URL` set:** the tests use that running node. The
 //!   value is one `host:port`, with no scheme, for example `127.0.0.1:59042`
-//!   (`docker/cassandra`) or `127.0.0.1:59142` (the CI job). The schema must
+//!   (`docker/cassandra`) or `127.0.0.1:29142` (the CI job). The schema must
 //!   already be applied there (`docs/Cassandra/schema/keyspace-single-node.cql`,
 //!   then `schema.cql`); the harness never runs DDL against that node. A node
 //!   that does not answer, or lacks one of the ten tables, fails every test.

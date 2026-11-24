@@ -16,7 +16,7 @@ name: Cassandra three nodes (report only)
 # The cluster is docker/cassandra/docker-compose.cluster.yml with
 # docker-compose.cluster.heap512m.yml (512M heap, 1700 MiB per node), in its
 # own Compose project (hfs-cassandra-3n), subnet (10.59.142.0/24) and host
-# ports (59642 to 59644); down -v at the end removes only that project. The
+# ports (29642 to 29644); down -v at the end removes only that project. The
 # tests run in a container on the cluster's network (run-tests.sh says why).
 #
 # Two checkouts: the code under test (the ref input, or the run's own commit)
@@ -70,7 +70,12 @@ permissions:
   actions: read
 
 # One run at a time across every ref: the ports, the subnet and the Compose
-# project are fixed. cancel-in-progress: false never cancels the run in
+# project are fixed. The group is also what lets them stay fixed on
+# acruzdebian, whose two runner instances share gh-runner's Docker and the
+# host's ports: no two runs overlap on any runner, so this job takes no
+# HFS_CI_SLOT (the single-node jobs do, ADR-aacruzgon-0086), and the leading
+# down -v finds a killed run's cluster whichever instance ran it.
+# cancel-in-progress: false never cancels the run in
 # flight, but GitHub keeps at most one pending run per group: a third run
 # (a dispatch while the nightly is queued, say) cancels the pending one and
 # takes its place.
@@ -89,8 +94,9 @@ jobs:
     name: Cassandra three-node tests (report only)
     # Fork guard (ADR-aacruzgon-0018); schedule and dispatch always pass it.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # Heavy, so acruzdebian only, within its 40G cap (ADR-aacruzgon-0023,
-    # 0080, 0082). The cap covers the build only (the required Cassandra
+    # Heavy, so acruzdebian only, within its instance's 20G cap
+    # (ADR-aacruzgon-0023, 0080, 0082, 0086; 40G before 0086, for its single
+    # instance). The cap covers the build only (the required Cassandra
     # job's two persistence binaries, 4.0 to 4.7 GiB anon measured): the
     # three nodes (3 x 1700 MiB limits) and the test container (6 GiB limit)
     # run in gh-runner's rootless Docker, outside the runner service's
@@ -110,11 +116,14 @@ jobs:
       THREE_NODE_JOB_FILES: .three-node-job
       COMPOSE_FILE: .three-node-job/docker/cassandra/docker-compose.cluster.yml:.three-node-job/docker/cassandra/docker-compose.cluster.heap512m.yml
       # Not the base file's 59342 to 59344, the bench harness's 59542, a
-      # developer's 59042, the required job's 59142 or coverage's and FHIR
-      # versions' 59242; free on acruzdebian on 2026-11-20 (ss -ltn).
-      CASSANDRA_CLUSTER_HOST_PORT_1: 59642
-      CASSANDRA_CLUSTER_HOST_PORT_2: 59643
-      CASSANDRA_CLUSTER_HOST_PORT_3: 59644
+      # developer's 59042, or any slot of the single-node jobs' 29142, 29242,
+      # 29442 and 29842 (docker/cassandra/README.md). Below Linux's ephemeral
+      # range (32768-60999), so no client socket can hold them: 59642 to
+      # 59644 before ADR-aacruzgon-0086. Free on acruzdebian on 2026-11-24
+      # (ss -ltn).
+      CASSANDRA_CLUSTER_HOST_PORT_1: 29642
+      CASSANDRA_CLUSTER_HOST_PORT_2: 29643
+      CASSANDRA_CLUSTER_HOST_PORT_3: 29644
       # Outside Docker's default address pools (172.17-31.0.0/16 and
       # 192.168.0.0/16), so no network the daemon has handed out can clash,
       # and clear of slirp4netns's own 10.0.2.0/24.

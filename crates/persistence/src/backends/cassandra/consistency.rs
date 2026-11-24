@@ -1191,14 +1191,16 @@ fn check_subject(
                 });
             }
             // Its own `data` is re-extracted like an older version's. When it
-            // is `resources.data` itself, rule 3 has compared it already, so
-            // only a body that differs from it is compared with the stored set.
-            if fixed && let Some(data) = version.data.as_deref() {
+            // is `resources.data` itself, rule 3 has extracted it already, so
+            // only a body that differs from it is extracted here: an equal
+            // body that is not JSON is rule 3's `read_failed`, reported once.
+            if fixed
+                && version.data != subject.row.data
+                && let Some(data) = version.data.as_deref()
+            {
                 match extract(backend, tenant, resource_type, data) {
                     Ok(fresh) => {
-                        if version.data != subject.row.data
-                            && let Ok(keys) = index_keys::decode(blob)
-                        {
+                        if let Ok(keys) = index_keys::decode(blob) {
                             let keys: BTreeSet<IndexKey> = keys.into_iter().collect();
                             if fresh != keys {
                                 report.defects.push(Defect::VersionReextraction {
@@ -1580,6 +1582,8 @@ mod tests {
     const PLANT_VERSION_WRITE_TS: &str = "UPDATE resource_versions USING TIMESTAMP ? SET write_ts = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
     /// Replaces a version row's `data`.
     const PLANT_VERSION_DATA: &str = "UPDATE resource_versions USING TIMESTAMP ? SET data = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
+    /// A CAS: replaces `resources.data`.
+    const PLANT_RESOURCE_DATA: &str = "UPDATE resources SET data = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
     const PLANT_RESOURCE_KEYS: &str = "UPDATE resources SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
 
     fn ms(millis: i64) -> DateTime<Utc> {
@@ -1773,6 +1777,7 @@ mod tests {
             "no-data-live-older-version",
             "no-data-current-version",
             "no-data-anywhere",
+            "malformed-data-in-both-rows",
         ];
         let version = test_fhir_version();
 
@@ -2180,6 +2185,36 @@ mod tests {
             write_index_rows(&backend, &t, lu, version, &keys).await;
         }
 
+        // malformed-data-in-both-rows: `resources.data` and the current
+        // version row hold the same body, which is not JSON.
+        let t = tenant_of("malformed-data-in-both-rows");
+        let (_, _, ts1, _) = seeded(&backend, &t).await;
+        plant_cas(
+            &backend,
+            PLANT_RESOURCE_DATA,
+            vec![
+                Value::from("{not json"),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+        plant(
+            &backend,
+            PLANT_VERSION_DATA,
+            vec![
+                Value::from(ts1 + 1),
+                Value::from("{not json"),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+
         // One shared scan for every case, taken after every `write_ts` above.
         // emptied-older-version's update comes last, and a scan in its
         // millisecond would be refused as stale. A second version's
@@ -2459,6 +2494,10 @@ mod tests {
             // Only an unchanged registry re-extracts the current version row.
             let report = check("malformed-current-version-data", registry).await;
             let want: &[&str] = if fixed { &["read_failed"] } else { &[] };
+            assert_eq!(report.kinds(), want, "{report}");
+
+            // One body that is not JSON, in both rows, is reported once, by rule 3.
+            let report = check("malformed-data-in-both-rows", registry).await;
             assert_eq!(report.kinds(), want, "{report}");
         }
         let checked = checked.into_inner();

@@ -2057,7 +2057,7 @@ mod tests {
                     crate::backends::cassandra::write::VersionKeys {
                         version_id: 1,
                         last_updated: lu1,
-                        fhir_version: version,
+                        fhir_version: version.as_mime_param(),
                         keys: &seeded_keys,
                     },
                 ),

@@ -73,7 +73,11 @@
 
 mod backend;
 mod batch;
+#[cfg(test)]
+mod checkpoint;
 mod config;
+#[cfg(test)]
+mod consistency;
 mod delete;
 mod errors;
 mod index_keys;

@@ -48,7 +48,6 @@ use serde_json::Value as Json;
 
 use super::backend::CassandraBackend;
 use super::errors::BACKEND_NAME;
-use super::index_keys::IndexKey;
 use super::read::ResourceRow;
 use super::write::{
     Applied, CasKind, CasMiss, CasOutcome, CasPlan, RowKey, UPSERT_MISS_RETRIES, check_id,
@@ -201,20 +200,16 @@ impl CassandraBackend {
                         let previous = request.previous_version(row)?;
                         let (body, data) =
                             normalized_body("create_or_update", resource_type, id, body)?;
-                        let plan =
-                            CasPlan::revive(previous, body, data, vec![IndexKey::ResourcesByType]);
+                        let keys = self.index_keys_of(tenant_id, resource_type, &body);
+                        let plan = CasPlan::revive(previous, body, data, keys);
                         (self.run_cas(&mut request, plan).await?, row.version_id)
                     }
                     // Branch a, the only one `Branch::of` picks for no row.
                     _ => {
                         let (body, data) =
                             normalized_body("create_or_update", resource_type, id, body)?;
-                        let plan = CasPlan::create(
-                            body,
-                            data,
-                            fhir_version,
-                            vec![IndexKey::ResourcesByType],
-                        );
+                        let keys = self.index_keys_of(tenant_id, resource_type, &body);
+                        let plan = CasPlan::create(body, data, fhir_version, keys);
                         (self.run_cas(&mut request, plan).await?, 0)
                     }
                 };
@@ -371,7 +366,7 @@ mod node_tests {
 
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
-    use crate::backends::cassandra::index_keys;
+    use crate::backends::cassandra::index_keys::{self, IndexKey};
     use crate::backends::cassandra::session::{Fault, StatementKind};
     use crate::backends::cassandra::write::{
         INSERT_VERSION, PreviousVersion, REVIVE_RESOURCE_IF_VERSION,

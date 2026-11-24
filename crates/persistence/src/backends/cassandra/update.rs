@@ -41,7 +41,6 @@ use serde_json::Value as Json;
 
 use super::backend::CassandraBackend;
 use super::errors::map_driver_error;
-use super::index_keys::IndexKey;
 use super::read::{ResourceRow, SELECT_RESOURCE};
 use super::session::StatementKind;
 use super::write::{
@@ -203,7 +202,8 @@ impl CassandraBackend {
         // R2's does (ADR-aacruzgon-0067).
         let previous = request.previous_version(row)?;
         let (body, data) = normalized_body("update", key.resource_type, key.id, resource)?;
-        let plan = CasPlan::update(previous, body, data, vec![IndexKey::ResourcesByType]);
+        let keys = self.index_keys_of(key.tenant_id, key.resource_type, &body);
+        let plan = CasPlan::update(previous, body, data, keys);
         self.run_cas(request, plan).await
     }
 
@@ -373,7 +373,7 @@ mod node_tests {
 
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
-    use crate::backends::cassandra::index_keys;
+    use crate::backends::cassandra::index_keys::{self, IndexKey};
     use crate::backends::cassandra::session::Fault;
     use crate::backends::cassandra::write::{
         PreviousVersion, SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, write_ts_of,

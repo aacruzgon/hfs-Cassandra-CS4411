@@ -31,10 +31,11 @@
 //! refuse for good, since none is planned: conditional operations, `_include`
 //! and `_revinclude`, history, and bulk export; a transaction Bundle is
 //! refused with `TransactionError::AtomicityUnsupported` instead. Every other
-//! `ResourceStorage` and `VersionedStorage` method keeps its trait default:
-//! for example `count_by_types` and `tenant_has_resources` count through
-//! `count`, `count_by_day` and `list_tenants` answer empty, and the
-//! tenant-registry writes refuse.
+//! `ResourceStorage` method keeps its trait default (every `VersionedStorage`
+//! method is overridden): for example `count_by_types` and
+//! `tenant_has_resources` count through `count`, `count_by_day` and
+//! `list_tenants` answer empty, and `update_verbatim` (which `$meta-delete`
+//! needs to remove a label) and the tenant-registry writes refuse.
 //!
 //! What comes next, by roadmap step: Step 5 writes the six index tables on
 //! every write and adds the sweeper, which finishes the intent rows a write

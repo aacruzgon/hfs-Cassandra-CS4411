@@ -123,10 +123,10 @@ pub(crate) enum ScanMode<'a> {
     /// The guard compares the writers' clock-derived `write_ts` with
     /// `taken_at`, so it also assumes the clock does not step back between
     /// the scan and the check. If it does, a write made after the scan can
-    /// carry a `write_ts` below `taken_at` and pass the guard: the check then
-    /// reports false `missing_row` or `stray_row` defects for that resource
-    /// instead of panicking. That is loud but misattributed, and never a
-    /// clean report.
+    /// carry a `write_ts` below `taken_at` and pass the guard. The check then
+    /// compares that resource with rows from before the write, so it can
+    /// report false `missing_row` or `stray_row` defects for it, and it can
+    /// miss a defect of that write.
     Shared(&'a IndexScan),
 }
 

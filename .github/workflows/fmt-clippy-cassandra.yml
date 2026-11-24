@@ -457,9 +457,10 @@ jobs:
       # Cassandra uses (ADR-sam-michaels-0001). Every compose command below
       # also names CI's own project, so down -v can only ever remove CI's
       # containers and volume. Both are the bases of this runner instance's
-      # slot (the first step): hfs-cassandra-ci and 59142 when HFS_CI_SLOT is
-      # unset, hfs-cassandra-ci-s1 and 59152 on slot 1.
-      CASSANDRA_BASE_PORT: 59142
+      # slot (the first step): hfs-cassandra-ci and 29142 when HFS_CI_SLOT is
+      # unset, hfs-cassandra-ci-s1 and 29152 on slot 1. 29142, below the
+      # ephemeral range, since ADR-aacruzgon-0086 (59142 before).
+      CASSANDRA_BASE_PORT: 29142
       COMPOSE_PROJECT_BASE: hfs-cassandra-ci
       # No incremental cache in the persistent target dir below: it would grow
       # with every commit until the size cap wipes the whole directory.
@@ -476,12 +477,14 @@ jobs:
       # project and host port. Unset or 0 keeps the base project and port
       # above; slot N (1 to 9) adds -sN to the project and 10 x N to the port,
       # which stays clear of every other job's port in every slot
-      # (docker/cassandra/README.md). The derived names go to $GITHUB_ENV and
-      # are never in the job's env:, and every command below reads them as
-      # ${NAME:?}, so a missing slot step fails rather than reaching the
-      # Compose file's default project. First, so the always() clean-up has
-      # them however early the job fails. The same step is in each job that
-      # starts a single node.
+      # (docker/cassandra/README.md). Every port stays below Linux's
+      # ephemeral range (32768-60999), where no client socket is placed, so
+      # none can hold it in TIME-WAIT; the step refuses one that does not.
+      # The derived names go to $GITHUB_ENV and are never in the job's env:,
+      # and every command below reads them as ${NAME:?}, so a missing slot
+      # step fails rather than reaching the Compose file's default project.
+      # First, so the always() clean-up has them however early the job fails.
+      # The same step is in each job that starts a single node.
       - name: Pick this runner's Compose project and host port
         run: |
           slot=${HFS_CI_SLOT:-0}
@@ -491,6 +494,10 @@ jobs:
           fi
           project=$COMPOSE_PROJECT_BASE port=$CASSANDRA_BASE_PORT
           if [ "$slot" != 0 ]; then project=$project-s$slot port=$((port + 10 * slot)); fi
+          if [ "$port" -ge 32768 ]; then
+            echo "::error title=HFS_CI_SLOT::host port $port is inside Linux's ephemeral range (32768-60999)"
+            exit 1
+          fi
           {
             echo "COMPOSE_PROJECT=$project"
             echo "CASSANDRA_HOST_PORT=$port"

@@ -16,11 +16,11 @@ name: Cassandra coverage
 # 0021).
 #
 # The job starts its own single-node Cassandra, with its own Compose project
-# (hfs-cassandra-cov) and host port (59242), the way the required Cassandra
-# job does with hfs-cassandra-ci and 59142 (ADR-sam-michaels-0001,
+# (hfs-cassandra-cov) and host port (29242), the way the required Cassandra
+# job does with hfs-cassandra-ci and 29142 (ADR-sam-michaels-0001,
 # ADR-aacruzgon-0020); down -v at the end removes only that project. A second
 # runner instance on the same machine adds its slot to both (HFS_CI_SLOT,
-# ADR-aacruzgon-0086): hfs-cassandra-cov-s1 and 59252 on slot 1.
+# ADR-aacruzgon-0086): hfs-cassandra-cov-s1 and 29252 on slot 1.
 #
 # Its sections go through the CI report helper (.github/scripts/ci-report.py)
 # into the job summary and the artifact ci-report-coverage, with the HTML
@@ -59,10 +59,11 @@ jobs:
     timeout-minutes: 60
     env:
       COMPOSE_FILE: docker/cassandra/docker-compose.yml
-      # Neither a developer's 59042 nor the required job's 59142. Every
+      # Neither a developer's 59042 nor the required job's 29142, and below
+      # the ephemeral range (59242 before ADR-aacruzgon-0086). Every
       # compose command below names this job's own project. Both are the
       # bases of this runner instance's slot (the first step).
-      CASSANDRA_BASE_PORT: 59242
+      CASSANDRA_BASE_PORT: 29242
       COMPOSE_PROJECT_BASE: hfs-cassandra-cov
       # No incremental cache in the persistent target dir below.
       CARGO_INCREMENTAL: 0
@@ -78,12 +79,14 @@ jobs:
       # project and host port. Unset or 0 keeps the base project and port
       # above; slot N (1 to 9) adds -sN to the project and 10 x N to the port,
       # which stays clear of every other job's port in every slot
-      # (docker/cassandra/README.md). The derived names go to $GITHUB_ENV and
-      # are never in the job's env:, and every command below reads them as
-      # ${NAME:?}, so a missing slot step fails rather than reaching the
-      # Compose file's default project. First, so the always() clean-up has
-      # them however early the job fails. The same step is in each job that
-      # starts a single node.
+      # (docker/cassandra/README.md). Every port stays below Linux's
+      # ephemeral range (32768-60999), where no client socket is placed, so
+      # none can hold it in TIME-WAIT; the step refuses one that does not.
+      # The derived names go to $GITHUB_ENV and are never in the job's env:,
+      # and every command below reads them as ${NAME:?}, so a missing slot
+      # step fails rather than reaching the Compose file's default project.
+      # First, so the always() clean-up has them however early the job fails.
+      # The same step is in each job that starts a single node.
       - name: Pick this runner's Compose project and host port
         run: |
           slot=${HFS_CI_SLOT:-0}
@@ -93,6 +96,10 @@ jobs:
           fi
           project=$COMPOSE_PROJECT_BASE port=$CASSANDRA_BASE_PORT
           if [ "$slot" != 0 ]; then project=$project-s$slot port=$((port + 10 * slot)); fi
+          if [ "$port" -ge 32768 ]; then
+            echo "::error title=HFS_CI_SLOT::host port $port is inside Linux's ephemeral range (32768-60999)"
+            exit 1
+          fi
           {
             echo "COMPOSE_PROJECT=$project"
             echo "CASSANDRA_HOST_PORT=$port"

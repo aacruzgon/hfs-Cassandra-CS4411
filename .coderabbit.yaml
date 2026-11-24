@@ -479,12 +479,14 @@ reviews:
           (unset: the base; slot N: -sN and base port + 10 x N) and uses
           them only as "${COMPOSE_PROJECT:?}", $CASSANDRA_HOST_PORT and
           "${CASSANDRA_CONTAINER:?}". Flag a literal Compose project name,
-          container name or host port in such a job, CASSANDRA_HOST_PORT or
-          COMPOSE_PROJECT in a job's env: (the same name set in env: and
-          through $GITHUB_ENV leaves the job depending on their order),
-          and a new base port that some slot of another job reaches
-          (ADR-aacruzgon-0086). cassandra-three-node.yml is the exception:
-          its global concurrency group keeps it unslotted.
+          container name or host port in such a job; CASSANDRA_HOST_PORT,
+          COMPOSE_PROJECT or CASSANDRA_CONTAINER in a job's env: (the same
+          name set in env: and through $GITHUB_ENV leaves the job depending
+          on their order); a new base port that some slot of another job
+          reaches; and any CI host port at 32768 or above, in any slot,
+          which is Linux's ephemeral range (ADR-aacruzgon-0086).
+          cassandra-three-node.yml is the exception to the slot: its global
+          concurrency group keeps it unslotted, on 29642-29644.
         - No paths: or paths-ignore: filter on r4b-compile-check.yml or
           fmt-clippy-cassandra.yml: their jobs are required checks, and a
           skipped workflow never reports.

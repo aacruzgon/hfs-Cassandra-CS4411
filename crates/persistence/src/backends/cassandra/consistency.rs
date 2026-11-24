@@ -1720,7 +1720,7 @@ mod tests {
                     VersionKeys {
                         version_id: 1,
                         last_updated: lu,
-                        fhir_version,
+                        fhir_version: fhir_version.as_mime_param(),
                         keys,
                     },
                 ),

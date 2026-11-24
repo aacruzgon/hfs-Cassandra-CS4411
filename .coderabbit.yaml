@@ -454,7 +454,7 @@ reviews:
     - path: ".github/workflows/**"
       instructions: |
         CI rules (CLAUDE.md "Commits and CI"; ADR-aacruzgon-0018, 0019, 0021,
-        0022, 0023, 0045, 0058, 0080, 0082):
+        0022, 0023, 0045, 0058, 0080, 0082, 0086):
         - Every job on a self-hosted runner has the fork guard:
           if: github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
@@ -463,14 +463,30 @@ reviews:
           version in a comment, e.g. "@<sha> # v7.0.2". A tag or branch fails
           the job before it starts.
         - runs-on is [self-hosted, hfs-cassandra-light] (fits about 9 GB),
-          [self-hosted, hfs-cassandra-medium] (more than that, within
-          sam-7900x's 20G cap, such as the clippy pair) or
-          [self-hosted, hfs-cassandra-heavy] (more than 20G, within
-          acruzdebian's 40G, such as the mutation-testing job, which runs
-          only on a pull request labelled mutants). Both runners
-          take light and medium; only acruzdebian takes heavy, so no required
-          check may be heavy (ADR-aacruzgon-0080, 0082). Never the bare
-          hfs-cassandra label in a new job.
+          [self-hosted, hfs-cassandra-medium] (more than that, within the
+          20G cap of sam-7900x and of each acruzdebian instance, such as the
+          clippy pair) or [self-hosted, hfs-cassandra-heavy] (also within
+          20G, kept off sam-7900x, a developer's desktop, such as the
+          mutation-testing job, which runs only on a pull request labelled
+          mutants). Every job must fit 20G. Both machines take light and
+          medium; only acruzdebian's two instances (acruzdebian,
+          acruzdebian-2) take heavy, so no required check may be heavy
+          (ADR-aacruzgon-0080, 0082, 0086). Never the bare hfs-cassandra
+          label in a new job.
+        - acruzdebian's two runner instances share one Docker daemon and the
+          host's ports. A job that starts a single Cassandra node takes its
+          Compose project and host port from HFS_CI_SLOT in its first step
+          (unset: the base; slot N: -sN and base port + 10 x N) and uses
+          them only as "${COMPOSE_PROJECT:?}", $CASSANDRA_HOST_PORT and
+          "${CASSANDRA_CONTAINER:?}". Flag a literal Compose project name,
+          container name or host port in such a job; CASSANDRA_HOST_PORT,
+          COMPOSE_PROJECT or CASSANDRA_CONTAINER in a job's env: (the same
+          name set in env: and through $GITHUB_ENV leaves the job depending
+          on their order); a new base port that some slot of another job
+          reaches; and any CI host port at 32768 or above, in any slot,
+          which is Linux's ephemeral range (ADR-aacruzgon-0086).
+          cassandra-three-node.yml is the exception to the slot: its global
+          concurrency group keeps it unslotted, on 29642-29644.
         - No paths: or paths-ignore: filter on r4b-compile-check.yml or
           fmt-clippy-cassandra.yml: their jobs are required checks, and a
           skipped workflow never reports.

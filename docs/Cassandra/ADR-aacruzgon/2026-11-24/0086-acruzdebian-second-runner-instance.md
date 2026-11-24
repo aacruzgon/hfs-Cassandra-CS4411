@@ -32,7 +32,7 @@
         - **What the step does:** each job's first step reads the slot and writes `COMPOSE_PROJECT`, `CASSANDRA_HOST_PORT` and `CASSANDRA_CONTAINER` to `$GITHUB_ENV`.
             - Unset or 0 keeps today's project and container names, and the job's base port.
             - Slot N (1–9) adds `-sN` to the project and 10 × N to the port.
-            - Any other value, or a port at 32768 or above, fails the job.
+            - Any other value, a base that isn't a plain number, or a port at 32768 or above, fails the job.
         - **No literals:** the job's `env:` holds only the bases, `COMPOSE_PROJECT_BASE` and `CASSANDRA_BASE_PORT`. Every command reads `"${COMPOSE_PROJECT:?}"` and `"${CASSANDRA_CONTAINER:?}"`, so a job without the slot step fails instead of reaching the Compose file's default project, `hfs-cassandra`.
         - **Why inline:** the step is written into each job, not kept in a script, because the flakiness and mutation jobs check out the pull request's head, which may not have a new script.
     - **Every CI host port moves below 32768,** out of the ephemeral range, which carries out ADR-aacruzgon-0082's plan. Each port is its old number minus 30000, so it still reads at a glance.
@@ -48,7 +48,7 @@
       | mutation | `hfs-cassandra-mutants`, 29842 | `hfs-cassandra-mutants-s1`, 29852 | 29932 | 59842 |
       | three-node (unslotted) | `hfs-cassandra-3n`, 29642–29644, `10.59.142.0/24` | the same | the same | 59642–59644 |
 
-      Every port in every slot lies in 29142–29932. None is shared across slots, and none is a port listened on by `acruzdebian` (22, 53, 80, 443, 631, 1883, 5355, plus ephemeral ones), published by the other projects, fixed elsewhere in this repository (all at 1xxxx, 27xxx or 5xxxx), or named in IANA's registry for 29000–29999 (29000, 29118, 29167–29169, 29999). Coverage and FHIR versions share a port within a slot, which is safe because an instance runs one job at a time.
+      Every port in every slot lies in 29142–29932. None is shared across slots, and none is a port listened on by `acruzdebian` (22, 53, 80, 443, 631, 1883, 5355, plus ephemeral ones), published by the other projects, fixed elsewhere in this repository (4-digit ones such as 5432, 8080, 8090, 8180, 9000 and 9001 in `docker/bulk-*` and `keycloak`, and 1xxxx, 27xxx or 5xxxx ones), or named in IANA's registry for 29000–29999 (29000, 29118, 29167–29169, 29999). Coverage and FHIR versions share a port within a slot, which is safe because an instance runs one job at a time.
     - **No bind retry for the required job, coverage or FHIR versions.** Below the ephemeral range no client socket is ever placed, so the TIME-WAIT refusal that made 0082 add retries can no longer happen, with one instance or two. The audit's report gives no other reason a bind fails. The flakiness and mutation jobs keep their three tries, which cost nothing when the first works; their comment now says why they were added.
     - **The three-node job stays unslotted.** Its concurrency group, `cassandra-three-node`, is one group for every ref, so no two runs overlap on any runner, and fixed names let the leading `down -v` find a killed run's cluster whichever instance ran it.
     - **The second instance has its own `RUSTUP_HOME`,** `/home/gh-runner/.rustup-2`, in its `.env`. The rustup proxies in the shared `~/.cargo/bin` read it, so no workflow changes for this.
@@ -107,15 +107,16 @@
     - **What the human changed:**
         - I decided the second instance and the 20G split before the session, and accepted that `cargo clippy (helios-fhir)` drops to 1 job.
         - After the independent audit of #111, I chose to move every CI port out of the ephemeral range, rather than add retries, and to limit the mutation job to 3 jobs.
-        - I approved this entry for #111.
-        - I ran every `sudo` step. <What you changed in review, if anything.>
+        - I approved this entry for #111. My review changes are those three decisions: the 20G split, the move of every CI port below 32768, and the limit of 3.
+        - I run every `sudo` step in the setup guide (`setup-acruzdebian.md`); the AI fetches the registration token when I reach its step 5. What that setup verifies is recorded below once the instance is online.
     - **Verified:**
         - **Lint:** `actionlint` 1.7.12 on the seven changed workflows reports only `runner.workspace`, in the same places as on `origin/main`. `zizmor` 1.32.0 reports no findings, with the same suppressions as `main`. PyYAML parses them, `.coderabbit.yaml` and the cluster Compose file. `shellcheck` 0.11.0 (`-s bash -S style`) is clean on the 61 extracted `run:` blocks that read a slot or project name.
         - **The slot step,** extracted and run:
             - unset, empty and `0` give `hfs-cassandra-ci`, 29142 and `hfs-cassandra-ci-cassandra-1`;
             - `1` gives `-s1` and 29152, and `9` gives 29232;
             - `10`, `-1`, `a`, `01`, `" 1"`, `"1 "` and `$'1\n'` fail;
-            - a base of 59142, or 32700 at slot 9, fails as inside the ephemeral range;
+            - a base of 59142, or 32700 at slot 9, or 32758 at slot 1 (32768), fails as inside the ephemeral range;
+            - a base that isn't a positive whole number without a leading zero (`abc`, `"59142 0"`, `029142`, `-29142`, `29142x`, empty) fails before the offset is added, in every slot. Bash arithmetic would read `abc` as an unset variable, so `abc` at slot 1 would otherwise give port 10;
             - a compose call without the step fails with `COMPOSE_PROJECT: parameter null or not set`;
             - the five copies are byte-identical and each is its job's step 0.
         - **Compose:** `docker compose config` publishes `127.0.0.1:29142` for `hfs-cassandra-ci`, 29152 for `-s1`, and 29642–29644 with subnet `10.59.142.0/24` for the three-node files.
@@ -137,7 +138,7 @@
         - **The machine side:** <after setup: `systemctl show` and the cgroup's `memory.max` for both units (21474836480); `gh api .../actions/runners` with both instances online; the first run with jobs on both instances, run `<id>`; the first mutation run at 3 jobs, run `<id>`, peak `<…>` MiB `anon`.>
 - **Links:**
     - PR #111, and its independent audit (`report-pr111-audit.md`).
-    - ADR-aacruzgon-0080 and 0082 (update notes), 0018, 0019, 0021, 0022, 0023, 0083.
+    - ADR-aacruzgon-0080, 0082 and 0083 (update notes), 0018, 0019, 0021, 0022, 0023.
     - ADR-sam-michaels-0001, 0002, 0003.
     - rust-lang/rustup#988.
     - `.github/workflows/fmt-clippy-cassandra.yml`, `cassandra-coverage.yml`, `fhir-versions.yml`, `cassandra-flaky.yml`, `cassandra-mutants.yml`, `cassandra-three-node.yml`, `runner-docker-prune.yml`.

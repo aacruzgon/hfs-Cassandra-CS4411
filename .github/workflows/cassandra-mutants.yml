@@ -11,6 +11,14 @@ name: Cassandra mutation testing (report only)
 # tool cannot: mutations specific to the design, bypasses of the source
 # scans, and comments checked against the ADRs.
 #
+# StorageResult<T> (ADR-aacruzgon-0084): cargo-mutants replaces a function's
+# body with Ok(...) only when the return type's last segment is `Result`, so
+# for the alias most backend functions return it tried StorageResult::new(...),
+# ::from(...) and ::from_iter(...), which never compile (28 of #102's 30
+# mutants). The job spells those return types as the Result they are, in its
+# own checkout only, before cargo-mutants reads the tree, and the report warns
+# when most of a run's mutants did not compile anyway.
+#
 # Report only. The job passes whatever survives, and whenever cargo-mutants
 # fails to install, its node does not start, or it fails itself, it writes a
 # warning instead of failing.
@@ -44,6 +52,7 @@ on:
       # change, it finds no mutants and says so).
       - '.github/workflows/cassandra-mutants.yml'
       - '.github/scripts/mutants-report.py'
+      - '.github/scripts/mutants-result-alias.py'
   workflow_dispatch:
     inputs:
       head:
@@ -112,6 +121,11 @@ jobs:
     env:
       # Released 2026-06-02 (ADR-aacruzgon-0082).
       CARGO_MUTANTS_VERSION: 27.1.0
+      # The Result alias the backend returns and its error type, rewritten in
+      # the job's checkout so cargo-mutants sees a Result (ADR-aacruzgon-0084).
+      # No release up to 27.1.0, nor its main branch on 2026-11-20, sees
+      # through an alias, and no option of .cargo/mutants.toml names one.
+      MUTANTS_ALIAS: StorageResult=crate::error::StorageError
       # cargo-mutants' build directories, one per job, each a copy of the
       # workspace (about 1.6 GB) and a cold target directory of its own. Not
       # kept between runs: cargo-mutants deletes them as it exits, and the
@@ -271,6 +285,68 @@ jobs:
             echo "files=$files"
           } >> "$GITHUB_OUTPUT"
 
+      # cargo-mutants 27.1.0 treats a return type as a Result only when its last
+      # path segment is `Result` (src/fnvalue.rs:77, `path_ends_with(path,
+      # "Result")`). StorageResult<T>, an alias for Result<T, StorageError>
+      # (crates/persistence/src/error.rs), falls through to its guess for an
+      # unknown generic type (src/fnvalue.rs:150-163): StorageResult::new(),
+      # ::new(v), ::from(v) and ::from_iter([v]), which rustc refuses, so
+      # every such body replacement was unviable and tested nothing: 559 of
+      # the whole backend's 1,327 mutants on main, and 28 of #102's 30. Here,
+      # in this checkout only, never in a commit, each `-> StorageResult<T>`
+      # under the backend is spelled `-> ::core::result::Result<T,
+      # crate::error::StorageError>`, the same type, so cargo-mutants tries
+      # Ok(...) of each value it can make for T (ADR-aacruzgon-0084). No line
+      # is added or removed, so every file:line in the report is the pull
+      # request's. cargo-mutants checks the diff's new side against the tree
+      # (src/in_diff.rs, check_diff_new_text_matches), so the script replaces
+      # those lines of the diff with the rewritten ones. Report only: a rewrite
+      # that fails puts the tree and the diff back, warns, and the run goes on
+      # as before. A pull request's scripts come from its head (Keep this
+      # workflow's scripts), so a head that predates ADR-aacruzgon-0084 has no
+      # mutants-result-alias.py: the step says so, and that run gets the old
+      # unviable replacements until main is merged into the branch. Not
+      # covered: a restore that itself fails (warned; the run goes on with the
+      # partly rewritten tree, the same type, so it builds and its names keep
+      # the ::core::result::Result<...> spelling; cargo-mutants refuses it,
+      # exit 5, only if a rewritten line is in the diff, and in_diff=none has
+      # no diff check), and a rewritten tree that does not build (the baseline
+      # fails, which the report warns about); neither has happened.
+      - name: Let cargo-mutants see through StorageResult
+        id: alias
+        if: steps.diff.outcome == 'success' && steps.diff.outputs.files != '0'
+        continue-on-error: true
+        env:
+          DIFF: ${{ steps.diff.outputs.diff }}
+        run: |
+          dir=crates/persistence/src/backends/cassandra
+          args=(--alias "$MUTANTS_ALIAS" --summary "$RUNNER_TEMP/ci-report/inputs/mutants/alias.json")
+          if [ ! -f "$CI_SCRIPTS/mutants-result-alias.py" ]; then
+            echo "predates=true" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Mutation testing::this head predates ADR-aacruzgon-0084 (it has no .github/scripts/mutants-result-alias.py); merge main to get Ok(…) mutants for functions returning StorageResult<T>"
+            exit 1
+          fi
+          if [ -n "$DIFF" ]; then cp "$DIFF" "$DIFF.orig"; args+=(--diff "$DIFF"); fi
+          status=0
+          out=$(python3 -I "$CI_SCRIPTS/mutants-result-alias.py" "${args[@]}" "$dir") || status=$?
+          if [ "$status" != 0 ]; then
+            git checkout -- "$dir" || echo "::warning title=Mutation testing::git checkout could not restore $dir after the failed rewrite"
+            if [ -n "$DIFF" ]; then cp "$DIFF.orig" "$DIFF"; fi
+            if [ "$status" = 3 ]; then
+              # The diff's new side is not this tree (a dispatch's in_diff
+              # range that does not end at head): realigning it would hide
+              # that, so nothing is rewritten and cargo-mutants refuses the
+              # diff itself (exit 5).
+              echo "stale=true" >> "$GITHUB_OUTPUT"
+              echo "::warning title=Mutation testing::the diff does not match the checked-out tree (an in_diff range that does not end at head?), so StorageResult<T> was not rewritten and cargo-mutants will refuse the diff; see this step's log"
+            else
+              echo "::warning title=Mutation testing::StorageResult<T> could not be spelled as a Result, so its functions get only body replacements that do not compile; see this step's log"
+            fi
+            exit 1
+          fi
+          echo "$out"
+          echo "summary=$(tail -n 1 <<< "$out")" >> "$GITHUB_OUTPUT"
+
       # Unless a dispatch turns it off (input node): the --lib tests' node
       # tests run against it. Every test isolates its data by tenant
       # (ADR-aacruzgon-0020), so the jobs share the node. Started the way the
@@ -388,6 +464,10 @@ jobs:
           RANGE: ${{ steps.diff.outputs.range }}
           DIFF: ${{ steps.diff.outputs.diff }}
           HEAD_NAME: ${{ inputs.head || github.head_ref || github.ref_name }}
+          ALIAS_OUTCOME: ${{ steps.alias.outcome }}
+          ALIAS_SUMMARY: ${{ steps.alias.outputs.summary }}
+          ALIAS_PREDATES: ${{ steps.alias.outputs.predates }}
+          ALIAS_STALE: ${{ steps.alias.outputs.stale }}
         run: |
           out="$RUNNER_TEMP/ci-report/inputs/mutants"
           mkdir -p "$out"
@@ -395,8 +475,19 @@ jobs:
           note="Mutated: \`$HEAD_NAME\` at \`$(git rev-parse --short HEAD)\`, range \`${RANGE:-?}\`, --lib tests $([ "$MUTANTS_NODE" = true ] && echo "against a node of this job's own" || echo "without a node (node tests skip)"), $MUTANTS_JOBS jobs. Scratch directory peak: ${peak:-?} MiB (sampled every 30 s)."
           diff_args=()
           if [ -n "$DIFF" ]; then diff_args=(--diff "$DIFF"); fi
+          alias_args=()
+          if [ "$ALIAS_OUTCOME" = success ]; then
+            alias_args=(--alias "$MUTANTS_ALIAS")
+            note+=" \`StorageResult<T>\` return types spelled \`::core::result::Result<T, crate::error::StorageError>\` in this job's checkout, so cargo-mutants tries \`Ok(…)\` (${ALIAS_SUMMARY:-?}); the names below spell them as the source does, the diffs in \`mutants.out/\` do not."
+          elif [ "$ALIAS_PREDATES" = true ]; then
+            note+=" This head predates ADR-aacruzgon-0084, so \`StorageResult<T>\` was not spelled as a Result and its functions' body replacements did not compile; merge main to get \`Ok(…)\` mutants."
+          elif [ "$ALIAS_STALE" = true ]; then
+            note+=" The diff did not match the checked-out tree, so \`StorageResult<T>\` was not rewritten (see the step's warning)."
+          elif [ "$ALIAS_OUTCOME" = failure ]; then
+            note+=" \`StorageResult<T>\` could not be spelled as a Result in this run, so its functions' body replacements did not compile."
+          fi
           python3 -I "$CI_SCRIPTS/mutants-report.py" "$RUNNER_TEMP/mutants/mutants.out" "$out" \
-            --exit-status "${STATUS:-}" --title-note "$note" "${diff_args[@]}" > /dev/null
+            --exit-status "${STATUS:-}" --title-note "$note" "${diff_args[@]}" "${alias_args[@]}" > /dev/null
           python3 "$CI_SCRIPTS/ci-report.py" add mutants "Mutation testing (cargo-mutants, report only)" \
             --markdown "$out/mutants.md" --json "$out/mutants.json"
 

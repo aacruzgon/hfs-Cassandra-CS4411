@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0082: CI gets report-only mutation testing and flakiness jobs, and the runners split into light, medium and heavy
 
 - **Date:** 2026-11-20
-- **Status:** accepted
+- **Status:** accepted; amended by [ADR-aacruzgon-0084](0084-mutants-see-through-storageresult.md) (the mutation job spells `StorageResult<T>` as a `Result` in its own checkout before cargo-mutants runs, and its report groups the unviable mutants by cause and warns when a run tested little; the rest of this entry stands)
 - **Context:**
     - **Reviewers were finding test gaps by hand.** On Sam's Step 5 pull requests (#87, #90) each review broke the code on purpose to see whether a test failed, and re-ran each new test 50 times. On #90 the first review (at `f7911aed3`) left 2 of its 9 mutations surviving: `index_batches` packing single statements, which splits a unit, and `buffer_unordered(usize::MAX)`, the in-flight bound. The second left 2 of its 5, both in the wiring of the batch's retry policy (`session.rs:541`, `:420`). I want each pull request to show its surviving mutants and its unstable tests without a reviewer having to look. Hand review stays for what a tool cannot do: mutations specific to the design, bypasses of the source scans, and comments checked against the ADRs.
     - **A new tool in CI is a dependency decision.** `cargo-mutants` would be the first mutation-testing tool here. Its 27.1.0 changelog (`NEWS.md`) covers what the job needs:

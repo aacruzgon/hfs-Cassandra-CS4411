@@ -50,3 +50,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0005](2026-10-15/0005-upstream-canary.md) | 2026-10-15 | The upstream canary merges upstream nightly, runs 0.4's check, and keeps one "upstream drift" issue | accepted |
 | [0006](2026-11-16/0006-step-5-design.md) | 2026-11-16 | Step 5's design: index rows by partition, the version row first, a quorum-first sweeper, bounded repair and a report-first CI check | accepted; amended on 2026-11-17 and 2026-11-18 after Alan's two reviews on #86; partly superseded by [0007](2026-11-17/0007-consistency-check-scan-modes.md) (RV13) |
 | [0007](2026-11-17/0007-consistency-check-scan-modes.md) | 2026-11-17 | The consistency check's scan modes, and the extraction helper's seat in pull request 4 | accepted |
+| [0008](2026-11-23/0008-step-5-implementation-choices.md) | 2026-11-23 | Step 5's implementation choices, pull requests 5 to 8: extraction, sweeper, repair and crash tests | accepted |

@@ -40,8 +40,8 @@
 #                    procedures and the backend tests, no OOM kill)
 #   Host ports       127.0.0.1:59342, 59343 and 59344, one per node
 #                    (CASSANDRA_CLUSTER_HOST_PORT_1 to _3 override). Not 59042
-#                    (developers), 59142 (the required CI job) or 59242
-#                    (coverage and FHIR versions).
+#                    (developers); the CI jobs' ports are all below 32768
+#                    (README.md, "CI host ports").
 #   Network          Fixed addresses, ${CASSANDRA_CLUSTER_SUBNET_PREFIX}.11 to
 #                    .13 (default 172.29.59), so a node keeps its address over
 #                    a restart and a network reconnect.

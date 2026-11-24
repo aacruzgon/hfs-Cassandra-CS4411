@@ -508,10 +508,58 @@ pub(crate) struct Extraction {
     pub(crate) failed_resource: Option<String>,
 }
 
+/// The stack of [`extract_index_keys`]'s thread in a debug build.
+///
+/// FHIRPath evaluates a union or operator chain with one stack frame per
+/// term, about 32 KB each in a debug build. On a 2 MiB thread, a tokio
+/// worker's or a test's, FHIRPath measured that debug survives a chain of 64
+/// and aborts at 80, while release survives 300; its parser refuses more than
+/// `MAX_EXPRESSION_DEPTH` (250), so release is covered and debug is not
+/// (`crates/fhirpath/src/lib.rs`). R5's shared parameters (`url`, `name`,
+/// `status` and the like) are unions over some 60 resource types, so creating
+/// an R5 `SearchParameter` overflowed a debug test thread. A 250-term chain
+/// needs about 8 MB in debug. Pages are committed only as they are touched.
+/// This is the size FHIRPath gives its own deep-parse thread (`run_parse`).
+const EXTRACTION_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 /// Runs `extractor.extract_with_missing(body, resource_type)` and maps it (IW1, D6).
-/// Never panics and never returns an error: a resource that cannot be
-/// extracted keeps only its `resources_by_type` key.
+/// A debug build runs it on a scoped thread with an [`EXTRACTION_STACK_BYTES`]
+/// stack, since a stack overflow aborts the whole process and cannot unwind.
+/// A release build, which FHIRPath's depth limit already covers, runs it on
+/// the caller's stack and starts no thread (about 45 µs a write).
+/// Never returns an error: a resource that cannot be extracted keeps only its
+/// `resources_by_type` key, and so does one whose thread cannot be started.
+/// A panic inside the extractor is resumed on the caller's thread.
 pub(crate) fn extract_index_keys(
+    extractor: &SearchParameterExtractor,
+    resource_type: &str,
+    body: &Json,
+) -> Extraction {
+    if !cfg!(debug_assertions) {
+        return extract_on_this_stack(extractor, resource_type, body);
+    }
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name("hfs-extraction".to_string())
+            .stack_size(EXTRACTION_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                extract_on_this_stack(extractor, resource_type, body)
+            });
+        match spawned {
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Err(error) => Extraction {
+                keys: vec![IndexKey::ResourcesByType],
+                failed_params: Vec::new(),
+                failed_resource: Some(format!("the extraction thread did not start: {error}")),
+            },
+        }
+    })
+}
+
+/// [`extract_index_keys`]'s work, on whatever stack calls it.
+fn extract_on_this_stack(
     extractor: &SearchParameterExtractor,
     resource_type: &str,
     body: &Json,
@@ -1134,5 +1182,46 @@ mod tests {
             assert!(extraction.failed_resource.is_some(), "{body}");
             assert!(extraction.failed_params.is_empty());
         }
+    }
+
+    /// FHIRPath evaluates a union with one stack frame per term, about 32 KB
+    /// each in a debug build, so a 200-term union (under FHIRPath's chain
+    /// limit of 250) needs about 6.4 MB there. A debug build's
+    /// `extract_index_keys` runs it on its own stack, so it extracts from a
+    /// 2 MiB thread, a tokio worker's size; run inline, it overflows that
+    /// thread and aborts the test binary. A release build runs it inline,
+    /// where FHIRPath measured that a 2 MiB thread survives 300.
+    #[test]
+    fn a_deep_union_extracts_from_a_two_mib_thread() {
+        let registry = test_registry();
+        let expression = vec!["Patient.gender"; 200].join(" | ");
+        registry
+            .write()
+            .register(
+                SearchParameterDefinition::new(
+                    "http://example.org/SearchParameter/deep",
+                    "deep",
+                    SearchParamType::Token,
+                    expression.as_str(),
+                )
+                .with_base(vec!["Patient"]),
+            )
+            .unwrap();
+        let extractor = SearchParameterExtractor::new(registry);
+        let body = json!({"resourceType": "Patient", "id": "p", "gender": "male"});
+        let extraction = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || extract_index_keys(&extractor, "Patient", &body))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(extraction.failed_resource, None);
+        assert!(extraction.failed_params.is_empty(), "{extraction:?}");
+        assert!(
+            extraction
+                .keys
+                .contains(&token_code("deep", "male", IMPLICIT)),
+            "{extraction:?}"
+        );
     }
 }

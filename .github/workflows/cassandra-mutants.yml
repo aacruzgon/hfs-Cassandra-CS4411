@@ -28,10 +28,13 @@ name: Cassandra mutation testing (report only)
 # (ADR-aacruzgon-0019, 0021), so it is a workflow of its own.
 #
 # Heavy (ADR-aacruzgon-0082): cargo-mutants builds one copy of the workspace
-# per job, cold. With 4 jobs it peaked at 15.4 GiB anon on #90, less than
-# 5 GiB under sam-7900x's 20G (ADR-aacruzgon-0080's margin), with up to
-# 32.9 GiB of build directories, and it holds its runner for about 26 minutes,
-# so it runs only on acruzdebian (40G), where the job count can grow. A
+# per job, cold, with up to 32.9 GiB of build directories, and it holds its
+# runner for about 26 minutes, so it runs only on acruzdebian, off
+# sam-7900x's desktop. Each of acruzdebian's two runner instances is capped
+# at 20G since ADR-aacruzgon-0086 (40G before). With 4 jobs it peaked at
+# 15.4 GiB anon on #90, 4.6 GiB under 20G, inside ADR-aacruzgon-0080's 5 GiB
+# margin, so the job count is 3 by default and at most: about 11.6 GiB anon
+# by 0082's 3.85 GiB a job, an estimate until a run measures it. A
 # paths: filter is fine here: no required check lives in this workflow.
 #
 # Only on a pull request labelled `mutants` (ADR-aacruzgon-0082): run on every
@@ -73,9 +76,9 @@ on:
         required: false
         default: true
       jobs:
-        description: cargo-mutants --jobs, the build directories tested at once.
+        description: cargo-mutants --jobs, the build directories tested at once (1 to 3, which keeps a 5 GiB margin under a runner instance's 20G).
         required: false
-        default: '4'
+        default: '3'
 
 permissions:
   contents: read
@@ -133,7 +136,7 @@ jobs:
       # $RUNNER_WORKSPACE/target/, next to the other jobs' target directories
       # (the runner context is not available in a job's env).
       MUTANTS_SCRATCH_NAME: mutants-scratch
-      MUTANTS_JOBS: ${{ inputs.jobs || '4' }}
+      MUTANTS_JOBS: ${{ inputs.jobs || '3' }}
       MUTANTS_MINUTES: 130
       # On for pull requests: on f7911aed3 the node took the missed mutants
       # from 18 to 8 for about 4 more minutes (ADR-aacruzgon-0082).
@@ -143,22 +146,65 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       # Its own node, if any, on a port nothing else publishes: not a
-      # developer's 59042, the required job's 59142, coverage's and FHIR
-      # versions' 59242, the three-node Compose file's 59342 to 59344, the
-      # flakiness job's 59442, the benchmark harness's 59542 or the nightly
-      # three-node job's 59642 to 59644 (docker/cassandra/README.md). Rootless
+      # developer's 59042, the required job's 29142, coverage's and FHIR
+      # versions' 29242, the three-node Compose file's 59342 to 59344, the
+      # flakiness job's 29442, the benchmark harness's 59542 or the nightly
+      # three-node job's 29642 to 29644 (docker/cassandra/README.md), and
+      # below the ephemeral range (59842 before ADR-aacruzgon-0086). Rootless
       # Docker publishes on the host itself, so a clash with a cluster started
       # by hand on the same machine would fail one of them. Its own Compose
       # project, so down -v can only remove this job's container and volume.
+      # Both are the bases of this runner instance's slot (the first step,
+      # ADR-aacruzgon-0086).
       COMPOSE_FILE: docker/cassandra/docker-compose.yml
-      CASSANDRA_HOST_PORT: 59842
-      COMPOSE_PROJECT: hfs-cassandra-mutants
+      CASSANDRA_BASE_PORT: 29842
+      COMPOSE_PROJECT_BASE: hfs-cassandra-mutants
       CI_REPORT_PROFILE: test (debug=0, incremental; cargo-mutants build directories)
     steps:
+      # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
+      # the runner's own .env. Two instances on one machine share gh-runner's
+      # rootless Docker and the host's ports, so each needs its own Compose
+      # project and host port. Unset or 0 keeps the base project and port
+      # above; slot N (1 to 9) adds -sN to the project and 10 x N to the port,
+      # which stays clear of every other job's port in every slot
+      # (docker/cassandra/README.md). Every port stays below Linux's
+      # ephemeral range (32768-60999), where no client socket is placed, so
+      # none can hold it in TIME-WAIT; the step refuses one that does not.
+      # The derived names go to $GITHUB_ENV and are never in the job's env:,
+      # and every command below reads them as ${NAME:?}, so a missing slot
+      # step fails rather than reaching the Compose file's default project.
+      # First, so the always() clean-up has them however early the job fails.
+      # The same step is in each job that starts a single node.
+      - name: Pick this runner's Compose project and host port
+        run: |
+          slot=${HFS_CI_SLOT:-0}
+          if ! [[ $slot =~ ^[0-9]$ ]]; then
+            echo "::error title=HFS_CI_SLOT::must be one digit (0 to 9) or unset, got $(printf %q "$slot")"
+            exit 1
+          fi
+          project=$COMPOSE_PROJECT_BASE port=$CASSANDRA_BASE_PORT
+          if ! [[ $port =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error title=HFS_CI_SLOT::base port must be a positive whole number with no leading zero, got $(printf %q "$port")"
+            exit 1
+          fi
+          if [ "$slot" != 0 ]; then project=$project-s$slot port=$((port + 10 * slot)); fi
+          if [ "$port" -ge 32768 ]; then
+            echo "::error title=HFS_CI_SLOT::host port $port is inside Linux's ephemeral range (32768-60999)"
+            exit 1
+          fi
+          {
+            echo "COMPOSE_PROJECT=$project"
+            echo "CASSANDRA_HOST_PORT=$port"
+            echo "CASSANDRA_CONTAINER=$project-cassandra-1"
+          } >> "$GITHUB_ENV"
+          echo "Runner ${RUNNER_NAME:-?}, slot $slot: Compose project $project, host port 127.0.0.1:$port"
+
       # A dispatch's inputs reach git, actions/checkout and cargo-mutants as
       # arguments. A value that starts with - would be read as an option
-      # (git diff --output=<file> writes that file), and a job count past 6
-      # would not fit 40G, so each input must look like what it is. A pull
+      # (git diff --output=<file> writes that file), and a job count past 3
+      # would leave less than ADR-aacruzgon-0080's 5 GiB margin under an
+      # acruzdebian instance's 20G (ADR-aacruzgon-0086; it was 6 under the
+      # single instance's 40G), so each input must look like what it is. A pull
       # request has no inputs: its refs come from GitHub.
       - name: Check the dispatch inputs
         if: github.event_name == 'workflow_dispatch'
@@ -188,7 +234,7 @@ jobs:
           # Empty means main, as in the diff step (inputs.base || 'main').
           [ -z "$BASE_IN" ] || check base "$BASE_IN" "$ref"
           [ -z "$RANGE_IN" ] || [ "$RANGE_IN" = none ] || check in_diff "$RANGE_IN" "$ref"
-          check jobs "$JOBS_IN" '[1-6]'
+          check jobs "$JOBS_IN" '[1-3]'
           exit "$bad"
 
       # The pull request's head, not the merge commit, so every file:line in
@@ -362,22 +408,24 @@ jobs:
         # warning, rather than failing the job.
         continue-on-error: true
         run: |
-          docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
+          docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
           # Up to three tries, 35 s apart, so the third comes about 70 s after
-          # the first. Every CI port is even and inside Linux's ephemeral range
-          # (32768-60999), and connect() takes even ports first, so the client
-          # side of the previous job's loopback test connections can sit on
-          # this port in TIME-WAIT for 60 s, which no listener can bind over,
-          # SO_REUSEADDR or not. Run 44765908091 hit it: its bind on 59842 came
-          # 17-46 s after the previous job's tests against 59242. This job
-          # reaches its node with no build first, so it is the most exposed.
+          # the first. Added when every CI port was even and inside Linux's
+          # ephemeral range (32768-60999): connect() takes even ports first, so
+          # the client side of the previous job's loopback test connections
+          # could sit on this port in TIME-WAIT for 60 s, which no listener can
+          # bind over, SO_REUSEADDR or not. Run 44765908091 hit it: its bind on
+          # 59842 came 17-46 s after the previous job's tests against 59242.
+          # Since ADR-aacruzgon-0086 every CI port is below that range, where
+          # no client socket is ever placed, so that cause is gone; the tries
+          # stay, as they cost nothing when the first one works.
           for try in 1 2 3; do
             if python3 "$CI_SCRIPTS/ci-report.py" timed node-start "Start and healthcheck (compose up --wait), try $try" -- \
-              docker compose -p "$COMPOSE_PROJECT" up -d --wait --wait-timeout 240; then
+              docker compose -p "${COMPOSE_PROJECT:?}" up -d --wait --wait-timeout 240; then
               break
             fi
-            docker compose -p "$COMPOSE_PROJECT" logs --tail 50 || true
-            docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans
+            docker compose -p "${COMPOSE_PROJECT:?}" logs --tail 50 || true
+            docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans
             if [ "$try" = 3 ]; then
               echo "::warning title=Mutation testing::the Cassandra node did not start in 3 tries, so nothing was run; see this step's log"
               exit 1
@@ -520,7 +568,7 @@ jobs:
         # too, and must not turn the job red.
         continue-on-error: true
         run: |
-          docker compose -p "$COMPOSE_PROJECT" logs --tail 200 \
+          docker compose -p "${COMPOSE_PROJECT:?}" logs --tail 200 \
             || echo "::warning title=Mutation testing::docker compose logs failed, so the node's logs are not in this run"
 
       # down -v is safe here only because -p names this job's own project.
@@ -530,7 +578,7 @@ jobs:
         # and the next run's leading down -v removes what it left.
         continue-on-error: true
         run: |
-          if ! docker compose -p "$COMPOSE_PROJECT" down -v --remove-orphans; then
+          if ! docker compose -p "${COMPOSE_PROJECT:?}" down -v --remove-orphans; then
             echo "::warning title=Mutation testing::docker compose down failed, so this job's container and volume may be left; the next run's leading down -v removes them"
           fi
 

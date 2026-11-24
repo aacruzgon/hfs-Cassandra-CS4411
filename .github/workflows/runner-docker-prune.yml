@@ -4,7 +4,10 @@ name: Runner Docker prune
 # (ADR-sam-michaels-0001, ADR-sam-michaels-0002). Each runner reaches its daemon
 # through DOCKER_HOST in its .env, so this never touches any other user's Docker.
 # A label shared by both runners would reach only one of them, so the job is a
-# matrix over each runner's own label (ADR-aacruzgon-0023).
+# matrix over each machine's own label (ADR-aacruzgon-0023). acruzdebian has
+# two runner instances under the same user, gh-runner, so one daemon
+# (ADR-aacruzgon-0086): only the first instance's label is in the matrix, and
+# the other instance may be running a job while this prunes.
 # Scheduled workflows run from the default branch only.
 
 on:
@@ -37,10 +40,17 @@ jobs:
     steps:
       # Without --all, tagged images such as the pinned cassandra image stay,
       # so the next Cassandra job does not download it again. Stopped
-      # containers, unused networks, dangling images, build cache and
-      # anonymous volumes go. Jobs run one at a time on this runner, so no CI
-      # container is running while this does.
-      - name: docker system prune --force --volumes
+      # containers, unused networks, dangling images and build cache go, but
+      # only those created more than 24 hours ago (until=24h): another runner
+      # instance on the same daemon may be running a job right now, which can
+      # hold a container it stopped on purpose (the readiness test's docker
+      # stop), or a network that compose up has made but not yet attached
+      # (ADR-aacruzgon-0086). No job runs for 24 hours (the longest
+      # timeout-minutes is 160). docker system prune refuses until with
+      # --volumes, so the volumes are pruned on their own: anonymous ones no
+      # container uses (Docker 23 and later leave named volumes, such as
+      # each Compose project's, to --all, which this never passes).
+      - name: docker system prune, then docker volume prune
         run: |
           # Refuse to prune any daemon but gh-runner's own rootless one.
           want="unix:///run/user/$(id -u)/docker.sock"
@@ -50,5 +60,6 @@ jobs:
           fi
           echo "Daemon: $DOCKER_HOST"
           docker system df
-          docker system prune --force --volumes
+          docker system prune --force --filter until=24h
+          docker volume prune --force
           docker system df

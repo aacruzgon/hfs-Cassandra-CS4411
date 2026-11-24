@@ -1197,11 +1197,13 @@ fn check_subject(
                 });
             }
             // Its own `data` is re-extracted like an older version's. When it
-            // is `resources.data` itself, rule 3 has extracted it already, so
-            // only a body that differs from it is extracted here: an equal
-            // body that is not JSON is rule 3's `read_failed`, reported once.
+            // is `resources.data` itself and rule 3 ran, rule 3 has extracted
+            // it already, so only a body that differs from it is extracted
+            // here: an equal body that is not JSON is rule 3's `read_failed`,
+            // reported once. When rule 3 did not run (R1's set does not
+            // decode), the body is extracted here whatever it is.
             if fixed
-                && version.data != subject.row.data
+                && (!rule_3 || version.data != subject.row.data)
                 && let Some(data) = version.data.as_deref()
             {
                 match extract(backend, tenant, resource_type, data) {
@@ -1785,6 +1787,7 @@ mod tests {
             "no-data-anywhere",
             "no-data-in-resources-row",
             "malformed-data-in-both-rows",
+            "malformed-data-undecodable-sets",
             "write-ts-behind",
         ];
         let version = test_fhir_version();
@@ -2229,6 +2232,38 @@ mod tests {
         )
         .await;
 
+        // malformed-data-undecodable-sets: as malformed-data-in-both-rows,
+        // with both stored sets undecodable, so rule 3 does not run.
+        let t = tenant_of("malformed-data-undecodable-sets");
+        let (_, _, ts1, _) = seeded(&backend, &t).await;
+        plant_resource_keys(&backend, &t, vec![0x02, 0x00], 1).await;
+        plant_version_keys(&backend, &t, 1, vec![0x02, 0x00], ts1 + 1).await;
+        plant_cas(
+            &backend,
+            PLANT_RESOURCE_DATA,
+            vec![
+                Value::from("{not json"),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+        plant(
+            &backend,
+            PLANT_VERSION_DATA,
+            vec![
+                Value::from(ts1 + 2),
+                Value::from("{not json"),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+
         // write-ts-behind: R1's and v1's `write_ts` are 5 us before
         // `write_ts_of(last_updated)`. The index rows keep the create's
         // WRITETIME, since a lower `USING TIMESTAMP` cannot replace it.
@@ -2572,6 +2607,16 @@ mod tests {
 
             // One body that is not JSON, in both rows, is reported once, by rule 3.
             let report = check("malformed-data-in-both-rows", registry).await;
+            assert_eq!(report.kinds(), want, "{report}");
+
+            // With R1's set undecodable rule 3 does not run, so the version
+            // row's extraction reports the body.
+            let report = check("malformed-data-undecodable-sets", registry).await;
+            let want: &[&str] = if fixed {
+                &["read_failed", "undecodable"]
+            } else {
+                &["undecodable"]
+            };
             assert_eq!(report.kinds(), want, "{report}");
         }
         let checked = checked.into_inner();

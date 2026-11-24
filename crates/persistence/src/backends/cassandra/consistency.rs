@@ -875,9 +875,20 @@ async fn run(
                 "the shared scan does not cover tenant {tenant}"
             );
             for subject in &subjects {
-                let writes = std::iter::once(subject.row.write_ts)
-                    .chain(subject.versions.iter().map(|v| v.write_ts))
-                    .flatten();
+                // A row with no `write_ts` is dated by its `last_updated`, as
+                // rule 6 does; with neither set it is not checked.
+                let writes = std::iter::once(
+                    subject
+                        .row
+                        .write_ts
+                        .unwrap_or_else(|| write_ts_of(subject.row.last_updated)),
+                )
+                .chain(
+                    subject
+                        .versions
+                        .iter()
+                        .filter_map(|v| v.write_ts.or_else(|| v.last_updated.map(write_ts_of))),
+                );
                 for write_ts in writes {
                     assert!(
                         write_ts < shared.taken_at,
@@ -2213,6 +2224,74 @@ mod tests {
         // The row is undecodable to a scan that does read it.
         assert_eq!(whole.kinds(), ["read_failed"], "{whole}");
         assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// The stale guard dates a row with no `write_ts` by its `last_updated`.
+    /// `p` is planted after the scan with no `write_ts` on either row.
+    #[tokio::test]
+    async fn a_shared_scan_is_stale_for_a_write_with_no_write_ts() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("planted-stale-no-write-ts");
+        let own = t.clone();
+        let scan = IndexScan::take(&backend, move |x| x == own).await;
+        assert!(scan.failed.is_none(), "{:?}", scan.failed);
+        let lu = Utc::now();
+        assert!(write_ts_of(lu) >= scan.taken_at);
+        let body =
+            serde_json::json!({"resourceType": "Patient", "id": "p", "active": true}).to_string();
+        let blob = Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType])));
+        let fhir = Value::from(test_fhir_version().as_mime_param());
+        plant_cas(
+            &backend,
+            PLANT_RESOURCE_NO_TS,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(body.as_str()),
+                Value::from(lu),
+                Value::from(lu),
+                fhir.clone(),
+                blob.clone(),
+            ],
+        )
+        .await;
+        plant(
+            &backend,
+            PLANT_VERSION_NO_TS,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(body.as_str()),
+                Value::from(lu),
+                fhir,
+                blob,
+                Value::from(write_ts_of(lu)),
+            ],
+        )
+        .await;
+        let stale = futures::FutureExt::catch_unwind(AssertUnwindSafe(index_consistency(
+            &backend,
+            &t,
+            Scope::Tenant,
+            ScanMode::Shared(&scan),
+            Registry::Fixed,
+        )))
+        .await;
+        let payload = stale.expect_err("a stale shared scan must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("shared scan is stale for Patient/p"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

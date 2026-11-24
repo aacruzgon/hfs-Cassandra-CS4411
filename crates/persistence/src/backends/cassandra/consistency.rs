@@ -115,10 +115,13 @@ pub(crate) enum ScanMode<'a> {
     /// scan covers the tenant, and panics if any resource the check examines
     /// has an R1 or version row `write_ts` at or after the scan's `taken_at`
     /// (a resource written after the scan was taken, so the scan is stale for
-    /// it). It cannot catch a write still in flight when the scan started
-    /// whose `write_ts` is earlier but whose index rows land later, nor an
-    /// index row planted by hand after the scan. Callers take the scan only
-    /// after every writer has returned, as T5 does.
+    /// it). A row with no `write_ts` is dated by `write_ts_of(last_updated)`,
+    /// the time a writer would have stored; a version row with neither is
+    /// not dated. It cannot catch a write still in flight when the scan
+    /// started whose `write_ts` is earlier but whose index rows land later,
+    /// nor an index row written after the scan with no `resources` write (a
+    /// hand plant, and later the sweeper or repair). Callers take the scan
+    /// only after every writer has returned, as T5 does.
     ///
     /// The guard compares the writers' clock-derived `write_ts` with
     /// `taken_at`, so it also assumes the clock does not step back between
@@ -185,8 +188,8 @@ pub(crate) struct IndexScan {
     /// resource written after the scan was taken, as long as the clock has
     /// not stepped back since (`ScanMode::Shared`). It cannot catch a write
     /// in flight at that moment (earlier `write_ts`, index rows landing
-    /// later) or an index row planted by hand after the scan; callers take
-    /// the scan only after every writer has returned.
+    /// later) or an index row written after the scan with no `resources`
+    /// write; callers take the scan only after every writer has returned.
     taken_at: i64,
 }
 
@@ -397,7 +400,10 @@ pub(crate) enum Defect {
         stored: Vec<IndexKey>,
         fresh: Vec<IndexKey>,
     },
-    /// Rule 4, RV10 clause 2 (a), `Fixed` only: a non-current content version's stored set differs from a re-extraction of its `data`.
+    /// Rule 4, RV10 clause 2 (a), `Fixed` only: a live version's stored set
+    /// differs from a re-extraction of its `data`. That is an older version,
+    /// or the current version row when its `data` is not `resources.data`
+    /// (rule 3 compares that one).
     VersionReextraction {
         resource_type: String,
         id: String,

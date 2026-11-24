@@ -1174,6 +1174,33 @@ fn check_subject(
                     version_id: version.version_id,
                 });
             }
+            // Its own `data` is re-extracted like an older version's. When it
+            // is `resources.data` itself, rule 3 has compared it already, so
+            // only a body that differs from it is compared with the stored set.
+            if fixed && let Some(data) = version.data.as_deref() {
+                match extract(backend, tenant, resource_type, data) {
+                    Ok(fresh) => {
+                        if version.data != subject.row.data
+                            && let Ok(keys) = index_keys::decode(blob)
+                        {
+                            let keys: BTreeSet<IndexKey> = keys.into_iter().collect();
+                            if fresh != keys {
+                                report.defects.push(Defect::VersionReextraction {
+                                    resource_type: resource_type.clone(),
+                                    id: id.clone(),
+                                    version_id: version.version_id,
+                                    stored: sorted(&keys),
+                                    fresh: sorted(&fresh),
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => report.defects.push(Defect::ReadFailed {
+                        what: format!("data of {resource_type}/{id} v{}", version.version_id),
+                        error,
+                    }),
+                }
+            }
             continue;
         }
         let keys: BTreeSet<IndexKey> = match index_keys::decode(blob) {
@@ -1531,6 +1558,8 @@ mod tests {
     /// A CAS: moves `resources.write_ts`.
     const PLANT_RESOURCE_WRITE_TS: &str = "UPDATE resources SET write_ts = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
     const PLANT_VERSION_WRITE_TS: &str = "UPDATE resource_versions USING TIMESTAMP ? SET write_ts = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
+    /// Replaces a version row's `data`.
+    const PLANT_VERSION_DATA: &str = "UPDATE resource_versions USING TIMESTAMP ? SET data = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
     const PLANT_RESOURCE_KEYS: &str = "UPDATE resources SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
 
     fn ms(millis: i64) -> DateTime<Utc> {
@@ -1687,6 +1716,7 @@ mod tests {
             "emptied-older-version",
             "no-data-older-version",
             "write-ts-mismatch",
+            "malformed-current-version-data",
         ];
         let version = test_fhir_version();
 
@@ -2008,6 +2038,26 @@ mod tests {
         .await;
         plant_x1(&backend, &t, lu1, "p", 1, ts1 + 5).await;
 
+        // malformed-current-version-data: the current version row's own `data`
+        // is not JSON, while `resources.data` is. (A valid body that differs
+        // from `resources.data` shows only once extraction is real; until then
+        // `index_keys_of` gives the same set for any body.)
+        let t = tenant_of("malformed-current-version-data");
+        let (_, _, ts1, _) = seeded(&backend, &t).await;
+        plant(
+            &backend,
+            PLANT_VERSION_DATA,
+            vec![
+                Value::from(ts1 + 1),
+                Value::from("{not json"),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+
         // One shared scan for every case, taken after every `write_ts` above.
         // emptied-older-version's update comes last, and a scan in its
         // millisecond would be refused as stale. A second version's
@@ -2262,6 +2312,11 @@ mod tests {
                 assert_eq!(*version_id, 1);
                 assert_eq!(*stored, *expected + 5);
             }
+
+            // Only an unchanged registry re-extracts the current version row.
+            let report = check("malformed-current-version-data", registry).await;
+            let want: &[&str] = if fixed { &["read_failed"] } else { &[] };
+            assert_eq!(report.kinds(), want, "{report}");
         }
         let checked = checked.into_inner();
         for case in all {

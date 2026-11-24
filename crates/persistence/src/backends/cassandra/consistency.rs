@@ -1784,6 +1784,7 @@ mod tests {
             "no-data-current-version",
             "no-data-anywhere",
             "malformed-data-in-both-rows",
+            "write-ts-behind",
         ];
         let version = test_fhir_version();
 
@@ -2221,6 +2222,37 @@ mod tests {
         )
         .await;
 
+        // write-ts-behind: R1's and v1's `write_ts` are 5 us before
+        // `write_ts_of(last_updated)`. The index rows keep the create's
+        // WRITETIME, since a lower `USING TIMESTAMP` cannot replace it.
+        let t = tenant_of("write-ts-behind");
+        let (_, _, ts1, k_behind) = seeded(&backend, &t).await;
+        plant_cas(
+            &backend,
+            PLANT_RESOURCE_WRITE_TS,
+            vec![
+                Value::from(ts1 - 5),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+        plant(
+            &backend,
+            PLANT_VERSION_WRITE_TS,
+            vec![
+                Value::from(ts1 + 1),
+                Value::from(ts1 - 5),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+
         // One shared scan for every case, taken after every `write_ts` above.
         // emptied-older-version's update comes last, and a scan in its
         // millisecond would be refused as stale. A second version's
@@ -2502,6 +2534,35 @@ mod tests {
             let want: &[&str] = if fixed { &["read_failed"] } else { &[] };
             assert_eq!(report.kinds(), want, "{report}");
 
+            // The same 5 us behind: rule 6 compares each index row's
+            // WRITETIME with v1's stored `write_ts`, so each row is off too.
+            let report = check("write-ts-behind", registry).await;
+            assert_eq!(
+                report.kinds(),
+                expect(&[
+                    ("write_ts_mismatch", 2),
+                    ("wrong_write_time", k_behind.len())
+                ]),
+                "{report}"
+            );
+            for defect in &report.defects {
+                match defect {
+                    Defect::WriteTsMismatch {
+                        version_id,
+                        stored,
+                        expected,
+                        ..
+                    } => {
+                        assert_eq!(*version_id, 1);
+                        assert_eq!(*stored, *expected - 5);
+                    }
+                    Defect::WrongWriteTime { row, expected } => {
+                        assert_eq!(row.written, *expected + 5);
+                    }
+                    other => panic!("{other}"),
+                }
+            }
+
             // One body that is not JSON, in both rows, is reported once, by rule 3.
             let report = check("malformed-data-in-both-rows", registry).await;
             assert_eq!(report.kinds(), want, "{report}");
@@ -2519,8 +2580,10 @@ mod tests {
 
     /// A `Full` scan scoped to some ids drops the other ids' rows before
     /// decoding them, so a row of another id that cannot be decoded does not
-    /// fail the check. The row is a type row of `p` with no `version_id`,
-    /// planted under a `test-` tenant and deleted before the assertions.
+    /// fail the check. The rows are type rows with no `version_id`, of
+    /// `Patient/p` and of `Observation/q` (the in-scope id under another
+    /// type), planted under a `test-` tenant and deleted before the
+    /// assertions.
     #[tokio::test]
     async fn a_scoped_full_check_does_not_decode_other_ids_rows() {
         let Some(backend) = backend().await else {
@@ -2539,19 +2602,22 @@ mod tests {
         }
         let lu = ms(1_700_000_000_000);
         let ts = write_ts_of(lu);
-        plant(
-            &backend,
-            PLANT_X1_NO_TAG,
-            vec![
-                Value::from(t.as_str()),
-                Value::from("Patient"),
-                Value::from(lu),
-                Value::from("p"),
-                Value::from(version.as_mime_param()),
-                Value::from(ts),
-            ],
-        )
-        .await;
+        let planted = [("Patient", "p"), ("Observation", "q")];
+        for (resource_type, id) in planted {
+            plant(
+                &backend,
+                PLANT_X1_NO_TAG,
+                vec![
+                    Value::from(t.as_str()),
+                    Value::from(resource_type),
+                    Value::from(lu),
+                    Value::from(id),
+                    Value::from(version.as_mime_param()),
+                    Value::from(ts),
+                ],
+            )
+            .await;
+        }
         let scoped = index_consistency(
             &backend,
             &t,
@@ -2561,18 +2627,20 @@ mod tests {
         )
         .await;
         let whole = check(&backend, &t).await;
-        plant(
-            &backend,
-            UNPLANT_X1,
-            vec![
-                Value::from(ts + 1),
-                Value::from(t.as_str()),
-                Value::from("Patient"),
-                Value::from(lu),
-                Value::from("p"),
-            ],
-        )
-        .await;
+        for (resource_type, id) in planted {
+            plant(
+                &backend,
+                UNPLANT_X1,
+                vec![
+                    Value::from(ts + 1),
+                    Value::from(t.as_str()),
+                    Value::from(resource_type),
+                    Value::from(lu),
+                    Value::from(id),
+                ],
+            )
+            .await;
+        }
         assert_consistent(&scoped);
         assert_eq!(scoped.resources, 1, "{scoped}");
         // The row is undecodable to a scan that does read it.
@@ -2580,72 +2648,145 @@ mod tests {
         assert_consistent(&check(&backend, &t).await);
     }
 
-    /// The stale guard dates a row with no `write_ts` by its `last_updated`.
-    /// `p` is planted after the scan with no `write_ts` on either row.
+    /// The text of a check's panic, or its report when it did not panic.
+    async fn panic_of(
+        check: impl std::future::Future<Output = ConsistencyReport>,
+    ) -> Result<ConsistencyReport, String> {
+        futures::FutureExt::catch_unwind(AssertUnwindSafe(check))
+            .await
+            .map_err(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            })
+    }
+
+    /// The stale guard dates a row with no `write_ts` by its `last_updated`,
+    /// R1 and each version row on its own, at the same boundary as a stored
+    /// `write_ts`. Three tenants each hold one planted `p` at `lu`: with no
+    /// `write_ts` on either row, on R1 only, and on v1 only. The row that has
+    /// one is dated a millisecond before the scan, so only the other row's
+    /// fallback can refuse it. The scan's `taken_at` is set to
+    /// `write_ts_of(lu)`, as in the tie test, so a fallback dated even one
+    /// millisecond early lets the check through.
     #[tokio::test]
     async fn a_shared_scan_is_stale_for_a_write_with_no_write_ts() {
         let Some(backend) = backend().await else {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
         };
-        let t = tenant_id("planted-stale-no-write-ts");
-        let own = t.clone();
-        let scan = IndexScan::take(&backend, move |x| x == own).await;
-        assert!(scan.failed.is_none(), "{:?}", scan.failed);
-        let lu = Utc::now();
-        assert!(write_ts_of(lu) >= scan.taken_at);
-        let body =
-            serde_json::json!({"resourceType": "Patient", "id": "p", "active": true}).to_string();
-        let blob = Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType])));
+        let lu = ms(1_700_000_000_000);
+        let at = write_ts_of(lu);
+        let cases = [
+            (tenant_id("planted-stale-no-write-ts"), false, false),
+            (tenant_id("planted-stale-no-r1-write-ts"), false, true),
+            (tenant_id("planted-stale-no-v1-write-ts"), true, false),
+        ];
+        let body = patient().to_string();
         let fhir = Value::from(test_fhir_version().as_mime_param());
-        plant_cas(
+        for (t, r1_has_ts, v1_has_ts) in &cases {
+            // The writer's key set and index rows for the body.
+            let keys = backend.index_keys_of(t, "Patient", &patient());
+            let blob = Value::from(Blob::from(index_keys::encode(&keys)));
+            plant_cas(
+                &backend,
+                PLANT_RESOURCE_NO_TS,
+                vec![
+                    Value::from(t.as_str()),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                    Value::from(body.as_str()),
+                    Value::from(lu),
+                    Value::from(lu),
+                    fhir.clone(),
+                    blob.clone(),
+                ],
+            )
+            .await;
+            plant(
+                &backend,
+                PLANT_VERSION_NO_TS,
+                vec![
+                    Value::from(t.as_str()),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                    Value::from(body.as_str()),
+                    Value::from(lu),
+                    fhir.clone(),
+                    blob.clone(),
+                    Value::from(at),
+                ],
+            )
+            .await;
+            if *r1_has_ts {
+                plant_cas(
+                    &backend,
+                    PLANT_RESOURCE_WRITE_TS,
+                    vec![
+                        Value::from(at - 1000),
+                        Value::from(t.as_str()),
+                        Value::from("Patient"),
+                        Value::from("p"),
+                        Value::from(1),
+                    ],
+                )
+                .await;
+            }
+            if *v1_has_ts {
+                plant(
+                    &backend,
+                    PLANT_VERSION_WRITE_TS,
+                    vec![
+                        Value::from(at + 1),
+                        Value::from(at - 1000),
+                        Value::from(t.as_str()),
+                        Value::from("Patient"),
+                        Value::from("p"),
+                        Value::from(1),
+                    ],
+                )
+                .await;
+            }
+            write_index_rows(&backend, t, lu, test_fhir_version(), &keys).await;
+        }
+        let tenants: Vec<String> = cases.iter().map(|(t, ..)| t.clone()).collect();
+        let mut scan = IndexScan::take(&backend, move |x| tenants.iter().any(|t| t == x)).await;
+        assert!(scan.failed.is_none(), "{:?}", scan.failed);
+        scan.taken_at = at;
+        for (t, ..) in &cases {
+            let message = panic_of(index_consistency(
+                &backend,
+                t,
+                Scope::Tenant,
+                ScanMode::Shared(&scan),
+                Registry::Fixed,
+            ))
+            .await
+            .expect_err("a stale shared scan must panic");
+            assert!(
+                message.contains(&format!(
+                    "shared scan is stale for Patient/p: written at write_ts {at}, scan taken_at {at}"
+                )),
+                "{t}: {message}"
+            );
+        }
+
+        // One millisecond later the scan is not stale for the row with
+        // neither `write_ts`, and its check is clean.
+        scan.taken_at = at + 1000;
+        let report = panic_of(index_consistency(
             &backend,
-            PLANT_RESOURCE_NO_TS,
-            vec![
-                Value::from(t.as_str()),
-                Value::from("Patient"),
-                Value::from("p"),
-                Value::from(body.as_str()),
-                Value::from(lu),
-                Value::from(lu),
-                fhir.clone(),
-                blob.clone(),
-            ],
-        )
-        .await;
-        plant(
-            &backend,
-            PLANT_VERSION_NO_TS,
-            vec![
-                Value::from(t.as_str()),
-                Value::from("Patient"),
-                Value::from("p"),
-                Value::from(body.as_str()),
-                Value::from(lu),
-                fhir,
-                blob,
-                Value::from(write_ts_of(lu)),
-            ],
-        )
-        .await;
-        let stale = futures::FutureExt::catch_unwind(AssertUnwindSafe(index_consistency(
-            &backend,
-            &t,
+            &cases[0].0,
             Scope::Tenant,
             ScanMode::Shared(&scan),
             Registry::Fixed,
-        )))
-        .await;
-        let payload = stale.expect_err("a stale shared scan must panic");
-        let message = payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_default();
-        assert!(
-            message.contains("shared scan is stale for Patient/p"),
-            "{message}"
-        );
+        ))
+        .await
+        .expect("a scan one millisecond later is not stale");
+        assert_consistent(&report);
+        assert_eq!(report.resources, 1, "{report}");
     }
 
     #[tokio::test]

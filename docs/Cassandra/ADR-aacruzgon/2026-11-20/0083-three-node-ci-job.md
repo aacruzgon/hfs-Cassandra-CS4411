@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0083: A report-only nightly job runs the backend's tests and five pause scenarios on three nodes, with the tests in a container on the cluster's network
 
 - **Date:** 2026-11-20
-- **Status:** accepted
+- **Status:** accepted; amended by [ADR-aacruzgon-0086](../2026-11-24/0086-acruzdebian-second-runner-instance.md) (its host ports move to 29642–29644, below Linux's ephemeral range; the job stays unslotted, its Compose project and subnet unchanged)
 - **Context:**
     - **No CI job ran Cassandra on three nodes.** Every Cassandra job used one node: the required `Cassandra schema (single node)`, coverage and the FHIR-versions job. The roadmap's failure tests run "against the single node first, then the three-node cluster" (`development-roadmap.md` section 6, `:612`), and row 8.3 (`:108`) gives the three-node ones to Step 8.
     - **Some behaviour exists only on three nodes.** The PR #90 review ran the cluster by hand on `acruzdebian` on 2026-11-19 (`report-pr90-review.md`, "Three nodes"):

@@ -19,7 +19,7 @@
   2. **RV13's `scan_mode` becomes `Full` or `Shared(&IndexScan)`.**
      - `Full` scans the seven index tables now, for this one tenant.
      - `Shared` reuses one full scan for many tenants: the planted-defects test now, and roadmap 5.4's post-suite step later.
-     - Whenever a `Shared` check doesn't panic, both modes report the same defects, as long as three things hold: no write to the tenant was in flight when the shared scan was taken; no index row was written after it without a `resources` write (a hand plant, and later the sweeper or repair); and the clock didn't step back between the scan and the check (see Consequences). One exception: a `Scope::Resources` check of a tenant that holds an undecodable index row of another id. `Full` drops that row before decoding it and is clean, while `Shared` reports `read_failed`, since the shared scan already failed on it (see Consequences).
+     - Whenever a `Shared` check doesn't panic, both modes report the same defects, as long as four things hold: no write to the tenant was in flight when the shared scan was taken; no index row was written after it without a `resources` write (a hand plant, and later the sweeper or repair); the clock didn't step back between the scan and the check (see Consequences); and no write to the tenant lands while the check runs. A `Full` check reads `resources` before it scans, so a resource created in between can give it a false `stray_row`, while `Shared` is clean. One exception: an undecodable index row in any tenant the shared scan covers. The shared scan fails on it, so every `Shared` check taken from it reports `read_failed`, while a `Full` check is clean unless the row is in its own tenant (for a `Scope::Resources` check, of an id in scope), since `Full` drops other rows before decoding them (see Consequences).
      - A `Shared` check panics in two cases: the scan didn't keep its tenant, or a resource it checks was written at or after the scan was taken. The second assumes the clock didn't step back between the scan and the check (see Consequences).
   3. **RV13's golden test of the walkthrough's worked example moves to pull request 5.** It needs real extraction.
 
@@ -41,7 +41,7 @@
     - an index row written after the scan with no `resources` write: a hand plant, and later the sweeper or repair.
   - So callers take a shared scan only after every writer has returned.
   - Two notes for later pull requests:
-    - Pull request 8's report should count checks run with `Registry::Changed`, since those skip rules 3 and 4.
+    - Pull request 8's report should count checks run with `Registry::Changed`, since those skip the two fresh-extraction comparisons (rules 3 and 4); every "data is unset" check still runs under both registries.
     - One undecodable index row fails a shared scan for every tenant it covers. That is loud, not silent, but it matters if pull request 7 plants such rows.
 - **AI involvement:**
   - Claude Code (Opus 5.5 as orchestrator, an Opus planner, a Sonnet implementer, an Opus reviewer).

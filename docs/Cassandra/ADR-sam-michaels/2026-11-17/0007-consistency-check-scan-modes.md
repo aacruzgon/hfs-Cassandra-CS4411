@@ -41,7 +41,7 @@
     - an index row written after the scan with no `resources` write: a hand plant, and later the sweeper or repair.
   - So callers take a shared scan only after every writer has returned.
   - Two notes for later pull requests:
-    - Pull request 8's report should count checks run with `Registry::Changed`, since those skip rules 3 and 4.
+    - Pull request 8's report should count checks run with `Registry::Changed`, since those skip the two fresh-extraction comparisons (rules 3 and 4); every "data is unset" check still runs under both registries.
     - One undecodable index row fails a shared scan for every tenant it covers. That is loud, not silent, but it matters if pull request 7 plants such rows.
 - **AI involvement:**
   - Claude Code (Opus 5.5 as orchestrator, an Opus planner, a Sonnet implementer, an Opus reviewer).

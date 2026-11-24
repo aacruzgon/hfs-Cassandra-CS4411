@@ -1786,6 +1786,8 @@ mod tests {
             "no-data-current-version",
             "no-data-anywhere",
             "no-data-in-resources-row",
+            "no-data-anywhere-and-older",
+            "no-data-undecodable-sets",
             "malformed-data-in-both-rows",
             "malformed-data-undecodable-sets",
             "write-ts-behind",
@@ -2154,16 +2156,28 @@ mod tests {
         // no-data-anywhere: neither row has `data`.
         // no-data-in-resources-row: only `resources.data` is unset; v1 keeps
         // its body.
-        for (case, r1_has_data, v1_has_data) in [
-            ("no-data-current-version", true, false),
-            ("no-data-anywhere", false, false),
-            ("no-data-in-resources-row", false, true),
+        // no-data-anywhere-and-older: no row has `data`, an older live v0
+        // included, so rule 3's report must not hide v0's.
+        // no-data-undecodable-sets: neither row has `data` and both stored
+        // sets are undecodable, so rule 3 does not run and the version row
+        // reports the missing body; no index row is written.
+        for (case, r1_has_data, v1_has_data, older_v0, undecodable) in [
+            ("no-data-current-version", true, false, false, false),
+            ("no-data-anywhere", false, false, false, false),
+            ("no-data-in-resources-row", false, true, false, false),
+            ("no-data-anywhere-and-older", false, false, true, false),
+            ("no-data-undecodable-sets", false, false, false, true),
         ] {
             let t = tenant_of(case);
             let lu = ms(1_700_000_000_000);
             let keys = backend.index_keys_of(&t, "Patient", &patient());
             let body = patient().to_string();
-            let blob = Value::from(Blob::from(index_keys::encode(&keys)));
+            let encoded = if undecodable {
+                vec![0x02, 0x00]
+            } else {
+                index_keys::encode(&keys)
+            };
+            let blob = Value::from(Blob::from(encoded.clone()));
             let fhir = Value::from(version.as_mime_param());
             let mut values = vec![
                 Value::from(t.as_str()),
@@ -2199,7 +2213,23 @@ mod tests {
                 PLANT_VERSION_NO_TS_NO_DATA
             };
             plant(&backend, version_row, values).await;
-            write_index_rows(&backend, &t, lu, version, &keys).await;
+            if older_v0 {
+                plant(
+                    &backend,
+                    PLANT_VERSION_NO_DATA,
+                    vec![
+                        Value::from(t.as_str()),
+                        Value::from("Patient"),
+                        Value::from("p"),
+                        Value::from(Blob::from(encoded)),
+                        Value::from(write_ts_of(lu)),
+                    ],
+                )
+                .await;
+            }
+            if !undecodable {
+                write_index_rows(&backend, &t, lu, version, &keys).await;
+            }
         }
 
         // malformed-data-in-both-rows: `resources.data` and the current
@@ -2534,23 +2564,40 @@ mod tests {
             }));
 
             // A live version with no `data`, or a `resources` row with none,
-            // is reported under either registry, once when both are unset.
-            for (case, v) in [
-                ("no-data-live-older-version", 0),
-                ("no-data-current-version", 1),
-                ("no-data-anywhere", 1),
-                ("no-data-in-resources-row", 1),
-            ] {
+            // is reported under either registry, once when both are unset:
+            // the kinds, and the versions whose body is reported unset.
+            let cases: [(&str, &[&str], &[i32]); 6] = [
+                ("no-data-live-older-version", &["read_failed"], &[0]),
+                ("no-data-current-version", &["read_failed"], &[1]),
+                ("no-data-anywhere", &["read_failed"], &[1]),
+                ("no-data-in-resources-row", &["read_failed"], &[1]),
+                ("no-data-anywhere-and-older", &["read_failed"; 2], &[0, 1]),
+                (
+                    "no-data-undecodable-sets",
+                    &["read_failed", "undecodable"],
+                    &[1],
+                ),
+            ];
+            for (case, kinds, versions) in cases {
                 let report = check(case, registry).await;
-                assert_eq!(report.kinds(), ["read_failed"], "{case}: {report}");
-                let Defect::ReadFailed { what, error } = &report.defects[0] else {
-                    unreachable!()
-                };
-                assert_eq!(
-                    (what.as_str(), error.as_str()),
-                    (format!("data of Patient/p v{v}").as_str(), "data is unset"),
-                    "{case}"
-                );
+                assert_eq!(report.kinds(), kinds, "{case}: {report}");
+                let mut unset: Vec<String> = report
+                    .defects
+                    .iter()
+                    .filter_map(|d| match d {
+                        Defect::ReadFailed { what, error } => {
+                            assert_eq!(error, "data is unset", "{case}");
+                            Some(what.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                unset.sort();
+                let want: Vec<String> = versions
+                    .iter()
+                    .map(|v| format!("data of Patient/p v{v}"))
+                    .collect();
+                assert_eq!(unset, want, "{case}");
             }
 
             // R1 and v1 both carry a `write_ts` that is not their own

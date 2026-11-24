@@ -73,7 +73,7 @@ const SELECT_VERSION_ROWS: &str = "SELECT version_id, data, last_updated, delete
      WHERE tenant_id = ? AND resource_type = ? AND id = ?";
 
 /// The defects' `kind()` names, in the report line's order.
-const DEFECT_KINDS: [&str; 12] = [
+const DEFECT_KINDS: [&str; 13] = [
     "missing_row",
     "stray_row",
     "wrong_tag",
@@ -86,6 +86,7 @@ const DEFECT_KINDS: [&str; 12] = [
     "undecodable",
     "read_failed",
     "no_type_key",
+    "write_ts_mismatch",
 ];
 
 /// Which resources of the tenant are checked.
@@ -97,7 +98,8 @@ pub(crate) enum Scope<'a> {
     /// the tenant: a row of an id with no `resources` row is a stray.
     Tenant,
     /// Only these `(resource_type, id)`; index rows of the tenant's other
-    /// ids are ignored, not reported. For a test that leaves one resource
+    /// ids are ignored, not reported. A `Full` scan drops them before
+    /// decoding, so one it cannot decode does not fail the check. For a test that leaves one resource
     /// broken on purpose and checks the others.
     Resources(&'a [(&'a str, &'a str)]),
 }
@@ -117,6 +119,14 @@ pub(crate) enum ScanMode<'a> {
     /// whose `write_ts` is earlier but whose index rows land later, nor an
     /// index row planted by hand after the scan. Callers take the scan only
     /// after every writer has returned, as T5 does.
+    ///
+    /// The guard compares the writers' clock-derived `write_ts` with
+    /// `taken_at`, so it also assumes the clock does not step back between
+    /// the scan and the check. If it does, a write made after the scan can
+    /// carry a `write_ts` below `taken_at` and pass the guard: the check then
+    /// reports false `missing_row` or `stray_row` defects for that resource
+    /// instead of panicking. That is loud but misattributed, and never a
+    /// clean report.
     Shared(&'a IndexScan),
 }
 
@@ -172,7 +182,8 @@ pub(crate) struct IndexScan {
     /// first millisecond has a `write_ts` equal to this value, and the
     /// strict `<` guard refuses that tie. A shared
     /// check refuses a resource whose `write_ts` is at or after it: a
-    /// resource written after the scan was taken. It cannot catch a write
+    /// resource written after the scan was taken, as long as the clock has
+    /// not stepped back since (`ScanMode::Shared`). It cannot catch a write
     /// in flight at that moment (earlier `write_ts`, index rows landing
     /// later) or an index row planted by hand after the scan; callers take
     /// the scan only after every writer has returned.
@@ -270,6 +281,18 @@ impl IndexScan {
         backend: &CassandraBackend,
         keep: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> IndexScan {
+        Self::take_only(backend, keep, None).await
+    }
+
+    /// `take`, and with `only` set, holds just the rows of those
+    /// `(resource_type, id)`. The rows of every other id are dropped before
+    /// they are decoded, so one the scan cannot decode is not read, and does
+    /// not fail the scan.
+    pub(crate) async fn take_only(
+        backend: &CassandraBackend,
+        keep: impl Fn(&str) -> bool + Send + Sync + 'static,
+        only: Option<&[(&str, &str)]>,
+    ) -> IndexScan {
         let mut scan = IndexScan {
             keep: Box::new(keep),
             rows: BTreeMap::new(),
@@ -290,10 +313,23 @@ impl IndexScan {
                     |row| {
                         seen.set(seen.get() + 1);
                         // An unreadable tenant is kept, so the decode below reports it.
-                        match column::<String>(row, "tenant_id") {
+                        let tenant_kept = match column::<String>(row, "tenant_id") {
                             Ok(tenant) => tenant.starts_with("test-") && accepts(&tenant),
                             Err(_) => true,
-                        }
+                        };
+                        // An unreadable id is kept too.
+                        tenant_kept
+                            && only.is_none_or(|only| {
+                                match (
+                                    column::<String>(row, "resource_type"),
+                                    column::<String>(row, "id"),
+                                ) {
+                                    (Ok(t), Ok(i)) => {
+                                        only.iter().any(|(ot, oi)| *ot == t && *oi == i)
+                                    }
+                                    _ => true,
+                                }
+                            })
                     },
                 )
                 .await;
@@ -414,14 +450,25 @@ pub(crate) enum Defect {
         id: String,
         version_id: i32,
     },
+    /// Rule 6: a stored `write_ts` that is not `write_ts_of(last_updated)` of
+    /// its own row, on the `resources` row (`version_id` is the current
+    /// version) or on a `resource_versions` row. The writer, the sweeper and
+    /// repair all derive the write time that way.
+    WriteTsMismatch {
+        resource_type: String,
+        id: String,
+        version_id: i32,
+        stored: i64,
+        expected: i64,
+    },
 }
 
 impl Defect {
     /// The defect's name in the log line and in tests: `missing_row`,
     /// `stray_row`, `wrong_tag`, `wrong_write_time`, `stale_extraction`,
     /// `version_reextraction`, `marker_not_empty`, `blob_mismatch`,
-    /// `missing_version_row`, `undecodable`, `read_failed`, `no_type_key`
-    /// (this order is
+    /// `missing_version_row`, `undecodable`, `read_failed`, `no_type_key`,
+    /// `write_ts_mismatch` (this order is
     /// `DEFECT_KINDS`, the line's order).
     pub(crate) fn kind(&self) -> &'static str {
         match self {
@@ -437,6 +484,7 @@ impl Defect {
             Defect::Undecodable { .. } => DEFECT_KINDS[9],
             Defect::ReadFailed { .. } => DEFECT_KINDS[10],
             Defect::NoTypeKey { .. } => DEFECT_KINDS[11],
+            Defect::WriteTsMismatch { .. } => DEFECT_KINDS[12],
         }
     }
 }
@@ -529,6 +577,16 @@ impl fmt::Display for Defect {
                 f,
                 "{resource_type}/{id} v{version_id}: the stored key set of a live version lacks ResourcesByType"
             ),
+            Defect::WriteTsMismatch {
+                resource_type,
+                id,
+                version_id,
+                stored,
+                expected,
+            } => write!(
+                f,
+                "{resource_type}/{id} v{version_id}: stored write_ts {stored} but its last_updated gives {expected}"
+            ),
         }
     }
 }
@@ -608,7 +666,8 @@ impl fmt::Display for ConsistencyReport {
 struct VersionRow {
     version_id: i32,
     data: Option<String>,
-    /// `deleted_at` set or `data` unset.
+    /// `deleted_at` set. The writer always sets it on a delete marker, so a
+    /// version without it is live, whether or not its `data` is set.
     marker: bool,
     write_ts: Option<i64>,
     last_updated: Option<DateTime<Utc>>,
@@ -625,7 +684,7 @@ fn decode_version_row(row: &Row) -> Result<VersionRow, String> {
         .map(Blob::into_vec);
     Ok(VersionRow {
         version_id: column::<i32>(row, "version_id")?,
-        marker: deleted.is_some() || data.is_none(),
+        marker: deleted.is_some(),
         data,
         write_ts: row
             .get_by_name("write_ts")
@@ -831,7 +890,11 @@ async fn run(
     let scan: &IndexScan = match scan_mode {
         ScanMode::Full => {
             let own = tenant.to_string();
-            owned = IndexScan::take(backend, move |t| t == own).await;
+            let only = match scope {
+                Scope::Tenant => None,
+                Scope::Resources(listed) => Some(listed),
+            };
+            owned = IndexScan::take_only(backend, move |t| t == own, only).await;
             &owned
         }
         ScanMode::Shared(shared) => {
@@ -840,9 +903,20 @@ async fn run(
                 "the shared scan does not cover tenant {tenant}"
             );
             for subject in &subjects {
-                let writes = std::iter::once(subject.row.write_ts)
-                    .chain(subject.versions.iter().map(|v| v.write_ts))
-                    .flatten();
+                // A row with no `write_ts` is dated by its `last_updated`, as
+                // rule 6 does; with neither set it is not checked.
+                let writes = std::iter::once(
+                    subject
+                        .row
+                        .write_ts
+                        .unwrap_or_else(|| write_ts_of(subject.row.last_updated)),
+                )
+                .chain(
+                    subject
+                        .versions
+                        .iter()
+                        .filter_map(|v| v.write_ts.or_else(|| v.last_updated.map(write_ts_of))),
+                );
                 for write_ts in writes {
                     assert!(
                         write_ts < shared.taken_at,
@@ -940,6 +1014,33 @@ fn check_subject(
                 version_id: None,
                 error,
             }),
+        }
+    }
+
+    // Rule 6: a stored `write_ts` is the write time of its own `last_updated`.
+    // This needs no scan, so it runs whatever the scan did.
+    let own_write_ts = std::iter::once((
+        current,
+        subject.row.write_ts,
+        Some(subject.row.last_updated),
+    ))
+    .chain(
+        subject
+            .versions
+            .iter()
+            .map(|v| (v.version_id, v.write_ts, v.last_updated)),
+    );
+    for (version_id, stored, last_updated) in own_write_ts {
+        if let (Some(stored), Some(last_updated)) = (stored, last_updated)
+            && stored != write_ts_of(last_updated)
+        {
+            report.defects.push(Defect::WriteTsMismatch {
+                resource_type: resource_type.clone(),
+                id: id.clone(),
+                version_id,
+                stored,
+                expected: write_ts_of(last_updated),
+            });
         }
     }
 
@@ -1077,6 +1178,33 @@ fn check_subject(
                     id: id.clone(),
                     version_id: version.version_id,
                 });
+            }
+            // Its own `data` is re-extracted like an older version's. When it
+            // is `resources.data` itself, rule 3 has compared it already, so
+            // only a body that differs from it is compared with the stored set.
+            if fixed && let Some(data) = version.data.as_deref() {
+                match extract(backend, tenant, resource_type, data) {
+                    Ok(fresh) => {
+                        if version.data != subject.row.data
+                            && let Ok(keys) = index_keys::decode(blob)
+                        {
+                            let keys: BTreeSet<IndexKey> = keys.into_iter().collect();
+                            if fresh != keys {
+                                report.defects.push(Defect::VersionReextraction {
+                                    resource_type: resource_type.clone(),
+                                    id: id.clone(),
+                                    version_id: version.version_id,
+                                    stored: sorted(&keys),
+                                    fresh: sorted(&fresh),
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => report.defects.push(Defect::ReadFailed {
+                        what: format!("data of {resource_type}/{id} v{}", version.version_id),
+                        error,
+                    }),
+                }
             }
             continue;
         }
@@ -1368,6 +1496,13 @@ mod tests {
                 id: "p".to_string(),
                 version_id: 1,
             },
+            Defect::WriteTsMismatch {
+                resource_type: "Patient".to_string(),
+                id: "p".to_string(),
+                version_id: 1,
+                stored: 2,
+                expected: 1,
+            },
         ]
     }
 
@@ -1392,9 +1527,9 @@ mod tests {
             report.to_string(),
             "[index-consistency tenant=test-line scope=tenant scan=full registry=fixed \
              resources=3 live=2 deleted=1 absent=0 versions=5 rows_scanned=40 rows_checked=4 \
-             defects=12 missing_row=1 stray_row=1 wrong_tag=1 wrong_write_time=1 \
+             defects=13 missing_row=1 stray_row=1 wrong_tag=1 wrong_write_time=1 \
              stale_extraction=1 version_reextraction=1 marker_not_empty=1 blob_mismatch=1 \
-             missing_version_row=1 undecodable=1 read_failed=1 no_type_key=1 took_ms=12]"
+             missing_version_row=1 undecodable=1 read_failed=1 no_type_key=1 write_ts_mismatch=1 took_ms=12]"
         );
         let mut names = DEFECT_KINDS.to_vec();
         names.sort_unstable();
@@ -1407,6 +1542,8 @@ mod tests {
     // Planting statements. Each is a `Write` unless marked.
     const PLANT_X1: &str = "INSERT INTO resources_by_type (tenant_id, resource_type, last_updated, id, version_id, fhir_version) VALUES (?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const UNPLANT_X1: &str = "DELETE FROM resources_by_type USING TIMESTAMP ? WHERE tenant_id = ? AND resource_type = ? AND last_updated = ? AND id = ?";
+    /// A type row with no `version_id`, which the scan cannot decode.
+    const PLANT_X1_NO_TAG: &str = "INSERT INTO resources_by_type (tenant_id, resource_type, last_updated, id, fhir_version) VALUES (?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_X2: &str = "INSERT INTO token_code_index (tenant_id, resource_type, param, code, last_updated, id, system, version_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_X3: &str = "INSERT INTO token_system_code_index (tenant_id, resource_type, param, system, code, last_updated, id, version_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_X4: &str = "INSERT INTO token_system_index (tenant_id, resource_type, param, system, last_updated, id, code, version_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
@@ -1420,6 +1557,14 @@ mod tests {
     const PLANT_VERSION_NO_TS: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version, index_keys) VALUES (?, ?, ?, 1, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_VERSION_KEYS: &str = "UPDATE resource_versions USING TIMESTAMP ? SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
     /// A CAS: asserts `[applied]`.
+    /// An older version row with no `data` and no `deleted_at`, written
+    /// without naming either column (a null write to this table is refused).
+    const PLANT_VERSION_NO_DATA: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, index_keys) VALUES (?, ?, ?, 0, ?) USING TIMESTAMP ?";
+    /// A CAS: moves `resources.write_ts`.
+    const PLANT_RESOURCE_WRITE_TS: &str = "UPDATE resources SET write_ts = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
+    const PLANT_VERSION_WRITE_TS: &str = "UPDATE resource_versions USING TIMESTAMP ? SET write_ts = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
+    /// Replaces a version row's `data`.
+    const PLANT_VERSION_DATA: &str = "UPDATE resource_versions USING TIMESTAMP ? SET data = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
     const PLANT_RESOURCE_KEYS: &str = "UPDATE resources SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
 
     fn ms(millis: i64) -> DateTime<Utc> {
@@ -1573,6 +1718,10 @@ mod tests {
             "undecodable",
             "no-type-key",
             "no-write-ts",
+            "emptied-older-version",
+            "no-data-older-version",
+            "write-ts-mismatch",
+            "malformed-current-version-data",
         ];
         let version = test_fhir_version();
 
@@ -1833,7 +1982,121 @@ mod tests {
             plant_x1(&backend, &t, lu, id, 1, written).await;
         }
 
-        // One shared scan for every case.
+        // emptied-older-version: v1 is a live older version whose stored set
+        // lost the type key after the update.
+        let t = tenant_of("emptied-older-version");
+        let (stored, _, ts1, _) = seeded(&backend, &t).await;
+        backend
+            .update(&context(&t), &stored, changed())
+            .await
+            .expect("update p");
+        plant_version_keys(&backend, &t, 1, index_keys::EMPTY.to_vec(), ts1 + 1).await;
+
+        // no-data-older-version: v0 has no `deleted_at`, so it is live although
+        // its `data` is unset and its stored set is empty.
+        let t = tenant_of("no-data-older-version");
+        let (stored, _, ts1, _) = seeded(&backend, &t).await;
+        backend
+            .update(&context(&t), &stored, changed())
+            .await
+            .expect("update p");
+        plant(
+            &backend,
+            PLANT_VERSION_NO_DATA,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(Blob::from(index_keys::EMPTY.to_vec())),
+                Value::from(ts1),
+            ],
+        )
+        .await;
+
+        // write-ts-mismatch: R1's and v1's `write_ts` are 5 us past
+        // `write_ts_of(last_updated)`, and the type row was written at that
+        // time, so rule 6's index-row comparison still holds.
+        let t = tenant_of("write-ts-mismatch");
+        let (_, lu1, ts1, seeded_keys) = seeded(&backend, &t).await;
+        plant_cas(
+            &backend,
+            PLANT_RESOURCE_WRITE_TS,
+            vec![
+                Value::from(ts1 + 5),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+        plant(
+            &backend,
+            PLANT_VERSION_WRITE_TS,
+            vec![
+                Value::from(ts1 + 1),
+                Value::from(ts1 + 5),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+        // Every row of the stored set is rewritten at that time, not only the
+        // type row, so no index row is off.
+        let rewritten = backend
+            .write_index_delta(
+                &crate::backends::cassandra::write::RowKey {
+                    tenant_id: &t,
+                    resource_type: "Patient",
+                    id: "p",
+                },
+                &crate::backends::cassandra::write::index_delta(
+                    &[],
+                    crate::backends::cassandra::write::VersionKeys {
+                        version_id: 1,
+                        last_updated: lu1,
+                        fhir_version: version,
+                        keys: &seeded_keys,
+                    },
+                ),
+                ts1 + 5,
+                3,
+            )
+            .await;
+        assert!(rewritten.result.is_ok(), "{:?}", rewritten.result);
+
+        // malformed-current-version-data: the current version row's own `data`
+        // is not JSON, while `resources.data` is. (A valid body that differs
+        // from `resources.data` shows only once extraction is real; until then
+        // `index_keys_of` gives the same set for any body.)
+        let t = tenant_of("malformed-current-version-data");
+        let (_, _, ts1, _) = seeded(&backend, &t).await;
+        plant(
+            &backend,
+            PLANT_VERSION_DATA,
+            vec![
+                Value::from(ts1 + 1),
+                Value::from("{not json"),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+
+        // One shared scan for every case, taken after every `write_ts` above.
+        // emptied-older-version's update comes last, and a scan in its
+        // millisecond would be refused as stale. A second version's
+        // `last_updated` can be one millisecond ahead of the clock
+        // (`next_last_updated`), and no planted resource has more than two
+        // versions, so every `write_ts` is at most `written_by + 1` ms.
+        let written_by = Utc::now().timestamp_millis();
+        while Utc::now().timestamp_millis() <= written_by + 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         let scan = {
             let run = run.clone();
             IndexScan::take(&backend, move |t| t.ends_with(&run)).await
@@ -1842,7 +2105,9 @@ mod tests {
         for case in all {
             assert!(scan.covers(&tenant_of(case)), "{case}");
         }
+        let checked = std::cell::RefCell::new(Vec::new());
         let check = |case: &'static str, registry: Registry| {
+            checked.borrow_mut().push((case, registry));
             let backend = backend.clone();
             let t = tenant_of(case);
             let scan = &scan;
@@ -1858,193 +2123,382 @@ mod tests {
             }
         };
 
-        let report = check("missing-row", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["missing_row"], "{report}");
-        let Defect::MissingRow {
-            key, last_updated, ..
-        } = &report.defects[0]
-        else {
-            unreachable!()
-        };
-        assert_eq!(key, &IndexKey::ResourcesByType);
-        let lu1 = backend
-            .read_resource_row(&tenant_of("missing-row"), "Patient", "p")
-            .await
-            .unwrap()
-            .unwrap()
-            .last_updated;
-        assert_eq!(*last_updated, Some(lu1));
-
-        let report = check("stray-ghost", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["stray_row"], "{report}");
-        let Defect::StrayRow { row } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(row.id, "ghost");
-
-        let report = check("stray-every-table", Registry::Fixed).await;
-        assert_eq!(report.kinds(), vec!["stray_row"; 6], "{report}");
-        let mut seen: Vec<(&str, IndexKey, Option<DateTime<Utc>>)> = report
-            .defects
-            .iter()
-            .map(|d| match d {
-                Defect::StrayRow { row } => (row.table, row.key.clone(), row.last_updated),
-                other => panic!("{other}"),
-            })
-            .collect();
-        seen.sort_by_key(|(table, ..)| *table);
-        let tables: Vec<&str> = seen.iter().map(|(t, ..)| *t).collect();
-        let mut want_tables = vec![
-            "date_index",
-            "date_index_by_end",
-            "token_code_index",
-            "token_system_code_index",
-            "token_system_index",
-            "uri_index",
-        ];
-        want_tables.sort_unstable();
-        assert_eq!(tables, want_tables);
-        let mut keys: Vec<IndexKey> = seen.iter().map(|(_, k, _)| k.clone()).collect();
-        keys.sort();
-        let (param, s, c) = ("planted".to_string(), "s".to_string(), "c".to_string());
-        let mut want_keys = vec![
-            IndexKey::TokenCode {
-                param: param.clone(),
-                code: c.clone(),
-                system: s.clone(),
-            },
-            IndexKey::TokenSystemCode {
-                param: param.clone(),
-                system: s.clone(),
-                code: c.clone(),
-            },
-            IndexKey::TokenSystem {
-                param: param.clone(),
-                system: s,
-                code: c,
-            },
-            IndexKey::Date {
-                param: param.clone(),
-                start: 1000,
-                end: 2000,
-            },
-            IndexKey::DateByEnd {
-                param,
-                end: 2000,
-                start: 1000,
-            },
-            planted_uri(),
-        ];
-        want_keys.sort();
-        assert_eq!(keys, want_keys);
-        for (table, _, last_updated) in &seen {
-            assert_eq!(
-                last_updated.is_none(),
-                table.starts_with("date_index"),
-                "{table}"
-            );
-        }
-
-        let report = check("wrong-tag", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["wrong_tag"], "{report}");
-        let Defect::WrongTag { row, current } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!((*current, row.version_id), (1, 0));
-
-        let report = check("wrong-write-time", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["wrong_write_time"], "{report}");
-        let Defect::WrongWriteTime { row, expected } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(row.written, *expected + 5);
-
-        let report = check("blob-mismatch", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["blob_mismatch"], "{report}");
-        let Defect::BlobMismatch { version_id, .. } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(*version_id, 1);
-
-        let report = check("stale-extraction", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["stale_extraction"], "{report}");
-        let report = check("stale-extraction", Registry::Changed).await;
-        assert_consistent(&report);
-
-        let report = check("version-reextraction", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["version_reextraction"], "{report}");
-        let Defect::VersionReextraction { version_id, .. } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(*version_id, 1);
-        let report = check("version-reextraction", Registry::Changed).await;
-        assert_consistent(&report);
-
-        let report = check("marker-not-empty", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["marker_not_empty"], "{report}");
-        let Defect::MarkerNotEmpty { version_id, .. } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(*version_id, 2);
-
-        let report = check("missing-version-row", Registry::Fixed).await;
-        assert_eq!(
-            report.kinds(),
-            expect(&[("missing_row", k_missing.len()), ("missing_version_row", 1)]),
-            "{report}"
-        );
-
-        let report = check("undecodable", Registry::Fixed).await;
-        assert_eq!(report.kinds(), ["undecodable"], "{report}");
-        let Defect::Undecodable { version_id, .. } = &report.defects[0] else {
-            unreachable!()
-        };
-        assert_eq!(*version_id, None);
-
-        // A changed registry silences rules 3 and 4 only: the stray scan, the
-        // tag rule and the write-time rule still run.
-        let report = check("stray-ghost", Registry::Changed).await;
-        assert_eq!(report.kinds(), ["stray_row"], "{report}");
-        let report = check("stray-every-table", Registry::Changed).await;
-        assert_eq!(report.kinds(), vec!["stray_row"; 6], "{report}");
-        let report = check("wrong-tag", Registry::Changed).await;
-        assert_eq!(report.kinds(), ["wrong_tag"], "{report}");
-        let report = check("wrong-write-time", Registry::Changed).await;
-        assert_eq!(report.kinds(), ["wrong_write_time"], "{report}");
-
-        // Only `p`'s type row is off; the expected time is derived from
-        // `last_updated`.
+        // Every planted tenant runs under both registries. A changed registry
+        // skips only the two fresh-extraction comparisons, rules 3 and 4
+        // (RV14), so it reports the same kinds as an unchanged one, less
+        // `stale_extraction` and `version_reextraction`.
         for registry in [Registry::Fixed, Registry::Changed] {
-            let report = check("no-write-ts", registry).await;
-            // The plant stores `[ResourcesByType]`, and a fresh extraction of
-            // its body gives more keys, so `Fixed` also reports both rows stale.
-            let mut want = vec![("wrong_write_time", 1)];
-            if registry == Registry::Fixed {
-                want.push(("stale_extraction", 2));
+            let fixed = registry == Registry::Fixed;
+            let under = |kinds: &[&'static str]| -> Vec<&'static str> {
+                kinds
+                    .iter()
+                    .copied()
+                    .filter(|k| fixed || !matches!(*k, "stale_extraction" | "version_reextraction"))
+                    .collect()
+            };
+
+            let report = check("missing-row", registry).await;
+            assert_eq!(report.kinds(), under(&["missing_row"]), "{report}");
+            let Defect::MissingRow {
+                key, last_updated, ..
+            } = &report.defects[0]
+            else {
+                unreachable!()
+            };
+            assert_eq!(key, &IndexKey::ResourcesByType);
+            let lu1 = backend
+                .read_resource_row(&tenant_of("missing-row"), "Patient", "p")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_updated;
+            assert_eq!(*last_updated, Some(lu1));
+
+            let report = check("stray-ghost", registry).await;
+            assert_eq!(report.kinds(), under(&["stray_row"]), "{report}");
+            let Defect::StrayRow { row } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!(row.id, "ghost");
+
+            let report = check("stray-every-table", registry).await;
+            assert_eq!(report.kinds(), under(&["stray_row"; 6]), "{report}");
+            let mut seen: Vec<(&str, IndexKey, Option<DateTime<Utc>>)> = report
+                .defects
+                .iter()
+                .map(|d| match d {
+                    Defect::StrayRow { row } => (row.table, row.key.clone(), row.last_updated),
+                    other => panic!("{other}"),
+                })
+                .collect();
+            seen.sort_by_key(|(table, ..)| *table);
+            let tables: Vec<&str> = seen.iter().map(|(t, ..)| *t).collect();
+            let mut want_tables = vec![
+                "date_index",
+                "date_index_by_end",
+                "token_code_index",
+                "token_system_code_index",
+                "token_system_index",
+                "uri_index",
+            ];
+            want_tables.sort_unstable();
+            assert_eq!(tables, want_tables);
+            let mut keys: Vec<IndexKey> = seen.iter().map(|(_, k, _)| k.clone()).collect();
+            keys.sort();
+            let (param, s, c) = ("planted".to_string(), "s".to_string(), "c".to_string());
+            let mut want_keys = vec![
+                IndexKey::TokenCode {
+                    param: param.clone(),
+                    code: c.clone(),
+                    system: s.clone(),
+                },
+                IndexKey::TokenSystemCode {
+                    param: param.clone(),
+                    system: s.clone(),
+                    code: c.clone(),
+                },
+                IndexKey::TokenSystem {
+                    param: param.clone(),
+                    system: s,
+                    code: c,
+                },
+                IndexKey::Date {
+                    param: param.clone(),
+                    start: 1000,
+                    end: 2000,
+                },
+                IndexKey::DateByEnd {
+                    param,
+                    end: 2000,
+                    start: 1000,
+                },
+                planted_uri(),
+            ];
+            want_keys.sort();
+            assert_eq!(keys, want_keys);
+            for (table, _, last_updated) in &seen {
+                assert_eq!(
+                    last_updated.is_none(),
+                    table.starts_with("date_index"),
+                    "{table}"
+                );
             }
-            assert_eq!(report.kinds(), expect(&want), "{report}");
+
+            let report = check("wrong-tag", registry).await;
+            assert_eq!(report.kinds(), under(&["wrong_tag"]), "{report}");
+            let Defect::WrongTag { row, current } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!((*current, row.version_id), (1, 0));
+
+            let report = check("wrong-write-time", registry).await;
+            assert_eq!(report.kinds(), under(&["wrong_write_time"]), "{report}");
+            let Defect::WrongWriteTime { row, expected } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!(row.written, *expected + 5);
+
+            let report = check("blob-mismatch", registry).await;
+            assert_eq!(report.kinds(), under(&["blob_mismatch"]), "{report}");
+            let Defect::BlobMismatch { version_id, .. } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!(*version_id, 1);
+
+            let report = check("stale-extraction", registry).await;
+            assert_eq!(report.kinds(), under(&["stale_extraction"]), "{report}");
+
+            let report = check("version-reextraction", registry).await;
+            assert_eq!(report.kinds(), under(&["version_reextraction"]), "{report}");
+            if fixed {
+                let Defect::VersionReextraction { version_id, .. } = &report.defects[0] else {
+                    unreachable!()
+                };
+                assert_eq!(*version_id, 1);
+            }
+
+            let report = check("marker-not-empty", registry).await;
+            assert_eq!(report.kinds(), under(&["marker_not_empty"]), "{report}");
+            let Defect::MarkerNotEmpty { version_id, .. } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!(*version_id, 2);
+
+            let report = check("missing-version-row", registry).await;
+            assert_eq!(
+                report.kinds(),
+                under(&expect(&[
+                    ("missing_row", k_missing.len()),
+                    ("missing_version_row", 1)
+                ])),
+                "{report}"
+            );
+
+            let report = check("undecodable", registry).await;
+            assert_eq!(report.kinds(), under(&["undecodable"]), "{report}");
+            let Defect::Undecodable { version_id, .. } = &report.defects[0] else {
+                unreachable!()
+            };
+            assert_eq!(*version_id, None);
+
+            // Only `p`'s type row is off; the expected time is derived from
+            // `last_updated`.
+            let report = check("no-write-ts", registry).await;
+            // The plant stores `[ResourcesByType]` and a fresh extraction of its
+            // body gives more keys, so `Fixed` also reports both rows stale.
+            assert_eq!(
+                report.kinds(),
+                under(&expect(&[("wrong_write_time", 1), ("stale_extraction", 2)])),
+                "{report}"
+            );
             let Defect::WrongWriteTime { row, expected } = &report.defects[0] else {
                 unreachable!()
             };
             assert_eq!(*expected, write_ts_of(ms(1_700_000_000_000)));
             assert_eq!((row.id.as_str(), row.written), ("p", *expected + 1000));
-        }
 
-        // The resources row and the version row both lack the type key.
-        for registry in [Registry::Fixed, Registry::Changed] {
+            // The resources row and the version row both lack the type key.
             let report = check("no-type-key", registry).await;
-            // `seeded` created real index rows; the plant empties the stored
-            // sets, so every row of the seeded set but the type row is a stray.
-            let mut want = vec![("no_type_key", 2), ("stray_row", strays)];
-            if registry == Registry::Fixed {
-                want.push(("stale_extraction", 1));
-            }
-            assert_eq!(report.kinds(), expect(&want), "{report}");
+            // `seeded` created real index rows and the plant empties the stored
+            // sets, so every seeded row but the type row is a stray.
+            assert_eq!(
+                report.kinds(),
+                under(&expect(&[
+                    ("no_type_key", 2),
+                    ("stray_row", strays),
+                    ("stale_extraction", 1)
+                ])),
+                "{report}"
+            );
             assert!(report.defects.iter().all(|d| match d {
                 Defect::NoTypeKey { version_id, .. } => *version_id == 1,
                 _ => true,
             }));
+
+            // Only the older version row lacks the type key.
+            let report = check("emptied-older-version", registry).await;
+            assert_eq!(
+                report.kinds(),
+                under(&["no_type_key", "version_reextraction"]),
+                "{report}"
+            );
+            assert!(report.defects.iter().all(|d| match d {
+                Defect::NoTypeKey { version_id, .. }
+                | Defect::VersionReextraction { version_id, .. } => *version_id == 1,
+                _ => true,
+            }));
+
+            // A version with no `deleted_at` is live even without `data`.
+            let report = check("no-data-older-version", registry).await;
+            assert_eq!(report.kinds(), ["no_type_key"], "{report}");
+            assert!(report.defects.iter().all(|d| match d {
+                Defect::NoTypeKey { version_id, .. } => *version_id == 0,
+                _ => true,
+            }));
+
+            // R1 and v1 both carry a `write_ts` that is not their own
+            // `last_updated`'s.
+            let report = check("write-ts-mismatch", registry).await;
+            assert_eq!(report.kinds(), ["write_ts_mismatch"; 2], "{report}");
+            for defect in &report.defects {
+                let Defect::WriteTsMismatch {
+                    version_id,
+                    stored,
+                    expected,
+                    ..
+                } = defect
+                else {
+                    unreachable!()
+                };
+                assert_eq!(*version_id, 1);
+                assert_eq!(*stored, *expected + 5);
+            }
+
+            // Only an unchanged registry re-extracts the current version row.
+            let report = check("malformed-current-version-data", registry).await;
+            let want: &[&str] = if fixed { &["read_failed"] } else { &[] };
+            assert_eq!(report.kinds(), want, "{report}");
         }
+        let checked = checked.into_inner();
+        for case in all {
+            for registry in [Registry::Fixed, Registry::Changed] {
+                assert!(
+                    checked.contains(&(case, registry)),
+                    "{case} is checked under {registry:?}"
+                );
+            }
+        }
+    }
+
+    /// A `Full` scan scoped to some ids drops the other ids' rows before
+    /// decoding them, so a row of another id that cannot be decoded does not
+    /// fail the check. The row is a type row of `p` with no `version_id`,
+    /// planted under a `test-` tenant and deleted before the assertions.
+    #[tokio::test]
+    async fn a_scoped_full_check_does_not_decode_other_ids_rows() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("consistency-scope-decode");
+        let version = test_fhir_version();
+        for id in ["p", "q"] {
+            let mut body = patient();
+            body["id"] = serde_json::json!(id);
+            backend
+                .create(&context(&t), "Patient", body, version)
+                .await
+                .expect("create");
+        }
+        let lu = ms(1_700_000_000_000);
+        let ts = write_ts_of(lu);
+        plant(
+            &backend,
+            PLANT_X1_NO_TAG,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from(lu),
+                Value::from("p"),
+                Value::from(version.as_mime_param()),
+                Value::from(ts),
+            ],
+        )
+        .await;
+        let scoped = index_consistency(
+            &backend,
+            &t,
+            Scope::Resources(&[("Patient", "q")]),
+            ScanMode::Full,
+            Registry::Fixed,
+        )
+        .await;
+        let whole = check(&backend, &t).await;
+        plant(
+            &backend,
+            UNPLANT_X1,
+            vec![
+                Value::from(ts + 1),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from(lu),
+                Value::from("p"),
+            ],
+        )
+        .await;
+        assert_consistent(&scoped);
+        assert_eq!(scoped.resources, 1, "{scoped}");
+        // The row is undecodable to a scan that does read it.
+        assert_eq!(whole.kinds(), ["read_failed"], "{whole}");
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// The stale guard dates a row with no `write_ts` by its `last_updated`.
+    /// `p` is planted after the scan with no `write_ts` on either row.
+    #[tokio::test]
+    async fn a_shared_scan_is_stale_for_a_write_with_no_write_ts() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("planted-stale-no-write-ts");
+        let own = t.clone();
+        let scan = IndexScan::take(&backend, move |x| x == own).await;
+        assert!(scan.failed.is_none(), "{:?}", scan.failed);
+        let lu = Utc::now();
+        assert!(write_ts_of(lu) >= scan.taken_at);
+        let body =
+            serde_json::json!({"resourceType": "Patient", "id": "p", "active": true}).to_string();
+        let blob = Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType])));
+        let fhir = Value::from(test_fhir_version().as_mime_param());
+        plant_cas(
+            &backend,
+            PLANT_RESOURCE_NO_TS,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(body.as_str()),
+                Value::from(lu),
+                Value::from(lu),
+                fhir.clone(),
+                blob.clone(),
+            ],
+        )
+        .await;
+        plant(
+            &backend,
+            PLANT_VERSION_NO_TS,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(body.as_str()),
+                Value::from(lu),
+                fhir,
+                blob,
+                Value::from(write_ts_of(lu)),
+            ],
+        )
+        .await;
+        let stale = futures::FutureExt::catch_unwind(AssertUnwindSafe(index_consistency(
+            &backend,
+            &t,
+            Scope::Tenant,
+            ScanMode::Shared(&scan),
+            Registry::Fixed,
+        )))
+        .await;
+        let payload = stale.expect_err("a stale shared scan must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("shared scan is stale for Patient/p"),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -2209,5 +2663,68 @@ mod tests {
             "{message}"
         );
         assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// The guard's boundary, with no race. A scan whose `taken_at` equals a
+    /// resource's `write_ts` is stale for it; one whose `taken_at` is the
+    /// next whole millisecond is not. `write_ts` and `taken_at` are in
+    /// microseconds, so `+ 1000` is one millisecond, the smallest step
+    /// `taken_at` takes. The test sets `taken_at` on a real scan, a field
+    /// this module can reach, so it needs no test-only seam.
+    #[tokio::test]
+    async fn a_shared_scan_taken_at_a_write_ts_is_refused_and_one_ms_later_is_not() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("consistency-tie");
+        backend
+            .create(&context(&t), "Patient", patient(), test_fhir_version())
+            .await
+            .expect("create p");
+        let write_ts = backend
+            .read_resource_row(&t, "Patient", "p")
+            .await
+            .unwrap()
+            .unwrap()
+            .write_ts
+            .expect("write_ts");
+        let own = t.clone();
+        let mut scan = IndexScan::take(&backend, move |x| x == own).await;
+        assert!(scan.failed.is_none(), "{:?}", scan.failed);
+
+        scan.taken_at = write_ts;
+        let tie = futures::FutureExt::catch_unwind(AssertUnwindSafe(index_consistency(
+            &backend,
+            &t,
+            Scope::Tenant,
+            ScanMode::Shared(&scan),
+            Registry::Fixed,
+        )))
+        .await;
+        let payload = tie.expect_err("a write_ts equal to taken_at must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains(&format!(
+                "shared scan is stale for Patient/p: written at write_ts {write_ts}, scan taken_at {write_ts}"
+            )),
+            "{message}"
+        );
+
+        scan.taken_at = write_ts + 1000;
+        let report = index_consistency(
+            &backend,
+            &t,
+            Scope::Tenant,
+            ScanMode::Shared(&scan),
+            Registry::Fixed,
+        )
+        .await;
+        assert_consistent(&report);
+        assert_eq!(report.resources, 1, "{report}");
     }
 }

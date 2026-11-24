@@ -105,6 +105,11 @@ mod seeding;
 #[path = "cassandra/crud.rs"]
 mod crud;
 
+/// Step 4: upstream's `tests/versioning/` as an adapted copy, and its parity
+/// test (row 4.1).
+#[path = "cassandra/versioning.rs"]
+mod versioning;
+
 /// Step 3: the backend-agnostic race suite for version-aware writes (#1404,
 /// #1405, #2111), the compare-and-swap contract (row 3.3). Wrappers in
 /// [`step3_suites`].

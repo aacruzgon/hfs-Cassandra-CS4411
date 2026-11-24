@@ -2,10 +2,11 @@
 //! [`CassandraBackend`].
 //!
 //! `search` and `search_count` are Step 6's; until then they return
-//! `UnsupportedCapability` (501). `search_param_registry` is real from Step 2
-//! on, because the CapabilityStatement, batch, compartment, `$everything`,
-//! bulk export and SQL-on-FHIR all call it, with or without search
-//! (roadmap Step 2, item 2.3).
+//! `UnsupportedCapability` (501), and `supports_search` is `false`, so
+//! `/metadata` lists no `search-type` and no search parameters (roadmap Step 7,
+//! ADR-aacruzgon-0085). `search_param_registry` is real from Step 2 on, because
+//! the CapabilityStatement, batch, compartment, `$everything`, bulk export and
+//! SQL-on-FHIR all call it, with or without search (roadmap Step 2, item 2.3).
 //!
 //! The capability declaration is the design's: token, date and URI
 //! parameters with no modifiers, `_id`, `_lastUpdated`, `_tag`, `_profile` and
@@ -69,6 +70,19 @@ fn pagination() -> Vec<PaginationCapability> {
 
 #[async_trait]
 impl SearchProvider for CassandraBackend {
+    /// From the declared [`BackendCapability::BasicSearch`], as S3 answers
+    /// (#514): one declaration, which `/metadata` reads. Cassandra does not
+    /// declare it while `search` refuses everything, so `/metadata` lists no
+    /// `search-type`, `searchParam`, `searchInclude` or `searchRevInclude`.
+    /// Step 6's last commit declares it, which turns this `true`, and
+    /// overrides `serves_search_param` with [`SUPPORTED_PARAM_TYPES`]
+    /// (roadmap Step 7, row 7.2).
+    ///
+    /// [`BackendCapability::BasicSearch`]: crate::core::BackendCapability::BasicSearch
+    fn supports_search(&self) -> bool {
+        crate::core::Backend::supports(self, crate::core::BackendCapability::BasicSearch)
+    }
+
     async fn search(
         &self,
         _tenant: &TenantContext,

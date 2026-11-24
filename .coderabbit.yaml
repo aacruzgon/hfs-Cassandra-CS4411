@@ -480,7 +480,8 @@ reviews:
           them only as "${COMPOSE_PROJECT:?}", $CASSANDRA_HOST_PORT and
           "${CASSANDRA_CONTAINER:?}". Flag a literal Compose project name,
           container name or host port in such a job, CASSANDRA_HOST_PORT or
-          COMPOSE_PROJECT in a job's env: (it would rank above $GITHUB_ENV),
+          COMPOSE_PROJECT in a job's env: (the same name set in env: and
+          through $GITHUB_ENV leaves the job depending on their order),
           and a new base port that some slot of another job reaches
           (ADR-aacruzgon-0086). cassandra-three-node.yml is the exception:
           its global concurrency group keeps it unslotted.

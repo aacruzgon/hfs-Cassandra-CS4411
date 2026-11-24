@@ -434,7 +434,8 @@ pub(crate) enum Defect {
         version_id: Option<i32>,
         error: String,
     },
-    /// Rule 8: a read the check needed failed.
+    /// Rule 8: a read the check needed failed, or a body it read is unset
+    /// or not JSON (`resources.data`, or a live version row's `data`).
     ReadFailed { what: String, error: String },
     /// IW5, either registry: the stored key set of a live version (the
     /// `resources` row's when the current version is live, or a
@@ -662,7 +663,8 @@ struct VersionRow {
     version_id: i32,
     data: Option<String>,
     /// `deleted_at` set. The writer always sets it on a delete marker, so a
-    /// version without it is live, whether or not its `data` is set.
+    /// version without it is live, whether or not its `data` is set; a live
+    /// version with no `data` is `read_failed` (rule 4).
     marker: bool,
     write_ts: Option<i64>,
     last_updated: Option<DateTime<Utc>>,
@@ -1124,6 +1126,7 @@ fn check_subject(
     }
 
     // Rule 3: the current version against a fresh extraction.
+    let rule_3 = live && fixed && stored.is_some();
     if live
         && fixed
         && let Some(stored) = &stored
@@ -1162,6 +1165,19 @@ fn check_subject(
                 });
             }
             continue;
+        }
+        // A live version is read with its body (`versions.rs`, vread), so
+        // it must have one, under either registry: this is no extraction.
+        // An unset body is `read_failed`, as rule 3 reports an unset
+        // `resources.data`. The current version row is left to rule 3 when
+        // `resources.data` is unset too and rule 3 has reported it.
+        if version.data.is_none()
+            && !(version.version_id == current && rule_3 && subject.row.data.is_none())
+        {
+            report.defects.push(Defect::ReadFailed {
+                what: format!("data of {resource_type}/{id} v{}", version.version_id),
+                error: "data is unset".to_string(),
+            });
         }
         if version.version_id == current {
             // Its blob is `resources.index_keys` (rule 5); only IW5 applies here.
@@ -1548,8 +1564,12 @@ mod tests {
     /// A live current row with no `write_ts` column. A CAS, like every write
     /// to `resources` (the CQL audit warns on a plain one).
     const PLANT_RESOURCE_NO_TS: &str = "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, created_at, fhir_version, index_keys, deleted_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0) IF NOT EXISTS";
+    /// The same with no `data` column either.
+    const PLANT_RESOURCE_NO_TS_NO_DATA: &str = "INSERT INTO resources (tenant_id, resource_type, id, version_id, last_updated, created_at, fhir_version, index_keys, deleted_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, 0) IF NOT EXISTS";
     /// Its version row, with no `write_ts` column.
     const PLANT_VERSION_NO_TS: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version, index_keys) VALUES (?, ?, ?, 1, ?, ?, ?, ?) USING TIMESTAMP ?";
+    /// A live current version row with no `write_ts` and no `data` column.
+    const PLANT_VERSION_NO_TS_NO_DATA: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, last_updated, fhir_version, index_keys) VALUES (?, ?, ?, 1, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_VERSION_KEYS: &str = "UPDATE resource_versions USING TIMESTAMP ? SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
     /// A CAS: asserts `[applied]`.
     /// An older version row with no `data` and no `deleted_at`, written
@@ -1663,6 +1683,39 @@ mod tests {
         .await;
     }
 
+    /// Writes `Patient/p` v1's index rows for `keys` at `lu`, at
+    /// `write_ts_of(lu)`, as the writer would.
+    async fn write_index_rows(
+        backend: &CassandraBackend,
+        tenant: &str,
+        lu: DateTime<Utc>,
+        fhir_version: helios_fhir::FhirVersion,
+        keys: &[IndexKey],
+    ) {
+        use crate::backends::cassandra::write::{RowKey, VersionKeys, index_delta};
+        let written = backend
+            .write_index_delta(
+                &RowKey {
+                    tenant_id: tenant,
+                    resource_type: "Patient",
+                    id: "p",
+                },
+                &index_delta(
+                    &[],
+                    VersionKeys {
+                        version_id: 1,
+                        last_updated: lu,
+                        fhir_version,
+                        keys,
+                    },
+                ),
+                write_ts_of(lu),
+                3,
+            )
+            .await;
+        assert!(written.result.is_ok(), "{:?}", written.result);
+    }
+
     /// Creates `p` (v1) and returns R1's `lu1`, `ts1` and `K1`.
     async fn seeded(
         backend: &CassandraBackend,
@@ -1717,6 +1770,9 @@ mod tests {
             "no-data-older-version",
             "write-ts-mismatch",
             "malformed-current-version-data",
+            "no-data-live-older-version",
+            "no-data-current-version",
+            "no-data-anywhere",
         ];
         let version = test_fhir_version();
 
@@ -2058,6 +2114,72 @@ mod tests {
         )
         .await;
 
+        // no-data-live-older-version: v0 has no `deleted_at`, no `data`, and
+        // the right key set, so only its missing body is wrong.
+        let t = tenant_of("no-data-live-older-version");
+        let (_, _, ts1, k1) = seeded(&backend, &t).await;
+        plant(
+            &backend,
+            PLANT_VERSION_NO_DATA,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(Blob::from(index_keys::encode(&k1))),
+                Value::from(ts1),
+            ],
+        )
+        .await;
+
+        // no-data-current-version: the current version row has no `data`,
+        // while `resources.data` is set and both key sets are right.
+        // no-data-anywhere: neither row has `data`. Both are planted from
+        // scratch, without a `write_ts`, since no write may set a null. The
+        // stored sets and the index rows are the writer's for the body.
+        for (case, r1_has_data) in [
+            ("no-data-current-version", true),
+            ("no-data-anywhere", false),
+        ] {
+            let t = tenant_of(case);
+            let lu = ms(1_700_000_000_000);
+            let keys = backend.index_keys_of(&t, "Patient", &patient());
+            let body = patient().to_string();
+            let blob = Value::from(Blob::from(index_keys::encode(&keys)));
+            let fhir = Value::from(version.as_mime_param());
+            let mut values = vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(body.as_str()),
+                Value::from(lu),
+                Value::from(lu),
+                fhir.clone(),
+                blob.clone(),
+            ];
+            let resource = if r1_has_data {
+                PLANT_RESOURCE_NO_TS
+            } else {
+                values.remove(3);
+                PLANT_RESOURCE_NO_TS_NO_DATA
+            };
+            plant_cas(&backend, resource, values).await;
+            plant(
+                &backend,
+                PLANT_VERSION_NO_TS_NO_DATA,
+                vec![
+                    Value::from(t.as_str()),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                    Value::from(lu),
+                    fhir,
+                    blob,
+                    Value::from(write_ts_of(lu)),
+                ],
+            )
+            .await;
+            write_index_rows(&backend, &t, lu, version, &keys).await;
+        }
+
         // One shared scan for every case, taken after every `write_ts` above.
         // emptied-older-version's update comes last, and a scan in its
         // millisecond would be refused as stale. A second version's
@@ -2289,11 +2411,32 @@ mod tests {
 
             // A version with no `deleted_at` is live even without `data`.
             let report = check("no-data-older-version", registry).await;
-            assert_eq!(report.kinds(), ["no_type_key"], "{report}");
+            assert_eq!(report.kinds(), ["no_type_key", "read_failed"], "{report}");
             assert!(report.defects.iter().all(|d| match d {
                 Defect::NoTypeKey { version_id, .. } => *version_id == 0,
+                Defect::ReadFailed { what, .. } => what.ends_with(" v0"),
                 _ => true,
             }));
+
+            // A live version with no `data` is reported under either
+            // registry, an older one or the current one, and once when
+            // `resources.data` is unset too.
+            for (case, v) in [
+                ("no-data-live-older-version", 0),
+                ("no-data-current-version", 1),
+                ("no-data-anywhere", 1),
+            ] {
+                let report = check(case, registry).await;
+                assert_eq!(report.kinds(), ["read_failed"], "{case}: {report}");
+                let Defect::ReadFailed { what, error } = &report.defects[0] else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    (what.as_str(), error.as_str()),
+                    (format!("data of Patient/p v{v}").as_str(), "data is unset"),
+                    "{case}"
+                );
+            }
 
             // R1 and v1 both carry a `write_ts` that is not their own
             // `last_updated`'s.

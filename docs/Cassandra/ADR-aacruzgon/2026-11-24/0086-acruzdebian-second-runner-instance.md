@@ -58,7 +58,7 @@
         - **The mutation job's `jobs`:** the default and the maximum go from 4 and 6 to 3. At 4 jobs it peaked at 15.4 GiB `anon` (ADR-aacruzgon-0082), 4.6 GiB under 20G, inside 0080's 5 GiB margin. At 0082's figure of about 3.85 GiB a job, 3 jobs should peak at about 11.6 GiB. That is an estimate, to be measured on the first run. A run should take about 33 minutes instead of about 25.
         - **`cargo clippy (helios-fhir)`** reads 20G and picks 1 job, as on `sam-7900x`, so a cold run on `acruzdebian` is back to about 286 s instead of 160 s.
     - **Rollout order.**
-        - The new instance starts only after this PR merges, and only after every run created before the merge has finished, since such a run keeps its old workflow files, and so does a re-run of one. The team is told not to re-run those runs. (Changed at the setup: instead of a message to the team, `main` was merged into the open pull requests' branches; see **What the human changed**.)
+        - The new instance starts only after this PR merges, and only after every run created before the merge has finished, since such a run keeps its old workflow files, and so does a re-run of one. The team is told not to re-run those runs. *Update 2026-11-24:* at the setup, `main` was merged into the open pull requests' branches instead of a message to the team; see **What the human changed**.
         - The PR merges right before the machine is set up. Until then `CLAUDE.md`, `AGENTS.md` and `.coderabbit.yaml` describe two 20G instances while `acruzdebian` still runs one at 40G.
         - No job's `name:`, `runs-on`, `if:` or `uses:` changes, so the five required checks stay as they are.
 - **Alternatives considered:**
@@ -108,6 +108,7 @@
         - I decided the second instance and the 20G split before the session, and accepted that `cargo clippy (helios-fhir)` drops to 1 job.
         - After the independent audit of #111, I chose to move every CI port out of the ephemeral range, rather than add retries, and to limit the mutation job to 3 jobs.
         - I approved this entry for #111. My review changes are those three decisions: the 20G split, the move of every CI port below 32768, and the limit of 3.
+        - I run every `sudo` step in the setup guide (`setup-acruzdebian.md`); the AI fetches the registration token when I reach its step 5. What that setup verifies is recorded below once the instance is online. *Update 2026-11-24:* the setup ran that day; the next four bullets record it.
         - I ran every `sudo` step of the setup guide (`setup-acruzdebian.md`) on 2026-11-24, typing my password in a visible pane. The AI put steps 3–8 into two scripts that ran there, fetched the registration token for step 5 and passed it through a file that was shredded after `config.sh` read it, and checked each step's output.
         - The first run of steps 4–7 stopped at its first line and changed nothing: `sudo -i` joins a multi-line `bash -c '…'` into one line. The guide's blocks now use `sudo -u gh-runner -H bash -lc`.
         - Step 3 waited as root for the first instance to have no job, then lowered it at once, so the lower cap never landed under a running job.
@@ -138,7 +139,7 @@
             - `taiki-e/install-action` at `1168f68`, `main.sh` 622–664;
             - the kernel's `ip-sysctl.rst`.
         - **Target-directory sizes:** from the latest CI reports (runs 45322606272, 45314658823, 45277266997).
-        - **The machine side,** after the setup on 2026-11-24:
+        - **The machine side:** <after setup: `systemctl show` and the cgroup's `memory.max` for both units (21474836480); `gh api .../actions/runners` with both instances online; the first run with jobs on both instances, run `<id>`; the first mutation run at 3 jobs, run `<id>`, peak `<…>` MiB `anon`.> *Update 2026-11-24:* the setup ran that day, and verified:
             - **The first instance** was lowered at 09:01:27 EST, when it had no job (0.1 GiB `anon`): `systemctl show` gives `MemoryMax=21474836480`, `MemorySwapMax=0`, `OOMPolicy=continue`; the cgroup's `memory.max` is 21474836480 and `memory.swap.max` 0; the runtime `50-MemoryMax.conf` also says 21474836480. It did not restart (`ActiveEnterTimestamp` still 2026-11-18 00:00:18 EST). The 40G setting is kept as `memory.conf.40G.bak`.
             - **`acruzdebian-2`:** runner 2.338.2 (SHA-256 checked), registered as runner 23 with `self-hosted,Linux,X64,hfs-cassandra-light,hfs-cassandra-medium,hfs-cassandra-heavy,hfs-runner-acruzdebian-2`. Its `.env` is the first one's plus `HFS_CI_SLOT=1` and `RUSTUP_HOME=/home/gh-runner/.rustup-2`; `.path` is identical; both toolchain homes give `rustc 1.100.0`. Its unit has `MemoryMax=21474836480`, `MemorySwapMax=0`, `OOMPolicy=continue`, `WorkingDirectory=/home/gh-runner/actions-runner-2`, the `memory.conf` and `timesync.conf` drop-ins, and its cgroup's `memory.max` is 21474836480 and `memory.swap.max` 0. It was started (step 8) right after step 3, once no run created before #111's merge was queued or running.
             - **The runners API** lists `acruzdebian` and `acruzdebian-2` both online and busy.

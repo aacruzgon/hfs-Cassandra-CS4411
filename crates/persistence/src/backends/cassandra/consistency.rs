@@ -612,7 +612,8 @@ impl fmt::Display for ConsistencyReport {
 struct VersionRow {
     version_id: i32,
     data: Option<String>,
-    /// `deleted_at` set or `data` unset.
+    /// `deleted_at` set. The writer always sets it on a delete marker, so a
+    /// version without it is live, whether or not its `data` is set.
     marker: bool,
     write_ts: Option<i64>,
     last_updated: Option<DateTime<Utc>>,
@@ -629,7 +630,7 @@ fn decode_version_row(row: &Row) -> Result<VersionRow, String> {
         .map(Blob::into_vec);
     Ok(VersionRow {
         version_id: column::<i32>(row, "version_id")?,
-        marker: deleted.is_some() || data.is_none(),
+        marker: deleted.is_some(),
         data,
         write_ts: row
             .get_by_name("write_ts")
@@ -1424,6 +1425,8 @@ mod tests {
     const PLANT_VERSION_NO_TS: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version, index_keys) VALUES (?, ?, ?, 1, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_VERSION_KEYS: &str = "UPDATE resource_versions USING TIMESTAMP ? SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
     /// A CAS: asserts `[applied]`.
+    /// Unsets a version row's `data` and replaces its stored set.
+    const PLANT_VERSION_NO_DATA: &str = "UPDATE resource_versions USING TIMESTAMP ? SET data = null, index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
     const PLANT_RESOURCE_KEYS: &str = "UPDATE resources SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
 
     fn ms(millis: i64) -> DateTime<Utc> {
@@ -1578,6 +1581,7 @@ mod tests {
             "no-type-key",
             "no-write-ts",
             "emptied-older-version",
+            "no-data-older-version",
         ];
         let version = test_fhir_version();
 
@@ -1846,6 +1850,28 @@ mod tests {
             .expect("update p");
         plant_version_keys(&backend, &t, 1, index_keys::EMPTY.to_vec(), ts1 + 1).await;
 
+        // no-data-older-version: v1 has no `deleted_at`, so it is live although
+        // its `data` is unset and its stored set is empty.
+        let t = tenant_of("no-data-older-version");
+        let (stored, _, ts1, _) = seeded(&backend, &t).await;
+        backend
+            .update(&context(&t), &stored, changed())
+            .await
+            .expect("update p");
+        plant(
+            &backend,
+            PLANT_VERSION_NO_DATA,
+            vec![
+                Value::from(ts1 + 1),
+                Value::from(Blob::from(index_keys::EMPTY.to_vec())),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+
         // One shared scan for every case, taken after every `write_ts` above.
         // emptied-older-version's update comes last, and a scan in its
         // millisecond would be refused as stale. A second version's
@@ -2072,6 +2098,14 @@ mod tests {
             assert!(report.defects.iter().all(|d| match d {
                 Defect::NoTypeKey { version_id, .. }
                 | Defect::VersionReextraction { version_id, .. } => *version_id == 1,
+                _ => true,
+            }));
+
+            // A version with no `deleted_at` is live even without `data`.
+            let report = check("no-data-older-version", registry).await;
+            assert_eq!(report.kinds(), ["no_type_key"], "{report}");
+            assert!(report.defects.iter().all(|d| match d {
+                Defect::NoTypeKey { version_id, .. } => *version_id == 1,
                 _ => true,
             }));
         }

@@ -4114,6 +4114,9 @@ pub(crate) mod post_suite {
             .write_intent(&key_i, &row_key, write_id, 1)
             .await
             .expect("the intent");
+        // A pass reads `[since, whole_ms(now))`, so an intent enqueued in the millisecond of the
+        // pass's own `now` is not read. A real writer's intent is older than the sweep by a request.
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         let report = post_suite_report(&backend, &prefix, since).await;
         eprintln!("{report}");

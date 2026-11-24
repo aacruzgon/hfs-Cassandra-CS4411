@@ -19,7 +19,7 @@
   2. **RV13's `scan_mode` becomes `Full` or `Shared(&IndexScan)`.**
      - `Full` scans the seven index tables now, for this one tenant.
      - `Shared` reuses one full scan for many tenants: the planted-defects test now, and roadmap 5.4's post-suite step later.
-     - Both modes report the same defects as long as three things hold: no write to the tenant was in flight when the shared scan was taken; no index row was written after it without a `resources` write (a hand plant, and later the sweeper or repair); and the clock didn't step back between the scan and the check (see Consequences).
+     - Whenever a `Shared` check doesn't panic, both modes report the same defects, as long as three things hold: no write to the tenant was in flight when the shared scan was taken; no index row was written after it without a `resources` write (a hand plant, and later the sweeper or repair); and the clock didn't step back between the scan and the check (see Consequences). One exception: a `Scope::Resources` check of a tenant that holds an undecodable index row of another id. `Full` drops that row before decoding it and is clean, while `Shared` reports `read_failed`, since the shared scan already failed on it (see Consequences).
      - A `Shared` check panics in two cases: the scan didn't keep its tenant, or a resource it checks was written at or after the scan was taken. The second assumes the clock didn't step back between the scan and the check (see Consequences).
   3. **RV13's golden test of the walkthrough's worked example moves to pull request 5.** It needs real extraction.
 
@@ -35,7 +35,7 @@
   - From pull request 4 on, the check and the writer call the same function, so the check cannot drift from what the writer stores.
   - `update.rs` and `upsert.rs` change one pull request early. Their signatures don't change, so Sara's `update_with_match` is unaffected.
   - The `Shared` guard compares client-clock `write_ts` values with the scan's start time, so it assumes the scan and the writers run on one machine, as they do in CI.
-  - It also assumes that clock doesn't step back between the scan and the check. If it does, a write made after the scan passes the guard, and the check reports false `missing_row` or `stray_row` defects instead of panicking. That is loud but misattributed, and never a clean report.
+  - It also assumes that clock doesn't step back between the scan and the check. If it does, a write made after the scan passes the guard, and the check compares that resource with rows from before the write: it can report false `missing_row` or `stray_row` defects, and it can miss a defect of that write.
   - The guard cannot see two things:
     - a write still in flight when the scan started;
     - an index row written after the scan with no `resources` write: a hand plant, and later the sweeper or repair.

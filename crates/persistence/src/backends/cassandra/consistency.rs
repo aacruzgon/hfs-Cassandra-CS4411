@@ -1131,17 +1131,17 @@ fn check_subject(
         }
     }
 
-    // Rule 3: the current version against a fresh extraction.
-    let rule_3 = live && fixed && stored.is_some();
-    if live
-        && fixed
-        && let Some(stored) = &stored
-    {
+    // Rule 3: the current version against a fresh extraction. That
+    // `resources.data` is set needs no extraction, so it is checked under
+    // either registry; only the comparison is `Fixed` only (RV14).
+    let rule_3 = live && stored.is_some();
+    if live && let Some(stored) = &stored {
         match subject.row.data.as_deref() {
             None => report.defects.push(Defect::ReadFailed {
                 what: format!("data of {resource_type}/{id} v{current}"),
                 error: "data is unset".to_string(),
             }),
+            Some(_) if !fixed => {}
             Some(data) => match extract(backend, tenant, resource_type, data) {
                 Ok(fresh) if &fresh != stored => report.defects.push(Defect::StaleExtraction {
                     resource_type: resource_type.clone(),
@@ -1783,6 +1783,7 @@ mod tests {
             "no-data-live-older-version",
             "no-data-current-version",
             "no-data-anywhere",
+            "no-data-in-resources-row",
             "malformed-data-in-both-rows",
             "write-ts-behind",
         ];
@@ -2143,14 +2144,17 @@ mod tests {
         )
         .await;
 
+        // From scratch, without a `write_ts`, since no write may set a null;
+        // the stored sets and the index rows are the writer's for the body.
         // no-data-current-version: the current version row has no `data`,
         // while `resources.data` is set and both key sets are right.
-        // no-data-anywhere: neither row has `data`. Both are planted from
-        // scratch, without a `write_ts`, since no write may set a null. The
-        // stored sets and the index rows are the writer's for the body.
-        for (case, r1_has_data) in [
-            ("no-data-current-version", true),
-            ("no-data-anywhere", false),
+        // no-data-anywhere: neither row has `data`.
+        // no-data-in-resources-row: only `resources.data` is unset; v1 keeps
+        // its body.
+        for (case, r1_has_data, v1_has_data) in [
+            ("no-data-current-version", true, false),
+            ("no-data-anywhere", false, false),
+            ("no-data-in-resources-row", false, true),
         ] {
             let t = tenant_of(case);
             let lu = ms(1_700_000_000_000);
@@ -2175,20 +2179,23 @@ mod tests {
                 PLANT_RESOURCE_NO_TS_NO_DATA
             };
             plant_cas(&backend, resource, values).await;
-            plant(
-                &backend,
-                PLANT_VERSION_NO_TS_NO_DATA,
-                vec![
-                    Value::from(t.as_str()),
-                    Value::from("Patient"),
-                    Value::from("p"),
-                    Value::from(lu),
-                    fhir,
-                    blob,
-                    Value::from(write_ts_of(lu)),
-                ],
-            )
-            .await;
+            let mut values = vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(body.as_str()),
+                Value::from(lu),
+                fhir,
+                blob,
+                Value::from(write_ts_of(lu)),
+            ];
+            let version_row = if v1_has_data {
+                PLANT_VERSION_NO_TS
+            } else {
+                values.remove(3);
+                PLANT_VERSION_NO_TS_NO_DATA
+            };
+            plant(&backend, version_row, values).await;
             write_index_rows(&backend, &t, lu, version, &keys).await;
         }
 
@@ -2491,13 +2498,13 @@ mod tests {
                 _ => true,
             }));
 
-            // A live version with no `data` is reported under either
-            // registry, an older one or the current one, and once when
-            // `resources.data` is unset too.
+            // A live version with no `data`, or a `resources` row with none,
+            // is reported under either registry, once when both are unset.
             for (case, v) in [
                 ("no-data-live-older-version", 0),
                 ("no-data-current-version", 1),
                 ("no-data-anywhere", 1),
+                ("no-data-in-resources-row", 1),
             ] {
                 let report = check(case, registry).await;
                 assert_eq!(report.kinds(), ["read_failed"], "{case}: {report}");

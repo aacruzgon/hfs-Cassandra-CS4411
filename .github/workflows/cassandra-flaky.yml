@@ -126,6 +126,10 @@ jobs:
             exit 1
           fi
           project=$COMPOSE_PROJECT_BASE port=$CASSANDRA_BASE_PORT
+          if ! [[ $port =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error title=HFS_CI_SLOT::base port must be a positive whole number with no leading zero, got $(printf %q "$port")"
+            exit 1
+          fi
           if [ "$slot" != 0 ]; then project=$project-s$slot port=$((port + 10 * slot)); fi
           if [ "$port" -ge 32768 ]; then
             echo "::error title=HFS_CI_SLOT::host port $port is inside Linux's ephemeral range (32768-60999)"

@@ -73,7 +73,7 @@ const SELECT_VERSION_ROWS: &str = "SELECT version_id, data, last_updated, delete
      WHERE tenant_id = ? AND resource_type = ? AND id = ?";
 
 /// The defects' `kind()` names, in the report line's order.
-const DEFECT_KINDS: [&str; 12] = [
+const DEFECT_KINDS: [&str; 13] = [
     "missing_row",
     "stray_row",
     "wrong_tag",
@@ -86,6 +86,7 @@ const DEFECT_KINDS: [&str; 12] = [
     "undecodable",
     "read_failed",
     "no_type_key",
+    "write_ts_mismatch",
 ];
 
 /// Which resources of the tenant are checked.
@@ -444,14 +445,25 @@ pub(crate) enum Defect {
         id: String,
         version_id: i32,
     },
+    /// Rule 6: a stored `write_ts` that is not `write_ts_of(last_updated)` of
+    /// its own row, on the `resources` row (`version_id` is the current
+    /// version) or on a `resource_versions` row. The writer, the sweeper and
+    /// repair all derive the write time that way.
+    WriteTsMismatch {
+        resource_type: String,
+        id: String,
+        version_id: i32,
+        stored: i64,
+        expected: i64,
+    },
 }
 
 impl Defect {
     /// The defect's name in the log line and in tests: `missing_row`,
     /// `stray_row`, `wrong_tag`, `wrong_write_time`, `stale_extraction`,
     /// `version_reextraction`, `marker_not_empty`, `blob_mismatch`,
-    /// `missing_version_row`, `undecodable`, `read_failed`, `no_type_key`
-    /// (this order is
+    /// `missing_version_row`, `undecodable`, `read_failed`, `no_type_key`,
+    /// `write_ts_mismatch` (this order is
     /// `DEFECT_KINDS`, the line's order).
     pub(crate) fn kind(&self) -> &'static str {
         match self {
@@ -467,6 +479,7 @@ impl Defect {
             Defect::Undecodable { .. } => DEFECT_KINDS[9],
             Defect::ReadFailed { .. } => DEFECT_KINDS[10],
             Defect::NoTypeKey { .. } => DEFECT_KINDS[11],
+            Defect::WriteTsMismatch { .. } => DEFECT_KINDS[12],
         }
     }
 }
@@ -558,6 +571,16 @@ impl fmt::Display for Defect {
             } => write!(
                 f,
                 "{resource_type}/{id} v{version_id}: the stored key set of a live version lacks ResourcesByType"
+            ),
+            Defect::WriteTsMismatch {
+                resource_type,
+                id,
+                version_id,
+                stored,
+                expected,
+            } => write!(
+                f,
+                "{resource_type}/{id} v{version_id}: stored write_ts {stored} but its last_updated gives {expected}"
             ),
         }
     }
@@ -989,6 +1012,33 @@ fn check_subject(
         }
     }
 
+    // Rule 6: a stored `write_ts` is the write time of its own `last_updated`.
+    // This needs no scan, so it runs whatever the scan did.
+    let own_write_ts = std::iter::once((
+        current,
+        subject.row.write_ts,
+        Some(subject.row.last_updated),
+    ))
+    .chain(
+        subject
+            .versions
+            .iter()
+            .map(|v| (v.version_id, v.write_ts, v.last_updated)),
+    );
+    for (version_id, stored, last_updated) in own_write_ts {
+        if let (Some(stored), Some(last_updated)) = (stored, last_updated)
+            && stored != write_ts_of(last_updated)
+        {
+            report.defects.push(Defect::WriteTsMismatch {
+                resource_type: resource_type.clone(),
+                id: id.clone(),
+                version_id,
+                stored,
+                expected: write_ts_of(last_updated),
+            });
+        }
+    }
+
     // IW5: a live version's stored set holds the type key. This does not
     // depend on extraction, so it runs under either registry.
     if let Some(stored) = &stored
@@ -1414,6 +1464,13 @@ mod tests {
                 id: "p".to_string(),
                 version_id: 1,
             },
+            Defect::WriteTsMismatch {
+                resource_type: "Patient".to_string(),
+                id: "p".to_string(),
+                version_id: 1,
+                stored: 2,
+                expected: 1,
+            },
         ]
     }
 
@@ -1438,9 +1495,9 @@ mod tests {
             report.to_string(),
             "[index-consistency tenant=test-line scope=tenant scan=full registry=fixed \
              resources=3 live=2 deleted=1 absent=0 versions=5 rows_scanned=40 rows_checked=4 \
-             defects=12 missing_row=1 stray_row=1 wrong_tag=1 wrong_write_time=1 \
+             defects=13 missing_row=1 stray_row=1 wrong_tag=1 wrong_write_time=1 \
              stale_extraction=1 version_reextraction=1 marker_not_empty=1 blob_mismatch=1 \
-             missing_version_row=1 undecodable=1 read_failed=1 no_type_key=1 took_ms=12]"
+             missing_version_row=1 undecodable=1 read_failed=1 no_type_key=1 write_ts_mismatch=1 took_ms=12]"
         );
         let mut names = DEFECT_KINDS.to_vec();
         names.sort_unstable();
@@ -1471,6 +1528,9 @@ mod tests {
     /// An older version row with no `data` and no `deleted_at`, written
     /// without naming either column (a null write to this table is refused).
     const PLANT_VERSION_NO_DATA: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, index_keys) VALUES (?, ?, ?, 0, ?) USING TIMESTAMP ?";
+    /// A CAS: moves `resources.write_ts`.
+    const PLANT_RESOURCE_WRITE_TS: &str = "UPDATE resources SET write_ts = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
+    const PLANT_VERSION_WRITE_TS: &str = "UPDATE resource_versions USING TIMESTAMP ? SET write_ts = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
     const PLANT_RESOURCE_KEYS: &str = "UPDATE resources SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
 
     fn ms(millis: i64) -> DateTime<Utc> {
@@ -1626,6 +1686,7 @@ mod tests {
             "no-write-ts",
             "emptied-older-version",
             "no-data-older-version",
+            "write-ts-mismatch",
         ];
         let version = test_fhir_version();
 
@@ -1915,6 +1976,38 @@ mod tests {
         )
         .await;
 
+        // write-ts-mismatch: R1's and v1's `write_ts` are 5 us past
+        // `write_ts_of(last_updated)`, and the type row was written at that
+        // time, so rule 6's index-row comparison still holds.
+        let t = tenant_of("write-ts-mismatch");
+        let (_, lu1, ts1, _) = seeded(&backend, &t).await;
+        plant_cas(
+            &backend,
+            PLANT_RESOURCE_WRITE_TS,
+            vec![
+                Value::from(ts1 + 5),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+        plant(
+            &backend,
+            PLANT_VERSION_WRITE_TS,
+            vec![
+                Value::from(ts1 + 1),
+                Value::from(ts1 + 5),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(1),
+            ],
+        )
+        .await;
+        plant_x1(&backend, &t, lu1, "p", 1, ts1 + 5).await;
+
         // One shared scan for every case, taken after every `write_ts` above.
         // emptied-older-version's update comes last, and a scan in its
         // millisecond would be refused as stale. A second version's
@@ -2151,6 +2244,24 @@ mod tests {
                 Defect::NoTypeKey { version_id, .. } => *version_id == 0,
                 _ => true,
             }));
+
+            // R1 and v1 both carry a `write_ts` that is not their own
+            // `last_updated`'s.
+            let report = check("write-ts-mismatch", registry).await;
+            assert_eq!(report.kinds(), ["write_ts_mismatch"; 2], "{report}");
+            for defect in &report.defects {
+                let Defect::WriteTsMismatch {
+                    version_id,
+                    stored,
+                    expected,
+                    ..
+                } = defect
+                else {
+                    unreachable!()
+                };
+                assert_eq!(*version_id, 1);
+                assert_eq!(*stored, *expected + 5);
+            }
         }
         let checked = checked.into_inner();
         for case in all {

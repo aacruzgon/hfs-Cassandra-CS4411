@@ -97,7 +97,8 @@ pub(crate) enum Scope<'a> {
     /// the tenant: a row of an id with no `resources` row is a stray.
     Tenant,
     /// Only these `(resource_type, id)`; index rows of the tenant's other
-    /// ids are ignored, not reported. For a test that leaves one resource
+    /// ids are ignored, not reported. A `Full` scan drops them before
+    /// decoding, so one it cannot decode does not fail the check. For a test that leaves one resource
     /// broken on purpose and checks the others.
     Resources(&'a [(&'a str, &'a str)]),
 }
@@ -279,6 +280,18 @@ impl IndexScan {
         backend: &CassandraBackend,
         keep: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> IndexScan {
+        Self::take_only(backend, keep, None).await
+    }
+
+    /// `take`, and with `only` set, holds just the rows of those
+    /// `(resource_type, id)`. The rows of every other id are dropped before
+    /// they are decoded, so one the scan cannot decode is not read, and does
+    /// not fail the scan.
+    pub(crate) async fn take_only(
+        backend: &CassandraBackend,
+        keep: impl Fn(&str) -> bool + Send + Sync + 'static,
+        only: Option<&[(&str, &str)]>,
+    ) -> IndexScan {
         let mut scan = IndexScan {
             keep: Box::new(keep),
             rows: BTreeMap::new(),
@@ -299,10 +312,23 @@ impl IndexScan {
                     |row| {
                         seen.set(seen.get() + 1);
                         // An unreadable tenant is kept, so the decode below reports it.
-                        match column::<String>(row, "tenant_id") {
+                        let tenant_kept = match column::<String>(row, "tenant_id") {
                             Ok(tenant) => tenant.starts_with("test-") && accepts(&tenant),
                             Err(_) => true,
-                        }
+                        };
+                        // An unreadable id is kept too.
+                        tenant_kept
+                            && only.is_none_or(|only| {
+                                match (
+                                    column::<String>(row, "resource_type"),
+                                    column::<String>(row, "id"),
+                                ) {
+                                    (Ok(t), Ok(i)) => {
+                                        only.iter().any(|(ot, oi)| *ot == t && *oi == i)
+                                    }
+                                    _ => true,
+                                }
+                            })
                     },
                 )
                 .await;
@@ -836,7 +862,11 @@ async fn run(
     let scan: &IndexScan = match scan_mode {
         ScanMode::Full => {
             let own = tenant.to_string();
-            owned = IndexScan::take(backend, move |t| t == own).await;
+            let only = match scope {
+                Scope::Tenant => None,
+                Scope::Resources(listed) => Some(listed),
+            };
+            owned = IndexScan::take_only(backend, move |t| t == own, only).await;
             &owned
         }
         ScanMode::Shared(shared) => {
@@ -1412,6 +1442,8 @@ mod tests {
     // Planting statements. Each is a `Write` unless marked.
     const PLANT_X1: &str = "INSERT INTO resources_by_type (tenant_id, resource_type, last_updated, id, version_id, fhir_version) VALUES (?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const UNPLANT_X1: &str = "DELETE FROM resources_by_type USING TIMESTAMP ? WHERE tenant_id = ? AND resource_type = ? AND last_updated = ? AND id = ?";
+    /// A type row with no `version_id`, which the scan cannot decode.
+    const PLANT_X1_NO_TAG: &str = "INSERT INTO resources_by_type (tenant_id, resource_type, last_updated, id, fhir_version) VALUES (?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_X2: &str = "INSERT INTO token_code_index (tenant_id, resource_type, param, code, last_updated, id, system, version_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_X3: &str = "INSERT INTO token_system_code_index (tenant_id, resource_type, param, system, code, last_updated, id, version_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_X4: &str = "INSERT INTO token_system_index (tenant_id, resource_type, param, system, last_updated, id, code, version_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
@@ -2118,6 +2150,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A `Full` scan scoped to some ids drops the other ids' rows before
+    /// decoding them, so a row of another id that cannot be decoded does not
+    /// fail the check. The row is a type row of `p` with no `version_id`,
+    /// planted under a `test-` tenant and deleted before the assertions.
+    #[tokio::test]
+    async fn a_scoped_full_check_does_not_decode_other_ids_rows() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("consistency-scope-decode");
+        let version = test_fhir_version();
+        for id in ["p", "q"] {
+            let mut body = patient();
+            body["id"] = serde_json::json!(id);
+            backend
+                .create(&context(&t), "Patient", body, version)
+                .await
+                .expect("create");
+        }
+        let lu = ms(1_700_000_000_000);
+        let ts = write_ts_of(lu);
+        plant(
+            &backend,
+            PLANT_X1_NO_TAG,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from(lu),
+                Value::from("p"),
+                Value::from(version.as_mime_param()),
+                Value::from(ts),
+            ],
+        )
+        .await;
+        let scoped = index_consistency(
+            &backend,
+            &t,
+            Scope::Resources(&[("Patient", "q")]),
+            ScanMode::Full,
+            Registry::Fixed,
+        )
+        .await;
+        let whole = check(&backend, &t).await;
+        plant(
+            &backend,
+            UNPLANT_X1,
+            vec![
+                Value::from(ts + 1),
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from(lu),
+                Value::from("p"),
+            ],
+        )
+        .await;
+        assert_consistent(&scoped);
+        assert_eq!(scoped.resources, 1, "{scoped}");
+        // The row is undecodable to a scan that does read it.
+        assert_eq!(whole.kinds(), ["read_failed"], "{whole}");
+        assert_consistent(&check(&backend, &t).await);
     }
 
     #[tokio::test]

@@ -1468,8 +1468,9 @@ mod tests {
     const PLANT_VERSION_NO_TS: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version, index_keys) VALUES (?, ?, ?, 1, ?, ?, ?, ?) USING TIMESTAMP ?";
     const PLANT_VERSION_KEYS: &str = "UPDATE resource_versions USING TIMESTAMP ? SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
     /// A CAS: asserts `[applied]`.
-    /// Unsets a version row's `data` and replaces its stored set.
-    const PLANT_VERSION_NO_DATA: &str = "UPDATE resource_versions USING TIMESTAMP ? SET data = null, index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
+    /// An older version row with no `data` and no `deleted_at`, written
+    /// without naming either column (a null write to this table is refused).
+    const PLANT_VERSION_NO_DATA: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, index_keys) VALUES (?, ?, ?, 0, ?) USING TIMESTAMP ?";
     const PLANT_RESOURCE_KEYS: &str = "UPDATE resources SET index_keys = ? WHERE tenant_id = ? AND resource_type = ? AND id = ? IF version_id = ?";
 
     fn ms(millis: i64) -> DateTime<Utc> {
@@ -1893,7 +1894,7 @@ mod tests {
             .expect("update p");
         plant_version_keys(&backend, &t, 1, index_keys::EMPTY.to_vec(), ts1 + 1).await;
 
-        // no-data-older-version: v1 has no `deleted_at`, so it is live although
+        // no-data-older-version: v0 has no `deleted_at`, so it is live although
         // its `data` is unset and its stored set is empty.
         let t = tenant_of("no-data-older-version");
         let (stored, _, ts1, _) = seeded(&backend, &t).await;
@@ -1905,12 +1906,11 @@ mod tests {
             &backend,
             PLANT_VERSION_NO_DATA,
             vec![
-                Value::from(ts1 + 1),
-                Value::from(Blob::from(index_keys::EMPTY.to_vec())),
                 Value::from(t.as_str()),
                 Value::from("Patient"),
                 Value::from("p"),
-                Value::from(1),
+                Value::from(Blob::from(index_keys::EMPTY.to_vec())),
+                Value::from(ts1),
             ],
         )
         .await;
@@ -2148,7 +2148,7 @@ mod tests {
             let report = check("no-data-older-version", registry).await;
             assert_eq!(report.kinds(), ["no_type_key"], "{report}");
             assert!(report.defects.iter().all(|d| match d {
-                Defect::NoTypeKey { version_id, .. } => *version_id == 1,
+                Defect::NoTypeKey { version_id, .. } => *version_id == 0,
                 _ => true,
             }));
         }

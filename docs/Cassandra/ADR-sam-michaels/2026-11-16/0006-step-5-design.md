@@ -1,7 +1,7 @@
 # ADR-sam-michaels-0006: Step 5's design: index rows by partition, the version row first, a quorum-first sweeper, bounded repair and a report-first CI check
 
 - **Date:** 2026-11-16
-- **Status:** accepted; amended on 2026-11-17 and 2026-11-18 after Alan's two reviews on #86 (see "Amendments after review")
+- **Status:** accepted; amended on 2026-11-17 and 2026-11-18 after Alan's two reviews on #86 (see "Amendments after review"); *Update 2026-11-18:* RV13 is superseded by [ADR-sam-michaels-0007](../2026-11-17/0007-consistency-check-scan-modes.md)
 - **Context:**
     - I own roadmap Step 5, rows 5.1 to 5.4: index rows on every write, the sweeper over `pending_index_writes`, repair on read, and the index consistency check. Alan built Steps 2 and 3, so all six steps of the write path already run on `main` (`b4b6d6ddd`). Step 5 of the path writes only the `resources_by_type` row, because the key set is hard-coded to `[IndexKey::ResourcesByType]` at `write.rs:1936`, `update.rs:206` and `upsert.rs:205` and `:216`. Sara owns Step 4, which does not block this.
     - My plan of 2026-11-05 was written before Alan's Steps 2 and 3 and is wrong on several facts. The biggest: every old key set is now read from a stored `index_keys` column and never re-extracted (G22, G40, ADR-aacruzgon-0027). Step 5 had to be planned again against the real code.

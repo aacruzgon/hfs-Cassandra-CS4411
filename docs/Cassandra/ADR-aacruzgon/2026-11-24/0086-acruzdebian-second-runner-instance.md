@@ -108,7 +108,10 @@
         - I decided the second instance and the 20G split before the session, and accepted that `cargo clippy (helios-fhir)` drops to 1 job.
         - After the independent audit of #111, I chose to move every CI port out of the ephemeral range, rather than add retries, and to limit the mutation job to 3 jobs.
         - I approved this entry for #111. My review changes are those three decisions: the 20G split, the move of every CI port below 32768, and the limit of 3.
-        - I run every `sudo` step in the setup guide (`setup-acruzdebian.md`); the AI fetches the registration token when I reach its step 5. What that setup verifies is recorded below once the instance is online.
+        - I ran every `sudo` step of the setup guide (`setup-acruzdebian.md`) on 2026-11-24, typing my password in a visible pane. The AI put steps 3–8 into two scripts that ran there, fetched the registration token for step 5 and passed it through a file that was shredded after `config.sh` read it, and checked each step's output.
+        - The first run of steps 4–7 stopped at its first line and changed nothing: `sudo -i` joins a multi-line `bash -c '…'` into one line. The guide's blocks now use `sudo -u gh-runner -H bash -lc`.
+        - Step 3 waited as root for the first instance to have no job, then lowered it at once, so the lower cap never landed under a running job.
+        - Instead of asking the team not to re-run runs from before #111, I had `main` merged into every open pull request's branch right after the setup (#76, #93, #99, #106–#110), so each one's latest run uses the new workflow files. This makes a re-run of an old run unlikely, not impossible: "Re-run" on an old run in the Actions tab still uses that run's old files.
     - **Verified:**
         - **Lint:** `actionlint` 1.7.12 on the seven changed workflows reports only `runner.workspace`, in the same places as on `origin/main`. `zizmor` 1.32.0 reports no findings, with the same suppressions as `main`. PyYAML parses them, `.coderabbit.yaml` and the cluster Compose file. `shellcheck` 0.11.0 (`-s bash -S style`) is clean on the 61 extracted `run:` blocks that read a slot or project name.
         - **The slot step,** extracted and run:
@@ -135,7 +138,12 @@
             - `taiki-e/install-action` at `1168f68`, `main.sh` 622–664;
             - the kernel's `ip-sysctl.rst`.
         - **Target-directory sizes:** from the latest CI reports (runs 45322606272, 45314658823, 45277266997).
-        - **The machine side:** <after setup: `systemctl show` and the cgroup's `memory.max` for both units (21474836480); `gh api .../actions/runners` with both instances online; the first run with jobs on both instances, run `<id>`; the first mutation run at 3 jobs, run `<id>`, peak `<…>` MiB `anon`.>
+        - **The machine side,** after the setup on 2026-11-24:
+            - **The first instance** was lowered at 09:01:27 EST, when it had no job (0.1 GiB `anon`): `systemctl show` gives `MemoryMax=21474836480`, `MemorySwapMax=0`, `OOMPolicy=continue`; the cgroup's `memory.max` is 21474836480 and `memory.swap.max` 0; the runtime `50-MemoryMax.conf` also says 21474836480. It did not restart (`ActiveEnterTimestamp` still 2026-11-18 00:00:18 EST). The 40G setting is kept as `memory.conf.40G.bak`.
+            - **`acruzdebian-2`:** runner 2.338.2 (SHA-256 checked), registered as runner 23 with `self-hosted,Linux,X64,hfs-cassandra-light,hfs-cassandra-medium,hfs-cassandra-heavy,hfs-runner-acruzdebian-2`. Its `.env` is the first one's plus `HFS_CI_SLOT=1` and `RUSTUP_HOME=/home/gh-runner/.rustup-2`; `.path` is identical; both toolchain homes give `rustc 1.100.0`. Its unit has `MemoryMax=21474836480`, `MemorySwapMax=0`, `OOMPolicy=continue`, `WorkingDirectory=/home/gh-runner/actions-runner-2`, the `memory.conf` and `timesync.conf` drop-ins, and its cgroup's `memory.max` is 21474836480 and `memory.swap.max` 0. It was started (step 8) right after step 3, once no run created before #111's merge was queued or running.
+            - **The runners API** lists `acruzdebian` and `acruzdebian-2` both online and busy.
+            - **The first jobs,** both from runs created after the merge: `cargo clippy (helios-fhir)` on `acruzdebian` (run 45408404816) and `Cassandra tests (all FHIR versions)` on `acruzdebian-2` (run 45408412568), overlapping from 14:01:34 to 14:06:23 UTC. Both passed. The second's first step logged `Runner acruzdebian-2, slot 1: Compose project hfs-cassandra-fhir-versions-s1, host port 127.0.0.1:29252`.
+            - **Not yet measured:** the mutation job at 3 jobs. It runs only on a pull request labelled `mutants` or by `workflow_dispatch`, and none has run since the merge.
 - **Links:**
     - PR #111, and its independent audit (`report-pr111-audit.md`).
     - ADR-aacruzgon-0080, 0082 and 0083 (update notes), 0018, 0019, 0021, 0022, 0023.

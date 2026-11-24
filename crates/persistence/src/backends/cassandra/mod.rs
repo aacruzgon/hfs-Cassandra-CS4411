@@ -72,6 +72,7 @@
 //! ```
 
 mod backend;
+mod batch;
 mod config;
 mod delete;
 mod errors;

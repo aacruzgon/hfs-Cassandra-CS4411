@@ -1813,6 +1813,29 @@ impl SearchProvider for CompositeStorage {
             .unwrap_or_default()
     }
 
+    fn serves_search_param(
+        &self,
+        resource_type: &str,
+        code: &str,
+        param_type: crate::types::SearchParamType,
+    ) -> bool {
+        // Same routing as `search`: defer to the dedicated Search backend when
+        // configured, otherwise the primary provider. No provider at all means
+        // `search` answers `UnsupportedCapability`, so `false`.
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+        {
+            if let Some(provider) = self.search_providers.get(&search_backend.id) {
+                return provider.serves_search_param(resource_type, code, param_type);
+            }
+        }
+        self.search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+            .is_some_and(|p| p.serves_search_param(resource_type, code, param_type))
+    }
+
     /// A composite's search lags its primary on two axes, and this closes
     /// both: writes still sitting in the asynchronous sync queue, and writes
     /// the search backend has accepted but not yet made searchable (#1047).
@@ -2256,6 +2279,20 @@ impl VersionedStorage for CompositeStorage {
 
 #[async_trait]
 impl InstanceHistoryProvider for CompositeStorage {
+    /// The answer of the providers the history methods reach: instance history
+    /// goes to `history_provider`, type and system history to
+    /// `system_history_provider`. Without either, its methods answer
+    /// `UnsupportedCapability`, so `false`.
+    fn supports_history(&self) -> bool {
+        self.history_provider
+            .as_ref()
+            .is_some_and(|provider| provider.supports_history())
+            && self
+                .system_history_provider
+                .as_ref()
+                .is_some_and(|provider| provider.supports_history())
+    }
+
     async fn history_instance(
         &self,
         tenant: &TenantContext,
@@ -3784,6 +3821,17 @@ mod tests {
             !self.unsupported.load(std::sync::atomic::Ordering::Relaxed)
         }
 
+        /// Serves only the parameter named like the provider, so a test can
+        /// tell which provider answered.
+        fn serves_search_param(
+            &self,
+            _resource_type: &str,
+            code: &str,
+            _param_type: SearchParamType,
+        ) -> bool {
+            code == self.name
+        }
+
         fn supports_native_reverse_chains(&self, _: &TenantContext, _: &SearchQuery) -> bool {
             self.native_reverse
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -5094,6 +5142,7 @@ mod tests {
         // No provider at all: `search` is `UnsupportedCapability`.
         composite.search_providers.remove("primary");
         assert!(!composite.supports_search());
+        assert!(!composite.serves_search_param("Patient", "primary", SearchParamType::Token));
         assert!(is_unsupported(composite.search(&tenant, &query).await));
 
         // No Search backend configured: the primary's provider answers.
@@ -5104,6 +5153,277 @@ mod tests {
         primary.unsupported.store(true, Ordering::Relaxed);
         assert!(!composite.supports_search());
         assert!(is_unsupported(composite.search(&tenant, &query).await));
+    }
+
+    /// `supports_history` is the history providers' answer, and `false` when
+    /// the composite has none, which is when every history method answers
+    /// `UnsupportedCapability`.
+    #[tokio::test]
+    async fn supports_history_follows_the_history_providers() {
+        let tenant = make_tenant();
+        let without = make_composite_no_secondary();
+        assert!(!without.supports_history());
+        assert!(matches!(
+            without
+                .history_type(&tenant, "Patient", &HistoryParams::new())
+                .await,
+            Err(StorageError::Backend(
+                BackendError::UnsupportedCapability { .. }
+            ))
+        ));
+
+        #[cfg(feature = "sqlite")]
+        {
+            let primary = Arc::new(crate::backends::sqlite::SqliteBackend::in_memory().unwrap());
+            primary.init_schema().unwrap();
+            let config = CompositeConfig::builder()
+                .primary("primary", BackendKind::Sqlite)
+                .build()
+                .unwrap();
+            let mut backends = HashMap::new();
+            backends.insert("primary".to_string(), primary.clone() as DynStorage);
+            let with = CompositeStorage::new(config, backends)
+                .unwrap()
+                .with_full_primary(primary);
+            assert!(with.supports_history());
+            assert!(
+                with.history_type(&tenant, "Patient", &HistoryParams::new())
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    /// A history provider whose `supports_history()` is the given answer. It
+    /// refuses every history read: only the answer is under test.
+    struct FixedHistoryAnswer(bool);
+
+    impl FixedHistoryAnswer {
+        fn refused<T>() -> StorageResult<T> {
+            Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "fixed-history".to_string(),
+                capability: "history".to_string(),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl ResourceStorage for FixedHistoryAnswer {
+        fn backend_name(&self) -> &'static str {
+            "fixed-history"
+        }
+
+        async fn create(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            MockStorage
+                .create(tenant, resource_type, resource, fhir_version)
+                .await
+        }
+
+        async fn create_or_update(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            MockStorage
+                .create_or_update(tenant, resource_type, id, resource, fhir_version)
+                .await
+        }
+
+        async fn read(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            MockStorage.read(tenant, resource_type, id).await
+        }
+
+        async fn update(
+            &self,
+            tenant: &TenantContext,
+            current: &StoredResource,
+            resource: Value,
+        ) -> StorageResult<StoredResource> {
+            MockStorage.update(tenant, current, resource).await
+        }
+
+        async fn delete(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<()> {
+            MockStorage.delete(tenant, resource_type, id).await
+        }
+
+        async fn count(
+            &self,
+            tenant: &TenantContext,
+            resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            MockStorage.count(tenant, resource_type).await
+        }
+    }
+
+    #[async_trait]
+    impl VersionedStorage for FixedHistoryAnswer {
+        async fn vread(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _version_id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update_with_match(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _expected_version: &str,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            Self::refused()
+        }
+
+        async fn delete_with_match(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _expected_version: &str,
+        ) -> StorageResult<()> {
+            Self::refused()
+        }
+
+        async fn list_versions(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl InstanceHistoryProvider for FixedHistoryAnswer {
+        fn supports_history(&self) -> bool {
+            self.0
+        }
+
+        async fn history_instance(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _params: &HistoryParams,
+        ) -> StorageResult<crate::core::HistoryPage> {
+            Self::refused()
+        }
+
+        async fn history_instance_count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<u64> {
+            Self::refused()
+        }
+    }
+
+    #[async_trait]
+    impl TypeHistoryProvider for FixedHistoryAnswer {
+        async fn history_type(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _params: &HistoryParams,
+        ) -> StorageResult<crate::core::HistoryPage> {
+            Self::refused()
+        }
+
+        async fn history_type_count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+        ) -> StorageResult<u64> {
+            Self::refused()
+        }
+    }
+
+    #[async_trait]
+    impl SystemHistoryProvider for FixedHistoryAnswer {
+        async fn history_system(
+            &self,
+            _tenant: &TenantContext,
+            _params: &HistoryParams,
+        ) -> StorageResult<crate::core::HistoryPage> {
+            Self::refused()
+        }
+
+        async fn history_system_count(&self, _tenant: &TenantContext) -> StorageResult<u64> {
+            Self::refused()
+        }
+    }
+
+    /// Having history providers is not enough: the composite answers `true`
+    /// only when both its instance and its system history provider answer
+    /// `true`, so a primary whose `supports_history()` is `false` keeps the
+    /// composite's `false`.
+    #[test]
+    fn supports_history_is_the_providers_answer_not_their_presence() {
+        for (instance, system) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut composite = make_composite_no_secondary();
+            composite.history_provider =
+                Some(Arc::new(FixedHistoryAnswer(instance)) as DynInstanceHistoryProvider);
+            composite.system_history_provider =
+                Some(Arc::new(FixedHistoryAnswer(system)) as DynSystemHistoryProvider);
+            assert_eq!(
+                composite.supports_history(),
+                instance && system,
+                "instance {instance}, system {system}"
+            );
+        }
+    }
+
+    /// `serves_search_param` follows the provider `search` reaches, as
+    /// `supports_search` does: the dedicated Search backend when one is
+    /// configured, the primary's provider otherwise, and `false` with none.
+    #[test]
+    fn serves_search_param_follows_the_provider_search_reaches() {
+        let serves = |composite: &CompositeStorage, code: &str| {
+            composite.serves_search_param("Patient", code, SearchParamType::Token)
+        };
+        let (mut composite, _primary, _search) = make_composite_with_dedicated_search(
+            vec![fake_patient("primary-id")],
+            vec![fake_patient("search-id")],
+        );
+        assert!(serves(&composite, "search"));
+        assert!(!serves(&composite, "primary"));
+
+        composite.search_providers.remove("search");
+        assert!(serves(&composite, "primary"));
+        assert!(!serves(&composite, "search"));
+
+        composite.search_providers.remove("primary");
+        assert!(!serves(&composite, "primary"));
+
+        let (composite, _primary) =
+            make_composite_no_search_backend(vec![fake_patient("primary-id")]);
+        assert!(serves(&composite, "primary"));
+        assert!(!serves(&composite, "search"));
     }
 
     #[test]

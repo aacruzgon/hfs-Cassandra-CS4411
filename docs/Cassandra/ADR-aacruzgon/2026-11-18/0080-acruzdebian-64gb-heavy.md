@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0080: `acruzdebian` has 64 GB: its runner cap goes to 40G, it takes heavy jobs, and `cargo clippy (helios-fhir)` sets its cargo job count from the runner's cap
 
 - **Date:** 2026-11-18
-- **Status:** accepted
+- **Status:** accepted; amended by [ADR-aacruzgon-0082](../2026-11-20/0082-mutation-flakiness-medium-tier.md) (the jobs it called heavy fit 20G and move to `hfs-cassandra-medium`; `hfs-cassandra-heavy` comes off `sam-7900x`, so heavy means `acruzdebian` only); amended by [ADR-aacruzgon-0086](../2026-11-24/0086-acruzdebian-second-runner-instance.md) (`acruzdebian`'s 40G is split into two runner instances of 20G each, so `cargo clippy (helios-fhir)` picks 1 job there too)
 - **Context:**
     - **`acruzdebian` now has 64 GB of RAM** (`MemTotal` 65,773,824 kB), up from the 15 GB that ADR-aacruzgon-0023 sized it for. Its runner service was still capped at `MemoryMax=9G`, and it still had only `hfs-cassandra-light`.
     - **The heavy queue still waited for `sam-7900x`.** On 2026-11-18 the two clippy checks and `Cassandra tests (all FHIR versions)` of several runs from 2026-11-17 sat queued for `hfs-cassandra-heavy` while `sam-7900x` was off, and every light job of the same runs had already passed on `acruzdebian`. So no pull request could merge without Sam's rig or an admin bypass (ADR-aacruzgon-0019, 0023).
@@ -19,7 +19,7 @@
     - **A cap of 20G, the same as `sam-7900x`:** lost. A peak measured on one machine would then hold on the other, but the clippy pair could not build faster on `acruzdebian`, which is the only gain the extra memory gives a job that must also fit 20G.
     - **A cap of 32G:** lost. It is just enough for the two 12.8 GB units side by side, with too thin a margin once the rest of the build is added.
     - **Run the `CONTRIBUTING.md` clippy command as one job on an `acruzdebian`-only label:** lost. It would make `acruzdebian` the only machine that can run a required check, which is the single point of failure ADR-aacruzgon-0023 removed. It would also rename required checks.
-    - **A second runner instance on `acruzdebian`:** not taken now. Two instances on one machine would share `CASSANDRA_HOST_PORT` (`fhir-versions.yml` and `cassandra-coverage.yml` both use 59242), the Compose project names and the persistent target directories, which all assume one job at a time per machine.
+    - **A second runner instance on `acruzdebian`:** not taken now. Two instances on one machine would share `CASSANDRA_HOST_PORT` (`fhir-versions.yml` and `cassandra-coverage.yml` both use 59242), the Compose project names and the persistent target directories, which all assume one job at a time per machine. *Update 2026-11-24:* taken in ADR-aacruzgon-0086, with each instance at 20G. The persistent target directories turned out to be per instance already (each runner's own `_work`). The ports and Compose projects get a per-instance slot, `HFS_CI_SLOT`, and every CI port moves below 32768. rustup, `taiki-e/install-action`'s temporary directory and the weekly prune were the other shared parts.
     - **Move `coverage.yml` from GitHub-hosted runners to the self-hosted ones:** not taken in this change. It would put the Codecov token on a personal desktop and is its own decision.
 - **Consequences:**
     - **Every required check runs while either machine is on.** A merge no longer needs `sam-7900x`.

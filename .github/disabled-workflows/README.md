@@ -45,6 +45,13 @@ guard from ADR-aacruzgon-0018 first. Follow-up CI, including
 adapting the benchmark to Cassandra/PostgreSQL, runs on the self-hosted runners
 (ADR-aacruzgon-0018).
 
+`docker-lint.yml` came with the 2026-11-24 upstream sync (HeliosSoftware/hfs#2591)
+and was moved here before that sync merged, as every workflow a sync adds is
+(ADR-aacruzgon-0022). It runs on GitHub-hosted `ubuntu-latest` on any pull
+request that changes `Dockerfile`, `.dockerignore` or `.hadolint.yaml`, and
+uses `actions/checkout` by tag, so the repository's SHA-pinning setting would
+fail it before its first step.
+
 `cassandra-integration.yml` is intentionally empty. Implement its triggers and
 jobs before moving it into `.github/workflows/`; an empty active workflow would
 fail validation.

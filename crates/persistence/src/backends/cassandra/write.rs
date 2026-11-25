@@ -26,9 +26,13 @@
 //!    key, so a date key both versions have is only re-inserted (IW7);
 //!    insert `K(N+1)`. Every row of one partition goes as one unit; the
 //!    units are packed into logged batches of at most 4,864 wire bytes,
-//!    never splitting a unit (a unit over the limit goes alone, as one
-//!    batch), and the batches go at once, at most 8 in
-//!    flight (IW9 B, IW11, IW12; [`CassandraBackend::write_index_delta`]).
+//!    never splitting a unit for its bytes (a unit over the limit goes
+//!    alone, as one batch). A unit of more than 65,535 statements, the
+//!    native protocol's limit, is split into pieces of whole rows, all at
+//!    `ts(N+1)`, each its own batch; the `resources_by_type` unit is never
+//!    split (ADR-aacruzgon-0089, amending IW11). The batches go at once, at
+//!    most 8 in flight (IW9 B, IW11, IW12;
+//!    [`CassandraBackend::write_index_delta`]).
 //! 6. I2, the intent delete.
 //!
 //! Steps 4 and 5 take plain inputs ([`VersionRow`], [`VersionKeys`], a
@@ -1124,7 +1128,8 @@ pub(crate) type IndexRow<'a> = (&'a IndexKey, DateTime<Utc>);
 /// the inserts and the deletes of that partition together. The writer sends
 /// a unit whole, except one of more than [`MAX_BATCH_STATEMENTS`] statements,
 /// which [`index_batches`] splits into pieces of at most that many; the
-/// `resources_by_type` unit is never split (IW9 B, ADR-sam-michaels-0006; see
+/// `resources_by_type` unit is never split (IW9 B, ADR-sam-michaels-0006;
+/// the split is ADR-aacruzgon-0089's; see
 /// [`CassandraBackend::write_index_delta`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct IndexUnit<'a> {
@@ -1465,7 +1470,8 @@ fn retry_pause(attempt: u32) -> Duration {
 
 /// A delta's units, packed into batches.
 struct IndexBatches {
-    /// Each batch's statements: whole units, in the delta's order.
+    /// Each batch's statements: whole units, or one piece of a unit over
+    /// [`MAX_BATCH_STATEMENTS`], in the delta's order.
     batches: Vec<Vec<IndexStatement>>,
     /// What the batches hold (IW14).
     stats: IndexWriteStats,
@@ -1482,7 +1488,11 @@ struct IndexBatches {
 /// the unit's statement order (inserts, then deletes); each piece is its own
 /// batch, being far over [`MAX_BATCH_BYTES`], and is counted in the stats on
 /// its own. The `resources_by_type` unit holds one or two statements per
-/// resource and is never split (IW9 B: `count` reads that partition).
+/// resource and is never split (IW9 B: `count` reads that partition). This
+/// split amends IW11 (ADR-aacruzgon-0089): the pieces all carry `ts`, so
+/// their order does not matter and a failed one keeps the intent, but one
+/// partition's rows no longer apply as one mutation, so a reader can see
+/// some of them new and some old until the last piece lands.
 fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatches {
     // (inserts, deletes, statements) of each piece, in the delta's order.
     let mut pieces: Vec<(u64, u64, Vec<IndexStatement>)> = Vec::new();
@@ -2635,7 +2645,8 @@ impl CassandraBackend {
         IndexOutcome { result, stats }
     }
 
-    /// Sends one packed batch of an index delta, whole units of it (IW9 B),
+    /// Sends one packed batch of an index delta, whole units of it, or one
+    /// piece of a unit over the statement limit (IW9 B, ADR-aacruzgon-0089),
     /// through [`CassandraSession::batch`](super::session::CassandraSession::batch)
     /// (IW13): one logged batch at `LOCAL_QUORUM`, or a plain write for a
     /// lone statement; either way the driver never re-sends it, so one try is
@@ -3825,8 +3836,10 @@ mod tests {
         assert_eq!(stats.largest_batch_bytes, wire_bytes(batch) as u64);
     }
 
-    /// IW11: a unit is every row of one partition and is never split, even
-    /// when it alone is over the batch limit: it goes as one batch.
+    /// IW11: a unit is every row of one partition and is never split for
+    /// its bytes, even when it alone is over the byte limit: it goes as one
+    /// batch. (Only a unit over the statement limit is split, see
+    /// `a_unit_over_the_statement_limit_is_split_and_the_type_unit_never_is`.)
     #[test]
     fn an_oversized_unit_is_sent_as_one_batch() {
         let lu1 = at("2026-11-16T10:00:00.000Z");
@@ -4209,7 +4222,8 @@ mod tests {
         ]
     }
 
-    /// IW11 (gate): the packer never splits a partition's rows, and with the
+    /// IW11 (gate): the packer never splits a partition's rows for their
+    /// bytes (none here is near the statement limit), and with the
     /// 1,024-byte mapping every batch of several units stays within the
     /// bound, in the worst case (a 64-byte tenant): six long identifiers, and
     /// one row whose param, system and code are each 1,024 bytes, which goes

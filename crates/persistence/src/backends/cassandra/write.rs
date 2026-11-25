@@ -6083,6 +6083,15 @@ mod node_tests {
                 .await
                 .is_empty()
         );
+        // The rows the sweep restored.
+        let versions: Vec<i32> = version_rows(&backend, &tenant)
+            .await
+            .into_iter()
+            .map(|(version, _, _)| version)
+            .collect();
+        assert_eq!(versions, vec![2, 1]);
+        assert_eq!(by_type_versions(&backend, &tenant).await, vec![2]);
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
     }
 
     /// IW15, IW17: an index batch the node refuses as `Invalid` is tried

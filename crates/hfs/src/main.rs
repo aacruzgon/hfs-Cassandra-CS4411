@@ -4843,6 +4843,19 @@ async fn start_cassandra(
     );
     spawn_cassandra_search_param_refresh(backend.clone(), &config);
 
+    // The index sweeper (ADR-sam-michaels-0006, SW1): one per process, in
+    // the shutdown-managed worker pool, so shutdown cancels it between
+    // intents (SW3). The backend never starts one itself.
+    if backend.config().sweeper_enabled {
+        let pools = worker_shutdown::pools();
+        let shutdown = pools.token();
+        let sweeper = backend.clone();
+        pools.spawn(async move { sweeper.run_sweeper(shutdown).await });
+        info!("Cassandra index sweeper started");
+    } else {
+        info!("Cassandra index sweeper is off (HFS_CASSANDRA_SWEEPER_ENABLED=false)");
+    }
+
     let ui_tenants: Option<Arc<dyn ResourceStorage>> =
         Some(backend.clone() as Arc<dyn ResourceStorage>);
     let ops = OperationsBundle {

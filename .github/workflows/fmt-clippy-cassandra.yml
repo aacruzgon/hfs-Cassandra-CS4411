@@ -1023,7 +1023,7 @@ jobs:
             grep -E '\[index-consistency .* defects=[1-9]' <<<"$clean" || true
             echo '```'
             echo
-            echo '`pending_index_writes` tablestats:'
+            echo "\`pending_index_writes\` tablestats:"
             echo
             echo '```'
             cat "$dir/outbox-tablestats.txt"

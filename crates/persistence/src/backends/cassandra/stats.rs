@@ -150,8 +150,9 @@ cas_counters! {
     /// Extractions that failed for the whole resource, so the version kept
     /// only its `resources_by_type` row (IW1, D6).
     extraction_fallbacks,
-    /// Bytes of `data` and of `index_keys` that the compare-and-swaps sent
-    /// carried, added up over every attempt (IW21).
+    /// Bytes of `data` and `index_keys` of every compare-and-swap attempted,
+    /// counted with `attempts` just before it is sent (an attempt whose
+    /// prepare failed counts too) (IW21).
     cas_payload_bytes,
 }
 
@@ -358,7 +359,8 @@ impl CasCounters {
         }
     }
 
-    /// What one compare-and-swap carried, `data` plus `index_keys` (IW21).
+    /// What one compare-and-swap attempt carries, `data` plus `index_keys`,
+    /// counted before it is sent (IW21).
     pub(crate) fn cas_payload(&self, bytes: u64) {
         self.cas_payload_bytes.fetch_add(bytes, Ordering::Relaxed);
     }

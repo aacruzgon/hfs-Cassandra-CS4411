@@ -1956,7 +1956,7 @@ HFS_CASSANDRA_CONTACT_POINTS=127.0.0.1:9042 \
   ./target/release/hfs
 ```
 
-**Keyspaces written before index writes (roadmap row 5.1).** A resource written before row 5.1 has only its `resources_by_type` row. Its next write adds its token, date and URI rows, but nothing adds them to a resource that is never written again, so search would miss it. Drop and reload every keyspace written before row 5.1, once: drop the keyspace, apply `keyspace-single-node.cql` and `schema.cql` again, and load the data again (ADR-sam-michaels-0006, RW6). CI starts every run from a fresh keyspace.
+**Keyspaces written before index writes (roadmap row 5.1).** A resource written before row 5.1 has only its `resources_by_type` row. Its next write adds its token, date and URI rows, but nothing adds them to a resource that is never written again, so search would miss it. Drop and reload every keyspace written before row 5.1, once: drop the keyspace, apply the keyspace file it was created with again (`docs/Cassandra/schema/keyspace-single-node.cql`, or `docker/cassandra/keyspace-three-node.cql` for the three-node cluster at RF 3), then `schema.cql`, and load the data again from its source files (ADR-sam-michaels-0006, RW6). CI starts every run from a fresh keyspace.
 
 The connection settings are read by `CassandraConfig::from_env` (`src/backends/cassandra/config.rs`), and an invalid value fails startup:
 

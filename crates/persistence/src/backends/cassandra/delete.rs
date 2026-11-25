@@ -773,10 +773,11 @@ mod node_tests {
     /// T-8, T-13, the statements a delete costs, and no CQL `DELETE` on
     /// `resources` or `resource_versions`: tripwires on every write and CAS
     /// that names either table in a `FROM` clause (only a `DELETE` does) are
-    /// still armed afterwards, so the delete sent none. Its one `DELETE` is
-    /// X1's, on `resources_by_type`.
+    /// still armed afterwards, so the delete sent none. Its only `DELETE`s are
+    /// the `k` rows of K(N), in one batch (IW9, IW14); the tripwires show that
+    /// none names `resources` or `resource_versions`.
     #[tokio::test]
-    async fn a_delete_writes_the_marker_and_removes_only_the_x1_row() {
+    async fn a_delete_writes_the_marker_and_deletes_only_index_rows() {
         let Some(backend) = backend().await else {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;

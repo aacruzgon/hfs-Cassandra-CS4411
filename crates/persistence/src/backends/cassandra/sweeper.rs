@@ -30,10 +30,11 @@
 //!   so only the rows of `K(V-1)` that version `V` replaced are deleted; no
 //!   version row and no insert is written (SW11).
 //!
-//! A missing version row, a key set that does not decode, a `write_ts` that
-//! is not `write_ts_of(last_updated)`, and a write the node refuses as
-//! `Invalid` are bugs, never an empty set (SW13): they are logged at `error`,
-//! counted, and the intent row is kept. A `SearchParameter` that was replayed
+//! A missing version row, a key set that does not decode, and a `write_ts`
+//! that is not `write_ts_of(last_updated)` are bugs, never an empty set
+//! (SW13): they are logged at `error`, counted, and the intent row is kept. A
+//! write the node refuses as `Invalid` is counted and logged the same way, and
+//! its intent row is kept too. A `SearchParameter` that was replayed
 //! is also put back in the registry overlay (SW19).
 //!
 //! # Marks, slices and the startup scan (SW8 to SW10)
@@ -59,7 +60,10 @@
 //! An intent that failed goes to an in-memory list, retried after 5 s, 10 s,
 //! 20 s and so on up to 5 min, and dropped only 24 hours after it was
 //! enqueued. A bug (an invariant) is tried 3 times and then left on the
-//! intent row until its TTL. The list holds at most [`RETRY_LIST_CAP`]
+//! intent row until its TTL. A write the node refused is tried 3 times 5 s
+//! apart, then every 5 min until the same 24 hours: it is the node's settings,
+//! not the stored rows, and an operator can fix those without restarting HFS
+//! (ADR-aacruzgon-0090). The list holds at most [`RETRY_LIST_CAP`]
 //! entries; when it is full the intent's shard keeps its mark, so the next
 //! poll reads it again. The intent row is never deleted for a failure.
 //!
@@ -410,6 +414,9 @@ pub(crate) enum Queued {
     GaveUp,
     /// Not added: the list is full. The caller holds its partition's mark (SW18).
     Overflow,
+    /// Kept: a write the node refused (`PermanentWrite`) for the third time or later, tried again at
+    /// `next_at`, `RETRY_MAX` on (ADR-aacruzgon-0090). `first` on the third, which logs at `error`.
+    Refused { next_at: DateTime<Utc>, first: bool },
 }
 
 impl RetryList {
@@ -442,7 +449,11 @@ impl RetryList {
     }
 
     /// Records a failed try at `now`. Backoff after the k-th transient failure: `min(RETRY_FIRST x 2^(k-1), RETRY_MAX)`;
-    /// an invariant failure is retried after `RETRY_FIRST` and counts toward `INVARIANT_TRIES`.
+    /// an invariant failure is retried after `RETRY_FIRST` and counts toward `INVARIANT_TRIES`. A write the node
+    /// refused (`PermanentWrite`) is not a bug in the stored rows but the node's settings, which an operator can
+    /// fix without restarting HFS: after its third try it stays on the list, tried every `RETRY_MAX`, until the
+    /// retry horizon (SW18; ADR-aacruzgon-0090). It never gives up, and a full list holds its mark as for a
+    /// transient failure.
     pub(crate) fn failed(
         &mut self,
         intent: Intent,
@@ -455,8 +466,10 @@ impl RetryList {
             return Queued::Expired;
         }
         if !self.entries.contains_key(&key) && self.entries.len() >= self.cap {
-            // A bug is tried three times however full the list is (SW13); a transient failure holds the mark (SW18).
-            if matches!(failure, Failure::Invariant(_)) {
+            // A bug is tried three times however full the list is (SW13); a transient failure, or a write the
+            // node refused, holds the mark (SW18).
+            if matches!(failure, Failure::Invariant(invariant) if invariant != Invariant::PermanentWrite)
+            {
                 let seen = self.overflow_seen;
                 let tries = {
                     let (_, tries) = self.overflow_tries.entry(key.clone()).or_insert((seen, 0));
@@ -496,6 +509,17 @@ impl RetryList {
             Failure::Transient(_) => {
                 entry.failures += 1;
                 entry.next_at = now + backoff(entry.failures);
+            }
+            Failure::Invariant(Invariant::PermanentWrite) => {
+                entry.invariant_failures += 1;
+                if entry.invariant_failures >= INVARIANT_TRIES {
+                    entry.next_at = now + retry_max();
+                    return Queued::Refused {
+                        next_at: entry.next_at,
+                        first: entry.invariant_failures == INVARIANT_TRIES,
+                    };
+                }
+                entry.next_at = now + retry_first();
             }
             Failure::Invariant(_) => {
                 entry.invariant_failures += 1;
@@ -788,7 +812,7 @@ impl SweeperCounters {
 
     fn queued(&self, queued: Queued) {
         match queued {
-            Queued::Retry { .. } => Self::add(&self.retries, 1),
+            Queued::Retry { .. } | Queued::Refused { .. } => Self::add(&self.retries, 1),
             Queued::Expired => Self::add(&self.retry_expired, 1),
             Queued::GaveUp => Self::add(&self.invariant_gave_up, 1),
             Queued::Overflow => Self::add(&self.overflow, 1),
@@ -1507,6 +1531,20 @@ impl CassandraBackend {
         self.sweeper.counters.queued(queued);
         match queued {
             Queued::Retry { .. } => false,
+            Queued::Refused { first, .. } => {
+                if first {
+                    tracing::error!(
+                        tenant_id = %intent.tenant_id,
+                        resource_type = %intent.resource_type,
+                        id = %intent.id,
+                        version_id = intent.version_id,
+                        "the node refused an intent's writes three times; the sweeper tries it again every \
+                         5 minutes until 24 hours after it was enqueued (check the node's settings against \
+                         crates/persistence/README.md, \"Node settings HFS depends on\")"
+                    );
+                }
+                false
+            }
             Queued::Expired => {
                 report.gave_up += 1;
                 tracing::error!(
@@ -2178,6 +2216,61 @@ mod tests {
         assert_eq!(full.failed(c.clone(), transient, t0), Queued::Overflow);
         assert_eq!(full.failed(c.clone(), transient, t0), Queued::Overflow);
         assert!(!full.owns(&c, t0));
+    }
+
+    /// ADR-aacruzgon-0090: a write the node refused is tried three times at `RETRY_FIRST`, then every
+    /// `RETRY_MAX` until the horizon. It never gives up, and a full list holds its mark.
+    #[test]
+    fn a_refused_write_stays_on_the_retry_list_until_the_horizon() {
+        let t0 = at("2026-11-22T10:00:00Z");
+        let i = intent("i", t0);
+        let refused = Failure::Invariant(Invariant::PermanentWrite);
+        let mut list = RetryList::new(RETRY_LIST_CAP);
+        let five = t0 + chrono::Duration::seconds(5);
+        assert_eq!(
+            list.failed(i.clone(), refused, t0),
+            Queued::Retry { next_at: five }
+        );
+        assert_eq!(
+            list.failed(i.clone(), refused, t0),
+            Queued::Retry { next_at: five }
+        );
+        let later = t0 + chrono::Duration::minutes(5);
+        assert_eq!(
+            list.failed(i.clone(), refused, t0),
+            Queued::Refused {
+                next_at: later,
+                first: true
+            }
+        );
+        assert!(list.owns(&i, t0));
+        assert!(list.due(later - chrono::Duration::seconds(1)).is_empty());
+        assert_eq!(list.due(later), vec![i.clone()]);
+        let near = t0 + chrono::Duration::hours(24) - chrono::Duration::seconds(1);
+        assert_eq!(
+            list.failed(i.clone(), refused, near),
+            Queued::Refused {
+                next_at: near + chrono::Duration::minutes(5),
+                first: false
+            }
+        );
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            list.failed(i.clone(), refused, t0 + chrono::Duration::hours(24)),
+            Queued::Expired
+        );
+        assert_eq!(list.len(), 0);
+
+        let mut full = RetryList::new(1);
+        let (a, b) = (intent("a", t0), intent("b", t0));
+        assert!(matches!(
+            full.failed(a, Failure::Transient("index"), t0),
+            Queued::Retry { .. }
+        ));
+        for _ in 0..4 {
+            assert_eq!(full.failed(b.clone(), refused, t0), Queued::Overflow);
+        }
+        assert!(!full.owns(&b, t0));
     }
 
     /// P4: at most 32 statements in flight, the startup scan at most 8 of them.
@@ -3372,6 +3465,72 @@ mod node_tests {
         assert!(intents(&backend, &t, "p", since).await.is_empty());
         assert_consistent(&check(&backend, &t).await);
         say("permanent", &backend, &before);
+    }
+
+    /// ADR-aacruzgon-0090: a replay the node refuses as `Invalid` three times (a node set below what HFS
+    /// needs) stays on the retry list, so once the node takes the write again, the same process finishes it
+    /// at the next `RETRY_MAX` retry, without a restart. Before, it gave up and the resource stayed out of
+    /// `count` and search until a restart or the intent's TTL.
+    #[tokio::test]
+    async fn a_refused_replay_is_finished_once_the_node_takes_it() {
+        let Some((backend, t, tenant, since)) = start("sweeper-refused").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 1, async move {
+            b.create(&ten, "Patient", patient(), version).await
+        })
+        .await;
+        for _ in 0..3 {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resources_by_type",
+                Fault::FailWithInvalid,
+            );
+        }
+        let start_mark = Utc::now() - chrono::Duration::minutes(2);
+        let state = SweepState::new(start_mark, CancellationToken::new());
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        let now = Utc::now() + chrono::Duration::seconds(40);
+        let mut gave_up = 0;
+        // Three refused tries 6 s apart, then two polls before the 5 minute retry is due.
+        for step in [0, 6, 12, 18, 24] {
+            rewind(&state, start_mark);
+            let report = backend
+                .poll_once(&state, now + chrono::Duration::seconds(step), &scope)
+                .await;
+            gave_up += report.gave_up;
+        }
+        let refused = backend.sweeper_stats().since(&before);
+        assert_eq!(gave_up, 0);
+        assert_eq!(
+            (
+                refused.invariant_violations,
+                refused.invariant_gave_up,
+                refused.done
+            ),
+            (3, 0, 0),
+            "{refused}"
+        );
+        assert_eq!(state.retry.lock().len(), 1);
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+        assert!(rbt_rows(&backend, &t, "p").await.is_empty());
+        assert_eq!(count(&backend, &tenant).await, 0);
+
+        // The faults are spent: the node takes the write. The retry due 5 minutes after the third try finishes it.
+        rewind(&state, start_mark);
+        let report = backend
+            .poll_once(&state, now + chrono::Duration::seconds(12 + 5 * 60), &scope)
+            .await;
+        assert_eq!((report.current, report.done), (1, 1), "{report}");
+        assert_eq!(state.retry.lock().len(), 0);
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_eq!(rbt_rows(&backend, &t, "p").await.len(), 1);
+        assert_eq!(count(&backend, &tenant).await, 1);
+        assert_consistent(&check(&backend, &t).await);
+        say("refused", &backend, &before);
     }
 
     /// N12: a transient failure keeps the intent for the next try.

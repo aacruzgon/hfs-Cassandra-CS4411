@@ -190,6 +190,42 @@ pub(crate) struct Slice {
     pub(crate) to: DateTime<Utc>,
 }
 
+/// What one slice read gave: each row as an intent, or `Err` with its tenant when the row does not decode
+/// and that column alone does.
+#[derive(Debug)]
+pub(crate) struct SliceRead {
+    pub(crate) rows: Vec<Result<Intent, Option<String>>>,
+    /// The node's tombstone warnings on the read (SW10).
+    pub(crate) warnings: u64,
+}
+
+impl SliceRead {
+    /// The rows that decoded, in every scope.
+    pub(crate) fn decoded(self) -> Vec<Intent> {
+        self.rows.into_iter().filter_map(Result::ok).collect()
+    }
+}
+
+/// The intents of `rows` in `scope`, and how many rows in scope do not decode. A row whose tenant is not
+/// readable either counts only for a scope of every tenant.
+pub(crate) fn in_scope(
+    rows: Vec<Result<Intent, Option<String>>>,
+    scope: &SweepScope,
+) -> (Vec<Intent>, u64) {
+    let mut intents = Vec::new();
+    let mut undecodable = 0;
+    for row in rows {
+        match row {
+            Ok(intent) if scope.covers(&intent.tenant_id) => intents.push(intent),
+            Ok(_) => {}
+            Err(Some(tenant)) if scope.covers(&tenant) => undecodable += 1,
+            Err(None) if *scope == SweepScope::All => undecodable += 1,
+            Err(_) => {}
+        }
+    }
+    (intents, undecodable)
+}
+
 /// `[from, to)`, both truncated to whole milliseconds, cut at every UTC multiple of `len` (an hour or a
 /// minute); each piece's bucket is `bucket_of(piece.from)` (SW5). Empty when `from >= to`.
 pub(crate) fn plan_slices(
@@ -877,7 +913,7 @@ pub struct SweepReport {
     pub done: u64,
     /// Transient failures (SW18); their intent rows stay.
     pub failed: u64,
-    /// Invariant failures (SW13); their intent rows stay.
+    /// Invariant failures (SW13), and undecodable intent rows in scope; their rows stay.
     pub invariant: u64,
     /// Poll only: intents the full retry list could not take.
     pub overflow: u64,
@@ -1290,13 +1326,14 @@ impl CassandraBackend {
         report
     }
 
-    /// I3 for one slice: its intents, and the node's tombstone warnings on it (SW10). Undecodable rows are logged at
-    /// `error`, counted as `invariant_violations`, and left out.
+    /// I3 for one slice: its rows, and the node's tombstone warnings on it (SW10). A row that does not
+    /// decode is logged at `error`, counted as `invariant_violations`, and kept as `Err` with its tenant
+    /// when that column alone reads, so a pass can count it in scope.
     pub(crate) async fn read_slice(
         &self,
         slice: &Slice,
         rank: Rank,
-    ) -> Result<(Vec<Intent>, u64), DriverError> {
+    ) -> Result<SliceRead, DriverError> {
         let (rows, warnings) = {
             let _permit = self.sweeper.permits(rank, 1).await;
             self.session
@@ -1314,10 +1351,10 @@ impl CassandraBackend {
                 )
                 .await?
         };
-        let mut intents = Vec::with_capacity(rows.len());
+        let mut decoded = Vec::with_capacity(rows.len());
         for row in &rows {
             match decode_intent(slice, row) {
-                Some(intent) => intents.push(intent),
+                Some(intent) => decoded.push(Ok(intent)),
                 None => {
                     self.sweeper.counters.invariant();
                     tracing::error!(
@@ -1326,10 +1363,14 @@ impl CassandraBackend {
                         invariant = "unreadable_intent",
                         "an intent row does not decode; it is left in the outbox"
                     );
+                    decoded.push(Err(row.get_r_by_name("tenant_id").ok()));
                 }
             }
         }
-        Ok((intents, warnings))
+        Ok(SliceRead {
+            rows: decoded,
+            warnings,
+        })
     }
 
     /// One slice: read it, keep the intents in scope, try each.
@@ -1351,7 +1392,7 @@ impl CassandraBackend {
             overflow: false,
         };
         self.sweeper.counters.slice_tried(rank == Rank::Startup);
-        let (intents, warnings) = match self.read_slice(slice, rank).await {
+        let read = match self.read_slice(slice, rank).await {
             Ok(read) => read,
             Err(error) => {
                 self.sweeper.counters.slice_failed();
@@ -1366,12 +1407,11 @@ impl CassandraBackend {
                 return outcome;
             }
         };
-        self.sweeper.counters.tombstones(warnings);
-        outcome.report.tombstone_warnings = warnings;
-        let mut intents: Vec<Intent> = intents
-            .into_iter()
-            .filter(|intent| scope.covers(&intent.tenant_id))
-            .collect();
+        self.sweeper.counters.tombstones(read.warnings);
+        outcome.report.tombstone_warnings = read.warnings;
+        let (mut intents, undecodable) = in_scope(read.rows, scope);
+        // An intent row that does not decode stays in the outbox, so the pass is not complete.
+        outcome.report.invariant += undecodable;
         // The retry list owns an intent it holds, or gave up on: its backoff, not this read, decides.
         if let Some(state) = state {
             let mut retry = state.retry.lock();
@@ -2181,6 +2221,30 @@ mod tests {
     #[test]
     fn sweeper_stats_subtract_counters_keep_gauges_and_print_every_pair() {
         let counters = SweeperCounters::default();
+    /// Rows of one slice, in scope or not, decoded or not (the node plants nothing that does not decode).
+    #[test]
+    fn undecodable_intent_rows_count_only_in_scope() {
+        let t0 = at("2026-11-25T10:00:00Z");
+        let mut in_a = intent("a", t0);
+        in_a.tenant_id = "test-a".into();
+        let mut in_b = intent("b", t0);
+        in_b.tenant_id = "other".into();
+        let rows = || {
+            vec![
+                Ok(in_a.clone()),
+                Ok(in_b.clone()),
+                Err(Some("test-a".to_string())),
+                Err(Some("other".to_string())),
+                Err(None),
+            ]
+        };
+        let (intents, undecodable) = in_scope(rows(), &SweepScope::Tenants(vec!["test-a".into()]));
+        assert_eq!((intents, undecodable), (vec![in_a.clone()], 1));
+        let (intents, undecodable) = in_scope(rows(), &SweepScope::TenantPrefix("test-".into()));
+        assert_eq!((intents, undecodable), (vec![in_a.clone()], 1));
+        let (intents, undecodable) = in_scope(rows(), &SweepScope::All);
+        assert_eq!((intents, undecodable), (vec![in_a, in_b], 3));
+    }
         counters.polled();
         counters.polled();
         counters.set_lag_ms(3);
@@ -2350,7 +2414,11 @@ mod node_tests {
         let to = Utc::now() + chrono::Duration::milliseconds(1);
         let mut found = Vec::new();
         for slice in plan_slices(shard, since, to, startup_slice()) {
-            let (intents, _) = backend.read_slice(&slice, Rank::Normal).await.unwrap();
+            let intents = backend
+                .read_slice(&slice, Rank::Normal)
+                .await
+                .unwrap()
+                .decoded();
             found.extend(
                 intents
                     .into_iter()
@@ -2517,7 +2585,11 @@ mod node_tests {
         assert_eq!(slices[1].from, edge);
         let mut found = Vec::new();
         for slice in &slices {
-            let (read, _) = backend.read_slice(slice, Rank::Normal).await.unwrap();
+            let read = backend
+                .read_slice(slice, Rank::Normal)
+                .await
+                .unwrap()
+                .decoded();
             found.push(
                 read.into_iter()
                     .filter(|intent| intent.tenant_id == t)
@@ -2542,7 +2614,11 @@ mod node_tests {
             .unwrap();
         assert_eq!((report.no_row, report.done), (3, 3), "{report}");
         for slice in &slices {
-            let (read, _) = backend.read_slice(slice, Rank::Normal).await.unwrap();
+            let read = backend
+                .read_slice(slice, Rank::Normal)
+                .await
+                .unwrap()
+                .decoded();
             assert!(read.iter().all(|intent| intent.tenant_id != t));
         }
         say("edges", &backend, &before);
@@ -3531,7 +3607,11 @@ mod node_tests {
         let slice = &plan_slices(old_key.shard(), old - minute, old + minute, startup_slice())[0];
         let mut left = 0;
         for slice in plan_slices(slice.shard, old - minute, old + minute, startup_slice()) {
-            let (read, _) = backend.read_slice(&slice, Rank::Normal).await.unwrap();
+            let read = backend
+                .read_slice(&slice, Rank::Normal)
+                .await
+                .unwrap()
+                .decoded();
             left += read.iter().filter(|intent| intent.tenant_id == t).count();
         }
         assert_eq!(left, 0, "the old intent row is gone");

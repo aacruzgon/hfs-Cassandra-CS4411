@@ -681,7 +681,9 @@ mod node_tests {
         let spent = backend.statement_counts().since(&before);
         eprintln!("[statements op=update {spent}]");
         // R1; V3, I1, V1, I2 sent alone; one C2. K(2) and K(1) hold `k` keys
-        // each (the same content, so the same rows), so the index step is one
+        // each (the body changes only `name.family`, a string parameter, which
+        // has no index row, and `meta`, which is not extracted, so both sets
+        // have the same keys), so the index step is one
         // batch of `k` inserts and `k` deletes: every row's `last_updated`
         // changed, and the batch is small enough to hold them all (IW9 B,
         // IW14).

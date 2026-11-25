@@ -118,7 +118,8 @@ use uuid::Uuid;
 
 use super::backend::CassandraBackend;
 use super::batch::{
-    BatchFailure, IndexCql, IndexStatement, MAX_BATCH_BYTES, classify_failure, pack, wire_bytes,
+    BatchFailure, IndexCql, IndexStatement, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS,
+    classify_failure, pack, wire_bytes,
 };
 #[cfg(test)]
 use super::checkpoint::Checkpoint;
@@ -1145,7 +1146,9 @@ pub(crate) type IndexRow<'a> = (&'a IndexKey, DateTime<Utc>);
 
 /// Every row of a delta that lives in one partition ([`IndexKey::partition`]):
 /// the inserts and the deletes of that partition together. The writer sends
-/// a unit whole and never splits one (IW9 B, ADR-sam-michaels-0006; see
+/// a unit whole, except one of more than [`MAX_BATCH_STATEMENTS`] statements,
+/// which [`index_batches`] splits into pieces of at most that many; the
+/// `resources_by_type` unit is never split (IW9 B, ADR-sam-michaels-0006; see
 /// [`CassandraBackend::write_index_delta`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct IndexUnit<'a> {
@@ -1494,39 +1497,65 @@ struct IndexBatches {
 
 /// Packs `delta`'s units into batches (IW11): each unit's statements at
 /// `ts`, sized by [`wire_bytes`], then [`pack`]ed in order under
-/// [`MAX_BATCH_BYTES`]. A unit is never split, so one over the limit on its
-/// own goes alone, as one batch over it.
+/// [`MAX_BATCH_BYTES`]. A unit is not split for its bytes, so one over that
+/// limit on its own goes alone, as one batch over it.
+///
+/// A unit of more than [`MAX_BATCH_STATEMENTS`] statements is split, since
+/// the native protocol counts a batch's statements in 16 bits and a longer
+/// batch would wrap. It becomes consecutive pieces of at most that many, in
+/// the unit's statement order (inserts, then deletes); each piece is its own
+/// batch, being far over [`MAX_BATCH_BYTES`], and is counted in the stats on
+/// its own. The `resources_by_type` unit holds one or two statements per
+/// resource and is never split (IW9 B: `count` reads that partition).
 fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatches {
-    let units: Vec<_> = delta
-        .units
+    // (inserts, deletes, statements) of each piece, in the delta's order.
+    let mut pieces: Vec<(u64, u64, Vec<IndexStatement>)> = Vec::new();
+    for unit in &delta.units {
+        let statements = unit_statements(key, delta, unit, ts);
+        debug_assert!(
+            statements.len() <= MAX_BATCH_STATEMENTS
+                || !unit
+                    .inserts
+                    .iter()
+                    .chain(&unit.deletes)
+                    .any(|(index_key, _)| matches!(index_key, IndexKey::ResourcesByType)),
+            "the resources_by_type unit is never split"
+        );
+        let inserts = unit.inserts.len();
+        let mut start = 0;
+        let mut rest = statements;
+        while !rest.is_empty() {
+            let tail = rest.split_off(rest.len().min(MAX_BATCH_STATEMENTS));
+            let end = start + rest.len();
+            let piece_inserts = inserts.clamp(start, end) - start;
+            pieces.push((
+                piece_inserts as u64,
+                (rest.len() - piece_inserts) as u64,
+                rest,
+            ));
+            start = end;
+            rest = tail;
+        }
+    }
+    let sizes: Vec<usize> = pieces
         .iter()
-        .map(|unit| (unit, unit_statements(key, delta, unit, ts)))
-        .collect();
-    let sizes: Vec<usize> = units
-        .iter()
-        .map(|(_, statements)| wire_bytes(statements))
+        .map(|(_, _, statements)| wire_bytes(statements))
         .collect();
     let mut stats = IndexWriteStats::default();
-    let mut units = units.into_iter();
+    let mut pieces = pieces.into_iter();
     let batches = pack(&sizes, MAX_BATCH_BYTES)
         .into_iter()
         .map(|range| {
             let bytes: usize = sizes[range.clone()].iter().sum();
-            let packed: Vec<_> = units.by_ref().take(range.len()).collect();
+            let packed: Vec<_> = pieces.by_ref().take(range.len()).collect();
             stats.batch(
-                packed
-                    .iter()
-                    .map(|(unit, _)| unit.inserts.len() as u64)
-                    .sum(),
-                packed
-                    .iter()
-                    .map(|(unit, _)| unit.deletes.len() as u64)
-                    .sum(),
+                packed.iter().map(|(inserts, _, _)| inserts).sum(),
+                packed.iter().map(|(_, deletes, _)| deletes).sum(),
                 bytes as u64,
             );
             packed
                 .into_iter()
-                .flat_map(|(_, statements)| statements)
+                .flat_map(|(_, _, statements)| statements)
                 .collect()
         })
         .collect();
@@ -2576,7 +2605,8 @@ impl CassandraBackend {
     /// sweeper 1 per pass and repair 1. Every caller computes
     /// `ts = write_ts_of(lu(V))` for the version `delta` writes.
     ///
-    /// - **Packed, never split** (IW9 B, IW11). The units are packed in order
+    /// - **Packed, split only past the statement limit** (IW9 B, IW11). The
+    ///   units are packed in order
     ///   into batches of at most [`MAX_BATCH_BYTES`] by [`wire_bytes`]
     ///   ([`index_batches`]). A unit is every row of one partition, which
     ///   Cassandra applies whole on each replica; above all, once the batch
@@ -2586,7 +2616,10 @@ impl CassandraBackend {
     ///   unfinished update or delete, and one too low after an unfinished
     ///   create or revive, until the sweeper or repair finishes it; and on
     ///   RF 3, twice or not at all through read repair after a batch that
-    ///   reached fewer than a quorum. A unit over the bound goes alone.
+    ///   reached fewer than a quorum. A unit over the byte bound goes alone;
+    ///   one of more than [`MAX_BATCH_STATEMENTS`] statements, never the
+    ///   `resources_by_type` unit, is split into consecutive pieces of at
+    ///   most that many, each its own batch.
     /// - **All at once, at most [`INDEX_BATCHES_IN_FLIGHT`] in flight**
     ///   (IW12), as futures inside the request's own task, never
     ///   `tokio::spawn`, so a request that is dropped, or a crash test that
@@ -3912,6 +3945,67 @@ mod tests {
                 INSERT_RESOURCES_BY_TYPE.as_str(),
                 DELETE_RESOURCES_BY_TYPE.as_str()
             ]
+        );
+    }
+
+    /// IW11: a unit of more than `MAX_BATCH_STATEMENTS` statements is split
+    /// into consecutive pieces, in statement order; the `resources_by_type`
+    /// unit, which holds one or two statements per resource, is never split.
+    /// Pure: nothing reaches a node.
+    #[test]
+    fn a_unit_over_the_statement_limit_is_split_and_the_type_unit_never_is() {
+        let lu = at("2026-11-16T10:00:00.000Z");
+        let ts = write_ts_of(lu);
+        let mut next = vec![IndexKey::ResourcesByType];
+        next.extend((0..70_000).map(|i| IndexKey::TokenSystem {
+            param: "identifier".to_string(),
+            system: "s".to_string(),
+            code: i.to_string(),
+        }));
+        let delta = index_delta(&[], version_keys(&next, lu));
+        assert_eq!(delta.units.len(), 2, "the type unit, and one token unit");
+        let packed = index_batches(&key(), &delta, ts);
+        let sizes: Vec<usize> = packed.batches.iter().map(Vec::len).collect();
+        assert!(
+            sizes.iter().all(|&n| n <= MAX_BATCH_STATEMENTS),
+            "{sizes:?}"
+        );
+        assert_eq!(sizes.iter().sum::<usize>(), 70_001);
+        let type_batches = packed
+            .batches
+            .iter()
+            .filter(|batch| {
+                batch
+                    .iter()
+                    .any(|s| s.cql() == INSERT_RESOURCES_BY_TYPE.as_str())
+            })
+            .count();
+        assert_eq!(type_batches, 1, "the type key's insert is in one batch");
+        let stats = packed.stats;
+        assert_eq!(stats.rows_inserted, 70_001);
+        assert_eq!(stats.rows_deleted, 0);
+        assert_eq!(stats.batches as usize, packed.batches.len());
+
+        // Pieces keep the statement order, and a delete lands in the piece
+        // it falls in: 65,535 inserts, then the rest of them and a delete.
+        let previous_key = IndexKey::TokenSystem {
+            param: "identifier".to_string(),
+            system: "s".to_string(),
+            code: "old".to_string(),
+        };
+        let lu0 = at("2026-11-15T10:00:00.000Z");
+        let delta = index_delta(&[(&previous_key, lu0)], version_keys(&next[1..], lu));
+        let packed = index_batches(&key(), &delta, ts);
+        assert_eq!(packed.batches.len(), 2);
+        assert_eq!(packed.batches[1].len(), 70_001 - MAX_BATCH_STATEMENTS);
+        assert_eq!(
+            packed.batches[1].last().map(IndexStatement::cql),
+            Some(DELETE_TOKEN_SYSTEM.as_str()),
+            "the delete is the unit's last statement"
+        );
+        assert_eq!(
+            (packed.stats.rows_inserted, packed.stats.rows_deleted),
+            (70_000, 1)
         );
     }
 

@@ -3863,7 +3863,6 @@ mod node_tests {
         let Some((backend, t, _, since)) = start("planted-sweeper-write-ts").await else {
             return;
         };
-        let before = backend.sweeper_stats();
         let blob = index_keys::encode(&[IndexKey::ResourcesByType]);
         let lu = whole_ms(Utc::now());
         // "current": version 2 is the row, and its write_ts is not write_ts_of(its last_updated).
@@ -3914,6 +3913,23 @@ mod node_tests {
                 .unwrap();
             planted.push((id, intent_key));
         }
+        // Each is refused for its `write_ts`, not for anything a replay would reach after the check: neither
+        // resource has a version row 1, so a replay that skipped the check would stop at `MissingVersionRow`,
+        // which the counts below cannot tell apart.
+        for (id, case) in [
+            ("current", IntentCase::Current),
+            ("superseded", IntentCase::Superseded),
+        ] {
+            let found = pending(&backend, &t, id, since).await;
+            let result = backend.process_intent(&found[0], Rank::Normal).await;
+            assert_eq!(result.case, Some(case), "{id}");
+            assert_eq!(
+                result.result,
+                Err(Failure::Invariant(Invariant::WriteTsMismatch)),
+                "{id}"
+            );
+        }
+        let before = backend.sweeper_stats();
         let gave_up = five_polls(&backend, &t).await;
         let delta = backend.sweeper_stats().since(&before);
         assert_eq!(delta.invariant_violations, 6, "{delta}");

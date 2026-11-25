@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0085: Step 7 starts before Step 6, in phases; Cassandra answers `supports_search() == false` until Step 6; the parameter hook takes #2593's per-parameter shape
 
 - **Date:** 2026-11-22
-- **Status:** accepted
+- **Status:** accepted; phase 5 superseded by ADR-aacruzgon-0087 (upstream-first as HeliosSoftware/hfs#2775, without the history hook)
 - **Context:**
     - **The defect.** A Cassandra server's `GET /metadata` advertises what the backend refuses (roadmap CS-4 / G1, ADR-aacruzgon-0064 item 8). Reproduced through `hfs` on a single node, with the code of `main` `c9ff363d7` for each half (see "Verified"):
         - `history-instance` and `history-type` on every resource type (`crates/rest/src/handlers/capabilities.rs:443-461`) and `history-system` at system level (`:222`). Cassandra answers all three `501` by design (design scope table; ADR-sara-lahourpour-0002 (PR #102) keeps the history suites out of Step 4).

@@ -206,10 +206,11 @@ async fn pending(
     let to = Utc::now() + chrono::Duration::milliseconds(1);
     let mut found = Vec::new();
     for slice in plan_slices(shard, since, to, chrono::Duration::minutes(1)) {
-        let (intents, _) = backend
+        let intents = backend
             .read_slice(&slice, Rank::Normal)
             .await
-            .expect("read a slice");
+            .expect("read a slice")
+            .decoded();
         found.extend(
             intents
                 .into_iter()

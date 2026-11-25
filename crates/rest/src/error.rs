@@ -301,6 +301,27 @@ pub enum RestError {
         message: String,
     },
 
+    /// A SQL query (`$sql-run`, `$sql-export`) ran out of its configured time
+    /// limit, `HFS_SOF_SQLQUERY_TIMEOUT_SECS`: its own SQL, a SQL View's, or
+    /// the materialization of a ViewDefinition it depends on (HTTP 504, code
+    /// `timeout`, #2577). Same status and code as [`RestError::GatewayTimeout`],
+    /// and for the same reasons (no `Retry-After`: the query is deterministically
+    /// too slow for the budget), but the advice the client gets is about the
+    /// query, not about search parameters.
+    SqlQueryTimeout {
+        /// The limit, in seconds, as configured.
+        secs: u64,
+    },
+
+    /// The store stopped a statement of a ViewDefinition at its time limit
+    /// (HTTP 504, code `timeout`, #2577). Same status and code as
+    /// [`RestError::GatewayTimeout`], and like it no `Retry-After`, but the
+    /// advice the client gets is about the view, not about search parameters.
+    ViewTimeout {
+        /// The store's own text, for the server log only.
+        message: String,
+    },
+
     /// Not implemented (HTTP 501).
     NotImplemented {
         /// Description of what's not implemented.
@@ -470,6 +491,12 @@ impl fmt::Display for RestError {
             }
             RestError::GatewayTimeout { message } => {
                 write!(f, "Backend timeout: {}", message)
+            }
+            RestError::SqlQueryTimeout { secs } => {
+                write!(f, "SQL query timeout: exceeded {}s", secs)
+            }
+            RestError::ViewTimeout { message } => {
+                write!(f, "View statement timeout: {}", message)
             }
             RestError::NotImplemented { feature } => {
                 write!(f, "Not implemented: {}", feature)
@@ -653,6 +680,33 @@ impl RestError {
                         .to_string(),
                 )
             }
+            RestError::ViewTimeout { message } => {
+                // As `GatewayTimeout`: the store's text (SQLSTATE, driver
+                // wording) is the operator's, the client gets advice it can
+                // act on and nothing that names the backend.
+                tracing::warn!(
+                    error.detail = %message,
+                    "backend cancelled a view statement at its server-side time limit"
+                );
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    "The view exceeded the server's time limit for a single statement. \
+                     Narrow it — a 'where' in the ViewDefinition, fewer columns, or a \
+                     'patient', 'group', '_since' or '_limit' parameter — and try again."
+                        .to_string(),
+                )
+            }
+            RestError::SqlQueryTimeout { secs } => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+                format!(
+                    "The SQL query exceeded the server's {secs}-second time limit. Each \
+                     ViewDefinition it depends on is materialized in full before the query \
+                     runs: narrow those views (a 'where', fewer columns) or simplify the query, \
+                     and try again."
+                ),
+            ),
             RestError::NotImplemented { feature } => (
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",
@@ -1120,6 +1174,8 @@ impl From<SearchError> for RestError {
             | SearchError::TerminologyRequired { .. } => RestError::NotImplemented {
                 feature: err.to_string(),
             },
+            // A chain hop through a type the token may not search (#2501).
+            SearchError::ChainHopRefused { message } => RestError::Forbidden { message },
             SearchError::TooManyResults { count, max } => RestError::UnprocessableEntity {
                 message: format!("Search returned {} results, maximum is {}", count, max),
             },
@@ -1254,6 +1310,7 @@ impl From<BackendError> for RestError {
             // 500. Their raw detail is sanitized and logged by
             // `RestError::client_response`, never leaked to the client.
             BackendError::MigrationError { .. }
+            | BackendError::InvalidConfiguration { .. }
             | BackendError::Internal { .. }
             | BackendError::QueryError { .. }
             | BackendError::SerializationError { .. } => RestError::InternalError {
@@ -1766,6 +1823,10 @@ mod tests {
         let faults = vec![
             BackendError::MigrationError {
                 message: "column \"foo\" already exists".to_string(),
+            },
+            BackendError::InvalidConfiguration {
+                backend_name: "postgres".to_string(),
+                message: "sslrootcert /etc/pg/ca.pem: No such file".to_string(),
             },
             BackendError::Internal {
                 backend_name: "sqlite".to_string(),

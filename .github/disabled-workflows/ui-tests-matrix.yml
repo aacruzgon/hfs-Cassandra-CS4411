@@ -58,7 +58,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       # GC *before* the matrix rather than after it. This suite pulls the
       # multi-GB Playwright image on top of Elasticsearch, Postgres and Mongo,
@@ -141,7 +141,7 @@ jobs:
       PW_CONTAINER: ui-e2e-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Download HFS binary
         uses: actions/download-artifact@v8
@@ -247,7 +247,7 @@ jobs:
             --label hfs-ci=true \
             --label github.run_id=${{ github.run_id }} \
             --label github.workflow=ui-tests-matrix \
-            mongo:7.0.48 --replSet rs0 --bind_ip_all
+            -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 mongo:9.0.8 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
 

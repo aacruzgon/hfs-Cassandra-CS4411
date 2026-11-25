@@ -1782,7 +1782,7 @@ impl CassandraBackend {
     }
 
     /// SW11's superseded case: `R` is a row of a version above V. Deletes the rows of `K(V-1)` that
-    /// version V replaced; never an insert, and no version row.
+    /// version V replaced, that is `K(V-1)` minus `K(V)` by row identity; never an insert, and no version row.
     async fn replay_superseded(
         &self,
         key: &RowKey<'_>,
@@ -1816,7 +1816,13 @@ impl CassandraBackend {
             .iter()
             .map(|key| (key, previous.last_updated))
             .collect();
-        let delta = index_delta(
+        // K(V-1) minus K(V), by row identity: a row version V also has (a date row both versions
+        // share) was written at `ts(V)` and a delete at `ts(V)` would win the tie (IW7).
+        let kept = match stored.index_keys.as_deref().map(index_keys::decode) {
+            Some(Ok(keys)) => keys,
+            _ => return Replay::failed(Failure::Invariant(Invariant::UnreadableKeys)),
+        };
+        let mut delta = index_delta(
             &previous_rows,
             VersionKeys {
                 version_id: version,
@@ -1825,9 +1831,14 @@ impl CassandraBackend {
                     .fhir_version
                     .as_deref()
                     .unwrap_or_else(|| row.fhir_version_text()),
-                keys: &[],
+                keys: &kept,
             },
         );
+        // Never an insert: version V's own rows are its request's or its replay's to write.
+        for unit in &mut delta.units {
+            unit.inserts.clear();
+        }
+        delta.units.retain(|unit| !unit.deletes.is_empty());
         if delta.units.is_empty() {
             return Replay {
                 result: Ok(()),
@@ -2580,6 +2591,42 @@ mod node_tests {
         say("current", &backend, &before);
     }
 
+    /// A Patient born on `date`, so its version has a date row as well as the token rows.
+    fn born(date: &str) -> serde_json::Value {
+        serde_json::json!({
+            "resourceType": "Patient",
+            "id": "p",
+            "active": true,
+            "birthDate": date
+        })
+    }
+
+    /// The `date_index` rows of `Patient/p`'s `birthdate`: `(start, version_id)`.
+    async fn birth_date_rows(backend: &CassandraBackend, t: &str) -> Vec<(DateTime<Utc>, i32)> {
+        backend
+            .session
+            .rows(
+                "SELECT start, version_id FROM date_index WHERE tenant_id = ? \
+                 AND resource_type = ? AND param = ?",
+                vec![
+                    Value::from(t),
+                    Value::from("Patient"),
+                    Value::from("birthdate"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("date_index")
+            .iter()
+            .map(|row| {
+                (
+                    row.get_r_by_name("start").unwrap(),
+                    row.get_r_by_name("version_id").unwrap(),
+                )
+            })
+            .collect()
+    }
+
     /// N4: a superseded intent deletes only the rows of the version before it.
     #[tokio::test]
     async fn a_superseded_intent_deletes_only_the_rows_of_the_version_before_it() {
@@ -2589,14 +2636,14 @@ mod node_tests {
         let before = backend.sweeper_stats();
         let version = test_fhir_version();
         let p = backend
-            .create(&tenant, "Patient", patient(), version)
+            .create(&tenant, "Patient", born("1970-01-01"), version)
             .await
             .unwrap();
-        let k1 = stored_keys(&backend, &t, "p").await;
+        let k1 = keys(&row_of(&backend, &t, "p").await);
         let lu1 = row_of(&backend, &t, "p").await.last_updated;
         let (b, ten) = (backend.clone(), tenant.clone());
         crash(&backend, Checkpoint::AfterCas, &t, "p", 2, async move {
-            b.update(&ten, &p, changed()).await
+            b.update(&ten, &p, born("1980-02-02")).await
         })
         .await;
         let v2 = backend
@@ -2604,7 +2651,10 @@ mod node_tests {
             .await
             .unwrap()
             .unwrap();
-        backend.update(&tenant, &v2, patient()).await.unwrap();
+        backend
+            .update(&tenant, &v2, born("1970-01-01"))
+            .await
+            .unwrap();
         let lu3 = row_of(&backend, &t, "p").await.last_updated;
         assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu3, 3), (lu1, 1)]);
         assert_eq!(count(&backend, &tenant).await, 2);
@@ -2636,6 +2686,8 @@ mod node_tests {
             "{spent}"
         );
         assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu3, 3)]);
+        // A, B, A: the date row of version 1 is not version 2's, and version 3 wrote it again.
+        assert_eq!(birth_date_rows(&backend, &t).await.len(), 1);
         assert_eq!(count(&backend, &tenant).await, 1);
         assert!(intents(&backend, &t, "p", since).await.is_empty());
         assert_eq!(
@@ -2644,6 +2696,52 @@ mod node_tests {
         );
         assert_consistent(&check(&backend, &t).await);
         say("superseded", &backend, &before);
+    }
+
+    /// A superseded replay deletes `K(V-1)` minus `K(V)`: a date row that version V also has stays.
+    #[tokio::test]
+    async fn a_superseded_replay_keeps_a_date_row_its_version_still_has() {
+        let Some((backend, t, tenant, since)) = start("sweeper-superseded-date").await else {
+            return;
+        };
+        let version = test_fhir_version();
+        let p = backend
+            .create(&tenant, "Patient", born("1970-01-01"), version)
+            .await
+            .unwrap();
+        // Version 2 has the same date; its rows are written and its I2 is not.
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterIndex, &t, "p", 2, async move {
+            b.update(&ten, &p, born("1970-01-01")).await
+        })
+        .await;
+        // Version 3 has it too; its CAS applied and nothing else.
+        let v2 = backend
+            .read(&tenant, "Patient", "p")
+            .await
+            .unwrap()
+            .unwrap();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 3, async move {
+            b.update(&ten, &v2, born("1970-01-01")).await
+        })
+        .await;
+        let found = pending(&backend, &t, "p", since).await;
+        assert_eq!(
+            found.iter().map(|i| i.version_id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        let first = backend.process_intent(&found[0], Rank::Normal).await;
+        assert_eq!(first.case, Some(IntentCase::Superseded));
+        assert_eq!(first.result, Ok(()));
+        let dates = birth_date_rows(&backend, &t).await;
+        assert_eq!(dates.len(), 1, "the shared date row is kept: {dates:?}");
+        let second = backend.process_intent(&found[1], Rank::Normal).await;
+        assert_eq!(second.case, Some(IntentCase::Current));
+        assert_eq!(second.result, Ok(()));
+        assert_eq!(birth_date_rows(&backend, &t).await.len(), 1);
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
     }
 
     /// N5: the IW24 skip, a later update, and the sweep that settles `count`.

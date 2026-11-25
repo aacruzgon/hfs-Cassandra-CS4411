@@ -1,0 +1,50 @@
+# ADR-aacruzgon-0092: An indexed `instant` is stored as the point `[t, t + 1 ms)`, as `_lastUpdated` already is (amends ADR-sam-michaels-0006, IW4, for `instant` elements)
+
+- **Date:** 2026-11-25
+- **Status:** accepted
+- **Context:**
+    - **The rule being amended.**
+        - ADR-sam-michaels-0006 IW4 (`docs/Cassandra/ADR-sam-michaels/2026-11-16/0006-step-5-design.md:251`) says: "`indexed_range(value, Millis)` gives one `Date` and one `DateByEnd` row in milliseconds. Open ends use sentinels, never null … An unparseable date is dropped".
+        - `indexed_range` gives every point value one unit of its written precision (`crates/persistence/src/search/date_value.rs:52-54`: "A point value — a `date`, `dateTime` or `instant` — covers one unit of its own precision"). So an `instant` written to the second is stored as a one-second range.
+        - IW4 cites no spec page and does not consider `instant`.
+        - The one-unit width is upstream's rule (HeliosSoftware/hfs#1391, PR #1490; `crates/persistence/README.md`, "Date prefix semantics (range targets, #1391)"), not a decision in our logs.
+        - `_lastUpdated` is already a point here: "A stored `last_updated` `t` is a millisecond point, the range `[t, t + 1 ms)`" (`docs/Cassandra/schema/coverage.md:110`).
+    - **What the spec says** (search.html#date, the list of types; descriptive text, no SHALL):
+        - R4, https://hl7.org/fhir/R4/search.html#date: "instant: An instant is considered a fixed point in time with an interval smaller than the precision of the system, i.e. an interval with an effective width of 0".
+        - R4B, https://hl7.org/fhir/R4B/search.html#date: the same sentence.
+        - R5, https://hl7.org/fhir/R5/search.html#date: the same sentence. R5 adds "Note that fractional seconds MAY be ignored by servers". That MAY is about the search value; HFS does not ignore fractions, so it does not apply.
+        - The prefixes (https://hl7.org/fhir/R4/search.html#prefix; R4B the same; R5 equivalent): `eq` "the range of the search value fully contains the range of the target value"; `gt` "the range above the search value intersects (i.e. overlaps) with the range of the target value".
+    - **What was observed** (base `2ae41258e`; the `validate-108-findings` run, `evidence/`):
+        - `DiagnosticReport.issued = "2020-01-01T10:00:00Z"` is missed by `issued=eq2020-01-01T10:00:00.000Z` and matched by `issued=gt2020-01-01T10:00:00.500Z`. The spec gives the opposite for both.
+        - Controls: the same instant written `.000Z` behaves as the spec says, and a `dateTime` with the same text behaves as the spec says for a `dateTime`.
+        - Seen on SQLite through REST (R4, R4B, R5; `evidence/sqlite/<V>/summary.txt`) and on upstream `fb7d12ed5` (`evidence/upstream-fb7d12ed5/sqlite/<V>/summary.txt`).
+        - The Cassandra rows are `date_index (issued, 2020-01-01 10:00:00.000, end 10:00:01.000)` on R4, R4B and R5 (`evidence/cassandra/<V>/cql-rows.txt`).
+        - A throwaway converter edit fixed both searches and left the controls unchanged (`evidence/sqlite-throwaway-fix/`, `evidence/throwaway-fix.diff`).
+- **Decision:**
+    - An indexed value of an element whose type is `instant` is stored as the point `[t, t + 1 ms)` in `date_index` and `date_index_by_end`, as `_lastUpdated` already is.
+    - `date` and `dateTime` values keep one unit of their own precision, and everything else in IW4 stands.
+    - Cassandra needs no code change. IW4 stores whatever `indexed_range(…, Millis)` returns, so this follows the upstream fix to the shared converter (HeliosSoftware/hfs#2962), which must learn the element's type, since it works on untyped JSON. The fork takes it with an upstream sync.
+- **Alternatives considered:**
+    - **Keep the one-unit width for instants.** Lost: it contradicts the spec's definition of an instant's range in all three versions, and it gives wrong answers at millisecond precision, as observed.
+    - **A Cassandra-only override** (detect instant paths in `index_keys_from`). Lost: SQLite, PostgreSQL and MongoDB would still differ, and the fix belongs in the shared code. Changes to upstream's files go upstream-first (roadmap §8).
+    - **Infer an instant from the value's shape.** Lost: a `dateTime` written to the second is legitimately a one-second range, so the shape cannot tell them apart.
+- **Consequences:**
+    - Date searches on `instant` parameters agree with the spec, and with `_lastUpdated`, once the upstream fix is synced. In R4 those include `DiagnosticReport.issued`, `Observation.effectiveInstant` (`date`), `DocumentReference.date`, `Appointment.start`, `Slot.start`, `Bundle.timestamp`, `AuditEvent.recorded` and `Provenance.recorded`.
+    - **Rows written before the fix** keep the one-second range until the resource is written again. They are reloaded as `crates/persistence/README.md` says ("Keyspaces written before index writes": drop the keyspace, apply the keyspace file and `schema.cql`, and load through the running server). The sync that brings the fix should say so in the README note, or add a line to it.
+    - Step 6's date tests need an `instant` case: `eq…:00.000Z` matches and `gt…:00.500Z` does not, with the `dateTime` control.
+    - Revisit if upstream chooses a different representation, for example a resolution-dependent point at PostgreSQL's microseconds. Cassandra stays at milliseconds.
+- **AI involvement:** Claude Code (Claude Opus 5.5), in a validation worker run by Alan.
+    - **The finding.** A spec-check worker reported the finding (its S1). An independent validation worker reproduced it from the claim, on SQLite through REST, as Cassandra rows (R4, R4B, R5), and on upstream `fb7d12ed5`. It showed that a throwaway converter edit changes it, checked IW4 against the spec, and drafted this entry and the upstream issue.
+    - **The decision.** Alan decided to amend IW4.
+    - **What was verified, and how:**
+        - the spec texts, fetched per version (`evidence/spec/`);
+        - the shared code at `2ae41258e` and `fb7d12ed5` (byte-identical `converters.rs`, `date_value.rs` and `extractor.rs`);
+        - the rows on a 5.0.9 node.
+    - **Not verified:** PostgreSQL and MongoDB (code only); instant parameters other than `issued`.
+    - **What the human changed:** Alan approved the draft as written on 2026-11-25.
+- **Links:**
+    - ADR-sam-michaels-0006, IW4 (amended).
+    - Upstream HeliosSoftware/hfs#1391, PR #1490.
+    - Upstream HeliosSoftware/hfs#2962, the shared converter fix this entry waits for (filed 2026-11-25).
+    - `coverage.md` §3 (`_lastUpdated`, `:110`); `crates/persistence/README.md`, "Date prefix semantics" and "Keyspaces written before index writes".
+    - Evidence: the `validate-108-findings` run, `report.md`, "C1" and "ADR decisions to supersede".

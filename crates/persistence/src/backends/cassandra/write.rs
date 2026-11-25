@@ -317,7 +317,10 @@ const INDEX_BATCHES_IN_FLIGHT: usize = 8;
 /// The most a CAS may carry, `data` plus `index_keys`, in bytes (ADR-aacruzgon-0053): half
 /// of the node's default `max_mutation_size` (16 MiB, half of the default
 /// 32 MiB `commitlog_segment_size`), which leaves room for the rest of the
-/// row and for Paxos's own copy of the update.
+/// row and for Paxos's own copy of the update. The CAS's message must also
+/// fit the node's `native_transport_max_message_size`, 16 MiB by default on
+/// a heap of 640 MiB or more (`crates/persistence/README.md`, "Node settings
+/// HFS depends on").
 pub(crate) const MAX_CAS_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 /// Longest FHIR id (`[A-Za-z0-9\-\.]{1,64}`, R4 datatypes.html#id).
 const MAX_ID_LEN: usize = 64;

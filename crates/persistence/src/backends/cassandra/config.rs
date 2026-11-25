@@ -36,7 +36,10 @@ pub const DEFAULT_LOCAL_DC: &str = "helios-dc1";
 pub const DEFAULT_POOL_SIZE: usize = 2;
 /// Default connect timeout, in milliseconds.
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
-/// Default per-statement deadline, in milliseconds.
+/// Default per-statement deadline, in milliseconds. Kept above the node's
+/// own request timeouts (`read_request_timeout` 5 s, `write_request_timeout`
+/// 2 s, `cas_contention_timeout` 1 s, `range_request_timeout` 10 s by
+/// default; `crates/persistence/README.md`, "Node settings HFS depends on").
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 10_000;
 
 /// Longest keyspace name Cassandra accepts.

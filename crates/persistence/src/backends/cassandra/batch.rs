@@ -213,7 +213,10 @@ pub(crate) fn wire_bytes(statements: &[IndexStatement]) -> usize {
 }
 
 /// The most bytes one batch may carry by [`wire_bytes`] (IW11): the node's
-/// `batch_size_warn_threshold` of 5 KiB, less a 256-byte margin.
+/// `batch_size_warn_threshold` of 5 KiB, less a 256-byte margin. It assumes
+/// the node's `batch_size_fail_threshold` (50 KiB by default) stays above it:
+/// below 4,864 bytes the node could refuse a batch of several partitions as
+/// `Invalid` (`crates/persistence/README.md`, "Node settings HFS depends on").
 pub(crate) const MAX_BATCH_BYTES: usize = 5 * 1024 - 256;
 
 /// The most statements one batch may hold (IW11): the native protocol counts
@@ -251,6 +254,14 @@ const _: () = assert!(
 /// (`BatchStatement.java:333-335`), so this is the limit a big unit meets.
 /// The other half leaves room for the frame's own bytes and for a node set
 /// lower. It is the same 8 MiB as `MAX_CAS_PAYLOAD_BYTES`.
+///
+/// It assumes the node's `native_transport_max_message_size` is at least
+/// 8 MiB plus the batch's own few bytes. Unset, that is
+/// `min(max_mutation_size, heap / 10, heap / 40)`
+/// (`DatabaseDescriptor.java:903-905`, `:3237-3245`): 16 MiB on a heap of
+/// 640 MiB or more, 12.8 MiB on 512 MiB, and under 8 MiB on a heap under
+/// about 321 MiB, where a full piece would be refused
+/// (`crates/persistence/README.md`, "Node settings HFS depends on").
 pub(crate) const MAX_PIECE_BYTES: usize = 8 * 1024 * 1024;
 
 /// How many of `statements`, from the first, go in the next piece of a unit

@@ -36,6 +36,19 @@
     7. **`ApplyLate` carries a `write_type`.** The new `Copy` enum `TimeoutWriteType` mirrors
        the driver's `WriteType`, which is not `Copy`. Date bounds are bound as `i64`
        milliseconds, which are the bytes cdrs would send.
+    8. **A partition unit over 65,535 statements is split, except `resources_by_type`'s.**
+       The native protocol sends a batch's statement count in 16 bits, and a one-partition
+       batch is not checked against `batch_size_fail_threshold`, so an update of a Patient
+       with 32,768 identifiers under one system would send a batch whose count wraps. Any
+       other unit is cut, in order, into pieces of at most 65,535 statements.
+       `resources_by_type`'s unit holds one or two statements per resource and is never
+       split, which keeps IW9's reason for whole partitions. This deviates from IW11's "a
+       unit is never split".
+    9. **A debug build extracts on a 64 MiB thread.** FHIRPath's union recursion uses about
+       32 KB of stack per frame in a debug build, and R5's shared parameters (`url`, `name`,
+       `status`, …) union about 60 types, which overflows a 2 MiB test thread. Release
+       builds extract inline: upstream measured 300 nested levels on 2 MiB, and the parser
+       caps expressions at 250. The thread costs about 45 µs a write, in debug builds only.
   - **Pull request 6, sweeper (row 5.2)**
     1. **SW13 against SW18.** SW13 says "try 3 times"; SW18 says the list never drops an
        intent before `enqueued_at` + 24 h. Both stand: transient failures (`TriesExhausted`,
@@ -61,16 +74,30 @@
        `startup_scan_ms`), so it and pull request 7's `RepairStats` edit no common lines.
     8. **RW8's shape:** `ResourceRow` gains `stored_fhir_version`, and the writer's version
        parameters become `&str`, so a replay carries the stored text verbatim.
+    9. **SW11's superseded replay deletes K(V−1) minus K(V), by row identity (IW7).**
+       Deleting all of K(V−1) at `ts(V)` would also delete a row V still has, which V wrote at
+       the same timestamp, and the delete wins the tie.
+    10. **An applied write left unfinished writes a fresh intent before it answers.** When
+        `finish` leaves work (the version row or the index step failed, or the write was
+        superseded), it writes a new intent stamped now, with one try. A writer that stalls
+        between its intent and its CAS for longer than the grace may have its first intent
+        swept as never applied; the fresh one keeps the replay. A second intent for the same
+        version is harmless, since replays are idempotent (SW22). It costs one more write, on
+        failure paths only.
   - **Pull request 7, repair (row 5.3)**
     1. **`MAX_FULL_REPAIR_KEYS = 64`** gives RV1's "about 64 keys". Above it a replay is
-       partial: a found row is re-tagged only when a key of K(current) names the same row by
-       `row_at` (only a date row can); any other found row is deleted.
+       partial and writes only the found rows. A found row whose key K(current) still
+       produces moves to `lu(R1)`; a date row, whose identity has no `last_updated`, is
+       re-tagged in place. Any other found row is deleted. This reads RV1's "delete those the
+       current version does not produce" by key, not by row.
     2. **Budget admission is in queue order.** A repair's size is its delta's inserts plus
        deletes. One that does not fit is skipped (`Budget`), and a later, smaller one may still
        be admitted. Skips for any other reason use no budget.
-    3. **One overall deadline for the repair phase, equal to `request_timeout_ms`.** `run` is
-       `run_within(backend, request_timeout_ms)` over `buffered(4)`, so outcomes keep queue
-       order. A repair the deadline cuts is `Failed { TriesExhausted }`, counted and logged.
+    3. **One overall deadline for the repair phase, equal to `request_timeout_ms`.** Admitted
+       repairs run 4 at a time, unordered; each leaves its outcome in a slot by queue
+       position, so outcomes keep queue order without one slow repair holding up the rest.
+       Skips never enter the stream. A repair the deadline cuts is `Failed { TriesExhausted }`
+       and logged, and if it had started, its delta's rows are counted.
     4. **Undecodable index rows are skipped and counted** (`undecodable_rows`, logged at
        `error`). Nothing returns an error or panics. An unset or undecodable `index_keys` on
        R1 skips the resource. No undecodable row is planted on a node, since one would fail
@@ -83,6 +110,12 @@
     7. **Pull request 7 merges pull request 5's branch,** so its date re-tag test runs on the
        node: without pull request 5 the writer has no statement for a date key. Two planning
        tests also cover the rule without a node.
+    8. **The contract for Step 6.** One repair context per search request, run once per
+       response, so the 32/512 budget is per response, not per page. A filtered
+       `search_count` queues no repairs. The repair phase's deadline is meant to come from the
+       search's remaining time, capped at `request_timeout_ms`; Step 6 adds that entry point.
+       The caller builds each found row's key from the stored values as they are, never
+       through `index_text` again.
   - **Pull request 8, crash tests and the post-suite check (row 5.4)**
     1. **Ten crash tests, not eight.** The plan's list leaves out two of RV17's rows that
        pause or kill Helios: "Paused writer, then a crashed successor (G40)" and "Stale batch
@@ -126,6 +159,14 @@
     tenant.
   - Generalise `cas_counters!` for sweeper and repair counters: lost for now, because two
     pull requests would edit the same lines.
+  - Oversized units, refuse the write before the CAS: lost, a client would get a 4xx for a
+    valid resource that the other backends store.
+  - A swept intent, skip the CAS when too long has passed since the intent: lost, it refuses
+    writes, and SW4 would have to require a grace of at least the request timeout plus 15 s.
+  - Partial repair, always keep `ResourcesByType`: lost, it writes a second type row when
+    only a token row was found, and still drops the found token and URI rows.
+  - Repair concurrency by `buffered(4)` for queue order: lost, one stalled repair stops the
+    ones behind it from starting.
 - **Consequences:**
   - Roadmap row 5.1 and the walkthrough now state 10 keys; any other document that still says
     8 is stale.
@@ -137,18 +178,25 @@
   - Pull request 7 merges after pull request 5, whose date statements its re-tag test needs.
   - The SW26 result is for one node on one host. The 1,000 bound applies to every node in
     CI, so recheck if the compose file's node settings change.
+  - Failure paths send one more write than before, and the tests' statement-count pins
+    include it.
+  - A split unit is no longer applied atomically per partition, so a reader can see part of
+    it. This can happen only in index tables other than `resources_by_type`, where the tag
+    check already hides a row of another version.
 - **AI involvement:**
   - Claude Code (Claude Opus planning and reviewing, Claude Sonnet implementing) planned and
     built pull requests 5 to 8 from ADR-sam-michaels-0006's decisions and proposed the choices
     above. Independent AI reviews checked each pull request against its spec. The reviews
     found, among other things, the startup scan's lost slices, the repair phase's missing
-    overall deadline and a one-day error in the extraction tests' date constants.
+    overall deadline and a one-day error in the extraction tests' date constants. Reviews by
+    Claude Opus, CodeRabbit and Alan Cruz then found the partial repair's lost type row, the
+    superseded replay's date row, the swept-intent gap and the batch statement count.
   - Verified by test runs against the dev node, among them `--lib -- backends::cassandra`
     (283 passed, 2 ignored on pull request 8, ten runs), `cassandra_tests` (179 passed), the
     new crash tests (10 passed) and the extraction tests under R4B, R5 and R6.
   - Sam Michaels chose to run SW26 on a private node started from CI's compose file, not the
     shared dev node, and to have each fixture in another collaborator's file changed by its
-    owner.
+    owner. He also chose the contract for Step 6 (pull request 7, item 8).
 - **Links:**
   - Pull requests 5 to 8: #108 (extraction), #107 (the sweeper), #106 (repair) and #109
     (crash tests and the post-suite check).

@@ -454,7 +454,7 @@ reviews:
     - path: ".github/workflows/**"
       instructions: |
         CI rules (CLAUDE.md "Commits and CI"; ADR-aacruzgon-0018, 0019, 0021,
-        0022, 0023, 0045, 0058, 0080, 0082, 0086):
+        0022, 0023, 0045, 0058, 0080, 0082, 0086, 0087):
         - Every job on a self-hosted runner has the fork guard:
           if: github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
@@ -469,10 +469,11 @@ reviews:
           20G, kept off sam-7900x, a developer's desktop, such as the
           mutation-testing job, which runs only on a pull request labelled
           mutants). Every job must fit 20G. Both machines take light and
-          medium; only acruzdebian's two instances (acruzdebian,
-          acruzdebian-2) take heavy, so no required check may be heavy
-          (ADR-aacruzgon-0080, 0082, 0086). Never the bare hfs-cassandra
-          label in a new job.
+          medium, and only acruzdebian takes heavy; there, only the first
+          instance (acruzdebian) takes medium and heavy, and acruzdebian-2
+          takes light only, so no required check may be heavy
+          (ADR-aacruzgon-0080, 0082, 0086, 0087). Never the bare
+          hfs-cassandra label in a new job.
         - acruzdebian's two runner instances share one Docker daemon and the
           host's ports. A job that starts a single Cassandra node takes its
           Compose project and host port from HFS_CI_SLOT in its first step

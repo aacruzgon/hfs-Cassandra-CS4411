@@ -1,4 +1,4 @@
-# ADR-aacruzgon-0088: This repository's CI on `acruzdebian` joins the host's CI budget: both runner instances and `gh-runner`'s rootless Docker run in `ci-hfs.slice`, one instance takes medium and heavy jobs, every build runs 4 cargo jobs with line-tables-only debug info, and a target-directory reset deletes in the background
+# ADR-aacruzgon-0088: This repository's CI on `acruzdebian` joins the host's CI budget: both runner instances run in `ci-hfs.slice` and `gh-runner`'s rootless Docker under an 8G cap of its own in `user-1005.slice`, one instance takes medium and heavy jobs, every build runs 4 cargo jobs with line-tables-only debug info, and a target-directory reset deletes in the background
 
 - **Date:** 2026-11-25
 - **Status:** accepted
@@ -9,10 +9,9 @@
     - **Our jobs built at one process per thread and full debug info.** No workflow set `CARGO_PROFILE_DEV_DEBUG`, and only the workspace clippy (8) and the GitHub-hosted `coverage.yml` (2) set `CARGO_BUILD_JOBS`. The runner units sit at their 20G `memory.max` all day (`memory.events` `max` 289,250 and 162,759 times since their last start, no OOM kill): page cache.
     - **Every job except fmt compiles**, light ones included, so a heavy label on one instance would not by itself bound our concurrent builds.
 - **Decision:**
-    - **`ci-hfs.slice`, a child of `ci.slice`,** with `MemoryMax=28G`, `MemorySwapMax=0` and `TasksMax=8192`, holds both runner units (each still 20G) and `gh-runner`'s user manager.
-        - **The runner units** move with a `Slice=ci-hfs.slice` drop-in each; `svc.sh` rewrites only its own unit file.
-        - **The user manager** moves with a drop-in on `user@1005.service`, `Slice=ci-hfs.slice`, `MemoryMax=8G`, `MemorySwapMax=0`. Rootless Docker and every container move with it, since a delegated subtree moves with its unit. `user-runtime-dir@1005.service` and any login session of `gh-runner` stay in `user-1005.slice`.
-        - **28G** is the largest medium or heavy job measured (the all-versions build, 15.9 GiB anon cold), the largest light build (coverage, 5.6 GiB in CI) and the user manager's week peak (4.5 GiB): 26.0 GiB, with 2 GiB to spare. **8G** is that week peak with 3.5 GiB to spare.
+    - **`ci-hfs.slice`, a child of `ci.slice`,** with `MemoryMax=28G`, `MemorySwapMax=0` and `TasksMax=8192`, holds both runner units (each still 20G). They move with a `Slice=ci-hfs.slice` drop-in each; `svc.sh` rewrites only its own unit file.
+    - **`gh-runner`'s user manager stays in `user-1005.slice`, under a cap of its own:** a drop-in on that slice, `MemoryMax=8G`, `MemorySwapMax=0` (user@.service(5)'s documented way, as Dynamism caps its users 1006 and 1008). Rootless Docker and every Cassandra container of our jobs run there, outside `ci.slice` but capped. Moving the user manager into `ci-hfs.slice` was tried on the PC and breaks rootless Docker (see Alternatives).
+    - **28G** for the runners alone is the largest medium or heavy job measured (the all-versions build, 15.9 GiB anon cold) and the largest light build (coverage, 5.6 GiB in CI): 21.5 GiB, with 6.5 GiB to spare. **8G** is the user manager's week peak (4.5 GiB) with 3.5 GiB to spare.
     - **Only the first instance, `acruzdebian`, takes `hfs-cassandra-medium` and `hfs-cassandra-heavy`;** `acruzdebian-2` keeps `hfs-cassandra-light` only. So one medium or heavy job runs on the PC at a time, and the second instance still runs fmt, the R4B check, the Cassandra schema job, coverage and the other light checks. `sam-7900x`'s labels do not change.
     - **Every self-hosted workflow that builds sets `CARGO_BUILD_JOBS: 4` and `CARGO_PROFILE_DEV_DEBUG: line-tables-only` in its `env:`.**
         - `cargo clippy (helios-fhir)` keeps its count from the runner's cap (1 under 20G).
@@ -23,7 +22,11 @@
     - **Ledger row:** 1 heavy runner × 4 = 4 (8 counting the light instance's builds).
     - **Order:** labels and the machine steps in my maintenance window, after `ci.slice` exists; then the merge. If `ci.slice` is not installed by then, the setup stops and waits for Muster's; this repository never creates or changes `ci.slice`. No job's `name:`, trigger, `runs-on`, `if:` or `uses:` changes, so the required checks stay as they are.
 - **Alternatives considered:**
-    - **A `MemoryMax=` drop-in on `user-1005.slice`** (user@.service(5)'s documented way; Dynamism caps its users 1006 and 1008 like that): lost. It caps Docker without a restart of the user manager, but leaves our containers outside `ci.slice`, where the host's budget can't see them.
+    - **Moving `user@1005.service` into `ci-hfs.slice`** (a drop-in with `Slice=ci-hfs.slice`, `MemoryMax=8G`, `MemorySwapMax=0`), so the containers count inside `ci.slice`: chosen first, tried on the PC on 2026-11-25, and lost, because rootless Docker then cannot start a container.
+        - **What happened:** from the user manager's restart at 10:21:06 EST, every container start failed: runc `unable to start unit "docker-<id>.scope" (… Slice user.slice …): Interactive authentication required`. Two CI jobs failed on it (PR #114: runs 45644195212 and 45644195570). `busctl --user --no-pager status` as `gh-runner` printed no `OwnerUID`, only `Unit=user@1005.service` and `Slice=ci-hfs.slice`.
+        - **Why, in runc 1.1.15** (Debian's `1.1.15+ds1-2+deb13u1`, the PC's): rootless `dockerd` runs runc as uid 0 in a user namespace, so `shouldUseRootlessCgroupManager` (`rootless_linux.go`, lines 39–45) asks `systemd.DetectUID()` for the bus's owner UID, and on an error assumes 0, which means rootful. `DetectUID` (`libcontainer/cgroups/systemd/user.go`, lines 54–77) reads it only from an `OwnerUID=` line of `busctl --user --no-pager status`. With the rootful manager runc connects to the system bus instead of the user's (`libcontainer/cgroups/systemd/dbus.go`, lines 66–71), and polkit refuses an unprivileged caller.
+        - **Why, in systemd 257.13:** `busctl` prints `OwnerUID=` only when `sd_bus_creds_get_owner_uid()` succeeds (`src/libsystemd/sd-bus/bus-dump.c`, lines 383–385). That function (`bus-creds.c`, lines 553–570) calls `cg_path_get_owner_uid()` (`src/basic/cgroup-util.c`, lines 1427–1451), which takes the right-most slice of the cgroup path (`cg_path_get_slice()`, lines 1464–1490) and accepts only `user-<UID>.slice`. Under `/ci.slice/ci-hfs.slice/user@1005.service/` the right-most slice is `ci-hfs.slice`, so there is no owner UID. sd_bus_creds_get_owner_uid(3) documents it as "the numeric UID … of the user who owns the user unit or login session that the process is a part of", and -ENXIO for a process that is part of neither; the code decides that from the `user-<UID>.slice` alone.
+        - **So** a rootless user manager must stay under `user-<UID>.slice`, and the containers stay outside `ci.slice`. `systemd-run --user --scope` from the host still worked, since it takes the user bus directly.
     - **Leave Docker uncapped:** lost; it is what the host note warns about.
     - **A system-wide rootless `dockerd` in `ci-hfs.slice`:** lost; Docker does not support it ("not supported, even with the `User=` directive").
     - **`acruzdebian-2` drops only `hfs-cassandra-heavy`:** lost. Two cold medium jobs at once are 29.6 to 31.7 GiB anon (all-versions with the clippy pair, or two all-versions), which needs a child of about 36G of a 40G parent.
@@ -37,33 +40,33 @@
     - **A 32G child:** not taken. It would give the page cache 6 GiB instead of 2 in the worst case, but take a bigger share of `ci.slice`.
 - **Consequences:**
     - **Easier:**
-        - Our CI, containers included, stays inside the host's budget, and yields CPU and disk to my own work and to the other projects through `ci.slice`'s weights.
+        - Our runners stay inside the host's budget and yield CPU and disk to my own work and to the other projects through `ci.slice`'s weights; our containers are capped at 8G of their own.
         - Measured cold on the PC on 2026-11-25:
             - the Cassandra job builds as fast as before (289 s against 288 s) at a lower peak (4.3 instead of 4.9 GiB anon), in half the target directory (5.5 instead of 11 GB);
             - the all-versions build's margin under 20G grows from 1.7 to 4.1 GiB (18.3 → 15.9 GiB anon);
             - the mutation job's three cold builds peak at 10.9 GiB anon, where its whole runs at 3 × 16 jobs peaked at 14.9–15.3 GiB in CI.
         - A reset no longer holds the job for its `rm -rf` (1.5 s for 10 GB on an idle PC, Muster's 7.6 s for 8.8 GiB under load).
     - **Harder:**
+        - Our containers (up to 8G) sit outside `ci.slice`, so its `MemoryHigh` and weights do not see them; only their own 8G cap holds them. The host's budget counts our runners only.
         - The medium jobs, two of them required checks, queue on `acruzdebian` alone while `sam-7900x` is off, so a clippy check can wait behind a flakiness run (47 minutes on run 45530008099). The flakiness job could move to light (its build is the required job's, 5.5 GiB anon) if that bites.
         - The workspace clippy is 9 % slower cold (309 s against 283 s at 8). The mutation job is about 3 minutes longer.
         - The first job of each kind on each runner after the merge builds from cold once.
-        - Moving the user manager needs one restart of `user@1005.service`, with both runners stopped.
         - The new caps can OOM-kill in `ci-hfs.slice` if more meets than measured. `memory.events` of the slice shows it.
     - **To measure after the setup:**
         - the first cold coverage build (not measured cold);
-        - two of our jobs at once inside `ci-hfs.slice` (its `memory.peak` and `memory.events`);
+        - two of our jobs at once inside `ci-hfs.slice` (its `memory.peak` and `memory.events`), and `user-1005.slice`'s `memory.peak` against its 8G;
         - our CI beside Muster's under `ci.slice`;
         - the clippy queue on a day `sam-7900x` is off.
 - **AI involvement:**
     - **Tool and model:** Claude Code (Opus 5.5), as the Rex worker `ci-host-budget`, with one Claude subagent that read the systemd and Docker documentation.
     - **What the AI proposed:**
-        - moving `user@1005.service` into the child rather than capping `user-1005.slice`, and the 28G and 8G caps;
+        - moving `user@1005.service` into the child rather than capping `user-1005.slice`, and the 28G and 8G caps. Its test of that move, in a container on the PC's systemd version, checked only where the user manager landed, never a rootless container start, so it missed the failure;
         - `acruzdebian-2` as light only: it first proposed dropping heavy only, and changed that once the measurements showed that two cold medium jobs don't fit;
         - 1 job a build directory for the mutation job, and the debug setting in the reset stamp;
         - the reset steps' rename, background delete and leftover clean-up;
         - the setup guide and its order.
     - **What the human changed:** on 2026-11-25 I chose, from the options the AI laid out in its plan, every one it recommended:
-        - D1: `user@1005.service` moves into `ci-hfs.slice` with `MemoryMax=8G`, not a cap on `user-1005.slice`;
+        - D1: `user@1005.service` moves into `ci-hfs.slice` with `MemoryMax=8G`, not a cap on `user-1005.slice`. After the move broke rootless Docker on the PC, I changed D1 the same day to its option 2: an 8G cap on `user-1005.slice`, the user manager left there;
         - D2: `acruzdebian-2` keeps only `hfs-cassandra-light`, not light and medium;
         - D3: `CARGO_BUILD_JOBS=4` everywhere, the mutation job 3 × 1, not 2 everywhere;
         - D4: `ci-hfs.slice` at `MemoryMax=28G`, not 32G;
@@ -71,21 +74,22 @@
         - D6: the per-directory target caps of ADR-sam-michaels-0002 stay, not a per-instance total;
         - D7: if `ci.slice` is not installed by my maintenance window, I wait for Muster's setup rather than create it.
     - **Verified:**
+        - **The setup on the PC,** on 2026-11-25: run by the orchestrating Claude Code session in a visible pane on `acruzdebian`, with me typing the `sudo` password. The label change on runner 23 at 10:19 EST; sections 2–4 as written, which put both runners and `user@1005.service` in `/ci.slice/ci-hfs.slice/`; then section 5's container test failed as above. The `user@1005.service` drop-in was removed, the `user-1005.slice` drop-in added, and the user manager restarted with section 4's idle-wait script.
         - **Measured on `acruzdebian`** as `acruzgon` without `sudo`, only while no CI job of any project ran (two `pgrep` checks 30 s apart; a build stopped itself when a job started, four times). Cold builds of `origin/main` `0339bd7c2` were sampled every half second in their own cgroup, with a node in its own Compose project, port and 3g limit, removed afterwards (`report-ci-host-budget.md`, its `evidence/`).
         - **CI reports reused:** runs 45408412568, 45522733076, 45566799539, 45484827652, 45496937227, 45530008021, 45533228102, and 0080's 44156440683.
-        - **The `Slice=` drop-in** moved a user manager on systemd 257.13-1~deb13u1 in a container, and the undo moved it back.
+        - **The `Slice=` drop-in** moved a user manager on systemd 257.13-1~deb13u1 in a container, and the undo moved it back; that test started no rootless container.
         - **cargo-llvm-cov** gave identical coverage with debug `true`, `line-tables-only` and `0`.
         - **The reset step,** extracted from all 11 copies and run under `bash -e` in `debian:trixie`: rename, background delete, leftover clean-up and the `rm -rf` fallback. `shellcheck` is clean.
         - **Lint:** `actionlint` 1.7.12 and `zizmor` 1.32.0 report only what they report on `main`, before and after the branch merged `origin/main` `23c5066c6` (PR #113). A script compared every workflow with `origin/main`: only the env lines, the reset steps and their comments changed; no `name:`, trigger, `runs-on`, `if:` or `uses:` line.
         - **Read on the PC with `systemctl show`, `systemd-cgls` and `/sys/fs/cgroup`:** the runner units' and the user manager's slices, caps, drop-ins, `memory.peak`, `pids.peak` and `memory.events`.
-        - **Sources:** systemd.resource-control(5) (`Slice=`, `MemoryMax=`, `EffectiveMemoryMax=`); systemd.slice(5); user@.service(5) ("Controlling resources for logged-in users"); systemd.io/CGROUP_DELEGATION; Docker's rootless tips and troubleshooting pages.
+        - **Sources:** systemd.resource-control(5) (`Slice=`, `MemoryMax=`, `EffectiveMemoryMax=`); systemd.slice(5); user@.service(5) ("Controlling resources for logged-in users"); sd_bus_creds_get_owner_uid(3); systemd.io/CGROUP_DELEGATION; Docker's rootless tips and troubleshooting pages; opencontainers/runc `v1.1.15` (`e835874446078fa58ae952e0ffe00d8fa1ed5ca0`) and systemd/systemd `v257.13` (`2dfae4954463e0ff00797a923907d357e4b2e91d`) at the files and lines named under Alternatives.
         - **Not measured before the decision:**
             - the coverage job's build from cold (only CI's warm 5.6 GiB);
             - two of our jobs at once inside `ci-hfs.slice`, and its `memory.peak` and `memory.events`;
             - our CI beside Muster's and Dynamism's under `ci.slice`;
             - the clippy queue on a day `sam-7900x` is off;
             - `sam-7900x` at 4 jobs (its timings and peaks are from 16);
-            - the `Slice=` drop-in on the PC itself: it was tested in a container on the same systemd version, and the PC's runner units and user manager were only read.
+            - the `Slice=` drop-ins on the PC itself: they were tested in a container on the same systemd version, without a rootless container start, and the PC's runner units and user manager were only read.
 - **Links:**
     - Branch `cassandra/ci-host-budget`.
     - aacruzgon/muster `deploy/ci-runner/HOST-CI-BUDGET.md`, `setup-runner.sh` (steps 7–10) and `job-started.sh`.

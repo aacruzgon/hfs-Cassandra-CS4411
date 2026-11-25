@@ -3339,6 +3339,18 @@ mod node_tests {
         version: i32,
         blob: Vec<u8>,
     ) {
+        plant_resource_with(backend, t, id, version, blob, None).await;
+    }
+
+    /// [`plant_resource`], with `write_ts` stored in place of `write_ts_of(last_updated)` when it is set.
+    async fn plant_resource_with(
+        backend: &CassandraBackend,
+        t: &str,
+        id: &str,
+        version: i32,
+        blob: Vec<u8>,
+        write_ts: Option<i64>,
+    ) {
         let lu = whole_ms(Utc::now());
         backend
             .session
@@ -3355,7 +3367,7 @@ mod node_tests {
                     Value::from(lu),
                     Value::from(lu),
                     Value::from(test_fhir_version().as_mime_param()),
-                    Value::from(write_ts_of(lu)),
+                    Value::from(write_ts.unwrap_or_else(|| write_ts_of(lu))),
                     Value::from(Uuid::new_v4()),
                     Value::from(Blob::from(blob)),
                 ],
@@ -3456,6 +3468,178 @@ mod node_tests {
         assert_eq!(intents(&backend, &t, "p", since).await, vec![2]);
         backend.delete_intent(&intent_key, &key).await;
         say("held-invariant", &backend, &before);
+    }
+
+    /// Five polls that each re-read the whole window, `now` moving 6 s a poll (backoff 5 s, then 10 s).
+    /// Returns how many intents the polls gave up on.
+    async fn five_polls(backend: &CassandraBackend, t: &str) -> u64 {
+        let start_mark = Utc::now() - chrono::Duration::minutes(2);
+        let state = SweepState::new(start_mark, CancellationToken::new());
+        let scope = SweepScope::Tenants(vec![t.to_string()]);
+        let now = Utc::now() + chrono::Duration::seconds(40);
+        let mut gave_up = 0;
+        for step in [0, 6, 12, 18, 24] {
+            rewind(&state, start_mark);
+            let report = backend
+                .poll_once(&state, now + chrono::Duration::seconds(step), &scope)
+                .await;
+            gave_up += report.gave_up;
+        }
+        gave_up
+    }
+
+    /// SW13, `WriteTsMismatch` in both places it is raised: the current replay (`R`'s `write_ts`) and the
+    /// superseded one (version row V's). Each is tried three times and its intent row is kept. The rows are
+    /// planted in a `test-planted-` tenant; they decode, only the stored `write_ts` is wrong, so no scan of
+    /// the node can fail on them.
+    #[tokio::test]
+    async fn a_write_ts_mismatch_is_tried_three_times_and_keeps_its_intent() {
+        let Some((backend, t, _, since)) = start("planted-sweeper-write-ts").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let blob = index_keys::encode(&[IndexKey::ResourcesByType]);
+        let lu = whole_ms(Utc::now());
+        // "current": version 2 is the row, and its write_ts is not write_ts_of(its last_updated).
+        plant_resource_with(
+            &backend,
+            &t,
+            "current",
+            2,
+            blob.clone(),
+            Some(write_ts_of(lu) + 1),
+        )
+        .await;
+        // "superseded": the row is version 3; version row 2 carries the wrong write_ts.
+        plant_resource(&backend, &t, "superseded", 3, blob.clone()).await;
+        backend
+            .session
+            .execute(
+                "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, data, \
+                 last_updated, fhir_version, write_ts, write_id, index_keys) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                vec![
+                    Value::from(t.as_str()),
+                    Value::from("Patient"),
+                    Value::from("superseded"),
+                    Value::from(2),
+                    Value::from("{\"resourceType\":\"Patient\"}"),
+                    Value::from(lu),
+                    Value::from(test_fhir_version().as_mime_param()),
+                    Value::from(write_ts_of(lu) + 1),
+                    Value::from(Uuid::new_v4()),
+                    Value::from(Blob::from(blob)),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect("plant the version row");
+        let mut planted = Vec::new();
+        for (id, version) in [("current", 2), ("superseded", 2)] {
+            let key = RowKey {
+                tenant_id: &t,
+                resource_type: "Patient",
+                id,
+            };
+            let intent_key = IntentKey::new(&t, id, Utc::now());
+            backend
+                .write_intent(&intent_key, &key, Uuid::new_v4(), version)
+                .await
+                .unwrap();
+            planted.push((id, intent_key));
+        }
+        let gave_up = five_polls(&backend, &t).await;
+        let delta = backend.sweeper_stats().since(&before);
+        assert_eq!(delta.invariant_violations, 6, "{delta}");
+        assert_eq!((delta.invariant_gave_up, gave_up), (2, 2));
+        assert_eq!(
+            (delta.case_current, delta.case_superseded),
+            (3, 3),
+            "{delta}"
+        );
+        assert_eq!(delta.done, 0, "{delta}");
+        for (id, intent_key) in planted {
+            assert_eq!(intents(&backend, &t, id, since).await, vec![2]);
+            let key = RowKey {
+                tenant_id: &t,
+                resource_type: "Patient",
+                id,
+            };
+            backend.delete_intent(&intent_key, &key).await;
+        }
+        say("write-ts", &backend, &before);
+    }
+
+    /// SW13, `UnreadableRow` where R1 is read and where R3 is: each is tried three times and its intent row
+    /// is kept. A stored row that does not decode would fail the node's shared scans, so none is planted:
+    /// the node answers the read with a row of another table ([`Fault::AnswerWithForeignRow`]), three times.
+    #[tokio::test]
+    async fn an_unreadable_row_is_tried_three_times_and_keeps_its_intent() {
+        let Some((backend, t, tenant, since)) = start("sweeper-unreadable").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        // R1: an intent with no resource row; the read of `resources` answers with a foreign row.
+        let key = RowKey {
+            tenant_id: &t,
+            resource_type: "Patient",
+            id: "r1",
+        };
+        let intent_key = IntentKey::new(&t, "r1", Utc::now());
+        backend
+            .write_intent(&intent_key, &key, Uuid::new_v4(), 1)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            backend.session.inject_fault(
+                StatementKind::Read,
+                "FROM resources WHERE",
+                Fault::AnswerWithForeignRow,
+            );
+        }
+        let gave_up = five_polls(&backend, &t).await;
+        let delta = backend.sweeper_stats().since(&before);
+        assert_eq!(delta.invariant_violations, 3, "{delta}");
+        assert_eq!((delta.invariant_gave_up, gave_up), (1, 1));
+        assert_eq!(delta.done, 0, "{delta}");
+        assert_eq!(intents(&backend, &t, "r1", since).await, vec![1]);
+        backend.delete_intent(&intent_key, &key).await;
+
+        // R3: a crashed update at version 2; the read of version row 1 answers with a foreign row.
+        let version = test_fhir_version();
+        let p = backend
+            .create(&tenant, "Patient", patient(), version)
+            .await
+            .unwrap();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 2, async move {
+            b.update(&ten, &p, changed()).await
+        })
+        .await;
+        let lu2 = row_of(&backend, &t, "p").await.last_updated;
+        for _ in 0..3 {
+            backend.session.inject_fault(
+                StatementKind::Read,
+                "FROM resource_versions WHERE",
+                Fault::AnswerWithForeignRow,
+            );
+        }
+        let at = backend.sweeper_stats();
+        let gave_up = five_polls(&backend, &t).await;
+        let delta = backend.sweeper_stats().since(&at);
+        assert_eq!(delta.invariant_violations, 3, "{delta}");
+        assert_eq!((delta.invariant_gave_up, gave_up), (1, 1));
+        assert_eq!(delta.done, 0, "{delta}");
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![2]);
+        assert_eq!(version_ids(&backend, &t, "Patient", "p").await, vec![1]);
+
+        // The faults are spent, so a pass heals it.
+        let report = pass(&backend, &[&t], since).await;
+        assert!(report.is_complete(), "{report}");
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu2, 2)]);
+        assert_consistent(&check(&backend, &t).await);
+        say("unreadable", &backend, &before);
     }
 
     /// A startup slice whose read failed is read again by a later poll: the marks start after the

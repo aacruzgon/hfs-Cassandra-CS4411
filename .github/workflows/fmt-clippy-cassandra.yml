@@ -884,14 +884,15 @@ jobs:
           dir="$RUNNER_TEMP/ci-report/inputs/post-suite"
           mkdir -p "$dir" "$RUNNER_TEMP/ci-report/logs"
           log="$RUNNER_TEMP/ci-report/logs/post-suite.log"
+          rc=0
           HFS_TEST_POST_SUITE_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-persistence --features cassandra --lib -- \
               --ignored --exact backends::cassandra::sweeper::post_suite::post_suite_sweep_and_check \
               --nocapture 2>&1 \
-            | tee "$log" || true
+            | tee "$log" || rc=$?
           python3 .github/scripts/ci-report.py intents post-suite-intents \
-            "Intent rows left after the post-suite sweep (R4b)" hfs-cassandra-ci-cassandra-1
-          docker exec -e MAX_HEAP_SIZE=128m hfs-cassandra-ci-cassandra-1 \
+            "Intent rows left after the post-suite sweep (R4b)" "${CASSANDRA_CONTAINER:?}"
+          docker exec -e MAX_HEAP_SIZE=128m "${CASSANDRA_CONTAINER:?}" \
             nodetool tablestats helios.pending_index_writes > "$dir/outbox-tablestats.txt" \
             || echo "nodetool tablestats failed" > "$dir/outbox-tablestats.txt"
           clean="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
@@ -915,8 +916,15 @@ jobs:
           if grep -q 'scan_failed="' <<<"$clean"; then
             echo "::warning title=Post-suite check::the shared index scan failed, so every tenant's check is void: $(grep -oE 'scan_failed="([^"\\]|\\.)*"' <<<"$clean" | head -1)"
           fi
-          grep -Eq '^test result: ok\. 1 passed;' <<<"$clean" \
-            || { echo "::warning title=Post-suite check::post_suite_sweep_and_check did not run exactly once"; exit 1; }
+          # A report step: it warns and ends 0 whatever the check found.
+          if grep -Eq '^test result: ok\. 1 passed;' <<<"$clean"; then
+            :
+          elif [ "$rc" -ne 0 ] && grep -Eq '^test result: FAILED\. 0 passed; 1 failed;' <<<"$clean"; then
+            echo "::warning title=Post-suite check::post_suite_sweep_and_check failed; see the report above"
+          else
+            echo "::warning title=Post-suite check::post_suite_sweep_and_check did not run exactly once"
+          fi
+          exit 0
 
       # The exit criterion's check (Step 3 plan D6), after every step that
       # writes and before the readiness test restarts the node. It stops the

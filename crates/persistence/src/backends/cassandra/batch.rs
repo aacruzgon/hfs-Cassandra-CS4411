@@ -3,7 +3,8 @@
 //!
 //! Step 5 of the write path sends a version's index rows in logged batches at
 //! `LOCAL_QUORUM`, each under 5 KiB (a unit over the limit goes alone, as one
-//! batch, and is split only past [`MAX_BATCH_STATEMENTS`]), sent concurrently (design step 5;
+//! batch, and is split only past [`MAX_BATCH_STATEMENTS`] statements or
+//! [`MAX_PIECE_BYTES`]), sent concurrently (design step 5;
 //! `docs/Cassandra/schema/walkthrough.md` section 2, "Index rows"). The
 //! session sends one batch, [`CassandraSession::batch`]; this module holds
 //! the parts that need no node, each tested on its own. The decisions are
@@ -17,8 +18,9 @@
 //! - [`wire_bytes`], [`MAX_BATCH_BYTES`] and [`pack`] (IW11): a batch is
 //!   measured by every byte its statements take on the wire, and units (one
 //!   partition's rows, IW9) are packed into batches. A unit is split only
-//!   when it has more than [`MAX_BATCH_STATEMENTS`] statements (and never the
-//!   `resources_by_type` unit).
+//!   when it has more than [`MAX_BATCH_STATEMENTS`] statements or more than
+//!   [`MAX_PIECE_BYTES`] of them ([`piece_len`]; never the
+//!   `resources_by_type` unit; ADR-aacruzgon-0089).
 //! - [`classify_failure`] (IW15): what a failed batch means for the writer,
 //!   from the error the node sent.
 //!
@@ -238,15 +240,44 @@ const _: () = assert!(
     "a batch's statement count is a protocol [short]"
 );
 
+/// The most bytes one piece of a split unit may carry by [`wire_bytes`]
+/// (ADR-aacruzgon-0089): 8 MiB, half the node's default 16 MiB limit on a
+/// whole native-protocol message (less on a heap under 640 MiB). The node
+/// refuses a larger BATCH frame before it looks at the batch at all
+/// (`OversizedCQLMessageException: CQL Message of size 17366788 bytes
+/// exceeds allowed maximum of 16777216 bytes`, Cassandra 5.0.9 with
+/// `native_transport_max_message_size` unset, `Config.java:288`),
+/// and a single-partition batch is exempt from `batch_size_fail_threshold`
+/// (`BatchStatement.java:333-335`), so this is the limit a big unit meets.
+/// The other half leaves room for the frame's own bytes and for a node set
+/// lower. It is the same 8 MiB as `MAX_CAS_PAYLOAD_BYTES`.
+pub(crate) const MAX_PIECE_BYTES: usize = 8 * 1024 * 1024;
+
+/// How many of `statements`, from the first, go in the next piece of a unit
+/// (ADR-aacruzgon-0089): as many as fit in [`MAX_BATCH_STATEMENTS`]
+/// statements and [`MAX_PIECE_BYTES`] by [`wire_bytes`], whichever ends
+/// first, and always at least one, so a lone statement over the byte budget
+/// still goes, alone. A unit within both limits is one piece: all of it.
+pub(crate) fn piece_len(statements: &[IndexStatement]) -> usize {
+    let mut bytes = 0;
+    for (taken, statement) in statements.iter().take(MAX_BATCH_STATEMENTS).enumerate() {
+        bytes += wire_bytes(std::slice::from_ref(statement));
+        if taken > 0 && bytes > MAX_PIECE_BYTES {
+            return taken;
+        }
+    }
+    statements.len().min(MAX_BATCH_STATEMENTS)
+}
+
 /// Packs units into batches of at most `bound` bytes, given each unit's size
 /// by [`wire_bytes`]. Returns each batch as the run of unit indices it holds
 /// (IW11).
 ///
 /// - **A unit is not split here.** A unit is every row of one partition key,
 ///   its inserts and its deletes (IW9 B); a unit of more than
-///   [`MAX_BATCH_STATEMENTS`] statements is split into pieces by
-///   `index_batches` before it gets here, and `pack` sees each piece as a
-///   unit. Cassandra applies one partition's
+///   [`MAX_BATCH_STATEMENTS`] statements or [`MAX_PIECE_BYTES`] is split
+///   into pieces by `index_batches` before it gets here ([`piece_len`]),
+///   and `pack` sees each piece as a unit. Cassandra applies one partition's
 ///   mutation whole on each replica; most of all, once the batch has
 ///   reached a quorum, an update alone never lets `count` see an updated
 ///   resource's `resources_by_type` row at both `last_updated` values.
@@ -621,6 +652,44 @@ mod tests {
             classify_failure(&server(ErrorType::Invalid)),
             BatchFailure::Refused
         );
+    }
+
+    /// ADR-aacruzgon-0089: a piece is as long as both limits allow. A run
+    /// within both is one piece; past 65,535 statements the count ends it;
+    /// past `MAX_PIECE_BYTES` the bytes do; and a lone statement over the
+    /// byte budget still goes, alone.
+    #[test]
+    fn a_piece_ends_at_the_statement_count_or_the_byte_budget() {
+        let row =
+            |bytes: usize| IndexStatement::new(INSERT_ROW, vec![Value::Some(vec![b'x'; bytes])]);
+        assert_eq!(piece_len(&[]), 0);
+        let small: Vec<IndexStatement> = (0..10).map(|_| row(10)).collect();
+        assert_eq!(piece_len(&small), 10);
+
+        let many: Vec<IndexStatement> = (0..70_000).map(|_| row(1)).collect();
+        assert!(wire_bytes(&many) < MAX_PIECE_BYTES);
+        assert_eq!(piece_len(&many), MAX_BATCH_STATEMENTS);
+
+        // 1,000-byte values: 4 + 1,000 + the head, so the budget ends the
+        // piece well before the count does.
+        let wide: Vec<IndexStatement> = (0..10_000).map(|_| row(1_000)).collect();
+        let each = wire_bytes(&wide[..1]);
+        let cut = piece_len(&wide);
+        assert_eq!(cut, MAX_PIECE_BYTES / each);
+        assert!(wire_bytes(&wide[..cut]) <= MAX_PIECE_BYTES);
+        assert!(wire_bytes(&wide[..=cut]) > MAX_PIECE_BYTES);
+
+        // Exactly at the budget: 21 + 4 + 4,071 = 4,096 bytes each, so
+        // 2,048 of them are 8 MiB to the byte. A piece holds all 2,048, and
+        // the 2,049th starts the next one.
+        let exact: Vec<IndexStatement> = (0..2_049).map(|_| row(4_071)).collect();
+        assert_eq!(wire_bytes(&exact[..1]), 4_096);
+        assert_eq!(wire_bytes(&exact[..2_048]), MAX_PIECE_BYTES);
+        assert_eq!(piece_len(&exact), 2_048);
+
+        let huge = [row(MAX_PIECE_BYTES), row(10)];
+        assert_eq!(piece_len(&huge), 1, "an oversized statement goes alone");
+        assert_eq!(piece_len(&huge[..1]), 1);
     }
 
     /// The session's own refusal of a batch over the statement limit is

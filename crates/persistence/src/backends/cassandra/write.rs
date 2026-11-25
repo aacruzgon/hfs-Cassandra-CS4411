@@ -28,11 +28,12 @@
 //!    units are packed into logged batches of at most 4,864 wire bytes,
 //!    never splitting a unit for its bytes (a unit over the limit goes
 //!    alone, as one batch). A unit of more than 65,535 statements, the
-//!    native protocol's limit, is split into pieces of whole rows, all at
-//!    `ts(N+1)`, each its own batch; the `resources_by_type` unit is never
-//!    split (ADR-aacruzgon-0089, amending IW11). The batches go at once, at
-//!    most 8 in flight (IW9 B, IW11, IW12;
-//!    [`CassandraBackend::write_index_delta`]).
+//!    native protocol's limit, or of more than 8 MiB of statements, half
+//!    the node's default 16 MiB message limit (less on a heap under
+//!    640 MiB), is split into pieces of whole rows, all at `ts(N+1)`; the
+//!    `resources_by_type` unit is never split (ADR-aacruzgon-0089,
+//!    amending IW11). The batches go at once, at most 8 in flight (IW9 B,
+//!    IW11, IW12; [`CassandraBackend::write_index_delta`]).
 //! 6. I2, the intent delete.
 //!
 //! Steps 4 and 5 take plain inputs ([`VersionRow`], [`VersionKeys`], a
@@ -120,9 +121,11 @@ use uuid::Uuid;
 
 use super::backend::CassandraBackend;
 use super::batch::{
-    BatchFailure, IndexCql, IndexStatement, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS,
-    classify_failure, pack, wire_bytes,
+    BatchFailure, IndexCql, IndexStatement, MAX_BATCH_BYTES, classify_failure, pack, piece_len,
+    wire_bytes,
 };
+#[cfg(test)]
+use super::batch::{MAX_BATCH_STATEMENTS, MAX_PIECE_BYTES};
 #[cfg(test)]
 use super::checkpoint::Checkpoint;
 use super::errors::{BACKEND_NAME, is_invalid, map_driver_error};
@@ -1129,11 +1132,12 @@ pub(crate) type IndexRow<'a> = (&'a IndexKey, DateTime<Utc>);
 
 /// Every row of a delta that lives in one partition ([`IndexKey::partition`]):
 /// the inserts and the deletes of that partition together. The writer sends
-/// a unit whole, except one of more than [`MAX_BATCH_STATEMENTS`] statements,
-/// which [`index_batches`] splits into pieces of at most that many; the
-/// `resources_by_type` unit is never split (IW9 B, ADR-sam-michaels-0006;
-/// the split is ADR-aacruzgon-0089's; see
-/// [`CassandraBackend::write_index_delta`]).
+/// a unit whole, except one of more than
+/// [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS) statements
+/// or [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES), which
+/// [`index_batches`] splits into pieces within both; the `resources_by_type`
+/// unit is never split (IW9 B, ADR-sam-michaels-0006; the split is
+/// ADR-aacruzgon-0089's; see [`CassandraBackend::write_index_delta`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct IndexUnit<'a> {
     /// Rows of the new version, at its `last_updated`.
@@ -1473,8 +1477,10 @@ fn retry_pause(attempt: u32) -> Duration {
 
 /// A delta's units, packed into batches.
 struct IndexBatches {
-    /// Each batch's statements: whole units, or one piece of a unit over
-    /// [`MAX_BATCH_STATEMENTS`], in the delta's order.
+    /// Each batch's statements: whole units and pieces of units over
+    /// [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS) or
+    /// [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES), in the delta's
+    /// order.
     batches: Vec<Vec<IndexStatement>>,
     /// What the batches hold (IW14).
     stats: IndexWriteStats,
@@ -1485,24 +1491,30 @@ struct IndexBatches {
 /// [`MAX_BATCH_BYTES`]. A unit is not split for its bytes, so one over that
 /// limit on its own goes alone, as one batch over it.
 ///
-/// A unit of more than [`MAX_BATCH_STATEMENTS`] statements is split, since
-/// the native protocol counts a batch's statements in 16 bits and a longer
-/// batch would wrap. It becomes consecutive pieces of at most that many, in
-/// the unit's statement order (inserts, then deletes); each piece is its own
-/// batch, being far over [`MAX_BATCH_BYTES`], and is counted in the stats on
-/// its own. The `resources_by_type` unit holds one or two statements per
-/// resource and is never split (IW9 B: `count` reads that partition). This
-/// split amends IW11 (ADR-aacruzgon-0089): the pieces all carry `ts`, so
-/// their order does not matter and a failed one keeps the intent, but one
-/// partition's rows no longer apply as one mutation, so a reader can see
-/// some of them new and some old until the last piece lands.
+/// A unit of more than
+/// [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS) statements,
+/// or of more than [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES) by
+/// [`wire_bytes`], is split: the native protocol counts a batch's statements
+/// in 16 bits, so a longer batch would wrap, and the node refuses a message
+/// over its limit (16 MiB by default, less on a heap under 640 MiB). It
+/// becomes consecutive pieces of whole rows, each as long as both limits
+/// allow ([`piece_len`]), in the unit's statement order (inserts, then
+/// deletes), each counted in the stats on its own. A full piece is far over
+/// [`MAX_BATCH_BYTES`], so it is a batch of its own; the last piece, when
+/// small, is packed like any unit. The `resources_by_type` unit holds one
+/// or two statements per resource and is never split (IW9 B: `count` reads
+/// that partition). This split amends IW11 (ADR-aacruzgon-0089): the pieces
+/// all carry `ts`, so their order does not matter and a failed one keeps
+/// the intent, but one partition's rows no longer apply as one mutation, so
+/// a reader can see some of them new and some old until the last piece
+/// lands.
 fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatches {
     // (inserts, deletes, statements) of each piece, in the delta's order.
     let mut pieces: Vec<(u64, u64, Vec<IndexStatement>)> = Vec::new();
     for unit in &delta.units {
         let statements = unit_statements(key, delta, unit, ts);
         debug_assert!(
-            statements.len() <= MAX_BATCH_STATEMENTS
+            piece_len(&statements) == statements.len()
                 || !unit
                     .inserts
                     .iter()
@@ -1514,7 +1526,7 @@ fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatc
         let mut start = 0;
         let mut rest = statements;
         while !rest.is_empty() {
-            let tail = rest.split_off(rest.len().min(MAX_BATCH_STATEMENTS));
+            let tail = rest.split_off(piece_len(&rest));
             let end = start + rest.len();
             let piece_inserts = inserts.clamp(start, end) - start;
             pieces.push((
@@ -2542,9 +2554,13 @@ impl CassandraBackend {
     ///   create or revive, until the sweeper or repair finishes it; and on
     ///   RF 3, twice or not at all through read repair after a batch that
     ///   reached fewer than a quorum. A unit over the byte bound goes alone;
-    ///   one of more than [`MAX_BATCH_STATEMENTS`] statements, never the
-    ///   `resources_by_type` unit, is split into consecutive pieces of at
-    ///   most that many, each its own batch.
+    ///   one of more than
+    ///   [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS)
+    ///   statements or [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES),
+    ///   never the `resources_by_type` unit, is split into consecutive
+    ///   pieces of whole rows within both (ADR-aacruzgon-0089); a full piece
+    ///   is a batch of its own, and a small last piece is packed like any
+    ///   unit.
     /// - **All at once, at most [`INDEX_BATCHES_IN_FLIGHT`] in flight**
     ///   (IW12), as futures inside the request's own task, never
     ///   `tokio::spawn`, so a request that is dropped, or a crash test that
@@ -2648,8 +2664,8 @@ impl CassandraBackend {
         IndexOutcome { result, stats }
     }
 
-    /// Sends one packed batch of an index delta, whole units of it, or one
-    /// piece of a unit over the statement limit (IW9 B, ADR-aacruzgon-0089),
+    /// Sends one packed batch of an index delta, whole units of it and pieces
+    /// of units over the statement or byte limit (IW9 B, ADR-aacruzgon-0089),
     /// through [`CassandraSession::batch`](super::session::CassandraSession::batch)
     /// (IW13): one logged batch at `LOCAL_QUORUM`, or a plain write for a
     /// lone statement; either way the driver never re-sends it, so one try is
@@ -4223,6 +4239,76 @@ mod tests {
             assert_packs_whole_units(key, &index_delta(&previous, version_keys(keys, lu2))),
             assert_packs_whole_units(key, &index_delta(&previous, version_keys(&[], lu2))),
         ]
+    }
+
+    /// ADR-aacruzgon-0089: a unit under the statement limit but over
+    /// `MAX_PIECE_BYTES` of statements is cut by bytes into pieces of whole
+    /// rows, each as long as the budget allows, in statement order; the
+    /// `resources_by_type` unit is never split. Pure: nothing reaches a node.
+    #[test]
+    fn a_unit_over_the_piece_bytes_is_split_by_bytes() {
+        let lu = at("2026-11-16T10:00:00.000Z");
+        let ts = write_ts_of(lu);
+        let mut next = vec![IndexKey::ResourcesByType];
+        next.extend((0..20_000).map(|i| IndexKey::TokenSystem {
+            param: "identifier".to_string(),
+            system: "s".to_string(),
+            code: format!("{i:0>500}"),
+        }));
+        let delta = index_delta(&[], version_keys(&next, lu));
+        assert_eq!(delta.units.len(), 2, "the type unit, and one token unit");
+        let token_unit = delta
+            .units
+            .iter()
+            .find(|unit| unit.inserts.len() == 20_000)
+            .expect("the token unit");
+        let whole = unit_statements(&key(), &delta, token_unit, ts);
+        assert!(whole.len() < MAX_BATCH_STATEMENTS);
+        assert!(wire_bytes(&whole) > MAX_PIECE_BYTES, "over the byte budget");
+
+        let packed = index_batches(&key(), &delta, ts);
+        let token_batches: Vec<&Vec<IndexStatement>> = packed
+            .batches
+            .iter()
+            .filter(|batch| {
+                batch
+                    .iter()
+                    .any(|s| s.cql() == INSERT_TOKEN_SYSTEM.as_str())
+            })
+            .collect();
+        assert!(token_batches.len() >= 2, "cut by bytes");
+        for batch in &token_batches {
+            assert!(
+                wire_bytes(batch) <= MAX_PIECE_BYTES,
+                "{}",
+                wire_bytes(batch)
+            );
+        }
+        // Each full piece is as long as the budget allows: one more row would
+        // pass it.
+        let first = token_batches[0];
+        let next_row = &token_batches[1][0];
+        assert!(wire_bytes(first) + wire_bytes(std::slice::from_ref(next_row)) > MAX_PIECE_BYTES);
+        // Whole rows, in the unit's order, none lost.
+        let cut: Vec<&[Value]> = token_batches
+            .iter()
+            .flat_map(|batch| batch.iter())
+            .filter(|s| s.cql() == INSERT_TOKEN_SYSTEM.as_str())
+            .map(IndexStatement::values)
+            .collect();
+        let expected: Vec<&[Value]> = whole.iter().map(IndexStatement::values).collect();
+        assert_eq!(cut, expected);
+        let type_batches = packed
+            .batches
+            .iter()
+            .filter(|batch| {
+                batch
+                    .iter()
+                    .any(|s| s.cql() == INSERT_RESOURCES_BY_TYPE.as_str())
+            })
+            .count();
+        assert_eq!(type_batches, 1, "the type key's insert is in one batch");
+        assert_eq!(packed.stats.rows_inserted, 20_001);
     }
 
     /// IW11 (gate): the packer never splits a partition's rows for their
@@ -6047,6 +6133,262 @@ mod node_tests {
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
         assert_eq!(spent.batch, 1, "{spent}");
+    }
+
+    /// Opts in to the full-size node test of the byte cut, which writes about
+    /// 98,000 rows (`the_largest_update_of_one_partition_is_cut_by_bytes_and_lands`).
+    const LARGE: &str = "HFS_TEST_CASSANDRA_LARGE";
+
+    /// ADR-aacruzgon-0089, in every run: the node refuses a message over its
+    /// limit (16 MiB by default, less on a heap under 640 MiB), and the byte
+    /// cut keeps every piece under it. One unit of 65,536 copies of one
+    /// 269-byte insert (a 64-byte tenant, a 64-character id, a 46-character
+    /// code: the audit's sizes), built by hand, since a real delta never
+    /// repeats a key. Its first 65,535 statements, a piece cut by count
+    /// alone, are a 17 MB message the node refuses as `Invalid`;
+    /// `write_index_delta` cuts the unit by bytes and every piece lands. The
+    /// node keeps one row, so later scans of the index tables pay nothing
+    /// for it.
+    #[tokio::test]
+    async fn a_unit_over_the_piece_bytes_lands_and_a_count_cut_piece_is_refused() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let mut tenant = format!("test-piece-node-{}", Uuid::new_v4().simple());
+        while tenant.len() < crate::tenant::MAX_TENANT_ID_LEN {
+            tenant.push('x');
+        }
+        let id = "b".repeat(64);
+        let key = RowKey {
+            tenant_id: &tenant,
+            resource_type: "Patient",
+            id: &id,
+        };
+        let row = IndexKey::TokenSystem {
+            param: "identifier".to_string(),
+            system: "s".to_string(),
+            code: "c".repeat(46),
+        };
+        let lu = Utc::now();
+        let ts = write_ts_of(lu);
+        let delta = IndexDelta {
+            version_id: 1,
+            fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            units: vec![IndexUnit {
+                inserts: vec![(&row, lu); MAX_BATCH_STATEMENTS + 1],
+                deletes: Vec::new(),
+            }],
+        };
+        let statements = unit_statements(&key, &delta, &delta.units[0], ts);
+        let count_cut = &statements[..MAX_BATCH_STATEMENTS];
+        assert!(
+            wire_bytes(count_cut) > 16 * 1024 * 1024,
+            "{} bytes",
+            wire_bytes(count_cut)
+        );
+
+        // The node's limit: a piece cut by count alone is refused.
+        let error = backend
+            .session
+            .batch(count_cut.to_vec())
+            .await
+            .expect_err("a message over 16 MiB");
+        assert!(is_invalid(&error), "{error:?}");
+        assert!(
+            format!("{error:?}").contains("exceeds allowed maximum"),
+            "{error:?}"
+        );
+
+        // The byte cut: every piece within 8 MiB, every one confirmed.
+        let outcome = backend
+            .write_index_delta(&key, &delta, ts, POST_CAS_WRITE_TRIES)
+            .await;
+        assert_eq!(outcome.result, Ok(()), "{}", outcome.stats);
+        assert!(outcome.stats.batches >= 3, "{}", outcome.stats);
+        assert!(
+            outcome.stats.largest_batch_bytes <= MAX_PIECE_BYTES as u64,
+            "{}",
+            outcome.stats
+        );
+        let rows = backend
+            .session
+            .rows(
+                "SELECT version_id FROM token_system_index \
+                 WHERE tenant_id = ? AND resource_type = ? AND param = ? AND system = ?",
+                vec![
+                    Value::from(tenant.as_str()),
+                    Value::from("Patient"),
+                    Value::from("identifier"),
+                    Value::from("s"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("token_system_index");
+        assert_eq!(rows.len(), 1, "one row, written 65,536 times");
+    }
+
+    /// ADR-aacruzgon-0089 (the audit's B1): the largest update a valid
+    /// resource can make in one partition. A 64-byte tenant
+    /// (`MAX_TENANT_ID_LEN`), a 64-character id and 32,768 identifiers of
+    /// one system, with codes as long as the 8 MiB CAS bound accepts, then
+    /// 32,768 new ones: a 65,536-statement `token_system_index` unit of over
+    /// 16 MiB. Cut by count alone, its first 65,535-statement piece is a
+    /// message the node refuses (`OversizedCQLMessageException`), so the
+    /// update answers `Ok("2")` with its rows left at version 1 and the
+    /// intent kept. Cut by `MAX_PIECE_BYTES` too, the create and the update
+    /// both write every row at their version and clear the intent.
+    ///
+    /// **Opt in, with `HFS_TEST_CASSANDRA_LARGE=1`.** Each run leaves about
+    /// 98,000 index rows and as many tombstones (every identifier has a row
+    /// in three token tables), and the consistency and checkpoint tests scan
+    /// whole index tables, so every later run on the same node would be
+    /// slower. CI runs it once, in the FHIR versions job's last lib run, on
+    /// that job's own node.
+    /// `a_unit_over_the_piece_bytes_lands_and_a_count_cut_piece_is_refused`
+    /// shows the same limit in every run, with one row.
+    #[tokio::test]
+    async fn the_largest_update_of_one_partition_is_cut_by_bytes_and_lands() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        if std::env::var(LARGE).ok().as_deref() != Some("1") {
+            eprintln!(
+                "not run: set {LARGE}=1 on a node of the run's own (it leaves about 98,000 \
+                 rows and as many tombstones)"
+            );
+            return;
+        }
+        let mut name = format!("test-piece-bytes-{}", Uuid::new_v4().simple());
+        while name.len() < crate::tenant::MAX_TENANT_ID_LEN {
+            name.push('x');
+        }
+        let tenant = TenantContext::new(
+            TenantId::new(name.clone()),
+            TenantPermissions::full_access(),
+        );
+        let id = "b".repeat(64);
+        let code = |tag: char, i: usize, len: usize| {
+            let mut code = format!("{tag}{i}");
+            while code.len() < len {
+                code.push('c');
+            }
+            code
+        };
+        let identifiers = |tag: char, len: usize| -> Vec<serde_json::Value> {
+            (0..32_768)
+                .map(|i| json!({"system": "s", "value": code(tag, i, len)}))
+                .collect()
+        };
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        // The longest code the CAS bound accepts (46 under R4).
+        let mut chosen = None;
+        for len in (40..=48).rev() {
+            let body =
+                json!({"resourceType": "Patient", "id": id, "identifier": identifiers('a', len)});
+            let before = backend.cas_stats();
+            match backend.create(&tenant, "Patient", body, version).await {
+                Ok(created) => {
+                    let stats = backend.cas_stats().since(&before);
+                    assert_eq!(
+                        stats.post_cas_failures, 0,
+                        "the create's index rows: {stats}"
+                    );
+                    chosen = Some((len, created));
+                    break;
+                }
+                Err(crate::error::StorageError::Validation(_)) => continue,
+                Err(other) => panic!("a {len}-character code: {other:?}"),
+            }
+        }
+        let (len, created) = chosen.expect("a code length the CAS bound accepts");
+
+        // The update's unit is over the node's message limit (16 MiB by
+        // default), so a 65,535-statement piece of it would be refused.
+        let old_keys: Vec<IndexKey> = (0..32_768)
+            .map(|i| IndexKey::TokenSystem {
+                param: "identifier".to_string(),
+                system: "s".to_string(),
+                code: code('a', i, len),
+            })
+            .collect();
+        let new_keys: Vec<IndexKey> = (0..32_768)
+            .map(|i| IndexKey::TokenSystem {
+                param: "identifier".to_string(),
+                system: "s".to_string(),
+                code: code('z', i, len),
+            })
+            .collect();
+        let lu = Utc::now();
+        let previous: Vec<(&IndexKey, DateTime<Utc>)> = old_keys.iter().map(|k| (k, lu)).collect();
+        let delta = index_delta(
+            &previous,
+            VersionKeys {
+                version_id: 2,
+                last_updated: lu,
+                fhir_version: version,
+                keys: &new_keys,
+            },
+        );
+        let row_key = RowKey {
+            tenant_id: &name,
+            resource_type: "Patient",
+            id: &id,
+        };
+        let statements = unit_statements(&row_key, &delta, &delta.units[0], write_ts_of(lu));
+        assert_eq!(statements.len(), 65_536);
+        eprintln!(
+            "[piece-bytes code_len={len} unit_bytes={} count_cut_piece_bytes={}]",
+            wire_bytes(&statements),
+            wire_bytes(&statements[..MAX_BATCH_STATEMENTS])
+        );
+        assert!(
+            wire_bytes(&statements[..MAX_BATCH_STATEMENTS]) > 16 * 1024 * 1024,
+            "a full count-cut piece is over the node's message limit"
+        );
+
+        let before = backend.cas_stats();
+        let updated = backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType": "Patient", "id": id, "identifier": identifiers('z', len), "active": true}),
+            )
+            .await
+            .expect("update");
+        assert_eq!(updated.version_id(), "2");
+        let stats = backend.cas_stats().since(&before);
+        assert_eq!(
+            stats.post_cas_failures, 0,
+            "every index batch confirmed and the intent deleted: {stats}"
+        );
+        let rows = backend
+            .session
+            .rows(
+                "SELECT version_id FROM token_system_index \
+                 WHERE tenant_id = ? AND resource_type = ? AND param = ? AND system = ?",
+                vec![
+                    Value::from(name.as_str()),
+                    Value::from("Patient"),
+                    Value::from("identifier"),
+                    Value::from("s"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("token_system_index");
+        let versions: Vec<i32> = rows
+            .iter()
+            .map(|row| row.get_r_by_name("version_id").unwrap())
+            .collect();
+        assert_eq!(
+            versions.len(),
+            32_768,
+            "the old rows deleted, the new inserted"
+        );
+        assert!(versions.iter().all(|&v| v == 2), "every row at version 2");
     }
 
     /// ADR-aacruzgon-0089: a batch over the statement limit, which the

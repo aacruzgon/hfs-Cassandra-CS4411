@@ -424,6 +424,23 @@ async fn cassandra_create_writes_every_cell_and_no_null() {
     assert_eq!(rows.len(), 1, "the gender token row");
     assert_eq!(col::<String>(&rows[0], "id"), "cells");
     assert_eq!(col::<i32>(&rows[0], "version_id"), 1);
+    // `gender` is a `code` element, so its row in the `system|code` table
+    // carries the implicit system (IW2).
+    let rows = query(
+        &cql,
+        "SELECT id, version_id FROM token_system_code_index \
+         WHERE tenant_id = ? AND resource_type = 'Patient' AND param = 'gender' \
+         AND system = ? AND code = 'male'",
+        vec![
+            Value::from(tenant_id),
+            Value::from(helios_persistence::search::IMPLICIT_TOKEN_SYSTEM),
+        ],
+        Consistency::LocalQuorum,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "the gender system|code token row");
+    assert_eq!(col::<String>(&rows[0], "id"), "cells");
+    assert_eq!(col::<i32>(&rows[0], "version_id"), 1);
     let rows = query(
         &cql,
         "SELECT id, start, end, version_id FROM date_index \

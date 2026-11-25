@@ -74,7 +74,20 @@
         - D6: the per-directory target caps of ADR-sam-michaels-0002 stay, not a per-instance total;
         - D7: if `ci.slice` is not installed by my maintenance window, I wait for Muster's setup rather than create it.
     - **Verified:**
-        - **The setup on the PC,** on 2026-11-25: run by the orchestrating Claude Code session in a visible pane on `acruzdebian`, with me typing the `sudo` password. The label change on runner 23 at 10:19 EST; sections 2–4 as written, which put both runners and `user@1005.service` in `/ci.slice/ci-hfs.slice/`; then section 5's container test failed as above. The `user@1005.service` drop-in was removed, the `user-1005.slice` drop-in added, and the user manager restarted with section 4's idle-wait script.
+        - **The setup on the PC,** on 2026-11-25, run by the orchestrating Claude Code session in a visible pane on `acruzdebian`, with me typing the `sudo` password:
+            - **The labels:** runner 23 kept only `hfs-cassandra-light`, at 10:19 EST.
+            - **The first version:**
+                - `ci-hfs.slice` loaded with `MemoryMax=30064771072`, `MemorySwapMax=0` and `TasksMax=8192`.
+                - The idle-wait script stopped both runners at 10:21:04 and restarted `user@1005.service` at 10:21:06, so both runners and the user manager were in `/ci.slice/ci-hfs.slice/`.
+                - Section 5's `docker run` then failed as above, and so did one without a memory limit, while `systemd-run --user --scope` worked. `busctl --user --no-pager status` as `gh-runner` gave `Unit=user@1005.service` and `Slice=ci-hfs.slice`, and no `OwnerUID`.
+            - **The fix:**
+                - The `user@1005.service` drop-in was removed and the `user-1005.slice` one added; `user-1005.slice` read `MemoryMax=8589934592`, `MemorySwapMax=0` at the reload.
+                - The script waited for `acruzdebian`'s job, the one cancelled to free it, stopped both runners at 10:37:08–09, and restarted the user manager at 10:37:10.
+            - **The checks after it:**
+                - Both runners are in `/ci.slice/ci-hfs.slice/`, active, at `EffectiveMemoryMax=21474836480`; `ci-hfs.slice` at 30064771072.
+                - `user@1005.service` is in `/user.slice/user-1005.slice/user@1005.service`, at `EffectiveMemoryMax=8589934592`. The slice's `memory.max` is 8589934592 and `memory.swap.max` 0.
+                - `busctl --user --no-pager status` gives `OwnerUID=1005` and `Slice=user-1005.slice`. Docker is 26.1.5+dfsg1, with the systemd driver on cgroup v2.
+                - A `docker run --memory 256m` started in `0::/user.slice/user-1005.slice/user@1005.service/user.slice/docker-<id>.scope`, with `memory.max` 268435456, and no container was left.
         - **Measured on `acruzdebian`** as `acruzgon` without `sudo`, only while no CI job of any project ran (two `pgrep` checks 30 s apart; a build stopped itself when a job started, four times). Cold builds of `origin/main` `0339bd7c2` were sampled every half second in their own cgroup, with a node in its own Compose project, port and 3g limit, removed afterwards (`report-ci-host-budget.md`, its `evidence/`).
         - **CI reports reused:** runs 45408412568, 45522733076, 45566799539, 45484827652, 45496937227, 45530008021, 45533228102, and 0080's 44156440683.
         - **The `Slice=` drop-in** moved a user manager on systemd 257.13-1~deb13u1 in a container, and the undo moved it back; that test started no rootless container.

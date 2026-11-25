@@ -177,9 +177,9 @@ docker run -d --name hfs-es -p 9200:9200 \
   -v hfs-es-data:/usr/share/elasticsearch/data \
   elasticsearch:8.15.0
 
-# MongoDB 7.0, minimum 7.0.48 (CVE-2026-118383) (mongodb, mongo-es) — a single-node replica set: transaction Bundles
+# MongoDB 9.0.8 (mongodb, mongo-es), minimum patch level 9.0.7 (CVE-2026-118383) — a single-node replica set: transaction Bundles
 # need multi-document transactions, which a standalone mongod cannot run (T2 6.3).
-docker run -d --name hfs-mongo -p 27017:27017 mongo:7.0.48 --replSet rs0 --bind_ip_all
+docker run -d --name hfs-mongo -p 27017:27017 -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 mongo:9.0.8 --replSet rs0 --bind_ip_all
 docker exec hfs-mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 
 # MinIO (s3, s3-es, and the S3 output-backend variants of T5/T7)
@@ -263,6 +263,7 @@ export HFS_DEFAULT_FHIR_VERSION=R4
 # HFS_MAX_BODY_SIZE: the 128 MiB default already covers every per-patient Synthea bundle (#1662)
 export HFS_REQUEST_TIMEOUT=600            # large bundles on composite backends
 export HFS_SUBSCRIPTIONS_ENABLED=true
+export HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true  # T9 receivers listen on loopback
 export HFS_BULK_EXPORT_OUTPUT_DIR=$WORK/bulk-exports  # T5 local-fs output
 export HFS_EXPORT_DIR=$WORK/sql-exports               # T7 fs sink
 # composites: read-your-write for T2 and T4; the rebuild skips the refresh wait
@@ -1500,9 +1501,10 @@ For each backend row, attach to the release issue:
 - **SQL export job list is per user and per tenant** and lives in the settings
   document; a restart turns in-progress cards into *Cancelled · the server no longer
   knows this job*. Expected.
-- **Rest-hook to loopback** works for `id-only` payloads without extra flags;
-  `full-resource` payloads require an `https://` endpoint.
-  `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` only affects the messaging channel.
+- **Rest-hook to loopback** needs `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true`
+  (it covers rest-hook and messaging; without it a loopback or private endpoint,
+  by address or by name, is a permanent delivery error). `full-resource`
+  payloads require an `https://` endpoint. Redirects are never followed.
 - **One AWS credential chain per process**: with MinIO as the primary store, the S3
   export/sink buckets must also live in MinIO.
 - **R6 fixtures**: the T0 build (`--workspace --all-features`, which includes

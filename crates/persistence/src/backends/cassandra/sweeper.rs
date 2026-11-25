@@ -3105,6 +3105,60 @@ mod node_tests {
         say("transient", &backend, &before);
     }
 
+    /// I2 is part of an intent: a replay whose index rows were written but whose delete of the intent row
+    /// failed is not finished. It is `Transient("intent delete")`, counts as failed, and the intent stays.
+    #[tokio::test]
+    async fn a_failed_intent_delete_leaves_the_intent_unfinished() {
+        let Some((backend, t, tenant, since)) = start("sweeper-i2").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 1, async move {
+            b.create(&ten, "Patient", patient(), version).await
+        })
+        .await;
+        let lu1 = row_of(&backend, &t, "p").await.last_updated;
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "DELETE FROM pending_index_writes",
+            Fault::FailWithUnavailable,
+        );
+        let found = pending(&backend, &t, "p", since).await;
+        let result = backend.process_intent(&found[0], Rank::Normal).await;
+        assert_eq!(result.case, Some(IntentCase::Current));
+        assert_eq!(result.result, Err(Failure::Transient("intent delete")));
+        assert!(
+            result.index.rows_inserted > 0,
+            "the index rows were written"
+        );
+        assert_eq!(rbt_rows(&backend, &t, "p").await, vec![(lu1, 1)]);
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+        let delta = backend.sweeper_stats().since(&before);
+        assert_eq!(delta.done, 0, "{delta}");
+
+        // Through the retry list: failed, not done, and the next try finishes it.
+        let mut report = SweepReport::default();
+        let state = SweepState::new(Utc::now(), CancellationToken::new());
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "DELETE FROM pending_index_writes",
+            Fault::FailWithUnavailable,
+        );
+        let now = Utc::now();
+        backend
+            .run_intents(&found, Rank::Normal, Some(&state), now, &mut report)
+            .await;
+        assert_eq!((report.done, report.failed), (0, 1), "{report}");
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+        let again = backend.process_intent(&found[0], Rank::Normal).await;
+        assert_eq!(again.result, Ok(()));
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+        say("i2", &backend, &before);
+    }
+
     /// IW24 on the replay: when the version row is not written, no index statement is sent and the
     /// intent stays.
     #[tokio::test]

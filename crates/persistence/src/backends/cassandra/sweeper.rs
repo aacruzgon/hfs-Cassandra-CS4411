@@ -314,7 +314,7 @@ pub(crate) enum Invariant {
     UnreadableKeys,
     /// A stored `write_ts` that is not `write_ts_of(last_updated)` (SW11, RW10).
     WriteTsMismatch,
-    /// A `resources` or `resource_versions` row whose columns do not decode.
+    /// A `resources` or `resource_versions` row whose columns do not decode, or a live `resources` row with no `data`.
     UnreadableRow,
     /// The version row or the index delta failed as `WriteFailure::Permanent`: no try can succeed.
     PermanentWrite,
@@ -1799,6 +1799,10 @@ impl CassandraBackend {
             return Replay::failed(Failure::Invariant(Invariant::WriteTsMismatch));
         }
         let marker = row.is_deleted();
+        // A live row with no body is a bug, never an empty value (SW13).
+        if !marker && row.data.is_none() {
+            return Replay::failed(Failure::Invariant(Invariant::UnreadableRow));
+        }
         let (keys, blob): (Vec<IndexKey>, Vec<u8>) = if marker {
             (Vec::new(), index_keys::EMPTY.to_vec())
         } else {
@@ -4003,6 +4007,60 @@ mod node_tests {
         let held = (0..16)
             .filter(|s| state.mark(*s) == whole_ms(start))
             .count();
+    /// SW13: a live `resources` row with no `data` is an unreadable row, never a version row with no body. The row
+    /// decodes, so it is planted in a `test-planted-` tenant as the other planted rows are.
+    #[tokio::test]
+    async fn a_live_row_with_no_data_is_an_unreadable_row_and_writes_nothing() {
+        let Some((backend, t, _, since)) = start("planted-sweeper-no-data").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let lu = whole_ms(Utc::now());
+        backend
+            .session
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, last_updated, \
+                 created_at, fhir_version, write_ts, write_id, index_keys, deleted_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0) IF NOT EXISTS",
+                vec![
+                    Value::from(t.as_str()),
+                    Value::from("Patient"),
+                    Value::from("p"),
+                    Value::from(1),
+                    Value::from(lu),
+                    Value::from(lu),
+                    Value::from(test_fhir_version().as_mime_param()),
+                    Value::from(write_ts_of(lu)),
+                    Value::from(Uuid::new_v4()),
+                    Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+                ],
+                StatementKind::Cas,
+            )
+            .await
+            .expect("plant");
+        let key = RowKey {
+            tenant_id: &t,
+            resource_type: "Patient",
+            id: "p",
+        };
+        let intent_key = IntentKey::new(&t, "p", Utc::now());
+        backend
+            .write_intent(&intent_key, &key, Uuid::new_v4(), 1)
+            .await
+            .unwrap();
+        let found = pending(&backend, &t, "p", since).await;
+        let result = backend.process_intent(&found[0], Rank::Normal).await;
+        assert_eq!(result.case, Some(IntentCase::Current));
+        assert_eq!(
+            result.result,
+            Err(Failure::Invariant(Invariant::UnreadableRow))
+        );
+        assert!(version_ids(&backend, &t, "Patient", "p").await.is_empty());
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+        backend.delete_intent(&intent_key, &key).await;
+        say("no-data", &backend, &before);
+    }
+
         assert_eq!((moved, held), (15, 1));
         let report = backend.poll_once(&state, now, &scope).await;
         assert_eq!(report.slice_errors, 0, "{report}");

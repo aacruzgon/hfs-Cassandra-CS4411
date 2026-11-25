@@ -410,13 +410,38 @@ async fn cassandra_create_writes_every_cell_and_no_null() {
         "K(1) holds more than the resources_by_type key: {index_keys:?}"
     );
     assert_eq!(index_keys[2], 0x01, "K(1) holds the resources_by_type key");
-    let holds = |text: &str| {
-        index_keys
-            .windows(text.len())
-            .any(|window| window == text.as_bytes())
-    };
-    assert!(holds("gender"), "K(1) holds the gender keys");
-    assert!(holds("birthdate"), "K(1) holds the birthdate keys");
+    // The body's `gender` and `birthDate` are read from their own tables,
+    // since the blob is private to the crate.
+    let tenant_id = tenant.tenant_id().as_str();
+    let rows = query(
+        &cql,
+        "SELECT id, version_id FROM token_code_index \
+         WHERE tenant_id = ? AND resource_type = 'Patient' AND param = 'gender' AND code = 'male'",
+        vec![Value::from(tenant_id)],
+        Consistency::LocalQuorum,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "the gender token row");
+    assert_eq!(col::<String>(&rows[0], "id"), "cells");
+    assert_eq!(col::<i32>(&rows[0], "version_id"), 1);
+    let rows = query(
+        &cql,
+        "SELECT id, start, end, version_id FROM date_index \
+         WHERE tenant_id = ? AND resource_type = 'Patient' AND param = 'birthdate'",
+        vec![Value::from(tenant_id)],
+        Consistency::LocalQuorum,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "the birthdate date row");
+    assert_eq!(col::<String>(&rows[0], "id"), "cells");
+    let start: DateTime<Utc> = col(&rows[0], "start");
+    let end: DateTime<Utc> = col(&rows[0], "end");
+    assert_eq!(start.timestamp_millis(), 325_987_200_000, "1980-05-01Z");
+    assert_eq!(
+        end.timestamp_millis(),
+        start.timestamp_millis() + 86_400_000
+    );
+    assert_eq!(col::<i32>(&rows[0], "version_id"), 1);
 
     // `resource_versions` row 1: V1 at ts(1), deleted_at unset (not null).
     let mut version_key = key(&tenant, "Patient", "cells");

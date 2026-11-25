@@ -81,7 +81,6 @@ use std::future::Future;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use parking_lot::Mutex;
 
 use super::backend::CassandraBackend;
@@ -624,14 +623,46 @@ fn outcomes_of<'a, P: 'a, C>(
 /// Runs `futures`, at most `concurrency` at once, until all finish or
 /// `ends_at` passes; the ones unfinished then are dropped. None waits for
 /// another to finish before it starts.
+///
+/// Each wake polls every running future once, and a future that finishes
+/// makes room for the next one at once. The futures are polled once before
+/// the clock is looked at, which starts the first `concurrency` of them: if
+/// every one is done, that is the end; if `ends_at` has already passed, it
+/// returns at once. So a deadline in the past cuts every future after its
+/// first poll, however fast the work behind it is (a timer's own check can lag
+/// the clock by a tick, and `FuturesUnordered` may stop after polling two
+/// futures that woke themselves, so neither can give that). Otherwise the rest
+/// runs until `ends_at`.
 async fn drive_within<F: Future<Output = ()>>(
     futures: Vec<F>,
     concurrency: usize,
     ends_at: tokio::time::Instant,
 ) {
-    let all = futures::stream::iter(futures)
-        .buffer_unordered(concurrency)
-        .for_each(|()| std::future::ready(()));
+    let mut waiting = futures.into_iter();
+    let mut running: Vec<std::pin::Pin<Box<F>>> = Vec::new();
+    let all = futures::future::poll_fn(|cx| {
+        loop {
+            while running.len() < concurrency {
+                match waiting.next() {
+                    Some(future) => running.push(Box::pin(future)),
+                    None => break,
+                }
+            }
+            let before = running.len();
+            running.retain_mut(|future| future.as_mut().poll(cx).is_pending());
+            if running.is_empty() && waiting.len() == 0 {
+                return std::task::Poll::Ready(());
+            }
+            // A finished future leaves room for another: start it now.
+            if running.len() == before {
+                return std::task::Poll::Pending;
+            }
+        }
+    });
+    let mut all = std::pin::pin!(all);
+    if futures::poll!(all.as_mut()).is_ready() || tokio::time::Instant::now() >= ends_at {
+        return;
+    }
     let _ = tokio::time::timeout_at(ends_at, all).await;
 }
 
@@ -1711,23 +1742,26 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(10));
     }
 
-    /// `timeout_at` polls its future before it checks the clock, so even a
-    /// phase whose deadline has passed starts the first futures.
+    /// A deadline already past cuts every future after its first poll: the
+    /// first `concurrency` are started (polled once, to their first yield),
+    /// none gets to run on, and the rest are never polled.
     #[tokio::test]
-    async fn the_driver_polls_each_started_future_once_past_its_deadline() {
+    async fn a_deadline_already_past_cuts_every_future_after_its_first_poll() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        let polled = Arc::new(AtomicUsize::new(0));
+        let (polled, finished) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let futures: Vec<Unit> = (0..6)
             .map(|_| {
-                let polled = polled.clone();
+                let (polled, finished) = (polled.clone(), finished.clone());
                 Box::pin(async move {
                     polled.fetch_add(1, SeqCst);
-                    std::future::pending::<()>().await;
+                    tokio::task::yield_now().await;
+                    finished.fetch_add(1, SeqCst);
                 }) as Unit
             })
             .collect();
         drive_within(futures, 4, tokio::time::Instant::now()).await;
         assert_eq!(polled.load(SeqCst), 4);
+        assert_eq!(finished.load(SeqCst), 0);
     }
 
     #[test]
@@ -1901,14 +1935,13 @@ mod tests {
         assert!(message.contains("token_code_index"), "{message}");
     }
 
-    /// The whole phase has one deadline. The clock is paused after the
-    /// backend is up and the repairs' first poll has started them, so while
-    /// the runtime waits for the node it jumps to the phase's deadline and no
-    /// repair can finish, whatever the node's speed (a deadline of zero is
-    /// not enough: the timer fires on the next millisecond tick, and a local
-    /// node answers within it). Every repair is `Failed`, counted, and `run`
-    /// returns at once. The writes that were started may have applied, so a
-    /// second, ordinary run repeats them and ends consistent.
+    /// The whole phase has one deadline. With a deadline of zero the driver
+    /// polls each repair once, which starts its write, then sees the deadline
+    /// has passed and drops them, so no repair can finish: the cut does not
+    /// depend on the node's speed or the clock. Every repair is `Failed`,
+    /// counted, and `run` returns at once. The writes that were started may
+    /// have applied, so a second, ordinary run repeats them and ends
+    /// consistent.
     #[tokio::test]
     async fn repair_returns_at_its_deadline_with_the_unfinished_failed() {
         let Some(backend) = backend().await else {
@@ -1930,16 +1963,9 @@ mod tests {
         };
 
         let before = backend.repair_stats();
-        let started = std::time::Instant::now();
-        tokio::time::pause();
-        let paused_at = tokio::time::Instant::now();
-        let outcomes = queue().run_within(&backend, Duration::from_secs(1)).await;
-        // The deadline ended the phase, not a statement's own timeout (10 s).
-        assert!(paused_at.elapsed() < Duration::from_secs(5));
-        tokio::time::resume();
+        let outcomes = queue().run_within(&backend, Duration::ZERO).await;
         let stats = backend.repair_stats().since(&before);
         eprintln!("[repair case=deadline {stats}]");
-        assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(outcomes.len(), 2);
         for outcome in &outcomes {
             assert!(
@@ -1965,12 +1991,12 @@ mod tests {
         assert_consistent(&check(&backend, &t).await);
     }
 
-    /// Five repairs and two skips, the clock paused as in the deadline test.
-    /// How many repairs the node answers before the deadline cuts the rest is
-    /// timing, so this asserts what holds either way: every skip stays a
-    /// skip, a repair reports its own packed rows whether it finished or was
-    /// cut, one that never started reports none, and the counters equal the
-    /// sum of the outcomes.
+    /// Five repairs and two skips with a deadline of zero. The driver polls
+    /// the first four repairs once, which packs their rows and starts their
+    /// writes, then drops them; the fifth never starts. So the first four are
+    /// `Failed` with their packed rows, the fifth is `Failed` with none, the
+    /// skips behind them stay skips, and the counters equal the sum of the
+    /// outcomes.
     #[tokio::test]
     async fn skips_behind_cut_repairs_stay_skips_and_the_counters_add_up() {
         let Some(backend) = backend().await else {
@@ -1996,37 +2022,29 @@ mod tests {
         };
 
         let before = backend.repair_stats();
-        tokio::time::pause();
-        let outcomes = queue().run_within(&backend, Duration::from_secs(1)).await;
-        tokio::time::resume();
+        let outcomes = queue().run_within(&backend, Duration::ZERO).await;
         let stats = backend.repair_stats().since(&before);
         eprintln!("[repair case=cut {stats}]");
         assert_eq!(outcomes.len(), 7);
+        for outcome in &outcomes[..4] {
+            let RepairOutcome::Failed { failure, index } = outcome else {
+                panic!("{outcomes:?}");
+            };
+            assert_eq!(*failure, WriteFailure::TriesExhausted);
+            assert_eq!((index.rows_inserted, index.rows_deleted), (k2_len, 1));
+            assert!(index.batches >= 1);
+        }
+        assert_eq!(
+            outcomes[4],
+            RepairOutcome::Failed {
+                failure: WriteFailure::TriesExhausted,
+                index: IndexWriteStats::default(),
+            }
+        );
         assert_eq!(
             outcomes[5..],
             [RepairOutcome::Skipped(SkipReason::NoRow); 2]
         );
-        let (mut repaired, mut failed, mut inserted, mut deleted) = (0, 0, 0, 0);
-        for outcome in &outcomes[..5] {
-            let (RepairOutcome::Repaired { index, .. } | RepairOutcome::Failed { index, .. }) =
-                outcome
-            else {
-                panic!("{outcomes:?}");
-            };
-            if matches!(outcome, RepairOutcome::Repaired { .. }) {
-                repaired += 1;
-            } else {
-                failed += 1;
-            }
-            // Packed, or never started.
-            assert!(
-                (index.rows_inserted, index.rows_deleted) == (k2_len, 1)
-                    || *index == IndexWriteStats::default(),
-                "{outcomes:?}"
-            );
-            inserted += index.rows_inserted;
-            deleted += index.rows_deleted;
-        }
         assert_eq!(
             (
                 stats.queued,
@@ -2034,12 +2052,9 @@ mod tests {
                 stats.failed,
                 stats.skipped_no_row
             ),
-            (7, repaired, failed, 2)
+            (7, 0, 5, 2)
         );
-        assert_eq!(
-            (stats.rows_inserted, stats.rows_deleted),
-            (inserted, deleted)
-        );
+        assert_eq!((stats.rows_inserted, stats.rows_deleted), (4 * k2_len, 4));
 
         let outcomes = queue().run(&backend).await;
         assert!(

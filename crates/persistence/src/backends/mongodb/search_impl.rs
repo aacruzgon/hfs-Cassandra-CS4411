@@ -1,6 +1,6 @@
 //! Search and conditional-operation implementation for MongoDB backend.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -32,7 +32,8 @@ use super::deferred_index::SEARCH_ROWS_PENDING_FIELD;
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 use super::search_deadline::{self, SearchCommand};
 use super::search_index_catalog::{
-    COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, SEARCH_COMPOSITE_INDEX,
+    COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, QUANTITY_RANGE_HIGH_FIELD,
+    SEARCH_COMPOSITE_INDEX, SEARCH_DATE_END_INDEX, SEARCH_QUANTITY_HIGH_INDEX, value_index_led_by,
 };
 
 /// Candidate ids per `$in` chunk when the parameter-sort aggregation is
@@ -128,6 +129,12 @@ fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
 /// The `search_index` field a date row stores the end of its range in
 /// (#1391); `value_date` holds the start.
 const VALUE_DATE_END: &str = "value_date_end";
+/// Upper end of a quantity row's closed interval (#2602); the lower end is
+/// `value_quantity_value`.
+const VALUE_QUANTITY_HIGH: &str = "value_quantity_high";
+/// Lower end of a stored quantity interval, and the field both value-led
+/// quantity indexes are partial on.
+const VALUE_QUANTITY_VALUE: &str = "value_quantity_value";
 
 /// Reads a date search value with the grammar every backend shares.
 ///
@@ -252,17 +259,27 @@ fn build_date_range_filter_doc(value: &SearchValue, param: &str) -> StorageResul
 /// A value filter is either one conjunction or `{ "$or": [conjunction, ..] }`
 /// (see [`build_date_range_filter_doc`]); comma-separated values are OR'd, so
 /// the union of all arms is the same set of rows as the nested form matched.
+///
+/// A quantity filter (#2602) is the same shape plus sibling conditions on the
+/// system and code; those sit beside the `$or`, so they join every arm of it.
 fn scoped_date_alternatives(scope: &Document, value_filters: Vec<Document>) -> Document {
     let mut arms: Vec<Bson> = Vec::new();
-    for value_filter in value_filters {
-        let alternatives = match value_filter.get_array("$or") {
-            Ok(alternatives) if value_filter.len() == 1 => alternatives.clone(),
-            _ => vec![Bson::Document(value_filter)],
+    for mut value_filter in value_filters {
+        let alternatives = match value_filter.remove("$or") {
+            Some(Bson::Array(alternatives)) => alternatives,
+            _ => Vec::new(),
         };
+        if alternatives.is_empty() {
+            let mut arm = scope.clone();
+            arm.extend(value_filter);
+            arms.push(Bson::Document(arm));
+            continue;
+        }
         for alternative in alternatives {
             if let Bson::Document(conditions) = alternative {
                 let mut arm = scope.clone();
                 arm.extend(conditions);
+                arm.extend(value_filter.clone());
                 arms.push(Bson::Document(arm));
             }
         }
@@ -276,7 +293,10 @@ fn scoped_date_alternatives(scope: &Document, value_filters: Vec<Document>) -> D
 fn strip_index_scope(filter: &mut Document, param_type: SearchParamType) {
     filter.remove("tenant_id");
     filter.remove("resource_type");
-    if param_type != SearchParamType::Date {
+    if !matches!(
+        param_type,
+        SearchParamType::Date | SearchParamType::Quantity
+    ) {
         return;
     }
     if let Ok(arms) = filter.get_array_mut("$or") {
@@ -361,6 +381,179 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
         docs.push(doc);
     }
     Ok(docs)
+}
+
+/// The candidate set a parameter sort orders: none (the whole type), the
+/// matches, or matches over the id-set cap, which are never collected.
+enum SortCandidates {
+    Type,
+    Matched(HashSet<String>),
+    OverCap,
+}
+
+/// A search's parameters as `retain_matching_candidates` checks them, with
+/// its `:identifier` references resolved.
+struct SearchChecks<'q> {
+    normal: Vec<&'q SearchParameter>,
+    missing: Vec<&'q SearchParameter>,
+    not_params: Vec<&'q SearchParameter>,
+    identifier_filters: HashMap<usize, Document>,
+}
+
+/// One index-ordered stream of a sort key's rows: each row's `resource_id`
+/// and its key, read a batch at a time.
+struct SortRowStream {
+    cursor: Cursor<Document>,
+    key_field: &'static str,
+    buffered: VecDeque<(String, Bson)>,
+    exhausted: bool,
+}
+
+impl SortRowStream {
+    /// Reads batches until a row is buffered or the cursor is done.
+    async fn fill(&mut self) -> StorageResult<()> {
+        let key_field = self.key_field;
+        while self.buffered.is_empty() && !self.exhausted {
+            let batch = read_cursor_batch(&mut self.cursor, CANDIDATE_BATCH_SIZE).await?;
+            self.exhausted = batch.len() < CANDIDATE_BATCH_SIZE;
+            self.buffered.extend(batch.into_iter().filter_map(|row| {
+                let id = row.get_str("resource_id").ok()?.to_string();
+                let key = row
+                    .get(key_field)
+                    .filter(|key| **key != Bson::Null)?
+                    .clone();
+                Some((id, key))
+            }));
+        }
+        Ok(())
+    }
+}
+
+/// The next row in key order across `streams`, each already in that order.
+async fn next_sort_row(
+    streams: &mut [SortRowStream],
+    direction: crate::types::SortDirection,
+) -> StorageResult<Option<(String, Bson)>> {
+    for stream in streams.iter_mut() {
+        stream.fill().await?;
+    }
+    let mut next: Option<usize> = None;
+    for (index, stream) in streams.iter().enumerate() {
+        let Some((_, key)) = stream.buffered.front() else {
+            continue;
+        };
+        let first = next.is_none_or(|best| {
+            let (_, best_key) = streams[best].buffered.front().expect("filled above");
+            let ordering = compare_sort_keys(key, best_key);
+            match direction {
+                crate::types::SortDirection::Ascending => ordering.is_lt(),
+                crate::types::SortDirection::Descending => ordering.is_gt(),
+            }
+        });
+        if first {
+            next = Some(index);
+        }
+    }
+    Ok(next.and_then(|index| streams[index].buffered.pop_front()))
+}
+
+/// A prefix of matching resources in key order. Only the remaining window's
+/// best ids are retained within a tie; completed keys and the current tie
+/// together hold at most `wanted` ids. The separate first-key deduplication
+/// set belongs to the caller.
+struct ParamSortWindow {
+    wanted: usize,
+    id_direction: crate::types::SortDirection,
+    ordered: Vec<String>,
+    key: Option<Bson>,
+    tied: BTreeSet<String>,
+}
+
+impl ParamSortWindow {
+    fn new(wanted: usize, id_direction: crate::types::SortDirection) -> Self {
+        Self {
+            wanted,
+            id_direction,
+            ordered: Vec::new(),
+            key: None,
+            tied: BTreeSet::new(),
+        }
+    }
+
+    /// Observe every first-key candidate, including rejected ones: a new key
+    /// closes the preceding tie. Returns true once the window is complete.
+    fn push(&mut self, id: String, key: Bson, matches: bool) -> bool {
+        use crate::types::SortDirection;
+
+        if self
+            .key
+            .as_ref()
+            .is_none_or(|previous| compare_sort_keys(previous, &key).is_ne())
+        {
+            self.finish_key();
+            if self.ordered.len() == self.wanted {
+                return true;
+            }
+            self.key = Some(key);
+        }
+        if matches {
+            let remaining = self.wanted - self.ordered.len();
+            if self.tied.len() == remaining {
+                let replaces = match self.id_direction {
+                    SortDirection::Ascending => self.tied.last().is_some_and(|last| &id < last),
+                    SortDirection::Descending => self.tied.first().is_some_and(|first| &id > first),
+                };
+                if !replaces {
+                    return false;
+                }
+                match self.id_direction {
+                    SortDirection::Ascending => self.tied.pop_last(),
+                    SortDirection::Descending => self.tied.pop_first(),
+                };
+            }
+            self.tied.insert(id);
+        }
+        false
+    }
+
+    fn finish_key(&mut self) {
+        let tied = std::mem::take(&mut self.tied).into_iter();
+        match self.id_direction {
+            crate::types::SortDirection::Ascending => self.ordered.extend(tied),
+            crate::types::SortDirection::Descending => self.ordered.extend(tied.rev()),
+        }
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.finish_key();
+        self.ordered
+    }
+}
+
+/// A search's parameters as `retain_matching_candidates` checks them:
+/// positive ones, `:missing` and `:not`. `_id` and `_lastUpdated` are
+/// resource-level and left out.
+fn split_parameters(
+    query: &SearchQuery,
+) -> (
+    Vec<&SearchParameter>,
+    Vec<&SearchParameter>,
+    Vec<&SearchParameter>,
+) {
+    let mut normal = Vec::new();
+    let mut missing = Vec::new();
+    let mut not_params = Vec::new();
+    for param in &query.parameters {
+        if matches!(param.name.as_str(), "_id" | "_lastUpdated") {
+            continue;
+        }
+        match &param.modifier {
+            Some(SearchModifier::Missing) => missing.push(param),
+            Some(SearchModifier::Not) => not_params.push(param),
+            _ => normal.push(param),
+        }
+    }
+    (normal, missing, not_params)
 }
 
 /// Orders `(resource_id, keys)` pairs the way the server's
@@ -610,6 +803,14 @@ pub(super) fn value_field_for(param_type: SearchParamType) -> Option<&'static st
 fn sort_key_expression(value_field: &str, direction: crate::types::SortDirection) -> Bson {
     if value_field == "value_date" && direction == crate::types::SortDirection::Descending {
         Bson::Document(doc! { "$ifNull": [format!("${VALUE_DATE_END}"), "$value_date"] })
+    } else if value_field == "value_quantity_value"
+        && direction == crate::types::SortDirection::Descending
+    {
+        // #2602: a Range sorts descending by where it ends. A row written
+        // before the high was backfilled falls back to its value.
+        Bson::Document(
+            doc! { "$ifNull": [format!("${VALUE_QUANTITY_HIGH}"), "$value_quantity_value"] },
+        )
     } else {
         Bson::String(format!("${value_field}"))
     }
@@ -1174,6 +1375,19 @@ impl SearchProvider for MongoBackend {
     ) -> Vec<&'static str> {
         Self::modifiers_for_type(param_type)
     }
+
+    /// Every parameter except a `special` one: `build_index_value_filter`
+    /// refuses each, `_text` and `_content` with `501`
+    /// (`TextSearchNotAvailable`) and the rest (`near`, and from R5
+    /// `contains`, `section-text` and `_filter`) with `400`.
+    fn serves_search_param(
+        &self,
+        _resource_type: &str,
+        _code: &str,
+        param_type: crate::types::SearchParamType,
+    ) -> bool {
+        param_type != crate::types::SearchParamType::Special
+    }
 }
 
 impl MongoBackend {
@@ -1432,9 +1646,26 @@ impl MongoBackend {
                 &mut probe_facts,
             )
             .await?;
-        let (filter_plan, matched_ids) = self
+        let param_sorted = query
+            .sort
+            .iter()
+            .any(|d| !matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"));
+        // A parameter sort whose matches exceed the id-set cap may still walk
+        // its sort index (#2588); it keeps the error in case it cannot.
+        let (filter_plan, matched_ids, over_cap) = match self
             .plan_or_matching_ids(&db, tenant_id, query, &missing_support, filter_plan)
-            .await?;
+            .await
+        {
+            Err(error @ StorageError::Search(SearchError::TooManyResults { .. }))
+                if param_sorted =>
+            {
+                (None, None, Some(error))
+            }
+            matched => {
+                let (filter_plan, matched_ids) = matched?;
+                (filter_plan, matched_ids, None)
+            }
+        };
         record_filter_strategy(
             "filter_strategy",
             filter_plan.as_ref(),
@@ -1448,11 +1679,7 @@ impl MongoBackend {
         // The resource id is already the last key of that order, so a final
         // `_id` directive only sets its direction. `_lastUpdated`, `_score`, or
         // `_id` anywhere else are not search-index keys and are refused.
-        if query
-            .sort
-            .iter()
-            .any(|d| !matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"))
-        {
+        if param_sorted {
             let (directives, id_direction) = match query.sort.split_last() {
                 Some((last, rest)) if last.parameter == "_id" => (rest, last.direction),
                 _ => (
@@ -1488,6 +1715,7 @@ impl MongoBackend {
                     &db,
                     tenant_id,
                     matched_ids,
+                    over_cap,
                     directives,
                     id_direction,
                 )
@@ -3312,6 +3540,7 @@ impl MongoBackend {
         db: &mongodb::Database,
         tenant_id: &str,
         matched_ids: Option<HashSet<String>>,
+        over_cap: Option<StorageError>,
         directives: &[crate::types::SortDirective],
         id_direction: crate::types::SortDirection,
     ) -> StorageResult<SearchResult> {
@@ -3319,11 +3548,14 @@ impl MongoBackend {
         // collection: that folds in the resource-level predicates (`_id`,
         // `_lastUpdated`) AND makes the set live-only by construction, so a
         // stale search-index row can never occupy a page slot (#1056/#1040).
-        // With no filter at all `allowed` stays `None` and the ordering is
-        // computed over the whole type.
-        let allowed: Option<HashSet<String>> = match matched_ids {
-            Some(set) if set.is_empty() => Some(set),
-            Some(set) => Some(
+        // With no filter at all the ordering is computed over the whole type.
+        // Matches over the id-set cap have no set; they walk the sort index
+        // when it can serve them, and answer the error otherwise (#2588).
+        let candidates = match (over_cap, matched_ids) {
+            (Some(error), _) if !self.walks_param_sort(directives) => return Err(error),
+            (Some(_), _) => SortCandidates::OverCap,
+            (None, Some(set)) if set.is_empty() => SortCandidates::Matched(set),
+            (None, Some(set)) => SortCandidates::Matched(
                 self.resource_level_ids(
                     db,
                     tenant_id,
@@ -3334,8 +3566,8 @@ impl MongoBackend {
                 )
                 .await?,
             ),
-            None if has_resource_level_params(query, missing_support) => Some(
-                self.resource_level_ids(
+            (None, None) if has_resource_level_params(query, missing_support) => match self
+                .resource_level_ids(
                     db,
                     tenant_id,
                     &query.resource_type,
@@ -3343,20 +3575,27 @@ impl MongoBackend {
                     missing_support,
                     None,
                 )
-                .await?,
-            ),
-            None => None,
+                .await
+            {
+                Err(StorageError::Search(SearchError::TooManyResults { .. }))
+                    if self.walks_param_sort(directives) =>
+                {
+                    SortCandidates::OverCap
+                }
+                resolved => SortCandidates::Matched(resolved?),
+            },
+            (None, None) => SortCandidates::Type,
         };
 
         let page_size = query.count.unwrap_or(100).max(1) as usize;
         let offset = query.offset.unwrap_or(0) as usize;
         let has_previous = offset > 0;
         let mut total: Option<u64> = None;
-        let mut page_ids: Vec<String> = match allowed.as_ref() {
+        let mut page_ids: Vec<String> = match candidates {
             // No filter at all: these sorts have no cursor, so the offset is
             // the only way to page and it is bounded by the id-set cap
             // (#2285). Only the window is computed, never the whole type.
-            None => {
+            SortCandidates::Type => {
                 let reach = offset.saturating_add(page_size);
                 if reach > result_id_cap() {
                     return Err(StorageError::Search(SearchError::TooManyResults {
@@ -3381,7 +3620,35 @@ impl MongoBackend {
                 )
                 .await?
             }
-            Some(allowed) => {
+            // Bounded by the cap like the unfiltered window. The order does
+            // not change the count, so the total is the unsorted query's,
+            // which a query plan may count without collecting ids.
+            SortCandidates::OverCap => {
+                let reach = offset.saturating_add(page_size);
+                if reach > result_id_cap() {
+                    return Err(StorageError::Search(SearchError::TooManyResults {
+                        count: reach,
+                        max: result_id_cap(),
+                    }));
+                }
+                if query.wants_total() {
+                    let mut unsorted = query.clone();
+                    unsorted.sort.clear();
+                    total = Some(self.count_standard(tenant, &unsorted).await?);
+                }
+                self.param_sorted_filtered_window(
+                    db,
+                    tenant_id,
+                    query,
+                    missing_support,
+                    &directives[0],
+                    id_direction,
+                    offset,
+                    page_size + 1,
+                )
+                .await?
+            }
+            SortCandidates::Matched(allowed) => {
                 // Nothing can match: skip the ordering aggregation entirely.
                 let ordered: Vec<String> = if allowed.is_empty() {
                     Vec::new()
@@ -3392,7 +3659,7 @@ impl MongoBackend {
                         &query.resource_type,
                         directives,
                         id_direction,
-                        allowed,
+                        &allowed,
                     )
                     .await?
                 };
@@ -3860,6 +4127,350 @@ impl MongoBackend {
         Ok(unkeyed.into_iter().skip(skip).take(take).collect())
     }
 
+    /// Reference `:identifier` (#1408) names its targets by their identifier,
+    /// which a filter document cannot join on: each such parameter of `normal`
+    /// is resolved to its complete filter here, once, keyed by its position.
+    /// `None` when one has no target at all, which empties the search
+    /// (parameters are ANDed).
+    async fn identifier_filters(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        normal: &[&SearchParameter],
+    ) -> StorageResult<Option<HashMap<usize, Document>>> {
+        let mut filters = HashMap::new();
+        for (i, param) in normal.iter().enumerate() {
+            if param.param_type == SearchParamType::Reference
+                && matches!(param.modifier, Some(SearchModifier::Identifier))
+            {
+                match self
+                    .resolve_reference_identifier(search_index, tenant_id, resource_type, param)
+                    .await?
+                {
+                    Some(filter) => filters.insert(i, filter),
+                    None => return Ok(None),
+                };
+            }
+        }
+        Ok(Some(filters))
+    }
+
+    /// Whether a parameter sort whose matches exceed the id-set cap can walk
+    /// its sort index: a single search-parameter key, an index that orders
+    /// its rows, and the value indexes built (#2588).
+    fn walks_param_sort(&self, directives: &[crate::types::SortDirective]) -> bool {
+        self.search_indexes_ready()
+            && matches!(directives, [directive]
+                if value_index_led_by(sort_value_field(directive)).is_some()
+                    && (!matches!(
+                        sort_value_field(directive),
+                        "value_date" | "value_quantity_value"
+                    ) || directive.direction != crate::types::SortDirection::Descending
+                        || self.date_end_index_ready()))
+    }
+
+    /// One page window of a single-key parameter sort whose matches exceed
+    /// the id-set cap: the ids at positions `offset..offset + take` of the
+    /// order `param_sorted_ids` gives, without collecting the matches
+    /// (#2588). The sort parameter's rows are read in key order, so the first
+    /// row read for a resource holds its key. Membership is checked in
+    /// bounded batches; equal-key winners retain only the requested prefix
+    /// in id order. Matches without a key follow in id order. `take` includes
+    /// the extra match for `has_next`, beyond the caller's capped page reach.
+    #[allow(clippy::too_many_arguments)]
+    async fn param_sorted_filtered_window(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        directive: &crate::types::SortDirective,
+        id_direction: crate::types::SortDirection,
+        offset: usize,
+        take: usize,
+    ) -> StorageResult<Vec<String>> {
+        use crate::types::SortDirection;
+
+        let resource_type = query.resource_type.as_str();
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let (normal, missing, not_params) = split_parameters(query);
+        let Some(identifier_filters) = self
+            .identifier_filters(&search_index, tenant_id, resource_type, &normal)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let checks = SearchChecks {
+            normal,
+            missing,
+            not_params,
+            identifier_filters,
+        };
+
+        let wanted = offset.saturating_add(take);
+        let mut streams = self
+            .sort_row_streams(&search_index, tenant_id, resource_type, directive)
+            .await?;
+        // Every resource a row was read for, matching or not: its first row
+        // held its key, so its later rows are skipped.
+        let mut keyed: HashSet<String> = HashSet::new();
+        let mut window = ParamSortWindow::new(wanted, id_direction);
+        let mut complete = false;
+        while !complete {
+            let mut batch = Vec::with_capacity(CANDIDATE_BATCH_SIZE);
+            while batch.len() < CANDIDATE_BATCH_SIZE {
+                match next_sort_row(&mut streams, directive.direction).await? {
+                    Some((id, key)) => {
+                        if keyed.insert(id.clone()) {
+                            batch.push((id, key));
+                        }
+                    }
+                    None => {
+                        complete = true;
+                        break;
+                    }
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let ids = batch.iter().map(|(id, _)| id.clone()).collect();
+            let passing: HashSet<String> = self
+                .matching_in_order(
+                    db,
+                    &search_index,
+                    tenant_id,
+                    query,
+                    missing_support,
+                    &checks,
+                    ids,
+                )
+                .await?
+                .into_iter()
+                .collect();
+            for (id, key) in batch {
+                let matches = passing.contains(&id);
+                if window.push(id, key, matches) {
+                    return Ok(window
+                        .finish()
+                        .into_iter()
+                        .skip(offset)
+                        .take(take)
+                        .collect());
+                }
+            }
+        }
+        let mut window = window.finish();
+        if window.len() == wanted {
+            return Ok(window.into_iter().skip(offset).take(take).collect());
+        }
+
+        let mut cursor = db
+            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+            .find(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .search_deadline()?
+            .projection(doc! { "_id": 0, "id": 1 })
+            .sort(doc! { "id": match id_direction {
+                SortDirection::Ascending => 1,
+                SortDirection::Descending => -1,
+            } })
+            .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()))
+            .batch_size(CANDIDATE_BATCH_SIZE as u32)
+            .await
+            .or_query_error("Failed to open the unkeyed resource cursor")?;
+        loop {
+            let batch = read_cursor_batch(&mut cursor, CANDIDATE_BATCH_SIZE).await?;
+            let docs_read = batch.len();
+            let unkeyed: Vec<String> = batch
+                .iter()
+                .filter_map(|doc| doc.get_str("id").ok())
+                .filter(|id| !keyed.contains(*id))
+                .map(ToString::to_string)
+                .collect();
+            if !unkeyed.is_empty() {
+                let remaining = wanted - window.len();
+                window.extend(
+                    self.matching_in_order(
+                        db,
+                        &search_index,
+                        tenant_id,
+                        query,
+                        missing_support,
+                        &checks,
+                        unkeyed,
+                    )
+                    .await?
+                    .into_iter()
+                    .take(remaining),
+                );
+            }
+            if window.len() >= wanted || docs_read < CANDIDATE_BATCH_SIZE {
+                break;
+            }
+        }
+        Ok(window.into_iter().skip(offset).take(take).collect())
+    }
+
+    /// The ids of `ids` that satisfy the search, in the order given: its
+    /// search-index conditions, then its resource-level ones and liveness.
+    #[allow(clippy::too_many_arguments)]
+    async fn matching_in_order(
+        &self,
+        db: &mongodb::Database,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        checks: &SearchChecks<'_>,
+        ids: Vec<String>,
+    ) -> StorageResult<Vec<String>> {
+        // Both keyed and keyless callers bound ids before any `$in` is built.
+        debug_assert!(ids.len() <= CANDIDATE_BATCH_SIZE);
+        let candidates = self
+            .retain_matching_candidates(
+                db,
+                search_index,
+                tenant_id,
+                &query.resource_type,
+                &checks.normal,
+                &checks.identifier_filters,
+                &checks.missing,
+                &checks.not_params,
+                missing_support,
+                query.compartment.as_ref(),
+                None,
+                ids.iter().cloned().collect(),
+            )
+            .await?;
+        // `build_resource_filter` refuses an id set over the cap, which a
+        // lowered test cap puts below one batch.
+        let candidates: Vec<String> = candidates.into_iter().collect();
+        let mut passing = HashSet::new();
+        for chunk in candidates.chunks(result_id_cap().max(1)) {
+            let chunk: HashSet<String> = chunk.iter().cloned().collect();
+            passing.extend(
+                self.resource_level_ids(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    query,
+                    missing_support,
+                    Some(&chunk),
+                )
+                .await?,
+            );
+        }
+        Ok(ids.into_iter().filter(|id| passing.contains(id)).collect())
+    }
+
+    /// The cursors that read a single sort key's rows in key order, each
+    /// hinted onto the index that orders them. A descending date sorts by the
+    /// end of each range (`sort_key_expression`): rows with an end come from
+    /// `idx_search_date_end`, and rows written before #1391, which have none
+    /// and sort by their start, from the null-end keys of the same index.
+    async fn sort_row_streams(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        directive: &crate::types::SortDirective,
+    ) -> StorageResult<Vec<SortRowStream>> {
+        use crate::types::SortDirection;
+
+        let order = match directive.direction {
+            SortDirection::Ascending => 1,
+            SortDirection::Descending => -1,
+        };
+        let value_field = sort_value_field(directive);
+        let rows = |value_field: &str| {
+            doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "param_name": &directive.parameter,
+                value_field: { "$exists": true, "$ne": Bson::Null },
+            }
+        };
+        let plans: Vec<(Document, Document, &'static str, &'static str)> = if value_field
+            == "value_quantity_value"
+            && directive.direction == SortDirection::Descending
+        {
+            // #2602: a descending quantity sorts by the interval end. Rows with
+            // a high come from `idx_search_quantity_high`, and rows not yet
+            // backfilled, which sort by their value, from its null-high keys.
+            let mut ended = rows(value_field);
+            ended.insert(VALUE_QUANTITY_HIGH, doc! { "$ne": Bson::Null });
+            let mut open = rows(value_field);
+            open.insert(VALUE_QUANTITY_HIGH, Bson::Null);
+            vec![
+                (
+                    ended,
+                    doc! { VALUE_QUANTITY_HIGH: order },
+                    SEARCH_QUANTITY_HIGH_INDEX,
+                    VALUE_QUANTITY_HIGH,
+                ),
+                (
+                    open,
+                    doc! { VALUE_QUANTITY_HIGH: order, "value_quantity_value": order },
+                    SEARCH_QUANTITY_HIGH_INDEX,
+                    "value_quantity_value",
+                ),
+            ]
+        } else if value_field == "value_date" && directive.direction == SortDirection::Descending {
+            let mut ended = rows(value_field);
+            ended.insert(VALUE_DATE_END, doc! { "$ne": Bson::Null });
+            let mut open = rows(value_field);
+            open.insert(VALUE_DATE_END, Bson::Null);
+            vec![
+                (
+                    ended,
+                    doc! { VALUE_DATE_END: order },
+                    SEARCH_DATE_END_INDEX,
+                    VALUE_DATE_END,
+                ),
+                (
+                    open,
+                    doc! { VALUE_DATE_END: order, "value_date": order },
+                    SEARCH_DATE_END_INDEX,
+                    "value_date",
+                ),
+            ]
+        } else {
+            let index = value_index_led_by(value_field).ok_or_else(|| {
+                internal_error(format!("no search_index index is led by {value_field}"))
+            })?;
+            vec![(
+                rows(value_field),
+                doc! { value_field: order },
+                index,
+                value_field,
+            )]
+        };
+        let mut streams = Vec::with_capacity(plans.len());
+        for (filter, sort, index, key_field) in plans {
+            let cursor = search_index
+                .find(filter)
+                .search_deadline()?
+                .projection(doc! { "_id": 0, "resource_id": 1, key_field: 1 })
+                .sort(sort)
+                .hint(Hint::Name(index.to_owned()))
+                .batch_size(CANDIDATE_BATCH_SIZE as u32)
+                .await
+                .or_query_error("Failed to open a sort-key cursor")?;
+            streams.push(SortRowStream {
+                cursor,
+                key_field,
+                buffered: VecDeque::new(),
+                exhausted: false,
+            });
+        }
+        Ok(streams)
+    }
+
     async fn matching_resource_ids(
         &self,
         db: &mongodb::Database,
@@ -3889,20 +4500,7 @@ impl MongoBackend {
         )
         .await?;
 
-        let mut normal: Vec<&SearchParameter> = Vec::new();
-        let mut missing: Vec<&SearchParameter> = Vec::new();
-        let mut not_params: Vec<&SearchParameter> = Vec::new();
-
-        for param in &query.parameters {
-            if matches!(param.name.as_str(), "_id" | "_lastUpdated") {
-                continue;
-            }
-            match &param.modifier {
-                Some(SearchModifier::Missing) => missing.push(param),
-                Some(SearchModifier::Not) => not_params.push(param),
-                _ => normal.push(param),
-            }
-        }
+        let (normal, missing, not_params) = split_parameters(query);
 
         // A compartment that matches nothing makes the overall AND certainly
         // match nothing, exactly like an empty `_id` seed below, and is answered
@@ -4052,24 +4650,12 @@ impl MongoBackend {
                 .await;
         }
 
-        // Reference `:identifier` (#1408) names its targets by their
-        // identifier, which a filter document cannot join on: each such
-        // parameter is resolved to its complete filter here, once, and no
-        // target at all empties the search (parameters are ANDed).
-        let mut identifier_filters: HashMap<usize, Document> = HashMap::new();
-        for (i, param) in normal.iter().enumerate() {
-            if param.param_type == SearchParamType::Reference
-                && matches!(param.modifier, Some(SearchModifier::Identifier))
-            {
-                match self
-                    .resolve_reference_identifier(&search_index, tenant_id, resource_type, param)
-                    .await?
-                {
-                    Some(filter) => identifier_filters.insert(i, filter),
-                    None => return Ok(Some(HashSet::new())),
-                };
-            }
-        }
+        let Some(identifier_filters) = self
+            .identifier_filters(&search_index, tenant_id, resource_type, &normal)
+            .await?
+        else {
+            return Ok(Some(HashSet::new()));
+        };
         let normal_predicate = |i: usize| -> StorageResult<(Document, PredicateAccess)> {
             let filter = match identifier_filters.get(&i) {
                 Some(filter) => filter.clone(),
@@ -4853,8 +5439,12 @@ impl MongoBackend {
         // reading the documents, not as a covered scan; an `$or` at the top,
         // every arm carrying the scope itself, plans one index scan per arm.
         // The alternatives and their OR are unchanged; only where they sit.
-        if param.param_type == SearchParamType::Date
-            && (value_filters.len() > 1 || value_filters.iter().any(|f| f.contains_key("$or")))
+        // #2602: a quantity is an interval, so `ap` and `ne` are alternatives
+        // of their own, and the same placement lets each arm seek its index.
+        if matches!(
+            param.param_type,
+            SearchParamType::Date | SearchParamType::Quantity
+        ) && (value_filters.len() > 1 || value_filters.iter().any(|f| f.contains_key("$or")))
         {
             return Ok(scoped_date_alternatives(&filter, value_filters));
         }
@@ -5943,9 +6533,10 @@ impl MongoBackend {
         let quantity = crate::search::FhirQuantityValue::parse(&value.value)
             .map_err(|error| invalid_number_value(param, &value.value, &error))?;
 
-        let mut filter = doc! {
-            "value_quantity_value": Self::numeric_condition(value.prefix, &quantity.number)?
-        };
+        // #2602: a row is the closed interval `[value_quantity_value,
+        // value_quantity_high]`; a point row is the case `low = high`.
+        let mut filter =
+            Self::quantity_interval_filter(&quantity.number.interval_predicate(value.prefix));
         if let Some(system) = quantity.system {
             filter.insert("value_quantity_system", system);
         }
@@ -5954,6 +6545,79 @@ impl MongoBackend {
         }
 
         Ok(filter)
+    }
+
+    /// The filter a [`QuantityIntervalPredicate`] makes on the stored interval:
+    /// one group is a flat document (one condition per bound, bounds on the
+    /// same field merged), several groups an `$or` of such documents.
+    ///
+    /// A group with no bound on the lower end (`gt`, `ge`, `eb`, the upper arm
+    /// of `ne`) also gets `value_quantity_value: {$ne: null}` (#2730).
+    /// `idx_search_quantity_v2` and `idx_search_quantity_high` are partial on
+    /// that field existing, and a condition on `value_quantity_high` alone
+    /// does not imply it, so without the guard the planner may use neither
+    /// and reads every row of the resource type. Every quantity row stores
+    /// its lower end (an open one as a finite sentinel), so the guard never
+    /// changes the result. `$ne: null` rather than `$exists`, as the date
+    /// filter does: the planner accepts it as implying the partial filter.
+    fn quantity_interval_filter(predicate: &crate::search::QuantityIntervalPredicate) -> Document {
+        use crate::search::{Cmp, QuantityBound};
+        let group_doc = |group: &[QuantityBound]| {
+            let mut doc = Document::new();
+            let high_field = if group.contains(&QuantityBound::RangeOnly) {
+                QUANTITY_RANGE_HIGH_FIELD
+            } else {
+                VALUE_QUANTITY_HIGH
+            };
+            for bound in group {
+                let (field, cmp, v) = match *bound {
+                    QuantityBound::Low(c, v) => (VALUE_QUANTITY_VALUE, c, v),
+                    QuantityBound::High(c, v) => (high_field, c, v),
+                    // A proper Range (low < high) is the one that carries the
+                    // sparse `value_quantity_range_high`, so the shared
+                    // predicate's `[Low(Lt,a), High(Ge,a), RangeOnly]` group
+                    // is `value < a AND range_high >= a`: its `High` bound
+                    // moves to that field (a `$gte` also implies it exists,
+                    // which is `RangeOnly`) and serves
+                    // `idx_search_quantity_range` with no hint.
+                    QuantityBound::RangeOnly => continue,
+                };
+                let op = match cmp {
+                    Cmp::Lt => "$lt",
+                    Cmp::Le => "$lte",
+                    Cmp::Gt => "$gt",
+                    Cmp::Ge => "$gte",
+                };
+                match doc.get_document_mut(field) {
+                    Ok(existing) => {
+                        existing.insert(op, v);
+                    }
+                    Err(_) => {
+                        doc.insert(field, doc! { op: v });
+                    }
+                }
+            }
+            // Decided from the bounds, not from the built document. A
+            // `RangeOnly` group always has a lower bound and is served by the
+            // range index, which is partial on its own field.
+            let bounds_low = group
+                .iter()
+                .any(|b| matches!(b, QuantityBound::Low(..) | QuantityBound::RangeOnly));
+            if !bounds_low {
+                doc.insert(VALUE_QUANTITY_VALUE, doc! { "$ne": Bson::Null });
+            }
+            doc
+        };
+        match predicate.any_of.as_slice() {
+            [only] => group_doc(only),
+            groups => {
+                let arms: Vec<Bson> = groups
+                    .iter()
+                    .map(|g| Bson::Document(group_doc(g)))
+                    .collect();
+                doc! { "$or": arms }
+            }
+        }
     }
 
     /// Builds a MongoDB filter for a number parameter, comparing against
@@ -6186,8 +6850,9 @@ impl MongoBackend {
 
     /// The keyset predicate for `cursor` over `keyset`'s field, in the
     /// order [`Self::build_sort_document`] produces for the same query:
-    /// the sorted field first, then `id` descending (ascending in previous
-    /// mode) as the tie-break when the field is not `id` itself.
+    /// the sorted field first, then `id` in the same direction as the sorted
+    /// field (mirrored in previous mode) as the tie-break when the field is
+    /// not `id` itself.
     fn build_cursor_condition(
         &self,
         cursor: &PageCursor,
@@ -6239,9 +6904,9 @@ impl MongoBackend {
         // sort direction, flipped when walking back to the previous page.
         let ascending = (keyset.direction == crate::types::SortDirection::Ascending) != previous;
         let field_op = if ascending { "$gt" } else { "$lt" };
-        // `id` is the secondary key in descending order (see
-        // `build_sort_document`), so the tie-break is `$lt` going forward.
-        let id_op = if previous { "$gt" } else { "$lt" };
+        // `id` follows the direction of the sorted field (see
+        // `build_sort_document`), so the tie-break uses the same operator.
+        let id_op = field_op;
 
         let id = cursor.resource_id().to_string();
 
@@ -6249,7 +6914,15 @@ impl MongoBackend {
             return Ok(doc! { field: { field_op: boundary } });
         }
 
+        // The `$or` alone is only a filter: MongoDB then starts the index walk
+        // at the first row of the type and discards everything before the
+        // cursor, so a deep page reads every row ahead of it. The redundant
+        // inclusive bound on the sorted field (every row the `$or` accepts
+        // satisfies it) gives the planner a range to seek to on
+        // `RESOURCES_TYPE_SCAN_INDEX`.
+        let inclusive_op = if ascending { "$gte" } else { "$lte" };
         Ok(doc! {
+            field: { inclusive_op: boundary.clone() },
             "$or": [
                 { field: { field_op: boundary.clone() } },
                 { field: boundary, "id": { id_op: id } }
@@ -6298,8 +6971,14 @@ impl MongoBackend {
             sort.insert(field, dir);
         }
 
+        // The tie-break follows the direction of `last_updated` (already
+        // negated in previous mode) so the order is one that
+        // `RESOURCES_TYPE_SCAN_INDEX` serves forward or backward.
         if !sort.contains_key("id") {
-            sort.insert("id", if previous_mode { 1_i32 } else { -1_i32 });
+            let id_dir =
+                sort.get_i32("last_updated")
+                    .unwrap_or(if previous_mode { 1_i32 } else { -1_i32 });
+            sort.insert("id", id_dir);
         }
 
         Ok(sort)
@@ -7194,6 +7873,184 @@ mod date_filter_tests {
         );
     }
 
+    /// #2602: every prefix of a quantity search is a condition on the stored
+    /// closed interval, and a point row (`high = low`) behaves as before.
+    #[test]
+    fn quantity_prefixes_compare_the_stored_interval() {
+        let backend =
+            MongoBackend::new(crate::backends::mongodb::MongoBackendConfig::default()).unwrap();
+        let filter = |raw: &str| {
+            backend
+                .build_quantity_filter("onset-age", &SearchValue::parse(raw))
+                .unwrap()
+        };
+        let high = |raw: &str| {
+            filter(raw)
+                .get_document("value_quantity_high")
+                .unwrap()
+                .clone()
+        };
+        let low = |raw: &str| {
+            filter(raw)
+                .get_document("value_quantity_value")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(high("gt45"), doc! { "$gt": 45.0 });
+        assert_eq!(high("ge45"), doc! { "$gte": 45.0 });
+        assert_eq!(high("eb45"), doc! { "$lt": 45.0 });
+        assert_eq!(low("lt45"), doc! { "$lt": 45.0 });
+        assert_eq!(low("le45"), doc! { "$lte": 45.0 });
+        assert_eq!(low("sa45"), doc! { "$gt": 45.0 });
+        // `ap`: a point in the window, or a proper Range that starts below it
+        // and reaches it; the second arm is on the sparse range-high field.
+        let ap = filter("ap45");
+        let arms = ap.get_array("$or").unwrap();
+        assert_eq!(arms.len(), 2);
+        let (lo, hi) = crate::search::FhirNumberValue::parse("45")
+            .unwrap()
+            .approx_range();
+        assert_eq!(
+            arms[0].as_document().unwrap(),
+            &doc! { "value_quantity_value": { "$gte": lo, "$lte": hi } }
+        );
+        assert_eq!(
+            arms[1].as_document().unwrap(),
+            &doc! {
+                "value_quantity_value": { "$lt": lo },
+                "value_quantity_range_high": { "$gte": lo },
+            }
+        );
+        let ne = filter("ne45");
+        assert_eq!(ne.get_array("$or").unwrap().len(), 2);
+    }
+
+    /// #2602: `ap` reaches the index as a top-level `$or` whose arms each repeat
+    /// the scope and the system/code, so each arm seeks its own index: the
+    /// point window `idx_search_quantity_v2`, the Range-only arm
+    /// `idx_search_quantity_range` (with no hint).
+    #[test]
+    fn ap_is_a_scoped_top_level_or_with_the_range_arm_on_the_sparse_field() {
+        let backend =
+            MongoBackend::new(crate::backends::mongodb::MongoBackendConfig::default()).unwrap();
+        let param = SearchParameter {
+            name: "onset-age".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::parse("ap45|http://unitsofmeasure.org|a")],
+            chain: vec![],
+            components: vec![],
+        };
+        let filter = backend
+            .build_search_index_filter("t1", "Condition", &param)
+            .unwrap();
+        assert_eq!(filter.keys().collect::<Vec<_>>(), vec!["$or"], "{filter:?}");
+        let (lo, hi) = crate::search::FhirNumberValue::parse("45")
+            .unwrap()
+            .approx_range();
+        let scope = |arm: Document| {
+            let mut full = doc! {
+                "tenant_id": "t1", "resource_type": "Condition", "param_name": "onset-age",
+            };
+            full.extend(arm);
+            full.insert("value_quantity_system", "http://unitsofmeasure.org");
+            full.insert("value_quantity_unit", "a");
+            Bson::Document(full)
+        };
+        assert_eq!(
+            filter.get_array("$or").unwrap(),
+            &vec![
+                scope(doc! { "value_quantity_value": { "$gte": lo, "$lte": hi } }),
+                scope(doc! {
+                    "value_quantity_value": { "$lt": lo },
+                    "value_quantity_range_high": { "$gte": lo },
+                }),
+            ]
+        );
+    }
+
+    /// A Range (low 40, high 50) is found by the filter the way the shared
+    /// predicate says, for every prefix: evaluates the produced documents.
+    #[test]
+    fn quantity_filter_agrees_with_the_shared_interval_predicate() {
+        let eval = |doc: &Document, low: f64, high: f64| -> bool {
+            let group = |d: &Document| {
+                d.iter().all(|(field, cond)| {
+                    let stored = match field.as_str() {
+                        "value_quantity_high" => high,
+                        // Sparse: present only on a proper Range, and a
+                        // condition on an absent field matches nothing.
+                        "value_quantity_range_high" if low < high => high,
+                        "value_quantity_range_high" => return false,
+                        _ => low,
+                    };
+                    cond.as_document().unwrap().iter().all(|(op, v)| {
+                        // The partial-index guard: every stored row has its
+                        // lower end, so it holds for all of them.
+                        if op == "$ne" && *v == Bson::Null {
+                            assert_eq!(field, "value_quantity_value");
+                            return true;
+                        }
+                        let v = v.as_f64().unwrap();
+                        match op.as_str() {
+                            "$lt" => stored < v,
+                            "$lte" => stored <= v,
+                            "$gt" => stored > v,
+                            "$gte" => stored >= v,
+                            other => panic!("{other}"),
+                        }
+                    })
+                })
+            };
+            match doc.get_array("$or") {
+                Ok(arms) => arms.iter().any(|a| group(a.as_document().unwrap())),
+                Err(_) => group(doc),
+            }
+        };
+        let backend =
+            MongoBackend::new(crate::backends::mongodb::MongoBackendConfig::default()).unwrap();
+        for prefix in ["eq", "ne", "gt", "lt", "ge", "le", "sa", "eb", "ap"] {
+            for text in ["35", "40", "45", "50", "55"] {
+                let raw = format!("{prefix}{text}");
+                let filter = backend
+                    .build_quantity_filter("onset-age", &SearchValue::parse(&raw))
+                    .unwrap();
+                let value = SearchValue::parse(&raw);
+                let number = crate::search::FhirQuantityValue::parse(&value.value)
+                    .unwrap()
+                    .number;
+                let expected = number.interval_predicate(value.prefix);
+                for (l, h) in [
+                    (40.0, 50.0),
+                    (45.0, 45.0),
+                    (40.0, 40.0),
+                    (f64::MIN, 10.0),
+                    (60.0, f64::MAX),
+                ] {
+                    assert_eq!(
+                        eval(&filter, l, h),
+                        expected.matches(l, h),
+                        "{raw} [{l},{h}]"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #2602: a descending quantity sort reads the interval end.
+    #[test]
+    fn descending_quantity_sort_reads_the_interval_end() {
+        use crate::types::SortDirection;
+        assert_eq!(
+            sort_key_expression("value_quantity_value", SortDirection::Descending),
+            Bson::Document(doc! { "$ifNull": ["$value_quantity_high", "$value_quantity_value"] })
+        );
+        assert_eq!(
+            sort_key_expression("value_quantity_value", SortDirection::Ascending),
+            Bson::String("$value_quantity_value".to_string())
+        );
+    }
+
     /// Garbage stays an error, not a silent full scan — under every prefix,
     /// and now for values chrono used to be the judge of.
     #[test]
@@ -7299,10 +8156,84 @@ mod date_filter_tests {
             Ok("http://example.org")
         );
         assert_eq!(filter.get_str("value_quantity_unit"), Ok("a|b"));
+        // `gt` on a closed interval bounds the high end (#2602).
         assert_eq!(
-            filter.get_document("value_quantity_value").unwrap(),
+            filter.get_document("value_quantity_high").unwrap(),
             &doc! { "$gt": 5.4 }
         );
+        // ... and names the lower end only through the guard that keeps the
+        // partial quantity indexes usable (#2730).
+        assert_eq!(
+            filter.get_document("value_quantity_value").unwrap(),
+            &doc! { "$ne": Bson::Null }
+        );
+    }
+
+    /// #2730: the rendered filter for each prefix. A group with no bound on
+    /// the lower end carries the non-null guard on `value_quantity_value`, so
+    /// the partial quantity indexes stay eligible; a group that bounds the
+    /// lower end does not get it.
+    #[test]
+    fn quantity_filter_guards_groups_without_a_low_bound() {
+        let backend =
+            MongoBackend::new(crate::backends::mongodb::MongoBackendConfig::default()).unwrap();
+        let filter = |raw: &str| {
+            backend
+                .build_quantity_filter("value-quantity", &SearchValue::parse(raw))
+                .unwrap()
+        };
+        let guard = doc! { "$ne": Bson::Null };
+
+        assert_eq!(
+            filter("gt5"),
+            doc! { "value_quantity_high": { "$gt": 5.0 }, "value_quantity_value": guard.clone() }
+        );
+        assert_eq!(
+            filter("ge5"),
+            doc! { "value_quantity_high": { "$gte": 5.0 }, "value_quantity_value": guard.clone() }
+        );
+        assert_eq!(
+            filter("eb5"),
+            doc! { "value_quantity_high": { "$lt": 5.0 }, "value_quantity_value": guard.clone() }
+        );
+        // `ne`: the low arm is already a bound on the field; only the high
+        // arm needs the guard.
+        assert_eq!(
+            filter("ne5"),
+            doc! { "$or": [
+                { "value_quantity_value": { "$lt": 4.5 } },
+                { "value_quantity_high": { "$gte": 5.5 }, "value_quantity_value": guard.clone() },
+            ]}
+        );
+        // `eq` keeps both ends bounded on both sides, with no guard.
+        assert_eq!(
+            filter("5"),
+            doc! {
+                "value_quantity_value": { "$gte": 4.5, "$lt": 5.5 },
+                "value_quantity_high": { "$lt": 5.5, "$gte": 4.5 },
+            }
+        );
+        // Low-bounded prefixes and both arms of `ap` are unchanged.
+        assert_eq!(
+            filter("lt5"),
+            doc! { "value_quantity_value": { "$lt": 5.0 } }
+        );
+        assert_eq!(
+            filter("le5"),
+            doc! { "value_quantity_value": { "$lte": 5.0 } }
+        );
+        assert_eq!(
+            filter("sa5"),
+            doc! { "value_quantity_value": { "$gt": 5.0 } }
+        );
+        let ap = filter("ap5");
+        for arm in ap.get_array("$or").unwrap() {
+            let low = arm
+                .as_document()
+                .unwrap()
+                .get_document("value_quantity_value");
+            assert!(!low.unwrap().contains_key("$ne"), "{ap:?}");
+        }
     }
 }
 
@@ -7328,6 +8259,50 @@ mod query_support_tests {
         });
 
         assert!(backend.validate_query_support(&query).is_ok());
+    }
+
+    /// `serves_search_param`, which `/metadata` reads, answers `false` for each
+    /// `special` parameter `build_index_value_filter` refuses (#2593): every one
+    /// the enabled specs register, and `_text` and `_content`, which answer
+    /// `501`.
+    #[test]
+    fn serves_search_param_is_false_for_each_special_parameter_the_filter_refuses() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        for code in crate::core::search::special_search_param_codes() {
+            let served = backend.serves_search_param("Location", &code, SearchParamType::Special);
+            assert!(!served, "{code}");
+            let param = SearchParameter {
+                name: code.clone(),
+                param_type: SearchParamType::Special,
+                values: vec![SearchValue::eq("x")],
+                ..Default::default()
+            };
+            let refused = backend
+                .build_index_value_filter(&param, &param.values[0], &[])
+                .unwrap_err();
+            let expected_501 = matches!(code.as_str(), "_text" | "_content");
+            assert!(
+                matches!(
+                    (&refused, expected_501),
+                    (
+                        StorageError::Search(SearchError::TextSearchNotAvailable),
+                        true
+                    ) | (
+                        StorageError::Search(SearchError::UnsupportedParameterType { .. }),
+                        false
+                    )
+                ),
+                "{code}: {refused:?}"
+            );
+        }
+        for param_type in [
+            SearchParamType::String,
+            SearchParamType::Token,
+            SearchParamType::Reference,
+            SearchParamType::Composite,
+        ] {
+            assert!(backend.serves_search_param("Patient", "x", param_type));
+        }
     }
 
     #[test]
@@ -7967,11 +8942,16 @@ mod number_quantity_precision_tests {
             .build_search_index_filter("t1", "Observation", &param)
             .expect("valid filter");
 
-        let bounds = filter
+        // `eq`: the stored interval lies inside the implicit-precision range:
+        // `s <= low` and `high < e` (#2602).
+        let low = filter
             .get_document("value_quantity_value")
             .expect("value_quantity_value condition");
-        assert!((bounds.get_f64("$gte").unwrap() - 59.95).abs() < 1e-9);
-        assert!((bounds.get_f64("$lt").unwrap() - 60.05).abs() < 1e-9);
+        assert!((low.get_f64("$gte").unwrap() - 59.95).abs() < 1e-9);
+        let high = filter
+            .get_document("value_quantity_high")
+            .expect("value_quantity_high condition");
+        assert!((high.get_f64("$lt").unwrap() - 60.05).abs() < 1e-9);
         assert_eq!(filter.get_str("value_quantity_unit").unwrap(), "kg");
     }
 
@@ -8158,13 +9138,23 @@ mod composite_component_filter_tests {
         // satisfy this `$not` -- this pins that the guard is present
         // alongside it, not merged into a single top-level key that a
         // sibling absence could still slip past.
+        // #2602: `ne` on the interval is `low < s OR high >= e`, an `$or`
+        // whose arms each name a quantity field, so a sibling row that lacks
+        // both matches neither arm.
         let predicate = and_arms[1].as_document().expect("typed predicate arm");
+        let arms = predicate.get_array("$or").expect("ne is an $or of bounds");
+        assert_eq!(arms.len(), 2, "{predicate:?}");
         assert!(
-            predicate
-                .get_document("value_quantity_value")
-                .expect("value_quantity_value condition")
-                .contains_key("$not"),
-            "quantity ne must build a $not-wrapped range predicate: {predicate:?}"
+            arms[0]
+                .as_document()
+                .unwrap()
+                .contains_key("value_quantity_value")
+        );
+        assert!(
+            arms[1]
+                .as_document()
+                .unwrap()
+                .contains_key("value_quantity_high")
         );
     }
 
@@ -9293,6 +10283,43 @@ mod cursor_keyset_tests {
         }
     }
 
+    /// #2603: the `id` tie-break follows the direction of `last_updated`
+    /// (mirrored for previous pages), so every order is one
+    /// `RESOURCES_TYPE_SCAN_INDEX` serves forward or backward.
+    #[test]
+    fn last_updated_sort_document_id_follows_the_sort_direction() {
+        for (sort, previous, expected) in [
+            (
+                "_lastUpdated",
+                false,
+                doc! { "last_updated": 1_i32, "id": 1_i32 },
+            ),
+            (
+                "_lastUpdated",
+                true,
+                doc! { "last_updated": -1_i32, "id": -1_i32 },
+            ),
+            (
+                "-_lastUpdated",
+                false,
+                doc! { "last_updated": -1_i32, "id": -1_i32 },
+            ),
+            (
+                "-_lastUpdated",
+                true,
+                doc! { "last_updated": 1_i32, "id": 1_i32 },
+            ),
+        ] {
+            let query =
+                SearchQuery::new("Patient").with_sort(crate::types::SortDirective::parse(sort));
+            assert_eq!(
+                backend().build_sort_document(&query, previous).unwrap(),
+                expected,
+                "{sort} previous={previous}"
+            );
+        }
+    }
+
     #[test]
     fn index_cursor_filter_excludes_timestamp_cursors_and_first_pages() {
         let backend = backend();
@@ -9312,8 +10339,8 @@ mod cursor_keyset_tests {
         }
     }
 
-    /// `_lastUpdated` keeps `id` (descending) as the tie-break, in both
-    /// explicit directions and for the default sort.
+    /// `_lastUpdated` uses `id` as the tie-break, in the same direction as
+    /// the sort, for both explicit directions and the default sort.
     #[test]
     fn last_updated_sort_cursor_compares_last_updated_then_id() {
         let r = resource("p-5", "2026-01-02T03:04:05Z");
@@ -9329,7 +10356,7 @@ mod cursor_keyset_tests {
         ));
         assert_eq!(
             backend().build_cursor_condition(&cursor, &default).unwrap(),
-            doc! { "$or": [
+            doc! { "last_updated": { "$lte": ts.clone() }, "$or": [
                 { "last_updated": { "$lt": ts.clone() } },
                 { "last_updated": ts.clone(), "id": { "$lt": "p-5" } }
             ]}
@@ -9346,9 +10373,9 @@ mod cursor_keyset_tests {
         let asc = keyset(&["_lastUpdated"]).unwrap();
         assert_eq!(
             backend().build_cursor_condition(&cursor, &asc).unwrap(),
-            doc! { "$or": [
+            doc! { "last_updated": { "$gte": ts.clone() }, "$or": [
                 { "last_updated": { "$gt": ts.clone() } },
-                { "last_updated": ts.clone(), "id": { "$lt": "p-5" } }
+                { "last_updated": ts.clone(), "id": { "$gt": "p-5" } }
             ]}
         );
 
@@ -9357,9 +10384,9 @@ mod cursor_keyset_tests {
                 .unwrap();
         assert_eq!(
             backend().build_cursor_condition(&prev, &asc).unwrap(),
-            doc! { "$or": [
+            doc! { "last_updated": { "$lte": ts.clone() }, "$or": [
                 { "last_updated": { "$lt": ts.clone() } },
-                { "last_updated": ts, "id": { "$gt": "p-5" } }
+                { "last_updated": ts, "id": { "$lt": "p-5" } }
             ]}
         );
     }

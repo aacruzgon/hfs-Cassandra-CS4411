@@ -1533,6 +1533,16 @@ fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatc
     IndexBatches { batches, stats }
 }
 
+/// What [`CassandraBackend::write_index_delta`] reports as `stats` for
+/// `delta` at `ts`: the rows and batches as packed, before anything is sent.
+pub(crate) fn index_pack_stats(
+    key: &RowKey<'_>,
+    delta: &IndexDelta<'_>,
+    ts: i64,
+) -> IndexWriteStats {
+    index_batches(key, delta, ts).stats
+}
+
 /// Why a plain write after the CAS (a version row or an index batch) was not
 /// written. Either way the write still answers success and its intent is
 /// left for the sweeper (G23); the kind tells a caller that retries on its

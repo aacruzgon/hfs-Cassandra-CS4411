@@ -9,16 +9,162 @@
 //! **Scope:** per the Bulk Data Submit spec, file-retrieval tokens are scoped to
 //! *read the resource types in the manifest* (e.g. `system/*.rs`) — **never** the
 //! `system/bulk-submit` operation scope used for HFS's own endpoints.
+//!
+//! **Destinations:** the metadata URL, the manifest URL and every file URL come
+//! from the submitter, so a token is only ever presented to the origin of the
+//! token endpoint that issued it, or to an origin the operator listed in
+//! `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` ([`TrustedProviders`]). When that list is
+//! set, discovery and the token request themselves are confined to it too.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use helios_persistence::core::FileTokenProvider;
+use helios_persistence::core::bulk_submit_input::redact_url;
+use helios_persistence::core::{FileTokenError, FileTokenProvider};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::Value;
 use tokio::sync::Mutex;
+
+/// Bounds on the metadata GET and the token POST, so a provider that accepts
+/// the connection and never answers cannot hold a submit worker slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientTimeouts {
+    /// Establishing the connection.
+    pub connect: Duration,
+    /// Idle time allowed between two reads of a response.
+    pub read: Duration,
+    /// The whole request, start to finish.
+    pub total: Duration,
+}
+
+impl Default for ClientTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            read: Duration::from_secs(30),
+            total: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Longest lifetime honoured for a provider-issued token, whatever its
+/// `expires_in` says: the value is the provider's to choose, so it bounds
+/// the cache entry, never the arithmetic.
+const MAX_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long a token is served from the cache: `expires_in` less a 30 s
+/// refresh margin, at least 1 s, at most [`MAX_TOKEN_TTL`].
+fn token_ttl(expires_in: u64) -> Duration {
+    Duration::from_secs(expires_in.saturating_sub(30).max(1)).min(MAX_TOKEN_TTL)
+}
+
+/// Origins (`scheme://host[:port]`) the operator trusts as bulk-submit Data
+/// Providers: the only origins `$bulk-submit` fetches from at all (the
+/// `manifestUrl`, the `oauthMetadataUrl`, every manifest output URL and
+/// every redirect), where HFS presents its client assertion, and where a
+/// token obtained there may be sent. Parsed from
+/// `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`.
+///
+/// Empty (the default) lets the submitter name any origin and confines a
+/// token to the origin of the token endpoint that issued it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedProviders(Vec<String>);
+
+/// Redirect hops followed, as reqwest's default policy allows.
+const MAX_REDIRECTS: usize = 10;
+
+impl TrustedProviders {
+    /// Parses one origin per entry. An entry must be an absolute URL with a
+    /// host and nothing after it: a path, query or fragment is refused rather
+    /// than silently widened to the whole origin.
+    pub fn parse<S: AsRef<str>>(entries: impl IntoIterator<Item = S>) -> Result<Self, String> {
+        let mut origins = Vec::new();
+        for entry in entries {
+            let entry = entry.as_ref().trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let url = reqwest::Url::parse(entry)
+                .map_err(|_| format!("'{entry}' is not an absolute URL"))?;
+            if !url.origin().is_tuple() {
+                return Err(format!("'{entry}' has no host"));
+            }
+            if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some()
+            {
+                return Err(format!(
+                    "'{entry}' names more than an origin; list only scheme://host[:port]"
+                ));
+            }
+            let origin = url.origin().ascii_serialization();
+            if !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+        Ok(Self(origins))
+    }
+
+    /// `true` when no origin is listed.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether `origin` is listed.
+    pub fn contains(&self, origin: &str) -> bool {
+        self.0.iter().any(|o| o == origin)
+    }
+
+    /// Whether `$bulk-submit` may send a request to `url`: anywhere when no
+    /// origin is listed, otherwise only to a listed origin. A URL without an
+    /// origin (an opaque scheme) is never permitted by a configured list.
+    pub fn permits_url(&self, url: &str) -> bool {
+        self.is_empty() || origin_of(url).is_some_and(|origin| self.contains(&origin))
+    }
+
+    /// The redirect policy of a client that sends `$bulk-submit` requests:
+    /// with a list configured a hop is followed only to a listed origin,
+    /// otherwise reqwest's default policy applies. Both the file fetcher and
+    /// the OAuth client use it, so neither the manifest and file GETs nor the
+    /// metadata GET and the token POST (whose body is the signed client
+    /// assertion) leave the listed origins by way of a redirect.
+    pub(crate) fn redirect_policy(&self) -> reqwest::redirect::Policy {
+        if self.is_empty() {
+            return reqwest::redirect::Policy::default();
+        }
+        let trusted = self.clone();
+        reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                attempt.error("too many redirects")
+            } else if trusted.permits_url(attempt.url().as_str()) {
+                attempt.follow()
+            } else {
+                attempt.error(
+                    "redirected to an origin not listed in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS",
+                )
+            }
+        })
+    }
+
+    /// With a list configured, refuses an origin outside it.
+    fn require(&self, origin: &str) -> Result<(), FileTokenError> {
+        if self.is_empty() || self.contains(origin) {
+            Ok(())
+        } else {
+            Err(FileTokenError::UntrustedProvider {
+                origin: origin.to_string(),
+            })
+        }
+    }
+}
+
+/// The `scheme://host[:port]` of an absolute URL, or `None` when it has no
+/// host (an opaque origin such as `data:`), the form every comparison here
+/// is made on.
+pub(crate) fn origin_of(url: &str) -> Option<String> {
+    let origin = reqwest::Url::parse(url).ok()?.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
 
 /// Acquires read-scoped bearer tokens via SMART Backend Services `client_credentials`.
 pub struct JwtClientCredentialsTokenProvider {
@@ -28,14 +174,66 @@ pub struct JwtClientCredentialsTokenProvider {
     encoding_key: EncodingKey,
     /// RFC 7638 thumbprint of the public key, used as `kid` in assertion headers.
     kid: Option<String>,
+    trusted_providers: TrustedProviders,
     /// Cache of `(token_endpoint, scope) -> (token, expiry)`.
     cache: Mutex<HashMap<(String, String), (String, Instant)>>,
 }
 
 impl JwtClientCredentialsTokenProvider {
     /// Builds a provider from a `client_id`, a PEM private key, and a signing alg
-    /// (`ES384` or `RS384`). Returns `None` if the key can't be parsed.
+    /// (`ES384` or `RS384`) that trusts no provider origin beyond the token
+    /// endpoint's own, with the default [`ClientTimeouts`]. Returns `None` if
+    /// the key can't be parsed.
     pub fn new(client_id: &str, private_key_pem: &str, signing_alg: &str) -> Option<Arc<Self>> {
+        Self::new_with(
+            client_id,
+            private_key_pem,
+            signing_alg,
+            TrustedProviders::default(),
+            ClientTimeouts::default(),
+        )
+    }
+
+    /// [`Self::new`] with the operator's trusted provider origins.
+    pub fn new_with_trusted_providers(
+        client_id: &str,
+        private_key_pem: &str,
+        signing_alg: &str,
+        trusted_providers: TrustedProviders,
+    ) -> Option<Arc<Self>> {
+        Self::new_with(
+            client_id,
+            private_key_pem,
+            signing_alg,
+            trusted_providers,
+            ClientTimeouts::default(),
+        )
+    }
+
+    /// [`Self::new`] with explicit bounds on the metadata and token requests.
+    pub fn new_with_timeouts(
+        client_id: &str,
+        private_key_pem: &str,
+        signing_alg: &str,
+        timeouts: ClientTimeouts,
+    ) -> Option<Arc<Self>> {
+        Self::new_with(
+            client_id,
+            private_key_pem,
+            signing_alg,
+            TrustedProviders::default(),
+            timeouts,
+        )
+    }
+
+    /// [`Self::new`] with the trusted provider origins and the request bounds.
+    pub fn new_with(
+        client_id: &str,
+        private_key_pem: &str,
+        signing_alg: &str,
+        trusted_providers: TrustedProviders,
+        timeouts: ClientTimeouts,
+    ) -> Option<Arc<Self>> {
         let (alg, key) = match signing_alg {
             "ES384" => (
                 Algorithm::ES384,
@@ -49,26 +247,52 @@ impl JwtClientCredentialsTokenProvider {
         };
         let kid = derive_public_jwk(private_key_pem, signing_alg)
             .and_then(|jwk| jwk.get("kid").and_then(|v| v.as_str()).map(String::from));
+        // `Client::new()` panics the same way when the TLS backend cannot start.
+        let client = reqwest::Client::builder()
+            .connect_timeout(timeouts.connect)
+            .read_timeout(timeouts.read)
+            .timeout(timeouts.total)
+            .redirect(trusted_providers.redirect_policy())
+            .build()
+            .expect("bulk-submit OAuth HTTP client configuration is valid");
         Some(Arc::new(Self {
-            client: reqwest::Client::new(),
+            client,
             client_id: client_id.to_string(),
             signing_alg: alg,
             encoding_key: key,
             kid,
+            trusted_providers,
             cache: Mutex::new(HashMap::new()),
         }))
     }
 
     /// Resolves the token endpoint from a SMART/OAuth metadata URL.
-    async fn discover_token_endpoint(&self, oauth_metadata_url: &str) -> Option<String> {
-        let resp = self.client.get(oauth_metadata_url).send().await.ok()?;
+    async fn discover_token_endpoint(
+        &self,
+        oauth_metadata_url: &str,
+    ) -> Result<String, FileTokenError> {
+        let shown = redact_url(oauth_metadata_url);
+        let unavailable = |reason: String| FileTokenError::Unavailable(reason);
+        let resp = self
+            .client
+            .get(oauth_metadata_url)
+            .send()
+            .await
+            .map_err(|e| unavailable(format!("metadata GET {shown} failed: {e}")))?;
         if !resp.status().is_success() {
-            return None;
+            return Err(unavailable(format!(
+                "metadata GET {shown} returned HTTP {}",
+                resp.status()
+            )));
         }
-        let meta: Value = resp.json().await.ok()?;
+        let meta: Value = resp
+            .json()
+            .await
+            .map_err(|e| unavailable(format!("metadata at {shown} is not JSON: {e}")))?;
         meta.get("token_endpoint")
             .and_then(|v| v.as_str())
             .map(String::from)
+            .ok_or_else(|| unavailable(format!("metadata at {shown} names no token_endpoint")))
     }
 
     /// Mints + signs a `private_key_jwt` client assertion for `token_endpoint`.
@@ -88,8 +312,16 @@ impl JwtClientCredentialsTokenProvider {
         jsonwebtoken::encode(&header, &claims, &self.encoding_key).ok()
     }
 
-    async fn request_token(&self, token_endpoint: &str, scope: &str) -> Option<(String, Instant)> {
-        let assertion = self.client_assertion(token_endpoint)?;
+    async fn request_token(
+        &self,
+        token_endpoint: &str,
+        scope: &str,
+    ) -> Result<(String, Instant), FileTokenError> {
+        let shown = redact_url(token_endpoint);
+        let unavailable = |reason: String| FileTokenError::Unavailable(reason);
+        let assertion = self
+            .client_assertion(token_endpoint)
+            .ok_or_else(|| unavailable("the client assertion could not be signed".to_string()))?;
         let params = [
             ("grant_type", "client_credentials"),
             ("scope", scope),
@@ -105,30 +337,82 @@ impl JwtClientCredentialsTokenProvider {
             .form(&params)
             .send()
             .await
-            .ok()?;
+            .map_err(|e| unavailable(format!("token POST {shown} failed: {e}")))?;
         if !resp.status().is_success() {
-            return None;
+            return Err(unavailable(format!(
+                "token POST {shown} returned HTTP {}",
+                resp.status()
+            )));
         }
-        let body: Value = resp.json().await.ok()?;
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| unavailable(format!("token response from {shown} is not JSON: {e}")))?;
         let token = body
             .get("access_token")
-            .and_then(|v| v.as_str())?
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| unavailable(format!("token response from {shown} has no access_token")))?
             .to_string();
         let expires_in = body
             .get("expires_in")
             .and_then(|v| v.as_u64())
             .unwrap_or(300);
         // Refresh ~30s before expiry.
-        let ttl = expires_in.saturating_sub(30).max(1);
-        Some((token, Instant::now() + Duration::from_secs(ttl)))
+        // Refresh ~30s before expiry. `expires_in` is the provider's number:
+        // bounded, and added with checked arithmetic, so no value it sends
+        // can fault the worker.
+        let expiry = Instant::now()
+            .checked_add(token_ttl(expires_in))
+            .ok_or_else(|| {
+                FileTokenError::Unavailable("token expiry is beyond the clock".to_string())
+            })?;
+        Ok((token, expiry))
     }
 }
 
 #[async_trait]
 impl FileTokenProvider for JwtClientCredentialsTokenProvider {
-    async fn token(&self, oauth_metadata_urls: &[String], scope: &str) -> Option<String> {
-        let metadata_url = oauth_metadata_urls.first()?;
+    async fn token(
+        &self,
+        oauth_metadata_urls: &[String],
+        scope: &str,
+        destination: &str,
+    ) -> Result<String, FileTokenError> {
+        let metadata_url = oauth_metadata_urls.first().ok_or_else(|| {
+            FileTokenError::Unavailable("the submission names no oauthMetadataUrl".to_string())
+        })?;
+        let metadata_origin = origin_of(metadata_url).ok_or_else(|| {
+            FileTokenError::Unavailable(format!(
+                "oauthMetadataUrl {} has no origin",
+                redact_url(metadata_url)
+            ))
+        })?;
+        self.trusted_providers.require(&metadata_origin)?;
+
         let token_endpoint = self.discover_token_endpoint(metadata_url).await?;
+        let token_origin = origin_of(&token_endpoint).ok_or_else(|| {
+            FileTokenError::Unavailable(format!(
+                "token_endpoint {} has no origin",
+                redact_url(&token_endpoint)
+            ))
+        })?;
+        self.trusted_providers.require(&token_origin)?;
+
+        let destination_origin = origin_of(destination).ok_or_else(|| {
+            FileTokenError::Unavailable(format!(
+                "destination {} has no origin",
+                redact_url(destination)
+            ))
+        })?;
+        if destination_origin != token_origin
+            && !self.trusted_providers.contains(&destination_origin)
+        {
+            return Err(FileTokenError::UntrustedDestination {
+                destination: destination_origin,
+                token_origin,
+            });
+        }
+
         let cache_key = (token_endpoint.clone(), scope.to_string());
 
         // Serve a cached, unexpired token.
@@ -136,7 +420,7 @@ impl FileTokenProvider for JwtClientCredentialsTokenProvider {
             let cache = self.cache.lock().await;
             if let Some((tok, exp)) = cache.get(&cache_key) {
                 if Instant::now() < *exp {
-                    return Some(tok.clone());
+                    return Ok(tok.clone());
                 }
             }
         }
@@ -146,7 +430,7 @@ impl FileTokenProvider for JwtClientCredentialsTokenProvider {
             .lock()
             .await
             .insert(cache_key, (token.clone(), exp));
-        Some(token)
+        Ok(token)
     }
 }
 
@@ -214,6 +498,95 @@ MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDDL2uAdbDMvTFQ/r+Tz\n\
 k5K6g75uWMf/NsVu7ay2lO8vuu9EC12UBjDQ+297+9I7+IlSzRmoWKUT0fVrOeoB\n\
 gMMPIjEueYREkCGj6cILnLaP5hAey+Q7JjRgVO6Xqf0u2uCO6yn8UTU=\n\
 -----END PRIVATE KEY-----\n";
+
+    #[test]
+    fn trusted_providers_parse_origins_only() {
+        let trusted = TrustedProviders::parse([
+            " https://auth.example.org ",
+            "https://files.example.org:8443/",
+            "",
+            "HTTPS://Auth.Example.org",
+        ])
+        .expect("origins parse");
+        assert_eq!(
+            trusted,
+            TrustedProviders(vec![
+                "https://auth.example.org".to_string(),
+                "https://files.example.org:8443".to_string(),
+            ])
+        );
+        assert!(trusted.contains("https://auth.example.org"));
+        assert!(!trusted.contains("http://auth.example.org"));
+        assert!(!trusted.contains("https://auth.example.org:8443"));
+
+        assert!(TrustedProviders::parse(["", "  "]).unwrap().is_empty());
+        assert!(
+            TrustedProviders::parse(Vec::<String>::new())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn trusted_providers_refuse_paths_and_hostless_entries() {
+        for entry in [
+            "https://auth.example.org/realms/fhir",
+            "https://auth.example.org/?x=1",
+            "https://auth.example.org/#frag",
+            "auth.example.org",
+            "data:text/plain,hi",
+            "not a url",
+        ] {
+            let err = TrustedProviders::parse([entry]).expect_err(entry);
+            assert!(err.contains(entry), "{err}");
+        }
+    }
+
+    #[test]
+    fn trusted_providers_require_only_when_configured() {
+        let none = TrustedProviders::default();
+        assert_eq!(none.require("https://anything.example"), Ok(()));
+
+        let some = TrustedProviders::parse(["https://auth.example.org"]).unwrap();
+        assert_eq!(some.require("https://auth.example.org"), Ok(()));
+        assert_eq!(
+            some.require("https://other.example.org"),
+            Err(FileTokenError::UntrustedProvider {
+                origin: "https://other.example.org".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn origin_of_reduces_a_url_to_scheme_host_port() {
+        assert_eq!(
+            origin_of("https://Files.Example.org/bulk/a.ndjson?sig=1#x").as_deref(),
+            Some("https://files.example.org")
+        );
+        assert_eq!(
+            origin_of("http://127.0.0.1:8080/token").as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(
+            origin_of("https://a.example:443/x").as_deref(),
+            Some("https://a.example"),
+            "the default port is dropped"
+        );
+        assert_eq!(origin_of("data:text/plain,hi"), None);
+        assert_eq!(origin_of("/relative"), None);
+    }
+
+    #[test]
+    fn token_ttl_keeps_the_refresh_margin_within_bounds() {
+        assert_eq!(token_ttl(300), Duration::from_secs(270));
+        assert_eq!(token_ttl(31), Duration::from_secs(1));
+        assert_eq!(token_ttl(30), Duration::from_secs(1));
+        assert_eq!(token_ttl(0), Duration::from_secs(1));
+        assert_eq!(token_ttl(7 * 24 * 60 * 60), MAX_TOKEN_TTL);
+        assert_eq!(token_ttl(u64::MAX), MAX_TOKEN_TTL);
+        // What the overflow was: adding the bounded value never panics.
+        let _ = Instant::now() + token_ttl(u64::MAX);
+    }
 
     #[test]
     fn test_new_rejects_unsupported_alg() {

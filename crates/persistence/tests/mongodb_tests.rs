@@ -429,7 +429,7 @@ mod shared_mongo {
         NoAddress(testcontainers::TestcontainersError),
     }
 
-    /// Starts a mongo:7.0.48 single-member replica set (`rs0`) for one test or
+    /// Starts a mongo:9.0.8 single-member replica set (`rs0`) for one test or
     /// harness alone, and returns it with its URL. It has a writable primary when
     /// this returns. The container is removed when the first element is dropped.
     ///
@@ -452,12 +452,16 @@ mod shared_mongo {
             wt_cache_gb,
             "--replSet",
             "rs0",
+            // As in `shared()`: keep mongod 9.0 from dropping profiler entries.
+            "--setParameter",
+            "internalQueryGlobalProfilingLockDeadlineMs=10000",
         ]
         .into_iter()
         .chain(extra_flags.iter().copied());
         let container = super::container_cleanup::with_cleanup_label(
             Mongo::default()
-                .with_tag("7.0.48")
+                .with_tag("9.0.8")
+                .with_env_var("MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES", "10485760")
                 .with_cmd(command)
                 .with_ulimit("nofile", 64000, Some(64000))
                 .with_startup_timeout(Duration::from_secs(120)),
@@ -497,7 +501,8 @@ mod shared_mongo {
                 // `SHARED` is a static and never dropped; the cleanup label
                 // lets the exit hook remove the container.
                 let container = super::container_cleanup::with_cleanup_label(
-                    Mongo::default().with_tag("7.0.48")
+                    Mongo::default().with_tag("9.0.8")
+                        .with_env_var("MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES", "10485760")
                         .with_label("github.run_id", &run_id)
                         // Cap WiredTiger's cache. By default mongod sizes it to
                         // ~50% of *host* RAM (ignoring container limits), so on CI
@@ -528,6 +533,12 @@ mod shared_mongo {
                             // is only registered when test commands are enabled.
                             "--setParameter",
                             "enableTestCommands=1",
+                            // mongod 9.0 gives each profiler write 1 ms to get its
+                            // lock and silently drops the entry when it cannot;
+                            // the plan tests then read an empty system.profile
+                            // (#2636).
+                            "--setParameter",
+                            "internalQueryGlobalProfilingLockDeadlineMs=10000",
                             "--replSet",
                             "rs0",
                             "--oplogSize",
@@ -749,6 +760,23 @@ async fn mongodb_date_period_targets_are_ranges() {
     date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
 }
 
+/// The backend-agnostic suite for quantity `Range` targets (#2602).
+/// Same `#[path]` arrangement.
+#[path = "search/quantity_range_suite.rs"]
+mod quantity_range_suite;
+
+/// #2602: a `Range` was not indexed for quantity parameters. It is one
+/// closed `[value_quantity_value, value_quantity_high]` interval now. Needs
+/// the full registry so `Condition.onset-age` and friends extract.
+#[tokio::test]
+async fn mongodb_quantity_range_targets_are_intervals() {
+    let Some(backend) = create_backend_with_full_registry("quantity_range").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    quantity_range_suite::quantity_ranges_are_intervals(&backend, "quantity-range-2602").await;
+}
+
 /// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
 /// Same `#[path]` arrangement.
 #[path = "search/sort_missing_suite.rs"]
@@ -763,6 +791,39 @@ async fn mongodb_missing_sort_values_sort_last() {
         return;
     };
     sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", true).await;
+}
+
+/// The backend-agnostic suite for paging through tied `last_updated` (#2603).
+#[path = "search/tiebreak_order_suite.rs"]
+mod tiebreak_order_suite;
+
+/// #2603: resources sharing one `last_updated` page forward and back with no
+/// gap or repeat, in the default, ascending and descending orders.
+#[tokio::test]
+async fn mongodb_tied_timestamps_page_without_gaps() {
+    let Some(backend) = create_backend_with_full_registry("tiebreak_2603").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let db = backend.get_database().await.unwrap();
+    tiebreak_order_suite::tied_timestamps_page_without_gaps(
+        &backend,
+        "tiebreak-2603",
+        async |tenant_id: &str, resource_type: &str| {
+            use mongodb::bson::{DateTime as BsonDateTime, Document, doc};
+            let at = BsonDateTime::from_millis(981_173_106_789);
+            let result = db
+                .collection::<Document>("resources")
+                .update_many(
+                    doc! { "tenant_id": tenant_id, "resource_type": resource_type },
+                    doc! { "$set": { "last_updated": at } },
+                )
+                .await
+                .unwrap();
+            assert!(result.matched_count > 0, "no {resource_type} rows to pin");
+        },
+    )
+    .await;
 }
 
 /// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
@@ -5822,6 +5883,81 @@ fn collect_index_names(doc: &Document, out: &mut Vec<String>) {
     }
 }
 
+/// #2603: checks that MongoDB serves the orders `(last_updated 1, id 1)` and
+/// `(last_updated -1, id -1)` straight from `idx_resources_type_scan`, with
+/// and without a cursor predicate, with no blocking SORT stage. The sort
+/// documents are written by hand here, so this does NOT exercise the
+/// backend's own sort; that is pinned by the unit test
+/// `last_updated_sort_document_id_follows_the_sort_direction`.
+#[tokio::test]
+async fn mongodb_last_updated_ascending_page_uses_type_scan_without_sort() {
+    let Some(backend) = create_backend("last_updated_asc_plan").await else {
+        eprintln!(
+            "Skipping mongodb_last_updated_ascending_page_uses_type_scan_without_sort (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-last-updated-asc-plan");
+    create_cursor_paging_patients(&backend, &tenant, 9).await;
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let database = client.database(&backend.config().database_name);
+
+    let base = doc! {
+        "tenant_id": tenant.tenant_id().as_str(),
+        "resource_type": "Patient",
+        "is_deleted": false,
+    };
+    let mut with_cursor = base.clone();
+    with_cursor.insert(
+        "$or",
+        vec![
+            mongodb::bson::Bson::Document(
+                doc! { "last_updated": { "$gt": mongodb::bson::DateTime::from_millis(0) } },
+            ),
+            mongodb::bson::Bson::Document(
+                doc! { "last_updated": mongodb::bson::DateTime::from_millis(0), "id": { "$gt": "cp-1" } },
+            ),
+        ],
+    );
+
+    for (label, filter) in [("first page", base), ("cursor page", with_cursor)] {
+        for sort in [
+            doc! { "last_updated": 1_i32, "id": 1_i32 },
+            doc! { "last_updated": -1_i32, "id": -1_i32 },
+        ] {
+            let explain = database
+                .run_command(doc! {
+                    "explain": {
+                        "find": "resources",
+                        "filter": filter.clone(),
+                        "sort": sort.clone(),
+                        "limit": 21_i32,
+                    },
+                    "verbosity": "queryPlanner",
+                })
+                .await
+                .expect("explain failed");
+            let winning_plan = explain
+                .get_document("queryPlanner")
+                .and_then(|q| q.get_document("winningPlan"))
+                .expect("explain missing winningPlan");
+            assert!(
+                !contains_stage_named(winning_plan, "SORT"),
+                "{label} {sort:?}: winning plan has a blocking SORT: {winning_plan:?}"
+            );
+            let mut index_names = Vec::new();
+            collect_index_names(winning_plan, &mut index_names);
+            assert!(
+                index_names.iter().any(|n| n == "idx_resources_type_scan"),
+                "{label} {sort:?}: expected idx_resources_type_scan, got {index_names:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn mongodb_integration_history_delete_trial_use_not_supported() {
     let Some(backend) = create_backend("history_delete_not_supported").await else {
@@ -8600,7 +8736,8 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
 /// rather than a type-wide `distinct`.
 #[tokio::test]
 async fn mongodb_integration_param_sort_is_bounded_by_the_candidate_set() {
-    let Some(backend) = create_backend_with_full_registry("param_sort_bounded").await else {
+    // The plan guard below needs the bounded plan, which a timed-out probe changes.
+    let Some(backend) = create_backend_with_stable_probes("param_sort_bounded").await else {
         eprintln!(
             "Skipping mongodb_integration_param_sort_is_bounded_by_the_candidate_set (requires Docker or HFS_TEST_MONGODB_URL)"
         );
@@ -15888,6 +16025,21 @@ mod bulk_submit {
         .await;
     }
 
+    /// See `claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others`
+    /// (#2760). The database is this test's own, so its claim queue is empty.
+    #[tokio::test]
+    async fn test_a_tenant_with_work_in_flight_waits_behind_the_others() {
+        let Some(backend) = create_backend("submit_claim_fairness").await else {
+            return;
+        };
+        claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others(
+            &backend,
+            &create_tenant("claim-fairness-busy"),
+            &create_tenant("claim-fairness-other"),
+        )
+        .await;
+    }
+
     #[async_trait::async_trait]
     impl receipt_paging_contract::ReceiptFixture for MongoBackend {
         async fn seed_receipts(
@@ -19558,11 +19710,17 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// Generation 4: `idx_search_date_v3` replaces `idx_search_date_v2` (#1391).
 /// Generation 5: `idx_search_reference_target_v2` is added (#2394).
 /// Generation 6: `idx_search_composite_tuple_qty` (token+quantity composites).
-const CURRENT_BACKGROUND_NAMES: [&str; 11] = [
+/// Generation 7: `idx_search_date_end` (descending date sorts, #2588).
+/// Generation 8: `idx_search_quantity_high` and `idx_search_quantity_range`
+/// (quantity `Range` intervals, #2602).
+const CURRENT_BACKGROUND_NAMES: [&str; 14] = [
     "idx_search_composite_tuple_qty",
+    "idx_search_date_end",
     "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
+    "idx_search_quantity_high",
+    "idx_search_quantity_range",
     "idx_search_quantity_v2",
     "idx_search_reference_target_v2",
     "idx_search_reference_v2",
@@ -19701,7 +19859,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(6)
+        Ok(8)
     );
 }
 
@@ -19826,7 +19984,7 @@ async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_d
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(6)
+        Ok(8)
     );
 }
 
@@ -19914,7 +20072,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(6));
+    assert_eq!(si.get_i32("generation"), Ok(8));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.
@@ -20320,6 +20478,235 @@ async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
         )
         .await;
     }
+}
+
+/// #2730: both value-led quantity indexes are partial on
+/// `value_quantity_value` existing, so a group that bounds only the high end
+/// (`gt`, `ge`, `eb`) carries a non-null guard on it; `eq` states both bounds
+/// on both ends. On a selective fixture, every unhinted quantity command a
+/// search sends must win with an index scan on a quantity index (either one),
+/// and for `eq` that scan bounds one quantity field on both sides. Only the
+/// winning plans are read, never the rejected ones.
+#[tokio::test]
+async fn mongodb_integration_quantity_search_keeps_quantity_index_access() {
+    use futures::stream::TryStreamExt;
+
+    let Some(backend) = create_backend_with_stable_probes("quantity_index_access").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-quantity-index-access");
+    for (id, value) in [("obs-q-0", 0.0), ("obs-q-500", 500.0), ("obs-q-999", 999.0)] {
+        backend
+            .seed_create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": id, "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                    "valueQuantity": {
+                        "value": value, "unit": "kg",
+                        "system": "http://unitsofmeasure.org", "code": "kg"
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    // 20,000 point rows over 1,000 distinct values, 20 per value, so each
+    // search below matches about 0.1% of the parameter's rows. The synthetic
+    // ids are not live resources: they drop out at the resource fetch.
+    let synthetic: Vec<Document> = (0..20_000_i32)
+        .map(|n| {
+            let value = f64::from(n % 1000);
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "resource_id": format!("syn-q-{n}"),
+                "param_name": "value-quantity",
+                "param_url": "http://hl7.org/fhir/SearchParameter/Observation-value-quantity",
+                "value_quantity_value": value,
+                "value_quantity_high": value,
+                "value_quantity_unit": "kg",
+                "value_quantity_system": "http://unitsofmeasure.org",
+            }
+        })
+        .collect();
+    db.collection::<Document>("search_index")
+        .insert_many(synthetic)
+        .await
+        .expect("failed to insert synthetic search_index quantity rows");
+    let build_info = db.run_command(doc! { "buildInfo": 1_i32 }).await.unwrap();
+    let version = build_info.get_str("version").unwrap_or("unknown");
+    eprintln!("quantity index access: MongoDB {version}");
+
+    for (value, expected, two_sided) in [
+        ("gt998", "obs-q-999", false),
+        ("ge999", "obs-q-999", false),
+        ("eb1", "obs-q-0", false),
+        ("eq500", "obs-q-500", true),
+    ] {
+        let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "value-quantity".into(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::parse(value)],
+            chain: vec![],
+            components: vec![],
+        });
+        // Results first, so a server that refuses profiling still checks them.
+        let ids: Vec<String> = backend
+            .search(&tenant, &q)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ids, vec![expected.to_string()], "value-quantity={value}");
+
+        let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+        let _ = db.collection::<Document>("system.profile").drop().await;
+        if db.run_command(doc! { "profile": 2_i32 }).await.is_err() {
+            eprintln!("Skipping quantity winning-plan assertions: profiling not permitted");
+            return;
+        }
+        backend.search(&tenant, &q).await.unwrap();
+        let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+        let ns = format!("{}.search_index", db.name());
+        let ops: Vec<Document> = db
+            .collection::<Document>("system.profile")
+            .find(doc! { "ns": &ns, "op": { "$in": ["query", "command"] } })
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut checked = 0;
+        for op in &ops {
+            let command = op
+                .get_document("command")
+                .expect("profile must include command");
+            let explainable = ["find", "aggregate", "distinct"]
+                .into_iter()
+                .any(|name| command.contains_key(name));
+            if !explainable
+                || command.contains_key("hint")
+                || !command.to_string().contains("value_quantity_")
+            {
+                continue;
+            }
+            let explain = db
+                .run_command(doc! {
+                    "explain": command_for_explain(command), "verbosity": "queryPlanner",
+                })
+                .await
+                .expect("explain captured quantity command");
+            for plan in winning_plans(&explain) {
+                let mut scans = Vec::new();
+                plan_ixscans(plan, &mut scans);
+                scans.retain(|scan| {
+                    matches!(
+                        scan.get_str("indexName"),
+                        Ok("idx_search_quantity_v2" | "idx_search_quantity_high")
+                    )
+                });
+                assert!(
+                    !scans.is_empty(),
+                    "{value} (MongoDB {version}): winning plan has no quantity IXSCAN: {plan:?}"
+                );
+                if two_sided {
+                    assert!(
+                        scans.iter().any(|scan| bounds_both_sides(scan)),
+                        "{value} (MongoDB {version}): no quantity field is bounded on both \
+                         sides: {plan:?}"
+                    );
+                }
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "{value}: no unhinted quantity command on {ns} was profiled: {ops:?}"
+        );
+    }
+}
+
+/// The winning plans of one explain reply: `queryPlanner.winningPlan` of the
+/// command's source (an aggregate's `$cursor` stage, or the reply itself), or
+/// each shard's winning plan on a sharded cluster. Rejected plans are never
+/// read. The slot-based engine nests the plan tree under `queryPlan`.
+fn winning_plans(explain: &Document) -> Vec<&Document> {
+    if let Ok(shards) = explain.get_document("shards") {
+        return shards
+            .values()
+            .filter_map(Bson::as_document)
+            .flat_map(winning_plans)
+            .collect();
+    }
+    let source = explain
+        .get_array("stages")
+        .ok()
+        .and_then(|stages| {
+            stages
+                .iter()
+                .find_map(|stage| stage.as_document()?.get_document("$cursor").ok())
+        })
+        .unwrap_or(explain);
+    let winning = source
+        .get_document("queryPlanner")
+        .and_then(|planner| planner.get_document("winningPlan"))
+        .unwrap_or_else(|e| panic!("explain has no winningPlan: {e}: {explain:?}"));
+    let plans: Vec<&Document> = match winning.get_array("shards") {
+        Ok(shards) => shards
+            .iter()
+            .filter_map(|shard| shard.as_document()?.get_document("winningPlan").ok())
+            .collect(),
+        Err(_) => vec![winning],
+    };
+    plans
+        .into_iter()
+        .map(|plan| plan.get_document("queryPlan").unwrap_or(plan))
+        .collect()
+}
+
+/// The `IXSCAN` stages of one winning plan tree, following only its
+/// `inputStage`/`inputStages` children.
+fn plan_ixscans<'a>(plan: &'a Document, out: &mut Vec<&'a Document>) {
+    if plan.get_str("stage") == Ok("IXSCAN") {
+        out.push(plan);
+    }
+    if let Ok(input) = plan.get_document("inputStage") {
+        plan_ixscans(input, out);
+    }
+    if let Ok(inputs) = plan.get_array("inputStages") {
+        for input in inputs.iter().filter_map(Bson::as_document) {
+            plan_ixscans(input, out);
+        }
+    }
+}
+
+/// Whether an `IXSCAN` bounds a quantity field by one interval with two finite
+/// ends, such as `[499.5, 500.5)`.
+fn bounds_both_sides(scan: &Document) -> bool {
+    let Ok(bounds) = scan.get_document("indexBounds") else {
+        return false;
+    };
+    ["value_quantity_value", "value_quantity_high"]
+        .into_iter()
+        .any(|field| {
+            matches!(
+                bounds.get_array(field).map(Vec::as_slice),
+                Ok([Bson::String(interval)])
+                    if !["inf", "MinKey", "MaxKey"].iter().any(|open| interval.contains(open))
+            )
+        })
 }
 
 /// The ids a `date` search returns, sorted; each inner list is one occurrence
@@ -23940,9 +24327,9 @@ async fn mongodb_predicate_plans_preserve_dates_live_scope_and_cursor_pages() {
                     };
                     let expected_total = (total_mode != TotalMode::None).then_some(expected_count);
                     expected.sort();
-                    if sort != "_id" {
+                    if sort != "_id" && sort != "_lastUpdated" {
                         expected.reverse();
-                    } // Timestamp ties use descending ID.
+                    } // Timestamp ties follow the sort direction (ID ascending for `_lastUpdated`).
                     let mut request = query.clone();
                     let mut pages = Vec::new();
                     let mut previous = loop {

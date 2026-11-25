@@ -286,7 +286,8 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_DEFAULT_TENANT` | `default` | Default tenant ID for requests without an `X-Tenant-ID` header |
 | `HFS_TENANT_ROUTING_MODE` | `header_only` | Tenant routing: `header_only`, `url_path`, or `both` |
 | `HFS_TENANT_STRICT_VALIDATION` | `false` | Error if URL and header tenant disagree |
-| `HFS_JWT_TENANT_CLAIM` | `tenant_id` | JWT claim name for tenant |
+| `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim carrying the tenant id when authentication is enabled (see [crates/auth/README.md](crates/auth/README.md#tenant-resolution)) |
+| `HFS_SEARCH_PARAM_CACHE_MAX_TENANTS` | `1024` | How many per-tenant SearchParameter registries stay cached at once; the oldest insertion is evicted past it and rebuilt on its next access. Every distinct tenant id a request names costs one base-registry clone until the hourly refresh, so set it to at least the number of active tenants, and set `HFS_TENANT_REQUIRE_PROVISIONED=true` so unknown ids never reach the cache |
 
 **Terminology**
 
@@ -325,6 +326,10 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_PG_DBNAME` | `helios` | Database name |
 | `HFS_PG_USER` | `helios` | Database user |
 | `HFS_PG_PASSWORD` | *(none)* | Database password |
+| `HFS_PG_SSL_MODE` | `prefer` | The minimum `sslmode` for every PostgreSQL connection `hfs` opens: `disable`, `allow`, `prefer`, `require`, `verify-ca` or `verify-full`, as in libpq. `?sslmode=` on `HFS_DATABASE_URL` (or `HFS_AUDIT_DATABASE_URL`) is honoured too, and the stronger of the two wins, so this variable can raise a URL's mode but never lower it (a weaker value is logged and ignored). An unknown value refuses to start. `prefer` and `allow` encrypt when the server offers TLS without checking its certificate; `require` always encrypts and checks the certificate chain only when a root certificate is given; `verify-ca` checks the chain; `verify-full` also checks the host name. Startup logs whether the link is encrypted, read from the server (a WARN when `prefer` fell back to cleartext). |
+| `HFS_PG_SSL_ROOT_CERT` | *(platform trust store)* | Trusted roots for `verify-ca` / `verify-full` (and `require`): a PEM file, or `system` for the platform store (only with `verify-full`). `?sslrootcert=` on the URL wins. For managed databases (Amazon RDS, Azure) point it at the provider's CA bundle. |
+| `HFS_PG_SSL_CERT` | *(none)* | Client certificate (PEM) for `cert` authentication, with `HFS_PG_SSL_KEY`. `?sslcert=` on the URL wins. |
+| `HFS_PG_SSL_KEY` | *(none)* | Private key (PEM) of `HFS_PG_SSL_CERT`. `?sslkey=` on the URL wins. |
 | `HFS_PG_MAX_CONNECTIONS` | `cores * 4`, 16 to 64 | Connection pool size. Without this variable (or with a value that does not parse) the pool is also limited at startup to half of the server's `max_connections`, shared with the other pools `hfs` opens against the same host and port, such as the `HFS_AUDIT_BACKEND=database` pool: on a stock server (`max_connections = 100`) the two get at most 25 each. A value you set is used as given, with a warning in the log when the pools add up to more than the server's limit. Raise it when PostgreSQL shares the machine with `hfs` and writes wait on the WAL flush; on a database with its own cores a larger pool did not raise throughput (#2216). |
 | `HFS_PG_CONNECT_TIMEOUT_SECS` | `5` | How long establishing a connection may take before failing (s), covering DNS, TCP, TLS and authentication. Raise it for a server that is slow to answer a fresh connection. |
 | `HFS_PG_STATEMENT_TIMEOUT_MS` | `30000` | Server-side `statement_timeout` applied to every pooled connection. Raise it for migrations or other long-running maintenance work. |
@@ -407,9 +412,9 @@ for the full `HFS_EXPORT_*` table.
 |---|---|---|
 | `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`); requires a `sqlite`/`postgres` backend |
 | `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`); rows beyond it are silently dropped, not an error |
-| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). Each dependency is materialized in full before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it. Narrow it with a ViewDefinition `where`, or raise this limit |
+| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). Each dependency is materialized before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it. A plain `column = literal` / `<>` / `IS [NOT] NULL` filter of a single-table query on a typed top-level column is pushed into the view first, so only the rows it keeps count. Otherwise narrow the view with its own `where`, or raise this limit |
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries |
-| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's); does not cover materializing a dependency |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs: its own SQL, each SQL View's, and the materialization of each ViewDefinition it depends on (on PostgreSQL under `SET LOCAL statement_timeout`, so `HFS_PG_STATEMENT_TIMEOUT_MS` does not cut it short); exceeding it answers `504` with code `timeout`. A `$sql-export` job bounds each statement the same way but not the read of a dependency as a whole, and a job that runs out of the limit fails with `504` / `timeout`. |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. Any other value fails startup; `s3` fails startup on a build without the `s3` feature. Not checked when `HFS_SOF_ENABLED=false` |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` export sink |
 | `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket for the `s3` sink; required when `HFS_EXPORT_SINK=s3` |
@@ -447,7 +452,9 @@ JWT/bearer auth (`HFS_AUTH_*`, e.g. `HFS_AUTH_ENABLED`, `HFS_AUTH_JWKS_URL`, `HF
 | `HFS_SUBSCRIPTIONS_ENABLED` | `false` | Enable the subscription engine when HFS is built with the `subscriptions` feature |
 | `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel |
 | `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers |
-| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow subscription deliveries to private or loopback endpoints; intended for local development and CI only |
+| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow rest-hook and FHIR Messaging deliveries to endpoints that are, or resolve to, private or loopback addresses; intended for local development and CI only. Redirects are never followed |
+| `HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS` | *(none)* | Comma-separated receivers (`host` or `host:port`) that may be sent the server credential on FHIR Messaging deliveries; unset means no receiver gets it |
+| `HFS_SUBSCRIPTION_MESSAGING_BEARER_TOKEN` | *(none)* | Bearer token sent to the listed messaging receivers; unset falls back to `HFS_OUTBOUND_BEARER_TOKEN`, the credential the server's own self-calls use |
 | `HFS_SUBSCRIPTION_REHYDRATE` | `true` | Reload stored `Subscription`/`SubscriptionTopic` resources into the engine at startup, so subscriptions keep delivering across a restart |
 | `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE` | `true` | Re-run the activation handshake for stored `requested` subscriptions during rehydration |
 | `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE` | `100` | Events remembered per subscription for `GET Subscription/{id}/$events` (in memory, lost on restart); `0` disables the history |

@@ -452,7 +452,6 @@ mod node_tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::backends::cassandra::index_keys::IndexKey;
     use crate::backends::cassandra::read::ResourceRow;
     use crate::backends::cassandra::session::{Fault, TimeoutWriteType};
     use crate::backends::cassandra::write::{
@@ -539,8 +538,9 @@ mod node_tests {
         family: &str,
     ) -> i32 {
         let (body, data) = normalized_body("update", "Patient", id, patient(id, family)).unwrap();
+        let keys = backend.index_keys_of(tenant.tenant_id().as_str(), "Patient", &body);
         through_the_engine(backend, tenant, id, |previous| {
-            CasPlan::update(previous, body, data, vec![IndexKey::ResourcesByType])
+            CasPlan::update(previous, body, data, keys)
         })
         .await
     }
@@ -1232,9 +1232,10 @@ mod node_tests {
             patient("gone", "Back"),
         )
         .unwrap();
+        let keys = backend.index_keys_of(t.tenant_id().as_str(), "Patient", &body);
         assert_eq!(
             through_the_engine(&backend, &t, "gone", |previous| {
-                CasPlan::revive(previous, body, data, vec![IndexKey::ResourcesByType])
+                CasPlan::revive(previous, body, data, keys)
             })
             .await,
             3
@@ -1295,9 +1296,10 @@ mod node_tests {
             patient("gone", "Back"),
         )
         .unwrap();
+        let keys = backend.index_keys_of(t.tenant_id().as_str(), "Patient", &body);
         assert_eq!(
             through_the_engine(&backend, &t, "gone", |previous| {
-                CasPlan::revive(previous, body, data, vec![IndexKey::ResourcesByType])
+                CasPlan::revive(previous, body, data, keys)
             })
             .await,
             3

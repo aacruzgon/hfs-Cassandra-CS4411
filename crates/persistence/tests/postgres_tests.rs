@@ -59,6 +59,10 @@ mod tenant_id_fidelity_suite;
 #[path = "multitenancy/tenant_existence_suite.rs"]
 mod tenant_existence_suite;
 
+/// TLS connections against a real server (#2746).
+#[path = "tls/postgres_tls.rs"]
+mod postgres_tls;
+
 #[path = "common/sof_terminology_suite.rs"]
 mod sof_terminology_suite;
 
@@ -130,10 +134,19 @@ mod ap_relations_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for quantity `Range` targets (#2602).
+/// Same `#[path]` arrangement.
+#[path = "search/quantity_range_suite.rs"]
+mod quantity_range_suite;
+
 /// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
 /// Same `#[path]` arrangement.
 #[path = "search/sort_missing_suite.rs"]
 mod sort_missing_suite;
+
+/// The backend-agnostic suite for paging through tied `last_updated` (#2603).
+#[path = "search/tiebreak_order_suite.rs"]
+mod tiebreak_order_suite;
 
 /// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
 #[path = "search/sort_meta_suite.rs"]
@@ -2331,6 +2344,20 @@ mod postgres_integration {
         claim_contract::unleased_processing_is_not_claimable(
             &create_backend().await,
             &create_tenant("unleased-processing"),
+        )
+        .await;
+    }
+
+    /// See `claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others`
+    /// (#2760). A database of its own: the shared one carries other tests'
+    /// claimable manifests, and this asserts on what the next claims return.
+    #[tokio::test]
+    async fn postgres_bulk_submit_a_tenant_with_work_in_flight_waits_behind_the_others() {
+        let (backend, _dbname) = isolated_reindex_backend().await;
+        claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others(
+            &backend,
+            &create_tenant("claim-fairness-busy"),
+            &create_tenant("claim-fairness-other"),
         )
         .await;
     }
@@ -6307,6 +6334,18 @@ mod postgres_integration {
              AND param_name IN ('code', 'value-quantity')",
             &[&tenant_id],
         ).await.unwrap();
+        // Fixture rows are written by hand, so give each the upper bound the
+        // storage writer would (a point: high = value, #2602).
+        client
+            .execute(
+                "UPDATE search_index SET value_quantity_high = value_quantity_value,
+             value_quantity_canonical_high = value_quantity_canonical_value
+             WHERE tenant_id = $1 AND value_quantity_value IS NOT NULL
+               AND value_quantity_high IS NULL",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
         client
             .execute(
                 "UPDATE resources SET last_updated = '2020-01-01T00:00:00Z' WHERE tenant_id = $1",
@@ -6668,8 +6707,12 @@ mod postgres_integration {
                         .filter_map(|field| plan[field].as_str())
                         .collect::<Vec<_>>()
                         .join(" ");
-                    let raw = predicates.contains("value_quantity_value");
-                    let canonical = predicates.contains("value_quantity_canonical_value");
+                    // `gt` on a point is `high > v` now (#2602), so a quantity arm is
+                    // recognised by either bound column.
+                    let raw = predicates.contains("value_quantity_value")
+                        || predicates.contains("value_quantity_high");
+                    let canonical = predicates.contains("value_quantity_canonical_value")
+                        || predicates.contains("value_quantity_canonical_high");
                     if converted {
                         assert!(
                             !(raw && canonical),
@@ -6724,6 +6767,18 @@ mod postgres_integration {
                     '2020-01-01T00:00:00Z' FROM generate_series(1, 20000) series",
             &[&tenant_id],
         ).await.unwrap();
+        // Fixture rows are written by hand, so give each the upper bound the
+        // storage writer would (a point: high = value, #2602).
+        client
+            .execute(
+                "UPDATE search_index SET value_quantity_high = value_quantity_value,
+             value_quantity_canonical_high = value_quantity_canonical_value
+             WHERE tenant_id = $1 AND value_quantity_value IS NOT NULL
+               AND value_quantity_high IS NULL",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
         client
             .batch_execute("ANALYZE resources; ANALYZE search_index")
             .await
@@ -6856,6 +6911,168 @@ mod postgres_integration {
             "UCUM-equivalent quantity (1000 mg) should match stored 1 g"
         );
         assert_eq!(result.resources.items[0].id(), "obs-mass-pg");
+    }
+
+    /// An instance older than #2602 keeps writing after the v56 backfill and
+    /// inserts quantity rows with `value_quantity_high` NULL. The temporary
+    /// trigger fills it, so `eq`/`gt`/`ap` and `_sort` still see those rows.
+    #[tokio::test]
+    async fn postgres_integration_old_writer_quantity_rows_are_filled_by_trigger() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
+        };
+
+        // A database the ladder creates has no trigger. The trigger protects an
+        // UPGRADE from a pre-#2602 build, so own a database, take v56 back out of
+        // it (as that build left it) and migrate again, which is the path that
+        // installs the trigger. Dropping the columns drops the indexes built on
+        // them; the old newest-first index is put back as that build had it.
+        let backend = hfs1407_backend(false).await;
+        {
+            let client = backend.get_client().await.unwrap();
+            let triggers: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_trigger
+                     WHERE tgname = 'trg_search_index_quantity_high' AND NOT tgisinternal",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(triggers, 0, "a fresh database has no trigger");
+            client
+                .batch_execute(
+                    "DROP TRIGGER IF EXISTS trg_search_index_quantity_high ON search_index;
+                     DROP FUNCTION IF EXISTS hfs_search_index_quantity_high();
+                     DROP INDEX IF EXISTS idx_search_quantity_high;
+                     DROP INDEX IF EXISTS idx_search_quantity_canonical_high;
+                     DROP INDEX IF EXISTS idx_search_quantity_range;
+                     DROP INDEX IF EXISTS idx_search_quantity_canonical_range;
+                     ALTER TABLE search_index
+                         DROP COLUMN value_quantity_high,
+                         DROP COLUMN value_quantity_canonical_high;
+                     DROP INDEX IF EXISTS idx_search_quantity_recent;
+                     CREATE INDEX idx_search_quantity_recent
+                         ON search_index (tenant_id, resource_type, param_name,
+                                          last_updated DESC, resource_id ASC)
+                         INCLUDE (value_quantity_value, value_quantity_unit)
+                         WHERE value_quantity_value IS NOT NULL;
+                     DELETE FROM schema_version;
+                     INSERT INTO schema_version (version) VALUES (55);",
+                )
+                .await
+                .expect("take v56 back out of the database");
+        }
+        backend
+            .init_schema()
+            .await
+            .expect("migrate v55 to v56 as an upgrade");
+        {
+            let client = backend.get_client().await.unwrap();
+            let triggers: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_trigger
+                     WHERE tgname = 'trg_search_index_quantity_high'
+                       AND tgrelid = 'search_index'::regclass AND NOT tgisinternal",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(triggers, 1, "the upgrade installs the trigger exactly once");
+        }
+        let tenant = create_tenant("old-writer-quantity");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        for (id, value) in [("ow-10", 10), ("ow-20", 20), ("ow-30", 30)] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": "x" }] },
+                        "valueQuantity": { "value": value, "unit": "g", "system": "http://unitsofmeasure.org", "code": "g" }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // Re-insert each quantity row the way an old build does: the same
+        // columns, but no upper bound.
+        let client = backend.get_client().await.unwrap();
+        let moved = client
+            .execute(
+                "WITH d AS (
+                     DELETE FROM search_index
+                     WHERE tenant_id = $1 AND param_name = 'value-quantity'
+                     RETURNING *)
+                 INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                     value_quantity_value, value_quantity_unit, value_quantity_system,
+                     value_quantity_canonical_value, value_quantity_canonical_unit, last_updated)
+                 SELECT tenant_id, resource_type, resource_id, param_name,
+                     value_quantity_value, value_quantity_unit, value_quantity_system,
+                     value_quantity_canonical_value, value_quantity_canonical_unit, last_updated
+                 FROM d",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved, 3);
+        let unfilled: i64 = client
+            .query_one(
+                "SELECT count(*) FROM search_index
+                 WHERE tenant_id = $1 AND param_name = 'value-quantity'
+                   AND (value_quantity_high IS DISTINCT FROM value_quantity_value
+                        OR value_quantity_canonical_high IS DISTINCT FROM value_quantity_canonical_value)",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(unfilled, 0, "the trigger must fill high at insert");
+        drop(client);
+
+        let find = |value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::parse(value)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        for (value, expected) in [
+            ("gt15", vec!["ow-20", "ow-30"]),
+            ("20", vec!["ow-20"]),
+            ("ap20", vec!["ow-20"]),
+        ] {
+            let result = backend.search(&tenant, &find(value)).await.unwrap();
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, expected, "value-quantity={value}");
+        }
+        let sorted =
+            SearchQuery::new("Observation").with_sort(SortDirective::parse("-value-quantity"));
+        let ids: Vec<String> = backend
+            .search(&tenant, &sorted)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ids, ["ow-30", "ow-20", "ow-10"]);
     }
 
     #[tokio::test]
@@ -9039,6 +9256,18 @@ mod postgres_integration {
         client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_reference) SELECT $1,'Observation','quantity-'||n,'patient',CASE WHEN n<=32 THEN 'Patient/anchor' ELSE 'Patient/decoy-'||n END FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
         client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) SELECT $1,'Observation','quantity-'||n,'code','http://loinc.org','8302-2' FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
         client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_quantity_value,value_quantity_unit,value_quantity_canonical_value,value_quantity_canonical_unit) SELECT $1,'Observation','quantity-'||n,'value-quantity',CASE WHEN n<=8 OR n>32 THEN 160 ELSE 90 END,'cm',CASE WHEN n<=8 OR n>32 THEN 1.6 ELSE 0.9 END,'m' FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
+        // Fixture rows are written by hand, so give each the upper bound the
+        // storage writer would (a point: high = value, #2602).
+        client
+            .execute(
+                "UPDATE search_index SET value_quantity_high = value_quantity_value,
+             value_quantity_canonical_high = value_quantity_canonical_value
+             WHERE tenant_id = $1 AND value_quantity_value IS NOT NULL
+               AND value_quantity_high IS NULL",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
         client
             .batch_execute("ANALYZE resources; ANALYZE search_index")
             .await
@@ -9360,9 +9589,10 @@ mod postgres_integration {
              CASE WHEN n <= 165 THEN 'Patient/anchor' ELSE 'Patient/decoy-' || n%12 END \
              FROM generate_series(1, 2165) n", &[&tenant_id]).await.unwrap();
         client.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, composite_group, value_token_system, value_token_code, value_quantity_value) \
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, composite_group, value_token_system, value_token_code, value_quantity_value, value_quantity_high) \
              SELECT $1, 'Observation', 'plan-' || n, 'code-value-quantity', 0, 'http://loinc.org', \
              CASE WHEN n <= 3 OR n > 165 THEN '8302-2' ELSE '1234' END, \
+             CASE WHEN n <= 3 OR n > 165 THEN 164.1 ELSE 50 END, \
              CASE WHEN n <= 3 OR n > 165 THEN 164.1 ELSE 50 END \
              FROM generate_series(1, 2165) n", &[&tenant_id]).await.unwrap();
         // Real Observation writes also index these seven parameter names;
@@ -13073,9 +13303,12 @@ mod postgres_integration {
             .clone()
             .with_sort(SortDirective::parse("_lastUpdated"));
         let asc = backend.search(&tenant, &ascending).await.unwrap();
+        // Three observations share each day; ascending `_lastUpdated` breaks
+        // those ties by `id DESC`, the backward scan of
+        // `idx_resources_search` (#2603).
         assert_eq!(
             page_ids(&asc),
-            vec!["obs-01", "obs-02", "obs-03", "obs-04", "obs-05"]
+            vec!["obs-03", "obs-02", "obs-01", "obs-06", "obs-05"]
         );
         let repeated = explicit.with_parameter(default.parameters[0].clone());
         assert_eq!(
@@ -35506,6 +35739,89 @@ mod postgres_integration {
             .await;
     }
 
+    /// #2602: `gt`/`ge`/`eb` filter on `value_quantity_high`, so a selective
+    /// one must be served by `idx_search_quantity_high`, not a scan.
+    #[tokio::test]
+    async fn postgres_integration_quantity_high_index_serves_upper_bound_prefixes() {
+        use helios_persistence::backends::postgres::search::query_builder::{
+            PostgresQueryBuilder, SqlParam,
+        };
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("quantity-high-explain");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        client.execute(
+            "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+             SELECT $1, 'Condition', 'qh-' || series, '1',
+                    jsonb_build_object('resourceType', 'Condition', 'id', 'qh-' || series),
+                    '2020-01-01T00:00:00Z', FALSE FROM generate_series(1, 40000) series",
+            &[&tenant_id],
+        ).await.unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+             value_quantity_value, value_quantity_high, last_updated)
+             SELECT $1, 'Condition', 'qh-' || series, 'onset-age',
+                    series % 1000, series % 1000, '2020-01-01T00:00:00Z'
+             FROM generate_series(1, 40000) series",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        client.batch_execute("ANALYZE search_index").await.unwrap();
+        // The predicate is the one the builder really emits for the search, not
+        // a hand-written one: whatever it adds or omits is what must be served.
+        for (prefix, value) in [(SearchPrefix::Gt, "990"), (SearchPrefix::Eb, "10")] {
+            let query = SearchQuery::new("Condition").with_parameter(SearchParameter {
+                name: "onset-age".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
+                .expect("the query builds")
+                .expect("a condition");
+            let mut predicate = PostgresQueryBuilder::single_index_predicate(&fragment.sql)
+                .expect("a lone membership test")
+                .to_string();
+            for (i, param) in fragment.params.iter().enumerate().rev() {
+                let SqlParam::Float(v) = param else {
+                    panic!("unexpected bind {param:?}");
+                };
+                predicate = predicate.replace(&format!("${}", i + 3), &format!("({v:?}::float8)"));
+            }
+            let sql = format!(
+                "EXPLAIN (FORMAT JSON) SELECT resource_id FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Condition' AND {predicate}"
+            );
+            let plan: serde_json::Value =
+                client.query_one(&sql, &[&tenant_id]).await.unwrap().get(0);
+            let text = plan.to_string();
+            assert!(
+                text.contains("idx_search_quantity_high"),
+                "{prefix:?}: expected idx_search_quantity_high: {text}\n{sql}"
+            );
+        }
+    }
+
+    /// #2602: a `Range` was not indexed for quantity parameters. It is one
+    /// closed `[value_quantity_value, value_quantity_high]` interval now.
+    #[tokio::test]
+    async fn postgres_integration_quantity_range_targets_are_intervals() {
+        let backend = create_backend().await;
+        super::quantity_range_suite::quantity_ranges_are_intervals(
+            &backend,
+            &unique_base("quantity_range"),
+        )
+        .await;
+    }
+
     /// #1606: PostgreSQL sorted a missing value as the largest, so it came
     /// first descending. It comes last both ways now.
     #[tokio::test]
@@ -35517,6 +35833,337 @@ mod postgres_integration {
             true,
         )
         .await;
+    }
+
+    /// #2603: resources sharing one `last_updated` page forward and back with
+    /// no gap or repeat, in the default, ascending and descending orders.
+    #[tokio::test]
+    async fn postgres_integration_tied_timestamps_page_without_gaps() {
+        let backend = create_backend().await;
+        let pin_backend = backend.clone();
+        super::tiebreak_order_suite::tied_timestamps_page_without_gaps(
+            &backend,
+            &unique_base("tiebreak"),
+            async |tenant_id: &str, resource_type: &str| {
+                let client = pin_backend.get_client().await.unwrap();
+                let at = tie_instant();
+                let changed = client
+                    .execute(
+                        "UPDATE resources SET last_updated = $1 \
+                         WHERE tenant_id = $2 AND resource_type = $3",
+                        &[&at, &tenant_id, &resource_type],
+                    )
+                    .await
+                    .unwrap();
+                assert!(changed > 0, "no {resource_type} rows to pin");
+                client
+                    .execute(
+                        "UPDATE search_index SET last_updated = $1 \
+                         WHERE tenant_id = $2 AND resource_type = $3",
+                        &[&at, &tenant_id, &resource_type],
+                    )
+                    .await
+                    .unwrap();
+            },
+        )
+        .await;
+    }
+
+    /// #2603: the shared tie suite walks unfiltered searches only. A filter
+    /// takes other statements: `active=true` sorted descending (or by
+    /// default) picks its page from `search_index` (`resource_id` keyset, the
+    /// index-selected fast path), and ascending filters `resources` through a
+    /// membership subquery. Both must page through a tie with no gap or
+    /// repeat, forward and back, whatever the page size.
+    #[tokio::test]
+    async fn postgres_integration_filtered_tied_timestamps_page_without_gaps() {
+        use helios_persistence::core::{ResourceStorage, SearchProvider};
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirection,
+            SortDirective,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("tiebreak-filtered");
+        let tenant_id = tenant.tenant_id().as_str();
+        let ids = [
+            "t-5", "t-2", "t-9", "t-1", "t-7", "t-3", "t-8", "t-4", "t-6", "t-0",
+        ];
+        for id in ids {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "active": true}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // A non-matching resource on the same instant must stay out.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "t-off", "active": false}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let client = backend.get_client().await.unwrap();
+        for table in ["resources", "search_index"] {
+            client
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET last_updated = $1 \
+                         WHERE tenant_id = $2 AND resource_type = 'Patient'"
+                    ),
+                    &[&tie_instant(), &tenant_id],
+                )
+                .await
+                .unwrap();
+        }
+        drop(client);
+
+        let query = |sort: Option<SortDirection>, count: u32| {
+            let mut q = SearchQuery::new("Patient")
+                .with_count(count)
+                .with_parameter(SearchParameter {
+                    name: "active".to_string(),
+                    param_type: SearchParamType::Token,
+                    modifier: None,
+                    values: vec![SearchValue::eq("true")],
+                    chain: vec![],
+                    components: vec![],
+                });
+            if let Some(direction) = sort {
+                q = q.with_sort(SortDirective {
+                    parameter: "_lastUpdated".to_string(),
+                    direction,
+                    param_type: None,
+                });
+            }
+            q
+        };
+        let page = async |q: SearchQuery| {
+            let r = backend.search(&tenant, &q).await.unwrap();
+            let ids = r
+                .resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>();
+            (ids, r.resources.page_info)
+        };
+        let mut expected = ids.map(str::to_string).to_vec();
+        expected.sort();
+        for sort in [
+            None,
+            Some(SortDirection::Ascending),
+            Some(SortDirection::Descending),
+        ] {
+            let (single, _) = page(query(sort, 100)).await;
+            let mut sorted = single.clone();
+            sorted.sort();
+            assert_eq!(sorted, expected, "{sort:?}: one full page");
+            for count in 1..=4 {
+                let mut forward = Vec::new();
+                let (mut ids, mut info) = page(query(sort, count)).await;
+                for _ in 0..=expected.len() {
+                    forward.extend(ids.clone());
+                    match info.next_cursor.clone().filter(|_| info.has_next) {
+                        Some(c) => (ids, info) = page(query(sort, count).with_cursor(c)).await,
+                        None => break,
+                    }
+                }
+                assert_eq!(forward, single, "{sort:?} _count={count}: forward walk");
+                let mut backward = ids;
+                for _ in 0..=expected.len() {
+                    match info.previous_cursor.clone().filter(|_| info.has_previous) {
+                        Some(c) => {
+                            let (mut before, before_info) =
+                                page(query(sort, count).with_cursor(c)).await;
+                            before.extend(backward);
+                            backward = before;
+                            info = before_info;
+                        }
+                        None => break,
+                    }
+                }
+                assert_eq!(backward, forward, "{sort:?} _count={count}: walk back");
+            }
+        }
+    }
+
+    /// #2603: a cursor page of `_sort=_lastUpdated` ordered `last_updated ASC,
+    /// id ASC`, which `idx_resources_search` (`last_updated DESC, id ASC`)
+    /// serves in neither direction, so every page sorted all the rows after
+    /// the cursor. Its tiebreak runs `id DESC` now, the index's backward scan;
+    /// the `Previous` page is the mirror, its forward scan. Neither plan may
+    /// sort (not even an Incremental Sort over `idx_resources_updated`, which
+    /// the planner chose before the redundant `last_updated >=`/`<=` bound),
+    /// and each page reads about one page of index entries however deep the
+    /// cursor is: without the bound the scan filtered every entry before it.
+    #[tokio::test]
+    async fn postgres_integration_ascending_last_updated_cursor_pages_do_not_sort() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CursorDirection, SearchQuery, SortDirection, SortDirective,
+        };
+
+        fn nodes<'a>(plan: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            out.push(plan);
+            if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
+        }
+
+        const ROWS: i64 = 4000;
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        // Keep one session for the cached search statements, so they can be
+        // found and EXPLAINed on it.
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let tenant = create_tenant("asc-last-updated-plan");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        // Pairs of resources share one `last_updated`, so the tiebreak matters.
+        // Another type shares the tenant and the instants, as in any real
+        // tenant: with one type only, `idx_resources_updated` (`tenant_id,
+        // last_updated`) is as selective as `idx_resources_search` and the
+        // planner may take it plus an Incremental Sort of each tie group.
+        for resource_type in ["Patient", "Observation"] {
+            client
+                .execute(
+                    "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                     SELECT $1, $3, 'p-' || lpad(series::text, 5, '0'), '1',
+                            jsonb_build_object('resourceType', $3::text, 'id', 'p-' || lpad(series::text, 5, '0')),
+                            TIMESTAMPTZ '2020-01-01T00:00:00Z' + (series / 2) * INTERVAL '1 second',
+                            FALSE FROM generate_series(1, $2::bigint) series",
+                    &[&tenant_id, &ROWS, &resource_type],
+                )
+                .await
+                .unwrap();
+        }
+        client.batch_execute("ANALYZE resources").await.unwrap();
+        drop(client);
+
+        let ascending = || {
+            SearchQuery::new("Patient")
+                .with_count(20)
+                .with_sort(SortDirective {
+                    parameter: "_lastUpdated".to_string(),
+                    direction: SortDirection::Ascending,
+                    param_type: None,
+                })
+        };
+        // The walk the plans are taken from: first page, its next page, and
+        // that page's previous page back.
+        let first = backend.search(&tenant, &ascending()).await.unwrap();
+        let ids = |r: &helios_persistence::core::SearchResult| {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>()
+        };
+        // `series / 2` puts p-00001 alone first, then p-00003 before p-00002.
+        assert_eq!(ids(&first)[..3], ["p-00001", "p-00003", "p-00002"]);
+        let next = backend
+            .search(
+                &tenant,
+                &ascending().with_cursor(first.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        // The tie p-00020/p-00021 straddles the page boundary.
+        assert_eq!(ids(&first)[19], "p-00021");
+        assert_eq!(ids(&next)[0], "p-00020");
+        let back = backend
+            .search(
+                &tenant,
+                &ascending().with_cursor(next.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&back), ids(&first));
+        // The pool's one free session, which prepared the statements above.
+        let client = backend.get_client().await.unwrap();
+
+        // A cursor deep in the type, so a plan that filters its way to the
+        // cursor instead of seeking it would read thousands of entries.
+        let deep_at = "2020-01-01T00:25:00Z"; // series 3000 and 3001
+        let deep_id = "p-03001";
+        for (direction, order, scan) in [
+            (
+                CursorDirection::Next,
+                "ORDER BY last_updated ASC, id DESC",
+                "Backward",
+            ),
+            (
+                CursorDirection::Previous,
+                "ORDER BY last_updated DESC, id ASC",
+                "Forward",
+            ),
+        ] {
+            let statement: String = client
+                .query_one(
+                    "SELECT name FROM pg_prepared_statements
+                     WHERE statement LIKE 'SELECT id, version_id, data, last_updated%'
+                       AND statement LIKE '%FROM resources%'
+                       AND statement LIKE '%' || $1 || '%'
+                       AND cardinality(parameter_types) = 4",
+                    &[&order],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{direction:?}: no cached cursor statement: {e}"))
+                .get(0);
+            // The walk prepared this statement; the deep cursor is bound by
+            // hand rather than walking 150 pages to reach it.
+            // `force_custom_plan` is the backend's default plan cache mode
+            // (`PostgresPlanCacheMode`). A generic plan is not asserted: in
+            // this shared, many-tenant test database it estimates
+            // `tenant_id = $1` at a handful of rows and may pick a bitmap scan
+            // and a top-N sort, which says nothing about a real deployment.
+            client
+                .batch_execute("SET plan_cache_mode = force_custom_plan")
+                .await
+                .unwrap();
+            let plan: serde_json::Value = client
+                .query_one(
+                    &format!(
+                        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{}\" \
+                         ('{tenant_id}', 'Patient', '{deep_at}', '{deep_id}')",
+                        statement.replace('"', "\"\"")
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            eprintln!("[2603] {direction:?}: {plan}");
+            let mut all = vec![];
+            nodes(&plan[0]["Plan"], &mut all);
+            assert!(
+                !all.iter()
+                    .any(|n| n["Node Type"].as_str().is_some_and(|t| t.ends_with("Sort"))),
+                "{direction:?}: the page sorted: {plan}"
+            );
+            let scan_node = all
+                .iter()
+                .find(|n| n["Index Name"] == "idx_resources_search")
+                .unwrap_or_else(|| panic!("{direction:?}: idx_resources_search unused: {plan}"));
+            assert_eq!(scan_node["Scan Direction"], scan, "{direction:?}: {plan}");
+            let read = scan_node["Actual Rows"].as_u64().unwrap()
+                + scan_node["Rows Removed by Filter"].as_u64().unwrap_or(0);
+            assert!(
+                read <= 25,
+                "{direction:?}: read {read} index entries for a 20-row page: {plan}"
+            );
+        }
+        client.batch_execute("RESET plan_cache_mode").await.unwrap();
     }
 
     /// #1711: an untyped meta-parameter sort fell back to `ORDER BY id`.

@@ -100,6 +100,10 @@ pub mod number_tests;
 /// Elasticsearch test binaries via `#[path]` (#1340).
 pub mod numeric_validation_suite;
 pub mod pagination_tests;
+/// Backend-agnostic scenarios for `Range` values of quantity parameters,
+/// shared with the PostgreSQL, MongoDB and Elasticsearch test binaries via
+/// `#[path]` (#2602).
+pub mod quantity_range_suite;
 pub mod quantity_tests;
 pub mod reference_tests;
 /// Backend-agnostic `_revinclude` reference-form scenarios, shared with the
@@ -112,6 +116,9 @@ pub mod sort_meta_suite;
 /// Elasticsearch test binaries via `#[path]` (#1606).
 pub mod sort_missing_suite;
 pub mod string_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL and MongoDB test
+/// binaries via `#[path]` (#2603).
+pub mod tiebreak_order_suite;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1379).
 pub mod token_code_system_suite;
@@ -125,6 +132,16 @@ pub mod token_tests;
 async fn date_period_targets_are_ranges() {
     let backend = make_sqlite_backend();
     date_period_suite::period_targets_are_ranges(&backend, "date-period").await;
+}
+
+/// The shared quantity `Range` table (#2602): a `Range` is one closed
+/// interval, a missing bound is open, and every prefix compares against the
+/// interval. PostgreSQL, MongoDB and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn quantity_range_targets_are_intervals() {
+    let backend = make_sqlite_backend();
+    quantity_range_suite::quantity_ranges_are_intervals(&backend, "quantity-range").await;
 }
 
 /// A compartment membership with no params or no reference matches nothing,
@@ -171,4 +188,43 @@ async fn date_composite_component_is_a_point_on_a_period() {
     let backend = make_sqlite_backend();
     composite_period_pin::composite_date_component_is_a_point(&backend, "date-composite-period")
         .await;
+}
+
+/// Resources sharing one `last_updated` page forward and back without a gap or
+/// a repeat (#2603). The in-memory database cannot be reached from outside, so
+/// the timestamps are pinned through a second connection onto a file-backed
+/// one. PostgreSQL and MongoDB run the same suite.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn tiebreak_tied_timestamps_page_without_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiebreak.db");
+    let config = SqliteBackendConfig {
+        data_dir: Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("data"))
+                .unwrap(),
+        ),
+        ..Default::default()
+    };
+    let backend = SqliteBackend::with_config(&path, config).unwrap();
+    backend.init_schema().unwrap();
+    tiebreak_order_suite::tied_timestamps_page_without_gaps(
+        &backend,
+        "tiebreak-2603",
+        async |tenant_id: &str, resource_type: &str| {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let changed = conn
+                .execute(
+                    "UPDATE resources SET last_updated = '2001-02-03T04:05:06.789012+00:00' \
+                     WHERE tenant_id = ?1 AND resource_type = ?2",
+                    [tenant_id, resource_type],
+                )
+                .unwrap();
+            assert!(changed > 0, "no {resource_type} rows to pin");
+        },
+    )
+    .await;
 }

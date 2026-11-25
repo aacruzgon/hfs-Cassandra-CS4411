@@ -112,7 +112,8 @@ mod shared_mongo {
         let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
         let container = crate::container_cleanup::with_cleanup_label(
             Mongo::default()
-                .with_tag("7.0.48")
+                .with_tag("9.0.8")
+                .with_env_var("MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES", "10485760")
                 .with_label("github.run_id", &run_id)
                 // Every fixture owns a database of collection and index files,
                 // and WiredTiger panics (taking `mongod` down) on EMFILE. Some
@@ -123,6 +124,13 @@ mod shared_mongo {
                     "--bind_ip_all",
                     "--setParameter",
                     "enableTestCommands=1",
+                    // mongod 9.0 gives each profiler write 1 ms to get its
+                    // lock and silently drops the entry when it cannot
+                    // (`serverStatus().profiler.totalAbandonedWrites`). Under
+                    // the parallel fixtures that lost up to a third of the
+                    // entries the plan tests assert on (#2636).
+                    "--setParameter",
+                    "internalQueryGlobalProfilingLockDeadlineMs=10000",
                     "--wiredTigerCacheSizeGB",
                     "0.25",
                 ]),
@@ -200,9 +208,18 @@ struct Fixture {
     rows: Vec<Row>,
 }
 
+/// The probe timeout of [`Fixture::new`] and [`Fixture::with_search_timeout`].
+///
+/// These tests assert the plan a search takes and the commands it sends. With
+/// the backend default ([`DEFAULT_PROBE_TIMEOUT_MS`], 10 ms) a loaded host
+/// times a probe out, and the search then takes a different, still correct
+/// plan that the assertions do not expect. A test about probe timeouts
+/// passes its own through [`Fixture::with_probe_timeout`].
+const STABLE_PROBE_TIMEOUT_MS: u64 = 10_000;
+
 impl Fixture {
     async fn new(label: &str, count: usize) -> Option<Self> {
-        Self::with_probe_timeout(label, count, DEFAULT_PROBE_TIMEOUT_MS).await
+        Self::with_probe_timeout(label, count, STABLE_PROBE_TIMEOUT_MS).await
     }
 
     async fn with_probe_timeout(label: &str, count: usize, probe_timeout_ms: u64) -> Option<Self> {
@@ -214,7 +231,7 @@ impl Fixture {
         count: usize,
         search_timeout_ms: Option<u64>,
     ) -> Option<Self> {
-        Self::with_timeouts(label, count, DEFAULT_PROBE_TIMEOUT_MS, search_timeout_ms).await
+        Self::with_timeouts(label, count, STABLE_PROBE_TIMEOUT_MS, search_timeout_ms).await
     }
 
     async fn with_timeouts(
@@ -1196,7 +1213,7 @@ async fn configured_probe_budget_reaches_the_plan_that_probes() {
     let configured = MongoBackend::new(config).unwrap();
     assert_eq!(
         fixture.backend.probe_timeout(),
-        Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS)
+        Duration::from_millis(STABLE_PROBE_TIMEOUT_MS)
     );
     assert_eq!(configured.probe_timeout(), Duration::from_millis(27));
 

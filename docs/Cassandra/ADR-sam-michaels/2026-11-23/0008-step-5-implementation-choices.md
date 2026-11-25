@@ -196,7 +196,8 @@
     new crash tests (10 passed) and the extraction tests under R4B, R5 and R6.
   - Sam Michaels chose to run SW26 on a private node started from CI's compose file, not the
     shared dev node, and to have each fixture in another collaborator's file changed by its
-    owner. He also chose the contract for Step 6 (pull request 7, item 8).
+    owner.
+  - Sam Michaels chose the contract for Step 6 (pull request 7, item 8).
 - **Links:**
   - Pull requests 5 to 8: #108 (extraction), #107 (the sweeper), #106 (repair) and #109
     (crash tests and the post-suite check).

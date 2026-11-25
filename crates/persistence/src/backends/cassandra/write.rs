@@ -2118,7 +2118,7 @@ impl CassandraBackend {
                     .await
                     .map_err(|error| request.statement_error(&error, "previous version row"))?;
             }
-            // SW6 = IW18 (ADR-sam-michaels-0006): stamped after V3, just before I1, so the grace covers only I1's latency and clock skew.
+            // SW6 = IW18 (ADR-sam-michaels-0006): stamped after V3, just before I1, so the grace covers only I1's latency and clock skew. A stall between I1 and the CAS is covered by `finish`, which writes a fresh intent when it leaves work.
             attempt.intent = IntentKey::new(key.tenant_id, key.id, Utc::now());
             request.attempts[index].intent = attempt.intent.clone();
             self.write_intent(
@@ -2370,7 +2370,12 @@ impl CassandraBackend {
 
     /// Steps 4 to 6 for attempt `n`, which applied, with its own values and
     /// intent; skipped when superseded, leaving the intent for the sweeper,
-    /// whose superseded case deletes `K(V-1)`.
+    /// whose superseded case deletes `K(V-1)` minus `K(V)`.
+    ///
+    /// **A write left unfinished** (superseded, or its version row or index
+    /// rows failed) writes one more intent, stamped now, before it returns:
+    /// the intent from step 1 may be older than the grace by now, and a
+    /// sweeper may have taken it for a CAS that never applied (SW6).
     ///
     /// **The version row first** (IW24, ADR-sam-michaels-0006): step 5 starts
     /// only once step 4's row is acknowledged, so any version a search finds
@@ -2440,6 +2445,13 @@ impl CassandraBackend {
                 false
             }
         };
+        // SW6: a write left unfinished (its rows failed, or a newer version superseded it) always
+        // leaves an intent younger than the grace, whatever the sweeper did to the first one while
+        // this writer was stalled before its CAS. A second intent for a version is harmless (SW22).
+        if !complete {
+            self.restamp_intent(&key, attempt.write_id, version_id)
+                .await;
+        }
         request
             .stats
             .applied(n + 1 != request.attempts.len(), superseded);
@@ -2451,6 +2463,21 @@ impl CassandraBackend {
             post_cas_complete: complete,
             index,
             plan,
+        }
+    }
+
+    /// A fresh I1 for a write that applied and was left unfinished: one try, stamped now. A failure is
+    /// logged; the intent the write started with is then all there is.
+    async fn restamp_intent(&self, key: &RowKey<'_>, write_id: Uuid, version_id: i32) {
+        let intent = IntentKey::new(key.tenant_id, key.id, Utc::now());
+        if let Err(error) = self.write_intent(&intent, key, write_id, version_id).await {
+            tracing::error!(
+                resource_type = key.resource_type,
+                id = %key.id,
+                version_id,
+                error = ?error,
+                "a write applied but is unfinished, and its new intent row could not be written"
+            );
         }
     }
 
@@ -5930,8 +5957,8 @@ mod node_tests {
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(created.version_id(), "1");
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        // I1, three tries of V1; no index statement (IW24), no I2.
-        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
+        // I1, three tries of V1, the fresh intent; no index statement (IW24), no I2.
+        assert_eq!((spent.write, spent.cas), (5, 1), "{spent}");
         assert_eq!((spent.batch, spent.batched), (0, 0), "{spent}");
         assert_eq!(
             backend.count(&tenant, Some("Patient")).await.unwrap(),
@@ -5999,8 +6026,8 @@ mod node_tests {
         let stats = backend.cas_stats().since(&before);
         let spent = backend.statement_counts().since(&counted);
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        // V3, I1 and three tries of V1; no index statement, no I2.
-        assert_eq!((spent.write, spent.batch, spent.cas), (5, 0, 1), "{spent}");
+        // V3, I1, three tries of V1, and the fresh intent of the unfinished write; no index statement, no I2.
+        assert_eq!((spent.write, spent.batch, spent.cas), (6, 0, 1), "{spent}");
 
         let error = backend
             .session
@@ -6028,12 +6055,12 @@ mod node_tests {
         assert_eq!(by_type_versions(&backend, &tenant).await, vec![1]);
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
 
-        // I1 is left for the sweeper.
+        // I1 and the fresh intent are left for the sweeper.
         assert_eq!(
             backend
                 .intent_versions(tenant.tenant_id().as_str(), "Patient", "p", since)
                 .await,
-            vec![2]
+            vec![2, 2]
         );
 
         // The sweep writes the row and the index rows, and leaves no intent of its own.
@@ -6231,8 +6258,8 @@ mod node_tests {
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
         // V3, I1, V1 sent alone; three tries of the one batch holding the
         // `k` inserts and `k` deletes, X1's among them, none applied (IW16);
-        // no I2.
-        assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
+        // the fresh intent in place of I2.
+        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
         assert_eq!((spent.batch, spent.batched), (3, 6 * k), "{spent}");
 
         // The old row is still there, at version 1's `last_updated`.
@@ -6355,8 +6382,8 @@ mod node_tests {
         assert_eq!(applied.version_id, 2);
         assert!(!applied.post_cas_complete, "not confirmed, so not complete");
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        // V3, I1, V1 sent alone; one try of the batch; no I2.
-        assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
+        // V3, I1, V1 sent alone, the fresh intent; one try of the batch; no I2.
+        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
         assert_eq!((spent.batch, spent.batched), (1, 2 * k), "one try: {spent}");
         assert_eq!(
             by_type_versions(&backend, &tenant).await,
@@ -6589,7 +6616,7 @@ mod node_tests {
         assert!(!applied.post_cas_complete);
         assert_eq!(applied.index.batches, batches);
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
+        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
         assert_eq!(
             spent.batch,
             batches - 1 + u64::from(POST_CAS_WRITE_TRIES),
@@ -6605,7 +6632,10 @@ mod node_tests {
             expect(&[("missing_row", n1), ("stray_row", n1)]),
             "only the failed batch's units"
         );
-        assert_eq!(backend.intent_versions(t, "Patient", "p", since).await, [2]);
+        assert_eq!(
+            backend.intent_versions(t, "Patient", "p", since).await,
+            [2, 2]
+        );
     }
 
     /// IW6 on every write path (ADR-aacruzgon-0079): a long value is hashed

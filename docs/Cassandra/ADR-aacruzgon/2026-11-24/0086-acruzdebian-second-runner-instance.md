@@ -55,7 +55,7 @@
     - **The coverage job's `taiki-e/install-action` step gets its own `HOME`** (`${{ runner.temp }}/install-action-home`). The binary still lands in gh-runner's `~/.cargo/bin` (the toolchain step exports `CARGO_HOME`), by `mv`, a rename, so a job already running the old copy keeps it.
     - **The weekly prune keeps anything created in the last 24 hours.** It runs `docker system prune --force --filter until=24h`, then `docker volume prune --force`, which removes anonymous volumes only on Docker 23 and later (`acruzdebian` has 26.1.5); `until` is refused together with `--volumes`. No job runs that long: the longest `timeout-minutes` is 160. The matrix keeps one entry per machine, `hfs-runner-acruzdebian`, since both instances share one daemon.
     - **Every job fits 20G, and heavy now only means "off `sam-7900x`".**
-        - **The mutation job's `jobs`:** the default and the maximum go from 4 and 6 to 3. At 4 jobs it peaked at 15.4 GiB `anon` (ADR-aacruzgon-0082), 4.6 GiB under 20G, inside 0080's 5 GiB margin. At 0082's figure of about 3.85 GiB a job, 3 jobs should peak at about 11.6 GiB. That is an estimate, to be measured on the first run. A run should take about 33 minutes instead of about 25.
+        - **The mutation job's `jobs`:** the default and the maximum go from 4 and 6 to 3. At 4 jobs it peaked at 15.4 GiB `anon` (ADR-aacruzgon-0082), 4.6 GiB under 20G, inside 0080's 5 GiB margin. At 0082's figure of about 3.85 GiB a job, 3 jobs should peak at about 11.6 GiB. That is an estimate, to be measured on the first run. A run should take about 33 minutes instead of about 25. *Update 2026-11-25:* that peak, run 44689049080 on #90, was 15,419 MiB `anon` (ADR-aacruzgon-0082's table), which is 15.1 GiB and leaves 4.9 GiB under 20G; the 15.4 and 4.6 above divided MiB by 1000. It is still inside 0080's 5 GiB margin, so the change to 3 jobs stands.
         - **`cargo clippy (helios-fhir)`** reads 20G and picks 1 job, as on `sam-7900x`, so a cold run on `acruzdebian` is back to about 286 s instead of 160 s.
     - **Rollout order.**
         - The new instance starts only after this PR merges, and only after every run created before the merge has finished, since such a run keeps its old workflow files, and so does a re-run of one. The team is told not to re-run those runs. *Update 2026-11-24:* at the setup, `main` was merged into the open pull requests' branches instead of a message to the team; see **What the human changed**.
@@ -92,7 +92,7 @@
         - the first run with two Cassandra jobs on `acruzdebian` at once (both projects in `docker ps`, both jobs green);
         - a cold `cargo clippy (helios-fhir)` at 1 job under 20G there;
         - the first mutation run at 3 jobs (its peak `anon`, against the 11.6 GiB estimate);
-        - the queue depth on a day `sam-7900x` is off.
+        - the queue depth on a day `sam-7900x` is off. *Update 2026-11-25:* the first mutation runs at 3 jobs peaked at 15,281 MiB `anon` (run 45522733076, 4,016 s) and 14,939 MiB (run 45566799539, 2,291 s), with `memory.current` at the 20G cap and no OOM kill: 3.3 and 3.0 GiB over 0086's estimate of about 11.6 GiB, and 5.1 and 5.4 GiB under 20G. Two Cassandra jobs ran on `acruzdebian` at once on 2026-11-25: `Cassandra flaky tests (report only)` on `acruzdebian-2` (run 45530008099, `hfs-cassandra-flaky-s1`, 29452) and `Cassandra tests (all FHIR versions)` on `acruzdebian` (run 45530008031, `hfs-cassandra-fhir-versions`, 29242); both nodes ran from 02:39:09 to 02:40:10 UTC, and both jobs passed (from the jobs' logs, not `docker ps`). ADR-aacruzgon-0088 moves both instances into `ci-hfs.slice` and keeps `acruzdebian-2` to light jobs.
 - **AI involvement:**
     - **Tool and model:** Claude Code (Opus 5.5), as the Rex worker `ci-second-runner`, with two Claude subagents: one read the rustup, cargo, `dtolnay/rust-toolchain` and `taiki-e/install-action` sources, and one read the runner's environment handling.
     - **What the AI proposed:**
@@ -150,6 +150,7 @@
                 - a fully cold `cargo clippy (helios-fhir)` at 1 job;
                 - the first mutation run at 3 jobs: it runs only on a pull request labelled `mutants` or by `workflow_dispatch`, and none has run since the merge;
                 - the queue depth on a day `sam-7900x` is off.
+                - *Update 2026-11-25:* the first mutation runs at 3 jobs and the first two Cassandra jobs at once are recorded under **To measure once it is online** above. The cold `cargo clippy (helios-fhir)` at 1 job was measured outside CI for ADR-aacruzgon-0088: 449 s, 13,493 MiB `anon`, on `acruzdebian` with rustc 1.99.1 while other projects' processes ran.
 - **Links:**
     - PR #111, and its independent audit (`report-pr111-audit.md`).
     - ADR-aacruzgon-0080, 0082 and 0083 (update notes), 0018, 0019, 0021, 0022, 0023.

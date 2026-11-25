@@ -471,9 +471,9 @@ reviews:
           mutants). Every job must fit 20G. Both machines take light and
           medium, and only acruzdebian takes heavy; there, only the first
           instance (acruzdebian) takes medium and heavy, and acruzdebian-2
-          takes light only, so no required check may be heavy
-          (ADR-aacruzgon-0080, 0082, 0086, 0088). Never the bare
-          hfs-cassandra label in a new job.
+          takes light only. A heavy job waits whenever acruzdebian is off,
+          so no required check may be heavy (ADR-aacruzgon-0080, 0082, 0086,
+          0088). Never the bare hfs-cassandra label in a new job.
         - acruzdebian's two runner instances share one Docker daemon and the
           host's ports. A job that starts a single Cassandra node takes its
           Compose project and host port from HFS_CI_SLOT in its first step

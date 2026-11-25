@@ -81,7 +81,6 @@ use std::future::Future;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use parking_lot::Mutex;
 
 use super::backend::CassandraBackend;
@@ -625,20 +624,41 @@ fn outcomes_of<'a, P: 'a, C>(
 /// `ends_at` passes; the ones unfinished then are dropped. None waits for
 /// another to finish before it starts.
 ///
-/// The futures are polled once before the clock is looked at, which starts
-/// the first `concurrency` of them. If every one is done, that is the end. If
-/// `ends_at` has already passed, it returns at once: a deadline in the past
-/// cuts every future after its first poll, however fast the work behind it is
-/// (a timer's own check can lag the clock by a tick, so it cannot give that).
-/// Otherwise the rest runs until `ends_at`.
+/// Each wake polls every running future once, and a future that finishes
+/// makes room for the next one at once. The futures are polled once before
+/// the clock is looked at, which starts the first `concurrency` of them: if
+/// every one is done, that is the end; if `ends_at` has already passed, it
+/// returns at once. So a deadline in the past cuts every future after its
+/// first poll, however fast the work behind it is (a timer's own check can lag
+/// the clock by a tick, and `FuturesUnordered` may stop after polling two
+/// futures that woke themselves, so neither can give that). Otherwise the rest
+/// runs until `ends_at`.
 async fn drive_within<F: Future<Output = ()>>(
     futures: Vec<F>,
     concurrency: usize,
     ends_at: tokio::time::Instant,
 ) {
-    let all = futures::stream::iter(futures)
-        .buffer_unordered(concurrency)
-        .for_each(|()| std::future::ready(()));
+    let mut waiting = futures.into_iter();
+    let mut running: Vec<std::pin::Pin<Box<F>>> = Vec::new();
+    let all = futures::future::poll_fn(|cx| {
+        loop {
+            while running.len() < concurrency {
+                match waiting.next() {
+                    Some(future) => running.push(Box::pin(future)),
+                    None => break,
+                }
+            }
+            let before = running.len();
+            running.retain_mut(|future| future.as_mut().poll(cx).is_pending());
+            if running.is_empty() && waiting.len() == 0 {
+                return std::task::Poll::Ready(());
+            }
+            // A finished future leaves room for another: start it now.
+            if running.len() == before {
+                return std::task::Poll::Pending;
+            }
+        }
+    });
     let mut all = std::pin::pin!(all);
     if futures::poll!(all.as_mut()).is_ready() || tokio::time::Instant::now() >= ends_at {
         return;

@@ -33,7 +33,7 @@ env:
   RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
   # The PC's CI budget (aacruzgon/muster deploy/ci-runner/HOST-CI-BUDGET.md,
-  # ADR-aacruzgon-0087): at most 4 rustc and linker processes per cargo build,
+  # ADR-aacruzgon-0088): at most 4 rustc and linker processes per cargo build,
   # and only file and line debug info, which is enough for a backtrace and
   # makes the objects, the links and the linkers' page cache much smaller.
   # At one process per thread (16) and full debug info, several projects'
@@ -85,7 +85,7 @@ jobs:
           # A reset renames the directory, which is instant, and deletes it in
           # the background at idle CPU and I/O priority, detached from this
           # step's output, as aacruzgon/muster's job-started.sh does
-          # (ADR-aacruzgon-0087): the job no longer waits for rm -rf of up to
+          # (ADR-aacruzgon-0088): the job no longer waits for rm -rf of up to
           # its cap. Each runner instance has its own _work folder and runs one
           # job at a time, so nothing else uses these directories now. The
           # runner stops a delete still running when the job ends, so every

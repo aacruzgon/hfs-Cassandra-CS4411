@@ -35,7 +35,7 @@ name: Cassandra mutation testing (report only)
 # 15.4 GiB anon on #90, 4.6 GiB under 20G, inside ADR-aacruzgon-0080's 5 GiB
 # margin, so the job count is 3 by default and at most. At 3 jobs, runs
 # 45522733076 and 45566799539 peaked at 15,281 and 14,939 MiB anon, each
-# build directory's cargo at one process per thread (ADR-aacruzgon-0087). A
+# build directory's cargo at one process per thread (ADR-aacruzgon-0088). A
 # paths: filter is fine here: no required check lives in this workflow.
 #
 # Only on a pull request labelled `mutants` (ADR-aacruzgon-0082): run on every
@@ -147,7 +147,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       # The PC's CI budget (aacruzgon/muster deploy/ci-runner/HOST-CI-BUDGET.md,
-      # ADR-aacruzgon-0087): each build directory runs a cargo of its own, so
+      # ADR-aacruzgon-0088): each build directory runs a cargo of its own, so
       # the job runs MUTANTS_JOBS x CARGO_BUILD_JOBS rustc processes at once
       # while the directories are cold, and later only one rebuild of the
       # mutated crate each. One a directory keeps the job at 3, inside the

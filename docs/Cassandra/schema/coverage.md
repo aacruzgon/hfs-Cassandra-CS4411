@@ -205,7 +205,7 @@ Spec: [R4 search.html#combining](https://hl7.org/fhir/R4/search.html#combining),
 
 ### Formerly refused, now accepted
 
-Two writes were refused for their size until ADR-aacruzgon-0079, which hashes a long index value instead (walkthrough 3.1). The first was never refused on `main`: G35's check was not built, and no index value is extracted before Step 5 (`crates/persistence/src/backends/cassandra/write.rs:1936`). The second was refused until roadmap row 5.1 removed `check_search_parameter_code`.
+Two writes were refused for their size until ADR-aacruzgon-0079, which hashes a long index value instead (walkthrough 3.1). The first was never refused on `main`: G35's check was not built, and no index value was extracted before roadmap row 5.1. The second was refused until roadmap row 5.1 removed `check_search_parameter_code`.
 
 | Request | Layer | Status | Error |
 | --- | --- | --- | --- |

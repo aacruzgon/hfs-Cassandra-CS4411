@@ -3534,6 +3534,57 @@ mod node_tests {
         say("marks", &backend, &before);
     }
 
+    /// RW4: a poll over many intents never has more than `MAX_IN_FLIGHT` statements in flight on the
+    /// session. The semaphore's own test cannot see a statement that takes no permit; this one counts at
+    /// the session. Intents with no resource row take the read, the serial read and the delete.
+    #[tokio::test]
+    async fn a_poll_over_many_intents_keeps_the_session_within_32_statements() {
+        let Some((backend, t, _, since)) = start("sweeper-rw4").await else {
+            return;
+        };
+        let before = backend.sweeper_stats();
+        let writes: Vec<_> = (0..400)
+            .map(|n| {
+                let (backend, t) = (backend.clone(), t.clone());
+                async move {
+                    let id = format!("p{n}");
+                    let key = RowKey {
+                        tenant_id: &t,
+                        resource_type: "Patient",
+                        id: &id,
+                    };
+                    backend
+                        .write_intent(
+                            &IntentKey::new(&t, &id, Utc::now()),
+                            &key,
+                            Uuid::new_v4(),
+                            1,
+                        )
+                        .await
+                        .expect("write intent");
+                }
+            })
+            .collect();
+        futures::stream::iter(writes)
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await;
+        let state = SweepState::new(
+            Utc::now() - chrono::Duration::minutes(2),
+            CancellationToken::new(),
+        );
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        let now = Utc::now() + chrono::Duration::seconds(40);
+        let report = backend.poll_once(&state, now, &scope).await;
+        assert_eq!((report.no_row, report.done), (400, 400), "{report}");
+        let peak = backend.session.max_statements_in_flight();
+        assert!(peak <= MAX_IN_FLIGHT, "{peak} statements in flight at once");
+        assert!(peak > 1, "nothing ran at once, so the count proves nothing");
+        assert!(intents(&backend, &t, "p0", since).await.is_empty());
+        eprintln!("[sweeper case=rw4 peak_statements={peak}]");
+        say("rw4", &backend, &before);
+    }
+
     /// R1 (SW26): the outbox's tombstones stay under the node's warning threshold under load.
     /// Run by hand; the 10-minute run is the CI node's.
     #[tokio::test]

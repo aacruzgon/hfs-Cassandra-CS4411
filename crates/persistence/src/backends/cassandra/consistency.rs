@@ -445,7 +445,8 @@ pub(crate) enum Defect {
         stored: Vec<IndexKey>,
         fresh: Vec<IndexKey>,
     },
-    /// Rule 4: a delete marker's stored set is not the empty set `0x01 0x00`.
+    /// Rule 4: a delete marker's stored set (a marker version row, or a
+    /// deleted `resources` row) is not the empty set `0x01 0x00`.
     MarkerNotEmpty {
         resource_type: String,
         id: String,
@@ -1054,6 +1055,20 @@ fn check_subject(
         }
     }
 
+    // Rule 4: a deleted resource's stored set is the empty set. This needs no
+    // extraction, so it runs under either registry.
+    if !live {
+        let blob = subject.row.index_keys.as_deref().unwrap_or(&[]);
+        if blob != index_keys::EMPTY {
+            report.defects.push(Defect::MarkerNotEmpty {
+                resource_type: resource_type.clone(),
+                id: id.clone(),
+                version_id: current,
+                blob: blob.to_vec(),
+            });
+        }
+    }
+
     // Rule 6: a stored `write_ts` is the write time of its own `last_updated`.
     // This needs no scan, so it runs whatever the scan did.
     let own_write_ts = std::iter::once((
@@ -1623,6 +1638,8 @@ mod tests {
     const PLANT_RESOURCE_NO_TS: &str = "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, created_at, fhir_version, index_keys, deleted_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0) IF NOT EXISTS";
     /// The same with no `data` column either.
     const PLANT_RESOURCE_NO_TS_NO_DATA: &str = "INSERT INTO resources (tenant_id, resource_type, id, version_id, last_updated, created_at, fhir_version, index_keys, deleted_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, 0) IF NOT EXISTS";
+    /// A deleted current row: `deleted_at` is set and `write_ts` is given.
+    const PLANT_RESOURCE_DELETED: &str = "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, created_at, fhir_version, write_ts, index_keys, deleted_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS";
     /// Its version row, with no `write_ts` column.
     const PLANT_VERSION_NO_TS: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version, index_keys) VALUES (?, ?, ?, 1, ?, ?, ?, ?) USING TIMESTAMP ?";
     /// A live current version row with no `write_ts` and no `data` column.
@@ -1838,6 +1855,7 @@ mod tests {
             "malformed-data-in-both-rows",
             "malformed-data-undecodable-sets",
             "write-ts-behind",
+            "deleted-row-with-keys",
         ];
         let version = test_fhir_version();
 
@@ -2006,9 +2024,56 @@ mod tests {
             .unwrap()
             .write_ts
             .expect("write_ts");
+        // R1 and the marker row hold the same keys (rule 5 stays quiet), so
+        // each reports once.
         let blob = index_keys::encode(&[planted_uri()]);
         plant_resource_keys(&backend, &t, blob.clone(), 2).await;
         plant_version_keys(&backend, &t, 2, blob, ts2 + 1).await;
+
+        // deleted-row-with-keys: R1 is deleted but holds the body's real key
+        // set; the current version row is live with the same body and blob,
+        // and no index row exists, so only the empty-set rule sees it.
+        let t = tenant_of("deleted-row-with-keys");
+        let lu = ms(1_700_000_000_000);
+        let body = patient().to_string();
+        let blob = Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+            &t,
+            "Patient",
+            &patient(),
+        ))));
+        let fhir = Value::from(version.as_mime_param());
+        plant_cas(
+            &backend,
+            PLANT_RESOURCE_DELETED,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(body.as_str()),
+                Value::from(lu),
+                Value::from(lu),
+                fhir.clone(),
+                Value::from(write_ts_of(lu)),
+                blob.clone(),
+                Value::from(lu),
+            ],
+        )
+        .await;
+        plant(
+            &backend,
+            PLANT_VERSION_NO_TS,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(body.as_str()),
+                Value::from(lu),
+                fhir,
+                blob,
+                Value::from(write_ts_of(lu)),
+            ],
+        )
+        .await;
 
         // missing-version-row
         let t = tenant_of("missing-version-row");
@@ -2567,11 +2632,24 @@ mod tests {
             }
 
             let report = check("marker-not-empty", registry).await;
+            assert_eq!(
+                report.kinds(),
+                under(&["marker_not_empty", "marker_not_empty"]),
+                "{report}"
+            );
+            for defect in &report.defects {
+                let Defect::MarkerNotEmpty { version_id, .. } = defect else {
+                    unreachable!()
+                };
+                assert_eq!(*version_id, 2);
+            }
+
+            let report = check("deleted-row-with-keys", registry).await;
             assert_eq!(report.kinds(), under(&["marker_not_empty"]), "{report}");
             let Defect::MarkerNotEmpty { version_id, .. } = &report.defects[0] else {
                 unreachable!()
             };
-            assert_eq!(*version_id, 2);
+            assert_eq!(*version_id, 1);
 
             let report = check("missing-version-row", registry).await;
             assert_eq!(

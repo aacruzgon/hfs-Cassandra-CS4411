@@ -3099,8 +3099,10 @@ mod node_tests {
         assert_consistent(&check(&backend, &t).await);
     }
 
-    /// N6 (exit criterion): the running loop heals a crash within poll + grace. The request timeout (5 s)
-    /// is long enough for `connect` to check the local DC with a node of three down, and SW4 sets the grace (10 s).
+    /// N6 (exit criterion): the running loop heals a crash within poll + grace. SW4 sets the grace (10 s) from
+    /// the request timeout (5 s). With a node of three down, `connect`'s local DC check can try that node
+    /// first, so the connect timeout (2 s) is kept well under the request timeout: at the default 5 s the try
+    /// used the whole deadline, and `connect` failed in 1 of 3 runs.
     #[tokio::test]
     async fn a_crash_after_the_cas_heals_within_poll_plus_grace() {
         let Some((backend, t, tenant, since)) = start("sweeper-loop").await else {
@@ -3110,6 +3112,7 @@ mod node_tests {
         let looped = Arc::new(
             CassandraBackend::connect(crate::backends::cassandra::CassandraConfig {
                 contact_points: vec![url],
+                connect_timeout_ms: 2_000,
                 request_timeout_ms: 5_000,
                 sweeper_poll_interval_ms: 1_000,
                 sweeper_grace_ms: 10_000,

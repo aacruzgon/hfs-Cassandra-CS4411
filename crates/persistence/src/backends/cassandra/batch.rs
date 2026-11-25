@@ -2,8 +2,8 @@
 //! hold, how many bytes one may carry, and what a failed one means.
 //!
 //! Step 5 of the write path sends a version's index rows in logged batches at
-//! `LOCAL_QUORUM`, each under 5 KiB (a unit over the limit is never split and
-//! goes alone, as one batch), sent concurrently (design step 5;
+//! `LOCAL_QUORUM`, each under 5 KiB (a unit over the limit goes alone, as one
+//! batch, and is split only past [`MAX_BATCH_STATEMENTS`]), sent concurrently (design step 5;
 //! `docs/Cassandra/schema/walkthrough.md` section 2, "Index rows"). The
 //! session sends one batch, [`CassandraSession::batch`]; this module holds
 //! the parts that need no node, each tested on its own. The decisions are
@@ -16,8 +16,9 @@
 //!   intent table.
 //! - [`wire_bytes`], [`MAX_BATCH_BYTES`] and [`pack`] (IW11): a batch is
 //!   measured by every byte its statements take on the wire, and units (one
-//!   partition's rows, IW9) are packed into batches without ever splitting
-//!   one.
+//!   partition's rows, IW9) are packed into batches. A unit is split only
+//!   when it has more than [`MAX_BATCH_STATEMENTS`] statements (and never the
+//!   `resources_by_type` unit).
 //! - [`classify_failure`] (IW15): what a failed batch means for the writer,
 //!   from the error the node sent.
 //!
@@ -213,12 +214,20 @@ pub(crate) fn wire_bytes(statements: &[IndexStatement]) -> usize {
 /// `batch_size_warn_threshold` of 5 KiB, less a 256-byte margin.
 pub(crate) const MAX_BATCH_BYTES: usize = 5 * 1024 - 256;
 
+/// The most statements one batch may hold (IW11): the native protocol counts
+/// them in 16 bits, so a longer batch would wrap. A unit with more is split
+/// by `index_batches` into consecutive pieces of at most this many.
+pub(crate) const MAX_BATCH_STATEMENTS: usize = u16::MAX as usize;
+
 /// Packs units into batches of at most `bound` bytes, given each unit's size
 /// by [`wire_bytes`]. Returns each batch as the run of unit indices it holds
 /// (IW11).
 ///
-/// - **A unit is never split.** A unit is every row of one partition key, its
-///   inserts and its deletes (IW9 B). Cassandra applies one partition's
+/// - **A unit is not split here.** A unit is every row of one partition key,
+///   its inserts and its deletes (IW9 B); a unit of more than
+///   [`MAX_BATCH_STATEMENTS`] statements is split into pieces by
+///   `index_batches` before it gets here, and `pack` sees each piece as a
+///   unit. Cassandra applies one partition's
 ///   mutation whole on each replica; most of all, once the batch has
 ///   reached a quorum, an update alone never lets `count` see an updated
 ///   resource's `resources_by_type` row at both `last_updated` values.

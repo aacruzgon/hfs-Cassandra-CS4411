@@ -1495,22 +1495,25 @@ struct IndexBatches {
 /// limit on its own goes alone, as one batch over it.
 ///
 /// A unit of more than
-/// [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS) statements,
-/// or of more than [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES) by
-/// [`wire_bytes`], is split: the native protocol counts a batch's statements
-/// in 16 bits, so a longer batch would wrap, and the node refuses a message
-/// over its limit (16 MiB by default, less on a heap under 640 MiB). It
-/// becomes consecutive pieces of whole rows, each as long as both limits
-/// allow ([`piece_len`]), in the unit's statement order (inserts, then
-/// deletes), each counted in the stats on its own. A full piece is far over
-/// [`MAX_BATCH_BYTES`], so it is a batch of its own; the last piece, when
-/// small, is packed like any unit. The `resources_by_type` unit holds one
-/// or two statements per resource and is never split (IW9 B: `count` reads
-/// that partition). This split amends IW11 (ADR-aacruzgon-0089): the pieces
-/// all carry `ts`, so their order does not matter and a failed one keeps
-/// the intent, but one partition's rows no longer apply as one mutation, so
-/// a reader can see some of them new and some old until the last piece
-/// lands.
+/// [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS) statements, or
+/// of more than [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES) by
+/// [`wire_bytes`], is split: the native protocol counts a batch's statements in
+/// 16 bits, so a longer batch would wrap, and the node refuses a message over
+/// its limit (16 MiB by default, less on a heap under 640 MiB). It becomes
+/// consecutive pieces of whole rows, each as long as both limits allow
+/// ([`piece_len`]), in the unit's statement order (inserts, then deletes). A
+/// full piece is far over [`MAX_BATCH_BYTES`], so it is a batch of its own: one
+/// partition, which the node runs without its batchlog, so a timeout is retried
+/// ([`BatchFailure::Retry`]). The last piece, when small, is packed like any
+/// unit, so it can share a batch with the next units: several partitions, which
+/// go through the batchlog, so a timeout there is [`BatchFailure::InBatchlog`].
+/// The stats count batches, so a packed last piece counts in the batch that
+/// holds it. The `resources_by_type` unit holds one or two statements per
+/// resource and is never split (IW9 B: `count` reads that partition). This
+/// split amends IW11 (ADR-aacruzgon-0089): the pieces all carry `ts`, so their
+/// order does not matter and a failed one keeps the intent, but one partition's
+/// rows no longer apply as one mutation, so a reader can see some of them new
+/// and some old until the last piece lands.
 fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatches {
     // (inserts, deletes, statements) of each piece, in the delta's order.
     let mut pieces: Vec<(u64, u64, Vec<IndexStatement>)> = Vec::new();
@@ -2545,25 +2548,27 @@ impl CassandraBackend {
     /// sweeper 1 per pass and repair 1. Every caller computes
     /// `ts = write_ts_of(lu(V))` for the version `delta` writes.
     ///
-    /// - **Packed, split only past the statement limit** (IW9 B, IW11). The
-    ///   units are packed in order
-    ///   into batches of at most [`MAX_BATCH_BYTES`] by [`wire_bytes`]
-    ///   ([`index_batches`]). A unit is every row of one partition, which
-    ///   Cassandra applies whole on each replica; above all, once the batch
-    ///   has reached a quorum, an update alone never lets `count` see an
-    ///   updated resource's `resources_by_type` row twice. `count` can still
-    ///   be off (ADR-aacruzgon-0081, decision 2): too high, by up to one per
-    ///   unfinished update or delete, and one too low after an unfinished
-    ///   create or revive, until the sweeper or repair finishes it; and on
-    ///   RF 3, twice or not at all through read repair after a batch that
-    ///   reached fewer than a quorum. A unit over the byte bound goes alone;
-    ///   one of more than
+    /// - **Packed, split only past the statement or byte limit** (IW9 B, IW11).
+    ///   The units are packed in order into batches of at most
+    ///   [`MAX_BATCH_BYTES`] by [`wire_bytes`] ([`index_batches`]). A unit is
+    ///   every row of one partition, which Cassandra applies whole on each
+    ///   replica; above all, once the batch has reached a quorum, an update
+    ///   alone never lets `count` see an updated resource's `resources_by_type`
+    ///   row twice. `count` can still be off (ADR-aacruzgon-0081, decision 2):
+    ///   too high, by up to one per unfinished update or delete, and one too
+    ///   low after an unfinished create or revive, until the sweeper or repair
+    ///   finishes it; and on RF 3, twice or not at all through read repair
+    ///   after a batch that reached fewer than a quorum. A unit over the byte
+    ///   bound goes alone; one of more than
     ///   [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS)
     ///   statements or [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES),
-    ///   never the `resources_by_type` unit, is split into consecutive
-    ///   pieces of whole rows within both (ADR-aacruzgon-0089); a full piece
-    ///   is a batch of its own, and a small last piece is packed like any
-    ///   unit.
+    ///   never the `resources_by_type` unit, is split into consecutive pieces
+    ///   of whole rows within both (ADR-aacruzgon-0089); a full piece is a
+    ///   batch of its own, and a small last piece is packed like any unit. A
+    ///   batch of one partition runs without the node's batchlog and one of
+    ///   several goes through it, so a timeout is retried for the first and not
+    ///   for the second ([`WriteFailure::InBatchlog`]); either way a batch not
+    ///   confirmed keeps the intent.
     /// - **All at once, at most [`INDEX_BATCHES_IN_FLIGHT`] in flight**
     ///   (IW12), as futures inside the request's own task, never
     ///   `tokio::spawn`, so a request that is dropped, or a crash test that

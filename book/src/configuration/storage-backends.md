@@ -129,7 +129,7 @@ HFS_CASSANDRA_CONTACT_POINTS=127.0.0.1:9042 \
 | `HFS_CASSANDRA_POOL_SIZE` | `2` | Connections per local node |
 | `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection |
 | `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` | `10000` | The backend's own deadline for one statement. The sweeper grace must be at least twice it, whether or not the sweeper is enabled: with the default grace, a value above `15000` fails startup. |
-| `HFS_CASSANDRA_SWEEPER_ENABLED` | `true` | Whether hfs runs the index sweeper (one per process). |
+| `HFS_CASSANDRA_SWEEPER_ENABLED` | `true` | Whether hfs starts the index sweeper with the server (one per process, stopped on shutdown). When `false`, it logs that the sweeper is off and nothing finishes a write whose version or index rows failed. |
 | `HFS_CASSANDRA_SWEEPER_POLL_INTERVAL_MS` | `5000` | Pause between two polls of pending_index_writes. |
 | `HFS_CASSANDRA_SWEEPER_GRACE_MS` | `30000` | How old an intent must be before the sweeper takes it: at least twice the request timeout, under one hour, and not under the poll interval. |
 

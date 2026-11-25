@@ -2116,7 +2116,7 @@ mod tests {
             VersionKeys {
                 version_id: 2,
                 last_updated: lu2,
-                fhir_version: row.fhir_version,
+                fhir_version: row.fhir_version_text(),
                 keys: &k2,
             },
         );

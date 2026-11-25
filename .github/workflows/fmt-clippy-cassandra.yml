@@ -213,26 +213,37 @@ jobs:
           # the background at idle CPU and I/O priority, detached from this
           # step's output, as aacruzgon/muster's job-started.sh does
           # (ADR-aacruzgon-0088): the job no longer waits for rm -rf of up to
-          # its cap. Each runner instance has its own _work folder and runs one
+          # its cap. Only BFQ and mq-deadline honour the I/O class;
+          # acruzdebian's NVMe disk uses none, so there only the CPU part
+          # counts. Each runner instance has its own _work folder and runs one
           # job at a time, so nothing else uses these directories now. The
           # runner stops a delete still running when the job ends, so every
           # reset step first deletes what such a delete left (*.pruning.*) in
-          # this instance's target/. du has a time limit: under heavy disk load
-          # it can take seconds, and an unknown size only skips the size check.
+          # this instance's target/, and names it in the log: a leftover that
+          # comes back run after run is a delete that keeps failing. du has a
+          # time limit: under heavy disk load it can take seconds, and an unknown
+          # size only skips the size check and is reported as unknown, not 0.
           prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
-          for left in "${TARGET_DIR%/*}"/*.pruning.*; do if [ -e "$left" ]; then prune "$left"; fi; done
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do
+            if [ -e "$left" ]; then
+              echo "Deleting a leftover of an earlier reset, last changed $(stat -c %y -- "$left" 2>/dev/null || echo "at an unknown time"): $left"
+              prune "$left"
+            fi
+          done
           stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
           before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
-          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          # Empty when du timed out (unknown); a missing directory is 0.
+          [ -e "$TARGET_DIR" ] || before_bytes=0
+          size_gb=${before_bytes:+$(( (before_bytes + 1073741823) / 1073741824 ))}
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
-          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+          if [ "$old_stamp" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
             if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
-            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain, Cargo.lock or the debug setting"
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
-            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            echo "Resetting $TARGET_DIR (size ${size_gb:-unknown}${size_gb:+ GB}, cap $CAP_GB GB, stamp: $stamp; $reason)"
             doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
             if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
@@ -246,7 +257,7 @@ jobs:
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
-            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_BEFORE_BYTES=$before_bytes"
             echo "TARGET_DIR_RESET=$reset"
             echo "TARGET_DIR_RESET_REASON=$reason"
             echo "TARGET_DIR_CAP_GB=$CAP_GB"
@@ -370,26 +381,37 @@ jobs:
           # the background at idle CPU and I/O priority, detached from this
           # step's output, as aacruzgon/muster's job-started.sh does
           # (ADR-aacruzgon-0088): the job no longer waits for rm -rf of up to
-          # its cap. Each runner instance has its own _work folder and runs one
+          # its cap. Only BFQ and mq-deadline honour the I/O class;
+          # acruzdebian's NVMe disk uses none, so there only the CPU part
+          # counts. Each runner instance has its own _work folder and runs one
           # job at a time, so nothing else uses these directories now. The
           # runner stops a delete still running when the job ends, so every
           # reset step first deletes what such a delete left (*.pruning.*) in
-          # this instance's target/. du has a time limit: under heavy disk load
-          # it can take seconds, and an unknown size only skips the size check.
+          # this instance's target/, and names it in the log: a leftover that
+          # comes back run after run is a delete that keeps failing. du has a
+          # time limit: under heavy disk load it can take seconds, and an unknown
+          # size only skips the size check and is reported as unknown, not 0.
           prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
-          for left in "${TARGET_DIR%/*}"/*.pruning.*; do if [ -e "$left" ]; then prune "$left"; fi; done
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do
+            if [ -e "$left" ]; then
+              echo "Deleting a leftover of an earlier reset, last changed $(stat -c %y -- "$left" 2>/dev/null || echo "at an unknown time"): $left"
+              prune "$left"
+            fi
+          done
           stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
           before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
-          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          # Empty when du timed out (unknown); a missing directory is 0.
+          [ -e "$TARGET_DIR" ] || before_bytes=0
+          size_gb=${before_bytes:+$(( (before_bytes + 1073741823) / 1073741824 ))}
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
-          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+          if [ "$old_stamp" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
             if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
-            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain, Cargo.lock or the debug setting"
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
-            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            echo "Resetting $TARGET_DIR (size ${size_gb:-unknown}${size_gb:+ GB}, cap $CAP_GB GB, stamp: $stamp; $reason)"
             doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
             if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
@@ -403,7 +425,7 @@ jobs:
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
-            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_BEFORE_BYTES=$before_bytes"
             echo "TARGET_DIR_RESET=$reset"
             echo "TARGET_DIR_RESET_REASON=$reason"
             echo "TARGET_DIR_CAP_GB=$CAP_GB"
@@ -568,26 +590,37 @@ jobs:
           # the background at idle CPU and I/O priority, detached from this
           # step's output, as aacruzgon/muster's job-started.sh does
           # (ADR-aacruzgon-0088): the job no longer waits for rm -rf of up to
-          # its cap. Each runner instance has its own _work folder and runs one
+          # its cap. Only BFQ and mq-deadline honour the I/O class;
+          # acruzdebian's NVMe disk uses none, so there only the CPU part
+          # counts. Each runner instance has its own _work folder and runs one
           # job at a time, so nothing else uses these directories now. The
           # runner stops a delete still running when the job ends, so every
           # reset step first deletes what such a delete left (*.pruning.*) in
-          # this instance's target/. du has a time limit: under heavy disk load
-          # it can take seconds, and an unknown size only skips the size check.
+          # this instance's target/, and names it in the log: a leftover that
+          # comes back run after run is a delete that keeps failing. du has a
+          # time limit: under heavy disk load it can take seconds, and an unknown
+          # size only skips the size check and is reported as unknown, not 0.
           prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
-          for left in "${TARGET_DIR%/*}"/*.pruning.*; do if [ -e "$left" ]; then prune "$left"; fi; done
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do
+            if [ -e "$left" ]; then
+              echo "Deleting a leftover of an earlier reset, last changed $(stat -c %y -- "$left" 2>/dev/null || echo "at an unknown time"): $left"
+              prune "$left"
+            fi
+          done
           stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
           before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
-          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          # Empty when du timed out (unknown); a missing directory is 0.
+          [ -e "$TARGET_DIR" ] || before_bytes=0
+          size_gb=${before_bytes:+$(( (before_bytes + 1073741823) / 1073741824 ))}
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
-          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+          if [ "$old_stamp" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
             if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
-            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain, Cargo.lock or the debug setting"
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
-            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            echo "Resetting $TARGET_DIR (size ${size_gb:-unknown}${size_gb:+ GB}, cap $CAP_GB GB, stamp: $stamp; $reason)"
             doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
             if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
@@ -601,7 +634,7 @@ jobs:
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
-            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_BEFORE_BYTES=$before_bytes"
             echo "TARGET_DIR_RESET=$reset"
             echo "TARGET_DIR_RESET_REASON=$reason"
             echo "TARGET_DIR_CAP_GB=$CAP_GB"

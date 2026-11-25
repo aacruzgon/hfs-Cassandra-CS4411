@@ -143,12 +143,15 @@ cas_counters! {
     extractions,
     /// Microseconds those extractions took, summed (IW22).
     extract_us,
-    /// Search parameters skipped because their extraction failed; the write
-    /// went ahead without their rows (IW1). A consistency check's
-    /// re-extractions count too.
+    /// Search parameters whose extraction failed, so the key set it returned
+    /// has no rows for them (IW1, IW22). Counted per extraction, when a plan
+    /// is built, before the compare-and-swap: an attempt that then misses or
+    /// fails counts too, and so does each re-extraction of a consistency
+    /// check.
     extraction_failures,
-    /// Extractions that failed for the whole resource, so the version kept
-    /// only its `resources_by_type` row (IW1, D6).
+    /// Extractions that failed for the whole resource, so the key set they
+    /// returned holds only its `resources_by_type` row (IW1, IW22, D6).
+    /// Counted the same way as `extraction_failures`.
     extraction_fallbacks,
     /// Bytes of `data` and `index_keys` of every compare-and-swap attempted,
     /// counted with `attempts` just before it is sent (an attempt whose

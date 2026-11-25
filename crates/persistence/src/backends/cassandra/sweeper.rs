@@ -383,6 +383,10 @@ impl RetryList {
 
     /// Whether the list already owns `intent`'s row: it is waiting for its `next_at`, or it gave up and
     /// is still inside the retry horizon. A slice read does not try such an intent again.
+    /// Tries of intents that hit an invariant while the list was full, so the third still gives up
+    /// (SW13): each key with the order it was first counted in, and its count. At most `GAVE_UP_CAP`.
+    overflow_tries: BTreeMap<RetryKey, (u64, u32)>,
+    overflow_seen: u64,
     pub(crate) fn owns(&mut self, intent: &Intent, now: DateTime<Utc>) -> bool {
         let key = retry_key(intent);
         if self.entries.contains_key(&key) {
@@ -414,6 +418,8 @@ impl RetryList {
         if !self.entries.contains_key(&key) && self.entries.len() >= self.cap {
             return Queued::Overflow;
         }
+            overflow_tries: BTreeMap::new(),
+            overflow_seen: 0,
         let entry = self.entries.entry(key.clone()).or_insert(Entry {
             intent,
             failures: 0,
@@ -430,17 +436,7 @@ impl RetryList {
                 if entry.invariant_failures >= INVARIANT_TRIES {
                     let enqueued = entry.intent.enqueued;
                     self.entries.remove(&key);
-                    if self.gave_up.insert(key.clone(), enqueued).is_none() {
-                        self.gave_up_order.push_back(key);
-                    }
-                    while self.gave_up.len() > GAVE_UP_CAP {
-                        match self.gave_up_order.pop_front() {
-                            Some(oldest) => {
-                                self.gave_up.remove(&oldest);
-                            }
-                            None => break,
-                        }
-                    }
+                    self.give_up(key, enqueued);
                     return Queued::GaveUp;
                 }
                 entry.next_at = now + retry_first();
@@ -448,12 +444,43 @@ impl RetryList {
         }
         Queued::Retry {
             next_at: entry.next_at,
+            // A bug is tried three times however full the list is (SW13); a transient failure holds the mark (SW18).
+            if matches!(failure, Failure::Invariant(_)) {
+                let seen = self.overflow_seen;
+                let tries = {
+                    let (_, tries) = self.overflow_tries.entry(key.clone()).or_insert((seen, 0));
+                    *tries += 1;
+                    *tries
+                };
+                self.overflow_seen += 1;
+                if tries >= INVARIANT_TRIES {
+                    let enqueued = intent.enqueued;
+                    self.overflow_tries.remove(&key);
+                    self.give_up(key, enqueued);
+                    return Queued::GaveUp;
+                }
+                while self.overflow_tries.len() > GAVE_UP_CAP {
+                    let oldest = self
+                        .overflow_tries
+                        .iter()
+                        .min_by_key(|(_, (order, _))| *order)
+                        .map(|(key, _)| key.clone());
+                    match oldest {
+                        Some(oldest) => {
+                            self.overflow_tries.remove(&oldest);
+                        }
+                        None => break,
+                    }
+                }
+            }
         }
     }
 
     /// Removes the entry of `intent`'s row, if any.
     pub(crate) fn succeeded(&mut self, intent: &Intent) {
-        self.entries.remove(&retry_key(intent));
+        let key = retry_key(intent);
+        self.entries.remove(&key);
+        self.overflow_tries.remove(&key);
     }
 
     /// The intents whose `next_at <= now`, oldest `next_at` first.
@@ -487,6 +514,21 @@ impl SweepState {
             marks: parking_lot::Mutex::new([whole_ms(mark); 16]),
             retry: parking_lot::Mutex::new(RetryList::new(RETRY_LIST_CAP)),
             pending: parking_lot::Mutex::new(Vec::new()),
+    /// Remembers that `key`'s intent gave up, so a later read of its row does not try it again (SW13).
+    fn give_up(&mut self, key: RetryKey, enqueued: DateTime<Utc>) {
+        if self.gave_up.insert(key.clone(), enqueued).is_none() {
+            self.gave_up_order.push_back(key);
+        }
+        while self.gave_up.len() > GAVE_UP_CAP {
+            match self.gave_up_order.pop_front() {
+                Some(oldest) => {
+                    self.gave_up.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+
             cancel,
         }
     }
@@ -2117,6 +2159,24 @@ mod tests {
         assert_eq!(shared.in_flight.available_permits(), MAX_IN_FLIGHT);
     }
 
+
+        // SW13 holds with the list full: a bug is tried three times, a transient failure holds the mark.
+        let mut full = RetryList::new(1);
+        let (a, b) = (intent("a", t0), intent("b", t0));
+        assert!(matches!(
+            full.failed(a, transient, t0),
+            Queued::Retry { .. }
+        ));
+        assert_eq!(full.failed(b.clone(), bug, t0), Queued::Overflow);
+        assert_eq!(full.failed(b.clone(), bug, t0), Queued::Overflow);
+        assert_eq!(full.failed(b.clone(), bug, t0), Queued::GaveUp);
+        assert!(full.owns(&b, t0));
+        assert_eq!(full.len(), 1);
+        let c = intent("c", t0);
+        assert_eq!(full.failed(c.clone(), transient, t0), Queued::Overflow);
+        assert_eq!(full.failed(c.clone(), transient, t0), Queued::Overflow);
+        assert_eq!(full.failed(c.clone(), transient, t0), Queued::Overflow);
+        assert!(!full.owns(&c, t0));
     /// P5: counters subtract, gauges keep the later value, every pair prints.
     #[test]
     fn sweeper_stats_subtract_counters_keep_gauges_and_print_every_pair() {

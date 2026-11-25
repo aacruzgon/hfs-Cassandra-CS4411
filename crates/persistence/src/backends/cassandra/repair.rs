@@ -18,21 +18,32 @@
 //!   `last_updated` and deletes every found row below R1 that K(current)
 //!   does not produce (compared by [`IndexKey::row_at`], IW7).
 //! - **Partial replay (RV1).** Above that, repair only touches the rows the
-//!   search found: a found row is re-tagged when a key of K(current) names
-//!   the same row (only a date row can, since its key has no
-//!   `last_updated`), and any other found row is deleted.
-//! - **Skips (RV3).** Nothing is written when a found row is tagged above
-//!   R1 (R1 lags behind a write: [`SkipReason::TagAhead`]), when there is no
-//!   `resources` row ([`SkipReason::NoRow`]), when R1's `write_ts` is not
-//!   `write_ts_of(last_updated)` ([`SkipReason::WriteTsMismatch`]), when
-//!   R1's key set cannot be decoded ([`SkipReason::UndecodableKeys`]), when no
-//!   found row is below R1 ([`SkipReason::NotStale`]), or when the search's
-//!   budget is spent ([`SkipReason::Budget`], RV5).
+//!   search found. A found row whose key K(current) still produces *moves*
+//!   to R1's `last_updated`, as the update itself moves it: it is deleted at
+//!   its old `last_updated` and inserted at R1's (a date row, whose key has
+//!   no `last_updated`, is only re-tagged in place). A found row whose key
+//!   K(current) no longer produces is deleted. So a resource never loses its
+//!   `resources_by_type` row to a partial repair, and the writes stay
+//!   bounded by the found rows.
+//! - **Skips (RV3).** Nothing is written, and the checks run in this order,
+//!   the first that applies deciding: no `resources` row
+//!   ([`SkipReason::NoRow`]); a found row tagged above R1 (R1 lags behind a
+//!   write: [`SkipReason::TagAhead`]); no found row below R1
+//!   ([`SkipReason::NotStale`]); R1's `write_ts` is not
+//!   `write_ts_of(last_updated)` ([`SkipReason::WriteTsMismatch`]); R1's key
+//!   set cannot be decoded ([`SkipReason::UndecodableKeys`]); the search's
+//!   budget is spent ([`SkipReason::Budget`], RV5). Once the budget's 32
+//!   resources are used, an entry still runs every check up to
+//!   `UndecodableKeys`, then is skipped as `Budget` without a delta built.
 //! - **A newer version wins.** Repair writes at `write_ts_of(R1.last_updated)`
 //!   (RW10), so if the resource was updated after R1 was read, the newer
 //!   version's rows carry a higher timestamp and win over this repair's:
 //!   its writes are confirmed and change nothing visible (RV4).
 //!
+//! - **Concurrency.** Admitted repairs run up to [`REPAIR_CONCURRENCY`] at a
+//!   time, none waiting behind another; each outcome is read from the
+//!   repair's own slot, so a stalled repair holds up no other, and a skip's
+//!   outcome never depends on a repair finishing.
 //! - **One deadline.** The whole repair phase is bounded by one request
 //!   deadline (`request_timeout_ms`), so a search waits at most that long
 //!   for its repairs. A repair unfinished by then is reported
@@ -45,15 +56,21 @@
 //!
 //! # Step 6's contract
 //!
-//! - Call [`RepairContext::run`] at the end of each page, on success and on
-//!   `TooManyResults`, inside the request's task, never through
-//!   `tokio::spawn`. Its result never fails the search.
+//! - Use one [`RepairContext`] per search request and call
+//!   [`RepairContext::run`] once per response (not per page), on success and
+//!   on `TooManyResults`, inside the request's task, never through
+//!   `tokio::spawn`. Its result never fails the search. A filtered
+//!   `search_count` does not queue repairs. The phase's deadline is meant to
+//!   come out of the search's remaining time, capped at `request_timeout_ms`;
+//!   Step 6 adds that entry point.
 //! - Queue every candidate the tag check hides for its tag: an index row
 //!   whose `version_id` is not R1's, a deleted R1, or no R1. Pass the tag
 //!   check's own R1. That R1 is `SELECT_RESOURCE`, which reads the row's
 //!   `index_keys`, so repair needs no other read (RV4).
-//! - Send a row the search cannot decode, or one [`StaleIndexRow::new`]
-//!   refuses, to [`RepairContext::skip_undecodable`].
+//! - Build each [`StaleIndexRow`]'s key from the stored column values as
+//!   they are, never through `index_text` again. Send a row the search
+//!   cannot decode, or one [`StaleIndexRow::new`] refuses, to
+//!   [`RepairContext::skip_undecodable`].
 //! - Remove both `allow(dead_code)`s when the search calls this module: the
 //!   inner attribute below, and the one on `impl RepairCounters` in
 //!   `stats.rs`.
@@ -72,7 +89,8 @@ use super::index_keys::{self, IndexKey, RowId};
 use super::read::ResourceRow;
 use super::stats::IndexWriteStats;
 use super::write::{
-    IndexDelta, IndexRow, RowKey, VersionKeys, WriteFailure, index_delta, write_ts_of,
+    IndexDelta, IndexRow, RowKey, VersionKeys, WriteFailure, index_delta, index_pack_stats,
+    write_ts_of,
 };
 
 /// Resources one search repairs at most (RV5, RV8): a chosen budget, not a measurement.
@@ -81,7 +99,8 @@ pub(crate) const MAX_REPAIRS_PER_SEARCH: usize = 32;
 pub(crate) const MAX_REPAIR_ROWS_PER_SEARCH: usize = 512;
 /// Repairs of one search in flight at once (RV5, RV8): futures in the search's own task.
 pub(crate) const REPAIR_CONCURRENCY: usize = 4;
-/// Above this many keys in K(current), repair writes only the rows found (RV1): a chosen budget.
+/// Above this many keys in K(current), repair writes only the rows found, and the keys of
+/// K(current) that name them (RV1): a chosen budget.
 pub(crate) const MAX_FULL_REPAIR_KEYS: usize = 64;
 /// Tries of each batch of a repair (IW17, RV7).
 const REPAIR_TRIES: u32 = 1;
@@ -98,6 +117,10 @@ pub(crate) struct StaleIndexRow {
 
 impl StaleIndexRow {
     /// Err(message) for a non-date key without `last_updated`, which names no row.
+    ///
+    /// The caller builds `key` from the index row's stored column values as
+    /// they are, never by passing them through `index_text` again: a stored
+    /// value is already what `index_text` produced.
     pub(crate) fn new(
         key: IndexKey,
         last_updated: Option<DateTime<Utc>>,
@@ -106,7 +129,8 @@ impl StaleIndexRow {
         let is_date = matches!(key, IndexKey::Date { .. } | IndexKey::DateByEnd { .. });
         if last_updated.is_none() && !is_date {
             return Err(format!(
-                "index row {key:?} has no last_updated, so it names no row"
+                "a {} row has no last_updated, so it names no row",
+                key.table()
             ));
         }
         Ok(Self {
@@ -132,6 +156,21 @@ impl StaleIndexRow {
     /// The `last_updated` this row is deleted at: its own, or the Unix epoch for a date row.
     fn delete_at(&self) -> DateTime<Utc> {
         self.last_updated.unwrap_or(DateTime::UNIX_EPOCH)
+    }
+}
+
+impl IndexKey {
+    /// The table of this key's rows. Names no indexed value, so it may be logged.
+    fn table(&self) -> &'static str {
+        match self {
+            IndexKey::ResourcesByType => "resources_by_type",
+            IndexKey::TokenCode { .. } => "token_code_index",
+            IndexKey::TokenSystemCode { .. } => "token_system_code_index",
+            IndexKey::TokenSystem { .. } => "token_system_index",
+            IndexKey::Date { .. } => "date_index",
+            IndexKey::DateByEnd { .. } => "date_index_by_end",
+            IndexKey::Uri { .. } => "uri_index",
+        }
     }
 }
 
@@ -183,7 +222,7 @@ pub(crate) enum RepairOutcome {
 /// What a repair writes, before anything is sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RepairPlan {
-    /// Keys inserted at R1's `last_updated`: K(current) whole, or the found rows it still names.
+    /// Keys inserted at R1's `last_updated`: K(current) whole, or only its keys equal to a found row's key.
     next: Vec<IndexKey>,
     /// The found rows below R1's version, each at `delete_at()`.
     previous: Vec<(IndexKey, DateTime<Utc>)>,
@@ -211,16 +250,25 @@ impl RepairPlan {
 
     /// Inserts plus deletes over the delta's units.
     fn rows(&self, row: &ResourceRow) -> usize {
-        self.delta(row)
-            .units
-            .iter()
-            .map(|unit| unit.inserts.len() + unit.deletes.len())
-            .sum()
+        delta_rows(&self.delta(row))
     }
 }
 
-/// RV3's checks, then RV1's plan. Pure: sends, logs and counts nothing.
-fn plan_repair(row: &ResourceRow, stale: &[StaleIndexRow]) -> Result<RepairPlan, SkipReason> {
+/// Inserts plus deletes over the delta's units.
+fn delta_rows(delta: &IndexDelta<'_>) -> usize {
+    delta
+        .units
+        .iter()
+        .map(|unit| unit.inserts.len() + unit.deletes.len())
+        .sum()
+}
+
+/// RV3's checks before the key set is decoded: TagAhead, NotStale, WriteTsMismatch, in that order.
+/// Returns the found rows below R1's version.
+fn check_stale<'a>(
+    row: &ResourceRow,
+    stale: &'a [StaleIndexRow],
+) -> Result<Vec<&'a StaleIndexRow>, SkipReason> {
     if stale.iter().any(|s| s.version_id > row.version_id) {
         return Err(SkipReason::TagAhead);
     }
@@ -234,11 +282,30 @@ fn plan_repair(row: &ResourceRow, stale: &[StaleIndexRow]) -> Result<RepairPlan,
     if row.write_ts != Some(write_ts_of(row.last_updated)) {
         return Err(SkipReason::WriteTsMismatch);
     }
-    let current = row
-        .index_keys
+    Ok(below)
+}
+
+/// RV1's plan, after [`check_stale`]: decodes K(current).
+///
+/// With at most [`MAX_FULL_REPAIR_KEYS`] keys the plan is full. Above that,
+/// `next` keeps the keys of K(current) that equal the key of a found row
+/// below R1 (or name the same row, for a date row): that found row moves to
+/// R1's `last_updated`, or is re-tagged in place if it is a date row. A found
+/// row K(current) does not produce is deleted. Writes stay bounded by the
+/// found rows.
+fn plan_below(row: &ResourceRow, below: &[&StaleIndexRow]) -> Result<RepairPlan, SkipReason> {
+    Ok(plan_from(row, below, decode_current(row)?))
+}
+
+/// K(current), from R1's `index_keys`.
+fn decode_current(row: &ResourceRow) -> Result<Vec<IndexKey>, SkipReason> {
+    row.index_keys
         .as_deref()
         .and_then(|blob| index_keys::decode(blob).ok())
-        .ok_or(SkipReason::UndecodableKeys)?;
+        .ok_or(SkipReason::UndecodableKeys)
+}
+
+fn plan_from(row: &ResourceRow, below: &[&StaleIndexRow], current: Vec<IndexKey>) -> RepairPlan {
     let full = current.len() <= MAX_FULL_REPAIR_KEYS;
     let next = if full {
         current
@@ -247,7 +314,7 @@ fn plan_repair(row: &ResourceRow, stale: &[StaleIndexRow]) -> Result<RepairPlan,
             .into_iter()
             .filter(|key| {
                 let id = key.row_at(row.last_updated);
-                below.iter().any(|s| s.row_id() == id)
+                below.iter().any(|s| s.key == *key || s.row_id() == id)
             })
             .collect()
     };
@@ -255,11 +322,17 @@ fn plan_repair(row: &ResourceRow, stale: &[StaleIndexRow]) -> Result<RepairPlan,
         .iter()
         .map(|s| (s.key.clone(), s.delete_at()))
         .collect();
-    Ok(RepairPlan {
+    RepairPlan {
         next,
         previous,
         full,
-    })
+    }
+}
+
+/// RV3's checks, then RV1's plan. Pure: sends, logs and counts nothing.
+fn plan_repair(row: &ResourceRow, stale: &[StaleIndexRow]) -> Result<RepairPlan, SkipReason> {
+    let below = check_stale(row, stale)?;
+    plan_below(row, &below)
 }
 
 /// One search's budget (RV5, RV8).
@@ -270,6 +343,11 @@ struct Budget {
 }
 
 impl Budget {
+    /// True once `MAX_REPAIRS_PER_SEARCH` repairs are admitted: nothing more can fit.
+    fn full(&self) -> bool {
+        self.resources >= MAX_REPAIRS_PER_SEARCH
+    }
+
     /// True, and counted, if one more repair of `rows` rows fits both limits.
     fn admit(&mut self, rows: usize) -> bool {
         if self.resources + 1 > MAX_REPAIRS_PER_SEARCH
@@ -284,6 +362,10 @@ impl Budget {
 }
 
 /// One search's repairs (RV5, RV6): queued during the page's tag checks, run once at its end.
+///
+/// One context per search request, and [`RepairContext::run`] called once per
+/// response, not once per page, so the budget of 32 repairs and 512 index
+/// rows is per response. A filtered `search_count` does not queue repairs.
 #[derive(Debug)]
 pub(crate) struct RepairContext {
     tenant_id: String,
@@ -349,9 +431,10 @@ impl RepairContext {
     }
 
     /// An index row the search could not decode, or that `StaleIndexRow::new` refused: logs `error` now, counted by `run`.
+    /// `error` is logged as is, so it must name no indexed value (a token code or a URI can be an identifier).
     pub(crate) fn skip_undecodable(&mut self, table: &str, error: &str) {
         tracing::error!(
-            tenant = %self.tenant_id,
+            tenant_id = %self.tenant_id,
             table,
             error,
             "repair on read skipped an index row it could not decode"
@@ -361,6 +444,11 @@ impl RepairContext {
 
     /// Plans, admits, writes; outcomes in queue order. Never fails.
     ///
+    /// Call it once per response (see [`RepairContext`]). The phase's
+    /// deadline is meant to come out of the search's remaining time, capped
+    /// at `request_timeout_ms`; Step 6 adds that entry point, so today `run`
+    /// always gives the whole `request_timeout_ms`.
+    ///
     /// The whole phase gets one request deadline (`request_timeout_ms`, the
     /// budget a request's index phase gets), so a search waits at most that
     /// long for its repairs. A repair that has not finished by then is
@@ -368,7 +456,7 @@ impl RepairContext {
     /// write has a fixed timestamp and the next search or the sweeper
     /// repeats it.
     pub(crate) async fn run(self, backend: &CassandraBackend) -> Vec<RepairOutcome> {
-        let deadline = Duration::from_millis(backend.config.request_timeout_ms);
+        let deadline = phase_deadline(backend.config.request_timeout_ms);
         self.run_within(backend, deadline).await
     }
 
@@ -384,95 +472,167 @@ impl RepairContext {
         counters.undecodable_rows(self.undecodable_rows);
 
         let tenant_id = self.tenant_id.as_str();
-        let mut budget = Budget::default();
-        let mut prepared: Vec<Result<(&ResourceRow, RepairPlan), SkipReason>> =
-            Vec::with_capacity(self.queued.len());
-        for queued in &self.queued {
-            let planned = match queued.row.as_ref() {
-                None => Err(SkipReason::NoRow),
-                Some(row) => plan_repair(row, &queued.stale).and_then(|plan| {
-                    if budget.admit(plan.rows(row)) {
-                        Ok((row, plan))
-                    } else {
-                        Err(SkipReason::Budget)
-                    }
-                }),
-            };
+        let plans = plan_queue(&self.queued);
+        let planned = admit_plans(&plans);
+        for (queued, planned) in self.queued.iter().zip(&planned) {
             if let Err(reason) = planned {
                 let version_id = queued.row.as_ref().map(|row| row.version_id);
-                backend.note_repair_skip(&queued.key(tenant_id), version_id, reason);
+                backend.note_repair_skip(&queued.key(tenant_id), version_id, *reason);
             }
-            prepared.push(planned);
         }
 
-        // One future per entry, a skip's ready at once, so the stream yields
-        // exactly one outcome per entry, in queue order. Each repair also
-        // leaves its outcome in `done`, which is how one that finished
-        // behind a stalled one is still reported as it was when the deadline
-        // cuts the stream. Built into a Vec first so the stream's items are
-        // plain futures (the same `Send` reason as in
-        // `write_index_delta_within`).
-        let done: Vec<Mutex<Option<RepairOutcome>>> =
-            self.queued.iter().map(|_| Mutex::new(None)).collect();
+        // Only the admitted repairs run, up to `REPAIR_CONCURRENCY` at a
+        // time, none waiting behind another. Each leaves what it packed
+        // (before it sends) and its outcome (when it ends) in its slot, so
+        // the outcomes come from the slots, by queue index, whatever the
+        // order the repairs finished in or whether the deadline cut them.
+        // Built into a Vec first so the stream's items are plain futures
+        // (the same `Send` reason as in `write_index_delta_within`).
+        let slots: Vec<Slot> = self.queued.iter().map(|_| Slot::default()).collect();
         let futures: Vec<_> = self
             .queued
             .iter()
-            .zip(&prepared)
-            .zip(&done)
-            .map(|((queued, prepared), done)| async move {
-                let outcome = match prepared {
-                    Ok((row, plan)) => backend.send_repair(&queued.key(tenant_id), row, plan).await,
-                    Err(reason) => RepairOutcome::Skipped(*reason),
-                };
-                *done.lock() = Some(outcome);
-                outcome
+            .zip(&planned)
+            .zip(&slots)
+            .filter_map(|((queued, planned), slot)| match planned {
+                Ok(admitted) => Some(async move {
+                    let outcome = backend
+                        .send_repair(
+                            &queued.key(tenant_id),
+                            admitted.row,
+                            admitted.plan.full,
+                            &admitted.delta,
+                            &slot.packed,
+                        )
+                        .await;
+                    *slot.done.lock() = Some(outcome);
+                }),
+                Err(_) => None,
             })
             .collect();
-        let mut finished = collect_within(futures, REPAIR_CONCURRENCY, ends_at)
-            .await
-            .into_iter();
-        self.queued
+        drive_within(futures, REPAIR_CONCURRENCY, ends_at).await;
+
+        let entries = self
+            .queued
             .iter()
-            .zip(&done)
-            .map(|(queued, done)| {
-                finished
-                    .next()
-                    .or_else(|| *done.lock())
-                    .unwrap_or_else(|| {
-                        let key = queued.key(tenant_id);
-                        tracing::warn!(
-                            tenant = %key.tenant_id,
-                            resource_type = key.resource_type,
-                            id = key.id,
-                            deadline_ms = deadline.as_millis() as u64,
-                            "repair on read passed its deadline; the repair is left for the next search or the sweeper"
-                        );
-                        let index = IndexWriteStats::default();
-                        counters.failed(&index);
-                        RepairOutcome::Failed {
-                            failure: WriteFailure::TriesExhausted,
-                            index,
-                        }
-                    })
-            })
-            .collect()
+            .zip(&planned)
+            .zip(&slots)
+            .map(|((queued, planned), slot)| (planned, *slot.done.lock(), (queued, slot)));
+        outcomes_of(entries, |(queued, slot)| {
+            let key = queued.key(tenant_id);
+            tracing::warn!(
+                tenant_id = %key.tenant_id,
+                resource_type = key.resource_type,
+                id = key.id,
+                deadline_ms = deadline.as_millis() as u64,
+                "repair on read passed its deadline; the repair is left for the next search or the sweeper"
+            );
+            let outcome = cut_outcome(*slot.packed.lock());
+            if let RepairOutcome::Failed { index, .. } = &outcome {
+                counters.failed(index);
+            }
+            outcome
+        })
     }
 }
 
-/// The outputs of `futures`, in order, at most `concurrency` running at once,
-/// up to `ends_at`: the ones still unfinished then are dropped and have no
-/// output.
-async fn collect_within<F: Future>(
+/// The repair phase's one deadline: the request deadline (`request_timeout_ms`).
+fn phase_deadline(request_timeout_ms: u64) -> Duration {
+    Duration::from_millis(request_timeout_ms)
+}
+
+/// The outcome of a repair the deadline cut: what it packed if it started
+/// (its batches may have been sent), nothing if it never started.
+fn cut_outcome(packed: Option<IndexWriteStats>) -> RepairOutcome {
+    RepairOutcome::Failed {
+        failure: WriteFailure::TriesExhausted,
+        index: packed.unwrap_or_default(),
+    }
+}
+
+/// One entry's plan, or why it is skipped.
+type Planned<'a> = Result<(&'a ResourceRow, RepairPlan), SkipReason>;
+
+/// An admitted repair: its plan and the delta built from it, once.
+struct Admitted<'a> {
+    row: &'a ResourceRow,
+    plan: &'a RepairPlan,
+    delta: IndexDelta<'a>,
+}
+
+/// What a repair leaves for `run` while it runs.
+#[derive(Debug, Default)]
+struct Slot {
+    /// What it packed, set before its first send.
+    packed: Mutex<Option<IndexWriteStats>>,
+    /// Its outcome, set when it ends.
+    done: Mutex<Option<RepairOutcome>>,
+}
+
+/// RV3's checks, in queue order, then RV1's plan (so up to
+/// `UndecodableKeys`): NoRow, TagAhead, NotStale, WriteTsMismatch,
+/// UndecodableKeys. Pure: sends, logs and counts nothing.
+fn plan_queue(queued: &[QueuedRepair]) -> Vec<Planned<'_>> {
+    queued
+        .iter()
+        .map(|queued| {
+            let row = queued.row.as_ref().ok_or(SkipReason::NoRow)?;
+            Ok((row, plan_repair(row, &queued.stale)?))
+        })
+        .collect()
+}
+
+/// RV5's admission, in queue order, over the plans. Once the resource limit
+/// is full, an entry that planned is skipped as `Budget` without a delta
+/// built; a repair that does not fit the row limit is skipped, and a later,
+/// smaller one may still be admitted. Each admitted repair's delta is built
+/// once, here. Pure.
+fn admit_plans<'a>(plans: &'a [Planned<'a>]) -> Vec<Result<Admitted<'a>, SkipReason>> {
+    let mut budget = Budget::default();
+    plans
+        .iter()
+        .map(|planned| {
+            let (row, plan) = planned.as_ref().map_err(|reason| *reason)?;
+            if budget.full() {
+                return Err(SkipReason::Budget);
+            }
+            let delta = plan.delta(row);
+            if budget.admit(delta_rows(&delta)) {
+                Ok(Admitted { row, plan, delta })
+            } else {
+                Err(SkipReason::Budget)
+            }
+        })
+        .collect()
+}
+
+/// One outcome per entry, in order: a skip's from its plan, an admitted
+/// repair's from its slot, else `cut(context)`: the repair the deadline cut.
+fn outcomes_of<'a, P: 'a, C>(
+    entries: impl IntoIterator<Item = (&'a Result<P, SkipReason>, Option<RepairOutcome>, C)>,
+    mut cut: impl FnMut(C) -> RepairOutcome,
+) -> Vec<RepairOutcome> {
+    entries
+        .into_iter()
+        .map(|(planned, done, context)| match planned {
+            Err(reason) => RepairOutcome::Skipped(*reason),
+            Ok(_) => done.unwrap_or_else(|| cut(context)),
+        })
+        .collect()
+}
+
+/// Runs `futures`, at most `concurrency` at once, until all finish or
+/// `ends_at` passes; the ones unfinished then are dropped. None waits for
+/// another to finish before it starts.
+async fn drive_within<F: Future<Output = ()>>(
     futures: Vec<F>,
     concurrency: usize,
     ends_at: tokio::time::Instant,
-) -> Vec<F::Output> {
-    let mut stream = futures::stream::iter(futures).buffered(concurrency);
-    let mut outputs = Vec::new();
-    while let Ok(Some(output)) = tokio::time::timeout_at(ends_at, stream.next()).await {
-        outputs.push(output);
-    }
-    outputs
+) {
+    let all = futures::stream::iter(futures)
+        .buffer_unordered(concurrency)
+        .for_each(|()| std::future::ready(()));
+    let _ = tokio::time::timeout_at(ends_at, all).await;
 }
 
 impl CassandraBackend {
@@ -484,7 +644,11 @@ impl CassandraBackend {
         stale: &[StaleIndexRow],
     ) -> RepairOutcome {
         match plan_repair(row, stale) {
-            Ok(plan) => self.send_repair(key, row, &plan).await,
+            Ok(plan) => {
+                let delta = plan.delta(row);
+                self.send_repair(key, row, plan.full, &delta, &Mutex::new(None))
+                    .await
+            }
             Err(reason) => {
                 self.note_repair_skip(key, Some(row.version_id), reason);
                 RepairOutcome::Skipped(reason)
@@ -493,36 +657,38 @@ impl CassandraBackend {
     }
 
     /// Writes `plan` through `write_index_delta` at `write_ts_of(row.last_updated)`, `REPAIR_TRIES`; logs and counts.
+    /// Sets `packed` to what the writer packs before it sends, so a repair cut by the deadline can report it.
     async fn send_repair(
         &self,
         key: &RowKey<'_>,
         row: &ResourceRow,
-        plan: &RepairPlan,
+        full: bool,
+        delta: &IndexDelta<'_>,
+        packed: &Mutex<Option<IndexWriteStats>>,
     ) -> RepairOutcome {
-        let delta = plan.delta(row);
-        let outcome = self
-            .write_index_delta(key, &delta, write_ts_of(row.last_updated), REPAIR_TRIES)
-            .await;
+        let ts = write_ts_of(row.last_updated);
+        *packed.lock() = Some(index_pack_stats(key, delta, ts));
+        let outcome = self.write_index_delta(key, delta, ts, REPAIR_TRIES).await;
         match outcome.result {
             Ok(()) => {
                 tracing::info!(
-                    tenant = %key.tenant_id,
+                    tenant_id = %key.tenant_id,
                     resource_type = key.resource_type,
                     id = key.id,
                     version_id = row.version_id,
-                    full = plan.full,
+                    full,
                     index = %outcome.stats,
                     "repair on read wrote the current version's index rows"
                 );
-                self.repair_counters.repaired(plan.full, &outcome.stats);
+                self.repair_counters.repaired(full, &outcome.stats);
                 RepairOutcome::Repaired {
-                    full: plan.full,
+                    full,
                     index: outcome.stats,
                 }
             }
             Err(failure) => {
                 tracing::warn!(
-                    tenant = %key.tenant_id,
+                    tenant_id = %key.tenant_id,
                     resource_type = key.resource_type,
                     id = key.id,
                     version_id = row.version_id,
@@ -542,7 +708,7 @@ impl CassandraBackend {
     /// `error` log and the skip's counter.
     fn note_repair_skip(&self, key: &RowKey<'_>, version_id: Option<i32>, reason: SkipReason) {
         tracing::error!(
-            tenant = %key.tenant_id,
+            tenant_id = %key.tenant_id,
             resource_type = key.resource_type,
             id = key.id,
             version_id = ?version_id,
@@ -698,36 +864,62 @@ mod tests {
         assert_eq!(plan.rows(&row), 5);
     }
 
-    #[test]
-    fn over_64_keys_repairs_only_the_found_rows_and_retags_their_date_rows() {
-        let rbt = IndexKey::ResourcesByType;
-        let mut keys = vec![rbt.clone()];
-        keys.extend((0..64).map(|i| token("c", &format!("{i:02}"))));
+    fn keys_of_len(len: usize) -> Vec<IndexKey> {
+        let mut keys = vec![IndexKey::ResourcesByType];
+        keys.extend((0..len - 2).map(|i| token("c", &format!("{i:02}"))));
         keys.push(date("d"));
-        assert_eq!(keys.len(), 66);
+        assert_eq!(keys.len(), len);
+        keys
+    }
+
+    #[test]
+    fn over_64_keys_moves_the_found_rows_and_retags_their_date_rows() {
+        let rbt = IndexKey::ResourcesByType;
+        let keys = keys_of_len(66);
         let row = r1(2, lu(2), &keys);
         let stale = [
             s(date("d"), None, 1),
             s(rbt.clone(), Some(lu(1)), 1),
             s(token("c", "x"), Some(lu(1)), 1),
+            s(token("c", "00"), Some(lu(1)), 1),
+            // Tagged equal to R1: not below it, so never deleted.
+            s(token("c", "y"), Some(lu(2)), 2),
         ];
         let plan = plan_repair(&row, &stale).unwrap();
         assert!(!plan.full);
-        assert_eq!(plan.next, vec![date("d")]);
+        assert_eq!(plan.next, vec![rbt.clone(), token("c", "00"), date("d")]);
         let (inserts, deletes) = flat(&plan.delta(&row));
-        assert_eq!(inserts, vec![(date("d"), lu(2))]);
+        assert_eq!(
+            inserts,
+            sorted(vec![
+                (rbt.clone(), lu(2)),
+                (token("c", "00"), lu(2)),
+                (date("d"), lu(2)),
+            ])
+        );
+        // A found row K(current) produces moves: deleted at its old
+        // last_updated, inserted at R1's. The date row is only re-tagged.
         assert_eq!(
             deletes,
-            sorted(vec![(rbt.clone(), lu(1)), (token("c", "x"), lu(1))])
+            sorted(vec![
+                (rbt, lu(1)),
+                (token("c", "00"), lu(1)),
+                (token("c", "x"), lu(1)),
+            ])
         );
-        assert_eq!(plan.rows(&row), 3);
+        assert!(!deletes.contains(&(token("c", "y"), lu(2))));
+        assert_eq!(plan.rows(&row), 6);
+    }
 
-        let mut keys = vec![rbt];
-        keys.extend((0..63).map(|i| token("c", &format!("{i:02}"))));
-        assert_eq!(keys.len(), 64);
-        let plan = plan_repair(&r1(2, lu(2), &keys), &stale).unwrap();
+    #[test]
+    fn exactly_65_keys_is_partial_and_64_is_full() {
+        let stale = [s(token("c", "x"), Some(lu(1)), 1)];
+        let plan = plan_repair(&r1(2, lu(2), &keys_of_len(64)), &stale).unwrap();
         assert!(plan.full);
         assert_eq!(plan.next.len(), 64);
+        let plan = plan_repair(&r1(2, lu(2), &keys_of_len(65)), &stale).unwrap();
+        assert!(!plan.full);
+        assert!(plan.next.is_empty());
     }
 
     #[test]
@@ -768,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_write_ts_and_keys_skip_in_rule_4_order() {
+    fn a_bad_write_ts_and_keys_skip_in_the_documented_order() {
         let rbt = IndexKey::ResourcesByType;
         let mut row = r1(2, lu(2), &[]);
         row.write_ts = None;
@@ -1474,24 +1666,248 @@ mod tests {
         assert_consistent(&report);
     }
 
+    type Unit = std::pin::Pin<Box<dyn Future<Output = ()>>>;
+
+    /// One stalled future at the head, and eight behind it that each run for 10 ms.
     #[tokio::test(start_paused = true)]
-    async fn collect_within_returns_the_outputs_finished_in_order_at_its_deadline() {
-        let futures: Vec<std::pin::Pin<Box<dyn Future<Output = i32>>>> = vec![
-            Box::pin(async { 1 }),
-            Box::pin(async { 2 }),
-            Box::pin(std::future::pending()),
-            Box::pin(async { 4 }),
-        ];
+    async fn a_stalled_repair_holds_up_no_other_and_four_run_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (in_flight, most, finished) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let enter = |in_flight: &AtomicUsize, most: &AtomicUsize| {
+            let now = in_flight.fetch_add(1, SeqCst) + 1;
+            most.fetch_max(now, SeqCst);
+        };
+        let mut futures: Vec<Unit> = Vec::new();
+        {
+            let (in_flight, most) = (in_flight.clone(), most.clone());
+            futures.push(Box::pin(async move {
+                enter(&in_flight, &most);
+                std::future::pending::<()>().await;
+            }));
+        }
+        for _ in 0..8 {
+            let (in_flight, most, finished) = (in_flight.clone(), most.clone(), finished.clone());
+            futures.push(Box::pin(async move {
+                enter(&in_flight, &most);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                in_flight.fetch_sub(1, SeqCst);
+                finished.fetch_add(1, SeqCst);
+            }));
+        }
         let started = tokio::time::Instant::now();
-        let outputs = collect_within(futures, 2, started + Duration::from_secs(10)).await;
-        assert_eq!(outputs, [1, 2]);
+        drive_within(
+            futures,
+            REPAIR_CONCURRENCY,
+            started + Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(finished.load(SeqCst), 8);
+        assert_eq!(most.load(SeqCst), 4);
         assert_eq!(started.elapsed(), Duration::from_secs(10));
     }
 
-    /// The whole phase has one deadline: with the clock jumped past it, a repair
-    /// that needs the node cannot finish, so every one is `Failed`, counted,
-    /// and `run` returns at once. The writes that were in flight may have
-    /// applied, so a second, ordinary run repeats them and ends consistent.
+    /// `timeout_at` polls its future before it checks the clock, so even a
+    /// phase whose deadline has passed starts the first futures.
+    #[tokio::test]
+    async fn the_driver_polls_each_started_future_once_past_its_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let polled = Arc::new(AtomicUsize::new(0));
+        let futures: Vec<Unit> = (0..6)
+            .map(|_| {
+                let polled = polled.clone();
+                Box::pin(async move {
+                    polled.fetch_add(1, SeqCst);
+                    std::future::pending::<()>().await;
+                }) as Unit
+            })
+            .collect();
+        drive_within(futures, 4, tokio::time::Instant::now()).await;
+        assert_eq!(polled.load(SeqCst), 4);
+    }
+
+    #[test]
+    fn outcomes_come_from_the_plan_for_a_skip_and_from_the_slot_for_a_repair() {
+        let repaired = RepairOutcome::Repaired {
+            full: true,
+            index: IndexWriteStats::default(),
+        };
+        let failed = RepairOutcome::Failed {
+            failure: WriteFailure::TriesExhausted,
+            index: IndexWriteStats::default(),
+        };
+        let planned: Vec<Result<(), SkipReason>> = vec![
+            Ok(()),
+            Err(SkipReason::NoRow),
+            Ok(()),
+            Ok(()),
+            Err(SkipReason::Budget),
+            Err(SkipReason::NoRow),
+            Err(SkipReason::TagAhead),
+        ];
+        // Repair 0 stalled, 2 finished behind it, 3 stalled.
+        let done = [None, None, Some(repaired), None, None, None, None];
+        let mut cut = Vec::new();
+        let outcomes = outcomes_of(
+            planned
+                .iter()
+                .zip(done)
+                .enumerate()
+                .map(|(i, (planned, done))| (planned, done, i)),
+            |i| {
+                cut.push(i);
+                failed
+            },
+        );
+        assert_eq!(
+            outcomes,
+            [
+                failed,
+                RepairOutcome::Skipped(SkipReason::NoRow),
+                repaired,
+                failed,
+                RepairOutcome::Skipped(SkipReason::Budget),
+                RepairOutcome::Skipped(SkipReason::NoRow),
+                RepairOutcome::Skipped(SkipReason::TagAhead),
+            ]
+        );
+        assert_eq!(cut, [0, 3]);
+    }
+
+    #[test]
+    fn a_cut_repair_reports_what_it_packed_and_one_that_never_started_nothing() {
+        let mut packed = IndexWriteStats::default();
+        packed.batch(5, 1, 827);
+        assert_eq!(
+            cut_outcome(Some(packed)),
+            RepairOutcome::Failed {
+                failure: WriteFailure::TriesExhausted,
+                index: packed,
+            }
+        );
+        assert_eq!(
+            cut_outcome(None),
+            RepairOutcome::Failed {
+                failure: WriteFailure::TriesExhausted,
+                index: IndexWriteStats::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_phase_deadline_is_the_request_deadline() {
+        assert_eq!(phase_deadline(1234), Duration::from_millis(1234));
+        assert_eq!(phase_deadline(0), Duration::ZERO);
+    }
+
+    fn queued(id: &str, row: Option<ResourceRow>, stale: Vec<StaleIndexRow>) -> QueuedRepair {
+        QueuedRepair {
+            resource_type: "Patient".to_string(),
+            id: id.to_string(),
+            row,
+            stale,
+        }
+    }
+
+    /// `run`'s planning and admission: each entry's repair size, or its skip.
+    fn admitted_sizes(queue: &[QueuedRepair]) -> Vec<Result<usize, SkipReason>> {
+        let plans = plan_queue(queue);
+        admit_plans(&plans)
+            .into_iter()
+            .map(|admitted| admitted.map(|a| delta_rows(&a.delta)))
+            .collect()
+    }
+
+    /// `n` found rows tagged 1, each its own row to delete.
+    fn found_rows(n: usize) -> Vec<StaleIndexRow> {
+        (0..n)
+            .map(|i| s(token("s", &format!("{i}")), Some(lu(1)), 1))
+            .collect()
+    }
+
+    #[test]
+    fn a_repair_over_the_row_limit_is_skipped_and_a_later_smaller_one_is_admitted() {
+        let rbt = IndexKey::ResourcesByType;
+        let row = r1(2, lu(2), std::slice::from_ref(&rbt));
+        let entry = |deletes: usize| queued("p", Some(row.clone()), found_rows(deletes));
+        // Each repair is 1 insert plus its deletes: 501, then 601 (over the 512
+        // limit), 2, 10 (503 + 10 = 513, over), 9 (512 exactly), then 2 (over).
+        let queue = [
+            entry(500),
+            entry(600),
+            entry(1),
+            entry(9),
+            entry(8),
+            entry(1),
+        ];
+        assert_eq!(
+            admitted_sizes(&queue),
+            [
+                Ok(501),
+                Err(SkipReason::Budget),
+                Ok(2),
+                Err(SkipReason::Budget),
+                Ok(9),
+                Err(SkipReason::Budget),
+            ]
+        );
+    }
+
+    #[test]
+    fn once_32_repairs_are_admitted_later_entries_still_run_the_checks_before_budget() {
+        let rbt = IndexKey::ResourcesByType;
+        let row = r1(2, lu(2), std::slice::from_ref(&rbt));
+        let mut queue: Vec<QueuedRepair> = (0..MAX_REPAIRS_PER_SEARCH)
+            .map(|_| queued("p", Some(row.clone()), found_rows(1)))
+            .collect();
+        let mut bad_keys = row.clone();
+        bad_keys.index_keys = Some(vec![0x02, 0x00]);
+        queue.push(queued("p", Some(row.clone()), found_rows(1)));
+        queue.push(queued("p", Some(bad_keys), found_rows(1)));
+        queue.push(queued(
+            "p",
+            Some(row.clone()),
+            vec![s(rbt.clone(), Some(lu(3)), 3)],
+        ));
+        queue.push(queued(
+            "p",
+            Some(row.clone()),
+            vec![s(rbt.clone(), Some(lu(2)), 2)],
+        ));
+        queue.push(queued("p", None, found_rows(1)));
+        let sizes = admitted_sizes(&queue);
+        assert!(sizes[..MAX_REPAIRS_PER_SEARCH].iter().all(|r| *r == Ok(2)));
+        assert_eq!(
+            sizes[MAX_REPAIRS_PER_SEARCH..],
+            [
+                Err(SkipReason::Budget),
+                Err(SkipReason::UndecodableKeys),
+                Err(SkipReason::TagAhead),
+                Err(SkipReason::NotStale),
+                Err(SkipReason::NoRow),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_message_of_a_refused_row_names_no_indexed_value() {
+        let message =
+            StaleIndexRow::new(token("identifier", "secret-mrn-42"), None, 1).unwrap_err();
+        assert!(!message.contains("secret-mrn-42"), "{message}");
+        assert!(message.contains("token_code_index"), "{message}");
+    }
+
+    /// The whole phase has one deadline. The clock is paused after the
+    /// backend is up and the repairs' first poll has started them, so while
+    /// the runtime waits for the node it jumps to the phase's deadline and no
+    /// repair can finish, whatever the node's speed (a deadline of zero is
+    /// not enough: the timer fires on the next millisecond tick, and a local
+    /// node answers within it). Every repair is `Failed`, counted, and `run`
+    /// returns at once. The writes that were started may have applied, so a
+    /// second, ordinary run repeats them and ends consistent.
     #[tokio::test]
     async fn repair_returns_at_its_deadline_with_the_unfinished_failed() {
         let Some(backend) = backend().await else {
@@ -1514,9 +1930,6 @@ mod tests {
 
         let before = backend.repair_stats();
         let started = std::time::Instant::now();
-        // Paused after the backend is up: while the runtime waits for the
-        // node, the clock jumps to the phase's deadline, so no repair can
-        // finish, whatever the node's speed.
         tokio::time::pause();
         let paused_at = tokio::time::Instant::now();
         let outcomes = queue().run_within(&backend, Duration::from_secs(1)).await;
@@ -1548,6 +1961,169 @@ mod tests {
                 .all(|o| matches!(o, RepairOutcome::Repaired { full: true, .. })),
             "{outcomes:?}"
         );
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// Five repairs and two skips, the clock paused as in the deadline test.
+    /// How many repairs the node answers before the deadline cuts the rest is
+    /// timing, so this asserts what holds either way: every skip stays a
+    /// skip, a repair reports its own packed rows whether it finished or was
+    /// cut, one that never started reports none, and the counters equal the
+    /// sum of the outcomes.
+    #[tokio::test]
+    async fn skips_behind_cut_repairs_stay_skips_and_the_counters_add_up() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-cut");
+        let tenant = context(&t);
+        let mut rows = Vec::new();
+        for i in 0..5 {
+            let id = format!("r{i}");
+            rows.push((id.clone(), updated(&backend, &tenant, &t, &id).await));
+        }
+        let k2_len = keys_of(&rows[0].1.0).len() as u64;
+        let queue = || {
+            let mut context = RepairContext::new(&t);
+            for (id, (row, stale)) in &rows {
+                context.queue("Patient", id, Some(row.clone()), stale.clone());
+            }
+            context.queue("Patient", "none0", None, Vec::new());
+            context.queue("Patient", "none1", None, Vec::new());
+            context
+        };
+
+        let before = backend.repair_stats();
+        tokio::time::pause();
+        let outcomes = queue().run_within(&backend, Duration::from_secs(1)).await;
+        tokio::time::resume();
+        let stats = backend.repair_stats().since(&before);
+        eprintln!("[repair case=cut {stats}]");
+        assert_eq!(outcomes.len(), 7);
+        assert_eq!(
+            outcomes[5..],
+            [RepairOutcome::Skipped(SkipReason::NoRow); 2]
+        );
+        let (mut repaired, mut failed, mut inserted, mut deleted) = (0, 0, 0, 0);
+        for outcome in &outcomes[..5] {
+            let (RepairOutcome::Repaired { index, .. } | RepairOutcome::Failed { index, .. }) =
+                outcome
+            else {
+                panic!("{outcomes:?}");
+            };
+            if matches!(outcome, RepairOutcome::Repaired { .. }) {
+                repaired += 1;
+            } else {
+                failed += 1;
+            }
+            // Packed, or never started.
+            assert!(
+                (index.rows_inserted, index.rows_deleted) == (k2_len, 1)
+                    || *index == IndexWriteStats::default(),
+                "{outcomes:?}"
+            );
+            inserted += index.rows_inserted;
+            deleted += index.rows_deleted;
+        }
+        assert_eq!(
+            (
+                stats.queued,
+                stats.repaired,
+                stats.failed,
+                stats.skipped_no_row
+            ),
+            (7, repaired, failed, 2)
+        );
+        assert_eq!(
+            (stats.rows_inserted, stats.rows_deleted),
+            (inserted, deleted)
+        );
+
+        let outcomes = queue().run(&backend).await;
+        assert!(
+            outcomes[..5]
+                .iter()
+                .all(|o| matches!(o, RepairOutcome::Repaired { full: true, .. })),
+            "{outcomes:?}"
+        );
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// A Patient with more than 64 keys whose update crashed after its
+    /// version row: a partial repair moves the found `resources_by_type`
+    /// row to the current version, so `count` never drops the resource.
+    #[tokio::test]
+    async fn a_partial_repair_moves_the_type_row_and_count_stays() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-partial");
+        let tenant = context(&t);
+        let body = |active: bool| {
+            let identifiers: Vec<Json> = (0..25)
+                .map(|i| json!({"system": "urn:repair", "value": format!("v{i}")}))
+                .collect();
+            json!({"resourceType": "Patient", "id": "p", "active": active, "identifier": identifiers})
+        };
+        let p = backend
+            .create(&tenant, "Patient", body(true), test_fhir_version())
+            .await
+            .expect("create p");
+        let first = r1_of(&backend, &t, "p").await;
+        let (lu1, k1) = (first.last_updated, keys_of(&first));
+        crash_update(&backend, &tenant, &t, &p, body(false)).await;
+        let row = r1_of(&backend, &t, "p").await;
+        assert_eq!(row.version_id, 2);
+        let (lu2, k2) = (row.last_updated, keys_of(&row));
+        assert!(k2.len() > MAX_FULL_REPAIR_KEYS, "{} keys", k2.len());
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+
+        let stale = found(&type_search(&backend, &t).await, "p", 2);
+        assert_eq!(stale.len(), 1);
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "p", Some(row.clone()), stale);
+        let outcomes = context.run(&backend).await;
+        let [RepairOutcome::Repaired { full: false, index }] = outcomes[..] else {
+            panic!("{outcomes:?}");
+        };
+        assert_eq!((index.rows_inserted, index.rows_deleted), (1, 1));
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+        let rows: Vec<_> = type_search(&backend, &t)
+            .await
+            .into_iter()
+            .filter(|(id, ..)| id == "p")
+            .map(|(_, at, tag)| (at, tag))
+            .collect();
+        assert_eq!(rows, [(lu2, 2)]);
+        // Only the found row was written: the token rows wait for the sweeper.
+        let report = check(&backend, &t).await;
+        assert_eq!(
+            report.kinds(),
+            expect(&[
+                ("missing_row", k2.len() - 1),
+                ("stray_row", not_produced(&k1, lu1, &k2, lu2) - 1),
+            ]),
+            "{report}"
+        );
+
+        // The sweeper's full delta then leaves the tenant consistent.
+        let previous: Vec<IndexRow<'_>> = k1.iter().map(|k| (k, lu1)).collect();
+        let delta = index_delta(
+            &previous,
+            VersionKeys {
+                version_id: 2,
+                last_updated: lu2,
+                fhir_version: row.fhir_version,
+                keys: &k2,
+            },
+        );
+        let done = backend
+            .write_index_delta(&key(&t, "p"), &delta, write_ts_of(lu2), 3)
+            .await;
+        assert_eq!(done.result, Ok(()));
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
         assert_consistent(&check(&backend, &t).await);
     }
 }

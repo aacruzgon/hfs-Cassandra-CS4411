@@ -409,11 +409,13 @@ repair_counters! {
     repaired_partial,
     /// Repairs the writer did not confirm, or the phase's deadline cut.
     failed,
-    /// Index rows packed (sent) for insert by every repair sent, confirmed or not.
+    /// Index rows packed for insert by every repair that started, confirmed or not; a repair the
+    /// deadline cut after it started counts the rows it packed, one that never started counts none.
     rows_inserted,
-    /// Index rows packed (sent) for delete by every repair sent, confirmed or not.
+    /// Index rows packed for delete, counted as `rows_inserted` is.
     rows_deleted,
-    /// Skipped: a found row is tagged above the current version.
+    /// Skipped: a found row is tagged above the current version. A resource's skip is the first of
+    /// these that applies: no row, tag ahead, not stale, write_ts, undecodable keys, budget.
     skipped_tag_ahead,
     /// Skipped: the tag check found no `resources` row.
     skipped_no_row,

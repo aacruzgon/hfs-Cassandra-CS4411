@@ -200,7 +200,8 @@ pub(crate) struct SliceRead {
 }
 
 impl SliceRead {
-    /// The rows that decoded, in every scope.
+    /// The rows that decoded, in every scope (tests read slices whole).
+    #[cfg(test)]
     pub(crate) fn decoded(self) -> Vec<Intent> {
         self.rows.into_iter().filter_map(Result::ok).collect()
     }

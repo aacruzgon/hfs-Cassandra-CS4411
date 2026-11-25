@@ -283,6 +283,10 @@ impl CasCounters {
     pub(crate) fn unknown(&self, error: &DriverError) {
         Self::bump(match error {
             DriverError::Deadline { .. } => &self.unknown_deadline,
+            // Never reached: only an index batch is refused this way, and
+            // `unknown` is called only for a CAS. Counted as a server error
+            // if that ever changes.
+            DriverError::TooManyStatements { .. } => &self.unknown_server_error,
             DriverError::Driver(inner) => match inner.as_ref() {
                 CdrsError::Server { body, .. } => match &body.ty {
                     ErrorType::WriteTimeout(timeout) => match timeout.write_type {

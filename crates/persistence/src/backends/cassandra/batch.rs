@@ -216,8 +216,27 @@ pub(crate) const MAX_BATCH_BYTES: usize = 5 * 1024 - 256;
 
 /// The most statements one batch may hold (IW11): the native protocol counts
 /// them in 16 bits, so a longer batch would wrap. A unit with more is split
-/// by `index_batches` into consecutive pieces of at most this many.
+/// by `index_batches` into consecutive pieces of at most this many
+/// (ADR-aacruzgon-0089), and [`CassandraSession::batch`] refuses a longer
+/// batch rather than send it.
+///
+/// **Pinned at 65,535.** A BATCH frame's statement count is a `[short]`, a
+/// 2-byte unsigned integer (`native_protocol_v5.spec`, sections 3 and
+/// 4.1.7), so 65,535 is the most a node reads. `cdrs-tokio` writes it as
+/// `self.queries.len() as CIntShort`, an `i16`
+/// (`cassandra-protocol-5.0.0/src/frame/message_batch.rs:56`): 65,535 goes
+/// out as `0xFFFF`, which the node reads as 65,535, and 65,536 wraps to 0,
+/// so the node reads the first statement's bytes as the consistency
+/// (`ProtocolException: Unknown code 256 for a consistency level`, the F1
+/// reproduction in ADR-aacruzgon-0089). A larger limit would bring that
+/// back, so the assertion below holds it at the protocol's.
+///
+/// [`CassandraSession::batch`]: super::session::CassandraSession::batch
 pub(crate) const MAX_BATCH_STATEMENTS: usize = u16::MAX as usize;
+const _: () = assert!(
+    MAX_BATCH_STATEMENTS == 65_535,
+    "a batch's statement count is a protocol [short]"
+);
 
 /// Packs units into batches of at most `bound` bytes, given each unit's size
 /// by [`wire_bytes`]. Returns each batch as the run of unit indices it holds
@@ -299,14 +318,16 @@ pub(crate) enum BatchFailure {
     /// a key over 64 KiB). Another try gets the same answer, so none is
     /// made, and the writer logs it at `error`. The 1,024-byte mapping of
     /// G35 as amended (ADR-aacruzgon-0079) and [`MAX_BATCH_BYTES`] should
-    /// make it impossible.
+    /// make it impossible. Also the session's own refusal of a batch over
+    /// [`MAX_BATCH_STATEMENTS`] ([`DriverError::TooManyStatements`],
+    /// ADR-aacruzgon-0089), which `index_batches` should make impossible.
     Refused,
 }
 
 /// Classifies a failed index batch or index statement (IW15); see
 /// [`BatchFailure`].
 pub(crate) fn classify_failure(error: &DriverError) -> BatchFailure {
-    if is_invalid(error) {
+    if is_invalid(error) || matches!(error, DriverError::TooManyStatements { .. }) {
         return BatchFailure::Refused;
     }
     let DriverError::Driver(error) = error else {
@@ -598,6 +619,19 @@ mod tests {
     fn an_invalid_batch_is_refused_and_not_retried() {
         assert_eq!(
             classify_failure(&server(ErrorType::Invalid)),
+            BatchFailure::Refused
+        );
+    }
+
+    /// The session's own refusal of a batch over the statement limit is
+    /// permanent too: nothing was sent, and another try gets the same answer
+    /// (ADR-aacruzgon-0089).
+    #[test]
+    fn a_batch_over_the_statement_limit_is_refused_and_not_retried() {
+        assert_eq!(
+            classify_failure(&DriverError::TooManyStatements {
+                statements: MAX_BATCH_STATEMENTS + 1
+            }),
             BatchFailure::Refused
         );
     }

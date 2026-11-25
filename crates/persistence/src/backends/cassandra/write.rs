@@ -505,6 +505,9 @@ fn classify_cas_failure(error: DriverError) -> CasFailure {
     match &error {
         DriverError::Deadline { sent: true, .. } => unknown(true, error),
         DriverError::Deadline { sent: false, .. } => CasFailure::NotApplied(error),
+        // Only an index batch is refused this way, never a CAS; nothing was
+        // sent.
+        DriverError::TooManyStatements { .. } => CasFailure::NotApplied(error),
         DriverError::Driver(inner) => match inner.as_ref() {
             CdrsError::Server { body, .. } => match &body.ty {
                 // `CasWriteUnknown` (0x1700) is the protocol's own unknown
@@ -6044,6 +6047,56 @@ mod node_tests {
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
         assert_eq!(spent.batch, 1, "{spent}");
+    }
+
+    /// ADR-aacruzgon-0089: a batch over the statement limit, which the
+    /// session refuses before sending it, fails as `Permanent` after one try
+    /// (the `Retry` path ends in `TriesExhausted`), with nothing counted, so
+    /// a writer keeps the intent and never retries a send that cannot
+    /// succeed. `index_batches` never builds such a batch, so the test hands
+    /// `send_index_batch` one unit's statements directly.
+    #[tokio::test]
+    async fn a_batch_over_the_statement_limit_fails_as_permanent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let lu = Utc::now();
+        let next: Vec<IndexKey> = (0..=MAX_BATCH_STATEMENTS)
+            .map(|i| IndexKey::TokenSystem {
+                param: "identifier".to_string(),
+                system: "s".to_string(),
+                code: i.to_string(),
+            })
+            .collect();
+        let delta = index_delta(
+            &[],
+            VersionKeys {
+                version_id: 1,
+                last_updated: lu,
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                keys: &next,
+            },
+        );
+        assert_eq!(delta.units.len(), 1);
+        let key = RowKey {
+            tenant_id: "test-over-the-limit",
+            resource_type: "Patient",
+            id: "p",
+        };
+        let statements = unit_statements(&key, &delta, &delta.units[0], write_ts_of(lu));
+        assert_eq!(statements.len(), 65_536);
+        let counted = backend.statement_counts();
+        let outcome = backend
+            .send_index_batch(
+                &statements,
+                POST_CAS_WRITE_TRIES,
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            )
+            .await;
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
+        assert_eq!(spent.total(), 0, "nothing sent: {spent}");
     }
 
     /// IW17, RW9: a post-CAS write the node refuses as `Invalid` is tried

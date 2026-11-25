@@ -108,7 +108,7 @@ use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
 use parking_lot::RwLock;
 
-use super::batch::IndexStatement;
+use super::batch::{IndexStatement, MAX_BATCH_STATEMENTS};
 use super::config::CassandraConfig;
 
 /// The native protocol version the session speaks. Cassandra 5.0 serves v5
@@ -197,6 +197,14 @@ pub(crate) enum DriverError {
         /// when the deadline ran out while connecting or preparing, so a CAS
         /// cut off there was never sent and its outcome is not unknown.
         sent: bool,
+    },
+    /// [`CassandraSession::batch`] refused an index batch of more than
+    /// [`MAX_BATCH_STATEMENTS`] statements before counting or sending it
+    /// (ADR-aacruzgon-0089). Nothing reached the node, and no later try can
+    /// change the answer, so a writer reads it as permanent.
+    TooManyStatements {
+        /// How many statements the refused batch held.
+        statements: usize,
     },
 }
 
@@ -588,7 +596,22 @@ impl CassandraSession {
     /// the rest all or nothing across partitions, eventually (walkthrough
     /// section 2, "Index rows"). What a failure means is
     /// [`classify_failure`](super::batch::classify_failure)'s to say.
+    ///
+    /// A batch of more than [`MAX_BATCH_STATEMENTS`] statements is refused
+    /// as [`DriverError::TooManyStatements`] before anything is counted or
+    /// sent: the driver would write its count as a wrapped 16-bit `[short]`,
+    /// a frame the node cannot read (ADR-aacruzgon-0089). The writer never
+    /// builds one, since `index_batches` splits a unit over the limit; this
+    /// keeps a future caller from sending a malformed frame.
+    /// [`classify_failure`](super::batch::classify_failure) reads the refusal
+    /// as `Refused`, so the writer does not retry it, reports
+    /// `WriteFailure::Permanent` and keeps the intent.
     pub(crate) async fn batch(&self, statements: Vec<IndexStatement>) -> Result<(), DriverError> {
+        if statements.len() > MAX_BATCH_STATEMENTS {
+            return Err(DriverError::TooManyStatements {
+                statements: statements.len(),
+            });
+        }
         #[cfg(test)]
         let _in_flight = (!statements.is_empty()).then(|| self.batches_in_flight.enter());
         if statements.len() <= 1 {
@@ -1680,6 +1703,56 @@ mod node_tests {
         assert_eq!(
             rows_of(&session, &t, "Patient").await,
             vec![("p1".to_string(), 4_000_001), ("p2".to_string(), 2_000_001)]
+        );
+    }
+
+    /// IW11 (ADR-aacruzgon-0089): a batch of exactly `MAX_BATCH_STATEMENTS`
+    /// statements is sent and applied, and one more is refused before
+    /// anything is counted or sent, so the driver never writes a wrapped
+    /// statement count. Every statement writes the same row, so the node
+    /// still reads a 65,535-statement batch but keeps one row: the
+    /// consistency and checkpoint tests scan whole index tables, and 65,535
+    /// rows left by every run would slow each later run on the same node.
+    #[tokio::test]
+    async fn a_batch_over_the_statement_limit_is_refused_and_sends_nothing() {
+        let Some(session) = session().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let full = tenant("full");
+        let statements: Vec<IndexStatement> = (0..MAX_BATCH_STATEMENTS)
+            .map(|_| insert(&full, "Patient", "p", 1_000, 1_000_001))
+            .collect();
+        assert_eq!(statements.len(), 65_535);
+        let before = session.statement_counts();
+        session
+            .batch(statements)
+            .await
+            .expect("a batch at the limit is sent");
+        let spent = session.statement_counts().since(&before);
+        assert_eq!((spent.batch, spent.batched), (1, 65_535), "{spent}");
+        assert_eq!(
+            rows_of(&session, &full, "Patient").await,
+            vec![("p".to_string(), 1_000_001)]
+        );
+
+        let t = tenant("limit");
+        let statements: Vec<IndexStatement> = (0..=MAX_BATCH_STATEMENTS)
+            .map(|_| insert(&t, "Patient", "p", 1_000, 1_000_001))
+            .collect();
+        assert_eq!(statements.len(), 65_536);
+        let before = session.statement_counts();
+        let error = session.batch(statements).await.expect_err("over the limit");
+        assert!(
+            matches!(error, DriverError::TooManyStatements { statements: 65_536 }),
+            "{error:?}"
+        );
+        let spent = session.statement_counts().since(&before);
+        assert_eq!(spent.total(), 0, "nothing counted: {spent}");
+        assert_eq!(spent.batched, 0, "{spent}");
+        assert!(
+            rows_of(&session, &t, "Patient").await.is_empty(),
+            "nothing written"
         );
     }
 

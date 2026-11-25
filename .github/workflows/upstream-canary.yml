@@ -36,6 +36,15 @@ env:
   # The check's output goes into an issue, so no ANSI colour codes.
   CARGO_TERM_COLOR: never
   UPSTREAM_URL: https://github.com/HeliosSoftware/hfs.git
+  # The PC's CI budget (aacruzgon/muster deploy/ci-runner/HOST-CI-BUDGET.md,
+  # ADR-aacruzgon-0087): at most 4 rustc and linker processes per cargo build,
+  # and only file and line debug info, which is enough for a backtrace and
+  # makes the objects, the links and the linkers' page cache much smaller.
+  # At one process per thread (16) and full debug info, several projects'
+  # jobs filled acruzdebian's memory and stalled its disk on 2026-11-24. A
+  # step may set CARGO_BUILD_JOBS lower (cargo clippy (helios-fhir)).
+  CARGO_BUILD_JOBS: 4
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   canary:
@@ -100,11 +109,24 @@ jobs:
           TARGET_DIR: ${{ runner.workspace }}/target/upstream-canary
           CAP_GB: 10
         run: |
-          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
-          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
+          # A reset renames the directory, which is instant, and deletes it in
+          # the background at idle CPU and I/O priority, detached from this
+          # step's output, as aacruzgon/muster's job-started.sh does
+          # (ADR-aacruzgon-0087): the job no longer waits for rm -rf of up to
+          # its cap. Each runner instance has its own _work folder and runs one
+          # job at a time, so nothing else uses these directories now. The
+          # runner stops a delete still running when the job ends, so every
+          # reset step first deletes what such a delete left (*.pruning.*) in
+          # this instance's target/. du has a time limit: under heavy disk load
+          # it can take seconds, and an unknown size only skips the size check.
+          prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do if [ -e "$left" ]; then prune "$left"; fi; done
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
+          size_gb=$(timeout 60 du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
           if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
             echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
-            rm -rf "$TARGET_DIR"
+            doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+            if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           # The tag cargo writes only into a target dir it creates itself; see

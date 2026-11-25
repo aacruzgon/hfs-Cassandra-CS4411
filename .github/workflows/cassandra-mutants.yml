@@ -33,8 +33,9 @@ name: Cassandra mutation testing (report only)
 # sam-7900x's desktop. Each of acruzdebian's two runner instances is capped
 # at 20G since ADR-aacruzgon-0086 (40G before). With 4 jobs it peaked at
 # 15.4 GiB anon on #90, 4.6 GiB under 20G, inside ADR-aacruzgon-0080's 5 GiB
-# margin, so the job count is 3 by default and at most: about 11.6 GiB anon
-# by 0082's 3.85 GiB a job, an estimate until a run measures it. A
+# margin, so the job count is 3 by default and at most. At 3 jobs, runs
+# 45522733076 and 45566799539 peaked at 15,281 and 14,939 MiB anon, each
+# build directory's cargo at one process per thread (ADR-aacruzgon-0087). A
 # paths: filter is fine here: no required check lives in this workflow.
 #
 # Only on a pull request labelled `mutants` (ADR-aacruzgon-0082): run on every
@@ -145,6 +146,15 @@ jobs:
       # and of each build directory's size.
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      # The PC's CI budget (aacruzgon/muster deploy/ci-runner/HOST-CI-BUDGET.md,
+      # ADR-aacruzgon-0087): each build directory runs a cargo of its own, so
+      # the job runs MUTANTS_JOBS x CARGO_BUILD_JOBS rustc processes at once
+      # while the directories are cold, and later only one rebuild of the
+      # mutated crate each. One a directory keeps the job at 3, inside the
+      # other workflows' 4. Cold on acruzdebian on 2026-11-25, the three first
+      # builds took 420 s and peaked at 10.9 GiB anon with 1, against 237 s
+      # and 12.8 GiB with 4 (12 processes).
+      CARGO_BUILD_JOBS: 1
       # Its own node, if any, on a port nothing else publishes: not a
       # developer's 59042, the required job's 29142, coverage's and FHIR
       # versions' 29242, the three-node Compose file's 59342 to 59344, the
@@ -290,7 +300,8 @@ jobs:
             tmp="$dir.partial.$$"
             trap 'rm -rf "$tmp"' EXIT
             mkdir -p "$tmp"
-            CARGO_TARGET_DIR="$tmp/build" nice -n 10 cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION" --root "$tmp/root"
+            # One cargo, so the other workflows' 4 jobs, not the job's 1.
+            CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR="$tmp/build" nice -n 10 cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION" --root "$tmp/root"
             rm -rf "$dir" && mv "$tmp/root" "$dir"
             rm -rf "$tmp"
           fi

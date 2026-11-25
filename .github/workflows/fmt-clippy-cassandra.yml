@@ -43,6 +43,15 @@ env:
   # a toolchain older than the workspace rust-version, 1.91.1.
   RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
+  # The PC's CI budget (aacruzgon/muster deploy/ci-runner/HOST-CI-BUDGET.md,
+  # ADR-aacruzgon-0087): at most 4 rustc and linker processes per cargo build,
+  # and only file and line debug info, which is enough for a backtrace and
+  # makes the objects, the links and the linkers' page cache much smaller.
+  # At one process per thread (16) and full debug info, several projects'
+  # jobs filled acruzdebian's memory and stalled its disk on 2026-11-24. A
+  # step may set CARGO_BUILD_JOBS lower (cargo clippy (helios-fhir)).
+  CARGO_BUILD_JOBS: 4
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   fmt:
@@ -200,9 +209,21 @@ jobs:
           TARGET_DIR: ${{ runner.workspace }}/target/clippy
           CAP_GB: 30
         run: |
-          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # A reset renames the directory, which is instant, and deletes it in
+          # the background at idle CPU and I/O priority, detached from this
+          # step's output, as aacruzgon/muster's job-started.sh does
+          # (ADR-aacruzgon-0087): the job no longer waits for rm -rf of up to
+          # its cap. Each runner instance has its own _work folder and runs one
+          # job at a time, so nothing else uses these directories now. The
+          # runner stops a delete still running when the job ends, so every
+          # reset step first deletes what such a delete left (*.pruning.*) in
+          # this instance's target/. du has a time limit: under heavy disk load
+          # it can take seconds, and an unknown size only skips the size check.
+          prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do if [ -e "$left" ]; then prune "$left"; fi; done
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
-          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
           size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
@@ -212,7 +233,8 @@ jobs:
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
             echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
-            rm -rf "$TARGET_DIR"
+            doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+            if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           # The tag cargo writes only into a target dir it creates itself; see
@@ -237,7 +259,9 @@ jobs:
       # ADR-aacruzgon-0086 each acruzdebian instance's, they build one at a
       # time (1 job); under a cap of 32 GiB or more, as acruzdebian's single
       # instance had at 40G, both at once (2 jobs).
-      # Unreadable, unlimited or under 32 GiB keeps 1.
+      # Unreadable, unlimited or under 32 GiB keeps 1. Either way fewer than
+      # the workflow's CARGO_BUILD_JOBS of 4, which this step's output
+      # overrides for the clippy step only.
       - name: Pick the build job count for this runner's memory cap
         id: jobs
         run: |
@@ -342,9 +366,21 @@ jobs:
           TARGET_DIR: ${{ runner.workspace }}/target/clippy
           CAP_GB: 30
         run: |
-          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # A reset renames the directory, which is instant, and deletes it in
+          # the background at idle CPU and I/O priority, detached from this
+          # step's output, as aacruzgon/muster's job-started.sh does
+          # (ADR-aacruzgon-0087): the job no longer waits for rm -rf of up to
+          # its cap. Each runner instance has its own _work folder and runs one
+          # job at a time, so nothing else uses these directories now. The
+          # runner stops a delete still running when the job ends, so every
+          # reset step first deletes what such a delete left (*.pruning.*) in
+          # this instance's target/. du has a time limit: under heavy disk load
+          # it can take seconds, and an unknown size only skips the size check.
+          prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do if [ -e "$left" ]; then prune "$left"; fi; done
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
-          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
           size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
@@ -354,7 +390,8 @@ jobs:
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
             echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
-            rm -rf "$TARGET_DIR"
+            doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+            if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           # The tag cargo writes only into a target dir it creates itself; see
@@ -377,12 +414,13 @@ jobs:
       # CONTRIBUTING.md command (R4, R4B, R5, R6, xml, skip-r6-download);
       # without it, helios-fhir's build script downloads R6 examples from
       # build.fhir.org, because an excluded package gets no --all-features.
-      # Wrapped in ci-report.py build, as in clippy-fhir. 8 jobs on every
-      # runner: 16 on acruzdebian's 40G took 236 s cold against 241 s with 8,
-      # at the same 13.4 GiB peak anon (ADR-aacruzgon-0080).
+      # Wrapped in ci-report.py build, as in clippy-fhir. The workflow's 4
+      # jobs, on every runner (ADR-aacruzgon-0087; 8 before): 16 on
+      # acruzdebian's 40G took 236 s cold against 241 s with 8, at the same
+      # 13.4 GiB peak anon (ADR-aacruzgon-0080). Cold on acruzdebian on
+      # 2026-11-25, 4 took 309 s against 283 s with 8, at the same 13.7 GiB.
       - name: cargo clippy --workspace --exclude helios-fhir --all-targets --all-features
         env:
-          CARGO_BUILD_JOBS: 8
           CI_REPORT_PROFILE: clippy (dev profile, check only)
           # The commit the CI reports name: on a pull request, its head, not
           # the merge commit GITHUB_SHA names.
@@ -468,7 +506,7 @@ jobs:
       # The build profile and the commit the CI reports name (ci-report.py
       # context): on a pull request, its head, not the merge commit
       # GITHUB_SHA names.
-      CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
+      CI_REPORT_PROFILE: dev (line-tables-only debug info, CARGO_INCREMENTAL=0)
       CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
@@ -526,9 +564,21 @@ jobs:
           TARGET_DIR: ${{ runner.workspace }}/target/cassandra-tests
           CAP_GB: 15
         run: |
-          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # A reset renames the directory, which is instant, and deletes it in
+          # the background at idle CPU and I/O priority, detached from this
+          # step's output, as aacruzgon/muster's job-started.sh does
+          # (ADR-aacruzgon-0087): the job no longer waits for rm -rf of up to
+          # its cap. Each runner instance has its own _work folder and runs one
+          # job at a time, so nothing else uses these directories now. The
+          # runner stops a delete still running when the job ends, so every
+          # reset step first deletes what such a delete left (*.pruning.*) in
+          # this instance's target/. du has a time limit: under heavy disk load
+          # it can take seconds, and an unknown size only skips the size check.
+          prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do if [ -e "$left" ]; then prune "$left"; fi; done
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
-          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
           size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
@@ -538,7 +588,8 @@ jobs:
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
             echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
-            rm -rf "$TARGET_DIR"
+            doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+            if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           # The tag cargo writes only into a target dir it creates itself; see

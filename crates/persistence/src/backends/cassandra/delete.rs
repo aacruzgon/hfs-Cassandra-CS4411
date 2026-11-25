@@ -449,7 +449,7 @@ mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
     use crate::backends::cassandra::index_keys::{self, IndexKey};
-    use crate::backends::cassandra::session::{Fault, StatementKind};
+    use crate::backends::cassandra::session::{Fault, StatementKind, TimeoutWriteType};
     use crate::backends::cassandra::write::{PreviousVersion, normalized_body};
     use crate::core::{ResourceStorage, SearchProvider};
     use crate::error::BackendError;
@@ -772,10 +772,11 @@ mod node_tests {
     /// T-8, T-13, the statements a delete costs, and no CQL `DELETE` on
     /// `resources` or `resource_versions`: tripwires on every write and CAS
     /// that names either table in a `FROM` clause (only a `DELETE` does) are
-    /// still armed afterwards, so the delete sent none. Its one `DELETE` is
-    /// X1's, on `resources_by_type`.
+    /// still armed afterwards, so the delete sent none. Its only `DELETE`s are
+    /// the `k` rows of K(N), in one batch (IW9, IW14); the tripwires show that
+    /// none names `resources` or `resource_versions`.
     #[tokio::test]
-    async fn a_delete_writes_the_marker_and_removes_only_the_x1_row() {
+    async fn a_delete_writes_the_marker_and_deletes_only_index_rows() {
         let Some(backend) = backend().await else {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
@@ -808,13 +809,15 @@ mod node_tests {
         let stats = backend.cas_stats().since(&before.1);
         eprintln!("[statements op=delete {spent}]");
         eprintln!("[cas case=delete {stats}]");
-        // R1; V3, I1, V2, the X1 delete, I2; one C3. The delete is the only
-        // row of its unit, so it goes as a plain write, not as a batch (IW13).
+        // R1; V3, I1, V2, I2; one C3. Every row of K(N), `k` deletes, is in
+        // one batch (IW9 B, IW14).
+        let k = row1.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
         assert_eq!(
             (spent.read, spent.write, spent.cas, spent.serial_read),
-            (1, 5, 1, 0)
+            (1, 4, 1, 0)
         );
-        assert_eq!((spent.batch, spent.batched), (0, 0), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (1, k), "{spent}");
         assert_eq!(
             (stats.attempts, stats.applied, stats.post_cas_failures),
             (1, 1, 0)
@@ -1300,6 +1303,7 @@ mod node_tests {
             C3_ONLY,
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();

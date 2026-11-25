@@ -1989,7 +1989,9 @@ mod tests {
         // no-type-key: a live resource whose stored sets are empty, and
         // whose type row is gone.
         let t = tenant_of("no-type-key");
-        let (_, lu1, ts1, _) = seeded(&backend, &t).await;
+        let (_, lu1, ts1, seeded_keys) = seeded(&backend, &t).await;
+        // The type row is removed, so every other row of the seeded set is a stray.
+        let strays = seeded_keys.len() - 1;
         plant_resource_keys(&backend, &t, index_keys::EMPTY.to_vec(), 1).await;
         plant_version_keys(&backend, &t, 1, index_keys::EMPTY.to_vec(), ts1 + 1).await;
         plant(
@@ -2084,7 +2086,7 @@ mod tests {
         // `write_ts_of(last_updated)`, and the type row was written at that
         // time, so rule 6's index-row comparison still holds.
         let t = tenant_of("write-ts-mismatch");
-        let (_, lu1, ts1, _) = seeded(&backend, &t).await;
+        let (_, lu1, ts1, seeded_keys) = seeded(&backend, &t).await;
         plant_cas(
             &backend,
             PLANT_RESOURCE_WRITE_TS,
@@ -2110,7 +2112,29 @@ mod tests {
             ],
         )
         .await;
-        plant_x1(&backend, &t, lu1, "p", 1, ts1 + 5).await;
+        // Every row of the stored set is rewritten at that time, not only the
+        // type row, so no index row is off.
+        let rewritten = backend
+            .write_index_delta(
+                &crate::backends::cassandra::write::RowKey {
+                    tenant_id: &t,
+                    resource_type: "Patient",
+                    id: "p",
+                },
+                &crate::backends::cassandra::write::index_delta(
+                    &[],
+                    crate::backends::cassandra::write::VersionKeys {
+                        version_id: 1,
+                        last_updated: lu1,
+                        fhir_version: version,
+                        keys: &seeded_keys,
+                    },
+                ),
+                ts1 + 5,
+                3,
+            )
+            .await;
+        assert!(rewritten.result.is_ok(), "{:?}", rewritten.result);
 
         // malformed-current-version-data: the current version row's own `data`
         // is not JSON, while `resources.data` is. (A valid body that differs
@@ -2522,7 +2546,13 @@ mod tests {
             // Only `p`'s type row is off; the expected time is derived from
             // `last_updated`.
             let report = check("no-write-ts", registry).await;
-            assert_eq!(report.kinds(), under(&["wrong_write_time"]), "{report}");
+            // The plant stores `[ResourcesByType]` and a fresh extraction of its
+            // body gives more keys, so `Fixed` also reports both rows stale.
+            assert_eq!(
+                report.kinds(),
+                under(&expect(&[("wrong_write_time", 1), ("stale_extraction", 2)])),
+                "{report}"
+            );
             let Defect::WrongWriteTime { row, expected } = &report.defects[0] else {
                 unreachable!()
             };
@@ -2531,9 +2561,15 @@ mod tests {
 
             // The resources row and the version row both lack the type key.
             let report = check("no-type-key", registry).await;
+            // `seeded` created real index rows and the plant empties the stored
+            // sets, so every seeded row but the type row is a stray.
             assert_eq!(
                 report.kinds(),
-                under(&expect(&[("no_type_key", 2), ("stale_extraction", 1)])),
+                under(&expect(&[
+                    ("no_type_key", 2),
+                    ("stray_row", strays),
+                    ("stale_extraction", 1)
+                ])),
                 "{report}"
             );
             assert!(report.defects.iter().all(|d| match d {

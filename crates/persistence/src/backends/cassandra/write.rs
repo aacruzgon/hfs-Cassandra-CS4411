@@ -8,7 +8,8 @@
 //! [`CasPlan`]:
 //!
 //! 1. The operation's own: `tenant.check_permission`; for a SearchParameter,
-//!    the 128-byte bound on `code` (G38); `K(N+1)`; `K(N)` from R1's
+//!    `K(N+1)` from the shared extractor ([`CassandraBackend::index_keys_of`],
+//!    IW1 to IW6), its long texts hashed once (ADR-aacruzgon-0079); `K(N)` from R1's
 //!    `index_keys` (G22). The engine adds the size bound on what the CAS
 //!    carries ([`MAX_CAS_PAYLOAD_BYTES`], ADR-aacruzgon-0053) before anything is written.
 //! 2. On update, delete and revive, V3: row `N` rewritten at `ts(N) − 1`,
@@ -25,9 +26,14 @@
 //!    key, so a date key both versions have is only re-inserted (IW7);
 //!    insert `K(N+1)`. Every row of one partition goes as one unit; the
 //!    units are packed into logged batches of at most 4,864 wire bytes,
-//!    never splitting a unit (a unit over the limit goes alone, as one
-//!    batch), and the batches go at once, at most 8 in
-//!    flight (IW9 B, IW11, IW12; [`CassandraBackend::write_index_delta`]).
+//!    never splitting a unit for its bytes (a unit over the limit goes
+//!    alone, as one batch). A unit of more than 65,535 statements, the
+//!    native protocol's limit, or of more than 8 MiB of statements, half
+//!    the node's default 16 MiB message limit (less on a heap under
+//!    640 MiB), is split into pieces of whole rows, all at `ts(N+1)`; the
+//!    `resources_by_type` unit is never split (ADR-aacruzgon-0089,
+//!    amending IW11). The batches go at once, at most 8 in flight (IW9 B,
+//!    IW11, IW12; [`CassandraBackend::write_index_delta`]).
 //! 6. I2, the intent delete.
 //!
 //! Steps 4 and 5 take plain inputs ([`VersionRow`], [`VersionKeys`], a
@@ -115,8 +121,11 @@ use uuid::Uuid;
 
 use super::backend::CassandraBackend;
 use super::batch::{
-    BatchFailure, IndexCql, IndexStatement, MAX_BATCH_BYTES, classify_failure, pack, wire_bytes,
+    BatchFailure, IndexCql, IndexStatement, MAX_BATCH_BYTES, classify_failure, pack, piece_len,
+    wire_bytes,
 };
+#[cfg(test)]
+use super::batch::{MAX_BATCH_STATEMENTS, MAX_PIECE_BYTES};
 #[cfg(test)]
 use super::checkpoint::Checkpoint;
 use super::errors::{BACKEND_NAME, is_invalid, map_driver_error};
@@ -128,6 +137,7 @@ use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, ValidationDetail,
     ValidationError, ValidationSeverity,
 };
+use crate::search::SearchParameterExtractor;
 use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
@@ -207,6 +217,87 @@ const DELETE_RESOURCES_BY_TYPE: IndexCql = IndexCql::new(
      WHERE tenant_id = ? AND resource_type = ? AND last_updated = ? AND id = ?",
 );
 
+/// X2: the `token_code_index` row (`token_code_index` in `schema.cql`).
+const INSERT_TOKEN_CODE: IndexCql = IndexCql::new(
+    "INSERT INTO token_code_index \
+     (tenant_id, resource_type, param, code, last_updated, id, system, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X2's delete, from `token_code_index`.
+const DELETE_TOKEN_CODE: IndexCql = IndexCql::new(
+    "DELETE FROM token_code_index USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND code = ? \
+     AND last_updated = ? AND id = ? AND system = ?",
+);
+
+/// X3: the `token_system_code_index` row.
+const INSERT_TOKEN_SYSTEM_CODE: IndexCql = IndexCql::new(
+    "INSERT INTO token_system_code_index \
+     (tenant_id, resource_type, param, system, code, last_updated, id, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X3's delete, from `token_system_code_index`.
+const DELETE_TOKEN_SYSTEM_CODE: IndexCql = IndexCql::new(
+    "DELETE FROM token_system_code_index USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND system = ? AND code = ? \
+     AND last_updated = ? AND id = ?",
+);
+
+/// X4: the `token_system_index` row.
+const INSERT_TOKEN_SYSTEM: IndexCql = IndexCql::new(
+    "INSERT INTO token_system_index \
+     (tenant_id, resource_type, param, system, last_updated, id, code, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X4's delete, from `token_system_index`.
+const DELETE_TOKEN_SYSTEM: IndexCql = IndexCql::new(
+    "DELETE FROM token_system_index USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND system = ? \
+     AND last_updated = ? AND id = ? AND code = ?",
+);
+
+/// X5: the `date_index` row. It has no `last_updated` column (IW7).
+const INSERT_DATE: IndexCql = IndexCql::new(
+    "INSERT INTO date_index \
+     (tenant_id, resource_type, param, start, id, end, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X5's delete, from `date_index`.
+const DELETE_DATE: IndexCql = IndexCql::new(
+    "DELETE FROM date_index USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND start = ? AND id = ? AND end = ?",
+);
+
+/// X6: the `date_index_by_end` row, the same range keyed by its end.
+const INSERT_DATE_BY_END: IndexCql = IndexCql::new(
+    "INSERT INTO date_index_by_end \
+     (tenant_id, resource_type, param, end, id, start, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X6's delete, from `date_index_by_end`.
+const DELETE_DATE_BY_END: IndexCql = IndexCql::new(
+    "DELETE FROM date_index_by_end USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND end = ? AND id = ? AND start = ?",
+);
+
+/// X7: the `uri_index` row.
+const INSERT_URI: IndexCql = IndexCql::new(
+    "INSERT INTO uri_index \
+     (tenant_id, resource_type, param, uri, last_updated, id, version_id) \
+     VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+);
+
+/// X7's delete, from `uri_index`.
+const DELETE_URI: IndexCql = IndexCql::new(
+    "DELETE FROM uri_index USING TIMESTAMP ? \
+     WHERE tenant_id = ? AND resource_type = ? AND param = ? AND uri = ? AND last_updated = ? AND id = ?",
+);
+
 /// Re-runs per request after an unknown outcome that the serial read showed
 /// unchanged (ADR-aacruzgon-0024): separate from the retries after definite
 /// misses.
@@ -226,10 +317,11 @@ const INDEX_BATCHES_IN_FLIGHT: usize = 8;
 /// The most a CAS may carry, `data` plus `index_keys`, in bytes (ADR-aacruzgon-0053): half
 /// of the node's default `max_mutation_size` (16 MiB, half of the default
 /// 32 MiB `commitlog_segment_size`), which leaves room for the rest of the
-/// row and for Paxos's own copy of the update.
+/// row and for Paxos's own copy of the update. The CAS's message must also
+/// fit the node's `native_transport_max_message_size`, 16 MiB by default on
+/// a heap of 640 MiB or more (`crates/persistence/README.md`, "Node settings
+/// HFS depends on").
 pub(crate) const MAX_CAS_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
-/// Longest custom SearchParameter `code` the backend stores (G38).
-const MAX_SEARCH_PARAMETER_CODE_BYTES: usize = 128;
 /// Longest FHIR id (`[A-Za-z0-9\-\.]{1,64}`, R4 datatypes.html#id).
 const MAX_ID_LEN: usize = 64;
 /// Number of intent shards (`schema.cql`, `pending_index_writes`).
@@ -419,6 +511,9 @@ fn classify_cas_failure(error: DriverError) -> CasFailure {
     match &error {
         DriverError::Deadline { sent: true, .. } => unknown(true, error),
         DriverError::Deadline { sent: false, .. } => CasFailure::NotApplied(error),
+        // Only an index batch is refused this way, never a CAS; nothing was
+        // sent.
+        DriverError::TooManyStatements { .. } => CasFailure::NotApplied(error),
         DriverError::Driver(inner) => match inner.as_ref() {
             CdrsError::Server { body, .. } => match &body.ty {
                 // `CasWriteUnknown` (0x1700) is the protocol's own unknown
@@ -551,38 +646,6 @@ pub(super) fn check_id(id: &str) -> StorageResult<()> {
     }
 }
 
-/// The 128-byte bound on a stored SearchParameter's `code` (G38,
-/// ADR-aacruzgon-0027): every index key under it carries the code as its
-/// `param`, and FHIR sets no limit.
-pub(super) fn check_search_parameter_code(
-    resource_type: &str,
-    resource: &Json,
-) -> StorageResult<()> {
-    if resource_type != "SearchParameter" {
-        return Ok(());
-    }
-    let Some(code) = resource.get("code").and_then(Json::as_str) else {
-        return Ok(());
-    };
-    if code.len() <= MAX_SEARCH_PARAMETER_CODE_BYTES {
-        return Ok(());
-    }
-    Err(StorageError::Validation(ValidationError::InvalidResource {
-        message: format!(
-            "SearchParameter.code is longer than {MAX_SEARCH_PARAMETER_CODE_BYTES} bytes"
-        ),
-        details: vec![ValidationDetail {
-            path: "SearchParameter.code".to_string(),
-            message: format!(
-                "the code is {} bytes in UTF-8; this server stores at most \
-                 {MAX_SEARCH_PARAMETER_CODE_BYTES}",
-                code.len()
-            ),
-            severity: ValidationSeverity::Error,
-        }],
-    }))
-}
-
 /// Sets `resourceType` and `id` on a resource about to be stored, and
 /// serializes it: the content every version row and CAS carries.
 pub(super) fn normalized_body(
@@ -604,19 +667,46 @@ pub(super) fn normalized_body(
 }
 
 impl CassandraBackend {
-    /// `K(V)` for a live version whose normalized body is `body`: the writer's
-    /// extraction (IW8, ADR-sam-michaels-0006), called wherever a plan gets a
-    /// body, and the one the consistency check compares stored key sets with
-    /// (RV13), so the check tests the writer, not a second extractor. Until
-    /// pull request 5 switches extraction on (IW1), it is the
-    /// `resources_by_type` row alone, as on `main` since Step 2.
+    /// `K(V)` for a live version whose normalized body is `body` (IW1 to
+    /// IW6, IW8): the shared extractor with the tenant's registry, mapped by
+    /// [`index_keys::extract_index_keys`], long texts hashed once
+    /// ([`index_keys::index_text`], ADR-aacruzgon-0079). A parameter that
+    /// fails is skipped; a resource that fails whole keeps only its
+    /// `resources_by_type` row (D6). Both are logged at `warn` and counted,
+    /// with the time it took (IW22). Called at the four plan sites and by the
+    /// consistency check (RV13), never on a stored key set.
     pub(crate) fn index_keys_of(
         &self,
-        _tenant_id: &str,
-        _resource_type: &str,
-        _body: &Json,
+        tenant_id: &str,
+        resource_type: &str,
+        body: &Json,
     ) -> Vec<IndexKey> {
-        vec![IndexKey::ResourcesByType]
+        let started = std::time::Instant::now();
+        let extractor = SearchParameterExtractor::new(self.registries.for_tenant(tenant_id));
+        let extraction = index_keys::extract_index_keys(&extractor, resource_type, body);
+        self.cas_counters.extraction(
+            started.elapsed(),
+            extraction.failed_params.len() as u64,
+            extraction.failed_resource.is_some(),
+        );
+        if let Some(error) = &extraction.failed_resource {
+            tracing::warn!(
+                tenant_id,
+                resource_type,
+                error = %error,
+                "extraction failed for the whole resource; the version keeps only its \
+                 resources_by_type row"
+            );
+        } else if !extraction.failed_params.is_empty() {
+            tracing::warn!(
+                tenant_id,
+                resource_type,
+                failed = ?extraction.failed_params,
+                "search parameters skipped: their extraction failed; the write goes ahead \
+                 without their index rows"
+            );
+        }
+        extraction.keys
     }
 }
 
@@ -1045,8 +1135,12 @@ pub(crate) type IndexRow<'a> = (&'a IndexKey, DateTime<Utc>);
 
 /// Every row of a delta that lives in one partition ([`IndexKey::partition`]):
 /// the inserts and the deletes of that partition together. The writer sends
-/// a unit whole and never splits one (IW9 B, ADR-sam-michaels-0006; see
-/// [`CassandraBackend::write_index_delta`]).
+/// a unit whole, except one of more than
+/// [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS) statements
+/// or [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES), which
+/// [`index_batches`] splits into pieces within both; the `resources_by_type`
+/// unit is never split (IW9 B, ADR-sam-michaels-0006; the split is
+/// ADR-aacruzgon-0089's; see [`CassandraBackend::write_index_delta`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct IndexUnit<'a> {
     /// Rows of the new version, at its `last_updated`.
@@ -1119,14 +1213,13 @@ pub(crate) fn index_delta<'a>(previous: &[IndexRow<'a>], next: VersionKeys<'a>) 
 }
 
 /// The statements of one unit, every one `USING TIMESTAMP ts`: the inserts,
-/// then the deletes. A row kind with no statement yet fails the unit before
-/// anything is sent.
+/// then the deletes.
 fn unit_statements(
     key: &RowKey<'_>,
     delta: &IndexDelta<'_>,
     unit: &IndexUnit<'_>,
     ts: i64,
-) -> Result<Vec<IndexStatement>, WriteFailure> {
+) -> Vec<IndexStatement> {
     let inserts = unit.inserts.iter().map(|row| (row, true));
     let deletes = unit.deletes.iter().map(|row| (row, false));
     inserts
@@ -1136,7 +1229,10 @@ fn unit_statements(
 }
 
 /// One row of a delta as a statement: an insert of `index_key` at
-/// `last_updated`, tagged with the delta's version, or its delete.
+/// `last_updated`, tagged with the delta's version, or its delete. Every
+/// statement binds `USING TIMESTAMP ts`; the bind order is each table's
+/// column order in the `INSERT_…` and `DELETE_…` constants (walkthrough
+/// section 2, "Index rows").
 fn index_statement(
     key: &RowKey<'_>,
     delta: &IndexDelta<'_>,
@@ -1144,36 +1240,235 @@ fn index_statement(
     last_updated: DateTime<Utc>,
     ts: i64,
     insert: bool,
-) -> Result<IndexStatement, WriteFailure> {
-    match (index_key, insert) {
-        (IndexKey::ResourcesByType, true) => Ok(IndexStatement::new(
+) -> IndexStatement {
+    let (t, r, i) = (key.tenant_id, key.resource_type, key.id);
+    let (lu, v) = (last_updated, delta.version_id);
+    let (cql, values) = match (index_key, insert) {
+        (IndexKey::ResourcesByType, true) => (
             INSERT_RESOURCES_BY_TYPE,
             vec![
-                Value::from(key.tenant_id),
-                Value::from(key.resource_type),
-                Value::from(last_updated),
-                Value::from(key.id),
-                Value::from(delta.version_id),
+                Value::from(t),
+                Value::from(r),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(v),
                 Value::from(delta.fhir_version.as_mime_param()),
                 Value::from(ts),
             ],
-        )),
-        (IndexKey::ResourcesByType, false) => Ok(IndexStatement::new(
+        ),
+        (IndexKey::ResourcesByType, false) => (
             DELETE_RESOURCES_BY_TYPE,
             vec![
                 Value::from(ts),
-                Value::from(key.tenant_id),
-                Value::from(key.resource_type),
-                Value::from(last_updated),
-                Value::from(key.id),
+                Value::from(t),
+                Value::from(r),
+                Value::from(lu),
+                Value::from(i),
             ],
-        )),
-        (other, _) => {
-            // Step 5 adds these rows; Steps 2 to 4 never have them.
-            tracing::error!(key = ?other, "index row kind not written before Step 5");
-            Err(WriteFailure::Permanent)
-        }
-    }
+        ),
+        (
+            IndexKey::TokenCode {
+                param,
+                code,
+                system,
+            },
+            true,
+        ) => (
+            INSERT_TOKEN_CODE,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(code.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(system.as_str()),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (
+            IndexKey::TokenCode {
+                param,
+                code,
+                system,
+            },
+            false,
+        ) => (
+            DELETE_TOKEN_CODE,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(code.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(system.as_str()),
+            ],
+        ),
+        (
+            IndexKey::TokenSystemCode {
+                param,
+                system,
+                code,
+            },
+            true,
+        ) => (
+            INSERT_TOKEN_SYSTEM_CODE,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(system.as_str()),
+                Value::from(code.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (
+            IndexKey::TokenSystemCode {
+                param,
+                system,
+                code,
+            },
+            false,
+        ) => (
+            DELETE_TOKEN_SYSTEM_CODE,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(system.as_str()),
+                Value::from(code.as_str()),
+                Value::from(lu),
+                Value::from(i),
+            ],
+        ),
+        (
+            IndexKey::TokenSystem {
+                param,
+                system,
+                code,
+            },
+            true,
+        ) => (
+            INSERT_TOKEN_SYSTEM,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(system.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(code.as_str()),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (
+            IndexKey::TokenSystem {
+                param,
+                system,
+                code,
+            },
+            false,
+        ) => (
+            DELETE_TOKEN_SYSTEM,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(system.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(code.as_str()),
+            ],
+        ),
+        // The date tables have no `last_updated` column (IW7), and the
+        // bounds are bound as `i64` milliseconds, the bytes a `timestamp`
+        // column holds.
+        (IndexKey::Date { param, start, end }, true) => (
+            INSERT_DATE,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(*start),
+                Value::from(i),
+                Value::from(*end),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (IndexKey::Date { param, start, end }, false) => (
+            DELETE_DATE,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(*start),
+                Value::from(i),
+                Value::from(*end),
+            ],
+        ),
+        (IndexKey::DateByEnd { param, end, start }, true) => (
+            INSERT_DATE_BY_END,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(*end),
+                Value::from(i),
+                Value::from(*start),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (IndexKey::DateByEnd { param, end, start }, false) => (
+            DELETE_DATE_BY_END,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(*end),
+                Value::from(i),
+                Value::from(*start),
+            ],
+        ),
+        (IndexKey::Uri { param, uri }, true) => (
+            INSERT_URI,
+            vec![
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(uri.as_str()),
+                Value::from(lu),
+                Value::from(i),
+                Value::from(v),
+                Value::from(ts),
+            ],
+        ),
+        (IndexKey::Uri { param, uri }, false) => (
+            DELETE_URI,
+            vec![
+                Value::from(ts),
+                Value::from(t),
+                Value::from(r),
+                Value::from(param.as_str()),
+                Value::from(uri.as_str()),
+                Value::from(lu),
+                Value::from(i),
+            ],
+        ),
+    };
+    IndexStatement::new(cql, values)
 }
 
 /// The pause after try `attempt` of a plain write after the CAS: 10 ms after
@@ -1185,63 +1480,93 @@ fn retry_pause(attempt: u32) -> Duration {
 
 /// A delta's units, packed into batches.
 struct IndexBatches {
-    /// Each batch's statements: whole units, in the delta's order.
+    /// Each batch's statements: whole units and pieces of units over
+    /// [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS) or
+    /// [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES), in the delta's
+    /// order.
     batches: Vec<Vec<IndexStatement>>,
     /// What the batches hold (IW14).
     stats: IndexWriteStats,
-    /// One [`WriteFailure::Permanent`] per unit with a row kind this build
-    /// has no statement for; those units are left out of the batches.
-    failures: Vec<WriteFailure>,
 }
 
 /// Packs `delta`'s units into batches (IW11): each unit's statements at
 /// `ts`, sized by [`wire_bytes`], then [`pack`]ed in order under
-/// [`MAX_BATCH_BYTES`]. A unit is never split, so one over the limit on its
-/// own goes alone, as one batch over it. A unit whose statements
-/// cannot be built fails alone, as it did when each unit was sent on its
-/// own, and the others are still packed.
+/// [`MAX_BATCH_BYTES`]. A unit is not split for its bytes, so one over that
+/// limit on its own goes alone, as one batch over it.
+///
+/// A unit of more than
+/// [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS) statements, or
+/// of more than [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES) by
+/// [`wire_bytes`], is split: the native protocol counts a batch's statements in
+/// 16 bits, so a longer batch would wrap, and the node refuses a message over
+/// its limit (16 MiB by default, less on a heap under 640 MiB). It becomes
+/// consecutive pieces of whole rows, each as long as both limits allow
+/// ([`piece_len`]), in the unit's statement order (inserts, then deletes). A
+/// full piece is far over [`MAX_BATCH_BYTES`], so it is a batch of its own: one
+/// partition, which the node runs without its batchlog, so a timeout is retried
+/// ([`BatchFailure::Retry`]). The last piece, when small, is packed like any
+/// unit, so it can share a batch with the next units: several partitions, which
+/// go through the batchlog, so a timeout there is [`BatchFailure::InBatchlog`].
+/// The stats count batches, so a packed last piece counts in the batch that
+/// holds it. The `resources_by_type` unit holds one or two statements per
+/// resource and is never split (IW9 B: `count` reads that partition). This
+/// split amends IW11 (ADR-aacruzgon-0089): the pieces all carry `ts`, so their
+/// order does not matter and a failed one keeps the intent, but one partition's
+/// rows no longer apply as one mutation, so a reader can see some of them new
+/// and some old until the last piece lands.
 fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatches {
-    let mut failures = Vec::new();
-    let mut units = Vec::with_capacity(delta.units.len());
+    // (inserts, deletes, statements) of each piece, in the delta's order.
+    let mut pieces: Vec<(u64, u64, Vec<IndexStatement>)> = Vec::new();
     for unit in &delta.units {
-        match unit_statements(key, delta, unit, ts) {
-            Ok(statements) => units.push((unit, statements)),
-            Err(failure) => failures.push(failure),
+        let statements = unit_statements(key, delta, unit, ts);
+        debug_assert!(
+            piece_len(&statements) == statements.len()
+                || !unit
+                    .inserts
+                    .iter()
+                    .chain(&unit.deletes)
+                    .any(|(index_key, _)| matches!(index_key, IndexKey::ResourcesByType)),
+            "the resources_by_type unit is never split"
+        );
+        let inserts = unit.inserts.len();
+        let mut start = 0;
+        let mut rest = statements;
+        while !rest.is_empty() {
+            let tail = rest.split_off(piece_len(&rest));
+            let end = start + rest.len();
+            let piece_inserts = inserts.clamp(start, end) - start;
+            pieces.push((
+                piece_inserts as u64,
+                (rest.len() - piece_inserts) as u64,
+                rest,
+            ));
+            start = end;
+            rest = tail;
         }
     }
-    let sizes: Vec<usize> = units
+    let sizes: Vec<usize> = pieces
         .iter()
-        .map(|(_, statements)| wire_bytes(statements))
+        .map(|(_, _, statements)| wire_bytes(statements))
         .collect();
     let mut stats = IndexWriteStats::default();
-    let mut units = units.into_iter();
+    let mut pieces = pieces.into_iter();
     let batches = pack(&sizes, MAX_BATCH_BYTES)
         .into_iter()
         .map(|range| {
             let bytes: usize = sizes[range.clone()].iter().sum();
-            let packed: Vec<_> = units.by_ref().take(range.len()).collect();
+            let packed: Vec<_> = pieces.by_ref().take(range.len()).collect();
             stats.batch(
-                packed
-                    .iter()
-                    .map(|(unit, _)| unit.inserts.len() as u64)
-                    .sum(),
-                packed
-                    .iter()
-                    .map(|(unit, _)| unit.deletes.len() as u64)
-                    .sum(),
+                packed.iter().map(|(inserts, _, _)| inserts).sum(),
+                packed.iter().map(|(_, deletes, _)| deletes).sum(),
                 bytes as u64,
             );
             packed
                 .into_iter()
-                .flat_map(|(_, statements)| statements)
+                .flat_map(|(_, _, statements)| statements)
                 .collect()
         })
         .collect();
-    IndexBatches {
-        batches,
-        stats,
-        failures,
-    }
+    IndexBatches { batches, stats }
 }
 
 /// Why a plain write after the CAS (a version row or an index batch) was not
@@ -1254,8 +1579,7 @@ pub(crate) enum WriteFailure {
     /// an unavailable replica, a lost connection.
     TriesExhausted,
     /// No try can succeed: the node refused the statement as `Invalid`
-    /// (IW17: "an `Invalid` error is permanent"), or this build has no
-    /// statement for the row. Not retried.
+    /// (IW17: "an `Invalid` error is permanent"). Not retried.
     Permanent,
     /// An index batch timed out with write type `BATCH`: the coordinator had
     /// written it to the batchlog, which replays it, so it is not retried
@@ -1845,6 +2169,7 @@ impl CassandraBackend {
 
             // Step 3.
             request.stats.attempt();
+            request.stats.cas_payload(plan.payload_bytes() as u64);
             let failure = match self
                 .session
                 .rows(
@@ -2223,17 +2548,27 @@ impl CassandraBackend {
     /// sweeper 1 per pass and repair 1. Every caller computes
     /// `ts = write_ts_of(lu(V))` for the version `delta` writes.
     ///
-    /// - **Packed, never split** (IW9 B, IW11). The units are packed in order
-    ///   into batches of at most [`MAX_BATCH_BYTES`] by [`wire_bytes`]
-    ///   ([`index_batches`]). A unit is every row of one partition, which
-    ///   Cassandra applies whole on each replica; above all, once the batch
-    ///   has reached a quorum, an update alone never lets `count` see an
-    ///   updated resource's `resources_by_type` row twice. `count` can still
-    ///   be off (ADR-aacruzgon-0081, decision 2): too high, by up to one per
-    ///   unfinished update or delete, and one too low after an unfinished
-    ///   create or revive, until the sweeper or repair finishes it; and on
-    ///   RF 3, twice or not at all through read repair after a batch that
-    ///   reached fewer than a quorum. A unit over the bound goes alone.
+    /// - **Packed, split only past the statement or byte limit** (IW9 B, IW11).
+    ///   The units are packed in order into batches of at most
+    ///   [`MAX_BATCH_BYTES`] by [`wire_bytes`] ([`index_batches`]). A unit is
+    ///   every row of one partition, which Cassandra applies whole on each
+    ///   replica; above all, once the batch has reached a quorum, an update
+    ///   alone never lets `count` see an updated resource's `resources_by_type`
+    ///   row twice. `count` can still be off (ADR-aacruzgon-0081, decision 2):
+    ///   too high, by up to one per unfinished update or delete, and one too
+    ///   low after an unfinished create or revive, until the sweeper or repair
+    ///   finishes it; and on RF 3, twice or not at all through read repair
+    ///   after a batch that reached fewer than a quorum. A unit over the byte
+    ///   bound goes alone; one of more than
+    ///   [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS)
+    ///   statements or [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES),
+    ///   never the `resources_by_type` unit, is split into consecutive pieces
+    ///   of whole rows within both (ADR-aacruzgon-0089); a full piece is a
+    ///   batch of its own, and a small last piece is packed like any unit. A
+    ///   batch of one partition runs without the node's batchlog and one of
+    ///   several goes through it, so a timeout is retried for the first and not
+    ///   for the second ([`WriteFailure::InBatchlog`]); either way a batch not
+    ///   confirmed keeps the intent.
     /// - **All at once, at most [`INDEX_BATCHES_IN_FLIGHT`] in flight**
     ///   (IW12), as futures inside the request's own task, never
     ///   `tokio::spawn`, so a request that is dropped, or a crash test that
@@ -2278,11 +2613,8 @@ impl CassandraBackend {
         tries: u32,
         deadline: Duration,
     ) -> IndexOutcome {
-        let IndexBatches {
-            batches,
-            stats,
-            mut failures,
-        } = index_batches(key, delta, ts);
+        let IndexBatches { batches, stats } = index_batches(key, delta, ts);
+        let mut failures = Vec::new();
         // The futures are built first and only then streamed: a stream holding
         // the closure that builds them is not `Send` for every lifetime, which
         // the storage traits' futures must be.
@@ -2340,7 +2672,8 @@ impl CassandraBackend {
         IndexOutcome { result, stats }
     }
 
-    /// Sends one packed batch of an index delta, whole units of it (IW9 B),
+    /// Sends one packed batch of an index delta, whole units of it and pieces
+    /// of units over the statement or byte limit (IW9 B, ADR-aacruzgon-0089),
     /// through [`CassandraSession::batch`](super::session::CassandraSession::batch)
     /// (IW13): one logged batch at `LOCAL_QUORUM`, or a plain write for a
     /// lone statement; either way the driver never re-sends it, so one try is
@@ -2458,7 +2791,6 @@ impl CassandraBackend {
     ) -> StorageResult<StoredResource> {
         // Step 1.
         tenant.check_permission(Operation::Create, resource_type)?;
-        check_search_parameter_code(resource_type, &resource)?;
 
         let id = match resource.get("id").and_then(Json::as_str) {
             Some(id) => {
@@ -2509,6 +2841,8 @@ impl CassandraBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::{ExtractedValue, IndexValue};
+    use crate::types::SearchParamType;
     use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::frame::Version;
     use cdrs_tokio::frame::message_error::{
@@ -3084,22 +3418,12 @@ mod tests {
     }
 
     #[test]
-    fn ids_and_search_parameter_codes_are_bounded() {
+    fn ids_are_bounded() {
         assert!(check_id("p1").is_ok());
         assert!(check_id(&"a".repeat(64)).is_ok());
         for bad in ["", "a/b", "a b", "ä", &"a".repeat(65)] {
             assert!(check_id(bad).is_err(), "{bad:?}");
         }
-        let code =
-            |n| serde_json::json!({"resourceType": "SearchParameter", "code": "c".repeat(n)});
-        assert!(check_search_parameter_code("SearchParameter", &code(128)).is_ok());
-        assert!(matches!(
-            check_search_parameter_code("SearchParameter", &code(129)),
-            Err(StorageError::Validation(
-                ValidationError::InvalidResource { .. }
-            ))
-        ));
-        assert!(check_search_parameter_code("Patient", &code(500)).is_ok());
     }
 
     /// D14: what a CAS carries is bounded before anything is written.
@@ -3279,9 +3603,9 @@ mod tests {
 
     const IMPLICIT: &str = "urn:x-helios:implicit code system";
     const MRN: &str = "http://hospital.example/mrn";
-    const B0: i64 = 326_073_600_000; // 1980-05-01T00:00:00Z
-    const B1: i64 = 326_160_000_000; // 1980-05-02T00:00:00Z
-    const B2: i64 = 326_246_400_000; // 1980-05-03T00:00:00Z
+    const B0: i64 = 325_987_200_000; // 1980-05-01T00:00:00Z
+    const B1: i64 = 326_073_600_000; // 1980-05-02T00:00:00Z
+    const B2: i64 = 326_160_000_000; // 1980-05-03T00:00:00Z
 
     fn gender(code: &str) -> IndexKey {
         IndexKey::TokenCode {
@@ -3459,10 +3783,8 @@ mod tests {
         );
     }
 
-    /// A unit's statements, as the writer sends them until pull request 3
-    /// batches them: its inserts, then its deletes, every one at the one
-    /// timestamp `ts`, the insert tagged with the delta's version. A row kind
-    /// with no statement yet fails the unit before anything is sent.
+    /// A unit's statements: its inserts, then its deletes, every one at the
+    /// one timestamp `ts`, the insert tagged with the delta's version.
     #[test]
     fn a_unit_sends_its_inserts_then_its_deletes_at_one_timestamp() {
         let lu1 = at("2026-11-16T10:00:00.000Z");
@@ -3472,7 +3794,7 @@ mod tests {
         let delta = index_delta(&previous, version_keys(&x1, lu2));
         assert_eq!(delta.units.len(), 1);
         let ts = write_ts_of(lu2);
-        let statements = unit_statements(&key(), &delta, &delta.units[0], ts).unwrap();
+        let statements = unit_statements(&key(), &delta, &delta.units[0], ts);
         let (insert, delete) = (&statements[0], &statements[1]);
         assert_eq!(statements.len(), 2);
         assert_eq!(insert.cql(), INSERT_RESOURCES_BY_TYPE.as_str());
@@ -3490,22 +3812,31 @@ mod tests {
 
         let t = [gender("male")];
         let delta = index_delta(&[], version_keys(&t, lu2));
+        let statements = unit_statements(&key(), &delta, &delta.units[0], ts);
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0].cql(), INSERT_TOKEN_CODE.as_str());
+        assert_eq!(statements[0].values()[6], Value::from(IMPLICIT), "system");
         assert_eq!(
-            unit_statements(&key(), &delta, &delta.units[0], ts).unwrap_err(),
-            WriteFailure::Permanent
+            statements[0].values()[7],
+            Value::from(2_i32),
+            "tagged with V"
+        );
+        assert_eq!(
+            statements[0].values()[8],
+            Value::from(ts),
+            "USING TIMESTAMP"
         );
     }
 
     /// IW11 and IW14: a delta's units become packed batches, whole units of
-    /// them, with what they hold counted; a unit whose rows have no
-    /// statement yet fails alone and the others are still packed.
+    /// them, with what they hold counted.
     #[test]
     fn a_delta_is_packed_into_batches_of_whole_units() {
         let lu1 = at("2026-11-16T10:00:00.000Z");
         let lu2 = at("2026-11-16T10:00:00.001Z");
         let ts = write_ts_of(lu2);
         let empty = index_batches(&key(), &index_delta(&[], version_keys(&[], lu2)), ts);
-        assert!(empty.batches.is_empty() && empty.failures.is_empty());
+        assert!(empty.batches.is_empty());
         assert_eq!(empty.stats, IndexWriteStats::default());
 
         let next = [IndexKey::ResourcesByType, gender("female")];
@@ -3513,27 +3844,29 @@ mod tests {
         let delta = index_delta(&previous, version_keys(&next, lu2));
         assert_eq!(delta.units.len(), 2, "resources_by_type, and the token");
         let packed = index_batches(&key(), &delta, ts);
-        assert_eq!(packed.failures, vec![WriteFailure::Permanent], "the token");
         assert_eq!(packed.batches.len(), 1);
         let batch = &packed.batches[0];
         assert_eq!(
             batch.iter().map(IndexStatement::cql).collect::<Vec<_>>(),
             vec![
                 INSERT_RESOURCES_BY_TYPE.as_str(),
-                DELETE_RESOURCES_BY_TYPE.as_str()
+                DELETE_RESOURCES_BY_TYPE.as_str(),
+                INSERT_TOKEN_CODE.as_str(),
             ],
-            "the unit whole, its insert first"
+            "the units whole in partition order, each insert first"
         );
         let stats = packed.stats;
         assert_eq!(
             (stats.rows_inserted, stats.rows_deleted, stats.batches),
-            (1, 1, 1)
+            (2, 1, 1)
         );
         assert_eq!(stats.largest_batch_bytes, wire_bytes(batch) as u64);
     }
 
-    /// IW11: a unit is every row of one partition and is never split, even
-    /// when it alone is over the batch limit: it goes as one batch.
+    /// IW11: a unit is every row of one partition and is never split for
+    /// its bytes, even when it alone is over the byte limit: it goes as one
+    /// batch. (Only a unit over the statement limit is split, see
+    /// `a_unit_over_the_statement_limit_is_split_and_the_type_unit_never_is`.)
     #[test]
     fn an_oversized_unit_is_sent_as_one_batch() {
         let lu1 = at("2026-11-16T10:00:00.000Z");
@@ -3554,7 +3887,6 @@ mod tests {
             "one partition, an insert and a delete"
         );
         let packed = index_batches(&big, &delta, ts);
-        assert!(packed.failures.is_empty());
         assert_eq!(packed.batches.len(), 1, "the unit is not split");
         let batch = &packed.batches[0];
         assert!(wire_bytes(batch) > MAX_BATCH_BYTES, "over the limit");
@@ -3565,6 +3897,634 @@ mod tests {
                 DELETE_RESOURCES_BY_TYPE.as_str()
             ]
         );
+    }
+
+    /// IW11: a unit of more than `MAX_BATCH_STATEMENTS` statements is split
+    /// into consecutive pieces, in statement order; the `resources_by_type`
+    /// unit, which holds one or two statements per resource, is never split.
+    /// Pure: nothing reaches a node.
+    #[test]
+    fn a_unit_over_the_statement_limit_is_split_and_the_type_unit_never_is() {
+        let lu = at("2026-11-16T10:00:00.000Z");
+        let ts = write_ts_of(lu);
+        let mut next = vec![IndexKey::ResourcesByType];
+        next.extend((0..70_000).map(|i| IndexKey::TokenSystem {
+            param: "identifier".to_string(),
+            system: "s".to_string(),
+            code: i.to_string(),
+        }));
+        let delta = index_delta(&[], version_keys(&next, lu));
+        assert_eq!(delta.units.len(), 2, "the type unit, and one token unit");
+        let packed = index_batches(&key(), &delta, ts);
+        let sizes: Vec<usize> = packed.batches.iter().map(Vec::len).collect();
+        assert!(
+            sizes.iter().all(|&n| n <= MAX_BATCH_STATEMENTS),
+            "{sizes:?}"
+        );
+        assert_eq!(sizes.iter().sum::<usize>(), 70_001);
+        let type_batches = packed
+            .batches
+            .iter()
+            .filter(|batch| {
+                batch
+                    .iter()
+                    .any(|s| s.cql() == INSERT_RESOURCES_BY_TYPE.as_str())
+            })
+            .count();
+        assert_eq!(type_batches, 1, "the type key's insert is in one batch");
+        let stats = packed.stats;
+        assert_eq!(stats.rows_inserted, 70_001);
+        assert_eq!(stats.rows_deleted, 0);
+        assert_eq!(stats.batches as usize, packed.batches.len());
+
+        // Pieces keep the statement order, and a delete lands in the piece
+        // it falls in: 65,535 inserts, then the rest of them and a delete.
+        let previous_key = IndexKey::TokenSystem {
+            param: "identifier".to_string(),
+            system: "s".to_string(),
+            code: "old".to_string(),
+        };
+        let lu0 = at("2026-11-15T10:00:00.000Z");
+        let delta = index_delta(&[(&previous_key, lu0)], version_keys(&next[1..], lu));
+        let packed = index_batches(&key(), &delta, ts);
+        assert_eq!(packed.batches.len(), 2);
+        assert_eq!(packed.batches[1].len(), 70_001 - MAX_BATCH_STATEMENTS);
+        assert_eq!(
+            packed.batches[1].last().map(IndexStatement::cql),
+            Some(DELETE_TOKEN_SYSTEM.as_str()),
+            "the delete is the unit's last statement"
+        );
+        assert_eq!(
+            (packed.stats.rows_inserted, packed.stats.rows_deleted),
+            (70_000, 1)
+        );
+    }
+
+    /// Every row kind has an insert and a delete, each with the statement's
+    /// own bind order (walkthrough section 2, "Index rows"), every value set,
+    /// and a date row binds no `last_updated` (IW7).
+    #[test]
+    fn every_row_kind_has_its_insert_and_delete() {
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let ts = write_ts_of(lu2);
+        let s = |text: &str| Value::from(text);
+        let tenant_row = || [s("acme"), s("Patient")];
+        let fhir = Value::from(
+            crate::backends::cassandra::test_support::test_fhir_version().as_mime_param(),
+        );
+        /// A key, its insert and delete statements, and their bound values.
+        type Case = (IndexKey, IndexCql, IndexCql, Vec<Value>, Vec<Value>);
+        let cases: Vec<Case> = vec![
+            (
+                IndexKey::ResourcesByType,
+                INSERT_RESOURCES_BY_TYPE,
+                DELETE_RESOURCES_BY_TYPE,
+                [
+                    &tenant_row()[..],
+                    &[
+                        Value::from(lu2),
+                        s("p"),
+                        Value::from(2_i32),
+                        fhir,
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[Value::from(lu1), s("p")],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::TokenCode {
+                    param: "gender".into(),
+                    code: "male".into(),
+                    system: "sys".into(),
+                },
+                INSERT_TOKEN_CODE,
+                DELETE_TOKEN_CODE,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("gender"),
+                        s("male"),
+                        Value::from(lu2),
+                        s("p"),
+                        s("sys"),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[s("gender"), s("male"), Value::from(lu1), s("p"), s("sys")],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::TokenSystemCode {
+                    param: "identifier".into(),
+                    system: "sys".into(),
+                    code: "c1".into(),
+                },
+                INSERT_TOKEN_SYSTEM_CODE,
+                DELETE_TOKEN_SYSTEM_CODE,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("identifier"),
+                        s("sys"),
+                        s("c1"),
+                        Value::from(lu2),
+                        s("p"),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[s("identifier"), s("sys"), s("c1"), Value::from(lu1), s("p")],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::TokenSystem {
+                    param: "identifier".into(),
+                    system: "sys".into(),
+                    code: "c1".into(),
+                },
+                INSERT_TOKEN_SYSTEM,
+                DELETE_TOKEN_SYSTEM,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("identifier"),
+                        s("sys"),
+                        Value::from(lu2),
+                        s("p"),
+                        s("c1"),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[s("identifier"), s("sys"), Value::from(lu1), s("p"), s("c1")],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::Date {
+                    param: "birthdate".into(),
+                    start: B0,
+                    end: B1,
+                },
+                INSERT_DATE,
+                DELETE_DATE,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("birthdate"),
+                        Value::from(B0),
+                        s("p"),
+                        Value::from(B1),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[s("birthdate"), Value::from(B0), s("p"), Value::from(B1)],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::DateByEnd {
+                    param: "birthdate".into(),
+                    end: B1,
+                    start: B0,
+                },
+                INSERT_DATE_BY_END,
+                DELETE_DATE_BY_END,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("birthdate"),
+                        Value::from(B1),
+                        s("p"),
+                        Value::from(B0),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[s("birthdate"), Value::from(B1), s("p"), Value::from(B0)],
+                ]
+                .concat(),
+            ),
+            (
+                IndexKey::Uri {
+                    param: "_profile".into(),
+                    uri: "http://example.org/profile".into(),
+                },
+                INSERT_URI,
+                DELETE_URI,
+                [
+                    &tenant_row()[..],
+                    &[
+                        s("_profile"),
+                        s("http://example.org/profile"),
+                        Value::from(lu2),
+                        s("p"),
+                        Value::from(2_i32),
+                        Value::from(ts),
+                    ],
+                ]
+                .concat(),
+                [
+                    &[Value::from(ts)][..],
+                    &tenant_row()[..],
+                    &[
+                        s("_profile"),
+                        s("http://example.org/profile"),
+                        Value::from(lu1),
+                        s("p"),
+                    ],
+                ]
+                .concat(),
+            ),
+        ];
+        for (index_key, insert_cql, delete_cql, insert_values, delete_values) in cases {
+            let keys = [index_key.clone()];
+            let previous = [(&keys[0], lu1)];
+            // The insert alone (a create), then the delete alone (a delete),
+            // so each statement is built from its own delta.
+            let created = index_delta(&[], version_keys(&keys, lu2));
+            let insert = unit_statements(&key(), &created, &created.units[0], ts);
+            let deleted = index_delta(&previous, version_keys(&[], lu2));
+            let delete = unit_statements(&key(), &deleted, &deleted.units[0], ts);
+            assert_eq!((insert.len(), delete.len()), (1, 1), "{index_key:?}");
+            for (statement, cql, values) in [
+                (&insert[0], insert_cql, &insert_values),
+                (&delete[0], delete_cql, &delete_values),
+            ] {
+                assert_eq!(statement.cql(), cql.as_str(), "{index_key:?}");
+                assert_eq!(
+                    statement.values().len(),
+                    cql.as_str().matches('?').count(),
+                    "{index_key:?}"
+                );
+                assert!(
+                    statement
+                        .values()
+                        .iter()
+                        .all(|value| matches!(value, Value::Some(_)))
+                );
+                assert_eq!(statement.values(), values.as_slice(), "{index_key:?}");
+            }
+            if matches!(
+                index_key,
+                IndexKey::Date { .. } | IndexKey::DateByEnd { .. }
+            ) {
+                assert!(
+                    !insert[0].values().contains(&Value::from(lu2)),
+                    "a date row binds no last_updated"
+                );
+            }
+        }
+    }
+
+    /// The units of a delta in a packed result: each batch is a run of whole
+    /// units (no unit split, every unit packed), and a batch of several units
+    /// is within [`MAX_BATCH_BYTES`]. Returns the batches that are over it.
+    fn assert_packs_whole_units(key: &RowKey<'_>, delta: &IndexDelta<'_>) -> Vec<usize> {
+        let packed = index_batches(key, delta, 1);
+        let mut units = delta
+            .units
+            .iter()
+            .map(|unit| unit.inserts.len() + unit.deletes.len())
+            .peekable();
+        let mut over = Vec::new();
+        for batch in &packed.batches {
+            let (mut taken, mut whole) = (0, 0);
+            while taken < batch.len() {
+                taken += units.next().expect("a unit left for this batch");
+                whole += 1;
+            }
+            assert_eq!(taken, batch.len(), "a unit was split across batches");
+            if wire_bytes(batch) > MAX_BATCH_BYTES {
+                assert_eq!(whole, 1, "only a lone unit may be over the bound");
+                over.push(wire_bytes(batch));
+            }
+        }
+        assert!(units.peek().is_none(), "a unit was not packed");
+        over
+    }
+
+    /// The create, the same-content update and the delete of `keys`, each
+    /// packed by [`assert_packs_whole_units`]; the number of batches over the
+    /// bound in each.
+    fn packs_create_update_and_delete(key: &RowKey<'_>, keys: &[IndexKey]) -> [Vec<usize>; 3] {
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let previous: Vec<IndexRow<'_>> = keys.iter().map(|k| (k, lu1)).collect();
+        [
+            assert_packs_whole_units(key, &index_delta(&[], version_keys(keys, lu2))),
+            assert_packs_whole_units(key, &index_delta(&previous, version_keys(keys, lu2))),
+            assert_packs_whole_units(key, &index_delta(&previous, version_keys(&[], lu2))),
+        ]
+    }
+
+    /// ADR-aacruzgon-0089: a unit under the statement limit but over
+    /// `MAX_PIECE_BYTES` of statements is cut by bytes into pieces of whole
+    /// rows, each as long as the budget allows, in statement order; the
+    /// `resources_by_type` unit is never split. Pure: nothing reaches a node.
+    #[test]
+    fn a_unit_over_the_piece_bytes_is_split_by_bytes() {
+        let lu = at("2026-11-16T10:00:00.000Z");
+        let ts = write_ts_of(lu);
+        let mut next = vec![IndexKey::ResourcesByType];
+        next.extend((0..20_000).map(|i| IndexKey::TokenSystem {
+            param: "identifier".to_string(),
+            system: "s".to_string(),
+            code: format!("{i:0>500}"),
+        }));
+        let delta = index_delta(&[], version_keys(&next, lu));
+        assert_eq!(delta.units.len(), 2, "the type unit, and one token unit");
+        let token_unit = delta
+            .units
+            .iter()
+            .find(|unit| unit.inserts.len() == 20_000)
+            .expect("the token unit");
+        let whole = unit_statements(&key(), &delta, token_unit, ts);
+        assert!(whole.len() < MAX_BATCH_STATEMENTS);
+        assert!(wire_bytes(&whole) > MAX_PIECE_BYTES, "over the byte budget");
+
+        let packed = index_batches(&key(), &delta, ts);
+        let token_batches: Vec<&Vec<IndexStatement>> = packed
+            .batches
+            .iter()
+            .filter(|batch| {
+                batch
+                    .iter()
+                    .any(|s| s.cql() == INSERT_TOKEN_SYSTEM.as_str())
+            })
+            .collect();
+        assert!(token_batches.len() >= 2, "cut by bytes");
+        for batch in &token_batches {
+            assert!(
+                wire_bytes(batch) <= MAX_PIECE_BYTES,
+                "{}",
+                wire_bytes(batch)
+            );
+        }
+        // Each full piece is as long as the budget allows: one more row would
+        // pass it.
+        let first = token_batches[0];
+        let next_row = &token_batches[1][0];
+        assert!(wire_bytes(first) + wire_bytes(std::slice::from_ref(next_row)) > MAX_PIECE_BYTES);
+        // Whole rows, in the unit's order, none lost.
+        let cut: Vec<&[Value]> = token_batches
+            .iter()
+            .flat_map(|batch| batch.iter())
+            .filter(|s| s.cql() == INSERT_TOKEN_SYSTEM.as_str())
+            .map(IndexStatement::values)
+            .collect();
+        let expected: Vec<&[Value]> = whole.iter().map(IndexStatement::values).collect();
+        assert_eq!(cut, expected);
+        let type_batches = packed
+            .batches
+            .iter()
+            .filter(|batch| {
+                batch
+                    .iter()
+                    .any(|s| s.cql() == INSERT_RESOURCES_BY_TYPE.as_str())
+            })
+            .count();
+        assert_eq!(type_batches, 1, "the type key's insert is in one batch");
+        assert_eq!(packed.stats.rows_inserted, 20_001);
+    }
+
+    /// IW11 (gate): the packer never splits a partition's rows for their
+    /// bytes (none here is near the statement limit), and with the
+    /// 1,024-byte mapping every batch of several units stays within the
+    /// bound, in the worst case (a 64-byte tenant): six long identifiers, and
+    /// one row whose param, system and code are each 1,024 bytes, which goes
+    /// alone because its own delete and insert are over the bound.
+    #[test]
+    fn the_packer_never_splits_a_pair_and_stays_under_the_bound() {
+        let tenant = format!("test-{}", "x".repeat(59));
+        let key = RowKey {
+            tenant_id: &tenant,
+            resource_type: "Patient",
+            id: "p",
+        };
+        let sys = "http://example.org/ids";
+        let mut values: Vec<ExtractedValue> = (0..6)
+            .map(|i| {
+                ExtractedValue::new(
+                    "identifier",
+                    "http://hl7.org/fhir/SearchParameter/Patient-identifier",
+                    SearchParamType::Token,
+                    IndexValue::token(Some(sys.to_string()), format!("{i}{}", "v".repeat(999))),
+                )
+            })
+            .collect();
+        values.push(ExtractedValue::new(
+            "birthdate",
+            "http://hl7.org/fhir/SearchParameter/individual-birthdate",
+            SearchParamType::Date,
+            IndexValue::date("1980-05-01"),
+        ));
+        let keys = index_keys::index_keys_from(&values);
+        // The six `token_system_index` rows share one partition (same param
+        // and system), so that unit alone is over the bound and goes alone;
+        // `assert_packs_whole_units` checks that no other batch is.
+        let [create, update, delete] = packs_create_update_and_delete(&key, &keys);
+        assert_eq!((create.len(), update.len(), delete.len()), (1, 1, 1));
+
+        let widest = [
+            IndexKey::ResourcesByType,
+            IndexKey::TokenSystemCode {
+                param: "p".repeat(1_024),
+                system: "s".repeat(1_024),
+                code: "c".repeat(1_024),
+            },
+        ];
+        let [create, update, delete] = packs_create_update_and_delete(&key, &widest);
+        assert!(create.is_empty(), "an insert alone fits");
+        assert_eq!(update.len(), 1, "the delete and the insert of one row");
+        assert_eq!(delete.len(), 0, "a delete alone fits");
+
+        // Every fixture resource's create, same-content update and delete.
+        for fixture in fixture_resources() {
+            let extraction = fixture.extract();
+            let [create, update, delete] = packs_create_update_and_delete(&key, &extraction.keys);
+            assert!(
+                create.is_empty() && update.is_empty() && delete.is_empty(),
+                "{}: {create:?} {update:?} {delete:?}",
+                fixture.name()
+            );
+        }
+    }
+
+    /// One resource of `tests/fixtures`, with its normalized body.
+    struct Fixture {
+        file: &'static str,
+        resource_type: String,
+        id: String,
+        body: Json,
+        data: String,
+    }
+
+    impl Fixture {
+        fn name(&self) -> String {
+            format!("{}/{}", self.file, self.id)
+        }
+
+        fn extract(&self) -> index_keys::Extraction {
+            let extraction = index_keys::extract_index_keys(
+                &crate::backends::cassandra::test_support::test_extractor(),
+                &self.resource_type,
+                &self.body,
+            );
+            assert!(extraction.failed_params.is_empty(), "{}", self.name());
+            assert_eq!(extraction.failed_resource, None, "{}", self.name());
+            extraction
+        }
+    }
+
+    /// The 16 resources of `tests/fixtures/{patients,observations,organizations}.json`.
+    fn fixture_resources() -> Vec<Fixture> {
+        let mut all = Vec::new();
+        for file in ["patients", "observations", "organizations"] {
+            let path = format!("{}/tests/fixtures/{file}.json", env!("CARGO_MANIFEST_DIR"));
+            let text = std::fs::read_to_string(&path).unwrap();
+            let parsed: Json = serde_json::from_str(&text).unwrap();
+            for resource in parsed[file].as_array().unwrap() {
+                let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+                let id = resource["id"].as_str().unwrap().to_string();
+                let (body, data) =
+                    normalized_body("create", &resource_type, &id, resource.clone()).unwrap();
+                all.push(Fixture {
+                    file,
+                    resource_type,
+                    id,
+                    body,
+                    data,
+                });
+            }
+        }
+        assert_eq!(all.len(), 16);
+        all
+    }
+
+    /// The texts a key holds, `param` included.
+    fn key_texts(key: &IndexKey) -> Vec<&str> {
+        match key {
+            IndexKey::ResourcesByType => vec![],
+            IndexKey::TokenCode {
+                param,
+                code,
+                system,
+            }
+            | IndexKey::TokenSystemCode {
+                param,
+                system,
+                code,
+            }
+            | IndexKey::TokenSystem {
+                param,
+                system,
+                code,
+            } => vec![param, code, system],
+            IndexKey::Date { param, .. } | IndexKey::DateByEnd { param, .. } => vec![param],
+            IndexKey::Uri { param, uri } => vec![param, uri],
+        }
+    }
+
+    /// IW11 (gate, the size report): every fixture's batches, in the worst
+    /// case (a 64-byte tenant), stay within the bound and none of their texts
+    /// is hashed; prints the figures the report compares with the bench.
+    #[test]
+    fn largest_batch_and_index_keys_per_fixture() {
+        let tenant = format!("test-{}", "x".repeat(59));
+        let key = RowKey {
+            tenant_id: &tenant,
+            resource_type: "",
+            id: "",
+        };
+        let lu1 = at("2026-11-16T10:00:00.000Z");
+        let lu2 = at("2026-11-16T10:00:00.001Z");
+        let (mut keys_max, mut blob_max, mut largest_all, mut hashed_all) = (0, 0, 0, 0);
+        for fixture in fixture_resources() {
+            let keys = fixture.extract().keys;
+            let blob = index_keys::encode(&keys);
+            let hashed = keys
+                .iter()
+                .flat_map(key_texts)
+                .filter(|text| text.starts_with(index_keys::HASHED_TEXT_PREFIX))
+                .count();
+            let key = RowKey {
+                resource_type: &fixture.resource_type,
+                id: &fixture.id,
+                ..key
+            };
+            let previous: Vec<IndexRow<'_>> = keys.iter().map(|k| (k, lu1)).collect();
+            let deltas = [
+                index_delta(&[], version_keys(&keys, lu2)),
+                index_delta(&previous, version_keys(&keys, lu2)),
+                index_delta(&previous, version_keys(&[], lu2)),
+            ];
+            let mut counts = [0; 3];
+            let mut largest = 0;
+            for (n, delta) in deltas.iter().enumerate() {
+                assert_packs_whole_units(&key, delta);
+                let packed = index_batches(&key, delta, 1);
+                counts[n] = packed.batches.len();
+                for batch in &packed.batches {
+                    assert!(wire_bytes(batch) <= MAX_BATCH_BYTES, "{}", fixture.name());
+                    largest = largest.max(wire_bytes(batch));
+                }
+            }
+            assert_eq!(hashed, 0, "{}", fixture.name());
+            println!(
+                "[index-keys fixture={} type={} keys={} data_bytes={} index_keys_bytes={} \
+                 hashed={hashed} create_batches={} update_batches={} delete_batches={} \
+                 largest_batch_bytes={largest}]",
+                fixture.name(),
+                fixture.resource_type,
+                keys.len(),
+                fixture.data.len(),
+                blob.len(),
+                counts[0],
+                counts[1],
+                counts[2],
+            );
+            keys_max = keys_max.max(keys.len());
+            blob_max = blob_max.max(blob.len());
+            largest_all = largest_all.max(largest);
+            hashed_all += hashed;
+        }
+        println!(
+            "[index-keys fixtures=16 keys_max={keys_max} index_keys_bytes_max={blob_max} \
+             largest_batch_bytes={largest_all} hashed={hashed_all}]"
+        );
+        assert_eq!(hashed_all, 0);
     }
 
     /// D4: the miss mapping from the returned columns (spike A1). A missing
@@ -4314,9 +5274,14 @@ mod tests {
 mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
-    use crate::backends::cassandra::session::Fault;
+    use crate::backends::cassandra::consistency::harness::{check, expect};
+    use crate::backends::cassandra::consistency::{
+        Registry, ScanMode, Scope, assert_consistent, index_consistency,
+    };
+    use crate::backends::cassandra::session::{Fault, TimeoutWriteType};
     use crate::core::ResourceStorage;
     use crate::tenant::{TenantId, TenantPermissions};
+    use serde_json::json;
 
     async fn backend() -> Option<CassandraBackend> {
         let url = std::env::var("HFS_TEST_CASSANDRA_URL")
@@ -4580,38 +5545,38 @@ mod node_tests {
         let row1 = current(&backend, &tenant).await;
         let previous = PreviousVersion::from_row(&row1).unwrap();
         let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let t = tenant.tenant_id().as_str();
+        let keys = backend.index_keys_of(t, "Patient", &json);
+        let k = row1.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
+        assert_eq!(keys.len() as u64, k, "the same content, the same rows");
         let before = backend.statement_counts();
         let mut request = backend.cas_request("update", key_of(&tenant));
         let applied = applied_of(
             backend
                 .run_cas(
                     &mut request,
-                    CasPlan::update(
-                        previous.clone(),
-                        json.clone(),
-                        data.clone(),
-                        vec![IndexKey::ResourcesByType],
-                    ),
+                    CasPlan::update(previous.clone(), json.clone(), data.clone(), keys.clone()),
                 )
                 .await
                 .unwrap(),
         );
         let spent = backend.statement_counts().since(&before);
         eprintln!("[statements op=c2 {spent}]");
-        // V3, I1, V1, I2 sent alone; the X1 insert and delete in one batch
-        // (IW9 B, IW14); one CAS; no read.
+        // V3, I1, V1, I2 sent alone; the `k` inserts and `k` deletes of the
+        // moved rows in one batch (IW9 B, IW14); one CAS; no read.
         assert_eq!(
             (spent.write, spent.cas, spent.read, spent.serial_read),
             (4, 1, 0, 0)
         );
-        assert_eq!((spent.batch, spent.batched), (1, 2), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (1, 2 * k), "{spent}");
         assert_eq!(applied.version_id, 2);
         assert!(applied.post_cas_complete && !applied.superseded);
-        // IW14: what step 5 sent, one row moved in one batch.
+        // IW14: what step 5 sent, every row moved, in one batch.
         let index = applied.index;
         assert_eq!(
             (index.rows_inserted, index.rows_deleted, index.batches),
-            (1, 1, 1),
+            (k, k, 1),
             "{index}"
         );
         assert!((1..=MAX_BATCH_BYTES as u64).contains(&index.largest_batch_bytes));
@@ -4695,7 +5660,7 @@ mod node_tests {
                         PreviousVersion::from_row(&row3).unwrap(),
                         json.clone(),
                         data.clone(),
-                        vec![IndexKey::ResourcesByType],
+                        backend.index_keys_of(t, "Patient", &json),
                     ),
                 )
                 .await
@@ -4824,6 +5789,7 @@ mod node_tests {
             "INSERT INTO resources",
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let created = backend
@@ -4873,6 +5839,7 @@ mod node_tests {
             "UPDATE resources",
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();
@@ -5112,10 +6079,12 @@ mod node_tests {
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(created.version_id(), "1");
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        // I1, three tries of V1, X1; no I2. X1 is the only row of its unit,
-        // so it goes as a plain write, not as a batch (IW13).
-        assert_eq!((spent.write, spent.cas), (5, 1), "{spent}");
-        assert_eq!((spent.batch, spent.batched), (0, 0), "{spent}");
+        // I1 and three tries of V1; no I2. The `k` index rows of the new
+        // version go as one batch (IW9 B, IW14).
+        let k = current(&backend, &tenant).await.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
+        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (1, k), "{spent}");
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
     }
 
@@ -5172,6 +6141,312 @@ mod node_tests {
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
         assert_eq!(spent.batch, 1, "{spent}");
+    }
+
+    /// Opts in to the full-size node test of the byte cut, which writes about
+    /// 98,000 rows (`the_largest_update_of_one_partition_is_cut_by_bytes_and_lands`).
+    const LARGE: &str = "HFS_TEST_CASSANDRA_LARGE";
+
+    /// ADR-aacruzgon-0089, in every run: the node refuses a message over its
+    /// limit (16 MiB by default, less on a heap under 640 MiB), and the byte
+    /// cut keeps every piece under it. One unit of 65,536 copies of one
+    /// 269-byte insert (a 64-byte tenant, a 64-character id, a 46-character
+    /// code: the audit's sizes), built by hand, since a real delta never
+    /// repeats a key. Its first 65,535 statements, a piece cut by count
+    /// alone, are a 17 MB message the node refuses as `Invalid`;
+    /// `write_index_delta` cuts the unit by bytes and every piece lands. The
+    /// node keeps one row, so later scans of the index tables pay nothing
+    /// for it.
+    #[tokio::test]
+    async fn a_unit_over_the_piece_bytes_lands_and_a_count_cut_piece_is_refused() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let mut tenant = format!("test-piece-node-{}", Uuid::new_v4().simple());
+        while tenant.len() < crate::tenant::MAX_TENANT_ID_LEN {
+            tenant.push('x');
+        }
+        let id = "b".repeat(64);
+        let key = RowKey {
+            tenant_id: &tenant,
+            resource_type: "Patient",
+            id: &id,
+        };
+        let row = IndexKey::TokenSystem {
+            param: "identifier".to_string(),
+            system: "s".to_string(),
+            code: "c".repeat(46),
+        };
+        let lu = Utc::now();
+        let ts = write_ts_of(lu);
+        let delta = IndexDelta {
+            version_id: 1,
+            fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            units: vec![IndexUnit {
+                inserts: vec![(&row, lu); MAX_BATCH_STATEMENTS + 1],
+                deletes: Vec::new(),
+            }],
+        };
+        let statements = unit_statements(&key, &delta, &delta.units[0], ts);
+        let count_cut = &statements[..MAX_BATCH_STATEMENTS];
+        assert!(
+            wire_bytes(count_cut) > 16 * 1024 * 1024,
+            "{} bytes",
+            wire_bytes(count_cut)
+        );
+
+        // The node's limit: a piece cut by count alone is refused.
+        let error = backend
+            .session
+            .batch(count_cut.to_vec())
+            .await
+            .expect_err("a message over 16 MiB");
+        assert!(is_invalid(&error), "{error:?}");
+        assert!(
+            format!("{error:?}").contains("exceeds allowed maximum"),
+            "{error:?}"
+        );
+
+        // The byte cut: every piece within 8 MiB, every one confirmed.
+        let outcome = backend
+            .write_index_delta(&key, &delta, ts, POST_CAS_WRITE_TRIES)
+            .await;
+        assert_eq!(outcome.result, Ok(()), "{}", outcome.stats);
+        assert!(outcome.stats.batches >= 3, "{}", outcome.stats);
+        assert!(
+            outcome.stats.largest_batch_bytes <= MAX_PIECE_BYTES as u64,
+            "{}",
+            outcome.stats
+        );
+        let rows = backend
+            .session
+            .rows(
+                "SELECT version_id FROM token_system_index \
+                 WHERE tenant_id = ? AND resource_type = ? AND param = ? AND system = ?",
+                vec![
+                    Value::from(tenant.as_str()),
+                    Value::from("Patient"),
+                    Value::from("identifier"),
+                    Value::from("s"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("token_system_index");
+        assert_eq!(rows.len(), 1, "one row, written 65,536 times");
+    }
+
+    /// ADR-aacruzgon-0089 (the audit's B1): the largest update a valid
+    /// resource can make in one partition. A 64-byte tenant
+    /// (`MAX_TENANT_ID_LEN`), a 64-character id and 32,768 identifiers of
+    /// one system, with codes as long as the 8 MiB CAS bound accepts, then
+    /// 32,768 new ones: a 65,536-statement `token_system_index` unit of over
+    /// 16 MiB. Cut by count alone, its first 65,535-statement piece is a
+    /// message the node refuses (`OversizedCQLMessageException`), so the
+    /// update answers `Ok("2")` with its rows left at version 1 and the
+    /// intent kept. Cut by `MAX_PIECE_BYTES` too, the create and the update
+    /// both write every row at their version and clear the intent.
+    ///
+    /// **Opt in, with `HFS_TEST_CASSANDRA_LARGE=1`.** Each run leaves about
+    /// 98,000 index rows and as many tombstones (every identifier has a row
+    /// in three token tables), and the consistency and checkpoint tests scan
+    /// whole index tables, so every later run on the same node would be
+    /// slower. CI runs it once, in the FHIR versions job's last lib run, on
+    /// that job's own node.
+    /// `a_unit_over_the_piece_bytes_lands_and_a_count_cut_piece_is_refused`
+    /// shows the same limit in every run, with one row.
+    #[tokio::test]
+    async fn the_largest_update_of_one_partition_is_cut_by_bytes_and_lands() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        if std::env::var(LARGE).ok().as_deref() != Some("1") {
+            eprintln!(
+                "not run: set {LARGE}=1 on a node of the run's own (it leaves about 98,000 \
+                 rows and as many tombstones)"
+            );
+            return;
+        }
+        let mut name = format!("test-piece-bytes-{}", Uuid::new_v4().simple());
+        while name.len() < crate::tenant::MAX_TENANT_ID_LEN {
+            name.push('x');
+        }
+        let tenant = TenantContext::new(
+            TenantId::new(name.clone()),
+            TenantPermissions::full_access(),
+        );
+        let id = "b".repeat(64);
+        let code = |tag: char, i: usize, len: usize| {
+            let mut code = format!("{tag}{i}");
+            while code.len() < len {
+                code.push('c');
+            }
+            code
+        };
+        let identifiers = |tag: char, len: usize| -> Vec<serde_json::Value> {
+            (0..32_768)
+                .map(|i| json!({"system": "s", "value": code(tag, i, len)}))
+                .collect()
+        };
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        // The longest code the CAS bound accepts (46 under R4).
+        let mut chosen = None;
+        for len in (40..=48).rev() {
+            let body =
+                json!({"resourceType": "Patient", "id": id, "identifier": identifiers('a', len)});
+            let before = backend.cas_stats();
+            match backend.create(&tenant, "Patient", body, version).await {
+                Ok(created) => {
+                    let stats = backend.cas_stats().since(&before);
+                    assert_eq!(
+                        stats.post_cas_failures, 0,
+                        "the create's index rows: {stats}"
+                    );
+                    chosen = Some((len, created));
+                    break;
+                }
+                Err(crate::error::StorageError::Validation(_)) => continue,
+                Err(other) => panic!("a {len}-character code: {other:?}"),
+            }
+        }
+        let (len, created) = chosen.expect("a code length the CAS bound accepts");
+
+        // The update's unit is over the node's message limit (16 MiB by
+        // default), so a 65,535-statement piece of it would be refused.
+        let old_keys: Vec<IndexKey> = (0..32_768)
+            .map(|i| IndexKey::TokenSystem {
+                param: "identifier".to_string(),
+                system: "s".to_string(),
+                code: code('a', i, len),
+            })
+            .collect();
+        let new_keys: Vec<IndexKey> = (0..32_768)
+            .map(|i| IndexKey::TokenSystem {
+                param: "identifier".to_string(),
+                system: "s".to_string(),
+                code: code('z', i, len),
+            })
+            .collect();
+        let lu = Utc::now();
+        let previous: Vec<(&IndexKey, DateTime<Utc>)> = old_keys.iter().map(|k| (k, lu)).collect();
+        let delta = index_delta(
+            &previous,
+            VersionKeys {
+                version_id: 2,
+                last_updated: lu,
+                fhir_version: version,
+                keys: &new_keys,
+            },
+        );
+        let row_key = RowKey {
+            tenant_id: &name,
+            resource_type: "Patient",
+            id: &id,
+        };
+        let statements = unit_statements(&row_key, &delta, &delta.units[0], write_ts_of(lu));
+        assert_eq!(statements.len(), 65_536);
+        eprintln!(
+            "[piece-bytes code_len={len} unit_bytes={} count_cut_piece_bytes={}]",
+            wire_bytes(&statements),
+            wire_bytes(&statements[..MAX_BATCH_STATEMENTS])
+        );
+        assert!(
+            wire_bytes(&statements[..MAX_BATCH_STATEMENTS]) > 16 * 1024 * 1024,
+            "a full count-cut piece is over the node's message limit"
+        );
+
+        let before = backend.cas_stats();
+        let updated = backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType": "Patient", "id": id, "identifier": identifiers('z', len), "active": true}),
+            )
+            .await
+            .expect("update");
+        assert_eq!(updated.version_id(), "2");
+        let stats = backend.cas_stats().since(&before);
+        assert_eq!(
+            stats.post_cas_failures, 0,
+            "every index batch confirmed and the intent deleted: {stats}"
+        );
+        let rows = backend
+            .session
+            .rows(
+                "SELECT version_id FROM token_system_index \
+                 WHERE tenant_id = ? AND resource_type = ? AND param = ? AND system = ?",
+                vec![
+                    Value::from(name.as_str()),
+                    Value::from("Patient"),
+                    Value::from("identifier"),
+                    Value::from("s"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("token_system_index");
+        let versions: Vec<i32> = rows
+            .iter()
+            .map(|row| row.get_r_by_name("version_id").unwrap())
+            .collect();
+        assert_eq!(
+            versions.len(),
+            32_768,
+            "the old rows deleted, the new inserted"
+        );
+        assert!(versions.iter().all(|&v| v == 2), "every row at version 2");
+    }
+
+    /// ADR-aacruzgon-0089: a batch over the statement limit, which the
+    /// session refuses before sending it, fails as `Permanent` after one try
+    /// (the `Retry` path ends in `TriesExhausted`), with nothing counted, so
+    /// a writer keeps the intent and never retries a send that cannot
+    /// succeed. `index_batches` never builds such a batch, so the test hands
+    /// `send_index_batch` one unit's statements directly.
+    #[tokio::test]
+    async fn a_batch_over_the_statement_limit_fails_as_permanent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let lu = Utc::now();
+        let next: Vec<IndexKey> = (0..=MAX_BATCH_STATEMENTS)
+            .map(|i| IndexKey::TokenSystem {
+                param: "identifier".to_string(),
+                system: "s".to_string(),
+                code: i.to_string(),
+            })
+            .collect();
+        let delta = index_delta(
+            &[],
+            VersionKeys {
+                version_id: 1,
+                last_updated: lu,
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                keys: &next,
+            },
+        );
+        assert_eq!(delta.units.len(), 1);
+        let key = RowKey {
+            tenant_id: "test-over-the-limit",
+            resource_type: "Patient",
+            id: "p",
+        };
+        let statements = unit_statements(&key, &delta, &delta.units[0], write_ts_of(lu));
+        assert_eq!(statements.len(), 65_536);
+        let counted = backend.statement_counts();
+        let outcome = backend
+            .send_index_batch(
+                &statements,
+                POST_CAS_WRITE_TRIES,
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            )
+            .await;
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
+        assert_eq!(spent.total(), 0, "nothing sent: {spent}");
     }
 
     /// IW17, RW9: a post-CAS write the node refuses as `Invalid` is tried
@@ -5269,12 +6544,10 @@ mod node_tests {
             .unwrap();
         let row1 = current(&backend, &tenant).await;
         let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
-        let plan = CasPlan::update(
-            PreviousVersion::from_row(&row1).unwrap(),
-            json,
-            data,
-            vec![IndexKey::ResourcesByType],
-        );
+        let keys = backend.index_keys_of(tenant.tenant_id().as_str(), "Patient", &json);
+        let k = row1.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
+        let plan = CasPlan::update(PreviousVersion::from_row(&row1).unwrap(), json, data, keys);
         for _ in 0..POST_CAS_WRITE_TRIES {
             backend.session.inject_fault(
                 StatementKind::Write,
@@ -5290,10 +6563,11 @@ mod node_tests {
         let stats = backend.cas_stats().since(&before);
         let spent = backend.statement_counts().since(&counted);
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        // V3, I1, V1 sent alone; three tries of the batch holding X1's insert
-        // and delete, none applied (IW16); no I2.
+        // V3, I1, V1 sent alone; three tries of the one batch holding the
+        // `k` inserts and `k` deletes, X1's among them, none applied (IW16);
+        // no I2.
         assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
-        assert_eq!((spent.batch, spent.batched), (3, 6), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (3, 6 * k), "{spent}");
 
         // The old row is still there, at version 1's `last_updated`.
         let by_type = backend
@@ -5377,11 +6651,9 @@ mod node_tests {
     /// as a node does when the replicas answer late: the row has moved, in
     /// one try.
     ///
-    /// The update's batch holds one partition, `(tenant, Patient)`, which a
-    /// real node applies without the batchlog and would time out as `SIMPLE`
-    /// (see `Fault`, "On a batch"). So this checks the writer's handling of
-    /// `BATCH`; a node first sends `BATCH` for a write's batch once pull
-    /// request 5 spreads a write's rows over several partitions.
+    /// The update's batch spans `k` partitions (the type row's, and those of
+    /// its token rows), so a real node can answer `BATCH` for it (see
+    /// `Fault`, "On a batch").
     #[tokio::test]
     async fn a_batch_timeout_after_the_batchlog_is_not_retried_and_keeps_the_intent() {
         let Some(backend) = backend().await else {
@@ -5400,12 +6672,10 @@ mod node_tests {
             .unwrap();
         let row1 = current(&backend, &tenant).await;
         let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
-        let plan = CasPlan::update(
-            PreviousVersion::from_row(&row1).unwrap(),
-            json,
-            data,
-            vec![IndexKey::ResourcesByType],
-        );
+        let keys = backend.index_keys_of(tenant.tenant_id().as_str(), "Patient", &json);
+        let k = row1.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
+        let plan = CasPlan::update(PreviousVersion::from_row(&row1).unwrap(), json, data, keys);
         backend.session.inject_fault(
             StatementKind::Write,
             "INSERT INTO resources_by_type",
@@ -5421,7 +6691,7 @@ mod node_tests {
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
         // V3, I1, V1 sent alone; one try of the batch; no I2.
         assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
-        assert_eq!((spent.batch, spent.batched), (1, 2), "one try: {spent}");
+        assert_eq!((spent.batch, spent.batched), (1, 2 * k), "one try: {spent}");
         assert_eq!(
             by_type_versions(&backend, &tenant).await,
             vec![2],
@@ -5448,6 +6718,539 @@ mod node_tests {
             .await
             .expect("pending_index_writes");
         assert_eq!(intents.len(), 1, "the intent is kept for the sweeper");
+    }
+
+    fn version() -> FhirVersion {
+        crate::backends::cassandra::test_support::test_fhir_version()
+    }
+
+    const SYS: &str = "http://example.org/ids";
+    const B0: i64 = 325_987_200_000; // 1980-05-01T00:00:00Z
+    const B1: i64 = 326_073_600_000; // 1980-05-02T00:00:00Z
+
+    /// `"sha256:"` and the lowercase hex of SHA-256 over `value`'s bytes.
+    fn digest(value: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let hex: String = Sha256::digest(value.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("sha256:{hex}")
+    }
+
+    /// `n` bytes of `c`.
+    fn long(n: usize, c: char) -> String {
+        c.to_string().repeat(n)
+    }
+
+    /// Rows of `cql` for `(tenant, Patient, param, …)`, as `(id, version_id)`.
+    async fn tag_rows(
+        backend: &CassandraBackend,
+        cql: &str,
+        values: Vec<Value>,
+    ) -> Vec<(String, i32)> {
+        backend
+            .session
+            .rows(cql, values, StatementKind::Read)
+            .await
+            .expect("index rows")
+            .iter()
+            .map(|row| {
+                (
+                    row.get_r_by_name("id").unwrap(),
+                    row.get_r_by_name("version_id").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// IW7 with real keys (gate): an update that keeps the birth date leaves
+    /// its `date_index` and `date_index_by_end` rows, re-tagged with the new
+    /// version at the new write time, and moves the token rows.
+    #[tokio::test]
+    async fn a_kept_birth_date_survives_an_update() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("birthdate");
+        let t = tenant.tenant_id().as_str();
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"p","gender":"male","birthDate":"1980-05-01"}),
+                version(),
+            )
+            .await
+            .unwrap();
+        backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType":"Patient","id":"p","gender":"female","birthDate":"1980-05-01"}),
+            )
+            .await
+            .unwrap();
+        let r1 = current(&backend, &tenant).await;
+        assert_eq!(r1.version_id, 2);
+        let ts2 = write_ts_of(r1.last_updated);
+
+        let date_rows = |table: &'static str, first: &'static str, second: &'static str| {
+            let backend = &backend;
+            async move {
+                let rows = backend
+                    .session
+                    .rows(
+                        &format!(
+                            "SELECT id, {first}, {second}, version_id, \
+                             WRITETIME(version_id) AS written FROM {table} \
+                             WHERE tenant_id = ? AND resource_type = ? AND param = ?"
+                        ),
+                        vec![
+                            Value::from(t),
+                            Value::from("Patient"),
+                            Value::from("birthdate"),
+                        ],
+                        StatementKind::Read,
+                    )
+                    .await
+                    .expect("date rows");
+                rows.iter()
+                    .map(|row| {
+                        let at = |name: &str| {
+                            let at: DateTime<Utc> = row.get_r_by_name(name).unwrap();
+                            at.timestamp_millis()
+                        };
+                        let id: String = row.get_r_by_name("id").unwrap();
+                        let version_id: i32 = row.get_r_by_name("version_id").unwrap();
+                        let written: i64 = row.get_r_by_name("written").unwrap();
+                        (id, at(first), at(second), version_id, written)
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            date_rows("date_index", "start", "end").await,
+            vec![("p".to_string(), B0, B1, 2, ts2)]
+        );
+        assert_eq!(
+            date_rows("date_index_by_end", "end", "start").await,
+            vec![("p".to_string(), B1, B0, 2, ts2)]
+        );
+
+        let token = |code: &'static str| {
+            tag_rows(
+                &backend,
+                "SELECT id, version_id FROM token_code_index \
+                 WHERE tenant_id = ? AND resource_type = ? AND param = ? AND code = ?",
+                vec![
+                    Value::from(t),
+                    Value::from("Patient"),
+                    Value::from("gender"),
+                    Value::from(code),
+                ],
+            )
+        };
+        assert_eq!(token("male").await, vec![], "the old token row is gone");
+        assert_eq!(token("female").await, vec![("p".to_string(), 2)]);
+        assert_consistent(&check(&backend, t).await);
+    }
+
+    /// IW9 B (gate): when one index batch fails every try, only its units are
+    /// missing; the old `resources_by_type` row is kept, the other batches are
+    /// written, and the intent stays for the sweeper.
+    #[tokio::test]
+    async fn a_failed_pair_batch_keeps_the_old_row_and_the_intent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("pair-batch");
+        let t = tenant.tenant_id().as_str();
+        let body = json!({
+            "resourceType": "Patient", "id": "p", "active": true,
+            "identifier": (0..4)
+                .map(|i| json!({"system": SYS, "value": format!("{i}{}", long(999, 'v'))}))
+                .collect::<Vec<_>>(),
+        });
+        backend
+            .create(&tenant, "Patient", body.clone(), version())
+            .await
+            .unwrap();
+        let row1 = current(&backend, &tenant).await;
+        let (json, data) = normalized_body("update", "Patient", "p", body).unwrap();
+        let keys = backend.index_keys_of(t, "Patient", &json);
+        let plan = CasPlan::update(PreviousVersion::from_row(&row1).unwrap(), json, data, keys);
+        // The packing the writer will use; byte sizes do not depend on the
+        // timestamp's value.
+        let packed = index_batches(
+            &key_of(&tenant),
+            &index_delta(
+                &plan.previous_rows(),
+                plan.version_keys(row1.last_updated + chrono::Duration::milliseconds(1)),
+            ),
+            1,
+        );
+        let batches = packed.batches.len() as u64;
+        assert!(batches >= 2, "{batches} batches");
+        let n1 = packed
+            .batches
+            .iter()
+            .find(|batch| {
+                batch
+                    .iter()
+                    .any(|statement| statement.cql() == INSERT_RESOURCES_BY_TYPE.as_str())
+            })
+            .expect("the batch holding X1")
+            .iter()
+            .filter(|statement| statement.cql().starts_with("INSERT"))
+            .count();
+        for _ in 0..POST_CAS_WRITE_TRIES {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resources_by_type",
+                Fault::FailWithUnavailable,
+            );
+        }
+        let since = Utc::now();
+        let (before, counted) = (backend.cas_stats(), backend.statement_counts());
+        let mut request = backend.cas_request("update", key_of(&tenant));
+        let applied = applied_of(backend.run_cas(&mut request, plan).await.unwrap());
+        let stats = backend.cas_stats().since(&before);
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(applied.version_id, 2);
+        assert!(!applied.post_cas_complete);
+        assert_eq!(applied.index.batches, batches);
+        assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
+        assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
+        assert_eq!(
+            spent.batch,
+            batches - 1 + u64::from(POST_CAS_WRITE_TRIES),
+            "{spent}"
+        );
+        assert_eq!(
+            by_type_versions(&backend, &tenant).await,
+            vec![1],
+            "the old row is kept"
+        );
+        assert_eq!(
+            check(&backend, t).await.kinds(),
+            expect(&[("missing_row", n1), ("stray_row", n1)]),
+            "only the failed batch's units"
+        );
+        assert_eq!(backend.intent_versions(t, "Patient", "p", since).await, [2]);
+    }
+
+    /// IW6 on every write path (ADR-aacruzgon-0079): a long value is hashed
+    /// once when a key set is made, and a later write deletes the stored
+    /// digests as they are.
+    #[tokio::test]
+    async fn a_long_value_is_hashed_once_on_every_write_path() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("hashed-once");
+        let t = tenant.tenant_id().as_str();
+        let long_value = |n: usize| format!("{n:x<1025}");
+        let body = |id: &str, n: usize| {
+            json!({
+                "resourceType": "Patient", "id": id, "active": true,
+                "identifier": [
+                    {"system": SYS, "value": long_value(n)},
+                    {"system": SYS, "value": "sha256:short"},
+                ],
+            })
+        };
+        let hashed_ok = |keys: &[IndexKey], n: usize| {
+            let raw = long_value(n);
+            let id = |code: &str| {
+                [
+                    IndexKey::TokenCode {
+                        param: "identifier".into(),
+                        code: code.into(),
+                        system: SYS.into(),
+                    },
+                    IndexKey::TokenSystemCode {
+                        param: "identifier".into(),
+                        system: SYS.into(),
+                        code: code.into(),
+                    },
+                    IndexKey::TokenSystem {
+                        param: "identifier".into(),
+                        system: SYS.into(),
+                        code: code.into(),
+                    },
+                ]
+            };
+            for expected in id(&digest(&raw))
+                .into_iter()
+                .chain(id(&digest("sha256:short")))
+            {
+                assert!(keys.contains(&expected), "{expected:?}");
+            }
+            for key in keys {
+                let texts: Vec<&str> = match key {
+                    IndexKey::TokenCode { code, system, .. }
+                    | IndexKey::TokenSystemCode { code, system, .. }
+                    | IndexKey::TokenSystem { code, system, .. } => vec![code, system],
+                    _ => vec![],
+                };
+                assert!(
+                    texts
+                        .iter()
+                        .all(|text| *text != raw && *text != "sha256:short"),
+                    "{key:?}"
+                );
+            }
+        };
+        let row_of = |id: &'static str| {
+            let (backend, t) = (&backend, t);
+            async move {
+                backend
+                    .read_resource_row(t, "Patient", id)
+                    .await
+                    .expect("R1")
+                    .expect("a row")
+            }
+        };
+
+        // 1. create.
+        let before = backend.cas_stats();
+        let a = backend
+            .create(&tenant, "Patient", body("a", 1), version())
+            .await
+            .unwrap();
+        let stats = backend.cas_stats().since(&before);
+        let r1 = row_of("a").await;
+        assert_eq!(stats.extractions, 1);
+        assert_eq!(
+            stats.cas_payload_bytes as usize,
+            r1.data.as_deref().map_or(0, str::len) + r1.index_keys.as_ref().map_or(0, Vec::len)
+        );
+        hashed_ok(&r1.keys().unwrap(), 1);
+
+        // 2. update.
+        let before = backend.cas_stats();
+        backend.update(&tenant, &a, body("a", 2)).await.unwrap();
+        assert_eq!(backend.cas_stats().since(&before).extractions, 1);
+        hashed_ok(&row_of("a").await.keys().unwrap(), 2);
+
+        // 3. create_or_update creates, 4. updates.
+        let before = backend.cas_stats();
+        let (_, created) = backend
+            .create_or_update(&tenant, "Patient", "b", body("b", 3), version())
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(backend.cas_stats().since(&before).extractions, 1);
+        hashed_ok(&row_of("b").await.keys().unwrap(), 3);
+        let before = backend.cas_stats();
+        let (_, created) = backend
+            .create_or_update(&tenant, "Patient", "b", body("b", 4), version())
+            .await
+            .unwrap();
+        assert!(!created);
+        assert_eq!(backend.cas_stats().since(&before).extractions, 1);
+        hashed_ok(&row_of("b").await.keys().unwrap(), 4);
+
+        // 5. delete, then revive.
+        backend.delete(&tenant, "Patient", "b").await.unwrap();
+        let before = backend.cas_stats();
+        let (_, created) = backend
+            .create_or_update(&tenant, "Patient", "b", body("b", 5), version())
+            .await
+            .unwrap();
+        assert!(created, "a revive reports a create");
+        assert_eq!(backend.cas_stats().since(&before).extractions, 1);
+        hashed_ok(&row_of("b").await.keys().unwrap(), 5);
+
+        assert_consistent(&check(&backend, t).await);
+    }
+
+    /// IW15: a batch the batchlog replays after a `BATCH_LOG` timeout, applied
+    /// late, is tried again and confirmed; the late apply is not counted.
+    #[tokio::test]
+    async fn a_batchlog_timeout_applied_late_is_retried_and_confirmed() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("batchlog-late");
+        let t = tenant.tenant_id().as_str();
+        backend
+            .create(&tenant, "Patient", patient(), version())
+            .await
+            .unwrap();
+        let row1 = current(&backend, &tenant).await;
+        let k = row1.keys().unwrap().len() as u64;
+        let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let keys = backend.index_keys_of(t, "Patient", &json);
+        let plan = CasPlan::update(PreviousVersion::from_row(&row1).unwrap(), json, data, keys);
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::ApplyLate {
+                before: StatementKind::Write,
+                write_type: TimeoutWriteType::BatchLog,
+            },
+        );
+        let since = Utc::now();
+        let (before, counted) = (backend.cas_stats(), backend.statement_counts());
+        let mut request = backend.cas_request("update", key_of(&tenant));
+        let applied = applied_of(backend.run_cas(&mut request, plan).await.unwrap());
+        let stats = backend.cas_stats().since(&before);
+        let spent = backend.statement_counts().since(&counted);
+        assert!(applied.post_cas_complete);
+        assert_eq!(stats.post_cas_failures, 0);
+        // V3, I1, V1, I2; two tries of the batch, the seam's late send not counted.
+        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (2, 4 * k), "{spent}");
+        assert_eq!(by_type_versions(&backend, &tenant).await, vec![2]);
+        assert_eq!(
+            backend.intent_versions(t, "Patient", "p", since).await,
+            Vec::<i32>::new()
+        );
+        assert_consistent(&check(&backend, t).await);
+    }
+
+    /// IW12: a write's index batches are never more than
+    /// [`INDEX_BATCHES_IN_FLIGHT`] at once.
+    #[tokio::test]
+    async fn index_batches_in_flight_never_exceed_eight() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("in-flight");
+        let t = tenant.tenant_id().as_str();
+        let body = json!({
+            "resourceType": "Patient", "id": "p", "active": true,
+            "identifier": (0..20)
+                .map(|i| json!({"system": SYS, "value": format!("{i:02}{}", long(998, 'v'))}))
+                .collect::<Vec<_>>(),
+        });
+        let counted = backend.statement_counts();
+        backend
+            .create(&tenant, "Patient", body, version())
+            .await
+            .unwrap();
+        let spent = backend.statement_counts().since(&counted);
+        eprintln!("[index-batches-in-flight batches={}]", spent.batch);
+        assert!(spent.batch >= 9, "{spent}");
+        assert_eq!(
+            backend.session.max_batches_in_flight(),
+            INDEX_BATCHES_IN_FLIGHT
+        );
+        assert_consistent(&check(&backend, t).await);
+    }
+
+    /// IW1: a stored SearchParameter whose expression fails at run time is
+    /// skipped and counted; the write goes ahead without its rows.
+    #[tokio::test]
+    async fn a_failing_search_parameter_is_skipped_and_counted() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("failing-param");
+        let t = tenant.tenant_id().as_str();
+        let url = format!(
+            "http://example.org/SearchParameter/broken-{}",
+            Uuid::new_v4()
+        );
+        backend
+            .create(
+                &tenant,
+                "SearchParameter",
+                json!({
+                    "resourceType": "SearchParameter", "id": "broken", "url": url,
+                    "name": "broken", "status": "active", "description": "fails at run time",
+                    "code": "broken", "base": ["Patient"], "type": "token",
+                    "expression": "Patient.name.single()"
+                }),
+                version(),
+            )
+            .await
+            .unwrap();
+        let before = backend.cas_stats();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient", "id": "p", "gender": "male",
+                    "name": [{"family": "One"}, {"family": "Two"}]
+                }),
+                version(),
+            )
+            .await
+            .unwrap();
+        let stats = backend.cas_stats().since(&before);
+        assert_eq!(
+            (
+                stats.extractions,
+                stats.extraction_failures,
+                stats.extraction_fallbacks
+            ),
+            (1, 1, 0),
+            "{stats}"
+        );
+        let keys = backend
+            .read_resource_row(t, "Patient", "p")
+            .await
+            .unwrap()
+            .unwrap()
+            .keys()
+            .unwrap();
+        assert!(keys.contains(&IndexKey::TokenCode {
+            param: "gender".into(),
+            code: "male".into(),
+            system: crate::search::IMPLICIT_TOKEN_SYSTEM.into(),
+        }));
+        assert!(!keys.iter().any(|key| matches!(key,
+            IndexKey::TokenCode { param, .. } if param == "broken")));
+        assert_consistent(
+            &index_consistency(
+                &backend,
+                t,
+                Scope::Tenant,
+                ScanMode::Full,
+                Registry::Changed,
+            )
+            .await,
+        );
+    }
+
+    /// D6: a resource that cannot be extracted keeps only its type key, and
+    /// nothing is sent to the node.
+    #[tokio::test]
+    async fn a_resource_that_cannot_be_extracted_keeps_only_its_type_key() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let (before, counted) = (backend.cas_stats(), backend.statement_counts());
+        for body in [
+            json!(["x"]),
+            json!({"resourceType": "Observation", "id": "p"}),
+        ] {
+            assert_eq!(
+                backend.index_keys_of("test-engine-fallback", "Patient", &body),
+                vec![IndexKey::ResourcesByType]
+            );
+        }
+        let stats = backend.cas_stats().since(&before);
+        assert_eq!(
+            (
+                stats.extractions,
+                stats.extraction_fallbacks,
+                stats.extraction_failures
+            ),
+            (2, 2, 0)
+        );
+        assert_eq!(backend.statement_counts().since(&counted).total(), 0);
     }
 
     /// IW16: the index phase has one deadline over its tries and pauses.
@@ -5776,7 +7579,10 @@ mod node_tests {
         backend.session.inject_fault(
             StatementKind::Cas,
             "deleted_at = ?, last_updated",
-            Fault::ApplyLate { before },
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
         );
         let lu = next_last_updated(Utc::now(), Some(row.last_updated));
         let held = backend
@@ -5912,6 +7718,7 @@ mod node_tests {
             "INSERT INTO resources",
             Fault::ApplyLate {
                 before: StatementKind::Write,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();
@@ -6008,6 +7815,7 @@ mod node_tests {
             "SET version_id = ?, data = ?",
             Fault::ApplyLate {
                 before: StatementKind::SerialRead,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let lu = next_last_updated(Utc::now(), Some(row.last_updated));
@@ -6058,6 +7866,7 @@ mod node_tests {
             "INSERT INTO resources",
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         backend.session.inject_fault(

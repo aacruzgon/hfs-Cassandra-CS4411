@@ -28,8 +28,8 @@
 //!   `delete_versioned`'s, so a writer landing after the comparison makes
 //!   that CAS miss rather than being deleted with it (#1404).
 //! - **`update_with_match`** (roadmap Step 4) has the same shape. It checks
-//!   `Operation::Update` (the SearchParameter `code` bound, G38, is
-//!   `update`'s, before any statement there),
+//!   `Operation::Update` (the 8 MiB CAS payload bound, ADR-aacruzgon-0053,
+//!   is `update`'s, after its own read and before any write there),
 //!   pre-reads the resource with `read` (absent or deleted: `NotFound`),
 //!   compares the field with its version as `delete_with_match` does (a
 //!   mismatch is `VersionConflict`, 409, with nothing written), and then
@@ -277,10 +277,10 @@ impl CassandraBackend {
         expected_version: &str,
         resource: Json,
     ) -> StorageResult<StoredResource> {
-        // Again in `update`, before any statement there too. The
-        // SearchParameter `code` bound (G38) is left to `update`, so this file
-        // does not depend on `write.rs`'s check, which Step 5's extraction
-        // pull request removes (ADR-aacruzgon-0079).
+        // Again in `update`, before any statement there too. The CAS payload
+        // bound (ADR-aacruzgon-0053) is left to `update`, which checks it
+        // after its own read and before any write; G38's 128-byte
+        // SearchParameter `code` refusal is gone (ADR-aacruzgon-0079).
         tenant.check_permission(Operation::Update, resource_type)?;
         let current = match self.read_resource(tenant, resource_type, id).await {
             Ok(Some(current)) => current,
@@ -454,7 +454,7 @@ mod node_tests {
     use super::*;
     use crate::backends::cassandra::index_keys::IndexKey;
     use crate::backends::cassandra::read::ResourceRow;
-    use crate::backends::cassandra::session::Fault;
+    use crate::backends::cassandra::session::{Fault, TimeoutWriteType};
     use crate::backends::cassandra::write::{
         CasOutcome, CasPlan, PreviousVersion, RowKey, normalized_body,
     };
@@ -871,6 +871,7 @@ mod node_tests {
             ANOTHER_WRITER,
             Fault::ApplyLate {
                 before: StatementKind::Write,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let deleted_at = if deleting {
@@ -989,9 +990,9 @@ mod node_tests {
     /// What `update_with_match` refuses, each with nothing written, as
     /// `delete_with_match` does: a stale tag (409), an absent or deleted
     /// resource (`NotFound`); a tenant without update permission, before any
-    /// statement; and a SearchParameter `code` over 128 bytes (G38), which
-    /// `update` refuses after the pre-read and before any statement of its
-    /// own.
+    /// statement; and a body over the 8 MiB CAS payload bound
+    /// (ADR-aacruzgon-0053), which `update` refuses after the pre-read and
+    /// its own read, before any write.
     #[tokio::test]
     async fn update_with_match_refuses_without_writing() {
         let Some(backend) = backend().await else {
@@ -1071,10 +1072,11 @@ mod node_tests {
         }
         assert_eq!(backend.statement_counts().since(&before).total(), 0);
 
-        // A SearchParameter `code` over 128 bytes (G38): `update` refuses it
-        // before any statement of its own, so only the pre-read is spent and
-        // nothing is written. The SearchParameter exists, with a short code,
-        // so the pre-read finds it.
+        // A body over the 8 MiB CAS bound (ADR-aacruzgon-0053): `update`
+        // refuses it before any write, so only reads are spent (the pre-read and
+        // `update`'s own read) and nothing is written. (A SearchParameter `code` over 128 bytes no
+        // longer serves: ADR-aacruzgon-0079 removed that refusal.) The
+        // SearchParameter exists, so the pre-read finds it.
         let search_parameter = |code: String| {
             json!({
                 "resourceType": "SearchParameter",
@@ -1098,13 +1100,11 @@ mod node_tests {
             .expect("create the SearchParameter");
         let before = backend.statement_counts();
         match backend
-            .update_with_match(
-                &t,
-                "SearchParameter",
-                "sp",
-                "*",
-                search_parameter("c".repeat(129)),
-            )
+            .update_with_match(&t, "SearchParameter", "sp", "*", {
+                let mut oversized = search_parameter("short".to_string());
+                oversized["description"] = json!("d".repeat(9 * 1024 * 1024));
+                oversized
+            })
             .await
         {
             Err(StorageError::Validation(_)) => {}
@@ -1113,8 +1113,8 @@ mod node_tests {
         let spent = backend.statement_counts().since(&before);
         assert_eq!(
             (spent.read, spent.total()),
-            (1, 1),
-            "the pre-read only, nothing written"
+            (2, 2),
+            "the pre-read and `update`'s own read of the row, nothing written"
         );
         assert_eq!(
             backend

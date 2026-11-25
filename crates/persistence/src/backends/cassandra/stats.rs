@@ -8,6 +8,9 @@
 //! before and after what it measures, and prints [`CasStats::since`] as
 //! `key=value` pairs (its `Display`).
 //!
+//! The five extraction and payload counters at the end of [`CasStats`] are
+//! the writer's step 1 (roadmap row 5.1).
+//!
 //! The statements themselves are counted per kind in `session.rs`
 //! ([`StatementCounts`](super::StatementCounts), report R5).
 //!
@@ -17,6 +20,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use cdrs_tokio::error::Error as CdrsError;
 use cdrs_tokio::frame::message_error::{ErrorType, WriteType};
@@ -134,6 +138,25 @@ cas_counters! {
     /// Writes refused before any statement because what the CAS would carry
     /// is over the size bound.
     too_large,
+    /// Extractions run for a new key set: one per plan built, and one per
+    /// live resource a consistency check re-extracts (IW8).
+    extractions,
+    /// Microseconds those extractions took, summed (IW22).
+    extract_us,
+    /// Search parameters whose extraction failed, so the key set it returned
+    /// has no rows for them (IW1, IW22). Counted per extraction, when a plan
+    /// is built, before the compare-and-swap: an attempt that then misses or
+    /// fails counts too, and so does each re-extraction of a consistency
+    /// check.
+    extraction_failures,
+    /// Extractions that failed for the whole resource, so the key set they
+    /// returned holds only its `resources_by_type` row (IW1, IW22, D6).
+    /// Counted the same way as `extraction_failures`.
+    extraction_fallbacks,
+    /// Bytes of `data` and `index_keys` of every compare-and-swap attempted,
+    /// counted with `attempts` just before it is sent (an attempt whose
+    /// prepare failed counts too) (IW21).
+    cas_payload_bytes,
 }
 
 impl fmt::Display for CasStats {
@@ -263,6 +286,10 @@ impl CasCounters {
     pub(crate) fn unknown(&self, error: &DriverError) {
         Self::bump(match error {
             DriverError::Deadline { .. } => &self.unknown_deadline,
+            // Never reached: only an index batch is refused this way, and
+            // `unknown` is called only for a CAS. Counted as a server error
+            // if that ever changes.
+            DriverError::TooManyStatements { .. } => &self.unknown_server_error,
             DriverError::Driver(inner) => match inner.as_ref() {
                 CdrsError::Server { body, .. } => match &body.ty {
                     ErrorType::WriteTimeout(timeout) => match timeout.write_type {
@@ -315,6 +342,26 @@ impl CasCounters {
     pub(crate) fn too_large(&self) {
         Self::bump(&self.too_large);
     }
+
+    /// One extraction for a new key set (IW1, IW22).
+    pub(crate) fn extraction(&self, took: Duration, failed_params: u64, failed_resource: bool) {
+        Self::bump(&self.extractions);
+        self.extract_us.fetch_add(
+            u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.extraction_failures
+            .fetch_add(failed_params, Ordering::Relaxed);
+        if failed_resource {
+            Self::bump(&self.extraction_fallbacks);
+        }
+    }
+
+    /// What one compare-and-swap attempt carries, `data` plus `index_keys`,
+    /// counted before it is sent (IW21).
+    pub(crate) fn cas_payload(&self, bytes: u64) {
+        self.cas_payload_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -333,8 +380,20 @@ mod tests {
             after: std::time::Duration::from_secs(1),
             sent: true,
         });
+        counters.extraction(Duration::from_micros(130), 2, true);
+        counters.cas_payload(900);
         let delta = counters.snapshot().since(&before);
         assert_eq!(delta.attempts, 2);
+        assert_eq!(
+            (
+                delta.extractions,
+                delta.extract_us,
+                delta.extraction_failures,
+                delta.extraction_fallbacks,
+                delta.cas_payload_bytes
+            ),
+            (1, 130, 2, 1, 900)
+        );
         assert_eq!((delta.applied, delta.applied_late), (1, 1));
         assert_eq!(delta.miss_version_conflict, 1);
         assert_eq!(delta.unknown_deadline, 1);

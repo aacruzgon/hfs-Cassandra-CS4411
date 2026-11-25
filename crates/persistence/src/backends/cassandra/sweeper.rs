@@ -2223,8 +2223,28 @@ mod tests {
         assert!(!full.owns(&c, t0));
     /// P5: counters subtract, gauges keep the later value, every pair prints.
     #[test]
-    fn sweeper_stats_subtract_counters_keep_gauges_and_print_every_pair() {
-        let counters = SweeperCounters::default();
+    fn a_pending_slice_older_than_24_hours_is_dropped() {
+        let now = at("2026-11-25T12:00:00Z");
+        let state = SweepState::new(now, CancellationToken::new());
+        let slice = |from: &str, to: &str| Slice {
+            bucket: bucket_of(at(from)),
+            shard: 0,
+            from: at(from),
+            to: at(to),
+        };
+        let old = slice("2026-11-24T10:00:00Z", "2026-11-24T10:01:00Z");
+        let edge = slice("2026-11-24T11:59:00Z", "2026-11-24T12:00:00Z");
+        let recent = slice("2026-11-25T11:00:00Z", "2026-11-25T11:01:00Z");
+        for held in [&old, &edge, &recent] {
+            state.hold_slice(held.clone(), 1, now - chrono::Duration::seconds(10));
+        }
+        let due = state.take_due_slices(now);
+        let kept: Vec<_> = due.iter().map(|held| held.slice.clone()).collect();
+        // `edge` ends exactly 24 hours before now: it is past the horizon too.
+        assert_eq!(kept, vec![recent]);
+        assert!(state.take_due_slices(now).is_empty());
+    }
+
     /// Rows of one slice, in scope or not, decoded or not (the node plants nothing that does not decode).
     #[test]
     fn undecodable_intent_rows_count_only_in_scope() {
@@ -4007,6 +4027,78 @@ mod node_tests {
         let held = (0..16)
             .filter(|s| state.mark(*s) == whole_ms(start))
             .count();
+    /// SW8: a poll never reads further back than the outbox's 24 hour TTL, whatever its mark says.
+    #[tokio::test]
+    async fn a_poll_reads_no_further_back_than_24_hours() {
+        let Some((backend, t, _, _)) = start("sweeper-clamp").await else {
+            return;
+        };
+        let now = Utc::now();
+        let state = SweepState::new(now - chrono::Duration::days(30), CancellationToken::new());
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        let report = backend.poll_once(&state, now, &scope).await;
+        let grace = chrono::Duration::from_std(backend.config.sweeper_grace()).unwrap();
+        let to = whole_ms(now - grace);
+        let expected = 16 * plan_slices(0, to - retry_horizon(), to, poll_slice()).len();
+        assert_eq!(report.slice_errors, 0, "{report}");
+        assert_eq!(report.slices as usize, expected, "{report}");
+        assert!((0..16).all(|s| state.mark(s) == to));
+    }
+
+    /// SW8: a full retry list refuses an intent, and that intent's shard keeps its mark while the others move.
+    #[tokio::test]
+    async fn a_full_retry_list_holds_the_mark_of_the_shard_it_refused() {
+        let Some((backend, t, _, _)) = start("sweeper-overflow").await else {
+            return;
+        };
+        let now = Utc::now();
+        let first = "p0".to_string();
+        let first_shard = IntentKey::new(&t, &first, now).shard();
+        let second = (1..)
+            .map(|n| format!("p{n}"))
+            .find(|id| IntentKey::new(&t, id, now).shard() != first_shard)
+            .unwrap();
+        let mut planted = Vec::new();
+        for id in [&first, &second] {
+            let key = RowKey {
+                tenant_id: &t,
+                resource_type: "Patient",
+                id,
+            };
+            let intent_key = IntentKey::new(&t, id, Utc::now());
+            backend
+                .write_intent(&intent_key, &key, Uuid::new_v4(), 1)
+                .await
+                .unwrap();
+            planted.push((intent_key, id.clone()));
+            backend.session.inject_fault(
+                StatementKind::Read,
+                "FROM resources WHERE",
+                Fault::FailWithUnavailable,
+            );
+        }
+        let start_mark = Utc::now() - chrono::Duration::minutes(2);
+        let state = SweepState::new(start_mark, CancellationToken::new());
+        *state.retry.lock() = RetryList::new(1);
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        let report = backend
+            .poll_once(&state, Utc::now() + chrono::Duration::seconds(40), &scope)
+            .await;
+        assert_eq!((report.failed, report.overflow), (2, 1), "{report}");
+        let held = (0..16)
+            .filter(|s| state.mark(*s) == whole_ms(start_mark))
+            .count();
+        assert_eq!(held, 1, "only the refused intent's shard keeps its mark");
+        for (intent_key, id) in planted {
+            let key = RowKey {
+                tenant_id: &t,
+                resource_type: "Patient",
+                id: &id,
+            };
+            backend.delete_intent(&intent_key, &key).await;
+        }
+    }
+
     /// SW13: a live `resources` row with no `data` is an unreadable row, never a version row with no body. The row
     /// decodes, so it is planted in a `test-planted-` tenant as the other planted rows are.
     #[tokio::test]

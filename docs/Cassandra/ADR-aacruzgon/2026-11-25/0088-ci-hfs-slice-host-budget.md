@@ -1,0 +1,94 @@
+# ADR-aacruzgon-0088: This repository's CI on `acruzdebian` joins the host's CI budget: both runner instances and `gh-runner`'s rootless Docker run in `ci-hfs.slice`, one instance takes medium and heavy jobs, every build runs 4 cargo jobs with line-tables-only debug info, and a target-directory reset deletes in the background
+
+- **Date:** 2026-11-25
+- **Status:** accepted
+- **Context:**
+    - **Several repositories run CI on `acruzdebian`, and their caps only added up.** Besides our two 20G instances (ADR-aacruzgon-0086), it runs aacruzgon/muster's three runners and aacruzgon/cs4471-dynamism's five, and aacruzgon/cs4470-ed-simulation's. GitHub schedules each repository's jobs on its own. On 2026-11-24 Muster's runners ran 16 rustc and linker processes per job at full debug info; the kernel evicted the linkers' input files under the slice cap, links stalled for hours, and the PC sat at 95 % I/O pressure.
+    - **The host now has one budget.** Muster's setup installs `ci.slice` (`MemoryHigh=40G`, `MemoryMax=44G`, `CPUWeight=20`, `IOWeight=20`), with a child slice per project (aacruzgon/muster `deploy/ci-runner/HOST-CI-BUDGET.md`). Its ledger adds up, over every project, the runners that take expensive jobs times the build jobs each runs, and asks for about 16 to 24 on the PC; Muster's share is 8 and Dynamism's about 12.
+    - **Our containers sat outside every cap.** `gh-runner`'s rootless Docker runs in its user manager `user@1005.service`, in `user-1005.slice` under `user.slice`, uncapped (ADR-aacruzgon-0023, 0080). A `Slice=` on the runner units would not move them.
+    - **Our jobs built at one process per thread and full debug info.** No workflow set `CARGO_PROFILE_DEV_DEBUG`, and only the workspace clippy (8) and the GitHub-hosted `coverage.yml` (2) set `CARGO_BUILD_JOBS`. The runner units sit at their 20G `memory.max` all day (`memory.events` `max` 289,250 and 162,759 times since their last start, no OOM kill): page cache.
+    - **Every job except fmt compiles**, light ones included, so a heavy label on one instance would not by itself bound our concurrent builds.
+- **Decision:**
+    - **`ci-hfs.slice`, a child of `ci.slice`,** with `MemoryMax=28G`, `MemorySwapMax=0` and `TasksMax=8192`, holds both runner units (each still 20G) and `gh-runner`'s user manager.
+        - **The runner units** move with a `Slice=ci-hfs.slice` drop-in each; `svc.sh` rewrites only its own unit file.
+        - **The user manager** moves with a drop-in on `user@1005.service`, `Slice=ci-hfs.slice`, `MemoryMax=8G`, `MemorySwapMax=0`. Rootless Docker and every container move with it, since a delegated subtree moves with its unit. `user-runtime-dir@1005.service` and any login session of `gh-runner` stay in `user-1005.slice`.
+        - **28G** is the largest medium or heavy job measured (the all-versions build, 15.9 GiB anon cold), the largest light build (coverage, 5.6 GiB in CI) and the user manager's week peak (4.5 GiB): 26.0 GiB, with 2 GiB to spare. **8G** is that week peak with 3.5 GiB to spare.
+    - **Only the first instance, `acruzdebian`, takes `hfs-cassandra-medium` and `hfs-cassandra-heavy`;** `acruzdebian-2` keeps `hfs-cassandra-light` only. So one medium or heavy job runs on the PC at a time, and the second instance still runs fmt, the R4B check, the Cassandra schema job, coverage and the other light checks. `sam-7900x`'s labels do not change.
+    - **Every self-hosted workflow that builds sets `CARGO_BUILD_JOBS: 4` and `CARGO_PROFILE_DEV_DEBUG: line-tables-only` in its `env:`.**
+        - `cargo clippy (helios-fhir)` keeps its count from the runner's cap (1 under 20G).
+        - `cargo clippy (workspace)` drops its 8.
+        - The mutation job runs 1 in each of its 3 build directories, keeps debug info off, and installs cargo-mutants at 4.
+        - `coverage.yml` runs on GitHub's runners and does not change.
+    - **The reset steps delete in the background.** Each of the 11 "Reset the target dir" steps renames the directory and deletes it at idle CPU and I/O priority, detached from the step's output, as Muster's `job-started.sh` does. It first deletes what an earlier delete left (`*.pruning.*`), gives `du` 60 s, and puts the debug setting in the stamp, so the profile change resets each directory once instead of leaving old artifacts beside new ones. The caps of ADR-sam-michaels-0002 stay.
+    - **Ledger row:** 1 heavy runner × 4 = 4 (8 counting the light instance's builds).
+    - **Order:** labels and the machine steps in my maintenance window, after `ci.slice` exists; then the merge. If `ci.slice` is not installed by then, the setup stops and waits for Muster's; this repository never creates or changes `ci.slice`. No job's `name:`, trigger, `runs-on`, `if:` or `uses:` changes, so the required checks stay as they are.
+- **Alternatives considered:**
+    - **A `MemoryMax=` drop-in on `user-1005.slice`** (user@.service(5)'s documented way; Dynamism caps its users 1006 and 1008 like that): lost. It caps Docker without a restart of the user manager, but leaves our containers outside `ci.slice`, where the host's budget can't see them.
+    - **Leave Docker uncapped:** lost; it is what the host note warns about.
+    - **A system-wide rootless `dockerd` in `ci-hfs.slice`:** lost; Docker does not support it ("not supported, even with the `User=` directive").
+    - **`acruzdebian-2` drops only `hfs-cassandra-heavy`:** lost. Two cold medium jobs at once are 29.6 to 31.7 GiB anon (all-versions with the clippy pair, or two all-versions), which needs a child of about 36G of a 40G parent.
+    - **No label change:** lost, for the same reason and because mutants could also meet a medium job.
+    - **One instance only:** lost; it brings back the queue ADR-aacruzgon-0086 solved, while compiling is only 15–50 % of most jobs' time.
+    - **`CARGO_BUILD_JOBS=2` everywhere** (2 × 2 = 4 even counting both instances): not taken. It costs about a third on cold builds (the Cassandra job's 289 → 373 s, the workspace clippy's 309 → 406 s) and lowers no anonymous peak that matters.
+    - **4 jobs in the mutation job too** (12 rustc at once): lost; 1 keeps the job at 3, inside the others' 4, for about 3 more minutes of a 38–67-minute run.
+    - **A step that sets the job count only on `acruzdebian`:** lost. It would set the same variable in a job's `env:` and through `$GITHUB_ENV`, whose order ADR-aacruzgon-0086 found undocumented, so `sam-7900x` builds at 4 too.
+    - **A runner hook (`ACTIONS_RUNNER_HOOK_JOB_STARTED`) for the prune:** not taken. It would be a new mechanism on the machine for what the reset steps already do.
+    - **A per-instance total threshold** (Muster's 40 GB) instead of the per-directory caps: not taken; line-tables-only halves what each directory holds.
+    - **A 32G child:** not taken. It would give the page cache 6 GiB instead of 2 in the worst case, but take a bigger share of `ci.slice`.
+- **Consequences:**
+    - **Easier:**
+        - Our CI, containers included, stays inside the host's budget, and yields CPU and disk to my own work and to the other projects through `ci.slice`'s weights.
+        - Measured cold on the PC on 2026-11-25:
+            - the Cassandra job builds as fast as before (289 s against 288 s) at a lower peak (4.3 instead of 4.9 GiB anon), in half the target directory (5.5 instead of 11 GB);
+            - the all-versions build's margin under 20G grows from 1.7 to 4.1 GiB (18.3 → 15.9 GiB anon);
+            - the mutation job's three cold builds peak at 10.9 GiB anon, where its whole runs at 3 × 16 jobs peaked at 14.9–15.3 GiB in CI.
+        - A reset no longer holds the job for its `rm -rf` (1.5 s for 10 GB on an idle PC, Muster's 7.6 s for 8.8 GiB under load).
+    - **Harder:**
+        - The medium jobs, two of them required checks, queue on `acruzdebian` alone while `sam-7900x` is off, so a clippy check can wait behind a flakiness run (47 minutes on run 45530008099). The flakiness job could move to light (its build is the required job's, 5.5 GiB anon) if that bites.
+        - The workspace clippy is 9 % slower cold (309 s against 283 s at 8). The mutation job is about 3 minutes longer.
+        - The first job of each kind on each runner after the merge builds from cold once.
+        - Moving the user manager needs one restart of `user@1005.service`, with both runners stopped.
+        - The new caps can OOM-kill in `ci-hfs.slice` if more meets than measured. `memory.events` of the slice shows it.
+    - **To measure after the setup:**
+        - the first cold coverage build (not measured cold);
+        - two of our jobs at once inside `ci-hfs.slice` (its `memory.peak` and `memory.events`);
+        - our CI beside Muster's under `ci.slice`;
+        - the clippy queue on a day `sam-7900x` is off.
+- **AI involvement:**
+    - **Tool and model:** Claude Code (Opus 5.5), as the Rex worker `ci-host-budget`, with one Claude subagent that read the systemd and Docker documentation.
+    - **What the AI proposed:**
+        - moving `user@1005.service` into the child rather than capping `user-1005.slice`, and the 28G and 8G caps;
+        - `acruzdebian-2` as light only: it first proposed dropping heavy only, and changed that once the measurements showed that two cold medium jobs don't fit;
+        - 1 job a build directory for the mutation job, and the debug setting in the reset stamp;
+        - the reset steps' rename, background delete and leftover clean-up;
+        - the setup guide and its order.
+    - **What the human changed:** on 2026-11-25 I chose, from the options the AI laid out in its plan, every one it recommended:
+        - D1: `user@1005.service` moves into `ci-hfs.slice` with `MemoryMax=8G`, not a cap on `user-1005.slice`;
+        - D2: `acruzdebian-2` keeps only `hfs-cassandra-light`, not light and medium;
+        - D3: `CARGO_BUILD_JOBS=4` everywhere, the mutation job 3 × 1, not 2 everywhere;
+        - D4: `ci-hfs.slice` at `MemoryMax=28G`, not 32G;
+        - D5: `sam-7900x` builds at 4 too, rather than a step that sets the count only on `acruzdebian`;
+        - D6: the per-directory target caps of ADR-sam-michaels-0002 stay, not a per-instance total;
+        - D7: if `ci.slice` is not installed by my maintenance window, I wait for Muster's setup rather than create it.
+    - **Verified:**
+        - **Measured on `acruzdebian`** as `acruzgon` without `sudo`, only while no CI job of any project ran (two `pgrep` checks 30 s apart; a build stopped itself when a job started, four times). Cold builds of `origin/main` `0339bd7c2` were sampled every half second in their own cgroup, with a node in its own Compose project, port and 3g limit, removed afterwards (`report-ci-host-budget.md`, its `evidence/`).
+        - **CI reports reused:** runs 45408412568, 45522733076, 45566799539, 45484827652, 45496937227, 45530008021, 45533228102, and 0080's 44156440683.
+        - **The `Slice=` drop-in** moved a user manager on systemd 257.13-1~deb13u1 in a container, and the undo moved it back.
+        - **cargo-llvm-cov** gave identical coverage with debug `true`, `line-tables-only` and `0`.
+        - **The reset step,** extracted from all 11 copies and run under `bash -e` in `debian:trixie`: rename, background delete, leftover clean-up and the `rm -rf` fallback. `shellcheck` is clean.
+        - **Lint:** `actionlint` 1.7.12 and `zizmor` 1.32.0 report only what they report on `main`, before and after the branch merged `origin/main` `23c5066c6` (PR #113). A script compared every workflow with `origin/main`: only the env lines, the reset steps and their comments changed; no `name:`, trigger, `runs-on`, `if:` or `uses:` line.
+        - **Read on the PC with `systemctl show`, `systemd-cgls` and `/sys/fs/cgroup`:** the runner units' and the user manager's slices, caps, drop-ins, `memory.peak`, `pids.peak` and `memory.events`.
+        - **Sources:** systemd.resource-control(5) (`Slice=`, `MemoryMax=`, `EffectiveMemoryMax=`); systemd.slice(5); user@.service(5) ("Controlling resources for logged-in users"); systemd.io/CGROUP_DELEGATION; Docker's rootless tips and troubleshooting pages.
+        - **Not measured before the decision:**
+            - the coverage job's build from cold (only CI's warm 5.6 GiB);
+            - two of our jobs at once inside `ci-hfs.slice`, and its `memory.peak` and `memory.events`;
+            - our CI beside Muster's and Dynamism's under `ci.slice`;
+            - the clippy queue on a day `sam-7900x` is off;
+            - `sam-7900x` at 4 jobs (its timings and peaks are from 16);
+            - the `Slice=` drop-in on the PC itself: it was tested in a container on the same systemd version, and the PC's runner units and user manager were only read.
+- **Links:**
+    - Branch `cassandra/ci-host-budget`.
+    - aacruzgon/muster `deploy/ci-runner/HOST-CI-BUDGET.md`, `setup-runner.sh` (steps 7–10) and `job-started.sh`.
+    - ADR-aacruzgon-0023, 0080, 0082, 0083, 0086 (update notes); ADR-sam-michaels-0002, 0003.
+    - The eight workflows changed; `CLAUDE.md`, `AGENTS.md`, `.coderabbit.yaml` ("Commits and CI").
+    - `development-roadmap.md` row 0.5, changed in the same commit as this entry.

@@ -92,7 +92,7 @@
         - the first run with two Cassandra jobs on `acruzdebian` at once (both projects in `docker ps`, both jobs green);
         - a cold `cargo clippy (helios-fhir)` at 1 job under 20G there;
         - the first mutation run at 3 jobs (its peak `anon`, against the 11.6 GiB estimate);
-        - the queue depth on a day `sam-7900x` is off.
+        - the queue depth on a day `sam-7900x` is off. *Update 2026-11-25:* the first mutation runs at 3 jobs peaked at 15,281 MiB `anon` (run 45522733076, 4,016 s) and 14,939 MiB (run 45566799539, 2,291 s), with `memory.current` at the 20G cap and no OOM kill: 3.3 and 3.0 GiB over 0086's estimate of about 11.6 GiB, and 5.1 and 5.4 GiB under 20G. Two Cassandra jobs ran on `acruzdebian` at once on 2026-11-25: `Cassandra flaky tests (report only)` on `acruzdebian-2` (run 45530008099, `hfs-cassandra-flaky-s1`, 29452) and `Cassandra tests (all FHIR versions)` on `acruzdebian` (run 45530008031, `hfs-cassandra-fhir-versions`, 29242); both nodes ran from 02:39:09 to 02:40:10 UTC, and both jobs passed (from the jobs' logs, not `docker ps`). ADR-aacruzgon-0088 moves both instances into `ci-hfs.slice` and keeps `acruzdebian-2` to light jobs.
 - **AI involvement:**
     - **Tool and model:** Claude Code (Opus 5.5), as the Rex worker `ci-second-runner`, with two Claude subagents: one read the rustup, cargo, `dtolnay/rust-toolchain` and `taiki-e/install-action` sources, and one read the runner's environment handling.
     - **What the AI proposed:**
@@ -150,6 +150,7 @@
                 - a fully cold `cargo clippy (helios-fhir)` at 1 job;
                 - the first mutation run at 3 jobs: it runs only on a pull request labelled `mutants` or by `workflow_dispatch`, and none has run since the merge;
                 - the queue depth on a day `sam-7900x` is off.
+                - *Update 2026-11-25:* the first mutation runs at 3 jobs and the first two Cassandra jobs at once are recorded under **To measure once it is online** above. The cold `cargo clippy (helios-fhir)` at 1 job was measured outside CI for ADR-aacruzgon-0088: 449 s, 13,493 MiB `anon`, on `acruzdebian` with rustc 1.99.1 while other projects' processes ran.
 - **Links:**
     - PR #111, and its independent audit (`report-pr111-audit.md`).
     - ADR-aacruzgon-0080, 0082 and 0083 (update notes), 0018, 0019, 0021, 0022, 0023.

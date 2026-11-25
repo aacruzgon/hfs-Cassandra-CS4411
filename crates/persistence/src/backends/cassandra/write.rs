@@ -6857,6 +6857,96 @@ mod node_tests {
         assert_consistent(&check(&backend, t).await);
     }
 
+    /// ADR-aacruzgon-0091 on a node: a Coding with a system and an empty code
+    /// writes its `token_system_index` row with code `''`, and no code row;
+    /// an update to a real code deletes that row and writes the code's rows;
+    /// a delete removes them. The REST layer removes `"code": ""` before a
+    /// write (`drop_empty_elements`), so this goes through the storage API.
+    #[tokio::test]
+    async fn a_system_with_an_empty_code_keeps_its_system_row() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("system-only");
+        let t = tenant.tenant_id().as_str();
+        let observation = |code: &str| {
+            json!({"resourceType":"Observation","id":"o","status":"final",
+                   "code":{"coding":[{"system":"http://loinc.org","code":code}]}})
+        };
+        let rows = |table: &'static str| {
+            let backend = &backend;
+            async move {
+                backend
+                    .session
+                    .rows(
+                        &format!(
+                            "SELECT system, code, id, version_id FROM {table} \
+                             WHERE tenant_id = ? AND resource_type = ? AND param = ? \
+                             ALLOW FILTERING"
+                        ),
+                        vec![
+                            Value::from(t),
+                            Value::from("Observation"),
+                            Value::from("code"),
+                        ],
+                        StatementKind::Read,
+                    )
+                    .await
+                    .expect("token rows")
+                    .iter()
+                    .map(|row| {
+                        let text = |name: &str| -> String { row.get_r_by_name(name).unwrap() };
+                        let version_id: i32 = row.get_r_by_name("version_id").unwrap();
+                        (text("system"), text("code"), text("id"), version_id)
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        let row = |code: &str, version_id: i32| {
+            (
+                "http://loinc.org".to_string(),
+                code.to_string(),
+                "o".to_string(),
+                version_id,
+            )
+        };
+
+        let created = backend
+            .create(&tenant, "Observation", observation(""), version())
+            .await
+            .unwrap();
+        assert_eq!(rows("token_system_index").await, vec![row("", 1)]);
+        assert_eq!(rows("token_code_index").await, vec![]);
+        assert_eq!(rows("token_system_code_index").await, vec![]);
+        assert_consistent(&check(&backend, t).await);
+
+        let updated = backend
+            .update(&tenant, &created, observation("8480-6"))
+            .await
+            .unwrap();
+        assert_eq!(rows("token_system_index").await, vec![row("8480-6", 2)]);
+        assert_eq!(rows("token_code_index").await, vec![row("8480-6", 2)]);
+        assert_eq!(
+            rows("token_system_code_index").await,
+            vec![row("8480-6", 2)]
+        );
+        assert_consistent(&check(&backend, t).await);
+
+        backend
+            .update(&tenant, &updated, observation(""))
+            .await
+            .unwrap();
+        assert_eq!(rows("token_system_index").await, vec![row("", 3)]);
+        assert_eq!(rows("token_code_index").await, vec![]);
+        assert_eq!(rows("token_system_code_index").await, vec![]);
+        assert_consistent(&check(&backend, t).await);
+
+        backend.delete(&tenant, "Observation", "o").await.unwrap();
+        assert_eq!(rows("token_system_index").await, vec![]);
+        assert_consistent(&check(&backend, t).await);
+    }
+
     /// IW9 B (gate): when one index batch fails every try, only its units are
     /// missing; the old `resources_by_type` row is kept, the other batches are
     /// written, and the intent stays for the sweeper.

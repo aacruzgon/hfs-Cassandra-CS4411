@@ -978,6 +978,10 @@ mod tests {
             token("code-value-quantity", Some("http://loinc.org"), "8480-6")
                 .with_composite_group(1),
             ev_date("birthdate", "1980-05-01"),
+            // Four fraction digits: stored in milliseconds, the value's own
+            // millisecond (IW4). In microseconds, `timestamp_millis()` would
+            // give the empty range `[…123, …123)`.
+            ev_date("effective", "2020-01-01T10:00:00.1234Z"),
             ev_date("death-date", "not a date"),
             value("name", SearchParamType::String, IndexValue::string("Smith")),
             value(
@@ -1019,6 +1023,16 @@ mod tests {
                 start: B0,
             },
             IndexKey::Date {
+                param: "effective".into(),
+                start: 1_577_872_800_123,
+                end: 1_577_872_800_124,
+            },
+            IndexKey::DateByEnd {
+                param: "effective".into(),
+                end: 1_577_872_800_124,
+                start: 1_577_872_800_123,
+            },
+            IndexKey::Date {
                 param: "period".into(),
                 start: -62_135_596_800_000,
                 end: 253_402_300_799_999,
@@ -1032,7 +1046,7 @@ mod tests {
         expected.sort();
         let keys = index_keys_from(&values);
         assert_eq!(keys, expected);
-        assert_eq!(keys.len(), 13);
+        assert_eq!(keys.len(), 15);
         assert_eq!(keys[0], IndexKey::ResourcesByType);
         assert!(
             !keys.iter().any(|key| matches!(key,

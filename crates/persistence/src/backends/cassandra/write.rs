@@ -14,7 +14,10 @@
 //!    carries ([`MAX_CAS_PAYLOAD_BYTES`], ADR-aacruzgon-0053) before anything is written.
 //! 2. On update, delete and revive, V3: row `N` rewritten at `ts(N) − 1`,
 //!    before the CAS (G40). Then I1, the intent row, at `LOCAL_QUORUM`,
-//!    carrying this attempt's `write_id` and target version.
+//!    carrying this attempt's `write_id` and target version. If the request
+//!    has been held up since the intent's stamp so long that the CAS could
+//!    end past the sweeper's grace, a fresh intent is written before the CAS
+//!    ([`CassandraBackend::run_cas`], ADR-aacruzgon-0098).
 //! 3. The CAS, at `LOCAL_SERIAL` / `LOCAL_QUORUM`, never re-sent by the
 //!    driver: C1 `INSERT … IF NOT EXISTS` (create, version 1), C2 update and
 //!    C3 soft delete `IF version_id = N AND deleted_at = 0`, C4 revive
@@ -2172,6 +2175,48 @@ fn check_cas_size(plan: &CasPlan) -> StorageResult<()> {
     }))
 }
 
+/// ADR-aacruzgon-0098: true when a CAS sent `held` after its intent's stamp could end, at HFS's own
+/// `request_timeout`, at or past the sweeper's `grace` from that stamp, so the request must write a
+/// fresh intent first. With `grace` at least twice `request_timeout` (SW4), a fresh intent written well
+/// inside one `request_timeout` passes; at exactly twice, one that answers close to its deadline can
+/// fail again and write one more. Each round's I1 answers within `request_timeout` or fails the
+/// request, so `run_cas`'s loop needs no cap. Pure.
+fn cas_may_outlive_grace(held: Duration, request_timeout: Duration, grace: Duration) -> bool {
+    held.saturating_add(request_timeout) >= grace
+}
+
+/// ADR-aacruzgon-0098: when an attempt's intent was stamped, on both clocks.
+#[derive(Debug, Clone, Copy)]
+struct Stamp {
+    /// Monotonic: counts a frozen thread, `SIGSTOP` and a starved runtime, whatever the wall clock does.
+    monotonic: std::time::Instant,
+    /// The intent's own `enqueued_at`, the time the sweeper compares with its own wall clock.
+    wall: DateTime<Utc>,
+}
+
+impl Stamp {
+    fn now() -> Self {
+        Self {
+            monotonic: std::time::Instant::now(),
+            wall: Utc::now(),
+        }
+    }
+
+    /// How long the request has been held since this stamp: see [`held_since`].
+    fn held(&self) -> Duration {
+        held_since(self.monotonic.elapsed(), Utc::now() - self.wall)
+    }
+}
+
+/// ADR-aacruzgon-0098: the time held since an intent's stamp, the larger of the monotonic clock's
+/// `monotonic` and the wall clock's `wall` (a negative `wall`, from a clock stepped back, counts as
+/// 0). `std::time::Instant` does not count a system suspend on Linux (`CLOCK_MONOTONIC`) or macOS
+/// (`CLOCK_UPTIME_RAW`), but the sweeper judges an intent's age by the wall clock, which does. A
+/// wall clock stepped forward only adds a harmless fresh intent. Pure.
+fn held_since(monotonic: Duration, wall: chrono::Duration) -> Duration {
+    monotonic.max(wall.to_std().unwrap_or(Duration::ZERO))
+}
+
 impl CassandraBackend {
     /// A new request on the partition `key`; `operation` names it in errors
     /// and logs.
@@ -2226,9 +2271,14 @@ impl CassandraBackend {
                     .await
                     .map_err(|error| request.statement_error(&error, "previous version row"))?;
             }
-            // SW6 = IW18 (ADR-sam-michaels-0006): stamped after V3, just before I1, so the grace covers only I1's latency and clock skew. A stall between I1 and the CAS is covered by `finish`, which writes a fresh intent when it leaves work.
-            attempt.intent = IntentKey::new(key.tenant_id, key.id, Utc::now());
+            // SW6 = IW18 (ADR-sam-michaels-0006): stamped after V3, just before I1, so the grace covers only I1's latency and clock skew.
+            let mut stamped = Stamp::now();
+            attempt.intent = IntentKey::new(key.tenant_id, key.id, stamped.wall);
             request.attempts[index].intent = attempt.intent.clone();
+            // ADR-aacruzgon-0098: a test can hold the request between the stamp and I1.
+            #[cfg(test)]
+            self.checkpoint(Checkpoint::AfterStamp, &key, plan.target_version())
+                .await;
             self.write_intent(
                 &attempt.intent,
                 &key,
@@ -2241,6 +2291,44 @@ impl CassandraBackend {
             #[cfg(test)]
             self.checkpoint(Checkpoint::AfterIntent, &key, plan.target_version())
                 .await;
+            // ADR-aacruzgon-0098, refining SW6: the CAS is sent only while it is sure to end, at
+            // HFS's own deadline, within the grace of its intent's stamp. A request held up since
+            // the stamp (a frozen thread or process, a starved runtime, a suspended host: there is
+            // no await between the stamp and the statement's deadline but I1's own) could otherwise apply its CAS after a running
+            // sweeper passed its intent by, or took it for one that never applied and deleted it;
+            // a crash before `finish` would then leave the write for the next startup scan, or for
+            // no one. So it writes a fresh intent, stamped now, first. The earlier intent stays:
+            // a replay of a CAS that applied, or one that never did, is harmless (SW22).
+            while cas_may_outlive_grace(
+                stamped.held(),
+                Duration::from_millis(self.config.request_timeout_ms),
+                self.config.sweeper_grace(),
+            ) {
+                tracing::warn!(
+                    operation,
+                    resource_type = key.resource_type,
+                    id = %key.id,
+                    version_id = plan.target_version(),
+                    held_ms = stamped.held().as_millis() as u64,
+                    "request held up since its intent was stamped; writing a fresh intent before the compare-and-swap"
+                );
+                request.stats.intent_restamped();
+                stamped = Stamp::now();
+                attempt.intent = IntentKey::new(key.tenant_id, key.id, stamped.wall);
+                request.attempts[index].intent = attempt.intent.clone();
+                self.write_intent(
+                    &attempt.intent,
+                    &key,
+                    attempt.write_id,
+                    plan.target_version(),
+                )
+                .await
+                .map_err(|error| request.statement_error(&error, "intent row"))?;
+                // ADR-aacruzgon-0098: a test can hold the request after a fresh I1, before the check runs again.
+                #[cfg(test)]
+                self.checkpoint(Checkpoint::AfterFreshIntent, &key, plan.target_version())
+                    .await;
+            }
 
             // Step 3.
             request.stats.attempt();
@@ -3104,6 +3192,90 @@ mod tests {
         BodyResResultRows, ColSpec, ColType, ColTypeOption, RowsMetadata, RowsMetadataFlags,
     };
     use cdrs_tokio::types::CBytes;
+
+    /// ADR-aacruzgon-0098: a fresh intent once the time held since the stamp plus HFS's deadline
+    /// reaches the grace, never before; at the defaults (10 s, 30 s) that is 20 s held.
+    #[test]
+    fn a_cas_that_could_end_past_the_grace_needs_a_fresh_intent() {
+        let (timeout, grace) = (Duration::from_secs(10), Duration::from_secs(30));
+        assert!(!cas_may_outlive_grace(Duration::ZERO, timeout, grace));
+        assert!(!cas_may_outlive_grace(
+            Duration::from_millis(19_999),
+            timeout,
+            grace
+        ));
+        assert!(cas_may_outlive_grace(
+            Duration::from_secs(20),
+            timeout,
+            grace
+        ));
+        assert!(cas_may_outlive_grace(
+            Duration::from_secs(45),
+            timeout,
+            grace
+        ));
+        assert!(cas_may_outlive_grace(Duration::MAX, timeout, grace));
+        // SW4's least grace, twice the deadline: a fresh intent that took up to one deadline to
+        // write leaves its CAS in time, so the loop in `run_cas` ends.
+        let least = Duration::from_secs(20);
+        assert!(!cas_may_outlive_grace(
+            Duration::from_millis(9_999),
+            timeout,
+            least
+        ));
+    }
+
+    /// ADR-aacruzgon-0098 (the audit of #123, F2): the time held is the larger of the two clocks, so
+    /// a suspended host, whose wall clock moved on while `Instant` did not, still writes a fresh
+    /// intent; a wall clock stepped back counts as 0 and leaves the monotonic time.
+    #[test]
+    fn the_time_held_counts_a_suspend_the_monotonic_clock_misses() {
+        let (timeout, grace) = (Duration::from_secs(10), Duration::from_secs(30));
+        let held = held_since(Duration::from_millis(5), chrono::Duration::seconds(25));
+        assert_eq!(held, Duration::from_secs(25));
+        assert!(cas_may_outlive_grace(held, timeout, grace));
+        // Without the wall clock, the 5 ms the monotonic clock saw would not.
+        assert!(!cas_may_outlive_grace(
+            Duration::from_millis(5),
+            timeout,
+            grace
+        ));
+        assert_eq!(
+            held_since(Duration::from_secs(21), chrono::Duration::seconds(-3600)),
+            Duration::from_secs(21)
+        );
+        assert_eq!(
+            held_since(
+                Duration::from_secs(3),
+                chrono::Duration::milliseconds(2_500)
+            ),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            held_since(Duration::ZERO, chrono::Duration::MIN),
+            Duration::ZERO
+        );
+    }
+
+    /// ADR-aacruzgon-0098 (the re-audit of #123, R1-1): `Stamp::held` feeds the wall clock's age to
+    /// `held_since`. A stamp whose wall time is 25 s back, as after a suspend, and whose monotonic
+    /// time is now, is held at least 25 s and needs a fresh intent.
+    #[test]
+    fn a_stamp_held_by_the_wall_clock_alone_needs_a_fresh_intent() {
+        let stamp = Stamp {
+            monotonic: std::time::Instant::now(),
+            wall: Utc::now() - chrono::Duration::seconds(25),
+        };
+        let held = stamp.held();
+        assert!(held >= Duration::from_secs(25), "{held:?}");
+        assert!(cas_may_outlive_grace(
+            held,
+            Duration::from_secs(10),
+            Duration::from_secs(30)
+        ));
+        // A fresh stamp is held for next to nothing.
+        assert!(Stamp::now().held() < Duration::from_secs(1));
+    }
 
     fn server(ty: ErrorType) -> DriverError {
         DriverError::from(CdrsError::Server {
@@ -6441,14 +6613,15 @@ mod node_tests {
             vec![2, 2]
         );
 
-        // The sweep writes the row and the index rows, and leaves no intent of its own.
+        // The sweep writes the row and the index rows, and leaves no intent of its own. Its `now` is one
+        // millisecond past now: the window's bound is in whole milliseconds (SW7).
         let report = backend
             .sweep_pass(crate::backends::cassandra::SweepOptions {
                 scope: crate::backends::cassandra::SweepScope::Tenants(vec![
                     tenant.tenant_id().as_str().to_string(),
                 ]),
                 grace: Duration::ZERO,
-                now: Utc::now(),
+                now: Utc::now() + chrono::Duration::milliseconds(1),
                 since,
                 allow_short_grace: true,
             })

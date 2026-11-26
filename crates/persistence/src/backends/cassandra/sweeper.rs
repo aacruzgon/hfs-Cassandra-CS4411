@@ -1056,6 +1056,14 @@ pub enum SweepError {
 }
 
 /// SW28: refuses a grace below the configured one unless `allow_short_grace`. Pure.
+/// SW28: the end of a pass at `now` with `grace`, in whole milliseconds. `None` when the grace is past
+/// what a timestamp can hold (`chrono` would panic on the subtraction): no intent is old enough, so
+/// the pass is empty.
+fn pass_end(now: DateTime<Utc>, grace: Duration) -> Option<DateTime<Utc>> {
+    let grace = chrono::Duration::from_std(grace).ok()?;
+    now.checked_sub_signed(grace).map(whole_ms)
+}
+
 fn check_grace(
     grace: Duration,
     allow_short_grace: bool,
@@ -1140,8 +1148,9 @@ impl CassandraBackend {
             self.config.sweeper_grace_ms,
         )?;
         self.sweeper.counters.polled();
-        let grace = chrono::Duration::from_std(options.grace).unwrap_or(chrono::Duration::MAX);
-        let to = whole_ms(options.now - grace);
+        let Some(to) = pass_end(options.now, options.grace) else {
+            return Ok(SweepReport::default());
+        };
         let from = whole_ms(options.since);
         if from >= to {
             return Ok(SweepReport::default());
@@ -2595,6 +2604,24 @@ mod tests {
         assert!(check_grace(Duration::ZERO, true, 30_000).is_ok());
         assert!(check_grace(Duration::from_secs(30), false, 30_000).is_ok());
         assert!(check_grace(Duration::from_millis(29_999), false, 30_000).is_err());
+    }
+
+    /// SW28: a grace past what a timestamp can hold gives an empty pass, never a panic; below that, the
+    /// pass ends at `now - grace` in whole milliseconds.
+    #[test]
+    fn a_pass_with_a_grace_past_the_timestamp_range_ends_nowhere() {
+        let now = at("2026-11-26T10:00:00.123456Z");
+        assert_eq!(pass_end(now, Duration::MAX), None);
+        // Inside `chrono::Duration`'s range, outside `DateTime`'s.
+        assert_eq!(
+            pass_end(now, Duration::from_secs(5_000_000_000_000_000)),
+            None
+        );
+        assert_eq!(
+            pass_end(now, Duration::from_secs(30)),
+            Some(at("2026-11-26T09:59:30.123Z"))
+        );
+        assert!(pass_end(now, Duration::from_secs(1_000_000_000_000)).is_some());
     }
 
     /// P7: what each scope covers.
@@ -5018,6 +5045,26 @@ mod node_tests {
         for id in ids {
             assert!(intents(&backend, &t, id, from).await.is_empty(), "{id}");
         }
+    }
+
+    /// SW28: `sweep_pass` with a grace of `Duration::MAX`, past what a timestamp can hold, returns an
+    /// empty pass instead of panicking on the subtraction.
+    #[tokio::test]
+    async fn a_pass_with_the_largest_grace_is_empty() {
+        let Some((backend, t, _, since)) = start("sweeper-huge-grace").await else {
+            return;
+        };
+        let report = backend
+            .sweep_pass(SweepOptions {
+                scope: SweepScope::Tenants(vec![t]),
+                grace: Duration::MAX,
+                now: Utc::now(),
+                since,
+                allow_short_grace: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!((report.slices, report.intents), (0, 0), "{report}");
     }
 
     /// SW8: a poll never reads further back than the outbox's 24 hour TTL, whatever its mark says.

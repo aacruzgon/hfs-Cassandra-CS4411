@@ -29,7 +29,7 @@
         - it is case-insensitive by its own definition: MIME types (`urn:ietf:bcp:13`, RFC 2045 §5.1), for example `CapabilityStatement-format`, `DocumentReference-contenttype`, `Library-content-type` and `Subscription-payload` in R4, R4B and R5; and BCP 47 language tags (`urn:ietf:bcp:47`, RFC 5646 §2.1.1), for example the `code` elements of `DocumentReference-language`, `CodeSystem-language` and R5 `_language`, and the CodeableConcepts of `Patient-language` and `Practitioner-communication`. Where a binding is only preferred, this applies to the codings that use the system;
         - it has no known case rule.
 
-      The category decides, not the examples, which are not a complete list. The complete set for a version is the token parameters in `data/search-parameters-*.json` whose element is bound to a case-insensitive or unknown-case system.
+      The category decides, not the examples, which are not a complete list.
     - **ContactPoint:** exact, which the spec leaves to the server.
     - **A token on a `string` element** (for example `Medication.batch.lotNumber`, or `version` on CodeSystem and the other conformance resources) is matched case-sensitively, which is a **documented deviation** from "If the underlying data type is string then the search is not case sensitive".
     - Why these deviations:
@@ -58,7 +58,7 @@
         - Cassandra's stored rows.
         - The diff applies cleanly to `2ae41258e` (`git apply --check`).
     - **Not verified:** PostgreSQL and MongoDB answers (code only).
-    - **What the human changed:** Alan approved the draft as written on 2026-11-25. Alan approved the audit's corrections on 2026-11-25 (F4/F6, R1/R3/R5 and S1/Q1–Q3 for 0093).
+    - **What the human changed:** Alan approved the draft as written on 2026-11-25. Alan approved the audit's corrections on 2026-11-25 (F4/F6, R1/R3/R5 and S1/Q1–Q3/Q1′ for 0093).
 - **Links:**
     - `cassandra-discussion.md:75`, `:145`; `coverage.md` §2.
     - The design's first commit `67dab9104`.

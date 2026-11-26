@@ -194,11 +194,15 @@ impl TenantOverlay {
     /// Replaces the definitions with what a reload read, given that it began
     /// at `since`:
     /// - each id the reload read but the overlay does not hold (`removed`: a
-    ///   row not `active`, one whose body the overlay does not take, or a
-    ///   delete marker, each at its `last_updated`) is recorded as a removal,
-    ///   so an older read of it, such as a replay's that began before the
-    ///   change (SW19), is refused later as one of this process's own
-    ///   removals is;
+    ///   row not `active`, or one whose body the overlay does not take, at
+    ///   its `last_updated`, or a delete marker the reload read because the
+    ///   delete landed between its id scan and its read) is recorded as a
+    ///   removal, so an older read of it, such as a replay's that began
+    ///   before the change (SW19), is refused later as one of this process's
+    ///   own removals is. A delete before the scan leaves no
+    ///   `resources_by_type` row to list, so it is not recorded, and a
+    ///   replay's read from before it can still put the definition back
+    ///   until the next reload;
     /// - a definition read is dropped if a removal holds it back (it was read
     ///   before the delete or the update that removed it);
     /// - a removal is forgotten only when the reload read a newer version of
@@ -767,8 +771,10 @@ impl CassandraBackend {
         while let Some(read) = reads.next().await {
             let stored = match read {
                 Ok(Some(stored)) => stored,
-                // Deleted since the scan: the marker's `deleted_at` is its
-                // `last_updated`.
+                // Deleted between the id scan and this read: the marker's
+                // `deleted_at` is its `last_updated`. A delete before the scan
+                // left no `resources_by_type` row, so it is not listed and
+                // not recorded here (see `TenantOverlay::merge_reload`).
                 Err(StorageError::Resource(ResourceError::Gone {
                     id,
                     deleted_at: Some(at),
@@ -1745,9 +1751,10 @@ mod reload_rules {
     }
 
     /// SW19: a reload that read an id the overlay does not hold (retired by
-    /// another instance, or deleted) records it as a removal at the version
-    /// it read, so a replay's older read of the id, noted after the reload or
-    /// during it, is refused; a newer version still replaces the removal.
+    /// another instance, or deleted between the reload's id scan and its
+    /// read) records it as a removal at the version it read, so a replay's
+    /// older read of the id, noted after the reload or during it, is refused;
+    /// a newer version still replaces the removal.
     #[test]
     fn a_reload_records_what_it_read_as_retired_against_an_older_read() {
         let mut overlay = TenantOverlay::default();

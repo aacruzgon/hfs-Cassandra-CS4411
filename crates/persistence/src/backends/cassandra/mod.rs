@@ -88,6 +88,7 @@ mod session;
 mod stats;
 mod storage;
 mod stubs;
+mod sweeper;
 #[cfg(test)]
 mod test_support;
 mod update;
@@ -99,7 +100,11 @@ pub use backend::{CassandraBackend, CassandraConnection, StoredSearchParameterRe
 pub use config::{
     CassandraConfig, CassandraConfigError, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_CONTACT_POINT,
     DEFAULT_KEYSPACE, DEFAULT_LOCAL_DC, DEFAULT_POOL_SIZE, DEFAULT_REQUEST_TIMEOUT_MS,
+    DEFAULT_SWEEPER_GRACE_MS, DEFAULT_SWEEPER_POLL_INTERVAL_MS,
 };
 pub use schema::TABLES;
 pub use session::StatementCounts;
 pub use stats::CasStats;
+pub use sweeper::SweeperStats;
+#[doc(hidden)]
+pub use sweeper::{SweepError, SweepOptions, SweepReport, SweepScope};

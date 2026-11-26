@@ -335,6 +335,7 @@ mod tests {
             created_at: Some(at),
             deleted_at: deleted.then_some(at),
             fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            stored_fhir_version: None,
             write_ts: Some(at.timestamp_millis() * 1000),
             write_id: None,
             index_keys: Some(super::super::index_keys::EMPTY.to_vec()),

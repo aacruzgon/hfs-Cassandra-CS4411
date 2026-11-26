@@ -1477,6 +1477,7 @@ impl Hfs {
         let mut child = command
             .env("HFS_STORAGE_BACKEND", "cassandra")
             .env("HFS_CASSANDRA_CONTACT_POINTS", contact_point)
+            .env("HFS_CASSANDRA_SWEEPER_ENABLED", "false")
             .env("HFS_DEFAULT_TENANT", tenant)
             .env("HFS_SEED_CONFORMANCE", seed.to_string())
             .env("HFS_SERVER_HOST", "127.0.0.1")

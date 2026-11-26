@@ -370,6 +370,17 @@ impl IndexScan {
     pub(crate) fn scanned(&self) -> usize {
         self.scanned
     }
+
+    /// The kept tenants with at least one scanned row, sorted.
+    pub(crate) fn tenants(&self) -> impl Iterator<Item = &str> {
+        self.rows.keys().map(String::as_str)
+    }
+
+    /// The first read that failed, `(what, error)`, if any: the scan stopped
+    /// there, so its rows are incomplete.
+    pub(crate) fn failure(&self) -> Option<&(String, String)> {
+        self.failed.as_ref()
+    }
 }
 
 /// One thing the check found wrong. Implements `Display` by hand, one line
@@ -1717,7 +1728,7 @@ mod tests {
                     VersionKeys {
                         version_id: 1,
                         last_updated: lu,
-                        fhir_version,
+                        fhir_version: fhir_version.as_mime_param(),
                         keys,
                     },
                 ),
@@ -2126,7 +2137,7 @@ mod tests {
                     crate::backends::cassandra::write::VersionKeys {
                         version_id: 1,
                         last_updated: lu1,
-                        fhir_version: version,
+                        fhir_version: version.as_mime_param(),
                         keys: &seeded_keys,
                     },
                 ),

@@ -274,6 +274,9 @@ pub(crate) struct CassandraSession {
     /// `batch` calls in flight, and the most at once (IW12; `cfg(test)` only).
     #[cfg(test)]
     batches_in_flight: InFlight,
+    /// Plain statements (and pages) in flight, and the most at once (RW4; `cfg(test)` only).
+    #[cfg(test)]
+    statements_in_flight: InFlight,
 }
 
 /// A count of calls in flight and the highest it reached (`cfg(test)` only).
@@ -361,6 +364,8 @@ impl CassandraSession {
             plain_sends: parking_lot::Mutex::new(Vec::new()),
             #[cfg(test)]
             batches_in_flight: InFlight::default(),
+            #[cfg(test)]
+            statements_in_flight: InFlight::default(),
         })
     }
 
@@ -441,6 +446,8 @@ impl CassandraSession {
         paging: Option<Paging>,
         retries: Retries,
     ) -> Result<Envelope, DriverError> {
+        #[cfg(test)]
+        let _in_flight = self.statements_in_flight.enter();
         self.counts.count(kind);
         #[cfg(test)]
         {
@@ -551,7 +558,22 @@ impl CassandraSession {
         page_size: i32,
         keep: impl Fn(&Row) -> bool,
     ) -> Result<Vec<Row>, DriverError> {
+        self.rows_paged_counting(cql, values, kind, page_size, keep)
+            .await
+            .map(|(rows, _)| rows)
+    }
+
+    /// [`Self::rows_paged_keeping`], also counting the node's warnings that mention tombstones, over every page (SW10).
+    pub(crate) async fn rows_paged_counting(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        kind: StatementKind,
+        page_size: i32,
+        keep: impl Fn(&Row) -> bool,
+    ) -> Result<(Vec<Row>, u64), DriverError> {
         let mut all = Vec::new();
+        let mut tombstone_warnings = 0u64;
         let mut state = None;
         loop {
             let paging = Paging {
@@ -561,6 +583,11 @@ impl CassandraSession {
             let envelope = self
                 .execute_with(cql, values.clone(), kind, Some(paging), Retries::OfKind)
                 .await?;
+            tombstone_warnings += envelope
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("tombstone"))
+                .count() as u64;
             let body = envelope.response_body()?;
             let next = body
                 .as_rows_metadata()
@@ -573,7 +600,7 @@ impl CassandraSession {
             );
             match next {
                 Some(next) => state = Some(next),
-                None => return Ok(all),
+                None => return Ok((all, tombstone_warnings)),
             }
         }
     }
@@ -631,6 +658,15 @@ impl CassandraSession {
             return result;
         }
         self.send_batch(&statements).await
+    }
+
+    /// The most plain statements (one page each) this session has had in flight at once (RW4). A
+    /// batch of two or more is counted by [`Self::max_batches_in_flight`] only.
+    #[cfg(test)]
+    pub(crate) fn max_statements_in_flight(&self) -> usize {
+        self.statements_in_flight
+            .max
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The most `batch` calls this session has had in flight at once (IW12).
@@ -943,6 +979,10 @@ pub(crate) enum Fault {
     /// answers to a statement or batch it refuses, so nothing refused need be
     /// sent to it.
     FailWithInvalid,
+    /// Answer a read with the rows of another table (`system.local`, one row, no resource column),
+    /// sent at `LOCAL_QUORUM`: a response the caller cannot decode, though no bad row is stored.
+    /// A batch is not a read, so it never matches.
+    AnswerWithForeignRow,
 }
 
 #[cfg(test)]
@@ -1075,6 +1115,19 @@ mod faults {
                     return Some(Err(server_error(ErrorType::Protocol)));
                 }
                 Fault::FailWithInvalid => return Some(Err(server_error(ErrorType::Invalid))),
+                Fault::AnswerWithForeignRow => {
+                    return Some(
+                        session
+                            .send_with(
+                                "SELECT cluster_name FROM system.local",
+                                Vec::new(),
+                                StatementKind::Read,
+                                None,
+                                retries,
+                            )
+                            .await,
+                    );
+                }
                 Fault::PassThrough => {
                     return Some(
                         session
@@ -1148,6 +1201,9 @@ mod faults {
                 Fault::FailWithServerError => Err(server_error(ErrorType::Server)),
                 Fault::FailWithProtocolError => Err(server_error(ErrorType::Protocol)),
                 Fault::FailWithInvalid => Err(server_error(ErrorType::Invalid)),
+                Fault::AnswerWithForeignRow => {
+                    unreachable!("an injected foreign row is for reads, not a batch")
+                }
             })
         }
     }

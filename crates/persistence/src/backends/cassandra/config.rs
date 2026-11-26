@@ -261,9 +261,11 @@ impl CassandraConfig {
         // and a statement can make one inside its deadline: the send loop
         // takes each node's connection (`cluster/send_envelope.rs:44-70`),
         // which opens the node's pool (`cluster/topology/node.rs:279-303`,
-        // `cluster/connection_pool.rs:645-678`). That happens once per node,
-        // for the first statement to use it: at startup, or for a node new to
-        // the driver.
+        // `cluster/connection_pool.rs:645-678`). Every statement that reaches
+        // a node while its pool is being opened waits on that opening: at
+        // startup, or for a node new to the driver. With the request timeout
+        // at or below the connect timeout, the deadline can cancel the opening,
+        // and the next statement starts it again.
         if self.request_timeout_ms <= self.connect_timeout_ms {
             return Err(CassandraConfigError(format!(
                 "HFS_CASSANDRA_REQUEST_TIMEOUT_MS ({}) must be longer than \

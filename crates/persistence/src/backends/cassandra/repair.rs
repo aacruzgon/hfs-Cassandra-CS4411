@@ -3231,4 +3231,48 @@ mod tests {
             );
         }
     }
+
+    /// A repair the deadline cuts after it packed reports the rows it
+    /// packed, and counts them (ADR-sam-michaels-0008, pull request 7, item
+    /// 3). Its type-row batch is held, so the version read and the pack
+    /// finish and the cut falls while that batch is pending.
+    #[tokio::test]
+    async fn a_repair_cut_after_it_packed_reports_its_packed_rows() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-cut-packed");
+        let tenant = context(&t);
+        let (row, stale) = updated(&backend, &tenant, &t, "p").await;
+        let k2_len = keys_of(&row).len() as u64;
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::Hold,
+        );
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "p", Some(row.clone()), stale.clone());
+        let before = backend.repair_stats();
+        let outcomes = context
+            .run_within(&backend, Duration::from_millis(1_000))
+            .await;
+        let stats = backend.repair_stats().since(&before);
+        let [RepairOutcome::Failed { failure, index }] = outcomes[..] else {
+            panic!("{outcomes:?}");
+        };
+        assert_eq!(failure, WriteFailure::TriesExhausted);
+        assert_eq!((index.rows_inserted, index.rows_deleted), (k2_len, 1));
+        assert_eq!((stats.failed, stats.repaired), (1, 0));
+        assert_eq!((stats.rows_inserted, stats.rows_deleted), (k2_len, 1));
+
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "p", Some(row), stale);
+        let outcomes = context.run(&backend).await;
+        assert!(
+            matches!(outcomes[..], [RepairOutcome::Repaired { full: true, .. }]),
+            "{outcomes:?}"
+        );
+        assert_consistent(&check(&backend, &t).await);
+    }
 }

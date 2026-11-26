@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0054: The required Cassandra job runs the backend's `--lib` tests
 
 - **Date:** 2026-11-06
-- **Status:** accepted (Alan approved it on 2026-11-06, as recommended)
+- **Status:** accepted (Alan approved it on 2026-11-06, as recommended); amended by [ADR-aacruzgon-0095](../2026-11-26/0095-at-limit-test-own-step.md): the step skips `a_batch_over_the_statement_limit_is_refused_and_sends_nothing`, which the next step runs alone
 - **Context:**
     - **What gated a pull request.** Until Step 3, the required `Cassandra schema (single node)` job ran only the integration binaries: `--test cassandra_tests --test backend_capability_contract` (`fmt-clippy-cassandra.yml:578-587`) and Milestone A.
     - **Where the backend's own tests ran.** They live in `#[cfg(test)]` modules of `crates/persistence/src/backends/cassandra/*.rs`, and ran only in `cassandra-coverage.yml`, which is not required. Its comment said so: "the required job runs no --lib tests" (`:189-191` before this change).

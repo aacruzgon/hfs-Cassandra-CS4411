@@ -2014,7 +2014,7 @@ The connection settings are read by `CassandraConfig::from_env` (`src/backends/c
 | `HFS_CASSANDRA_LOCAL_DC` | `helios-dc1` | Data centre whose nodes serve every request (`LOCAL_QUORUM`, `LOCAL_SERIAL`) |
 | `HFS_CASSANDRA_USERNAME`, `HFS_CASSANDRA_PASSWORD` | unset | `PasswordAuthenticator` credentials; set both or neither |
 | `HFS_CASSANDRA_POOL_SIZE` | `2` | Connections per local node |
-| `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection |
+| `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection. Keep it below `HFS_CASSANDRA_REQUEST_TIMEOUT_MS`: one attempt to connect to a node that does not answer waits up to this long (`cdrs-tokio` 10.0.0's connection pool) inside a statement's deadline, so with the two equal, startup can fail while one node of three is down. Seen on three 5.0.9 nodes during PR #107's review (2026-11-25): with both at 5,000 ms, `connect` failed 4 of 5 times when it started within about 10 s of the stop; with 2,000 ms it passed 34 of 34. The defaults leave room for a second attempt. Nothing checks this at startup yet. |
 | `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` | `10000` | The backend's own deadline for one statement. The sweeper grace must be at least twice it, whether or not the sweeper is enabled: with the default grace, a value above `15000` fails startup. |
 | `HFS_CASSANDRA_SWEEPER_ENABLED` | `true` | Whether hfs starts the index sweeper with the server (one per process, stopped on shutdown). When `false`, it logs that the sweeper is off and nothing finishes a write whose version or index rows failed. |
 | `HFS_CASSANDRA_SWEEPER_POLL_INTERVAL_MS` | `5000` | Pause between two polls of pending_index_writes. |
@@ -2037,8 +2037,6 @@ The backend sizes what it sends to the node with constants compiled into `src/ba
 | `MAX_INDEX_TEXT_BYTES` (`index_keys.rs`) | 1,024 bytes | The longest token system or code, URI or parameter name stored as it is; a longer one is stored as `sha256:` and its digest | HFS's design ([ADR-aacruzgon-0079](../../docs/Cassandra/ADR-aacruzgon/2026-11-17/0079-hash-oversized-index-values.md)): the largest index row, 3,299 wire bytes, fits one batch, far below the 65,535-byte key limit |
 | `SCAN_PAGE_SIZE` (`consistency.rs`) | 1,000 rows | One page of the consistency utility's full scans | Keeps the tombstones one page reads far below `tombstone_failure_threshold` |
 | `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` (`config.rs`) | 10,000 ms | The backend's own deadline for one statement | [ADR-aacruzgon-0031](../../docs/Cassandra/ADR-aacruzgon/2026-11-06/0031-cassandra-config-names.md): above the node's own request timeouts |
-
-**Keep the request timeout above the connect timeout.** One attempt to connect to a node that does not answer waits up to `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` (`cdrs-tokio` 10.0.0's connection pool), and it runs inside a statement's `HFS_CASSANDRA_REQUEST_TIMEOUT_MS`. With the two equal, one attempt to a stopped node can use up the whole deadline, so `connect`'s local data-centre check fails, and startup with it. That was seen on three 5.0.9 nodes with one stopped: with both at 5,000 ms, `connect` failed 4 of 5 times when it started within about 10 s of the stop, and with a 2,000 ms connect timeout it passed 34 of 34 (the PR #107 validation, run `validate-107-findings`, V2). The defaults, 10,000 ms and 5,000 ms, leave room for a second attempt. Nothing checks this at startup yet.
 
 **The node settings**
 

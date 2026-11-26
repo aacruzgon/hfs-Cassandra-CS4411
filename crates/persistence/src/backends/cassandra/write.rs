@@ -3257,6 +3257,26 @@ mod tests {
         );
     }
 
+    /// ADR-aacruzgon-0098 (the re-audit of #123, R1-1): `Stamp::held` feeds the wall clock's age to
+    /// `held_since`. A stamp whose wall time is 25 s back, as after a suspend, and whose monotonic
+    /// time is now, is held at least 25 s and needs a fresh intent.
+    #[test]
+    fn a_stamp_held_by_the_wall_clock_alone_needs_a_fresh_intent() {
+        let stamp = Stamp {
+            monotonic: std::time::Instant::now(),
+            wall: Utc::now() - chrono::Duration::seconds(25),
+        };
+        let held = stamp.held();
+        assert!(held >= Duration::from_secs(25), "{held:?}");
+        assert!(cas_may_outlive_grace(
+            held,
+            Duration::from_secs(10),
+            Duration::from_secs(30)
+        ));
+        // A fresh stamp is held for next to nothing.
+        assert!(Stamp::now().held() < Duration::from_secs(1));
+    }
+
     fn server(ty: ErrorType) -> DriverError {
         DriverError::from(CdrsError::Server {
             body: ErrorBody::new("x", ty),

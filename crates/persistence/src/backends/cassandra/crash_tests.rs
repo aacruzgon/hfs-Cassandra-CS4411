@@ -623,6 +623,7 @@ async fn sweeper_outage_processes_two_hour_old_intents_on_startup() {
     let looped = Arc::new(
         CassandraBackend::connect(super::CassandraConfig {
             contact_points: vec![url],
+            connect_timeout_ms: 1_000,
             request_timeout_ms: 2_500,
             sweeper_poll_interval_ms: 1_000,
             sweeper_grace_ms: 5_000,

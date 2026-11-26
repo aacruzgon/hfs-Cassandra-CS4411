@@ -74,8 +74,10 @@
 //! it, and logs at `warn`. SW13's count of a bug's tries off the list holds
 //! at most `GAVE_UP_CAP` (10,000) keys, the first counted first out: with
 //! more bugs than that failing at once past a full list, a bug can be evicted
-//! before its third try, and with the near-fixed order the sweeper reads them
-//! in, most never give up; they are replayed on every poll, each try logged
+//! before its third try. How many give up then depends on how far past the
+//! cap they are: in a model of the sweeper's near-fixed order, nearly all of
+//! 10,001 gave up on the third poll, but at most 319 of 11,000 within five
+//! (ADR-aacruzgon-0090). The rest are replayed on every poll, each try logged
 //! at `error`, until the list has room. The intent row is never deleted for a
 //! failure.
 //!
@@ -2426,10 +2428,11 @@ mod tests {
 
     /// ADR-aacruzgon-0090 and SW13 on a full list: refused writes the list cannot take are not counted
     /// toward their tries, so a data bug among them still gives up on its third try even with more
-    /// refusals than `GAVE_UP_CAP` (more bugs than that mostly do not, as the module doc says), every
-    /// refusal logs at `warn`, and only the bugs are in `overflow_tries` (no insert, so no eviction
-    /// scan, for a refusal). Each round, the list fails the same intents in the same order, as a held
-    /// shard is read again on every poll: a bug first, the refusals, then a bug last.
+    /// refusals than `GAVE_UP_CAP` (more bugs than that may not, depending on how far past the cap
+    /// they are, as the module doc says), every refusal logs at `warn`, and only the bugs are in
+    /// `overflow_tries` (no insert, so no eviction scan, for a refusal). Each round, the list fails
+    /// the same intents in the same order, as a held shard is read again on every poll: a bug
+    /// first, the refusals, then a bug last.
     #[test]
     fn past_a_full_list_refusals_are_not_counted_and_a_bug_still_gives_up() {
         let t0 = at("2026-11-22T10:00:00Z");

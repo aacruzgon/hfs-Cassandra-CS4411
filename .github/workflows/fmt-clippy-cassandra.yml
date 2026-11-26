@@ -846,25 +846,27 @@ jobs:
       # before, and right after the lib step, so a failure skips the same
       # steps it did inside it. --exact must run its one test, as in the
       # other --exact steps. The [at-limit-batch …] line, the batch's time,
-      # goes to the report. Already built above.
+      # goes to the report whether the test passed or failed, then the step
+      # exits with the test's status. Already built above.
       - name: cargo test --lib, the 65,535-statement batch test alone against this node
         run: |
           set -o pipefail
           logs="$RUNNER_TEMP/ci-report/logs"
           mkdir -p "$logs"
           log="$logs/persistence-lib-at-limit.log"
+          # The test's status, kept so the report below is written whatever it is.
+          status=0
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-persistence --features cassandra \
               --lib -- --exact "${AT_LIMIT_TEST:?}" --show-output 2>&1 \
-            | tee "$log"
+            | tee "$log" || status=$?
           clean="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
-          grep -Eq '^test result: ok\. 1 passed;' <<<"$clean" \
-            || { echo "::error title=At-limit batch test::$AT_LIMIT_TEST did not run exactly once"; exit 1; }
-          # Report only: a failed report leaves the test's result alone.
+          # Report only, on a pass or a failure (a time-out is the case it measures):
+          # a failed report leaves the test's result alone.
           dir="$RUNNER_TEMP/ci-report/inputs/at-limit"
           mkdir -p "$dir"
           {
-            echo "Runner \`${RUNNER_NAME:-?}\`; the node's write_request_timeout is 2000 ms."
+            echo "Runner \`${RUNNER_NAME:-?}\`; the node's write_request_timeout is 2000 ms; the test's exit status: $status."
             echo
             echo '```'
             grep -F '[at-limit-batch ' <<<"$clean" || echo "no [at-limit-batch] line"
@@ -873,6 +875,9 @@ jobs:
           python3 .github/scripts/ci-report.py add at-limit \
             "The 65,535-statement batch, alone on the node (report only)" \
             --markdown "$dir/at-limit.md" || true
+          [ "$status" -eq 0 ] || exit "$status"
+          grep -Eq '^test result: ok\. 1 passed;' <<<"$clean" \
+            || { echo "::error title=At-limit batch test::$AT_LIMIT_TEST did not run exactly once"; exit 1; }
 
       # Milestone A (roadmap Step 2, item 2.7): the real hfs binary on this
       # node, POST /Patient then GET /Patient/{id}. Built above. Like every

@@ -592,16 +592,23 @@ jobs:
           # matches skip filters by substring unless --exact, and --exact would
           # make the backends::cassandra filter exact too), so check once that
           # it drops exactly one. The list does not depend on the version:
-          # HFS_TEST_FHIR_VERSION is read only at run time.
+          # HFS_TEST_FHIR_VERSION is read only at run time. cargo's stderr goes
+          # to the log, so a failed listing shows why, and it is a failure.
           listed() {
-            cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
-              --lib -- backends::cassandra --list "$@" 2>/dev/null \
-              | { grep -c ': test$' || true; }
+            local list
+            list=$(cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
+              --lib -- backends::cassandra --list "$@") \
+              || { echo "::error title=FHIR versions::cargo test --list${*:+ $*} failed (exit $?)" >&2; return 1; }
+            grep -c ': test$' <<<"$list" || true
           }
-          dropped=$(( $(listed) - $(listed --skip "${AT_LIMIT_TEST:?}") ))
-          if [ "$dropped" -ne 1 ]; then
-            echo "::error title=FHIR versions::--skip $AT_LIMIT_TEST drops $dropped lib tests, not 1"
-            failed+=("lib skip (drops $dropped)")
+          if all=$(listed) && kept=$(listed --skip "${AT_LIMIT_TEST:?}"); then
+            dropped=$(( all - kept ))
+            if [ "$dropped" -ne 1 ]; then
+              echo "::error title=FHIR versions::--skip $AT_LIMIT_TEST drops $dropped lib tests, not 1"
+              failed+=("lib skip (drops $dropped)")
+            fi
+          else
+            failed+=("lib skip guard (cargo test --list failed)")
           fi
           for version in R4 R4B R5 R6; do
             large=()

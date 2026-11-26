@@ -941,43 +941,6 @@ jobs:
             --markdown "$dir/hfs-rest-latency.md" --json "$dir/hfs-rest-latency.json"
           exit "$status"
 
-      # The exit criterion's check (Step 3 plan D6), after every step that
-      # writes and before the readiness test restarts the node. It stops the
-      # audit log, which flushes it, dumps it with auditlogviewer (in the
-      # image, not on its PATH), and fails if any entry is a CQL DELETE
-      # against resources or resource_versions: type DELETE with exactly that
-      # scope, or a DELETE … FROM either table in the CQL text of a batch or a
-      # failed statement, which carry no scope. resources_by_type (the X1
-      # row) and pending_index_writes (I2) are deleted from legitimately, and
-      # are never matched by prefix. It also fails on an empty log, which
-      # would prove nothing, and on a failed native batch, whose entry holds
-      # no statement text although a logged one that timed out may still
-      # apply. A check, not a report (ADR-aacruzgon-0045): no
-      # continue-on-error. Its section also counts DML per table and type
-      # (R7). The dump is kept, gzipped, in the artifact.
-      - name: Check the CQL audit log for a DELETE on resources or resource_versions
-        if: ${{ !cancelled() && steps.cql-audit-on.outcome == 'success' }}
-        timeout-minutes: 5
-        run: |
-          set -o pipefail
-          dir="$RUNNER_TEMP/ci-report/inputs/cql-audit"
-          mkdir -p "$dir"
-          # Still on: a log that stopped early would leave writes unchecked.
-          # Written to the file first, then grepped: grep -q exits at its
-          # first match, so behind a tee under pipefail the tee could die of
-          # SIGPIPE (141) and fail the check although the log was enabled.
-          docker exec -e MAX_HEAP_SIZE=128m "${CASSANDRA_CONTAINER:?}" nodetool getauditlog \
-            > "$dir/getauditlog.txt"
-          cat "$dir/getauditlog.txt"
-          grep -Eq '^enabled[[:space:]]+true' "$dir/getauditlog.txt" \
-            || { echo "::error title=CQL audit (Step 3 exit criterion)::the audit log was not enabled at the end of the tests"; exit 1; }
-          docker exec -e MAX_HEAP_SIZE=128m "${CASSANDRA_CONTAINER:?}" nodetool disableauditlog
-          docker exec -e MAX_HEAP_SIZE=256M "${CASSANDRA_CONTAINER:?}" /opt/cassandra/tools/bin/auditlogviewer /opt/cassandra/logs/audit \
-            | gzip > "$dir/auditlogviewer.txt.gz"
-          python3 .github/scripts/ci-report.py cql-audit cql-audit \
-            "CQL audit log: no DELETE on resources or resource_versions (Step 3 exit criterion)" \
-            "$dir/auditlogviewer.txt.gz" --check
-
       # Intent rows the run's tests left in pending_index_writes (R4): every
       # shard of this hour's bucket and the two before it, for test- tenants,
       # each set against its resource's current version. Expected near 0: a
@@ -993,7 +956,9 @@ jobs:
       # of every test- tenant, the consistency check over every test- tenant
       # but the test-planted- ones (one shared scan, ADR-sam-michaels-0007),
       # the intent rows left after the sweep (R4b) and the outbox's
-      # tablestats. It never runs on a shared node: the test refuses 59042.
+      # tablestats. It runs while the audit log is on, before the CQL audit
+      # check, so the D6 check covers the sweep's writes. It never runs on a
+      # shared node: the test refuses 59042.
       - name: Post-suite sweep and consistency check (report only)
         if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
         continue-on-error: true
@@ -1040,6 +1005,44 @@ jobs:
             echo "::warning title=Post-suite check::post_suite_sweep_and_check did not run exactly once"
           fi
           exit 0
+
+      # The exit criterion's check (Step 3 plan D6), after every step that
+      # writes, the post-suite sweep included, and before the readiness test
+      # restarts the node. It stops the audit log, which flushes it, dumps it
+      # with auditlogviewer (in the image, not on its PATH), and fails if any
+      # entry is a CQL DELETE
+      # against resources or resource_versions: type DELETE with exactly that
+      # scope, or a DELETE … FROM either table in the CQL text of a batch or a
+      # failed statement, which carry no scope. resources_by_type (the X1
+      # row) and pending_index_writes (I2) are deleted from legitimately, and
+      # are never matched by prefix. It also fails on an empty log, which
+      # would prove nothing, and on a failed native batch, whose entry holds
+      # no statement text although a logged one that timed out may still
+      # apply. A check, not a report (ADR-aacruzgon-0045): no
+      # continue-on-error. Its section also counts DML per table and type
+      # (R7). The dump is kept, gzipped, in the artifact.
+      - name: Check the CQL audit log for a DELETE on resources or resource_versions
+        if: ${{ !cancelled() && steps.cql-audit-on.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/ci-report/inputs/cql-audit"
+          mkdir -p "$dir"
+          # Still on: a log that stopped early would leave writes unchecked.
+          # Written to the file first, then grepped: grep -q exits at its
+          # first match, so behind a tee under pipefail the tee could die of
+          # SIGPIPE (141) and fail the check although the log was enabled.
+          docker exec -e MAX_HEAP_SIZE=128m "${CASSANDRA_CONTAINER:?}" nodetool getauditlog \
+            > "$dir/getauditlog.txt"
+          cat "$dir/getauditlog.txt"
+          grep -Eq '^enabled[[:space:]]+true' "$dir/getauditlog.txt" \
+            || { echo "::error title=CQL audit (Step 3 exit criterion)::the audit log was not enabled at the end of the tests"; exit 1; }
+          docker exec -e MAX_HEAP_SIZE=128m "${CASSANDRA_CONTAINER:?}" nodetool disableauditlog
+          docker exec -e MAX_HEAP_SIZE=256M "${CASSANDRA_CONTAINER:?}" /opt/cassandra/tools/bin/auditlogviewer /opt/cassandra/logs/audit \
+            | gzip > "$dir/auditlogviewer.txt.gz"
+          python3 .github/scripts/ci-report.py cql-audit cql-audit \
+            "CQL audit log: no DELETE on resources or resource_versions (Step 3 exit criterion)" \
+            "$dir/auditlogviewer.txt.gz" --check
 
       # Before the readiness test, which restarts the node and so resets these
       # metrics: tablestats, tpstats, the per-table latency and tombstone

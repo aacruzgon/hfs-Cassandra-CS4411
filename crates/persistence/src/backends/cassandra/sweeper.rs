@@ -2602,13 +2602,28 @@ mod node_tests {
     const SKIP: &str = "skipping: HFS_TEST_CASSANDRA_URL is not set";
 
     /// Every event's level and message, recorded by a `tracing` subscriber set as this thread's default
-    /// (`tracing::subscriber::set_default`). A `#[tokio::test]` runs on one thread, and the sweeper polls
-    /// its intents and their batches as futures inside that task, never `tokio::spawn`, so its events
-    /// land here; other tests' threads keep their own. It needs no new dev-dependency.
+    /// ([`Captured::install`]). A `#[tokio::test]` runs on one thread, and the sweeper polls its intents
+    /// and their batches as futures inside that task, never `tokio::spawn`, so its events land here;
+    /// other tests' threads keep their own. It needs no new dev-dependency.
     #[derive(Clone, Default)]
     struct Captured(Arc<parking_lot::Mutex<Vec<(tracing::Level, String)>>>);
 
     impl Captured {
+        /// Sets this subscriber as the thread's default until the guard is dropped, with a second
+        /// dispatcher kept registered beside it. While only one dispatcher is registered, `tracing-core`
+        /// (0.1.36, `Rebuilder::JustOne`) caches a callsite's interest from the default of whichever
+        /// thread hits it first. Another test's thread has none, so a callsite it hit first was cached
+        /// as never enabled, and this thread's events from it were lost: under `backends::cassandra` at
+        /// 24 threads, the refused-replay test failed 4 runs in 20 (the branch audit's re-check, R2).
+        /// With two registered, every callsite's interest comes from both, and both always want it.
+        fn install(&self) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+            let keep_interest = tracing::Dispatch::new(Captured::default());
+            (
+                tracing::subscriber::set_default(self.clone()),
+                keep_interest,
+            )
+        }
+
         /// Events at `level` whose message starts with `text`.
         fn count(&self, level: tracing::Level, text: &str) -> usize {
             self.0
@@ -3669,7 +3684,7 @@ mod node_tests {
             return;
         };
         let logs = Captured::default();
-        let _logging = tracing::subscriber::set_default(logs.clone());
+        let _logging = logs.install();
         let before = backend.sweeper_stats();
         let version = test_fhir_version();
         let (b, ten) = (backend.clone(), tenant.clone());

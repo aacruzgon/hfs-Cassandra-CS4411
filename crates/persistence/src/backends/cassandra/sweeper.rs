@@ -4233,9 +4233,11 @@ mod node_tests {
     /// ADR-aacruzgon-0099 (CodeRabbit on #122): two reloads of one tenant on A, called at once. The
     /// follow takes its stamp; A's first reload reads B's v1 and, before it merges, B updates to v2
     /// (`Patient.gender`), A reads v2 for the follow, B deletes the SearchParameter (`delete`) or, as
-    /// the control, does not, and a second reload is started. The follow is put after both merged.
-    /// Returns what is in force before the follow and after it, and whether the second reload
-    /// finished before the first merged.
+    /// the control, does not, and a second reload is started. With the delete, the first reload
+    /// awaits the second for up to [`SECOND_RELOAD_WAIT`] before it merges: without the lock the
+    /// second finishes in that time, whatever the load, and merges first; with it, it waits for the
+    /// first. The follow is put after both merged. Returns what is in force before the follow and
+    /// after it, and whether the second reload finished before the first merged.
     async fn overlapping_reloads(delete: bool) -> Option<(Option<String>, Option<String>, bool)> {
         let (a, t, tenant, _) = start("sweeper-sp-overlap").await?;
         let b = harness::backend().await.expect("instance B");
@@ -4252,7 +4254,6 @@ mod node_tests {
         let stamp = a.search_parameter_read_stamp();
         let mut row = None;
         let mut second = None;
-        let mut overlapped = false;
         a.load_stored_search_parameters_around(&t, async {
             let mut v2 = search_parameter(&url);
             v2["expression"] = serde_json::json!("Patient.gender");
@@ -4266,28 +4267,40 @@ mod node_tests {
                     .await
                     .expect("B's delete");
             }
-            let task = tokio::spawn({
+            let mut task = tokio::spawn({
                 let (a, t) = (a.clone(), t.clone());
                 async move { a.load_stored_search_parameters(&t).await }
             });
-            for _ in 0..50 {
-                if task.is_finished() {
-                    overlapped = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            second = Some(task);
+            // A finished `JoinHandle` cannot be awaited again, so its result is kept.
+            let finished = if delete {
+                tokio::time::timeout(SECOND_RELOAD_WAIT, &mut task)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            second = Some((task, finished));
         })
         .await
         .unwrap();
-        second.unwrap().await.expect("the second reload").unwrap();
+        let (task, finished) = second.unwrap();
+        let overlapped = finished.is_some();
+        match finished {
+            Some(result) => result,
+            None => task.await,
+        }
+        .expect("the second reload")
+        .unwrap();
         let row = row.expect("v2's row");
         assert_eq!(row.version_id, 2);
         let before = expression_of(&a, &tenant, &url);
         a.follow_stored_search_parameter(&t, "sp", Some(&row), stamp);
         Some((before, expression_of(&a, &tenant, &url), overlapped))
     }
+
+    /// How long the first reload of [`overlapping_reloads`] awaits the second, which only the lock
+    /// holds back; a reload of one SearchParameter takes milliseconds.
+    const SECOND_RELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
     #[tokio::test]
     async fn a_reload_called_during_another_does_not_bring_back_a_deleted_searchparameter() {
@@ -4307,10 +4320,7 @@ mod node_tests {
             deleted.2,
             control.2
         );
-        assert!(
-            !deleted.2 && !control.2,
-            "the second reload waits for the first"
-        );
+        assert!(!deleted.2, "the second reload waits for the first");
     }
 
     /// A SearchParameter created with every `resources_by_type` insert failing, so its intent is

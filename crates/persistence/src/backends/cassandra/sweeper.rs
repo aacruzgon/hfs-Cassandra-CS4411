@@ -2842,6 +2842,10 @@ mod node_tests {
         }
     }
 
+    /// A grace-0 pass over every intent enqueued before this call. The pass reads `[since, now)` in whole
+    /// milliseconds (SW7), so its `now` is one millisecond past the call, as `pending`'s `to` is: at
+    /// `Utc::now()` a pass taken in the same millisecond as an intent's stamp misses it (SW6's test, after
+    /// an I1 write of under a millisecond).
     async fn pass(
         backend: &CassandraBackend,
         tenants: &[&str],
@@ -2851,7 +2855,7 @@ mod node_tests {
             .sweep_pass(SweepOptions {
                 scope: SweepScope::Tenants(tenants.iter().map(|t| t.to_string()).collect()),
                 grace: Duration::ZERO,
-                now: Utc::now(),
+                now: Utc::now() + chrono::Duration::milliseconds(1),
                 since,
                 allow_short_grace: true,
             })
@@ -3524,10 +3528,11 @@ mod node_tests {
         .await;
         let lu2 = row_of(&backend, &t, "p").await.last_updated;
         let other = harness::backend().await.expect("a second backend");
+        // One millisecond past now, as `pass` does: the window's bound is in whole milliseconds (SW7).
         let options = SweepOptions {
             scope: SweepScope::Tenants(vec![t.clone()]),
             grace: Duration::ZERO,
-            now: Utc::now(),
+            now: Utc::now() + chrono::Duration::milliseconds(1),
             since,
             allow_short_grace: true,
         };
@@ -5434,11 +5439,13 @@ pub(crate) mod post_suite {
         since: DateTime<Utc>,
     ) -> PostSuiteReport {
         let started = Instant::now();
+        // One millisecond past now, so an intent stamped in this millisecond is in the window, whose bound
+        // is in whole milliseconds (SW7); every writer has returned by now.
         let sweep = backend
             .sweep_pass(SweepOptions {
                 scope: SweepScope::TenantPrefix(prefix.to_string()),
                 grace: Duration::ZERO,
-                now: Utc::now(),
+                now: Utc::now() + chrono::Duration::milliseconds(1),
                 since,
                 allow_short_grace: true,
             })

@@ -3432,7 +3432,8 @@ mod node_tests {
     }
 
     /// ADR-aacruzgon-0098: a backend whose grace (4 s) is SW4's least for its 2 s deadline, so a
-    /// test can hold a writer past it in real time; with a fresh tenant and `since`.
+    /// test can hold a writer past it in real time; with a fresh tenant and `since`. Its connect
+    /// timeout (1 s) stays under the request timeout, as #121's check requires.
     async fn start_short_grace(
         prefix: &str,
     ) -> Option<(Arc<CassandraBackend>, String, TenantContext, DateTime<Utc>)> {
@@ -3447,6 +3448,8 @@ mod node_tests {
         let backend = Arc::new(
             CassandraBackend::connect(crate::backends::cassandra::CassandraConfig {
                 contact_points: vec![url],
+                // Under the request timeout, as `connect` to a local node needs far less.
+                connect_timeout_ms: 1_000,
                 request_timeout_ms: 2_000,
                 sweeper_poll_interval_ms: 1_000,
                 sweeper_grace_ms: 4_000,

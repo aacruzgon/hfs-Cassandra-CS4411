@@ -316,6 +316,27 @@ const POST_CAS_WRITE_TRIES: u32 = 3;
 /// Index batches of one write in flight at once (IW12): futures inside the
 /// request's task, never `tokio::spawn`.
 pub(super) const INDEX_BATCHES_IN_FLIGHT: usize = 8;
+
+/// The level a write the node refuses as `Invalid` is logged at (ADR-aacruzgon-0090). The request
+/// path, and the sweeper's first three tries of an intent, log it at `error`. The sweeper's later
+/// tries log it at `warn`: by then its retry list has logged the refusal once at `error`, and a node
+/// set below what HFS needs refuses every try, every 5 minutes for 24 hours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefusalLog {
+    Error,
+    Warn,
+}
+
+/// A `tracing` event at a [`RefusalLog`]'s level: `log_refusal!(level, fields…, "message")`.
+macro_rules! log_refusal {
+    ($refusal:expr, $($arg:tt)+) => {
+        match $refusal {
+            $crate::backends::cassandra::write::RefusalLog::Error => tracing::error!($($arg)+),
+            $crate::backends::cassandra::write::RefusalLog::Warn => tracing::warn!($($arg)+),
+        }
+    };
+}
+pub(crate) use log_refusal;
 /// The most a CAS may carry, `data` plus `index_keys`, in bytes (ADR-aacruzgon-0053): half
 /// of the node's default `max_mutation_size` (16 MiB, half of the default
 /// 32 MiB `commitlog_segment_size`), which leaves room for the rest of the
@@ -2607,7 +2628,7 @@ impl CassandraBackend {
     /// Step 4 on plain inputs (IW17 = SW14, ADR-sam-michaels-0006): `row`
     /// `USING TIMESTAMP ts`, with up to `tries` tries. The request passes 3
     /// ([`POST_CAS_WRITE_TRIES`]); the sweeper, whose retry list already
-    /// retries, passes 1 per pass.
+    /// retries, passes 1 per pass. A refusal is logged at `error`.
     pub(crate) async fn write_version_row(
         &self,
         key: &RowKey<'_>,
@@ -2615,8 +2636,22 @@ impl CassandraBackend {
         ts: i64,
         tries: u32,
     ) -> Result<(), WriteFailure> {
+        self.write_version_row_logged(key, row, ts, tries, RefusalLog::Error)
+            .await
+    }
+
+    /// [`Self::write_version_row`], with a refusal logged at `refusal` (the
+    /// sweeper's later tries, ADR-aacruzgon-0090).
+    pub(crate) async fn write_version_row_logged(
+        &self,
+        key: &RowKey<'_>,
+        row: &VersionRow<'_>,
+        ts: i64,
+        tries: u32,
+        refusal: RefusalLog,
+    ) -> Result<(), WriteFailure> {
         let (cql, values) = version_row(key, row, ts);
-        self.write_with_retries(cql, values, "version row", tries)
+        self.write_with_retries(cql, values, "version row", tries, refusal)
             .await
     }
 
@@ -2676,13 +2711,27 @@ impl CassandraBackend {
         ts: i64,
         tries: u32,
     ) -> IndexOutcome {
-        let deadline = Duration::from_millis(self.config.request_timeout_ms);
-        self.write_index_delta_within(key, delta, ts, tries, deadline)
+        self.write_index_delta_logged(key, delta, ts, tries, RefusalLog::Error)
             .await
     }
 
-    /// [`Self::write_index_delta`] with the phase's deadline given, so a test
-    /// can make it short.
+    /// [`Self::write_index_delta`], with a refused batch logged at `refusal`
+    /// (the sweeper's later tries, ADR-aacruzgon-0090).
+    pub(crate) async fn write_index_delta_logged(
+        &self,
+        key: &RowKey<'_>,
+        delta: &IndexDelta<'_>,
+        ts: i64,
+        tries: u32,
+        refusal: RefusalLog,
+    ) -> IndexOutcome {
+        let deadline = Duration::from_millis(self.config.request_timeout_ms);
+        self.write_index_delta_within(key, delta, ts, tries, deadline, refusal)
+            .await
+    }
+
+    /// [`Self::write_index_delta_logged`] with the phase's deadline given, so
+    /// a test can make it short.
     async fn write_index_delta_within(
         &self,
         key: &RowKey<'_>,
@@ -2690,6 +2739,7 @@ impl CassandraBackend {
         ts: i64,
         tries: u32,
         deadline: Duration,
+        refusal: RefusalLog,
     ) -> IndexOutcome {
         let IndexBatches { batches, stats } = index_batches(key, delta, ts);
         let mut failures = Vec::new();
@@ -2701,7 +2751,7 @@ impl CassandraBackend {
         let ends_at = tokio::time::Instant::now() + deadline;
         let sends: Vec<_> = batches
             .iter()
-            .map(|batch| self.send_index_batch(batch, tries, ends_at))
+            .map(|batch| self.send_index_batch(batch, tries, ends_at, refusal))
             .collect();
         let sends = futures::stream::iter(sends)
             .buffer_unordered(INDEX_BATCHES_IN_FLIGHT)
@@ -2773,11 +2823,14 @@ impl CassandraBackend {
     /// `tokio::time::timeout` still bounds a try already in flight, but it
     /// polls its future before its timer, so on its own it would let a
     /// stalled writer start one more try after the deadline.
+    ///
+    /// A refusal is logged at `refusal`'s level ([`RefusalLog`]).
     async fn send_index_batch(
         &self,
         statements: &[IndexStatement],
         tries: u32,
         ends_at: tokio::time::Instant,
+        refusal: RefusalLog,
     ) -> Result<(), WriteFailure> {
         for attempt in 1..=tries {
             if tokio::time::Instant::now() >= ends_at {
@@ -2798,7 +2851,8 @@ impl CassandraBackend {
                     return Err(WriteFailure::InBatchlog);
                 }
                 BatchFailure::Refused => {
-                    tracing::error!(
+                    log_refusal!(
+                        refusal,
                         attempt,
                         statements = statements.len(),
                         error = ?error,
@@ -2824,13 +2878,15 @@ impl CassandraBackend {
 
     /// A plain, idempotent write with a fixed timestamp, tried up to `tries`
     /// times, 10 ms then 20 ms apart. An `Invalid` refusal is not retried:
-    /// the node refuses the same statement every time (IW17, RW9).
+    /// the node refuses the same statement every time (IW17, RW9). It is
+    /// logged at `refusal`'s level ([`RefusalLog`]).
     async fn write_with_retries(
         &self,
         cql: &str,
         values: Vec<Value>,
         what: &str,
         tries: u32,
+        refusal: RefusalLog,
     ) -> Result<(), WriteFailure> {
         for attempt in 1..=tries {
             match self
@@ -2840,7 +2896,8 @@ impl CassandraBackend {
             {
                 Ok(_) => return Ok(()),
                 Err(error) if is_invalid(&error) => {
-                    tracing::error!(
+                    log_refusal!(
+                        refusal,
                         attempt,
                         what,
                         error = ?error,
@@ -6348,6 +6405,7 @@ mod node_tests {
                 &batches[0],
                 POST_CAS_WRITE_TRIES,
                 tokio::time::Instant::now() + Duration::from_secs(60),
+                RefusalLog::Error,
             )
             .await;
         let spent = backend.statement_counts().since(&counted);
@@ -6656,6 +6714,7 @@ mod node_tests {
                 &statements,
                 POST_CAS_WRITE_TRIES,
                 tokio::time::Instant::now() + Duration::from_secs(60),
+                RefusalLog::Error,
             )
             .await;
         let spent = backend.statement_counts().since(&counted);
@@ -6689,6 +6748,7 @@ mod node_tests {
                 values,
                 "index row",
                 POST_CAS_WRITE_TRIES,
+                RefusalLog::Error,
             )
             .await;
         let spent = backend.statement_counts().since(&counted);
@@ -7514,6 +7574,7 @@ mod node_tests {
                 write_ts_of(lu2),
                 POST_CAS_WRITE_TRIES,
                 Duration::from_millis(15),
+                RefusalLog::Error,
             )
             .await;
         let elapsed = started.elapsed();
@@ -7573,6 +7634,7 @@ mod node_tests {
             write_ts_of(lu2),
             POST_CAS_WRITE_TRIES,
             Duration::from_millis(15),
+            RefusalLog::Error,
         );
         let mut phase = std::pin::pin!(phase);
         assert!(

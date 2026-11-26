@@ -63,7 +63,9 @@
 //! intent row until its TTL. A write the node refused is tried 3 times 5 s
 //! apart, then every 5 min until the same 24 hours: it is the node's settings,
 //! not the stored rows, and an operator can fix those without restarting HFS
-//! (ADR-aacruzgon-0090). The list holds at most [`RETRY_LIST_CAP`]
+//! (ADR-aacruzgon-0090). Its first three tries log at `error`, the third once
+//! more to say it is kept; later tries log at `warn`, the request path always
+//! at `error`. The list holds at most [`RETRY_LIST_CAP`]
 //! entries; when it is full the intent's shard keeps its mark, so the next
 //! poll reads it again. The intent row is never deleted for a failure.
 //!
@@ -120,8 +122,8 @@ use super::session::{DriverError, StatementKind};
 use super::stats::CasStats;
 use super::stats::IndexWriteStats;
 use super::write::{
-    INDEX_BATCHES_IN_FLIGHT, INTENT_SHARDS, IndexRow, IntentKey, RowKey, VersionKeys, VersionRow,
-    WriteFailure, bucket_of, index_delta, write_ts_of,
+    INDEX_BATCHES_IN_FLIGHT, INTENT_SHARDS, IndexRow, IntentKey, RefusalLog, RowKey, VersionKeys,
+    VersionRow, WriteFailure, bucket_of, index_delta, log_refusal, write_ts_of,
 };
 
 /// I3, one slice of one outbox partition (walkthrough section 2; SW7). Both bounds in whole milliseconds.
@@ -389,7 +391,8 @@ pub(crate) struct RetryList {
     gave_up: BTreeMap<RetryKey, DateTime<Utc>>,
     gave_up_order: std::collections::VecDeque<RetryKey>,
     /// Tries of intents that hit an invariant while the list was full, so the third still gives up
-    /// (SW13): each key with the order it was first counted in, and its count. At most `GAVE_UP_CAP`.
+    /// (SW13), and a refused write's fourth logs at `warn` ([`RetryList::refusal_log`]): each key with
+    /// the order it was first counted in, and its count. At most `GAVE_UP_CAP`.
     overflow_tries: BTreeMap<RetryKey, (u64, u32)>,
     overflow_seen: u64,
 }
@@ -467,9 +470,9 @@ impl RetryList {
         }
         if !self.entries.contains_key(&key) && self.entries.len() >= self.cap {
             // A bug is tried three times however full the list is (SW13); a transient failure, or a write the
-            // node refused, holds the mark (SW18).
-            if matches!(failure, Failure::Invariant(invariant) if invariant != Invariant::PermanentWrite)
-            {
+            // node refused, holds the mark (SW18). A refused write's tries are counted too, never to give up,
+            // only so that its fourth logs at `warn` (ADR-aacruzgon-0090).
+            if let Failure::Invariant(invariant) = failure {
                 let seen = self.overflow_seen;
                 let tries = {
                     let (_, tries) = self.overflow_tries.entry(key.clone()).or_insert((seen, 0));
@@ -477,7 +480,7 @@ impl RetryList {
                     *tries
                 };
                 self.overflow_seen += 1;
-                if tries >= INVARIANT_TRIES {
+                if invariant != Invariant::PermanentWrite && tries >= INVARIANT_TRIES {
                     let enqueued = intent.enqueued;
                     self.overflow_tries.remove(&key);
                     self.give_up(key, enqueued);
@@ -534,6 +537,24 @@ impl RetryList {
         }
         Queued::Retry {
             next_at: entry.next_at,
+        }
+    }
+
+    /// The level the next try of `intent` logs a refused write at (ADR-aacruzgon-0090): `warn` once the
+    /// list has counted `INVARIANT_TRIES` invariant failures for it, on the list or while it was full,
+    /// since the third refusal already logged at `error` that the sweeper keeps trying. Only a refused
+    /// write gets that far without giving up. `error` otherwise, and the request path always logs at
+    /// `error`.
+    pub(crate) fn refusal_log(&self, intent: &Intent) -> RefusalLog {
+        let key = retry_key(intent);
+        let tries = match self.entries.get(&key) {
+            Some(entry) => entry.invariant_failures,
+            None => self.overflow_tries.get(&key).map_or(0, |(_, tries)| *tries),
+        };
+        if tries >= INVARIANT_TRIES {
+            RefusalLog::Warn
+        } else {
+            RefusalLog::Error
         }
     }
 
@@ -1465,12 +1486,16 @@ impl CassandraBackend {
             .iter()
             .map(|intent| {
                 let cancel = cancel.clone();
+                // ADR-aacruzgon-0090: a refused write past its third try logs at `warn`.
+                let refusal = state.map_or(RefusalLog::Error, |state| {
+                    state.retry.lock().refusal_log(intent)
+                });
                 async move {
                     // SW3: an intent not yet started is skipped once shutdown is asked for.
                     if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
                         return None;
                     }
-                    Some((intent, self.process_intent(intent, rank).await))
+                    Some((intent, self.try_intent(intent, rank, refusal).await))
                 }
             })
             .collect();
@@ -1574,8 +1599,16 @@ impl CassandraBackend {
         }
     }
 
-    /// SW11 to SW16, SW19: one try of one intent.
+    /// SW11 to SW16, SW19: one try of one intent, a refused write logged at `error`. The tests' entry
+    /// point; the sweeper's own loop goes through [`Self::try_intent`] with its retry list's level.
+    #[cfg(test)]
     pub(crate) async fn process_intent(&self, intent: &Intent, rank: Rank) -> IntentResult {
+        self.try_intent(intent, rank, RefusalLog::Error).await
+    }
+
+    /// [`Self::process_intent`], with a refused write (`PermanentWrite`) logged at `refusal`
+    /// ([`RetryList::refusal_log`]); every other invariant is logged at `error`.
+    async fn try_intent(&self, intent: &Intent, rank: Rank, refusal: RefusalLog) -> IntentResult {
         let key = RowKey {
             tenant_id: &intent.tenant_id,
             resource_type: &intent.resource_type,
@@ -1595,9 +1628,12 @@ impl CassandraBackend {
         let case = IntentCase::of(version, row.as_ref().map(|row| row.version_id));
         self.sweeper.counters.case(case);
         let replay = match (case, row.as_ref()) {
-            (IntentCase::Current, Some(row)) => self.replay_current(&key, intent, row, rank).await,
+            (IntentCase::Current, Some(row)) => {
+                self.replay_current(&key, intent, row, rank, refusal).await
+            }
             (IntentCase::Superseded, Some(row)) => {
-                self.replay_superseded(&key, intent, row, rank).await
+                self.replay_superseded(&key, intent, row, rank, refusal)
+                    .await
             }
             _ => Replay {
                 result: Ok(()),
@@ -1608,7 +1644,13 @@ impl CassandraBackend {
         if let Err(failure) = replay.result {
             if let Failure::Invariant(invariant) = failure {
                 self.sweeper.counters.invariant();
-                tracing::error!(
+                let level = if invariant == Invariant::PermanentWrite {
+                    refusal
+                } else {
+                    RefusalLog::Error
+                };
+                log_refusal!(
+                    level,
                     tenant_id = %intent.tenant_id,
                     resource_type = %intent.resource_type,
                     id = %intent.id,
@@ -1804,19 +1846,23 @@ impl CassandraBackend {
         })
     }
 
-    /// Writes `delta` with the permits it needs, as the request does (IW17).
+    /// Writes `delta` with the permits it needs, as the request does (IW17), a refused batch logged at
+    /// `refusal`.
     async fn send_delta(
         &self,
         key: &RowKey<'_>,
         delta: &super::write::IndexDelta<'_>,
         ts: i64,
         rank: Rank,
+        refusal: RefusalLog,
     ) -> (Result<(), Failure>, IndexWriteStats) {
         let _permit = self
             .sweeper
             .permits(rank, delta.units.len().clamp(1, INDEX_BATCHES_IN_FLIGHT))
             .await;
-        let outcome = self.write_index_delta(key, delta, ts, SWEEPER_TRIES).await;
+        let outcome = self
+            .write_index_delta_logged(key, delta, ts, SWEEPER_TRIES, refusal)
+            .await;
         let result = match outcome.result {
             Ok(()) => Ok(()),
             Err(WriteFailure::Permanent) => Err(Failure::Invariant(Invariant::PermanentWrite)),
@@ -1832,6 +1878,7 @@ impl CassandraBackend {
         intent: &Intent,
         row: &ResourceRow,
         rank: Rank,
+        refusal: RefusalLog,
     ) -> Replay {
         let version = intent.version_id;
         if row.write_ts != Some(write_ts_of(row.last_updated)) {
@@ -1860,7 +1907,7 @@ impl CassandraBackend {
         let ts = write_ts_of(row.last_updated);
         let written = {
             let _permit = self.sweeper.permits(rank, 1).await;
-            self.write_version_row(
+            self.write_version_row_logged(
                 key,
                 &VersionRow {
                     version_id: version,
@@ -1873,6 +1920,7 @@ impl CassandraBackend {
                 },
                 ts,
                 SWEEPER_TRIES,
+                refusal,
             )
             .await
         };
@@ -1898,7 +1946,7 @@ impl CassandraBackend {
                 keys: &keys,
             },
         );
-        let (result, index) = self.send_delta(key, &delta, ts, rank).await;
+        let (result, index) = self.send_delta(key, &delta, ts, rank, refusal).await;
         Replay {
             result,
             index,
@@ -1914,6 +1962,7 @@ impl CassandraBackend {
         intent: &Intent,
         row: &ResourceRow,
         rank: Rank,
+        refusal: RefusalLog,
     ) -> Replay {
         let version = intent.version_id;
         if version <= 1 {
@@ -1971,7 +2020,7 @@ impl CassandraBackend {
                 noop: true,
             };
         }
-        let (result, index) = self.send_delta(key, &delta, ts, rank).await;
+        let (result, index) = self.send_delta(key, &delta, ts, rank, refusal).await;
         Replay {
             result,
             index,
@@ -2219,7 +2268,9 @@ mod tests {
     }
 
     /// ADR-aacruzgon-0090: a write the node refused is tried three times at `RETRY_FIRST`, then every
-    /// `RETRY_MAX` until the horizon. It never gives up, and a full list holds its mark.
+    /// `RETRY_MAX` until the horizon. It never gives up, and a full list holds its mark. Its first three
+    /// tries log at `error` and the later ones at `warn` (`refusal_log`), on the list or past its cap;
+    /// a bug never gets past `error`.
     #[test]
     fn a_refused_write_stays_on_the_retry_list_until_the_horizon() {
         let t0 = at("2026-11-22T10:00:00Z");
@@ -2227,14 +2278,17 @@ mod tests {
         let refused = Failure::Invariant(Invariant::PermanentWrite);
         let mut list = RetryList::new(RETRY_LIST_CAP);
         let five = t0 + chrono::Duration::seconds(5);
+        assert_eq!(list.refusal_log(&i), RefusalLog::Error, "try 1");
         assert_eq!(
             list.failed(i.clone(), refused, t0),
             Queued::Retry { next_at: five }
         );
+        assert_eq!(list.refusal_log(&i), RefusalLog::Error, "try 2");
         assert_eq!(
             list.failed(i.clone(), refused, t0),
             Queued::Retry { next_at: five }
         );
+        assert_eq!(list.refusal_log(&i), RefusalLog::Error, "try 3");
         let later = t0 + chrono::Duration::minutes(5);
         assert_eq!(
             list.failed(i.clone(), refused, t0),
@@ -2243,6 +2297,7 @@ mod tests {
                 first: true
             }
         );
+        assert_eq!(list.refusal_log(&i), RefusalLog::Warn, "try 4");
         assert!(list.owns(&i, t0));
         assert!(list.due(later - chrono::Duration::seconds(1)).is_empty());
         assert_eq!(list.due(later), vec![i.clone()]);
@@ -2267,10 +2322,30 @@ mod tests {
             full.failed(a, Failure::Transient("index"), t0),
             Queued::Retry { .. }
         ));
-        for _ in 0..4 {
+        for try_ in 1..=4 {
+            let expected = if try_ <= 3 {
+                RefusalLog::Error
+            } else {
+                RefusalLog::Warn
+            };
+            assert_eq!(full.refusal_log(&b), expected, "overflowed try {try_}");
             assert_eq!(full.failed(b.clone(), refused, t0), Queued::Overflow);
         }
         assert!(!full.owns(&b, t0));
+
+        // A bug gives up on its third try, and is logged at `error` on each.
+        let m = intent("m", t0);
+        let missing = Failure::Invariant(Invariant::MissingVersionRow);
+        let mut bugs = RetryList::new(RETRY_LIST_CAP);
+        for _ in 0..2 {
+            assert!(matches!(
+                bugs.failed(m.clone(), missing, t0),
+                Queued::Retry { .. }
+            ));
+            assert_eq!(bugs.refusal_log(&m), RefusalLog::Error);
+        }
+        assert_eq!(bugs.failed(m.clone(), missing, t0), Queued::GaveUp);
+        assert_eq!(bugs.refusal_log(&m), RefusalLog::Error);
     }
 
     /// P4: at most 32 statements in flight, the startup scan at most 8 of them.
@@ -2472,6 +2547,65 @@ mod node_tests {
     use crate::tenant::TenantContext;
 
     const SKIP: &str = "skipping: HFS_TEST_CASSANDRA_URL is not set";
+
+    /// Every event's level and message, recorded by a `tracing` subscriber set as this thread's default
+    /// (`tracing::subscriber::set_default`). A `#[tokio::test]` runs on one thread, and the sweeper polls
+    /// its intents and their batches as futures inside that task, never `tokio::spawn`, so its events
+    /// land here; other tests' threads keep their own. It needs no new dev-dependency.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<parking_lot::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl Captured {
+        /// Events at `level` whose message starts with `text`.
+        fn count(&self, level: tracing::Level, text: &str) -> usize {
+            self.0
+                .lock()
+                .iter()
+                .filter(|(at, message)| *at == level && message.starts_with(text))
+                .count()
+        }
+
+        /// The events at `warn` or `error`, for a failed assertion's message.
+        fn all(&self) -> Vec<(tracing::Level, String)> {
+            self.0
+                .lock()
+                .iter()
+                .filter(|(level, _)| *level <= tracing::Level::WARN)
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl tracing::Subscriber for Captured {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "message" {
+                        self.0 = value.to_string();
+                    }
+                }
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0.lock().push((*event.metadata().level(), message.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     /// A backend, a fresh tenant, and `since`, taken before the first write.
     async fn start(
@@ -3470,15 +3604,19 @@ mod node_tests {
         say("permanent", &backend, &before);
     }
 
-    /// ADR-aacruzgon-0090: a replay the node refuses as `Invalid` three times (a node set below what HFS
-    /// needs) stays on the retry list, so once the node takes the write again, the same process finishes it
-    /// at the next `RETRY_MAX` retry, without a restart. Before, it gave up and the resource stayed out of
-    /// `count` and search until a restart or the intent's TTL.
+    /// ADR-aacruzgon-0090: a replay the node refuses as `Invalid` (a node set below what HFS needs) stays
+    /// on the retry list, so once the node takes the write again, the same process finishes it at the next
+    /// `RETRY_MAX` retry, without a restart. Before, it gave up and the resource stayed out of `count` and
+    /// search until a restart or the intent's TTL. Each refused try is counted in `retries`. Tries 1 to 3
+    /// log the refusal at `error`, the third once more that the sweeper keeps trying; try 4 logs it at
+    /// `warn`, the batch's line and the sweeper's both.
     #[tokio::test]
     async fn a_refused_replay_is_finished_once_the_node_takes_it() {
         let Some((backend, t, tenant, since)) = start("sweeper-refused").await else {
             return;
         };
+        let logs = Captured::default();
+        let _logging = tracing::subscriber::set_default(logs.clone());
         let before = backend.sweeper_stats();
         let version = test_fhir_version();
         let (b, ten) = (backend.clone(), tenant.clone());
@@ -3486,7 +3624,7 @@ mod node_tests {
             b.create(&ten, "Patient", patient(), version).await
         })
         .await;
-        for _ in 0..3 {
+        for _ in 0..4 {
             backend.session.inject_fault(
                 StatementKind::Write,
                 "INSERT INTO resources_by_type",
@@ -3512,20 +3650,63 @@ mod node_tests {
             (
                 refused.invariant_violations,
                 refused.invariant_gave_up,
+                refused.retries,
                 refused.done
             ),
-            (3, 0, 0),
+            (3, 0, 3, 0),
             "{refused}"
         );
         assert_eq!(state.retry.lock().len(), 1);
         assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
         assert!(rbt_rows(&backend, &t, "p").await.is_empty());
         assert_eq!(count(&backend, &tenant).await, 0);
+        let batch = "index batch refused as invalid; not retried";
+        let hit = "an intent hit an invariant; its row is kept in the outbox";
+        let kept = "the node refused an intent's writes three times";
+        let lines = |logs: &Captured| {
+            [
+                (tracing::Level::ERROR, batch),
+                (tracing::Level::WARN, batch),
+                (tracing::Level::ERROR, hit),
+                (tracing::Level::WARN, hit),
+                (tracing::Level::ERROR, kept),
+            ]
+            .map(|(level, text)| logs.count(level, text))
+        };
+        assert_eq!(
+            lines(&logs),
+            [3, 0, 3, 0, 1],
+            "tries 1 to 3: {:?}",
+            logs.all()
+        );
 
-        // The faults are spent: the node takes the write. The retry due 5 minutes after the third try finishes it.
+        // Try 4, the retry 5 minutes after the third, is refused again: kept, counted, logged at `warn`.
         rewind(&state, start_mark);
         let report = backend
             .poll_once(&state, now + chrono::Duration::seconds(12 + 5 * 60), &scope)
+            .await;
+        assert_eq!(
+            (report.current, report.invariant, report.done),
+            (1, 1, 0),
+            "{report}"
+        );
+        let fourth = backend.sweeper_stats().since(&before);
+        assert_eq!(
+            (fourth.invariant_violations, fourth.retries),
+            (4, 4),
+            "{fourth}"
+        );
+        assert_eq!(state.retry.lock().len(), 1);
+        assert_eq!(lines(&logs), [3, 1, 3, 1, 1], "try 4: {:?}", logs.all());
+
+        // The faults are spent: the node takes the write. The retry due 5 minutes after try 4 finishes it.
+        rewind(&state, start_mark);
+        let report = backend
+            .poll_once(
+                &state,
+                now + chrono::Duration::seconds(12 + 10 * 60),
+                &scope,
+            )
             .await;
         assert_eq!((report.current, report.done), (1, 1), "{report}");
         assert_eq!(state.retry.lock().len(), 0);

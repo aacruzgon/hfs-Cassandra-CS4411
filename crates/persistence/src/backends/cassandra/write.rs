@@ -2888,9 +2888,9 @@ impl CassandraBackend {
                     version_id = delta.version_id,
                     failed = failures.len(),
                     index = %stats,
-                    "index batches not confirmed; repair on read keeps no intent, so only a \
-                     later search's repair, or the sweeper replaying an intent the original \
-                     write kept, tries them again"
+                    "index batches not confirmed; repair on read keeps no intent, so apart from \
+                     the batchlog's replay of a batch it holds, only a later search's repair, or \
+                     the sweeper replaying an intent the original write kept, tries them again"
                 ),
             }
             Err([

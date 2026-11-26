@@ -1584,7 +1584,7 @@ mod tests {
             );
         }
         let request_line = logged_lines!("the intent is kept for the sweeper");
-        let repair_line = logged_lines!("repair on read keeps no intent, so only");
+        let repair_line = logged_lines!("repair on read keeps no intent, so apart from");
         let repair_failed = logged_lines!("repair on read did not confirm every index batch");
         let repaired = logged_lines!("repair on read wrote the current version's index rows");
         assert!(request_line.is_empty(), "{request_line:?}");

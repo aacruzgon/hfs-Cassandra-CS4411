@@ -360,6 +360,12 @@ jobs:
       HFS_FEATURES: R4,R4B,R5,R6,cassandra,sqlite,helios-fhir/skip-r6-download
       CI_REPORT_PROFILE: dev (line-tables-only debug info, CARGO_INCREMENTAL=0)
       CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The lib test every lib run below skips: the batch of exactly 65,535
+      # statements (ADR-aacruzgon-0089), which the required job runs alone
+      # in a step of its own (fmt-clippy-cassandra.yml). Under a whole lib
+      # run it timed out on sam-7900x (R4 lib, run 45783764882 on main), and
+      # it binds the FHIR version only as a column's text.
+      AT_LIMIT_TEST: backends::cassandra::session::node_tests::a_batch_over_the_statement_limit_is_refused_and_sends_nothing
     steps:
       # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
       # the runner's own .env. Two instances on one machine share gh-runner's
@@ -521,7 +527,8 @@ jobs:
       # For each version, the three suites, each against this node and each
       # into its own log, $RUNNER_TEMP/ci-report/logs/fhir-<version>-<suite>.log,
       # which ends with `exit=<status>` for the report below:
-      #   lib    the backend's unit tests (--lib backends::cassandra); its
+      #   lib    the backend's unit tests (--lib backends::cassandra), all
+      #          but $AT_LIMIT_TEST (see the job's env); its
       #          restart_tests skip without HFS_TEST_CASSANDRA_RESTART_*,
       #          which this job never sets. R6's run, the last, also sets
       #          HFS_TEST_CASSANDRA_LARGE=1 for the full-size byte-cut test
@@ -586,7 +593,7 @@ jobs:
             if [ "$version" = R6 ]; then large=(env HFS_TEST_CASSANDRA_LARGE=1); fi
             run_suite "$version" lib "${large[@]}" \
               cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
-                --lib -- backends::cassandra --nocapture
+                --lib -- backends::cassandra --nocapture --skip "${AT_LIMIT_TEST:?}"
             run_suite "$version" tests \
               cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
                 --test cassandra_tests --test backend_capability_contract --no-fail-fast -- --nocapture

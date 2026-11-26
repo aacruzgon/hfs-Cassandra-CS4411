@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0099: A SearchParameter follow is stamped before its read, and a reload that began after the stamp wins over it unless it read the id at an older version (amends ADR-sam-michaels-0006 SW19 and ADR-aacruzgon-0068)
 
 - **Date:** 2026-11-26
-- **Status:** proposed
+- **Status:** accepted (Alan confirmed the entry on 2026-11-26)
 - **Context:**
     - **The overlay and the follow.** Each instance keeps, per tenant, the stored SearchParameters it serves (ADR-aacruzgon-0041, 0062). The TTL refresh (`HFS_SEARCH_PARAM_CACHE_TTL`) reloads them: it lists the tenant's ids from `resources_by_type` (`stored_search_parameter_ids`, `backend.rs`) and reads each one. Between reloads, `follow_stored_search_parameter` makes an id's entry follow a row read from `resources`. It is called by the sweeper after it replays a SearchParameter intent (ADR-sam-michaels-0006 SW19: "After replaying a SearchParameter, call `follow_stored_search_parameter` with the row it read", `0006-step-5-design.md:221`), and by the writes of ADR-aacruzgon-0068 (the serial read-back after an unknown outcome, the delete's catch-up on R1, and its catch-up after a missed C3).
     - **The gap (#107 V1, and CodeRabbit's C7).** A follow applies a row read earlier, and a reload can complete between that read and the follow. A delete removes the id's `resources_by_type` row, so a reload after the delete does not list the id, reads nothing for it, and records no removal; `merge_reload` drops A's old definition without trace. The follow then puts the row it read before the delete back in force, until the next reload. It also happens for an id the instance never held, as when its sweeper finishes another instance's create. `22a75941d` (on #107) closed the retirement case, because a retired row is still listed and read and becomes a removal, and narrowed `merge_reload`'s doc to say the delete case is open.
@@ -56,7 +56,7 @@
     - **Sam can add a pointer to this entry beside SW19 in his log;** this entry does not edit it.
 - **AI involvement:** Claude Code (Claude Opus 5.5), the worker `v1-reload-follow`, in a session run by Alan.
     - **What it proposed:** the validator's recommendation, checked against every caller of `follow_stored_search_parameter`. That check found the in-flight order and the SW19 regression, and led to the stamp-at-read form and the sweeper's re-read above.
-    - **What the human changed:** Alan approved the recommendation on 2026-11-26 ("the open items lets go with the recommendations as long as they follow what would be appropriate for the specs"); he has not yet confirmed this entry's text. After the independent audit of #122 (`pr106-audit`, report `report-pr122.md`), the orchestrator chose its fixes under Alan's approval: F1's exception above (`c7606a75b`), T1's tests (`5e2588f89`), and A1 and A2 in this text.
+    - **What the human changed:** Alan approved the recommendation on 2026-11-26 ("the open items lets go with the recommendations as long as they follow what would be appropriate for the specs"); he had not yet confirmed this entry's text when it was drafted. After the independent audit of #122 (`pr106-audit`, report `report-pr122.md`), the orchestrator chose its fixes under Alan's approval: F1's exception above (`c7606a75b`), T1's tests (`5e2588f89`), and A1 and A2 in this text. Alan confirmed the entry on 2026-11-26 ('i also confirm all the ADRS').
     - **What was verified, and how:**
         - the FHIR pages above, per version, fetched on 2026-11-26;
         - the SQLite and PostgreSQL code cited above;

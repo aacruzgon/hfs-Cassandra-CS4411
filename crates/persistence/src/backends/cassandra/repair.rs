@@ -617,7 +617,7 @@ fn outcomes_of<'a, P: 'a, C>(
 /// `ends_at` passes; the ones unfinished then are dropped. None waits for
 /// another to finish before it starts.
 ///
-/// Each wake polls every running future once, and a future that finishes
+/// Each wake polls every started future once, and a future that finishes
 /// makes room for the next one at once, but a future admitted after the
 /// first fill is first polled only if the clock, read just before that poll,
 /// is before `ends_at`; one that is not stays unstarted and is dropped with
@@ -2111,6 +2111,25 @@ mod tests {
     async fn both_replacements_admitted_before_the_deadline_start_before_it() {
         let second = second_replacement_first_polled(Duration::from_millis(2)).await;
         assert_eq!(second, Some(-3_000));
+    }
+
+    /// The check's boundary: the first replacement's first poll ends exactly
+    /// on the deadline (5 ms + 5 ms = 10 ms), so the second's check finds the
+    /// clock at `ends_at`, which is not before it, and leaves it unstarted.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_reached_exactly_on_the_deadline_stays_unstarted() {
+        let second = second_replacement_first_polled(Duration::from_millis(5)).await;
+        assert_eq!(second, None, "first polled {second:?} us from the deadline");
+    }
+
+    /// The control of the test above: reached 1 us before the deadline, the
+    /// second replacement starts.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_reached_just_before_the_deadline_starts() {
+        let second =
+            second_replacement_first_polled(Duration::from_millis(5) - Duration::from_micros(1))
+                .await;
+        assert_eq!(second, Some(-1));
     }
 
     #[test]

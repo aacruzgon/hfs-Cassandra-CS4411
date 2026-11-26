@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0095: The 65,535-statement batch test runs alone, in a step of its own (amends ADR-aacruzgon-0054)
 
 - **Date:** 2026-11-26
-- **Status:** proposed (drafted under Alan's delegation of 2026-11-25, applied to this pull request; awaiting Alan's confirmation of its text)
+- **Status:** accepted (Alan confirmed the text on 2026-11-26, after PR #119 merged)
 - **Context:**
     - **The test.** `a_batch_over_the_statement_limit_is_refused_and_sends_nothing` (`session.rs`, ADR-aacruzgon-0089) sends one batch of exactly 65,535 statements, all writing one `resources_by_type` row. ADR-aacruzgon-0054 put it in the required job's step "cargo test --lib backends::cassandra against this node", where it runs alongside the rest of the suite, at libtest's default thread count.
     - **The failure.** On `sam-7900x` the batch timed out with `WriteTimeout` ("received only 0 responses", `LOCAL_QUORUM`, write type `SIMPLE`). The CQL audit check then failed as well ("cannot rule out a CQL DELETE: a failed native-protocol batch"), as ADR-aacruzgon-0058 foresaw for a timed-out native batch. The record of the schema job, from 2026-11-25 to 2026-11-26:
@@ -62,7 +62,7 @@
         - `actionlint` (the same 3 `runner.workspace` findings as on `main`) and `zizmor` (no findings) on both workflows.
 
       An independent audit of PR #119, by a reviewer the author did not brief, recounted the CI record (8 of 9 and 17 of 17, and the second FHIR versions failure) and found nothing blocking.
-    - **What the human changed:** Alan's delegation of 2026-11-25 ('go with any recommendations when it comes to make the decisions so you can merge the PR') was given for PRs #107, #106 and #109. The orchestrator applied it to this pull request on 2026-11-26, because #106's required check fails on sam-7900x without it. Alan has not yet read this entry, and may amend or supersede it in a later entry.
+    - **What the human changed:** Alan's delegation of 2026-11-25 ('go with any recommendations when it comes to make the decisions so you can merge the PR') was given for PRs #107, #106 and #109. The orchestrator applied it to this pull request on 2026-11-26, because #106's required check fails on sam-7900x without it. Alan has not yet read this entry, and may amend or supersede it in a later entry. *Update 2026-11-26:* Alan read the entry after PR #119 merged and approved its text unchanged.
 - **Links:**
     - PR #119 (`ci/cassandra-at-limit-headroom`), with commits `0204d817b` (the test prints its batch time), `746f78a0a` (the required job's new step), `32dac4c3f` (the FHIR versions skip), `6a6fff10b` (the `--skip` guard in both workflows), `00acc2555` (the report section written on a failed test too) and `8c0d4ea70` (the guard keeps cargo's errors and fails on a failed listing);
     - amends [ADR-aacruzgon-0054](../2026-11-06/0054-required-job-lib-step.md) (the `--lib` step's command);

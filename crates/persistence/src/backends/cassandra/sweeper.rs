@@ -1055,7 +1055,6 @@ pub enum SweepError {
     ShortGrace { grace_ms: u64, configured_ms: u64 },
 }
 
-/// SW28: refuses a grace below the configured one unless `allow_short_grace`. Pure.
 /// SW28: the end of a pass at `now` with `grace`, in whole milliseconds. `None` when the grace is past
 /// what a timestamp can hold (`chrono` would panic on the subtraction): no intent is old enough, so
 /// the pass is empty.
@@ -1064,6 +1063,7 @@ fn pass_end(now: DateTime<Utc>, grace: Duration) -> Option<DateTime<Utc>> {
     now.checked_sub_signed(grace).map(whole_ms)
 }
 
+/// SW28: refuses a grace below the configured one unless `allow_short_grace`. Pure.
 fn check_grace(
     grace: Duration,
     allow_short_grace: bool,

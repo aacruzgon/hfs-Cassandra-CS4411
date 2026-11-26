@@ -3710,8 +3710,8 @@ mod node_tests {
     /// search until a restart or the intent's TTL. Each refused try is counted in `retries`. Tries 1 to 3
     /// log the refusal at `error`, the third once more that the sweeper keeps trying; try 4 logs it at
     /// `warn`, the batch's line and the sweeper's both. Each try's unconfirmed batches are logged as
-    /// leaving the intent queued for the sweeper's next try, never as kept for the sweeper, which is
-    /// the request path's line.
+    /// leaving the intent row in the outbox, never as kept for the sweeper, which is the request path's
+    /// line.
     #[tokio::test]
     async fn a_refused_replay_is_finished_once_the_node_takes_it() {
         let Some((backend, t, tenant, since)) = start("sweeper-refused").await else {
@@ -3765,8 +3765,7 @@ mod node_tests {
         let batch = "index batch refused as invalid; not retried";
         let hit = "an intent hit an invariant; its row is kept in the outbox";
         let kept = "the node refused an intent's writes three times";
-        let queued =
-            "index batches not confirmed; the intent stays queued for the sweeper's next try";
+        let stays = "index batches not confirmed; the intent row stays in the outbox";
         let request = "index batches not confirmed; the intent is kept for the sweeper";
         let lines = |logs: &Captured| {
             [
@@ -3775,7 +3774,7 @@ mod node_tests {
                 (tracing::Level::ERROR, hit),
                 (tracing::Level::WARN, hit),
                 (tracing::Level::ERROR, kept),
-                (tracing::Level::WARN, queued),
+                (tracing::Level::WARN, stays),
                 (tracing::Level::WARN, request),
             ]
             .map(|(level, text)| logs.count(level, text))

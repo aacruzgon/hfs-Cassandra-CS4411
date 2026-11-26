@@ -328,8 +328,10 @@ pub(crate) enum RefusalLog {
 }
 
 /// Who writes an index delta, for the line logged when one of its batches is
-/// not confirmed: a request leaves the intent for the sweeper, and the sweeper
-/// leaves it queued for its own next try.
+/// not confirmed: a request leaves the intent for the sweeper. The sweeper's
+/// line says only that the intent row stays in the outbox, since it is logged
+/// before the sweeper knows whether it tries again (at the 24 hour horizon it
+/// does not, and the row stays until its TTL).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeltaWriter {
     Request,
@@ -2825,7 +2827,7 @@ impl CassandraBackend {
                     version_id = delta.version_id,
                     failed = failures.len(),
                     index = %stats,
-                    "index batches not confirmed; the intent stays queued for the sweeper's next try"
+                    "index batches not confirmed; the intent row stays in the outbox"
                 ),
             }
             Err([

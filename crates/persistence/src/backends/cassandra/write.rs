@@ -2183,6 +2183,38 @@ fn cas_may_outlive_grace(held: Duration, request_timeout: Duration, grace: Durat
     held.saturating_add(request_timeout) >= grace
 }
 
+/// ADR-aacruzgon-0098: when an attempt's intent was stamped, on both clocks.
+#[derive(Debug, Clone, Copy)]
+struct Stamp {
+    /// Monotonic: counts a frozen thread, `SIGSTOP` and a starved runtime, whatever the wall clock does.
+    monotonic: std::time::Instant,
+    /// The intent's own `enqueued_at`, the time the sweeper compares with its own wall clock.
+    wall: DateTime<Utc>,
+}
+
+impl Stamp {
+    fn now() -> Self {
+        Self {
+            monotonic: std::time::Instant::now(),
+            wall: Utc::now(),
+        }
+    }
+
+    /// How long the request has been held since this stamp: see [`held_since`].
+    fn held(&self) -> Duration {
+        held_since(self.monotonic.elapsed(), Utc::now() - self.wall)
+    }
+}
+
+/// ADR-aacruzgon-0098: the time held since an intent's stamp, the larger of the monotonic clock's
+/// `monotonic` and the wall clock's `wall` (a negative `wall`, from a clock stepped back, counts as
+/// 0). `std::time::Instant` does not count a system suspend on Linux (`CLOCK_MONOTONIC`) or macOS
+/// (`CLOCK_UPTIME_RAW`), but the sweeper judges an intent's age by the wall clock, which does. A
+/// wall clock stepped forward only adds a harmless fresh intent. Pure.
+fn held_since(monotonic: Duration, wall: chrono::Duration) -> Duration {
+    monotonic.max(wall.to_std().unwrap_or(Duration::ZERO))
+}
+
 impl CassandraBackend {
     /// A new request on the partition `key`; `operation` names it in errors
     /// and logs.
@@ -2238,8 +2270,8 @@ impl CassandraBackend {
                     .map_err(|error| request.statement_error(&error, "previous version row"))?;
             }
             // SW6 = IW18 (ADR-sam-michaels-0006): stamped after V3, just before I1, so the grace covers only I1's latency and clock skew.
-            let mut stamped = std::time::Instant::now();
-            attempt.intent = IntentKey::new(key.tenant_id, key.id, Utc::now());
+            let mut stamped = Stamp::now();
+            attempt.intent = IntentKey::new(key.tenant_id, key.id, stamped.wall);
             request.attempts[index].intent = attempt.intent.clone();
             // ADR-aacruzgon-0098: a test can hold the request between the stamp and I1.
             #[cfg(test)]
@@ -2259,14 +2291,14 @@ impl CassandraBackend {
                 .await;
             // ADR-aacruzgon-0098, refining SW6: the CAS is sent only while it is sure to end, at
             // HFS's own deadline, within the grace of its intent's stamp. A request held up since
-            // the stamp (a frozen thread or process: there is no await between the stamp and the
-            // statement's deadline but I1's own) could otherwise apply its CAS after a running
+            // the stamp (a frozen thread or process, a starved runtime, a suspended host: there is
+            // no await between the stamp and the statement's deadline but I1's own) could otherwise apply its CAS after a running
             // sweeper passed its intent by, or took it for one that never applied and deleted it;
             // a crash before `finish` would then leave the write for the next startup scan, or for
             // no one. So it writes a fresh intent, stamped now, first. The earlier intent stays:
             // a replay of a CAS that applied, or one that never did, is harmless (SW22).
             while cas_may_outlive_grace(
-                stamped.elapsed(),
+                stamped.held(),
                 Duration::from_millis(self.config.request_timeout_ms),
                 self.config.sweeper_grace(),
             ) {
@@ -2275,12 +2307,12 @@ impl CassandraBackend {
                     resource_type = key.resource_type,
                     id = %key.id,
                     version_id = plan.target_version(),
-                    held_ms = stamped.elapsed().as_millis() as u64,
+                    held_ms = stamped.held().as_millis() as u64,
                     "request held up since its intent was stamped; writing a fresh intent before the compare-and-swap"
                 );
                 request.stats.intent_restamped();
-                stamped = std::time::Instant::now();
-                attempt.intent = IntentKey::new(key.tenant_id, key.id, Utc::now());
+                stamped = Stamp::now();
+                attempt.intent = IntentKey::new(key.tenant_id, key.id, stamped.wall);
                 request.attempts[index].intent = attempt.intent.clone();
                 self.write_intent(
                     &attempt.intent,
@@ -3185,6 +3217,38 @@ mod tests {
             timeout,
             least
         ));
+    }
+
+    /// ADR-aacruzgon-0098 (the audit of #123, F2): the time held is the larger of the two clocks, so
+    /// a suspended host, whose wall clock moved on while `Instant` did not, still writes a fresh
+    /// intent; a wall clock stepped back counts as 0 and leaves the monotonic time.
+    #[test]
+    fn the_time_held_counts_a_suspend_the_monotonic_clock_misses() {
+        let (timeout, grace) = (Duration::from_secs(10), Duration::from_secs(30));
+        let held = held_since(Duration::from_millis(5), chrono::Duration::seconds(25));
+        assert_eq!(held, Duration::from_secs(25));
+        assert!(cas_may_outlive_grace(held, timeout, grace));
+        // Without the wall clock, the 5 ms the monotonic clock saw would not.
+        assert!(!cas_may_outlive_grace(
+            Duration::from_millis(5),
+            timeout,
+            grace
+        ));
+        assert_eq!(
+            held_since(Duration::from_secs(21), chrono::Duration::seconds(-3600)),
+            Duration::from_secs(21)
+        );
+        assert_eq!(
+            held_since(
+                Duration::from_secs(3),
+                chrono::Duration::milliseconds(2_500)
+            ),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            held_since(Duration::ZERO, chrono::Duration::MIN),
+            Duration::ZERO
+        );
     }
 
     fn server(ty: ErrorType) -> DriverError {

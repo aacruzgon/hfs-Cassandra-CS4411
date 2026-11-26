@@ -61,17 +61,22 @@
 //! 20 s and so on up to 5 min, and dropped only 24 hours after it was
 //! enqueued. A bug (an invariant) is tried 3 times and then left on the
 //! intent row until its TTL. A write the node refused is tried 3 times 5 s
-//! apart, then every 5 min until the same 24 hours: it is the node's settings,
-//! not the stored rows, and an operator can fix those without restarting HFS
-//! (ADR-aacruzgon-0090). Its first three tries log at `error`, the third once
-//! more to say it is kept; later tries log at `warn`, the request path always
-//! at `error`. The list holds at most [`RETRY_LIST_CAP`]
+//! apart, then every 5 min until the same 24 hours: it is the node's
+//! settings, not the stored rows, and an operator can fix those without
+//! restarting HFS (ADR-aacruzgon-0090). Its first three tries log at `error`,
+//! the third once more to say it is kept; later tries log at `warn`, the
+//! request path always at `error`. The list holds at most [`RETRY_LIST_CAP`]
 //! entries; when it is full the intent's shard keeps its mark, or its startup
 //! or held slice stays held, so a later poll reads it again. The poll, and
 //! the startup scan at most once a minute, log at `error` that the list is
-//! full (SW18). A refused
-//! write the full list cannot take is not counted and logs at `warn`. The
-//! intent row is never deleted for a failure.
+//! full (SW18). A refused write the full list cannot take is not counted
+//! toward its tries, though `invariant_violations` and `overflow` still count
+//! it, and logs at `warn`. SW13's count of a bug's tries off the list holds
+//! at most `GAVE_UP_CAP` (10,000) keys, the oldest first out: with more bugs
+//! than that failing at once past a full list, each is evicted before its
+//! third try, so none gives up; they are replayed on every poll, each try
+//! logged at `error`, until the list has room. The intent row is never
+//! deleted for a failure.
 //!
 //! # The load limit (RW4)
 //!
@@ -488,9 +493,10 @@ impl RetryList {
             return Queued::Expired;
         }
         if !self.entries.contains_key(&key) && self.entries.len() >= self.cap {
-            // A bug is tried three times however full the list is (SW13); a transient failure, or a write the
-            // node refused, holds the mark (SW18) and is not counted. A refused write off the list logs at
-            // `warn` (`refusal_log`); the poll's "retry list is full" line is the `error` (ADR-aacruzgon-0090).
+            // A bug is tried three times however full the list is (SW13), up to `GAVE_UP_CAP` of them; a
+            // transient failure, or a write the node refused, holds the mark (SW18) and is not counted
+            // toward its tries. A refused write off the list logs at `warn` (`refusal_log`); the "retry
+            // list is full" line is the `error` (ADR-aacruzgon-0090).
             if matches!(failure, Failure::Invariant(invariant) if invariant != Invariant::PermanentWrite)
             {
                 let seen = self.overflow_seen;
@@ -564,8 +570,9 @@ impl RetryList {
     /// list has counted `INVARIANT_TRIES` invariant failures for its entry, since the third refusal
     /// already logged at `error` that the sweeper keeps trying (only a refused write gets that far
     /// without giving up), and `warn` when it has no entry and the list is full, so a refusal could not
-    /// be queued: it is not counted, and the poll's "retry list is full" line is the `error`. `error`
-    /// otherwise, and the request path always logs at `error`.
+    /// be queued: it is not counted toward its tries (`invariant_violations` and `overflow` still count
+    /// it), and the "retry list is full" line is the `error`. `error` otherwise, and the request path
+    /// always logs at `error`.
     pub(crate) fn refusal_log(&self, intent: &Intent) -> RefusalLog {
         match self.entries.get(&retry_key(intent)) {
             Some(entry) if entry.invariant_failures >= INVARIANT_TRIES => RefusalLog::Warn,
@@ -2401,11 +2408,12 @@ mod tests {
         assert_eq!(bugs.refusal_log(&m), RefusalLog::Error);
     }
 
-    /// ADR-aacruzgon-0090 and SW13 on a full list: refused writes the list cannot take are not counted,
-    /// so a data bug among them still gives up on its third try even with more of them than
-    /// `GAVE_UP_CAP`, every refusal logs at `warn`, and only the bugs are in `overflow_tries` (no insert,
-    /// so no eviction scan, for a refusal). Each round, the list fails the same intents in the same
-    /// order, as a held shard is read again on every poll: a bug first, the refusals, then a bug last.
+    /// ADR-aacruzgon-0090 and SW13 on a full list: refused writes the list cannot take are not counted
+    /// toward their tries, so a data bug among them still gives up on its third try even with more
+    /// refusals than `GAVE_UP_CAP` (more bugs than that do not, as the module doc says), every refusal
+    /// logs at `warn`, and only the bugs are in `overflow_tries` (no insert, so no eviction scan, for a
+    /// refusal). Each round, the list fails the same intents in the same order, as a held shard is
+    /// read again on every poll: a bug first, the refusals, then a bug last.
     #[test]
     fn past_a_full_list_refusals_are_not_counted_and_a_bug_still_gives_up() {
         let t0 = at("2026-11-22T10:00:00Z");

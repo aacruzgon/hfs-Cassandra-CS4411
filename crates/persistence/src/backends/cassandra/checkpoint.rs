@@ -25,6 +25,9 @@ const REACH_TIMEOUT: Duration = Duration::from_secs(30);
 // The names are RV16's; each says where the request is, so the shared prefix stays.
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum Checkpoint {
+    /// After the intent's stamp, before I1 (`run_cas`): nothing of this attempt is written yet
+    /// (ADR-aacruzgon-0098).
+    AfterStamp,
     /// After I1, before the CAS (`run_cas`): the intent exists, nothing else changed.
     AfterIntent,
     /// After a CAS that applied, before step 4 (`finish`), superseded or not.
@@ -236,6 +239,7 @@ mod tests {
         };
         let t = tenant_id("crash-checkpoint-hold");
         let mut holds: Vec<Hold> = [
+            Checkpoint::AfterStamp,
             Checkpoint::AfterIntent,
             Checkpoint::AfterCas,
             Checkpoint::AfterVersionRow,
@@ -254,6 +258,16 @@ mod tests {
             }
         });
         let mut next = holds.drain(..);
+
+        let mut hold = next.next().unwrap();
+        hold.reached().await;
+        assert!(
+            backend
+                .intent_versions(&t, "Patient", "p", since)
+                .await
+                .is_empty()
+        );
+        hold.release();
 
         let mut hold = next.next().unwrap();
         hold.reached().await;
@@ -327,6 +341,7 @@ mod tests {
             return;
         };
         for (point, name) in [
+            (Checkpoint::AfterStamp, "after-stamp"),
             (Checkpoint::AfterIntent, "after-intent"),
             (Checkpoint::AfterCas, "after-cas"),
             (Checkpoint::AfterVersionRow, "after-version-row"),
@@ -369,7 +384,7 @@ mod tests {
                 .unwrap();
             let report = check(&backend, &t).await;
             let (r1_version, versions, want): (i32, Vec<i32>, Vec<&str>) = match point {
-                Checkpoint::AfterIntent => (1, vec![1], vec![]),
+                Checkpoint::AfterStamp | Checkpoint::AfterIntent => (1, vec![1], vec![]),
                 Checkpoint::AfterCas | Checkpoint::AfterVersionRow => {
                     let k2 = index_keys::decode(r1.index_keys.as_deref().unwrap())
                         .unwrap()
@@ -391,9 +406,15 @@ mod tests {
                 versions,
                 "{name}"
             );
+            // Aborted after the stamp, the request never wrote its intent.
+            let intents: &[i32] = if point == Checkpoint::AfterStamp {
+                &[]
+            } else {
+                &[2]
+            };
             assert_eq!(
                 backend.intent_versions(&t, "Patient", "p", since).await,
-                [2],
+                intents,
                 "{name}"
             );
             assert_eq!(report.kinds(), want, "{name}: {report}");

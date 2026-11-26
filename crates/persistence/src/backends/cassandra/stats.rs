@@ -135,6 +135,10 @@ cas_counters! {
     /// Applied writes whose version or index rows still failed after their
     /// retries, leaving the intent row for the sweeper (G23).
     post_cas_failures,
+    /// Fresh intent rows written before a CAS because the request was held
+    /// up so long since its intent's stamp that the CAS could end past the
+    /// sweeper's grace (ADR-aacruzgon-0098).
+    intent_restamps,
     /// Writes refused before any statement because what the CAS would carry
     /// is over the size bound.
     too_large,
@@ -346,6 +350,10 @@ impl CasCounters {
 
     pub(crate) fn post_cas_failure(&self) {
         Self::bump(&self.post_cas_failures);
+    }
+
+    pub(crate) fn intent_restamped(&self) {
+        Self::bump(&self.intent_restamps);
     }
 
     pub(crate) fn too_large(&self) {

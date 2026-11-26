@@ -3431,6 +3431,218 @@ mod node_tests {
         assert_consistent(&check(&backend, &t).await);
     }
 
+    /// ADR-aacruzgon-0098: a backend whose grace (4 s) is SW4's least for its 2 s deadline, so a
+    /// test can hold a writer past it in real time; with a fresh tenant and `since`.
+    async fn start_short_grace(
+        prefix: &str,
+    ) -> Option<(Arc<CassandraBackend>, String, TenantContext, DateTime<Utc>)> {
+        let Ok(url) = std::env::var("HFS_TEST_CASSANDRA_URL") else {
+            eprintln!("{SKIP}");
+            return None;
+        };
+        if url.trim().is_empty() {
+            eprintln!("{SKIP}");
+            return None;
+        }
+        let backend = Arc::new(
+            CassandraBackend::connect(crate::backends::cassandra::CassandraConfig {
+                contact_points: vec![url],
+                request_timeout_ms: 2_000,
+                sweeper_poll_interval_ms: 1_000,
+                sweeper_grace_ms: 4_000,
+                ..crate::backends::cassandra::test_support::test_config()
+            })
+            .await
+            .expect("connect"),
+        );
+        let t = tenant_id(prefix);
+        let tenant = context(&t);
+        Some((
+            backend,
+            t,
+            tenant,
+            Utc::now() - chrono::Duration::seconds(5),
+        ))
+    }
+
+    /// ADR-aacruzgon-0098: a running sweeper's state for `t` (marks two minutes back) and its scope.
+    fn running(t: &str) -> (SweepState, SweepScope) {
+        (
+            SweepState::new(
+                Utc::now() - chrono::Duration::minutes(2),
+                CancellationToken::new(),
+            ),
+            SweepScope::Tenants(vec![t.to_string()]),
+        )
+    }
+
+    /// ADR-aacruzgon-0098: a create held at `held` for longer than the grace while a running sweeper
+    /// polls, then crashed after its CAS. Returns the poll made during the hold and the CAS counters
+    /// the create spent.
+    async fn held_past_the_grace_then_crashed(
+        backend: &Arc<CassandraBackend>,
+        held: Checkpoint,
+        t: &str,
+        tenant: &TenantContext,
+        state: &SweepState,
+        scope: &SweepScope,
+    ) -> (SweepReport, crate::backends::cassandra::CasStats) {
+        let before = backend.cas_stats();
+        let mut hold = backend.hold_at(held, t, "p", 1);
+        let mut cas = backend.hold_at(Checkpoint::AfterCas, t, "p", 1);
+        let (b, ten) = (backend.clone(), tenant.clone());
+        let task = tokio::spawn(async move {
+            b.create(&ten, "Patient", patient(), test_fhir_version())
+                .await
+        });
+        hold.reached().await;
+        // A real stall, past the grace since the stamp; the sweeper polls meanwhile.
+        tokio::time::sleep(backend.config.sweeper_grace() + Duration::from_millis(200)).await;
+        let during = backend.poll_once(state, Utc::now(), scope).await;
+        hold.release();
+        cas.reached().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        (during, backend.cas_stats().since(&before))
+    }
+
+    /// ADR-aacruzgon-0098 (CodeRabbit C6 on #107): a writer held between its intent's stamp and I1
+    /// for longer than the grace writes its intent after a running sweeper's marks passed its
+    /// stamp. It writes a fresh intent before its CAS, so when it crashes after the CAS the next
+    /// poll still finishes the write; without the fresh intent only a restart's startup scan would.
+    #[tokio::test]
+    async fn a_writer_held_before_its_intent_past_the_grace_writes_a_fresh_one() {
+        let Some((backend, t, tenant, since)) =
+            start_short_grace("sweeper-held-before-intent").await
+        else {
+            return;
+        };
+        let (state, scope) = running(&t);
+        let (during, spent) = held_past_the_grace_then_crashed(
+            &backend,
+            Checkpoint::AfterStamp,
+            &t,
+            &tenant,
+            &state,
+            &scope,
+        )
+        .await;
+        assert_eq!(
+            during.intents, 0,
+            "nothing to see during the hold: {during}"
+        );
+        let left = intents(&backend, &t, "p", since).await;
+        assert!(rbt_rows(&backend, &t, "p").await.is_empty());
+
+        let grace = chrono::Duration::from_std(backend.config.sweeper_grace()).unwrap();
+        let after = backend
+            .poll_once(
+                &state,
+                Utc::now() + grace + chrono::Duration::seconds(1),
+                &scope,
+            )
+            .await;
+        assert_eq!(
+            (after.current, after.done),
+            (1, 1),
+            "the running sweeper finishes the crashed write: {after}"
+        );
+        assert_eq!(rbt_rows(&backend, &t, "p").await.len(), 1);
+        assert_eq!(count(&backend, &tenant).await, 1);
+        assert_eq!(version_ids(&backend, &t, "Patient", "p").await, vec![1]);
+        assert_eq!(spent.intent_restamps, 1, "{spent:?}");
+        assert_eq!(left, vec![1, 1], "the first intent and the fresh one");
+        // The first intent, behind the marks, is left for a startup scan, whose replay is harmless (SW22).
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// ADR-aacruzgon-0098: a writer held between I1 and its CAS for longer than the grace has its
+    /// intent deleted by a running sweeper as "no row". It writes a fresh intent before its CAS, so
+    /// when it crashes after the CAS the next poll still finishes the write; without it nothing
+    /// would, not even a startup scan, until the resource's next write.
+    #[tokio::test]
+    async fn a_writer_held_after_its_intent_past_the_grace_writes_a_fresh_one() {
+        let Some((backend, t, tenant, since)) =
+            start_short_grace("sweeper-held-after-intent").await
+        else {
+            return;
+        };
+        let (state, scope) = running(&t);
+        let (during, spent) = held_past_the_grace_then_crashed(
+            &backend,
+            Checkpoint::AfterIntent,
+            &t,
+            &tenant,
+            &state,
+            &scope,
+        )
+        .await;
+        assert_eq!((during.no_row, during.done), (1, 1), "{during}");
+        let left = intents(&backend, &t, "p", since).await;
+        assert!(rbt_rows(&backend, &t, "p").await.is_empty());
+
+        let grace = chrono::Duration::from_std(backend.config.sweeper_grace()).unwrap();
+        let after = backend
+            .poll_once(
+                &state,
+                Utc::now() + grace + chrono::Duration::seconds(1),
+                &scope,
+            )
+            .await;
+        assert_eq!(
+            (after.current, after.done),
+            (1, 1),
+            "the running sweeper finishes the crashed write: {after}"
+        );
+        assert_eq!(rbt_rows(&backend, &t, "p").await.len(), 1);
+        assert_eq!(count(&backend, &tenant).await, 1);
+        assert_eq!(spent.intent_restamps, 1, "{spent:?}");
+        assert_eq!(left, vec![1], "the fresh intent");
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// ADR-aacruzgon-0098's control: a writer held only briefly writes no fresh intent, and the
+    /// running sweeper finishes its crash from the one intent it has.
+    #[tokio::test]
+    async fn a_writer_held_briefly_writes_no_fresh_intent() {
+        let Some((backend, t, tenant, since)) = start_short_grace("sweeper-held-briefly").await
+        else {
+            return;
+        };
+        let (state, scope) = running(&t);
+        let before = backend.cas_stats();
+        let mut hold = backend.hold_at(Checkpoint::AfterStamp, &t, "p", 1);
+        let mut cas = backend.hold_at(Checkpoint::AfterCas, &t, "p", 1);
+        let (b, ten) = (backend.clone(), tenant.clone());
+        let task = tokio::spawn(async move {
+            b.create(&ten, "Patient", patient(), test_fhir_version())
+                .await
+        });
+        hold.reached().await;
+        hold.release();
+        cas.reached().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let spent = backend.cas_stats().since(&before);
+        assert_eq!(spent.intent_restamps, 0, "{spent:?}");
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+
+        let grace = chrono::Duration::from_std(backend.config.sweeper_grace()).unwrap();
+        let after = backend
+            .poll_once(
+                &state,
+                Utc::now() + grace + chrono::Duration::seconds(1),
+                &scope,
+            )
+            .await;
+        assert_eq!((after.current, after.done), (1, 1), "{after}");
+        assert_eq!(rbt_rows(&backend, &t, "p").await.len(), 1);
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+    }
+
     /// N6 (exit criterion): the running loop heals a crash within poll + grace. SW4 sets the grace (10 s) from
     /// the request timeout (5 s). With a node of three down, `connect`'s local DC check can try that node
     /// first, so the connect timeout (2 s) is kept well under the request timeout: at the default 5 s the try

@@ -14,7 +14,10 @@
 //!    carries ([`MAX_CAS_PAYLOAD_BYTES`], ADR-aacruzgon-0053) before anything is written.
 //! 2. On update, delete and revive, V3: row `N` rewritten at `ts(N) − 1`,
 //!    before the CAS (G40). Then I1, the intent row, at `LOCAL_QUORUM`,
-//!    carrying this attempt's `write_id` and target version.
+//!    carrying this attempt's `write_id` and target version. If the request
+//!    has been held up since the intent's stamp so long that the CAS could
+//!    end past the sweeper's grace, a fresh intent is written before the CAS
+//!    ([`CassandraBackend::run_cas`], ADR-aacruzgon-0098).
 //! 3. The CAS, at `LOCAL_SERIAL` / `LOCAL_QUORUM`, never re-sent by the
 //!    driver: C1 `INSERT … IF NOT EXISTS` (create, version 1), C2 update and
 //!    C3 soft delete `IF version_id = N AND deleted_at = 0`, C4 revive
@@ -2157,6 +2160,14 @@ fn check_cas_size(plan: &CasPlan) -> StorageResult<()> {
     }))
 }
 
+/// ADR-aacruzgon-0098: true when a CAS sent `held` after its intent's stamp could end, at HFS's own
+/// `request_timeout`, at or past the sweeper's `grace` from that stamp, so the request must write a
+/// fresh intent first. With `grace` at least twice `request_timeout` (SW4), a fresh intent and its
+/// CAS each end within one `request_timeout`, so a request that is not held up again passes. Pure.
+fn cas_may_outlive_grace(held: Duration, request_timeout: Duration, grace: Duration) -> bool {
+    held.saturating_add(request_timeout) >= grace
+}
+
 impl CassandraBackend {
     /// A new request on the partition `key`; `operation` names it in errors
     /// and logs.
@@ -2211,9 +2222,14 @@ impl CassandraBackend {
                     .await
                     .map_err(|error| request.statement_error(&error, "previous version row"))?;
             }
-            // SW6 = IW18 (ADR-sam-michaels-0006): stamped after V3, just before I1, so the grace covers only I1's latency and clock skew. A stall between I1 and the CAS is covered by `finish`, which writes a fresh intent when it leaves work.
+            // SW6 = IW18 (ADR-sam-michaels-0006): stamped after V3, just before I1, so the grace covers only I1's latency and clock skew.
+            let mut stamped = std::time::Instant::now();
             attempt.intent = IntentKey::new(key.tenant_id, key.id, Utc::now());
             request.attempts[index].intent = attempt.intent.clone();
+            // ADR-aacruzgon-0098: a test can hold the request between the stamp and I1.
+            #[cfg(test)]
+            self.checkpoint(Checkpoint::AfterStamp, &key, plan.target_version())
+                .await;
             self.write_intent(
                 &attempt.intent,
                 &key,
@@ -2226,6 +2242,40 @@ impl CassandraBackend {
             #[cfg(test)]
             self.checkpoint(Checkpoint::AfterIntent, &key, plan.target_version())
                 .await;
+            // ADR-aacruzgon-0098, refining SW6: the CAS is sent only while it is sure to end, at
+            // HFS's own deadline, within the grace of its intent's stamp. A request held up since
+            // the stamp (a frozen thread or process: there is no await between the stamp and the
+            // statement's deadline but I1's own) could otherwise apply its CAS after a running
+            // sweeper passed its intent by, or took it for one that never applied and deleted it;
+            // a crash before `finish` would then leave the write for the next startup scan, or for
+            // no one. So it writes a fresh intent, stamped now, first. The earlier intent stays:
+            // a replay of a CAS that applied, or one that never did, is harmless (SW22).
+            while cas_may_outlive_grace(
+                stamped.elapsed(),
+                Duration::from_millis(self.config.request_timeout_ms),
+                self.config.sweeper_grace(),
+            ) {
+                tracing::warn!(
+                    operation,
+                    resource_type = key.resource_type,
+                    id = %key.id,
+                    version_id = plan.target_version(),
+                    held_ms = stamped.elapsed().as_millis() as u64,
+                    "request held up since its intent was stamped; writing a fresh intent before the compare-and-swap"
+                );
+                request.stats.intent_restamped();
+                stamped = std::time::Instant::now();
+                attempt.intent = IntentKey::new(key.tenant_id, key.id, Utc::now());
+                request.attempts[index].intent = attempt.intent.clone();
+                self.write_intent(
+                    &attempt.intent,
+                    &key,
+                    attempt.write_id,
+                    plan.target_version(),
+                )
+                .await
+                .map_err(|error| request.statement_error(&error, "intent row"))?;
+            }
 
             // Step 3.
             request.stats.attempt();
@@ -3034,6 +3084,38 @@ mod tests {
         BodyResResultRows, ColSpec, ColType, ColTypeOption, RowsMetadata, RowsMetadataFlags,
     };
     use cdrs_tokio::types::CBytes;
+
+    /// ADR-aacruzgon-0098: a fresh intent once the time held since the stamp plus HFS's deadline
+    /// reaches the grace, never before; at the defaults (10 s, 30 s) that is 20 s held.
+    #[test]
+    fn a_cas_that_could_end_past_the_grace_needs_a_fresh_intent() {
+        let (timeout, grace) = (Duration::from_secs(10), Duration::from_secs(30));
+        assert!(!cas_may_outlive_grace(Duration::ZERO, timeout, grace));
+        assert!(!cas_may_outlive_grace(
+            Duration::from_millis(19_999),
+            timeout,
+            grace
+        ));
+        assert!(cas_may_outlive_grace(
+            Duration::from_secs(20),
+            timeout,
+            grace
+        ));
+        assert!(cas_may_outlive_grace(
+            Duration::from_secs(45),
+            timeout,
+            grace
+        ));
+        assert!(cas_may_outlive_grace(Duration::MAX, timeout, grace));
+        // SW4's least grace, twice the deadline: a fresh intent that took up to one deadline to
+        // write leaves its CAS in time, so the loop in `run_cas` ends.
+        let least = Duration::from_secs(20);
+        assert!(!cas_may_outlive_grace(
+            Duration::from_millis(9_999),
+            timeout,
+            least
+        ));
+    }
 
     fn server(ty: ErrorType) -> DriverError {
         DriverError::from(CdrsError::Server {

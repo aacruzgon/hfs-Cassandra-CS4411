@@ -3785,6 +3785,94 @@ mod node_tests {
         say("refused", &backend, &before);
     }
 
+    /// ADR-aacruzgon-0090, the version row: a replay whose version row the node refuses as `Invalid`
+    /// writes no index row (IW24) and is kept like a refused batch. Tries 1 to 3 log "post-CAS write
+    /// refused as invalid" at `error`, the third once more that the sweeper keeps trying; try 4 logs it
+    /// at `warn`. Once the node takes the row, the next retry finishes the intent.
+    #[tokio::test]
+    async fn a_refused_version_row_logs_at_warn_from_the_fourth_try() {
+        let Some((backend, t, tenant, since)) = start("sweeper-refused-row").await else {
+            return;
+        };
+        let logs = Captured::default();
+        let _logging = logs.install();
+        let before = backend.sweeper_stats();
+        let version = test_fhir_version();
+        let (b, ten) = (backend.clone(), tenant.clone());
+        crash(&backend, Checkpoint::AfterCas, &t, "p", 1, async move {
+            b.create(&ten, "Patient", patient(), version).await
+        })
+        .await;
+        for _ in 0..4 {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resource_versions",
+                Fault::FailWithInvalid,
+            );
+        }
+        let start_mark = Utc::now() - chrono::Duration::minutes(2);
+        let state = SweepState::new(start_mark, CancellationToken::new());
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        let now = Utc::now() + chrono::Duration::seconds(40);
+        let row = "post-CAS write refused as invalid; not retried";
+        let hit = "an intent hit an invariant; its row is kept in the outbox";
+        let kept = "the node refused an intent's writes three times";
+        let lines = |logs: &Captured| {
+            [
+                (tracing::Level::ERROR, row),
+                (tracing::Level::WARN, row),
+                (tracing::Level::ERROR, hit),
+                (tracing::Level::WARN, hit),
+                (tracing::Level::ERROR, kept),
+            ]
+            .map(|(level, text)| logs.count(level, text))
+        };
+        for (step, expected) in [
+            (0, [1, 0, 1, 0, 0]),
+            (6, [2, 0, 2, 0, 0]),
+            (12, [3, 0, 3, 0, 1]),
+            (12 + 5 * 60, [3, 1, 3, 1, 1]),
+        ] {
+            rewind(&state, start_mark);
+            let report = backend
+                .poll_once(&state, now + chrono::Duration::seconds(step), &scope)
+                .await;
+            assert_eq!(
+                (report.current, report.invariant, report.done),
+                (1, 1, 0),
+                "+{step} s: {report}"
+            );
+            assert_eq!(lines(&logs), expected, "+{step} s: {:?}", logs.all());
+        }
+        let refused = backend.sweeper_stats().since(&before);
+        assert_eq!(
+            (
+                refused.invariant_violations,
+                refused.invariant_gave_up,
+                refused.retries
+            ),
+            (4, 0, 4),
+            "{refused}"
+        );
+        assert_eq!(state.retry.lock().len(), 1);
+        assert!(rbt_rows(&backend, &t, "p").await.is_empty());
+
+        // The faults are spent: the retry due 5 minutes after try 4 finishes it.
+        rewind(&state, start_mark);
+        let report = backend
+            .poll_once(
+                &state,
+                now + chrono::Duration::seconds(12 + 10 * 60),
+                &scope,
+            )
+            .await;
+        assert_eq!((report.current, report.done), (1, 1), "{report}");
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_eq!(count(&backend, &tenant).await, 1);
+        assert_consistent(&check(&backend, &t).await);
+        say("refused-row", &backend, &before);
+    }
+
     /// N12: a transient failure keeps the intent for the next try.
     #[tokio::test]
     async fn a_transient_failure_keeps_the_intent_for_the_next_try() {

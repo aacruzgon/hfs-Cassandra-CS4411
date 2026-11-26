@@ -1,4 +1,4 @@
-# ADR-aacruzgon-0099: A SearchParameter follow is stamped before its read, and a reload that began after the stamp wins over it (amends ADR-sam-michaels-0006 SW19 and ADR-aacruzgon-0068)
+# ADR-aacruzgon-0099: A SearchParameter follow is stamped before its read, and a reload that began after the stamp wins over it unless it read the id at an older version (amends ADR-sam-michaels-0006 SW19 and ADR-aacruzgon-0068)
 
 - **Date:** 2026-11-26
 - **Status:** proposed

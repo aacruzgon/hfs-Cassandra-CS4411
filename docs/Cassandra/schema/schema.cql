@@ -282,7 +282,8 @@ CREATE TABLE IF NOT EXISTS token_system_index (
    AND comment = 'Token search, form system|';
 
 -- Date-only search, prefixes that bound the range start (eq, lt, le, ap, sa,
--- and the start half of ne and ge). [start, end) is half-open and finite:
+-- and the start half of ne; ge is served from date_index_by_end,
+-- ADR-aacruzgon-0027). [start, end) is half-open and finite:
 -- indexed_range maps an open Period end to its open_end sentinel.
 CREATE TABLE IF NOT EXISTS date_index (
     tenant_id     text,
@@ -297,8 +298,8 @@ CREATE TABLE IF NOT EXISTS date_index (
    AND gc_grace_seconds = 10800
    AND comment = 'Date-only search, bounded by range start';
 
--- Date-only search, prefixes that bound the range end (gt, eb, and the end
--- half of ne and ge).
+-- Date-only search, prefixes that bound the range end (gt, ge, eb, and the
+-- end half of ne; ADR-aacruzgon-0027).
 CREATE TABLE IF NOT EXISTS date_index_by_end (
     tenant_id     text,
     resource_type text,

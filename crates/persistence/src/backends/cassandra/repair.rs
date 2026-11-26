@@ -618,37 +618,48 @@ fn outcomes_of<'a, P: 'a, C>(
 /// another to finish before it starts.
 ///
 /// Each wake polls every running future once, and a future that finishes
-/// makes room for the next one at once, but only while `ends_at` has not
-/// passed: after the first fill, no future is started at or past the
-/// deadline, even in the wake the deadline falls in, so none is started only
-/// to be dropped. The futures are polled once before the clock is looked at,
-/// which starts the first `concurrency` of them: if every one is done, that
-/// is the end; if `ends_at` has already passed, it returns at once. So a
-/// deadline in the past cuts every future after its
-/// first poll, however fast the work behind it is (a timer's own check can lag
-/// the clock by a tick, and `FuturesUnordered` may stop after polling two
-/// futures that woke themselves, so neither can give that). Otherwise the rest
-/// runs until `ends_at`.
+/// makes room for the next one at once, but a future admitted after the
+/// first fill is first polled only if the clock, read just before that poll,
+/// is before `ends_at`; one that is not stays unstarted and is dropped with
+/// the rest, so none is started only to be dropped. The futures are polled
+/// once before the clock is looked at, which starts the first `concurrency`
+/// of them: if every one is done, that is the end; if `ends_at` has already
+/// passed, it returns at once. So a deadline in the past cuts every future
+/// after its first poll, however fast the work behind it is (a timer's own
+/// check can lag the clock by a tick, and `FuturesUnordered` may stop after
+/// polling two futures that woke themselves, so neither can give that).
+/// Otherwise the rest runs until `ends_at`.
 async fn drive_within<F: Future<Output = ()>>(
     futures: Vec<F>,
     concurrency: usize,
     ends_at: tokio::time::Instant,
 ) {
     let mut waiting = futures.into_iter();
-    let mut running: Vec<std::pin::Pin<Box<F>>> = Vec::new();
+    // Each running future with whether it may be polled: the first fill may,
+    // always; a replacement only once a check just before its first poll
+    // finds the clock before `ends_at`.
+    let mut running: Vec<(bool, std::pin::Pin<Box<F>>)> = Vec::new();
     let mut started = false;
     let all = futures::future::poll_fn(|cx| {
         loop {
             while running.len() < concurrency && (!started || tokio::time::Instant::now() < ends_at)
             {
                 match waiting.next() {
-                    Some(future) => running.push(Box::pin(future)),
+                    Some(future) => running.push((!started, Box::pin(future))),
                     None => break,
                 }
             }
             started = true;
             let before = running.len();
-            running.retain_mut(|future| future.as_mut().poll(cx).is_pending());
+            running.retain_mut(|(may_poll, future)| {
+                if !*may_poll {
+                    if tokio::time::Instant::now() >= ends_at {
+                        return true;
+                    }
+                    *may_poll = true;
+                }
+                future.as_mut().poll(cx).is_pending()
+            });
             if running.is_empty() && waiting.len() == 0 {
                 return std::task::Poll::Ready(());
             }
@@ -2029,6 +2040,77 @@ mod tests {
                 "the first finishing at {finish_ms} ms, the deadline at 10 ms"
             );
         }
+    }
+
+    /// A future that records the clock at its first poll, then stays pending.
+    fn first_polled_at(at: Arc<Mutex<Option<tokio::time::Instant>>>) -> Unit {
+        Box::pin(futures::future::poll_fn(move |_cx| {
+            at.lock().get_or_insert_with(tokio::time::Instant::now);
+            std::task::Poll::<()>::Pending
+        }))
+    }
+
+    /// A future whose first poll moves the paused clock by `by` (an
+    /// `advance` polled once inside it, which moves the clock before its
+    /// first yield), standing in for a repair's synchronous first poll; then
+    /// it stays pending.
+    fn moves_the_clock_at_first_poll(by: Duration) -> Unit {
+        let mut done = false;
+        Box::pin(futures::future::poll_fn(move |cx| {
+            if !done {
+                done = true;
+                let mut advance = Box::pin(tokio::time::advance(by));
+                let _ = advance.as_mut().poll(cx);
+            }
+            std::task::Poll::<()>::Pending
+        }))
+    }
+
+    /// Four running, a 10 ms deadline; the first two finish together at
+    /// 5 ms, so one pass admits two replacements before the deadline. The
+    /// first one's first poll takes the clock to 5 ms + `first_takes`.
+    /// Returns when the second was first polled, relative to the deadline
+    /// (negative: before it), or `None` if it never was.
+    async fn second_replacement_first_polled(first_takes: Duration) -> Option<i128> {
+        let t0 = tokio::time::Instant::now();
+        let ends_at = t0 + Duration::from_millis(10);
+        let both = t0 + Duration::from_millis(5);
+        let second = Arc::new(Mutex::new(None));
+        let futures: Vec<Unit> = vec![
+            Box::pin(tokio::time::sleep_until(both)),
+            Box::pin(tokio::time::sleep_until(both)),
+            Box::pin(std::future::pending()),
+            Box::pin(std::future::pending()),
+            moves_the_clock_at_first_poll(first_takes),
+            first_polled_at(second.clone()),
+        ];
+        drive_within(futures, REPAIR_CONCURRENCY, ends_at).await;
+        let at = *second.lock();
+        at.map(|at| {
+            if at >= ends_at {
+                (at - ends_at).as_micros() as i128
+            } else {
+                -((ends_at - at).as_micros() as i128)
+            }
+        })
+    }
+
+    /// Two replacements admitted in one pass, before the deadline: the
+    /// first one's first poll takes the clock past it, so the second, whose
+    /// check then finds the deadline passed, is never started (CodeRabbit on
+    /// #106).
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_reached_past_the_deadline_in_its_pass_stays_unstarted() {
+        let second = second_replacement_first_polled(Duration::from_millis(10)).await;
+        assert_eq!(second, None, "first polled {second:?} us from the deadline");
+    }
+
+    /// The control of the test above: the first replacement's first poll
+    /// ends at 7 ms, so the second starts 3 ms before the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn both_replacements_admitted_before_the_deadline_start_before_it() {
+        let second = second_replacement_first_polled(Duration::from_millis(2)).await;
+        assert_eq!(second, Some(-3_000));
     }
 
     #[test]

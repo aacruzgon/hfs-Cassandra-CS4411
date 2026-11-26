@@ -47,8 +47,9 @@
 //! - **One deadline.** The whole repair phase is bounded by one request
 //!   deadline (`request_timeout_ms`), so a search waits at most that long
 //!   for its repairs. A repair unfinished by then is reported
-//!   [`WriteFailure::TriesExhausted`] and counted as failed; the next search
-//!   or the sweeper repeats it.
+//!   [`WriteFailure::TriesExhausted`] and counted as failed; a later search's
+//!   repair repeats it, or the sweeper, if the write that left the stale rows
+//!   kept an intent.
 //!
 //! Repair never writes `resources`, `resource_versions` or an intent row,
 //! and never sends a CAS. Its only statements are the index writer's
@@ -443,8 +444,8 @@ impl RepairContext {
     /// budget a request's index phase gets), so a search waits at most that
     /// long for its repairs. A repair that has not finished by then is
     /// reported [`WriteFailure::TriesExhausted`]: safe, since every repair
-    /// write has a fixed timestamp and the next search or the sweeper
-    /// repeats it.
+    /// write has a fixed timestamp and a later search's repair repeats it,
+    /// or the sweeper, if the write that left the stale rows kept an intent.
     pub(crate) async fn run(self, backend: &CassandraBackend) -> Vec<RepairOutcome> {
         let deadline = phase_deadline(backend.config.request_timeout_ms);
         self.run_within(backend, deadline).await
@@ -515,7 +516,8 @@ impl RepairContext {
                 resource_type = key.resource_type,
                 id = key.id,
                 deadline_ms = deadline.as_millis() as u64,
-                "repair on read passed its deadline; the repair is left for the next search or the sweeper"
+                "repair on read passed its deadline; the repair is left for a later search, or for \
+                 the sweeper if the original write kept an intent"
             );
             let outcome = cut_outcome(*slot.packed.lock());
             if let RepairOutcome::Failed { index, .. } = &outcome {

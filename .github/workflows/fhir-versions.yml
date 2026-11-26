@@ -523,7 +523,19 @@ jobs:
       # which ends with `exit=<status>` for the report below:
       #   lib    the backend's unit tests (--lib backends::cassandra); its
       #          restart_tests skip without HFS_TEST_CASSANDRA_RESTART_*,
-      #          which this job never sets
+      #          which this job never sets. R6's run, the last, also sets
+      #          HFS_TEST_CASSANDRA_LARGE=1 for the full-size byte-cut test
+      #          (ADR-aacruzgon-0089), once per CI run: it leaves about 98,000
+      #          index rows and as many tombstones on this job's node, and the
+      #          lib tests' scans of whole index tables would pay for them in
+      #          every later lib run. After it, only R6's tests and rest
+      #          suites run: they read the token tables only by partition, and
+      #          their one scan, the SELECT DISTINCT over resources_by_type's
+      #          partition keys, meets a single partition of the test's own
+      #          tenant. The step fails R6's lib run if its log lacks the
+      #          test's [piece-bytes line: the test passes as `not run:`
+      #          without the variable, so a lost variable would otherwise
+      #          drop it and stay green
       #   tests  tests/cassandra_tests.rs and backend_capability_contract.rs;
       #          --no-fail-fast, so a failure in the first binary does not
       #          keep the second from running
@@ -560,12 +572,19 @@ jobs:
               echo "::error title=FHIR versions::$version rest did not run exactly its three tests"
               status=1
             fi
+            if [ "$version" = R6 ] && [ "$suite" = lib ] && [ "$status" -eq 0 ] \
+              && ! grep -Fq '[piece-bytes code_len=' "$log"; then
+              echo "::error title=FHIR versions::R6 lib did not run the_largest_update_of_one_partition_is_cut_by_bytes_and_lands (HFS_TEST_CASSANDRA_LARGE=1)"
+              status=1
+            fi
             echo "exit=$status" | tee -a "$log"
             echo "::endgroup::"
             if [ "$status" -ne 0 ]; then failed+=("$version $suite (exit $status)"); fi
           }
           for version in R4 R4B R5 R6; do
-            run_suite "$version" lib \
+            large=()
+            if [ "$version" = R6 ]; then large=(env HFS_TEST_CASSANDRA_LARGE=1); fi
+            run_suite "$version" lib "${large[@]}" \
               cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
                 --lib -- backends::cassandra --nocapture
             run_suite "$version" tests \

@@ -108,7 +108,7 @@ use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
 use parking_lot::RwLock;
 
-use super::batch::IndexStatement;
+use super::batch::{IndexStatement, MAX_BATCH_STATEMENTS};
 use super::config::CassandraConfig;
 
 /// The native protocol version the session speaks. Cassandra 5.0 serves v5
@@ -198,6 +198,14 @@ pub(crate) enum DriverError {
         /// cut off there was never sent and its outcome is not unknown.
         sent: bool,
     },
+    /// [`CassandraSession::batch`] refused an index batch of more than
+    /// [`MAX_BATCH_STATEMENTS`] statements before counting or sending it
+    /// (ADR-aacruzgon-0089). Nothing reached the node, and no later try can
+    /// change the answer, so a writer reads it as permanent.
+    TooManyStatements {
+        /// How many statements the refused batch held.
+        statements: usize,
+    },
 }
 
 /// Nodes in the local data centre are `Local`; every other node gets no
@@ -266,6 +274,9 @@ pub(crate) struct CassandraSession {
     /// `batch` calls in flight, and the most at once (IW12; `cfg(test)` only).
     #[cfg(test)]
     batches_in_flight: InFlight,
+    /// Plain statements (and pages) in flight, and the most at once (RW4; `cfg(test)` only).
+    #[cfg(test)]
+    statements_in_flight: InFlight,
 }
 
 /// A count of calls in flight and the highest it reached (`cfg(test)` only).
@@ -353,6 +364,8 @@ impl CassandraSession {
             plain_sends: parking_lot::Mutex::new(Vec::new()),
             #[cfg(test)]
             batches_in_flight: InFlight::default(),
+            #[cfg(test)]
+            statements_in_flight: InFlight::default(),
         })
     }
 
@@ -433,6 +446,8 @@ impl CassandraSession {
         paging: Option<Paging>,
         retries: Retries,
     ) -> Result<Envelope, DriverError> {
+        #[cfg(test)]
+        let _in_flight = self.statements_in_flight.enter();
         self.counts.count(kind);
         #[cfg(test)]
         {
@@ -543,7 +558,22 @@ impl CassandraSession {
         page_size: i32,
         keep: impl Fn(&Row) -> bool,
     ) -> Result<Vec<Row>, DriverError> {
+        self.rows_paged_counting(cql, values, kind, page_size, keep)
+            .await
+            .map(|(rows, _)| rows)
+    }
+
+    /// [`Self::rows_paged_keeping`], also counting the node's warnings that mention tombstones, over every page (SW10).
+    pub(crate) async fn rows_paged_counting(
+        &self,
+        cql: &str,
+        values: Vec<Value>,
+        kind: StatementKind,
+        page_size: i32,
+        keep: impl Fn(&Row) -> bool,
+    ) -> Result<(Vec<Row>, u64), DriverError> {
         let mut all = Vec::new();
+        let mut tombstone_warnings = 0u64;
         let mut state = None;
         loop {
             let paging = Paging {
@@ -553,6 +583,11 @@ impl CassandraSession {
             let envelope = self
                 .execute_with(cql, values.clone(), kind, Some(paging), Retries::OfKind)
                 .await?;
+            tombstone_warnings += envelope
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("tombstone"))
+                .count() as u64;
             let body = envelope.response_body()?;
             let next = body
                 .as_rows_metadata()
@@ -565,7 +600,7 @@ impl CassandraSession {
             );
             match next {
                 Some(next) => state = Some(next),
-                None => return Ok(all),
+                None => return Ok((all, tombstone_warnings)),
             }
         }
     }
@@ -588,7 +623,22 @@ impl CassandraSession {
     /// the rest all or nothing across partitions, eventually (walkthrough
     /// section 2, "Index rows"). What a failure means is
     /// [`classify_failure`](super::batch::classify_failure)'s to say.
+    ///
+    /// A batch of more than [`MAX_BATCH_STATEMENTS`] statements is refused
+    /// as [`DriverError::TooManyStatements`] before anything is counted or
+    /// sent: the driver would write its count as a wrapped 16-bit `[short]`,
+    /// a frame the node cannot read (ADR-aacruzgon-0089). The writer never
+    /// builds one, since `index_batches` splits a unit over the limit; this
+    /// keeps a future caller from sending a malformed frame.
+    /// [`classify_failure`](super::batch::classify_failure) reads the refusal
+    /// as `Refused`, so the writer does not retry it, reports
+    /// `WriteFailure::Permanent` and keeps the intent.
     pub(crate) async fn batch(&self, statements: Vec<IndexStatement>) -> Result<(), DriverError> {
+        if statements.len() > MAX_BATCH_STATEMENTS {
+            return Err(DriverError::TooManyStatements {
+                statements: statements.len(),
+            });
+        }
         #[cfg(test)]
         let _in_flight = (!statements.is_empty()).then(|| self.batches_in_flight.enter());
         if statements.len() <= 1 {
@@ -608,6 +658,15 @@ impl CassandraSession {
             return result;
         }
         self.send_batch(&statements).await
+    }
+
+    /// The most plain statements (one page each) this session has had in flight at once (RW4). A
+    /// batch of two or more is counted by [`Self::max_batches_in_flight`] only.
+    #[cfg(test)]
+    pub(crate) fn max_statements_in_flight(&self) -> usize {
+        self.statements_in_flight
+            .max
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The most `batch` calls this session has had in flight at once (IW12).
@@ -920,6 +979,10 @@ pub(crate) enum Fault {
     /// answers to a statement or batch it refuses, so nothing refused need be
     /// sent to it.
     FailWithInvalid,
+    /// Answer a read with the rows of another table (`system.local`, one row, no resource column),
+    /// sent at `LOCAL_QUORUM`: a response the caller cannot decode, though no bad row is stored.
+    /// A batch is not a read, so it never matches.
+    AnswerWithForeignRow,
 }
 
 #[cfg(test)]
@@ -1052,6 +1115,19 @@ mod faults {
                     return Some(Err(server_error(ErrorType::Protocol)));
                 }
                 Fault::FailWithInvalid => return Some(Err(server_error(ErrorType::Invalid))),
+                Fault::AnswerWithForeignRow => {
+                    return Some(
+                        session
+                            .send_with(
+                                "SELECT cluster_name FROM system.local",
+                                Vec::new(),
+                                StatementKind::Read,
+                                None,
+                                retries,
+                            )
+                            .await,
+                    );
+                }
                 Fault::PassThrough => {
                     return Some(
                         session
@@ -1125,6 +1201,9 @@ mod faults {
                 Fault::FailWithServerError => Err(server_error(ErrorType::Server)),
                 Fault::FailWithProtocolError => Err(server_error(ErrorType::Protocol)),
                 Fault::FailWithInvalid => Err(server_error(ErrorType::Invalid)),
+                Fault::AnswerWithForeignRow => {
+                    unreachable!("an injected foreign row is for reads, not a batch")
+                }
             })
         }
     }
@@ -1680,6 +1759,56 @@ mod node_tests {
         assert_eq!(
             rows_of(&session, &t, "Patient").await,
             vec![("p1".to_string(), 4_000_001), ("p2".to_string(), 2_000_001)]
+        );
+    }
+
+    /// IW11 (ADR-aacruzgon-0089): a batch of exactly `MAX_BATCH_STATEMENTS`
+    /// statements is sent and applied, and one more is refused before
+    /// anything is counted or sent, so the driver never writes a wrapped
+    /// statement count. Every statement writes the same row, so the node
+    /// still reads a 65,535-statement batch but keeps one row: the
+    /// consistency and checkpoint tests scan whole index tables, and 65,535
+    /// rows left by every run would slow each later run on the same node.
+    #[tokio::test]
+    async fn a_batch_over_the_statement_limit_is_refused_and_sends_nothing() {
+        let Some(session) = session().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let full = tenant("full");
+        let statements: Vec<IndexStatement> = (0..MAX_BATCH_STATEMENTS)
+            .map(|_| insert(&full, "Patient", "p", 1_000, 1_000_001))
+            .collect();
+        assert_eq!(statements.len(), 65_535);
+        let before = session.statement_counts();
+        session
+            .batch(statements)
+            .await
+            .expect("a batch at the limit is sent");
+        let spent = session.statement_counts().since(&before);
+        assert_eq!((spent.batch, spent.batched), (1, 65_535), "{spent}");
+        assert_eq!(
+            rows_of(&session, &full, "Patient").await,
+            vec![("p".to_string(), 1_000_001)]
+        );
+
+        let t = tenant("limit");
+        let statements: Vec<IndexStatement> = (0..=MAX_BATCH_STATEMENTS)
+            .map(|_| insert(&t, "Patient", "p", 1_000, 1_000_001))
+            .collect();
+        assert_eq!(statements.len(), 65_536);
+        let before = session.statement_counts();
+        let error = session.batch(statements).await.expect_err("over the limit");
+        assert!(
+            matches!(error, DriverError::TooManyStatements { statements: 65_536 }),
+            "{error:?}"
+        );
+        let spent = session.statement_counts().since(&before);
+        assert_eq!(spent.total(), 0, "nothing counted: {spent}");
+        assert_eq!(spent.batched, 0, "{spent}");
+        assert!(
+            rows_of(&session, &t, "Patient").await.is_empty(),
+            "nothing written"
         );
     }
 

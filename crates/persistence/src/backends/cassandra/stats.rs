@@ -146,12 +146,15 @@ cas_counters! {
     extractions,
     /// Microseconds those extractions took, summed (IW22).
     extract_us,
-    /// Search parameters skipped because their extraction failed; the write
-    /// went ahead without their rows (IW1). A consistency check's
-    /// re-extractions count too.
+    /// Search parameters whose extraction failed, so the key set it returned
+    /// has no rows for them (IW1, IW22). Counted per extraction, when a plan
+    /// is built, before the compare-and-swap: an attempt that then misses or
+    /// fails counts too, and so does each re-extraction of a consistency
+    /// check.
     extraction_failures,
-    /// Extractions that failed for the whole resource, so the version kept
-    /// only its `resources_by_type` row (IW1, D6).
+    /// Extractions that failed for the whole resource, so the key set they
+    /// returned holds only its `resources_by_type` row (IW1, IW22, D6).
+    /// Counted the same way as `extraction_failures`.
     extraction_fallbacks,
     /// Bytes of `data` and `index_keys` of every compare-and-swap attempted,
     /// counted with `attempts` just before it is sent (an attempt whose
@@ -171,6 +174,15 @@ impl fmt::Display for CasStats {
             write!(f, "{name}={value}")?;
         }
         Ok(())
+    }
+}
+
+impl CasStats {
+    /// Unknown outcomes the node did not answer: HFS's own deadline after the CAS was sent, or a dropped
+    /// connection after it may have left. A grace-0 `sweep_pass` is safe only when, for every writer of the swept
+    /// tenants, this did not move (SW28, RV19, issue #89).
+    pub fn client_side_unknowns(&self) -> u64 {
+        self.unknown_deadline + self.unknown_connection
     }
 }
 
@@ -286,6 +298,10 @@ impl CasCounters {
     pub(crate) fn unknown(&self, error: &DriverError) {
         Self::bump(match error {
             DriverError::Deadline { .. } => &self.unknown_deadline,
+            // Never reached: only an index batch is refused this way, and
+            // `unknown` is called only for a CAS. Counted as a server error
+            // if that ever changes.
+            DriverError::TooManyStatements { .. } => &self.unknown_server_error,
             DriverError::Driver(inner) => match inner.as_ref() {
                 CdrsError::Server { body, .. } => match &body.ty {
                     ErrorType::WriteTimeout(timeout) => match timeout.write_type {

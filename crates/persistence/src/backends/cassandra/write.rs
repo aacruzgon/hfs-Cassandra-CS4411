@@ -20,15 +20,20 @@
 //!    C3 soft delete `IF version_id = N AND deleted_at = 0`, C4 revive
 //!    `IF version_id = N`, setting `deleted_at = 0` (G39).
 //! 4. V1 (content) or V2 (delete marker) for the new version,
-//!    `USING TIMESTAMP ts(N+1)`.
+//!    `USING TIMESTAMP ts(N+1)`, acknowledged before step 5 starts (IW24).
 //! 5. The index delta at `ts(N+1)` ([`index_delta`]): delete the rows of
 //!    `K(N)` that `K(N+1)` does not have, compared by each table's primary
 //!    key, so a date key both versions have is only re-inserted (IW7);
 //!    insert `K(N+1)`. Every row of one partition goes as one unit; the
 //!    units are packed into logged batches of at most 4,864 wire bytes,
-//!    never splitting a unit (a unit over the limit goes alone, as one
-//!    batch), and the batches go at once, at most 8 in
-//!    flight (IW9 B, IW11, IW12; [`CassandraBackend::write_index_delta`]).
+//!    never splitting a unit for its bytes (a unit over the limit goes
+//!    alone, as one batch). A unit of more than 65,535 statements, the
+//!    native protocol's limit, or of more than 8 MiB of statements, half
+//!    the node's default 16 MiB message limit (less on a heap under
+//!    640 MiB), is split into pieces of whole rows, all at `ts(N+1)`; the
+//!    `resources_by_type` unit is never split (ADR-aacruzgon-0089,
+//!    amending IW11). The batches go at once, at most 8 in flight (IW9 B,
+//!    IW11, IW12; [`CassandraBackend::write_index_delta`]).
 //! 6. I2, the intent delete.
 //!
 //! Steps 4 and 5 take plain inputs ([`VersionRow`], [`VersionKeys`], a
@@ -95,7 +100,9 @@
 //!   the node refuses as `Invalid`, which no retry changes; when the retries
 //!   run out the write still succeeds and its intent row is left for the
 //!   sweeper (G23), on every operation: a 5xx after an applied CAS would make
-//!   a client's retried request write twice.
+//!   a client's retried request write twice. When step 4 fails, step 5 is not
+//!   sent at all (IW24), so search never finds a version whose row vread and
+//!   `_history` cannot open; the sweeper writes both.
 //! - Step 6 fails: ignored; the sweeper deletes the intent.
 
 use std::collections::{BTreeMap, HashSet};
@@ -116,9 +123,11 @@ use uuid::Uuid;
 
 use super::backend::CassandraBackend;
 use super::batch::{
-    BatchFailure, IndexCql, IndexStatement, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS,
-    classify_failure, pack, wire_bytes,
+    BatchFailure, IndexCql, IndexStatement, MAX_BATCH_BYTES, classify_failure, pack, piece_len,
+    wire_bytes,
 };
+#[cfg(test)]
+use super::batch::{MAX_BATCH_STATEMENTS, MAX_PIECE_BYTES};
 #[cfg(test)]
 use super::checkpoint::Checkpoint;
 use super::errors::{BACKEND_NAME, is_invalid, map_driver_error};
@@ -306,20 +315,55 @@ pub(crate) const PLAIN_DELETE_MISS_RETRIES: usize = 1;
 const POST_CAS_WRITE_TRIES: u32 = 3;
 /// Index batches of one write in flight at once (IW12): futures inside the
 /// request's task, never `tokio::spawn`.
-const INDEX_BATCHES_IN_FLIGHT: usize = 8;
+pub(super) const INDEX_BATCHES_IN_FLIGHT: usize = 8;
+
+/// The level a write the node refuses as `Invalid` is logged at (ADR-aacruzgon-0090). The request
+/// path, and the sweeper's first three tries of an intent, log it at `error`. The sweeper's later
+/// tries log it at `warn`: by then its retry list has logged the refusal once at `error`, and a node
+/// set below what HFS needs refuses every try, every 5 minutes for 24 hours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefusalLog {
+    Error,
+    Warn,
+}
+
+/// Who writes an index delta, for the line logged when one of its batches is
+/// not confirmed: a request leaves the intent for the sweeper. The sweeper's
+/// line says only that the intent row stays in the outbox, since it is logged
+/// before the sweeper knows whether it tries again (at the 24 hour horizon it
+/// does not, and the row stays until its TTL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeltaWriter {
+    Request,
+    Sweeper,
+}
+
+/// A `tracing` event at a [`RefusalLog`]'s level: `log_refusal!(level, fields…, "message")`.
+macro_rules! log_refusal {
+    ($refusal:expr, $($arg:tt)+) => {
+        match $refusal {
+            $crate::backends::cassandra::write::RefusalLog::Error => tracing::error!($($arg)+),
+            $crate::backends::cassandra::write::RefusalLog::Warn => tracing::warn!($($arg)+),
+        }
+    };
+}
+pub(crate) use log_refusal;
 /// The most a CAS may carry, `data` plus `index_keys`, in bytes (ADR-aacruzgon-0053): half
 /// of the node's default `max_mutation_size` (16 MiB, half of the default
 /// 32 MiB `commitlog_segment_size`), which leaves room for the rest of the
-/// row and for Paxos's own copy of the update.
+/// row and for Paxos's own copy of the update. The CAS's message must also
+/// fit the node's `native_transport_max_message_size`, 16 MiB by default on
+/// a heap of 640 MiB or more (`crates/persistence/README.md`, "Node settings
+/// HFS depends on").
 pub(crate) const MAX_CAS_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 /// Longest FHIR id (`[A-Za-z0-9\-\.]{1,64}`, R4 datatypes.html#id).
 const MAX_ID_LEN: usize = 64;
 /// Number of intent shards (`schema.cql`, `pending_index_writes`).
-const INTENT_SHARDS: u32 = 16;
+pub(super) const INTENT_SHARDS: u32 = 16;
 
 /// The full key of an intent row, kept by the request so I2 finds it even
 /// after the hour rolls over.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct IntentKey {
     bucket: String,
     shard: i16,
@@ -335,10 +379,31 @@ impl IntentKey {
             enqueued_at: timeuuid(now),
         }
     }
+
+    /// An intent's key as I3 read it: the slice's bucket and shard, the row's `enqueued_at`.
+    pub(super) fn from_parts(bucket: String, shard: i16, enqueued_at: Uuid) -> Self {
+        Self {
+            bucket,
+            shard,
+            enqueued_at,
+        }
+    }
+
+    pub(super) fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub(super) fn shard(&self) -> i16 {
+        self.shard
+    }
+
+    pub(super) fn enqueued_at(&self) -> Uuid {
+        self.enqueued_at
+    }
 }
 
 /// `bucket`: the UTC hour of `enqueued_at`, `'YYYY-MM-DDTHH'`.
-fn bucket_of(at: DateTime<Utc>) -> String {
+pub(super) fn bucket_of(at: DateTime<Utc>) -> String {
     at.format("%Y-%m-%dT%H").to_string()
 }
 
@@ -501,6 +566,9 @@ fn classify_cas_failure(error: DriverError) -> CasFailure {
     match &error {
         DriverError::Deadline { sent: true, .. } => unknown(true, error),
         DriverError::Deadline { sent: false, .. } => CasFailure::NotApplied(error),
+        // Only an index batch is refused this way, never a CAS; nothing was
+        // sent.
+        DriverError::TooManyStatements { .. } => CasFailure::NotApplied(error),
         DriverError::Driver(inner) => match inner.as_ref() {
             CdrsError::Server { body, .. } => match &body.ty {
                 // `CasWriteUnknown` (0x1700) is the protocol's own unknown
@@ -968,7 +1036,7 @@ impl CasPlan {
             last_updated,
             deleted_at: marker.then_some(last_updated),
             data: self.data(),
-            fhir_version: self.fhir_version,
+            fhir_version: self.fhir_version.as_mime_param(),
             write_id: Some(write_id),
             keys_blob: if marker {
                 &index_keys::EMPTY
@@ -1000,7 +1068,7 @@ impl CasPlan {
         VersionKeys {
             version_id: self.target_version(),
             last_updated,
-            fhir_version: self.fhir_version,
+            fhir_version: self.fhir_version.as_mime_param(),
             keys: &self.keys,
         }
     }
@@ -1035,8 +1103,8 @@ pub(crate) struct VersionRow<'a> {
     pub(crate) deleted_at: Option<DateTime<Utc>>,
     /// The version's content; left unset when `None`, never null.
     pub(crate) data: Option<&'a str>,
-    /// The resource's FHIR version, fixed at create (G13).
-    pub(crate) fhir_version: FhirVersion,
+    /// The `fhir_version` text written: the request's `FhirVersion::as_mime_param`, or a replay's stored text, verbatim (RW8).
+    pub(crate) fhir_version: &'a str,
     /// The `write_id` of the CAS that wrote the version; left unset when
     /// `None` (a V3 whose `w(N)` R1 did not have), never null.
     pub(crate) write_id: Option<Uuid>,
@@ -1060,7 +1128,7 @@ pub(crate) fn version_row(key: &RowKey<'_>, row: &VersionRow<'_>, ts: i64) -> St
         Value::from(row.version_id),
     ];
     let tail = [
-        Value::from(row.fhir_version.as_mime_param()),
+        Value::from(row.fhir_version),
         Value::from(write_ts_of(row.last_updated)),
         row.write_id.map_or(Value::NotSet, Value::from),
         Value::from(Blob::from(row.keys_blob.to_vec())),
@@ -1097,7 +1165,7 @@ fn previous_version_row(key: &RowKey<'_>, previous: &PreviousVersion) -> Stateme
         last_updated: previous.last_updated,
         deleted_at: previous.deleted_at,
         data: previous.data.as_deref(),
-        fhir_version: previous.fhir_version,
+        fhir_version: previous.fhir_version.as_mime_param(),
         write_id: previous.write_id,
         keys_blob: &previous.keys_blob,
     };
@@ -1107,12 +1175,14 @@ fn previous_version_row(key: &RowKey<'_>, previous: &PreviousVersion) -> Stateme
 /// One version's key set, as the index writer needs it (IW17): the rows it
 /// inserts are `keys` at `last_updated`, tagged `version_id`, and the
 /// `resources_by_type` row carries `fhir_version` (G34). The sweeper's
-/// superseded case passes an empty `keys`, so its delta only deletes.
+/// superseded case passes `K(V)` and clears the inserts, so its delta deletes
+/// only the rows of `K(V-1)` that `K(V)` does not hold (ADR-aacruzgon-0094).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct VersionKeys<'a> {
     pub(crate) version_id: i32,
     pub(crate) last_updated: DateTime<Utc>,
-    pub(crate) fhir_version: FhirVersion,
+    /// The `fhir_version` text written: the request's `FhirVersion::as_mime_param`, or a replay's stored text, verbatim (RW8).
+    pub(crate) fhir_version: &'a str,
     pub(crate) keys: &'a [IndexKey],
 }
 
@@ -1122,10 +1192,12 @@ pub(crate) type IndexRow<'a> = (&'a IndexKey, DateTime<Utc>);
 
 /// Every row of a delta that lives in one partition ([`IndexKey::partition`]):
 /// the inserts and the deletes of that partition together. The writer sends
-/// a unit whole, except one of more than [`MAX_BATCH_STATEMENTS`] statements,
-/// which [`index_batches`] splits into pieces of at most that many; the
-/// `resources_by_type` unit is never split (IW9 B, ADR-sam-michaels-0006; see
-/// [`CassandraBackend::write_index_delta`]).
+/// a unit whole, except one of more than
+/// [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS) statements
+/// or [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES), which
+/// [`index_batches`] splits into pieces within both; the `resources_by_type`
+/// unit is never split (IW9 B, ADR-sam-michaels-0006; the split is
+/// ADR-aacruzgon-0089's; see [`CassandraBackend::write_index_delta`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct IndexUnit<'a> {
     /// Rows of the new version, at its `last_updated`.
@@ -1141,8 +1213,8 @@ pub(crate) struct IndexUnit<'a> {
 pub(crate) struct IndexDelta<'a> {
     /// The tag every inserted row carries.
     pub(crate) version_id: i32,
-    /// The `fhir_version` the `resources_by_type` row carries (G34).
-    pub(crate) fhir_version: FhirVersion,
+    /// The `resources_by_type` row carries it (G34). The `fhir_version` text written: the request's `FhirVersion::as_mime_param`, or a replay's stored text, verbatim (RW8).
+    pub(crate) fhir_version: &'a str,
     /// One unit per partition the delta touches, in partition order.
     pub(crate) units: Vec<IndexUnit<'a>>,
 }
@@ -1237,7 +1309,7 @@ fn index_statement(
                 Value::from(lu),
                 Value::from(i),
                 Value::from(v),
-                Value::from(delta.fhir_version.as_mime_param()),
+                Value::from(delta.fhir_version),
                 Value::from(ts),
             ],
         ),
@@ -1465,7 +1537,10 @@ fn retry_pause(attempt: u32) -> Duration {
 
 /// A delta's units, packed into batches.
 struct IndexBatches {
-    /// Each batch's statements: whole units, in the delta's order.
+    /// Each batch's statements: whole units and pieces of units over
+    /// [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS) or
+    /// [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES), in the delta's
+    /// order.
     batches: Vec<Vec<IndexStatement>>,
     /// What the batches hold (IW14).
     stats: IndexWriteStats,
@@ -1476,20 +1551,33 @@ struct IndexBatches {
 /// [`MAX_BATCH_BYTES`]. A unit is not split for its bytes, so one over that
 /// limit on its own goes alone, as one batch over it.
 ///
-/// A unit of more than [`MAX_BATCH_STATEMENTS`] statements is split, since
-/// the native protocol counts a batch's statements in 16 bits and a longer
-/// batch would wrap. It becomes consecutive pieces of at most that many, in
-/// the unit's statement order (inserts, then deletes); each piece is its own
-/// batch, being far over [`MAX_BATCH_BYTES`], and is counted in the stats on
-/// its own. The `resources_by_type` unit holds one or two statements per
-/// resource and is never split (IW9 B: `count` reads that partition).
+/// A unit of more than
+/// [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS) statements, or
+/// of more than [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES) by
+/// [`wire_bytes`], is split: the native protocol counts a batch's statements in
+/// 16 bits, so a longer batch would wrap, and the node refuses a message over
+/// its limit (16 MiB by default, less on a heap under 640 MiB). It becomes
+/// consecutive pieces of whole rows, each as long as both limits allow
+/// ([`piece_len`]), in the unit's statement order (inserts, then deletes). A
+/// full piece is far over [`MAX_BATCH_BYTES`], so it is a batch of its own: one
+/// partition, which the node runs without its batchlog, so a timeout is retried
+/// ([`BatchFailure::Retry`]). The last piece, when small, is packed like any
+/// unit, so it can share a batch with the next units: several partitions, which
+/// go through the batchlog, so a timeout there is [`BatchFailure::InBatchlog`].
+/// The stats count batches, so a packed last piece counts in the batch that
+/// holds it. The `resources_by_type` unit holds one or two statements per
+/// resource and is never split (IW9 B: `count` reads that partition). This
+/// split amends IW11 (ADR-aacruzgon-0089): the pieces all carry `ts`, so their
+/// order does not matter and a failed one keeps the intent, but one partition's
+/// rows no longer apply as one mutation, so a reader can see some of them new
+/// and some old until the last piece lands.
 fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatches {
     // (inserts, deletes, statements) of each piece, in the delta's order.
     let mut pieces: Vec<(u64, u64, Vec<IndexStatement>)> = Vec::new();
     for unit in &delta.units {
         let statements = unit_statements(key, delta, unit, ts);
         debug_assert!(
-            statements.len() <= MAX_BATCH_STATEMENTS
+            piece_len(&statements) == statements.len()
                 || !unit
                     .inserts
                     .iter()
@@ -1501,7 +1589,7 @@ fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatc
         let mut start = 0;
         let mut rest = statements;
         while !rest.is_empty() {
-            let tail = rest.split_off(rest.len().min(MAX_BATCH_STATEMENTS));
+            let tail = rest.split_off(piece_len(&rest));
             let end = start + rest.len();
             let piece_inserts = inserts.clamp(start, end) - start;
             pieces.push((
@@ -2114,7 +2202,7 @@ impl CassandraBackend {
         let operation = request.operation;
         loop {
             let lu_n = plan.previous.as_ref().map(|p| p.last_updated);
-            let attempt = Attempt {
+            let mut attempt = Attempt {
                 write_id: Uuid::new_v4(),
                 last_updated: next_last_updated(Utc::now(), lu_n),
                 intent: IntentKey::new(key.tenant_id, key.id, Utc::now()),
@@ -2133,6 +2221,9 @@ impl CassandraBackend {
                     .await
                     .map_err(|error| request.statement_error(&error, "previous version row"))?;
             }
+            // SW6 = IW18 (ADR-sam-michaels-0006): stamped after V3, just before I1, so the grace covers only I1's latency and clock skew. A stall between I1 and the CAS is covered by `finish`, which writes a fresh intent when it leaves work.
+            attempt.intent = IntentKey::new(key.tenant_id, key.id, Utc::now());
+            request.attempts[index].intent = attempt.intent.clone();
             self.write_intent(
                 &attempt.intent,
                 &key,
@@ -2382,7 +2473,23 @@ impl CassandraBackend {
 
     /// Steps 4 to 6 for attempt `n`, which applied, with its own values and
     /// intent; skipped when superseded, leaving the intent for the sweeper,
-    /// whose superseded case deletes `K(V-1)`.
+    /// whose superseded case deletes `K(V-1)` minus `K(V)`.
+    ///
+    /// **A write left unfinished** (superseded, or its version row or index
+    /// rows failed) writes one more intent, stamped now, before it returns:
+    /// the intent from step 1 may be older than the grace by now, and a
+    /// sweeper may have taken it for a CAS that never applied (SW6).
+    ///
+    /// **The version row first** (IW24, ADR-sam-michaels-0006): step 5 starts
+    /// only once step 4's row is acknowledged, so any version a search finds
+    /// through an index row is one vread and `_history` can open. When the
+    /// version row fails all its tries, the index rows are not sent at all:
+    /// the intent stays and the sweeper writes both. Until then the
+    /// resource's index rows are still version V−1's, which search drops
+    /// against the version-V `resources` row (the tag check,
+    /// `cassandra-discussion.md`, "Index rows carry `version_id`"), so search
+    /// omits the resource rather than finding a version vread answers 404
+    /// for; `count` still counts its `resources_by_type` row.
     async fn finish(&self, request: &mut CasRequest<'_>, n: usize, superseded: bool) -> Applied {
         let target = request.attempts[n].plan.target_version();
         request.settle(target);
@@ -2411,17 +2518,24 @@ impl CassandraBackend {
             #[cfg(test)]
             self.checkpoint(Checkpoint::AfterVersionRow, &key, version_id)
                 .await;
-            let previous = plan.previous_rows();
-            let delta = index_delta(&previous, plan.version_keys(attempt.last_updated));
-            let indexed = self
-                .write_index_delta(&key, &delta, ts, POST_CAS_WRITE_TRIES)
-                .await;
+            // IW24 (ADR-sam-michaels-0006): no index row for a version whose row is missing.
+            let indexed = match &version_written {
+                Ok(()) => {
+                    let previous = plan.previous_rows();
+                    let delta = index_delta(&previous, plan.version_keys(attempt.last_updated));
+                    let outcome = self
+                        .write_index_delta(&key, &delta, ts, POST_CAS_WRITE_TRIES)
+                        .await;
+                    index = outcome.stats;
+                    outcome.result
+                }
+                Err(failure) => Err(*failure),
+            };
             // RV15/RV16 (ADR-sam-michaels-0006): a test can hold or crash the request here.
             #[cfg(test)]
             self.checkpoint(Checkpoint::AfterIndex, &key, version_id)
                 .await;
-            index = indexed.stats;
-            if version_written.is_ok() && indexed.result.is_ok() {
+            if indexed.is_ok() {
                 self.delete_intent(&attempt.intent, &key).await;
                 true
             } else {
@@ -2431,12 +2545,20 @@ impl CassandraBackend {
                     resource_type = key.resource_type,
                     id = %key.id,
                     version_id,
+                    index_rows_skipped = version_written.is_err(),
                     "write applied, but its version or index rows could not be written; \
                      the sweeper finishes it from the intent row"
                 );
                 false
             }
         };
+        // SW6: a write left unfinished (its rows failed, or a newer version superseded it) always
+        // leaves an intent younger than the grace, whatever the sweeper did to the first one while
+        // this writer was stalled before its CAS. A second intent for a version is harmless (SW22).
+        if !complete {
+            self.restamp_intent(&key, attempt.write_id, version_id)
+                .await;
+        }
         request
             .stats
             .applied(n + 1 != request.attempts.len(), superseded);
@@ -2451,8 +2573,23 @@ impl CassandraBackend {
         }
     }
 
+    /// A fresh I1 for a write that applied and was left unfinished: one try, stamped now. A failure is
+    /// logged; the intent the write started with is then all there is.
+    async fn restamp_intent(&self, key: &RowKey<'_>, write_id: Uuid, version_id: i32) {
+        let intent = IntentKey::new(key.tenant_id, key.id, Utc::now());
+        if let Err(error) = self.write_intent(&intent, key, write_id, version_id).await {
+            tracing::error!(
+                resource_type = key.resource_type,
+                id = %key.id,
+                version_id,
+                error = ?error,
+                "a write applied but is unfinished, and its new intent row could not be written"
+            );
+        }
+    }
+
     /// I1.
-    async fn write_intent(
+    pub(super) async fn write_intent(
         &self,
         intent: &IntentKey,
         key: &RowKey<'_>,
@@ -2479,9 +2616,25 @@ impl CassandraBackend {
     }
 
     /// I2, best effort: a failure leaves the intent for the sweeper.
-    async fn delete_intent(&self, intent: &IntentKey, key: &RowKey<'_>) {
-        let result = self
-            .session
+    pub(super) async fn delete_intent(&self, intent: &IntentKey, key: &RowKey<'_>) {
+        if let Err(error) = self.try_delete_intent(intent, key).await {
+            tracing::debug!(
+                resource_type = key.resource_type,
+                id = key.id,
+                error = ?error,
+                "intent delete failed; the sweeper deletes it"
+            );
+        }
+    }
+
+    /// I2 with its result, for the sweeper, which counts an intent as finished only once I2 is confirmed.
+    /// It is a delete at the server's time, not at a fixed timestamp.
+    pub(super) async fn try_delete_intent(
+        &self,
+        intent: &IntentKey,
+        key: &RowKey<'_>,
+    ) -> Result<(), DriverError> {
+        self.session
             .execute(
                 DELETE_INTENT,
                 vec![
@@ -2494,21 +2647,14 @@ impl CassandraBackend {
                 ],
                 StatementKind::Write,
             )
-            .await;
-        if let Err(error) = result {
-            tracing::debug!(
-                resource_type = key.resource_type,
-                id = key.id,
-                error = ?error,
-                "intent delete failed; the sweeper deletes it"
-            );
-        }
+            .await
+            .map(|_| ())
     }
 
     /// Step 4 on plain inputs (IW17 = SW14, ADR-sam-michaels-0006): `row`
     /// `USING TIMESTAMP ts`, with up to `tries` tries. The request passes 3
     /// ([`POST_CAS_WRITE_TRIES`]); the sweeper, whose retry list already
-    /// retries, passes 1 per pass.
+    /// retries, passes 1 per pass. A refusal is logged at `error`.
     pub(crate) async fn write_version_row(
         &self,
         key: &RowKey<'_>,
@@ -2516,8 +2662,22 @@ impl CassandraBackend {
         ts: i64,
         tries: u32,
     ) -> Result<(), WriteFailure> {
+        self.write_version_row_logged(key, row, ts, tries, RefusalLog::Error)
+            .await
+    }
+
+    /// [`Self::write_version_row`], with a refusal logged at `refusal` (the
+    /// sweeper's later tries, ADR-aacruzgon-0090).
+    pub(crate) async fn write_version_row_logged(
+        &self,
+        key: &RowKey<'_>,
+        row: &VersionRow<'_>,
+        ts: i64,
+        tries: u32,
+        refusal: RefusalLog,
+    ) -> Result<(), WriteFailure> {
         let (cql, values) = version_row(key, row, ts);
-        self.write_with_retries(cql, values, "version row", tries)
+        self.write_with_retries(cql, values, "version row", tries, refusal)
             .await
     }
 
@@ -2527,21 +2687,27 @@ impl CassandraBackend {
     /// sweeper 1 per pass and repair 1. Every caller computes
     /// `ts = write_ts_of(lu(V))` for the version `delta` writes.
     ///
-    /// - **Packed, split only past the statement limit** (IW9 B, IW11). The
-    ///   units are packed in order
-    ///   into batches of at most [`MAX_BATCH_BYTES`] by [`wire_bytes`]
-    ///   ([`index_batches`]). A unit is every row of one partition, which
-    ///   Cassandra applies whole on each replica; above all, once the batch
-    ///   has reached a quorum, an update alone never lets `count` see an
-    ///   updated resource's `resources_by_type` row twice. `count` can still
-    ///   be off (ADR-aacruzgon-0081, decision 2): too high, by up to one per
-    ///   unfinished update or delete, and one too low after an unfinished
-    ///   create or revive, until the sweeper or repair finishes it; and on
-    ///   RF 3, twice or not at all through read repair after a batch that
-    ///   reached fewer than a quorum. A unit over the byte bound goes alone;
-    ///   one of more than [`MAX_BATCH_STATEMENTS`] statements, never the
-    ///   `resources_by_type` unit, is split into consecutive pieces of at
-    ///   most that many, each its own batch.
+    /// - **Packed, split only past the statement or byte limit** (IW9 B, IW11).
+    ///   The units are packed in order into batches of at most
+    ///   [`MAX_BATCH_BYTES`] by [`wire_bytes`] ([`index_batches`]). A unit is
+    ///   every row of one partition, which Cassandra applies whole on each
+    ///   replica; above all, once the batch has reached a quorum, an update
+    ///   alone never lets `count` see an updated resource's `resources_by_type`
+    ///   row twice. `count` can still be off (ADR-aacruzgon-0081, decision 2):
+    ///   too high, by up to one per unfinished update or delete, and one too
+    ///   low after an unfinished create or revive, until the sweeper or repair
+    ///   finishes it; and on RF 3, twice or not at all through read repair
+    ///   after a batch that reached fewer than a quorum. A unit over the byte
+    ///   bound goes alone; one of more than
+    ///   [`MAX_BATCH_STATEMENTS`](super::batch::MAX_BATCH_STATEMENTS)
+    ///   statements or [`MAX_PIECE_BYTES`](super::batch::MAX_PIECE_BYTES),
+    ///   never the `resources_by_type` unit, is split into consecutive pieces
+    ///   of whole rows within both (ADR-aacruzgon-0089); a full piece is a
+    ///   batch of its own, and a small last piece is packed like any unit. A
+    ///   batch of one partition runs without the node's batchlog and one of
+    ///   several goes through it, so a timeout is retried for the first and not
+    ///   for the second ([`WriteFailure::InBatchlog`]); either way a batch not
+    ///   confirmed keeps the intent.
     /// - **All at once, at most [`INDEX_BATCHES_IN_FLIGHT`] in flight**
     ///   (IW12), as futures inside the request's own task, never
     ///   `tokio::spawn`, so a request that is dropped, or a crash test that
@@ -2572,12 +2738,45 @@ impl CassandraBackend {
         tries: u32,
     ) -> IndexOutcome {
         let deadline = Duration::from_millis(self.config.request_timeout_ms);
-        self.write_index_delta_within(key, delta, ts, tries, deadline)
-            .await
+        self.write_index_delta_within(
+            key,
+            delta,
+            ts,
+            tries,
+            deadline,
+            RefusalLog::Error,
+            DeltaWriter::Request,
+        )
+        .await
     }
 
-    /// [`Self::write_index_delta`] with the phase's deadline given, so a test
-    /// can make it short.
+    /// [`Self::write_index_delta`] for the sweeper: a refused batch logged at
+    /// `refusal` (its later tries, ADR-aacruzgon-0090), and a batch not
+    /// confirmed logged as leaving the intent queued for its next try.
+    pub(crate) async fn write_index_delta_logged(
+        &self,
+        key: &RowKey<'_>,
+        delta: &IndexDelta<'_>,
+        ts: i64,
+        tries: u32,
+        refusal: RefusalLog,
+    ) -> IndexOutcome {
+        let deadline = Duration::from_millis(self.config.request_timeout_ms);
+        self.write_index_delta_within(
+            key,
+            delta,
+            ts,
+            tries,
+            deadline,
+            refusal,
+            DeltaWriter::Sweeper,
+        )
+        .await
+    }
+
+    /// [`Self::write_index_delta`] with the phase's deadline, the refusal's
+    /// level and the writer given, so a test can make the deadline short.
+    #[allow(clippy::too_many_arguments)]
     async fn write_index_delta_within(
         &self,
         key: &RowKey<'_>,
@@ -2585,6 +2784,8 @@ impl CassandraBackend {
         ts: i64,
         tries: u32,
         deadline: Duration,
+        refusal: RefusalLog,
+        writer: DeltaWriter,
     ) -> IndexOutcome {
         let IndexBatches { batches, stats } = index_batches(key, delta, ts);
         let mut failures = Vec::new();
@@ -2596,7 +2797,7 @@ impl CassandraBackend {
         let ends_at = tokio::time::Instant::now() + deadline;
         let sends: Vec<_> = batches
             .iter()
-            .map(|batch| self.send_index_batch(batch, tries, ends_at))
+            .map(|batch| self.send_index_batch(batch, tries, ends_at, refusal))
             .collect();
         let sends = futures::stream::iter(sends)
             .buffer_unordered(INDEX_BATCHES_IN_FLIGHT)
@@ -2625,14 +2826,24 @@ impl CassandraBackend {
             );
             Ok(())
         } else {
-            tracing::warn!(
-                resource_type = key.resource_type,
-                id = key.id,
-                version_id = delta.version_id,
-                failed = failures.len(),
-                index = %stats,
-                "index batches not confirmed; the intent is kept for the sweeper"
-            );
+            match writer {
+                DeltaWriter::Request => tracing::warn!(
+                    resource_type = key.resource_type,
+                    id = key.id,
+                    version_id = delta.version_id,
+                    failed = failures.len(),
+                    index = %stats,
+                    "index batches not confirmed; the intent is kept for the sweeper"
+                ),
+                DeltaWriter::Sweeper => tracing::warn!(
+                    resource_type = key.resource_type,
+                    id = key.id,
+                    version_id = delta.version_id,
+                    failed = failures.len(),
+                    index = %stats,
+                    "index batches not confirmed; the intent row stays in the outbox"
+                ),
+            }
             Err([
                 WriteFailure::Permanent,
                 WriteFailure::TriesExhausted,
@@ -2645,7 +2856,8 @@ impl CassandraBackend {
         IndexOutcome { result, stats }
     }
 
-    /// Sends one packed batch of an index delta, whole units of it (IW9 B),
+    /// Sends one packed batch of an index delta, whole units of it and pieces
+    /// of units over the statement or byte limit (IW9 B, ADR-aacruzgon-0089),
     /// through [`CassandraSession::batch`](super::session::CassandraSession::batch)
     /// (IW13): one logged batch at `LOCAL_QUORUM`, or a plain write for a
     /// lone statement; either way the driver never re-sends it, so one try is
@@ -2667,11 +2879,14 @@ impl CassandraBackend {
     /// `tokio::time::timeout` still bounds a try already in flight, but it
     /// polls its future before its timer, so on its own it would let a
     /// stalled writer start one more try after the deadline.
+    ///
+    /// A refusal is logged at `refusal`'s level ([`RefusalLog`]).
     async fn send_index_batch(
         &self,
         statements: &[IndexStatement],
         tries: u32,
         ends_at: tokio::time::Instant,
+        refusal: RefusalLog,
     ) -> Result<(), WriteFailure> {
         for attempt in 1..=tries {
             if tokio::time::Instant::now() >= ends_at {
@@ -2692,7 +2907,8 @@ impl CassandraBackend {
                     return Err(WriteFailure::InBatchlog);
                 }
                 BatchFailure::Refused => {
-                    tracing::error!(
+                    log_refusal!(
+                        refusal,
                         attempt,
                         statements = statements.len(),
                         error = ?error,
@@ -2718,13 +2934,15 @@ impl CassandraBackend {
 
     /// A plain, idempotent write with a fixed timestamp, tried up to `tries`
     /// times, 10 ms then 20 ms apart. An `Invalid` refusal is not retried:
-    /// the node refuses the same statement every time (IW17, RW9).
+    /// the node refuses the same statement every time (IW17, RW9). It is
+    /// logged at `refusal`'s level ([`RefusalLog`]).
     async fn write_with_retries(
         &self,
         cql: &str,
         values: Vec<Value>,
         what: &str,
         tries: u32,
+        refusal: RefusalLog,
     ) -> Result<(), WriteFailure> {
         for attempt in 1..=tries {
             match self
@@ -2734,7 +2952,8 @@ impl CassandraBackend {
             {
                 Ok(_) => return Ok(()),
                 Err(error) if is_invalid(&error) => {
-                    tracing::error!(
+                    log_refusal!(
+                        refusal,
                         attempt,
                         what,
                         error = ?error,
@@ -3540,7 +3759,8 @@ mod tests {
         VersionKeys {
             version_id: 2,
             last_updated,
-            fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                .as_mime_param(),
             keys,
         }
     }
@@ -3835,8 +4055,10 @@ mod tests {
         assert_eq!(stats.largest_batch_bytes, wire_bytes(batch) as u64);
     }
 
-    /// IW11: a unit is every row of one partition and is never split, even
-    /// when it alone is over the batch limit: it goes as one batch.
+    /// IW11: a unit is every row of one partition and is never split for
+    /// its bytes, even when it alone is over the byte limit: it goes as one
+    /// batch. (Only a unit over the statement limit is split, see
+    /// `a_unit_over_the_statement_limit_is_split_and_the_type_unit_never_is`.)
     #[test]
     fn an_oversized_unit_is_sent_as_one_batch() {
         let lu1 = at("2026-11-16T10:00:00.000Z");
@@ -4219,7 +4441,78 @@ mod tests {
         ]
     }
 
-    /// IW11 (gate): the packer never splits a partition's rows, and with the
+    /// ADR-aacruzgon-0089: a unit under the statement limit but over
+    /// `MAX_PIECE_BYTES` of statements is cut by bytes into pieces of whole
+    /// rows, each as long as the budget allows, in statement order; the
+    /// `resources_by_type` unit is never split. Pure: nothing reaches a node.
+    #[test]
+    fn a_unit_over_the_piece_bytes_is_split_by_bytes() {
+        let lu = at("2026-11-16T10:00:00.000Z");
+        let ts = write_ts_of(lu);
+        let mut next = vec![IndexKey::ResourcesByType];
+        next.extend((0..20_000).map(|i| IndexKey::TokenSystem {
+            param: "identifier".to_string(),
+            system: "s".to_string(),
+            code: format!("{i:0>500}"),
+        }));
+        let delta = index_delta(&[], version_keys(&next, lu));
+        assert_eq!(delta.units.len(), 2, "the type unit, and one token unit");
+        let token_unit = delta
+            .units
+            .iter()
+            .find(|unit| unit.inserts.len() == 20_000)
+            .expect("the token unit");
+        let whole = unit_statements(&key(), &delta, token_unit, ts);
+        assert!(whole.len() < MAX_BATCH_STATEMENTS);
+        assert!(wire_bytes(&whole) > MAX_PIECE_BYTES, "over the byte budget");
+
+        let packed = index_batches(&key(), &delta, ts);
+        let token_batches: Vec<&Vec<IndexStatement>> = packed
+            .batches
+            .iter()
+            .filter(|batch| {
+                batch
+                    .iter()
+                    .any(|s| s.cql() == INSERT_TOKEN_SYSTEM.as_str())
+            })
+            .collect();
+        assert!(token_batches.len() >= 2, "cut by bytes");
+        for batch in &token_batches {
+            assert!(
+                wire_bytes(batch) <= MAX_PIECE_BYTES,
+                "{}",
+                wire_bytes(batch)
+            );
+        }
+        // Each full piece is as long as the budget allows: one more row would
+        // pass it.
+        let first = token_batches[0];
+        let next_row = &token_batches[1][0];
+        assert!(wire_bytes(first) + wire_bytes(std::slice::from_ref(next_row)) > MAX_PIECE_BYTES);
+        // Whole rows, in the unit's order, none lost.
+        let cut: Vec<&[Value]> = token_batches
+            .iter()
+            .flat_map(|batch| batch.iter())
+            .filter(|s| s.cql() == INSERT_TOKEN_SYSTEM.as_str())
+            .map(IndexStatement::values)
+            .collect();
+        let expected: Vec<&[Value]> = whole.iter().map(IndexStatement::values).collect();
+        assert_eq!(cut, expected);
+        let type_batches = packed
+            .batches
+            .iter()
+            .filter(|batch| {
+                batch
+                    .iter()
+                    .any(|s| s.cql() == INSERT_RESOURCES_BY_TYPE.as_str())
+            })
+            .count();
+        assert_eq!(type_batches, 1, "the type key's insert is in one batch");
+        assert_eq!(packed.stats.rows_inserted, 20_001);
+    }
+
+    /// IW11 (gate): the packer never splits a partition's rows for their
+    /// bytes (none here is near the statement limit), and with the
     /// 1,024-byte mapping every batch of several units stays within the
     /// bound, in the worst case (a 64-byte tenant): six long identifiers, and
     /// one row whose param, system and code are each 1,024 bytes, which goes
@@ -4743,6 +5036,7 @@ mod tests {
             created_at: None,
             deleted_at: None,
             fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            stored_fhir_version: None,
             write_ts: None,
             write_id: None,
             index_keys: None,
@@ -5949,7 +6243,10 @@ mod node_tests {
 
     /// G23 on every operation (ADR-aacruzgon-0034, 0050): the CAS applied,
     /// the version row fails all three tries, and the write still succeeds,
-    /// with the intent row left for the sweeper (no I2).
+    /// with the intent row left for the sweeper (no I2). Its index rows are
+    /// not sent (IW24, ADR-sam-michaels-0006), so the new resource is not
+    /// counted until the sweeper writes its version row and its
+    /// `resources_by_type` row together.
     #[tokio::test]
     async fn a_post_cas_failure_still_succeeds_and_leaves_the_intent() {
         let Some(backend) = backend().await else {
@@ -5978,12 +6275,140 @@ mod node_tests {
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(created.version_id(), "1");
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        // I1 and three tries of V1; no I2. The `k` index rows of the new
-        // version go as one batch (IW9 B, IW14).
-        let k = current(&backend, &tenant).await.keys().unwrap().len() as u64;
-        assert!(k > 1, "the index rows go as a batch");
-        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
-        assert_eq!((spent.batch, spent.batched), (1, k), "{spent}");
+        // I1, three tries of V1, the fresh intent; no index statement (IW24), no I2.
+        assert_eq!((spent.write, spent.cas), (5, 1), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (0, 0), "{spent}");
+        assert_eq!(
+            backend.count(&tenant, Some("Patient")).await.unwrap(),
+            0,
+            "the resources_by_type row waits for the sweeper (IW24)"
+        );
+    }
+
+    /// IW24, version row first (ADR-sam-michaels-0006): an update whose
+    /// version row fails all three tries sends no index statement at all, so
+    /// no index row points at a version that vread and `_history` cannot
+    /// open. A tripwire on every `resources_by_type` write is still armed
+    /// afterwards, so neither X1's insert nor its delete was sent: the old
+    /// row stays, and `count` still sees the resource once. The intent is
+    /// kept for the sweeper, and the write still answers success (G23).
+    #[tokio::test]
+    async fn a_failed_version_row_sends_no_index_row_and_keeps_the_intent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let since = Utc::now();
+        let tenant = tenant_context("version-row-first");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                patient(),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
+            .await
+            .unwrap();
+        let row1 = current(&backend, &tenant).await;
+        let (json, data) = normalized_body("update", "Patient", "p", patient()).unwrap();
+        let plan = CasPlan::update(
+            PreviousVersion::from_row(&row1).unwrap(),
+            json,
+            data,
+            vec![IndexKey::ResourcesByType],
+        );
+        // V3 (step 2) shares V1's text, so it passes; then V1 fails every try.
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resource_versions",
+            Fault::PassThrough,
+        );
+        for _ in 0..POST_CAS_WRITE_TRIES {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resource_versions",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "resources_by_type",
+            Fault::TimeOutWithoutApplying,
+        );
+
+        let (before, counted) = (backend.cas_stats(), backend.statement_counts());
+        let mut request = backend.cas_request("update", key_of(&tenant));
+        let applied = applied_of(backend.run_cas(&mut request, plan).await.unwrap());
+        assert_eq!(applied.version_id, 2);
+        assert!(!applied.post_cas_complete && !applied.superseded);
+        let stats = backend.cas_stats().since(&before);
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
+        // V3, I1, three tries of V1, and the fresh intent of the unfinished write; no index statement, no I2.
+        assert_eq!((spent.write, spent.batch, spent.cas), (6, 0, 1), "{spent}");
+
+        let error = backend
+            .session
+            .rows(
+                "SELECT id FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect_err("the tripwire is still armed: no index statement was sent");
+        assert!(format!("{error:?}").contains("injected fault"), "{error:?}");
+
+        // The CAS applied; row 2 of resource_versions is the sweeper's to
+        // write, and the index still shows version 1.
+        assert_eq!(current(&backend, &tenant).await.version_id, 2);
+        let versions: Vec<i32> = version_rows(&backend, &tenant)
+            .await
+            .into_iter()
+            .map(|(version, _, _)| version)
+            .collect();
+        assert_eq!(versions, vec![1]);
+        assert_eq!(by_type_versions(&backend, &tenant).await, vec![1]);
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+
+        // I1 and the fresh intent are left for the sweeper.
+        assert_eq!(
+            backend
+                .intent_versions(tenant.tenant_id().as_str(), "Patient", "p", since)
+                .await,
+            vec![2, 2]
+        );
+
+        // The sweep writes the row and the index rows, and leaves no intent of its own.
+        let report = backend
+            .sweep_pass(crate::backends::cassandra::SweepOptions {
+                scope: crate::backends::cassandra::SweepScope::Tenants(vec![
+                    tenant.tenant_id().as_str().to_string(),
+                ]),
+                grace: Duration::ZERO,
+                now: Utc::now(),
+                since,
+                allow_short_grace: true,
+            })
+            .await
+            .unwrap();
+        assert!(report.is_complete(), "{report}");
+        assert!(
+            backend
+                .intent_versions(tenant.tenant_id().as_str(), "Patient", "p", since)
+                .await
+                .is_empty()
+        );
+        // The rows the sweep restored.
+        let versions: Vec<i32> = version_rows(&backend, &tenant)
+            .await
+            .into_iter()
+            .map(|(version, _, _)| version)
+            .collect();
+        assert_eq!(versions, vec![2, 1]);
+        assert_eq!(by_type_versions(&backend, &tenant).await, vec![2]);
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
     }
 
@@ -6017,7 +6442,8 @@ mod node_tests {
             VersionKeys {
                 version_id: 2,
                 last_updated: lu2,
-                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                    .as_mime_param(),
                 keys: std::slice::from_ref(&x1),
             },
         );
@@ -6035,11 +6461,321 @@ mod node_tests {
                 &batches[0],
                 POST_CAS_WRITE_TRIES,
                 tokio::time::Instant::now() + Duration::from_secs(60),
+                RefusalLog::Error,
             )
             .await;
         let spent = backend.statement_counts().since(&counted);
         assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
         assert_eq!(spent.batch, 1, "{spent}");
+    }
+
+    /// Opts in to the full-size node test of the byte cut, which writes about
+    /// 98,000 rows (`the_largest_update_of_one_partition_is_cut_by_bytes_and_lands`).
+    const LARGE: &str = "HFS_TEST_CASSANDRA_LARGE";
+
+    /// ADR-aacruzgon-0089, in every run: the node refuses a message over its
+    /// limit (16 MiB by default, less on a heap under 640 MiB), and the byte
+    /// cut keeps every piece under it. One unit of 65,536 copies of one
+    /// 269-byte insert (a 64-byte tenant, a 64-character id, a 46-character
+    /// code: the audit's sizes), built by hand, since a real delta never
+    /// repeats a key. Its first 65,535 statements, a piece cut by count
+    /// alone, are a 17 MB message the node refuses as `Invalid`;
+    /// `write_index_delta` cuts the unit by bytes and every piece lands. The
+    /// node keeps one row, so later scans of the index tables pay nothing
+    /// for it.
+    #[tokio::test]
+    async fn a_unit_over_the_piece_bytes_lands_and_a_count_cut_piece_is_refused() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let mut tenant = format!("test-piece-node-{}", Uuid::new_v4().simple());
+        while tenant.len() < crate::tenant::MAX_TENANT_ID_LEN {
+            tenant.push('x');
+        }
+        let id = "b".repeat(64);
+        let key = RowKey {
+            tenant_id: &tenant,
+            resource_type: "Patient",
+            id: &id,
+        };
+        let row = IndexKey::TokenSystem {
+            param: "identifier".to_string(),
+            system: "s".to_string(),
+            code: "c".repeat(46),
+        };
+        let lu = Utc::now();
+        let ts = write_ts_of(lu);
+        let delta = IndexDelta {
+            version_id: 1,
+            fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                .as_mime_param(),
+            units: vec![IndexUnit {
+                inserts: vec![(&row, lu); MAX_BATCH_STATEMENTS + 1],
+                deletes: Vec::new(),
+            }],
+        };
+        let statements = unit_statements(&key, &delta, &delta.units[0], ts);
+        let count_cut = &statements[..MAX_BATCH_STATEMENTS];
+        assert!(
+            wire_bytes(count_cut) > 16 * 1024 * 1024,
+            "{} bytes",
+            wire_bytes(count_cut)
+        );
+
+        // The node's limit: a piece cut by count alone is refused.
+        let error = backend
+            .session
+            .batch(count_cut.to_vec())
+            .await
+            .expect_err("a message over 16 MiB");
+        assert!(is_invalid(&error), "{error:?}");
+        assert!(
+            format!("{error:?}").contains("exceeds allowed maximum"),
+            "{error:?}"
+        );
+
+        // The byte cut: every piece within 8 MiB, every one confirmed.
+        let outcome = backend
+            .write_index_delta(&key, &delta, ts, POST_CAS_WRITE_TRIES)
+            .await;
+        assert_eq!(outcome.result, Ok(()), "{}", outcome.stats);
+        assert!(outcome.stats.batches >= 3, "{}", outcome.stats);
+        assert!(
+            outcome.stats.largest_batch_bytes <= MAX_PIECE_BYTES as u64,
+            "{}",
+            outcome.stats
+        );
+        let rows = backend
+            .session
+            .rows(
+                "SELECT version_id FROM token_system_index \
+                 WHERE tenant_id = ? AND resource_type = ? AND param = ? AND system = ?",
+                vec![
+                    Value::from(tenant.as_str()),
+                    Value::from("Patient"),
+                    Value::from("identifier"),
+                    Value::from("s"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("token_system_index");
+        assert_eq!(rows.len(), 1, "one row, written 65,536 times");
+    }
+
+    /// ADR-aacruzgon-0089 (the audit's B1): the largest update a valid
+    /// resource can make in one partition. A 64-byte tenant
+    /// (`MAX_TENANT_ID_LEN`), a 64-character id and 32,768 identifiers of
+    /// one system, with codes as long as the 8 MiB CAS bound accepts, then
+    /// 32,768 new ones: a 65,536-statement `token_system_index` unit of over
+    /// 16 MiB. Cut by count alone, its first 65,535-statement piece is a
+    /// message the node refuses (`OversizedCQLMessageException`), so the
+    /// update answers `Ok("2")` with its rows left at version 1 and the
+    /// intent kept. Cut by `MAX_PIECE_BYTES` too, the create and the update
+    /// both write every row at their version and clear the intent.
+    ///
+    /// **Opt in, with `HFS_TEST_CASSANDRA_LARGE=1`.** Each run leaves about
+    /// 98,000 index rows and as many tombstones (every identifier has a row
+    /// in three token tables), and the consistency and checkpoint tests scan
+    /// whole index tables, so every later run on the same node would be
+    /// slower. CI runs it once, in the FHIR versions job's last lib run, on
+    /// that job's own node.
+    /// `a_unit_over_the_piece_bytes_lands_and_a_count_cut_piece_is_refused`
+    /// shows the same limit in every run, with one row.
+    #[tokio::test]
+    async fn the_largest_update_of_one_partition_is_cut_by_bytes_and_lands() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        if std::env::var(LARGE).ok().as_deref() != Some("1") {
+            eprintln!(
+                "not run: set {LARGE}=1 on a node of the run's own (it leaves about 98,000 \
+                 rows and as many tombstones)"
+            );
+            return;
+        }
+        let mut name = format!("test-piece-bytes-{}", Uuid::new_v4().simple());
+        while name.len() < crate::tenant::MAX_TENANT_ID_LEN {
+            name.push('x');
+        }
+        let tenant = TenantContext::new(
+            TenantId::new(name.clone()),
+            TenantPermissions::full_access(),
+        );
+        let id = "b".repeat(64);
+        let code = |tag: char, i: usize, len: usize| {
+            let mut code = format!("{tag}{i}");
+            while code.len() < len {
+                code.push('c');
+            }
+            code
+        };
+        let identifiers = |tag: char, len: usize| -> Vec<serde_json::Value> {
+            (0..32_768)
+                .map(|i| json!({"system": "s", "value": code(tag, i, len)}))
+                .collect()
+        };
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        // The longest code the CAS bound accepts (46 under R4).
+        let mut chosen = None;
+        for len in (40..=48).rev() {
+            let body =
+                json!({"resourceType": "Patient", "id": id, "identifier": identifiers('a', len)});
+            let before = backend.cas_stats();
+            match backend.create(&tenant, "Patient", body, version).await {
+                Ok(created) => {
+                    let stats = backend.cas_stats().since(&before);
+                    assert_eq!(
+                        stats.post_cas_failures, 0,
+                        "the create's index rows: {stats}"
+                    );
+                    chosen = Some((len, created));
+                    break;
+                }
+                Err(crate::error::StorageError::Validation(_)) => continue,
+                Err(other) => panic!("a {len}-character code: {other:?}"),
+            }
+        }
+        let (len, created) = chosen.expect("a code length the CAS bound accepts");
+
+        // The update's unit is over the node's message limit (16 MiB by
+        // default), so a 65,535-statement piece of it would be refused.
+        let old_keys: Vec<IndexKey> = (0..32_768)
+            .map(|i| IndexKey::TokenSystem {
+                param: "identifier".to_string(),
+                system: "s".to_string(),
+                code: code('a', i, len),
+            })
+            .collect();
+        let new_keys: Vec<IndexKey> = (0..32_768)
+            .map(|i| IndexKey::TokenSystem {
+                param: "identifier".to_string(),
+                system: "s".to_string(),
+                code: code('z', i, len),
+            })
+            .collect();
+        let lu = Utc::now();
+        let previous: Vec<(&IndexKey, DateTime<Utc>)> = old_keys.iter().map(|k| (k, lu)).collect();
+        let delta = index_delta(
+            &previous,
+            VersionKeys {
+                version_id: 2,
+                last_updated: lu,
+                fhir_version: version.as_mime_param(),
+                keys: &new_keys,
+            },
+        );
+        let row_key = RowKey {
+            tenant_id: &name,
+            resource_type: "Patient",
+            id: &id,
+        };
+        let statements = unit_statements(&row_key, &delta, &delta.units[0], write_ts_of(lu));
+        assert_eq!(statements.len(), 65_536);
+        eprintln!(
+            "[piece-bytes code_len={len} unit_bytes={} count_cut_piece_bytes={}]",
+            wire_bytes(&statements),
+            wire_bytes(&statements[..MAX_BATCH_STATEMENTS])
+        );
+        assert!(
+            wire_bytes(&statements[..MAX_BATCH_STATEMENTS]) > 16 * 1024 * 1024,
+            "a full count-cut piece is over the node's message limit"
+        );
+
+        let before = backend.cas_stats();
+        let updated = backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType": "Patient", "id": id, "identifier": identifiers('z', len), "active": true}),
+            )
+            .await
+            .expect("update");
+        assert_eq!(updated.version_id(), "2");
+        let stats = backend.cas_stats().since(&before);
+        assert_eq!(
+            stats.post_cas_failures, 0,
+            "every index batch confirmed and the intent deleted: {stats}"
+        );
+        let rows = backend
+            .session
+            .rows(
+                "SELECT version_id FROM token_system_index \
+                 WHERE tenant_id = ? AND resource_type = ? AND param = ? AND system = ?",
+                vec![
+                    Value::from(name.as_str()),
+                    Value::from("Patient"),
+                    Value::from("identifier"),
+                    Value::from("s"),
+                ],
+                StatementKind::Read,
+            )
+            .await
+            .expect("token_system_index");
+        let versions: Vec<i32> = rows
+            .iter()
+            .map(|row| row.get_r_by_name("version_id").unwrap())
+            .collect();
+        assert_eq!(
+            versions.len(),
+            32_768,
+            "the old rows deleted, the new inserted"
+        );
+        assert!(versions.iter().all(|&v| v == 2), "every row at version 2");
+    }
+
+    /// ADR-aacruzgon-0089: a batch over the statement limit, which the
+    /// session refuses before sending it, fails as `Permanent` after one try
+    /// (the `Retry` path ends in `TriesExhausted`), with nothing counted, so
+    /// a writer keeps the intent and never retries a send that cannot
+    /// succeed. `index_batches` never builds such a batch, so the test hands
+    /// `send_index_batch` one unit's statements directly.
+    #[tokio::test]
+    async fn a_batch_over_the_statement_limit_fails_as_permanent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let lu = Utc::now();
+        let next: Vec<IndexKey> = (0..=MAX_BATCH_STATEMENTS)
+            .map(|i| IndexKey::TokenSystem {
+                param: "identifier".to_string(),
+                system: "s".to_string(),
+                code: i.to_string(),
+            })
+            .collect();
+        let delta = index_delta(
+            &[],
+            VersionKeys {
+                version_id: 1,
+                last_updated: lu,
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                    .as_mime_param(),
+                keys: &next,
+            },
+        );
+        assert_eq!(delta.units.len(), 1);
+        let key = RowKey {
+            tenant_id: "test-over-the-limit",
+            resource_type: "Patient",
+            id: "p",
+        };
+        let statements = unit_statements(&key, &delta, &delta.units[0], write_ts_of(lu));
+        assert_eq!(statements.len(), 65_536);
+        let counted = backend.statement_counts();
+        let outcome = backend
+            .send_index_batch(
+                &statements,
+                POST_CAS_WRITE_TRIES,
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                RefusalLog::Error,
+            )
+            .await;
+        let spent = backend.statement_counts().since(&counted);
+        assert_eq!(outcome, Err(WriteFailure::Permanent), "{spent}");
+        assert_eq!(spent.total(), 0, "nothing sent: {spent}");
     }
 
     /// IW17, RW9: a post-CAS write the node refuses as `Invalid` is tried
@@ -6068,6 +6804,7 @@ mod node_tests {
                 values,
                 "index row",
                 POST_CAS_WRITE_TRIES,
+                RefusalLog::Error,
             )
             .await;
         let spent = backend.statement_counts().since(&counted);
@@ -6098,7 +6835,8 @@ mod node_tests {
             VersionKeys {
                 version_id: 1,
                 last_updated: Utc::now(),
-                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                    .as_mime_param(),
                 keys: &keys,
             },
         );
@@ -6158,8 +6896,8 @@ mod node_tests {
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
         // V3, I1, V1 sent alone; three tries of the one batch holding the
         // `k` inserts and `k` deletes, X1's among them, none applied (IW16);
-        // no I2.
-        assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
+        // the fresh intent in place of I2.
+        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
         assert_eq!((spent.batch, spent.batched), (3, 6 * k), "{spent}");
 
         // The old row is still there, at version 1's `last_updated`.
@@ -6282,8 +7020,8 @@ mod node_tests {
         assert_eq!(applied.version_id, 2);
         assert!(!applied.post_cas_complete, "not confirmed, so not complete");
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        // V3, I1, V1 sent alone; one try of the batch; no I2.
-        assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
+        // V3, I1, V1 sent alone, the fresh intent; one try of the batch; no I2.
+        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
         assert_eq!((spent.batch, spent.batched), (1, 2 * k), "one try: {spent}");
         assert_eq!(
             by_type_versions(&backend, &tenant).await,
@@ -6450,6 +7188,214 @@ mod node_tests {
         assert_consistent(&check(&backend, t).await);
     }
 
+    /// The `(code, id, version_id)` rows of one partition of an Observation
+    /// `code` token table: `tenant_id`, `resource_type` and `param` plus
+    /// `keys`, the rest of the table's partition key, so no read needs
+    /// `ALLOW FILTERING` (`schema.cql`, the statement rules).
+    async fn code_token_rows(
+        backend: &CassandraBackend,
+        t: &str,
+        table: &str,
+        keys: &[(&str, &str)],
+    ) -> Vec<(String, String, i32)> {
+        let mut cql = format!(
+            "SELECT code, id, version_id FROM {table} \
+             WHERE tenant_id = ? AND resource_type = ? AND param = ?"
+        );
+        let mut values = vec![
+            Value::from(t),
+            Value::from("Observation"),
+            Value::from("code"),
+        ];
+        for (column, value) in keys {
+            cql.push_str(&format!(" AND {column} = ?"));
+            values.push(Value::from(*value));
+        }
+        let mut rows: Vec<(String, String, i32)> = backend
+            .session
+            .rows(&cql, values, StatementKind::Read)
+            .await
+            .expect("token rows")
+            .iter()
+            .map(|row| {
+                (
+                    row.get_r_by_name("code").unwrap(),
+                    row.get_r_by_name("id").unwrap(),
+                    row.get_r_by_name("version_id").unwrap(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// `token_system_index`'s `(code, http://loinc.org)` partition.
+    async fn loinc_system_rows(backend: &CassandraBackend, t: &str) -> Vec<(String, String, i32)> {
+        code_token_rows(backend, t, "token_system_index", &[("system", LOINC)]).await
+    }
+
+    /// `token_code_index`'s partition for `code`, then
+    /// `token_system_code_index`'s for `(http://loinc.org, code)`.
+    async fn loinc_code_rows(
+        backend: &CassandraBackend,
+        t: &str,
+        code: &str,
+    ) -> [Vec<(String, String, i32)>; 2] {
+        [
+            code_token_rows(backend, t, "token_code_index", &[("code", code)]).await,
+            code_token_rows(
+                backend,
+                t,
+                "token_system_code_index",
+                &[("system", LOINC), ("code", code)],
+            )
+            .await,
+        ]
+    }
+
+    const LOINC: &str = "http://loinc.org";
+
+    /// ADR-aacruzgon-0091 on a node: a Coding with a system and an empty code
+    /// writes its `token_system_index` row with code `''`, and no code row;
+    /// an update to a real code deletes that row and writes the code's rows;
+    /// a delete removes them. The REST layer removes `"code": ""` before a
+    /// write (`drop_empty_elements`), so this goes through the storage API.
+    #[tokio::test]
+    async fn a_system_with_an_empty_code_keeps_its_system_row() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("system-only");
+        let t = tenant.tenant_id().as_str();
+        let observation = |code: &str| {
+            json!({"resourceType":"Observation","id":"o","status":"final",
+                   "code":{"coding":[{"system":LOINC,"code":code}]}})
+        };
+        let row = |code: &str, v: i32| vec![(code.to_string(), "o".to_string(), v)];
+        let none = || [vec![], vec![]];
+
+        let created = backend
+            .create(&tenant, "Observation", observation(""), version())
+            .await
+            .unwrap();
+        assert_eq!(loinc_system_rows(&backend, t).await, row("", 1), "v1");
+        for code in ["", "8480-6"] {
+            assert_eq!(
+                loinc_code_rows(&backend, t, code).await,
+                none(),
+                "v1 {code:?}"
+            );
+        }
+        assert_consistent(&check(&backend, t).await);
+
+        let updated = backend
+            .update(&tenant, &created, observation("8480-6"))
+            .await
+            .unwrap();
+        assert_eq!(loinc_system_rows(&backend, t).await, row("8480-6", 2), "v2");
+        assert_eq!(
+            loinc_code_rows(&backend, t, "8480-6").await,
+            [row("8480-6", 2), row("8480-6", 2)]
+        );
+        assert_eq!(loinc_code_rows(&backend, t, "").await, none(), "v2");
+        assert_consistent(&check(&backend, t).await);
+
+        backend
+            .update(&tenant, &updated, observation(""))
+            .await
+            .unwrap();
+        assert_eq!(loinc_system_rows(&backend, t).await, row("", 3), "v3");
+        for code in ["", "8480-6"] {
+            assert_eq!(
+                loinc_code_rows(&backend, t, code).await,
+                none(),
+                "v3 {code:?}"
+            );
+        }
+        assert_consistent(&check(&backend, t).await);
+
+        backend.delete(&tenant, "Observation", "o").await.unwrap();
+        assert_eq!(loinc_system_rows(&backend, t).await, vec![], "deleted");
+        assert_consistent(&check(&backend, t).await);
+    }
+
+    /// ADR-aacruzgon-0091 next to a real code of the same system: a
+    /// CodeableConcept with codings `''` and `8480-6` of LOINC writes both
+    /// `token_system_index` rows into the one `(code, LOINC)` partition, told
+    /// apart by `code`; when only `8480-6` is left, the `''` row is deleted
+    /// and the `8480-6` rows move to the new version.
+    #[tokio::test]
+    async fn an_empty_code_beside_a_real_code_of_its_system_shares_its_partition() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("system-only-mixed");
+        let t = tenant.tenant_id().as_str();
+        let observation = |codes: &[&str]| {
+            let coding: Vec<_> = codes
+                .iter()
+                .map(|code| json!({"system": LOINC, "code": code}))
+                .collect();
+            json!({"resourceType":"Observation","id":"m","status":"final",
+                   "code":{"coding":coding}})
+        };
+        let rows = |codes: &[&str], v: i32| -> Vec<(String, String, i32)> {
+            codes
+                .iter()
+                .map(|code| (code.to_string(), "m".to_string(), v))
+                .collect()
+        };
+
+        let created = backend
+            .create(
+                &tenant,
+                "Observation",
+                observation(&["", "8480-6"]),
+                version(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            loinc_system_rows(&backend, t).await,
+            rows(&["", "8480-6"], 1),
+            "v1: both rows, in one partition"
+        );
+        assert_eq!(
+            loinc_code_rows(&backend, t, "8480-6").await,
+            [rows(&["8480-6"], 1), rows(&["8480-6"], 1)]
+        );
+        assert_eq!(loinc_code_rows(&backend, t, "").await, [vec![], vec![]]);
+        assert_consistent(&check(&backend, t).await);
+
+        let updated = backend
+            .update(&tenant, &created, observation(&["8480-6"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            loinc_system_rows(&backend, t).await,
+            rows(&["8480-6"], 2),
+            "v2: the '' row is deleted"
+        );
+        assert_eq!(
+            loinc_code_rows(&backend, t, "8480-6").await,
+            [rows(&["8480-6"], 2), rows(&["8480-6"], 2)]
+        );
+        assert_consistent(&check(&backend, t).await);
+
+        backend
+            .update(&tenant, &updated, observation(&["8480-6", ""]))
+            .await
+            .unwrap();
+        assert_eq!(
+            loinc_system_rows(&backend, t).await,
+            rows(&["", "8480-6"], 3),
+            "v3: both again, in either order"
+        );
+        assert_consistent(&check(&backend, t).await);
+    }
+
     /// IW9 B (gate): when one index batch fails every try, only its units are
     /// missing; the old `resources_by_type` row is kept, the other batches are
     /// written, and the intent stays for the sweeper.
@@ -6516,7 +7462,7 @@ mod node_tests {
         assert!(!applied.post_cas_complete);
         assert_eq!(applied.index.batches, batches);
         assert_eq!((stats.applied, stats.post_cas_failures), (1, 1));
-        assert_eq!((spent.write, spent.cas), (3, 1), "{spent}");
+        assert_eq!((spent.write, spent.cas), (4, 1), "{spent}");
         assert_eq!(
             spent.batch,
             batches - 1 + u64::from(POST_CAS_WRITE_TRIES),
@@ -6532,7 +7478,10 @@ mod node_tests {
             expect(&[("missing_row", n1), ("stray_row", n1)]),
             "only the failed batch's units"
         );
-        assert_eq!(backend.intent_versions(t, "Patient", "p", since).await, [2]);
+        assert_eq!(
+            backend.intent_versions(t, "Patient", "p", since).await,
+            [2, 2]
+        );
     }
 
     /// IW6 on every write path (ADR-aacruzgon-0079): a long value is hashed
@@ -6868,7 +7817,8 @@ mod node_tests {
             VersionKeys {
                 version_id: 2,
                 last_updated: lu2,
-                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                    .as_mime_param(),
                 keys: &x1,
             },
         );
@@ -6888,6 +7838,8 @@ mod node_tests {
                 write_ts_of(lu2),
                 POST_CAS_WRITE_TRIES,
                 Duration::from_millis(15),
+                RefusalLog::Error,
+                DeltaWriter::Request,
             )
             .await;
         let elapsed = started.elapsed();
@@ -6927,7 +7879,8 @@ mod node_tests {
             VersionKeys {
                 version_id: 2,
                 last_updated: lu2,
-                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                    .as_mime_param(),
                 keys: &x1,
             },
         );
@@ -6946,6 +7899,8 @@ mod node_tests {
             write_ts_of(lu2),
             POST_CAS_WRITE_TRIES,
             Duration::from_millis(15),
+            RefusalLog::Error,
+            DeltaWriter::Request,
         );
         let mut phase = std::pin::pin!(phase);
         assert!(

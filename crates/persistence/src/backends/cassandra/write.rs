@@ -2474,8 +2474,12 @@ impl CassandraBackend {
     /// only once step 4's row is acknowledged, so any version a search finds
     /// through an index row is one vread and `_history` can open. When the
     /// version row fails all its tries, the index rows are not sent at all:
-    /// the intent stays and the sweeper writes both, so search shows the old
-    /// state until then rather than a version vread answers 404 for.
+    /// the intent stays and the sweeper writes both. Until then the
+    /// resource's index rows are still version V−1's, which search drops
+    /// against the version-V `resources` row (the tag check,
+    /// `cassandra-discussion.md`, "Index rows carry `version_id`"), so search
+    /// omits the resource rather than finding a version vread answers 404
+    /// for; `count` still counts its `resources_by_type` row.
     async fn finish(&self, request: &mut CasRequest<'_>, n: usize, superseded: bool) -> Applied {
         let target = request.attempts[n].plan.target_version();
         request.settle(target);

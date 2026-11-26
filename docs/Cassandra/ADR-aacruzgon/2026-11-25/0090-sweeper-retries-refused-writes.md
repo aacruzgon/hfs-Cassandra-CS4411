@@ -1,0 +1,86 @@
+# ADR-aacruzgon-0090: The sweeper retries a replay the node refuses until the intent's 24 hours, instead of giving up after three tries (amends ADR-sam-michaels-0006 IW17 for the sweeper, and the handling of `PermanentWrite` under SW13 and SW18)
+
+- **Date:** 2026-11-25
+- **Status:** accepted
+- **Context:**
+    - **What #107 did.** The sweeper reads `WriteFailure::Permanent` from a replay's version row or index delta as `Invariant::PermanentWrite` (`sweeper.rs`, `send_delta` and `replay_current`). It handles it like SW13's bugs: logged at `error`, counted, tried three times 5 s apart, then given up. A given-up key stays in the retry list's `gave_up` set until 24 hours after its intent was enqueued, so no later poll or retry of the same process tries it again. Only a new process's startup scan does. The intent row stays until its 24 h TTL.
+    - **Why it came up.** The audit of PR #108 found it. Since #108, two more failures read as `Permanent`. The session refuses a batch of more than 65,535 statements as `DriverError::TooManyStatements` (ADR-aacruzgon-0089). And `crates/persistence/README.md`, "Node settings HFS depends on", lists the node settings whose lowering makes the node refuse HFS's statements as `Invalid`:
+        - `native_transport_max_message_size` below 8 MiB plus about 1 KiB, which a heap under about 321 MiB gives by default;
+        - `batch_size_warn_threshold` and `batch_size_fail_threshold` both below a multi-partition batch's data size. Lowering the fail threshold alone refuses nothing (see below).
+    - **What can reach the sweeper as `Permanent`.**
+        - **`TooManyStatements`:** nothing in practice. `index_batches` splits every unit to at most 65,535 statements and 8 MiB (ADR-aacruzgon-0089; `a_unit_over_the_statement_limit_is_split_and_the_type_unit_never_is`, `a_unit_over_the_piece_bytes_is_split_by_bytes`), and the sweeper sends through the same `write_index_delta`. The session's refusal is a backstop against a future caller.
+        - **A node `Invalid`:** yes. These refusals come from the node's settings (above) or from a schema the keyspace does not have (RW6). They are not a bug in the stored rows, which SW13 is about ("a missing version row or an unreadable key set"). Each is permanent only while the node stays as it is. An operator fixes it with a `cassandra.yaml` change and a node restart, or a schema change, and HFS keeps running through either.
+    - **What giving up then costs.** The request path does not retry an `Invalid` (IW15, IW17) and answers success with the intent kept (G23). So the sweeper is the only thing that finishes such a write.
+        - After a create, the resource is out of `count` and search: IW24 skips its index rows when the version row fails, and an index failure leaves its `resources_by_type` row unwritten.
+        - After an update, the tag check hides the resource from search.
+        - Repair on read heals only rows a search finds (RV1), and finds nothing for a create.
+        - Once the intent's TTL passes, nothing heals it until the resource is next written (`cassandra-discussion.md`, "Clocks"; ADR-sam-michaels-0006, Consequences: "SW18 must not be weakened later").
+    - **Where "permanent" comes from, and why it does not hold for the sweeper.** ADR-sam-michaels-0006 IW17 says "An `Invalid` error is permanent", and IW15 says "`Invalid`: no retry, an error". For the request's three tries 10 ms and 20 ms apart, that holds. A refusal for a node setting depends on the setting, and an operator can change it while HFS runs:
+        - `BatchStatement.java:331-358` (cassandra-5.0.9), `verifyBatchSize`, returns at once for a batch of one mutation. For more, it reads the fail threshold only inside `if (size > warnThreshold)`, then `if (size > failThreshold) … throw new InvalidRequestException("Batch too large")`. So the node refuses a multi-partition batch only when its data size is above both `batch_size_warn_threshold` and `batch_size_fail_threshold`. `DatabaseDescriptor` and `Config` at 5.0.9 do not check one against the other, so a node can run with the fail threshold below the warn threshold, and then nothing is refused below the warn threshold.
+        - The 5.0 `cassandra.yaml` docs say `batch_size_fail_threshold`: "Fail any multiple-partition batch exceeding this value. 50KiB (10x warn threshold) by default." Read alone, they suggest the fail threshold is enough; the source decides.
+        - `StorageServiceMBean.java:1043` and `:1061` have `setBatchSizeFailureThreshold` and `setBatchSizeWarnThresholdInKiB`, so both can even change at runtime, over JMX. `system_views.settings` refuses the update.
+
+      So the sweeper, which keeps an intent for 24 hours (SW18; `schema.cql:195`, `default_time_to_live = 86400`), should not treat the refusal as permanent for all of that time.
+    - **Observed at L2 on `4b0e4024c`, the merged head with #108**, through REST and CQL, with a running `hfs` and its own sweeper loop (script `.agent-share/pr107-fixes/point9-l2.sh`; output in `p9-l2-base/` and `p9-l2-head/`).
+        - **The setup:** one 5.0.9 node with `batch_size_warn_threshold` and `batch_size_fail_threshold` both at 1KiB, set in the container's `cassandra_latest.yaml` and applied by a node restart.
+        - **The two writes:** `PUT Patient/control`, with `active` only, and `PUT Patient/big`, with 30 identifiers. Both answered 201, and `GET` and vread `_history/1` answered 200 for both.
+        - **The control** has its `resources_by_type` row and no intent.
+        - **`big`** has no `resources_by_type` row, no `token_system_index` row, and two intents (I1 and SW6's fresh one). Its three index batches were refused (`index batches not confirmed … failed=3 … largest_batch_bytes=4846`).
+        - **Then:** the sweeper logged `an intent hit an invariant three times; the sweeper stops retrying it` at 22:43:46. The thresholds were set back to their defaults and the node restarted, with `hfs` still running. At +433 s, `big` still had no index rows and both intents.
+        - **On `3a4e0ed1d`, with this rule, the same script:** the third refusal logged `the node refused an intent's writes three times; the sweeper tries it again every 5 minutes …` at 22:34:56. About 5 minutes later (seen at 22:40:11, +277 s after the fix), `big` had its `resources_by_type` and identifier rows, and no intent was left.
+    - **Confirmed independently, at L2, narrower** (the validator run `validate-107-findings`, claim V3; its evidence in `.agent-share/validate-107-findings/`, `v3a-*`, `v3b-*` and `v3c-*`). It wrote its own reproduction from the claim, with the real `hfs` binary at `4b0e4024c` and at `97649b94f`, the sweeper at its defaults, a 40-identifier Patient and a small control Patient.
+        - **Narrower:** with only `batch_size_fail_threshold` at 1KiB and the warn threshold at its 5KiB default, nothing was refused; the big Patient's 7 batches, the largest 4,801 wire bytes, were all written (`v3a-hfs.log`). The refusal needs the warn threshold lowered too, as `BatchStatement.java` says.
+        - **Before (`4b0e4024c`), both thresholds at 1KiB:** 6 of 7 batches refused as "Batch too large"; three tries, then "stops retrying"; 10 minutes after the node was restored, with `hfs` still running, still no index rows and both intents (`v3b-rows-2-restore-plus-9min.txt`). Only an `hfs` restart finished it.
+        - **After (`97649b94f`), the same settings:** the 5-minute retry indexed it 4 min 38 s after the restore, with no `hfs` restart (`v3c-rows-1-after-heal.txt`).
+        - **The control** was indexed at once on both binaries, before and after the restore.
+        - **Not shown:** the full 24 h (read from `RetryList::owns`, L0); a message-size refusal; a JMX change at runtime.
+    - **Also reproduced at L1** on `4b0e4024c` (scratch probe `probe_permanent_then_fixed`, not committed; output in `.agent-share/pr107-fixes/point9-probe-before.txt`). The setup: a create crashed after its CAS (`Checkpoint::AfterCas`), and the node refuses three `resources_by_type` inserts (`Fault::FailWithInvalid`), standing in for a misconfigured node.
+        - Polls at +0 s, +6 s and +12 s each tried the intent and failed; the third gave up (`gave_up=1`, `invariant_violations=3`, `invariant_gave_up=1`).
+        - Then the faults were spent, standing in for the node being fixed. Polls of the same process at +5.5 min, +11 min, +1 h, +6 h and +23 h each read the slice and did nothing (`current=0`). After every one, the intent was still there, with no `resources_by_type` row and `count` 0.
+        - A new `SweepState`, as after a restart, finished it on its first poll (`done=1`, `count=1`).
+    - **HL7.** `search.html#currency` (R4 3.1.1.8, R4B 3.1.1.8, R5 3.2.1.10) is descriptive only: "The results of a search operation are only guaranteed to be current at the instant the operation is executed". No version requires a created resource to be searchable at once, and `read` and vread answered 200 throughout. So this is a design question, not a spec one.
+- **Decision:**
+    - **The rule.** A replay that fails as `Invariant::PermanentWrite` is tried three times 5 s apart, as now, each try logged and counted as an invariant. It is then kept on the retry list and tried again every `RETRY_MAX` (5 min) until 24 hours after the intent was enqueued, when SW18 drops every entry. It never gives up, so it is never put in the `gave_up` set.
+    - **The log.** The third failure logs once at `error`, naming the README's node-settings section (`Queued::Refused { first: true }`). The later ones are counted like every try (`invariant_violations`, `retries`) but not logged at `error`.
+    - **A full list.** When the retry list is full, such an intent holds its shard's mark, as a transient failure does (SW18). It is not counted toward SW13's three tries on an overflowing list, which would give it up.
+    - **The other invariants keep SW13's rule:** a missing version row, an unreadable key set or row, and a `write_ts` mismatch are still tried three times and given up.
+    - **IW17, amended for the sweeper.** "An `Invalid` error is permanent" holds for one write's tries: the request path still does not retry it. For the sweeper it means "permanent for the node's settings at the time", and the sweeper keeps the intent on SW18's schedule.
+- **Alternatives considered:**
+    - **Keep #107's rule (three tries, then give up until a restart).** It lost on the reproductions above: a node fixed without restarting HFS leaves every refused write unfinished. Each such resource stays out of `count` and search, and for good once the TTL passes. The only fix would be an HFS restart within 24 hours, which nothing tells the operator to do.
+    - **Give up at the first refusal and count it.** It saves two tries of a write the node will refuse again, but it has the same loss as above, and three tries 5 s apart cost little.
+    - **Read it as transient (the 5 s to 5 min backoff, with no `error` and no invariant count).** It heals the same, but the operator loses the signal: an `Invalid` from the node means its settings are below what HFS needs, and that is worth an `error` and a count.
+    - **Retry less often, for example hourly.** It would bound the cost lower (at most 24 tries a day, not 288), but a fixed node would wait up to an hour for its writes. 5 minutes is SW18's existing `RETRY_MAX`, so no new constant is needed.
+    - **Restart-only healing, documented.** It is simpler, but it puts on the operator a step the code can do itself.
+- **Consequences:**
+    - **What it gives.** A write the node refused is finished within 5 minutes once the node takes it again, as long as that happens within 24 hours of the write. SW18's "the retry list never drops an intent" holds for it.
+    - **What it costs.** Each refused intent makes up to 288 more replays over its 24 hours. Each replay is R1 at `LOCAL_QUORUM`, R3, the version row (idempotent at `ts(V)`) and the delta, all under RW4's 32-statement limit.
+        - For a message-size refusal, each replay sends the oversized piece again: up to 8 MiB, and that many bytes the node reads and discards.
+        - At the 10,000-entry cap, that is up to 33 replays a second. Only a node refusing most writes (both batch thresholds lowered, a missing table) reaches it, and it is then the same load as a node that times out every write, which SW18 already accepts.
+        - It is measured only by the counters (`retries`, `invariant_violations`). Revisit if a real refusal storm shows up.
+    - **What it does not change.** The request path still does not retry an `Invalid`. `sweep_pass`, which has no retry list, still reports `invariant` for it. The intent row is still never deleted for a failure.
+    - **No design-document change.** Neither `cassandra-discussion.md` nor `development-roadmap.md` says how a refused replay is handled; the discussion's retry list "never drops an intent before its 24 h TTL" (`cassandra-discussion.md:346`) already matches this rule. The README's node-settings rows and the sweeper's module doc said it, and `97649b94f` changes both.
+    - **Tests** (in `97649b94f`):
+        - `a_refused_write_stays_on_the_retry_list_until_the_horizon` (pure): three tries at 5 s, then `Refused` at 5 min, the first time with `first`, until `Expired` at 24 h; on a full list, `Overflow` every time, never `GaveUp`.
+        - `a_refused_replay_is_finished_once_the_node_takes_it` (node): three refused tries with `gave_up` 0 and the entry kept, then the 5 min retry finishes it, with `count` 1 and the index consistent.
+        - The L2 runs above: this session's on `3a4e0ed1d` against `4b0e4024c`, and the validator's on `97649b94f` against `4b0e4024c`.
+        - With the old rule restored by hand, both tests fail (`GaveUp` where `Refused` was expected; `gave_up` 1 where 0 was expected), and both pass with the new rule (`.agent-share/pr107-fixes/point9-mutant.txt`).
+        - N11 (`a_permanent_index_failure_keeps_the_intent_and_counts_as_an_invariant`) is unchanged and passes.
+- **AI involvement:** Claude Code (Claude Opus 5.5), as the co-author worker on PR #107, in a session run by Alan.
+    - **What it did.** It read `sweeper.rs` (`RetryList::failed`, `send_delta`, `replay_current`), `write.rs` (`write_index_delta`'s failure folding), `batch.rs` (`classify_failure`), `session.rs` (`TooManyStatements`), ADR-sam-michaels-0006 (IW15, IW17, SW13, SW18 and its Consequences), ADR-aacruzgon-0089, and the README's "Node settings HFS depends on".
+    - **What it proposed.** The rule above, written in `97649b94f` with its tests and the README and module-doc edits, and this entry.
+    - **What Alan changed:** Alan approved the draft as written on 2026-11-25. The validator's narrower result (the warn threshold must be lowered too) was folded in afterwards, as he asked.
+    - **What was verified, and how:**
+        - the old rule's behaviour, at L2 through REST and CQL with a running `hfs` and a node that really refuses (a control write was indexed), and by the probe above;
+        - the new rule, by the same L2 script on the head binary: healed about 5 minutes after the third refusal, without restarting `hfs`;
+        - both, independently, by the validator run `validate-107-findings` (V3, confirmed narrower);
+        - `Cells.java`, `BatchStatement.java`, `StorageServiceMBean.java`, `DatabaseDescriptor.java` and `Config.java` at the tag `cassandra-5.0.9`, and the 5.0 `cassandra.yaml` and DML docs, read;
+        - HL7 `search.html#currency`, R4, R4B and R5, read;
+        - the new rule, by the two new tests, which both fail under the old rule;
+        - the lib (`backends::cassandra`) and `cassandra_tests` suites, run on a single 5.0.9 node.
+- **Links:**
+    - PR #107 (`cassandra/step5-sweeper`), commit `97649b94f`;
+    - the PR #108 audit, which raised it;
+    - [ADR-sam-michaels-0006](../../ADR-sam-michaels/2026-11-16/0006-step-5-design.md): IW17's "An `Invalid` error is permanent", which this entry narrows for the sweeper to "for the node's settings at the time", and SW13 and SW18 (this entry amends how #107 applies SW13 to `PermanentWrite`; SW13's own text names only data bugs). Sam's log is not edited;
+    - Cassandra 5.0.9 `BatchStatement.java:331-358`, `StorageServiceMBean.java:1043` and `:1061`, and the 5.0 `cassandra.yaml` docs (`batch_size_warn_threshold`, `batch_size_fail_threshold`);
+    - [ADR-aacruzgon-0089](0089-index-unit-split-at-statement-limit.md);
+    - `crates/persistence/README.md`, "Node settings HFS depends on".

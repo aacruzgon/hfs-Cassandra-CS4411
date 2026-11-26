@@ -1,4 +1,4 @@
-# ADR-aacruzgon-0093: Token matching stays case-sensitive; for a token on a `string` element, a code system not known to be case-sensitive or an Identifier, that is a documented deviation from the spec, not "the spec default"
+# ADR-aacruzgon-0093: Token matching stays case-sensitive; for a token on a `string` element, a Coding or a `code` element whose system is not known to be case-sensitive, or an Identifier, that is a documented deviation from the spec, not "the spec default"
 
 - **Date:** 2026-11-25
 - **Status:** accepted
@@ -13,7 +13,8 @@
         - R5, https://hl7.org/fhir/R5/search.html#token: the same case paragraph ("If the underlying datatype is `string` then the search is not case sensitive"), the same SHOULD, and the same ContactPoint row. The `string` row changes to "Token is sometimes used for string to indicate that case-insensitive full-string matching is the correct default search strategy".
         - Levels: the case paragraph is descriptive, "When in doubt" is a SHOULD, and the ContactPoint row is left to the server. The R4 and R4B `string` row ("exact matching") pulls against the case paragraph; R5 removes that conflict.
         - `CodeSystem.caseSensitive` (R4, R4B and R5, codesystem-definitions.html): "If this value is missing, then it is not specified whether a code system is case sensitive or not." In the core packages, `http://snomed.info/sct` is `caseSensitive: false` in R4 and R4B, and `color-names` and `color-rgb` are in R5. HFS's search path reads no `caseSensitive`; only HTS does (`crates/hts/`).
-        - So the design's justification holds for `_id`, `code` elements bound to a case-sensitive code system, `uri`, `id` and `boolean`. It leaves out the `string` sentence in every version, and, for a Coding whose system is `caseSensitive: false` or has no known case rule and for an Identifier, the `CodeSystem.caseSensitive` reference and the "When in doubt" SHOULD (the audit of PR #116, F4).
+        - Some `code` elements are bound to external systems that define their own case rule. `Attachment.contentType` (`DocumentReference.content.attachment.contentType`, `Library.content.contentType`) and R5 `Subscription.contentType` take MIME types (`ValueSet/mimetypes`, system `urn:ietf:bcp:13`). RFC 2045 §5.1 says "Matching of media type and subtype is ALWAYS case-insensitive" and "The type, subtype, and parameter names are not case sensitive", though "Parameter values are normally case sensitive". `Attachment.language`, `CodeSystem.concept.designation.language` and R5 `Resource.language` take BCP 47 language tags, and RFC 5646 §2.1.1 says "At all times, language tags and their subtags, including private use and extensions, are to be treated as case insensitive". Those semantics indicate case-insensitive matching, as SNOMED CT's `caseSensitive: false` does.
+        - So the design's justification holds for `_id`, `code` elements bound to a case-sensitive code system, `uri`, `id` and `boolean`. It leaves out the `string` sentence in every version. For a Coding whose system is `caseSensitive: false` or has no known case rule, for a `code` element bound to an external system that is case-insensitive by its own definition (MIME types, `urn:ietf:bcp:13`, RFC 2045 §5.1: `DocumentReference-contenttype`, `Library-content-type`, R5 `Subscription-payload`; BCP 47 language tags, RFC 5646 §2.1.1: `DocumentReference-language`, `CodeSystem-language`, R5 `_language`), and for an Identifier, it names the "When in doubt" SHOULD but not the `CodeSystem.caseSensitive` reference, and it calls the behaviour "the spec default", though HFS reads no `caseSensitive` and so does not follow that SHOULD (the audit of PR #116, F4 and R3).
     - **What was observed** (base `2ae41258e`; the `validate-108-findings` run, `evidence/`):
         - `Patient?gender=Female` misses `gender: female` on SQLite through REST (R4, R4B, R5). That is spec-correct for a `code` element.
         - `Medication?lot-number=ab12C` misses `batch.lotNumber: "AB12c"` (R4, R4B, R5; `evidence/sqlite/<V>/summary.txt`, `C6s-*`). `Medication.batch.lotNumber` is `0..1 string` in all three (`evidence/spec/R*-medication.txt`). The spec says that search is not case-sensitive.
@@ -23,10 +24,10 @@
 - **Decision:**
     - Token matching stays case-sensitive on every backend, and HFS reads no `CodeSystem.caseSensitive`.
     - **`_id`, `code` elements bound to a case-sensitive code system, `uri`, `id` and `boolean`:** exact, which is the spec's rule ("case sensitive unless the underlying semantics … indicate" otherwise).
-    - **A Coding or CodeableConcept whose system is `caseSensitive: false`** (SNOMED CT in the R4 and R4B core packages) **or has no known case rule, and an Identifier:** matched exactly, which is a **documented deviation** from "unless the underlying semantics … indicate" and from "When in doubt, servers SHOULD treat tokens in a case-insensitive manner".
+    - **A Coding or CodeableConcept whose system is `caseSensitive: false`** (SNOMED CT in the R4 and R4B core packages) **or has no known case rule, a `code` element bound to an external system that is case-insensitive by its own definition (MIME types, `urn:ietf:bcp:13`, RFC 2045 §5.1: `DocumentReference-contenttype`, `Library-content-type`, R5 `Subscription-payload`; BCP 47 language tags, RFC 5646 §2.1.1: `DocumentReference-language`, `CodeSystem-language`, R5 `_language`), and an Identifier:** matched exactly, which is a **documented deviation** from "unless the underlying semantics … indicate" and from "When in doubt, servers SHOULD treat tokens in a case-insensitive manner".
     - **ContactPoint:** exact, which the spec leaves to the server.
     - **A token on a `string` element** (for example `Medication.batch.lotNumber`, or `version` on CodeSystem and the other conformance resources) is matched case-sensitively, which is a **documented deviation** from "If the underlying data type is string then the search is not case sensitive".
-    - Why both deviations:
+    - Why these deviations:
         - every Helios backend matches these tokens case-sensitively, so Cassandra agrees with them;
         - serving them would need a case-folded code for those parameters, and for Codings a per-system case rule at write or query time, which is a schema and extraction change;
         - the spec texts they depart from are descriptive or a SHOULD, not a SHALL.
@@ -52,7 +53,7 @@
         - Cassandra's stored rows.
         - The diff applies cleanly to `2ae41258e` (`git apply --check`).
     - **Not verified:** PostgreSQL and MongoDB answers (code only).
-    - **What the human changed:** Alan approved the draft as written on 2026-11-25. Alan approved the audit's corrections on 2026-11-25 (F4/F6 for 0093).
+    - **What the human changed:** Alan approved the draft as written on 2026-11-25. Alan approved the audit's corrections on 2026-11-25 (F4/F6 and R1/R3/R5 for 0093).
 - **Links:**
     - `cassandra-discussion.md:75`, `:145`; `coverage.md` §2.
     - The design's first commit `67dab9104`.

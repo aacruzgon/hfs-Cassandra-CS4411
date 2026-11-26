@@ -84,7 +84,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
 use super::backend::CassandraBackend;
-use super::index_keys::{self, IndexKey, RowId};
+use super::index_keys::{self, IndexKey};
 use super::read::ResourceRow;
 use super::stats::IndexWriteStats;
 use super::write::{
@@ -145,11 +145,6 @@ impl StaleIndexRow {
 
     pub(crate) fn version_id(&self) -> i32 {
         self.version_id
-    }
-
-    /// `key.row_at(last_updated)`, the Unix epoch for a date row (`row_at` ignores it there).
-    fn row_id(&self) -> RowId<'_> {
-        self.key.row_at(self.delete_at())
     }
 
     /// The `last_updated` this row is deleted at: its own, or the Unix epoch for a date row.
@@ -288,12 +283,11 @@ fn check_stale<'a>(
 ///
 /// With at most [`MAX_FULL_REPAIR_KEYS`] keys the plan is full. Above that,
 /// `next` keeps the keys of K(current) that equal the key of a found row
-/// below R1 (or name the same row, for a date row): that found row moves to
-/// R1's `last_updated`, or is re-tagged in place if it is a date row. A found
-/// row K(current) does not produce is deleted. Writes stay bounded by the
-/// found rows.
+/// below R1: that found row moves to R1's `last_updated`, or is re-tagged in
+/// place if it is a date row. A found row K(current) does not produce is
+/// deleted. Writes stay bounded by the found rows.
 fn plan_below(row: &ResourceRow, below: &[&StaleIndexRow]) -> Result<RepairPlan, SkipReason> {
-    Ok(plan_from(row, below, decode_current(row)?))
+    Ok(plan_from(below, decode_current(row)?))
 }
 
 /// K(current), from R1's `index_keys`.
@@ -304,17 +298,14 @@ fn decode_current(row: &ResourceRow) -> Result<Vec<IndexKey>, SkipReason> {
         .ok_or(SkipReason::UndecodableKeys)
 }
 
-fn plan_from(row: &ResourceRow, below: &[&StaleIndexRow], current: Vec<IndexKey>) -> RepairPlan {
+fn plan_from(below: &[&StaleIndexRow], current: Vec<IndexKey>) -> RepairPlan {
     let full = current.len() <= MAX_FULL_REPAIR_KEYS;
     let next = if full {
         current
     } else {
         current
             .into_iter()
-            .filter(|key| {
-                let id = key.row_at(row.last_updated);
-                below.iter().any(|s| s.key == *key || s.row_id() == id)
-            })
+            .filter(|key| below.iter().any(|s| s.key == *key))
             .collect()
     };
     let previous = below

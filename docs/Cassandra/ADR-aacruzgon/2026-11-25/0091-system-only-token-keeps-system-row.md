@@ -16,7 +16,7 @@
     - **What was observed** (base `2ae41258e`; the `validate-108-findings` run, `evidence/`):
         - `Patient.identifier = [{"system": "http://hospital.example/mrn"}]` is missed by `Patient?identifier=http://hospital.example/mrn|`. The control, with value `123`, matches. This is on SQLite through REST (R4, R4B, R5; `evidence/sqlite/<V>/summary.txt`), and as Cassandra rows on R4, R4B and R5 (`evidence/cassandra/<V>/cql-rows.txt`: no `identifier` row in any token table).
         - The same holds on upstream `main` at `fb7d12ed5` (`evidence/upstream-fb7d12ed5/sqlite/<V>/summary.txt`).
-        - There are two causes. The first is in the shared converter (`converters.rs:528-566`, `:500`), which emits nothing; that is upstream's to fix (HeliosSoftware/hfs#2965).
+        - There are two causes. The first is in the shared converter, which emits no token for an Identifier with no value (`converters.rs:528-566`) or a Coding with no code (`:493` for a bare Coding, `:509` for a CodeableConcept's coding; `:509` does emit a CodeableConcept coding whose `code` is `""`); that is upstream's to fix (HeliosSoftware/hfs#2965).
         - The second is IW2. With a throwaway converter edit, SQLite found the resource, but Cassandra still wrote no `token_system_index` row for it (`evidence/cassandra-c4-converter-fix/<V>/cql-rows.txt`, R4, R4B, R5). With IW2 also mutated as the rule below says, the row `(identifier, http://hospital.example/mrn, p-sysonly, code '')` appeared, and no code row did (`evidence/cassandra-c4-iw2-fix/<V>/cql-rows.txt`; `evidence/throwaway-c4-iw2.diff`). Both edits were reverted.
 - **Decision:**
     - A token value with an empty code and a real system (not `IMPLICIT`, not `''`) gets its `TokenSystem` key, with `code ''`, and no `TokenCode` or `TokenSystemCode` key. No `code`, `system|code` or `|code` form can match an empty code, so those rows would never be read.
@@ -24,7 +24,7 @@
     - Every other IW2 and P5 drop stays.
     - The code change is in `index_keys_from` (`index_keys.rs:449-451`): when `code` is empty, insert `IndexKey::TokenSystem { param, system, code }` if the system is real, then `continue`.
     - It lands in its own Cassandra pull request.
-    - Values reach it only once the shared converter emits them (HeliosSoftware/hfs#2965). Until then the only input it changes is an invalid `"code": ""` Coding, which then becomes findable by `system|`, as on SQLite and PostgreSQL.
+    - Values reach it only once the shared converter emits them (HeliosSoftware/hfs#2965). Until then it changes no write made through REST. Every REST write path removes an empty `code` before extraction (`drop_empty_elements`, HeliosSoftware/hfs#2554, in the fork since the sync of 2026-11-18; `crates/rest/src/validation.rs:212-214`, `crates/persistence/src/core/patch.rs:157`). The one exception, `$meta-add`, adds only bare Codings to `meta.tag` and `meta.security`, and the converter skips those when their code is empty (`converters.rs:500`). Only a direct caller of the storage API can pass a CodeableConcept coding with `"code": ""` (`converters.rs:509`), which then gets its `TokenSystem` key.
 - **Alternatives considered:**
     - **Keep IW2's drop.** Lost: once the converter is fixed, every backend but Cassandra would answer `system|` for these resources, and the drop rests on a premise the spec does not support.
     - **Write all three token rows for an empty code.** Lost: no query form reads a code row with an empty code, so they are dead rows and tombstones.
@@ -36,8 +36,8 @@
         - `token_forms_map_to_the_three_tables` (`index_keys.rs:954`) pins IW2. Its input has `token("code", Some("http://loinc.org"), "")` and it expects 15 keys. It must expect the new `TokenSystem { param: "code", system: "http://loinc.org", code: "" }` (16 keys).
         - A new unit test: a real system with an empty code gives exactly one `TokenSystem` key; the `IMPLICIT` marker or `''` with an empty code gives none.
         - A REST-level test once Step 6 serves `system|`.
-    - Rows written before the change are not rewritten. Since the converter emits no such value yet, there are none to fix, except invalid `"code": ""` Codings, which a reload or the next write fixes (`crates/persistence/README.md`, "Keyspaces written before index writes").
-    - **Not tested so far:** a Coding with a system and no code. It has the same shape in the converter (`converters.rs:500`) and in `index_keys_from`, but no run covered it. The pull request's tests must.
+    - Rows written before the change are not rewritten. Since the converter emits no such value yet, and REST removes an empty `code` before storing (HeliosSoftware/hfs#2554), there are none to fix, except a resource stored with `"code": ""` before the sync of 2026-11-18 or through the storage API, which a reload or its next REST write cleans (`crates/persistence/README.md`, "Keyspaces written before index writes").
+    - **Not tested so far:** a Coding with a system and no code. It has the same shape in the converter (`converters.rs:493` for a bare Coding, `:509` for a CodeableConcept's coding, which emits one whose `code` is `""`) and in `index_keys_from`, but no run covered it. The pull request's tests must.
     - **Design documents.** `cassandra-discussion.md:188` and `walkthrough.md:959` change in the same commit as this entry.
 - **AI involvement:** Claude Code (Claude Opus 5.5), in a validation worker run by Alan.
     - **The finding and its causes.** A spec-check worker reported the gap (its M1), naming the converter and IW2. An independent validation worker reproduced it from the claim, on SQLite through REST and as Cassandra rows (R4, R4B, R5), and on upstream `fb7d12ed5`. It separated the two causes with two throwaway builds, and proposed this rule.
@@ -48,8 +48,9 @@
         - the rows on a 5.0.9 node;
         - that the existing test pins the old rule (read, not run).
     - **Not verified:** a Coding with a system and no code; a REST search on the new row (search is 501 until Step 6).
-    - **What the human changed:** Alan approved the draft as written on 2026-11-25.
+    - **What the human changed:** Alan approved the draft as written on 2026-11-25. Alan approved the audit's corrections on 2026-11-25 (D1/F7 for 0091).
 - **Links:**
+    - IW2's "Only invalid content…" was overtaken by the fork's sync of 2026-11-18 (HeliosSoftware/hfs#2554): through REST, no backend receives that content.
     - ADR-sam-michaels-0006, IW2 and Decision 9 (amended); ADR-aacruzgon-0027, G18/P5 (its premise corrected).
     - Upstream HeliosSoftware/hfs#2965, the shared converter's half of the gap (filed 2026-11-25). The Cassandra change to `index_keys.rs:449-451` and its tests land in their own pull request, not in the docs pull request that commits this entry.
     - `cassandra-discussion.md` "index rows" paragraph (`:188`); walkthrough `:959`.

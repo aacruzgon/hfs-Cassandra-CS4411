@@ -2177,8 +2177,10 @@ fn check_cas_size(plan: &CasPlan) -> StorageResult<()> {
 
 /// ADR-aacruzgon-0098: true when a CAS sent `held` after its intent's stamp could end, at HFS's own
 /// `request_timeout`, at or past the sweeper's `grace` from that stamp, so the request must write a
-/// fresh intent first. With `grace` at least twice `request_timeout` (SW4), a fresh intent and its
-/// CAS each end within one `request_timeout`, so a request that is not held up again passes. Pure.
+/// fresh intent first. With `grace` at least twice `request_timeout` (SW4), a fresh intent written well
+/// inside one `request_timeout` passes; at exactly twice, one that answers close to its deadline can
+/// fail again and write one more. Each round's I1 answers within `request_timeout` or fails the
+/// request, so `run_cas`'s loop needs no cap. Pure.
 fn cas_may_outlive_grace(held: Duration, request_timeout: Duration, grace: Duration) -> bool {
     held.saturating_add(request_timeout) >= grace
 }

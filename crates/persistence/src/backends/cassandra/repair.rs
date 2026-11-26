@@ -47,12 +47,13 @@
 //! - **One deadline.** The whole repair phase is bounded by one request
 //!   deadline (`request_timeout_ms`), so a search waits at most that long
 //!   for its repairs. A repair unfinished by then is reported
-//!   [`WriteFailure::TriesExhausted`] and counted as failed; the next search
-//!   or the sweeper repeats it.
+//!   [`WriteFailure::TriesExhausted`] and counted as failed; a later search's
+//!   repair repeats it, or the sweeper, if the write that left the stale rows
+//!   kept an intent.
 //!
 //! Repair never writes `resources`, `resource_versions` or an intent row,
 //! and never sends a CAS. Its only statements are the index writer's
-//! batches ([`CassandraBackend::write_index_delta`], one try, IW17).
+//! batches ([`CassandraBackend::write_index_delta_repair`], one try, IW17).
 //!
 //! # Step 6's contract
 //!
@@ -84,7 +85,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
 use super::backend::CassandraBackend;
-use super::index_keys::{self, IndexKey, RowId};
+use super::index_keys::{self, IndexKey};
 use super::read::ResourceRow;
 use super::stats::IndexWriteStats;
 use super::write::{
@@ -145,11 +146,6 @@ impl StaleIndexRow {
 
     pub(crate) fn version_id(&self) -> i32 {
         self.version_id
-    }
-
-    /// `key.row_at(last_updated)`, the Unix epoch for a date row (`row_at` ignores it there).
-    fn row_id(&self) -> RowId<'_> {
-        self.key.row_at(self.delete_at())
     }
 
     /// The `last_updated` this row is deleted at: its own, or the Unix epoch for a date row.
@@ -288,12 +284,11 @@ fn check_stale<'a>(
 ///
 /// With at most [`MAX_FULL_REPAIR_KEYS`] keys the plan is full. Above that,
 /// `next` keeps the keys of K(current) that equal the key of a found row
-/// below R1 (or name the same row, for a date row): that found row moves to
-/// R1's `last_updated`, or is re-tagged in place if it is a date row. A found
-/// row K(current) does not produce is deleted. Writes stay bounded by the
-/// found rows.
+/// below R1: that found row moves to R1's `last_updated`, or is re-tagged in
+/// place if it is a date row. A found row K(current) does not produce is
+/// deleted. Writes stay bounded by the found rows.
 fn plan_below(row: &ResourceRow, below: &[&StaleIndexRow]) -> Result<RepairPlan, SkipReason> {
-    Ok(plan_from(row, below, decode_current(row)?))
+    Ok(plan_from(below, decode_current(row)?))
 }
 
 /// K(current), from R1's `index_keys`.
@@ -304,17 +299,14 @@ fn decode_current(row: &ResourceRow) -> Result<Vec<IndexKey>, SkipReason> {
         .ok_or(SkipReason::UndecodableKeys)
 }
 
-fn plan_from(row: &ResourceRow, below: &[&StaleIndexRow], current: Vec<IndexKey>) -> RepairPlan {
+fn plan_from(below: &[&StaleIndexRow], current: Vec<IndexKey>) -> RepairPlan {
     let full = current.len() <= MAX_FULL_REPAIR_KEYS;
     let next = if full {
         current
     } else {
         current
             .into_iter()
-            .filter(|key| {
-                let id = key.row_at(row.last_updated);
-                below.iter().any(|s| s.key == *key || s.row_id() == id)
-            })
+            .filter(|key| below.iter().any(|s| s.key == *key))
             .collect()
     };
     let previous = below
@@ -452,8 +444,8 @@ impl RepairContext {
     /// budget a request's index phase gets), so a search waits at most that
     /// long for its repairs. A repair that has not finished by then is
     /// reported [`WriteFailure::TriesExhausted`]: safe, since every repair
-    /// write has a fixed timestamp and the next search or the sweeper
-    /// repeats it.
+    /// write has a fixed timestamp and a later search's repair repeats it,
+    /// or the sweeper, if the write that left the stale rows kept an intent.
     pub(crate) async fn run(self, backend: &CassandraBackend) -> Vec<RepairOutcome> {
         let deadline = phase_deadline(backend.config.request_timeout_ms);
         self.run_within(backend, deadline).await
@@ -485,7 +477,7 @@ impl RepairContext {
         // (before it sends) and its outcome (when it ends) in its slot, so
         // the outcomes come from the slots, by queue index, whatever the
         // order the repairs finished in or whether the deadline cut them.
-        // Built into a Vec first so the stream's items are plain futures
+        // Built into a Vec first, so `drive_within` is given plain futures
         // (the same `Send` reason as in `write_index_delta_within`).
         let slots: Vec<Slot> = self.queued.iter().map(|_| Slot::default()).collect();
         let futures: Vec<_> = self
@@ -524,7 +516,8 @@ impl RepairContext {
                 resource_type = key.resource_type,
                 id = key.id,
                 deadline_ms = deadline.as_millis() as u64,
-                "repair on read passed its deadline; the repair is left for the next search or the sweeper"
+                "repair on read passed its deadline; the repair is left for a later search, or for \
+                 the sweeper if the original write kept an intent"
             );
             let outcome = cut_outcome(*slot.packed.lock());
             if let RepairOutcome::Failed { index, .. } = &outcome {
@@ -624,32 +617,49 @@ fn outcomes_of<'a, P: 'a, C>(
 /// `ends_at` passes; the ones unfinished then are dropped. None waits for
 /// another to finish before it starts.
 ///
-/// Each wake polls every running future once, and a future that finishes
-/// makes room for the next one at once. The futures are polled once before
-/// the clock is looked at, which starts the first `concurrency` of them: if
-/// every one is done, that is the end; if `ends_at` has already passed, it
-/// returns at once. So a deadline in the past cuts every future after its
-/// first poll, however fast the work behind it is (a timer's own check can lag
-/// the clock by a tick, and `FuturesUnordered` may stop after polling two
-/// futures that woke themselves, so neither can give that). Otherwise the rest
-/// runs until `ends_at`.
+/// Each wake polls every started future once, and a future that finishes
+/// makes room for the next one at once, but a future admitted after the
+/// first fill is first polled only if the clock, read just before that poll,
+/// is before `ends_at`; one that is not stays unstarted and is dropped with
+/// the rest, so none is started only to be dropped. The futures are polled
+/// once before the clock is looked at, which starts the first `concurrency`
+/// of them: if every one is done, that is the end; if `ends_at` has already
+/// passed, it returns at once. So a deadline in the past cuts every future
+/// after its first poll, however fast the work behind it is (a timer's own
+/// check can lag the clock by a tick, and `FuturesUnordered` may stop after
+/// polling two futures that woke themselves, so neither can give that).
+/// Otherwise the rest runs until `ends_at`.
 async fn drive_within<F: Future<Output = ()>>(
     futures: Vec<F>,
     concurrency: usize,
     ends_at: tokio::time::Instant,
 ) {
     let mut waiting = futures.into_iter();
-    let mut running: Vec<std::pin::Pin<Box<F>>> = Vec::new();
+    // Each running future with whether it may be polled: the first fill may,
+    // always; a replacement only once a check just before its first poll
+    // finds the clock before `ends_at`.
+    let mut running: Vec<(bool, std::pin::Pin<Box<F>>)> = Vec::new();
+    let mut started = false;
     let all = futures::future::poll_fn(|cx| {
         loop {
-            while running.len() < concurrency {
+            while running.len() < concurrency && (!started || tokio::time::Instant::now() < ends_at)
+            {
                 match waiting.next() {
-                    Some(future) => running.push(Box::pin(future)),
+                    Some(future) => running.push((!started, Box::pin(future))),
                     None => break,
                 }
             }
+            started = true;
             let before = running.len();
-            running.retain_mut(|future| future.as_mut().poll(cx).is_pending());
+            running.retain_mut(|(may_poll, future)| {
+                if !*may_poll {
+                    if tokio::time::Instant::now() >= ends_at {
+                        return true;
+                    }
+                    *may_poll = true;
+                }
+                future.as_mut().poll(cx).is_pending()
+            });
             if running.is_empty() && waiting.len() == 0 {
                 return std::task::Poll::Ready(());
             }
@@ -687,7 +697,7 @@ impl CassandraBackend {
         }
     }
 
-    /// Writes `plan` through `write_index_delta` at `write_ts_of(row.last_updated)`, `REPAIR_TRIES`; logs and counts.
+    /// Writes `plan` through `write_index_delta_repair` at `write_ts_of(row.last_updated)`, `REPAIR_TRIES`; logs and counts.
     /// Sets `packed` to what the writer packs before it sends, so a repair cut by the deadline can report it.
     async fn send_repair(
         &self,
@@ -699,7 +709,9 @@ impl CassandraBackend {
     ) -> RepairOutcome {
         let ts = write_ts_of(row.last_updated);
         *packed.lock() = Some(index_pack_stats(key, delta, ts));
-        let outcome = self.write_index_delta(key, delta, ts, REPAIR_TRIES).await;
+        let outcome = self
+            .write_index_delta_repair(key, delta, ts, REPAIR_TRIES)
+            .await;
         match outcome.result {
             Ok(()) => {
                 tracing::info!(
@@ -1242,6 +1254,7 @@ mod tests {
         assert_eq!(spent.batch + spent.write, index.batches);
         assert_eq!((spent.read, spent.serial_read, spent.cas), (0, 0, 0));
         assert_eq!((stats.queued, stats.repaired, stats.failed), (1, 1, 0));
+        assert_eq!(stats.repaired_partial, 0);
         assert_eq!(
             (stats.rows_inserted, stats.rows_deleted),
             (k2.len() as u64, 1)
@@ -1510,7 +1523,227 @@ mod tests {
             })
             .sum();
         assert_eq!(spent.batch + spent.write, batches);
+        let rows = outcomes.iter().fold((0, 0), |(i, d), o| match o {
+            RepairOutcome::Repaired { index, .. } | RepairOutcome::Failed { index, .. } => {
+                (i + index.rows_inserted, d + index.rows_deleted)
+            }
+            RepairOutcome::Skipped(_) => (i, d),
+        });
+        let RepairOutcome::Failed { index: lost, .. } = failed[0] else {
+            unreachable!()
+        };
+        assert!(lost.rows_inserted + lost.rows_deleted > 0, "{lost:?}");
+        assert_eq!((stats.rows_inserted, stats.rows_deleted), rows);
         assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// The captured log lines that contain `text`. A macro, since
+    /// `#[traced_test]` defines `logs_assert` in the test's own body.
+    macro_rules! logged_lines {
+        ($text:expr) => {{
+            let found = std::cell::RefCell::new(Vec::<String>::new());
+            logs_assert(|lines: &[&str]| {
+                *found.borrow_mut() = lines
+                    .iter()
+                    .filter(|line| line.contains($text))
+                    .map(|line| line.to_string())
+                    .collect();
+                Ok(())
+            });
+            found.into_inner()
+        }};
+    }
+
+    /// A failed repair of a resource with no intent row logs the writer's
+    /// repair line, at `warn`, and never the request path's "the intent is
+    /// kept for the sweeper", which would be false here (repair writes no
+    /// intent, RV7). The other repair, which succeeds, logs neither.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_failed_repair_logs_that_it_keeps_no_intent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-failed-log");
+        let tenant = context(&t);
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let mut context = RepairContext::new(&t);
+        for id in ["p", "q"] {
+            let (row, stale) = updated(&backend, &tenant, &t, id).await;
+            context.queue("Patient", id, Some(row), stale);
+        }
+        for id in ["p", "q"] {
+            assert_eq!(
+                backend.intent_versions(&t, "Patient", id, since).await,
+                Vec::<i32>::new(),
+                "{id}: no intent before the repair"
+            );
+        }
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::FailWithUnavailable,
+        );
+
+        let outcomes = context.run(&backend).await;
+
+        let failed = outcomes
+            .iter()
+            .filter(|o| matches!(o, RepairOutcome::Failed { .. }))
+            .count();
+        assert_eq!(failed, 1, "{outcomes:?}");
+        for id in ["p", "q"] {
+            assert_eq!(
+                backend.intent_versions(&t, "Patient", id, since).await,
+                Vec::<i32>::new(),
+                "{id}: repair writes no intent"
+            );
+        }
+        let request_line = logged_lines!("the intent is kept for the sweeper");
+        let repair_line = logged_lines!("repair on read keeps no intent, so apart from");
+        let repair_failed = logged_lines!("repair on read did not confirm every index batch");
+        let repaired = logged_lines!("repair on read wrote the current version's index rows");
+        assert!(request_line.is_empty(), "{request_line:?}");
+        assert_eq!(repair_line.len(), 1, "{repair_line:?}");
+        assert!(repair_line[0].contains("WARN"), "{repair_line:?}");
+        assert_eq!(repair_failed.len(), 1, "{repair_failed:?}");
+        assert!(repair_failed[0].contains("WARN"), "{repair_failed:?}");
+        assert_eq!(repaired.len(), 1, "{repaired:?}");
+    }
+
+    /// A repair batch that times out after its batchlog write
+    /// (`WriteTimeout`/`BATCH`) logs the writer's per-batch line with
+    /// repair's text, at `warn`, and never "the intent stays for the
+    /// sweeper": the resource has no intent row, before or after.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_repair_batch_in_the_batchlog_logs_that_repair_keeps_no_intent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-batchlog-log");
+        let tenant = context(&t);
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let (row, stale) = updated(&backend, &tenant, &t, "p").await;
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "p", Some(row), stale);
+        // The repair's batch spans partitions, so the fault answers it
+        // `WriteTimeout`/`BATCH`.
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::ApplyThenTimeOut,
+        );
+
+        let outcomes = context.run(&backend).await;
+
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [RepairOutcome::Failed {
+                    failure: WriteFailure::InBatchlog,
+                    ..
+                }]
+            ),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            backend.intent_versions(&t, "Patient", "p", since).await,
+            Vec::<i32>::new(),
+            "repair writes no intent"
+        );
+        let request_line = logged_lines!("the intent stays for the sweeper");
+        let repair_line = logged_lines!("repair on read keeps no intent for it");
+        assert!(request_line.is_empty(), "{request_line:?}");
+        assert_eq!(repair_line.len(), 1, "{repair_line:?}");
+        assert!(repair_line[0].contains("WARN"), "{repair_line:?}");
+    }
+
+    /// A repair batch the node refuses as invalid is logged at `error`, as on
+    /// the request path (`write_index_delta_repair`'s `RefusalLog::Error`),
+    /// not at the `warn` the sweeper's later tries use (ADR-aacruzgon-0090).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_refused_repair_batch_is_logged_at_error() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-refused-log");
+        let tenant = context(&t);
+        let (row, stale) = updated(&backend, &tenant, &t, "p").await;
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "p", Some(row), stale);
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::FailWithInvalid,
+        );
+
+        let outcomes = context.run(&backend).await;
+
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [RepairOutcome::Failed {
+                    failure: WriteFailure::Permanent,
+                    ..
+                }]
+            ),
+            "{outcomes:?}"
+        );
+        let refused = logged_lines!("index batch refused as invalid");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("ERROR"), "{refused:?}");
+    }
+
+    /// The control of the test above: the same fault on a request's update
+    /// logs the request path's per-batch line, and there the intent really
+    /// is kept.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_request_batch_in_the_batchlog_logs_that_its_intent_stays() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-batchlog-request");
+        let tenant = context(&t);
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p", "active": true}),
+                test_fhir_version(),
+            )
+            .await
+            .expect("create");
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::ApplyThenTimeOut,
+        );
+        backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType": "Patient", "id": "p", "active": false}),
+            )
+            .await
+            .expect("the update answers success (G23)");
+
+        let intents = backend.intent_versions(&t, "Patient", "p", since).await;
+        assert!(
+            !intents.is_empty() && intents.iter().all(|v| *v == 2),
+            "the request path keeps its intent: {intents:?}"
+        );
+        let request_line = logged_lines!("the intent stays for the sweeper");
+        let repair_line = logged_lines!("repair on read keeps no intent");
+        assert_eq!(request_line.len(), 1, "{request_line:?}");
+        assert!(repair_line.is_empty(), "{repair_line:?}");
     }
 
     #[tokio::test]
@@ -1762,6 +1995,141 @@ mod tests {
         drive_within(futures, 4, tokio::time::Instant::now()).await;
         assert_eq!(polled.load(SeqCst), 4);
         assert_eq!(finished.load(SeqCst), 0);
+    }
+
+    /// A future that counts its polls.
+    fn counted(polls: Arc<std::sync::atomic::AtomicUsize>, mut inner: Unit) -> Unit {
+        Box::pin(futures::future::poll_fn(move |cx| {
+            polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            inner.as_mut().poll(cx)
+        }))
+    }
+
+    /// No future is started at or past the deadline (CodeRabbit on #106):
+    /// with the deadline already past and the first four ready at once, the
+    /// fifth is never polled; with four running and the first finishing on
+    /// the deadline's own tick, the fifth is never polled either. The
+    /// controls: one finishing before the deadline starts the fifth, and one
+    /// finishing after it does not.
+    #[tokio::test(start_paused = true)]
+    async fn no_future_is_started_at_or_past_the_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        // Past the deadline, the first four ready at once.
+        let fifth = Arc::new(AtomicUsize::new(0));
+        let mut futures: Vec<Unit> = (0..4).map(|_| Box::pin(async {}) as Unit).collect();
+        futures.push(counted(fifth.clone(), Box::pin(std::future::pending())));
+        drive_within(futures, REPAIR_CONCURRENCY, tokio::time::Instant::now()).await;
+        assert_eq!(fifth.load(SeqCst), 0, "past the deadline");
+
+        // The first of four finishes on the deadline's tick (10 ms), and
+        // controls finishing at 5 ms and at 20 ms.
+        for (finish_ms, started) in [(10u64, false), (5, true), (20, false)] {
+            let fifth = Arc::new(AtomicUsize::new(0));
+            let ends_at = tokio::time::Instant::now() + Duration::from_millis(10);
+            let mut futures: Vec<Unit> = vec![Box::pin(tokio::time::sleep_until(
+                tokio::time::Instant::now() + Duration::from_millis(finish_ms),
+            ))];
+            for _ in 0..3 {
+                futures.push(Box::pin(std::future::pending()));
+            }
+            futures.push(counted(fifth.clone(), Box::pin(std::future::pending())));
+            drive_within(futures, REPAIR_CONCURRENCY, ends_at).await;
+            assert_eq!(
+                fifth.load(SeqCst) > 0,
+                started,
+                "the first finishing at {finish_ms} ms, the deadline at 10 ms"
+            );
+        }
+    }
+
+    /// A future that records the clock at its first poll, then stays pending.
+    fn first_polled_at(at: Arc<Mutex<Option<tokio::time::Instant>>>) -> Unit {
+        Box::pin(futures::future::poll_fn(move |_cx| {
+            at.lock().get_or_insert_with(tokio::time::Instant::now);
+            std::task::Poll::<()>::Pending
+        }))
+    }
+
+    /// A future whose first poll moves the paused clock by `by` (an
+    /// `advance` polled once inside it, which moves the clock before its
+    /// first yield), standing in for a repair's synchronous first poll; then
+    /// it stays pending.
+    fn moves_the_clock_at_first_poll(by: Duration) -> Unit {
+        let mut done = false;
+        Box::pin(futures::future::poll_fn(move |cx| {
+            if !done {
+                done = true;
+                let mut advance = Box::pin(tokio::time::advance(by));
+                let _ = advance.as_mut().poll(cx);
+            }
+            std::task::Poll::<()>::Pending
+        }))
+    }
+
+    /// Four running, a 10 ms deadline; the first two finish together at
+    /// 5 ms, so one pass admits two replacements before the deadline. The
+    /// first one's first poll takes the clock to 5 ms + `first_takes`.
+    /// Returns when the second was first polled, relative to the deadline
+    /// (negative: before it), or `None` if it never was.
+    async fn second_replacement_first_polled(first_takes: Duration) -> Option<i128> {
+        let t0 = tokio::time::Instant::now();
+        let ends_at = t0 + Duration::from_millis(10);
+        let both = t0 + Duration::from_millis(5);
+        let second = Arc::new(Mutex::new(None));
+        let futures: Vec<Unit> = vec![
+            Box::pin(tokio::time::sleep_until(both)),
+            Box::pin(tokio::time::sleep_until(both)),
+            Box::pin(std::future::pending()),
+            Box::pin(std::future::pending()),
+            moves_the_clock_at_first_poll(first_takes),
+            first_polled_at(second.clone()),
+        ];
+        drive_within(futures, REPAIR_CONCURRENCY, ends_at).await;
+        let at = *second.lock();
+        at.map(|at| {
+            if at >= ends_at {
+                (at - ends_at).as_micros() as i128
+            } else {
+                -((ends_at - at).as_micros() as i128)
+            }
+        })
+    }
+
+    /// Two replacements admitted in one pass, before the deadline: the
+    /// first one's first poll takes the clock past it, so the second, whose
+    /// check then finds the deadline passed, is never started (CodeRabbit on
+    /// #106).
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_reached_past_the_deadline_in_its_pass_stays_unstarted() {
+        let second = second_replacement_first_polled(Duration::from_millis(10)).await;
+        assert_eq!(second, None, "first polled {second:?} us from the deadline");
+    }
+
+    /// The control of the test above: the first replacement's first poll
+    /// ends at 7 ms, so the second starts 3 ms before the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn both_replacements_admitted_before_the_deadline_start_before_it() {
+        let second = second_replacement_first_polled(Duration::from_millis(2)).await;
+        assert_eq!(second, Some(-3_000));
+    }
+
+    /// The check's boundary: the first replacement's first poll ends exactly
+    /// on the deadline (5 ms + 5 ms = 10 ms), so the second's check finds the
+    /// clock at `ends_at`, which is not before it, and leaves it unstarted.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_reached_exactly_on_the_deadline_stays_unstarted() {
+        let second = second_replacement_first_polled(Duration::from_millis(5)).await;
+        assert_eq!(second, None, "first polled {second:?} us from the deadline");
+    }
+
+    /// The control of the test above: reached 1 us before the deadline, the
+    /// second replacement starts.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_reached_just_before_the_deadline_starts() {
+        let second =
+            second_replacement_first_polled(Duration::from_millis(5) - Duration::from_micros(1))
+                .await;
+        assert_eq!(second, Some(-1));
     }
 
     #[test]
@@ -2100,11 +2468,14 @@ mod tests {
         assert_eq!(stale.len(), 1);
         let mut context = RepairContext::new(&t);
         context.queue("Patient", "p", Some(row.clone()), stale);
+        let before = backend.repair_stats();
         let outcomes = context.run(&backend).await;
+        let stats = backend.repair_stats().since(&before);
         let [RepairOutcome::Repaired { full: false, index }] = outcomes[..] else {
             panic!("{outcomes:?}");
         };
         assert_eq!((index.rows_inserted, index.rows_deleted), (1, 1));
+        assert_eq!((stats.repaired, stats.repaired_partial), (1, 1));
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
         let rows: Vec<_> = type_search(&backend, &t)
             .await

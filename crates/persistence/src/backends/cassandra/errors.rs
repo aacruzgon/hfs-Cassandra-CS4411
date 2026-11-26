@@ -133,6 +133,12 @@ fn classify(error: &DriverError, operation: &str) -> BackendError {
                 after.as_millis()
             ));
         }
+        DriverError::TooManyStatements { statements } => {
+            return internal(format!(
+                "{operation}: an index batch of {statements} statements is over the \
+                 native protocol's 65,535; it was not sent"
+            ));
+        }
         DriverError::Driver(error) => error,
     };
 
@@ -205,6 +211,9 @@ fn describe(error: &DriverError) -> String {
                 "before sending"
             }
         ),
+        DriverError::TooManyStatements { statements } => {
+            format!("an index batch of {statements} statements, refused before sending")
+        }
         DriverError::Driver(error) => match error.as_ref() {
             CdrsError::Server { body, addr } => {
                 format!("{:?} from {addr}: {}", body.ty, body.message)

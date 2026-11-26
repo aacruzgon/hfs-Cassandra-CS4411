@@ -530,6 +530,8 @@ jobs:
       # GITHUB_SHA names.
       CI_REPORT_PROFILE: dev (line-tables-only debug info, CARGO_INCREMENTAL=0)
       CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The lib test the --lib step skips and the step after it runs alone.
+      AT_LIMIT_TEST: backends::cassandra::session::node_tests::a_batch_over_the_statement_limit_is_refused_and_sends_nothing
     steps:
       # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
       # the runner's own .env. Two instances on one machine share gh-runner's
@@ -804,16 +806,84 @@ jobs:
       # writes 101,000 tombstones (a few seconds) in a keyspace of its own and
       # drops it, so they are opted in on this job's node and no shared one
       # (issues #74 and #79).
-      # Already built above.
+      # Already built above. The 65,535-statement batch test is skipped here
+      # and runs alone in the next step.
       - name: cargo test --lib backends::cassandra against this node
         run: |
           set -o pipefail
+          # --skip drops every test whose name contains $AT_LIMIT_TEST (libtest
+          # matches skip filters by substring unless --exact, and --exact would
+          # make the backends::cassandra filter exact too), so check that it
+          # drops exactly one. --list needs no node and reuses the build.
+          # cargo's stderr goes to the log, so a failed listing shows why, and
+          # it fails the step.
+          listed() {
+            local list
+            list=$(cargo test -p helios-persistence --features cassandra \
+              --lib -- backends::cassandra --list "$@") \
+              || { echo "::error title=At-limit skip::cargo test --list${*:+ $*} failed (exit $?)" >&2; return 1; }
+            grep -c ': test$' <<<"$list" || true
+          }
+          all=$(listed) || exit 1
+          kept=$(listed --skip "${AT_LIMIT_TEST:?}") || exit 1
+          dropped=$(( all - kept ))
+          [ "$dropped" -eq 1 ] \
+            || { echo "::error title=At-limit skip::--skip $AT_LIMIT_TEST drops $dropped lib tests, not 1"; exit 1; }
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
           HFS_TEST_CASSANDRA_TOMBSTONE_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-persistence --features cassandra \
-              --lib -- backends::cassandra --show-output 2>&1 \
+              --lib -- backends::cassandra --show-output \
+              --skip "${AT_LIMIT_TEST:?}" 2>&1 \
             | tee "$RUNNER_TEMP/ci-report/logs/persistence-lib-tests.log"
+
+      # The batch of exactly 65,535 statements (ADR-aacruzgon-0089), alone on
+      # this node. The node builds its one mutation inside
+      # write_request_timeout (2 s), from when it begins the request
+      # (cql_start_time: REQUEST in 5.0.9), so the CPU it shares decides the
+      # margin. Inside the lib run above, it timed out in 7 of 8 attempts on
+      # sam-7900x (24 test threads) from 2026-11-25 to 2026-11-26, and in
+      # none of 17 on the Debian runners (16). On the pass, the node's
+      # slowest write (nodetool proxyhistograms) was in the bucket ending at
+      # 1.96 s; on two Debian passes, 0.26 s and 0.32 s. Alone on a node it
+      # took 0.28 to 0.36 s (a Mac, OrbStack, the same Compose file). A
+      # timed-out batch also fails the CQL audit check below, whose log
+      # cannot show what a failed native batch held. In the audit window, as
+      # before, and right after the lib step, so a failure skips the same
+      # steps it did inside it. --exact must run its one test, as in the
+      # other --exact steps. The [at-limit-batch …] line, the batch's time,
+      # goes to the report whether the test passed or failed, then the step
+      # exits with the test's status. Already built above.
+      - name: cargo test --lib, the 65,535-statement batch test alone against this node
+        run: |
+          set -o pipefail
+          logs="$RUNNER_TEMP/ci-report/logs"
+          mkdir -p "$logs"
+          log="$logs/persistence-lib-at-limit.log"
+          # The test's status, kept so the report below is written whatever it is.
+          status=0
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+            cargo test -p helios-persistence --features cassandra \
+              --lib -- --exact "${AT_LIMIT_TEST:?}" --show-output 2>&1 \
+            | tee "$log" || status=$?
+          clean="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
+          # Report only, on a pass or a failure (a time-out is the case it measures):
+          # a failed report leaves the test's result alone.
+          dir="$RUNNER_TEMP/ci-report/inputs/at-limit"
+          mkdir -p "$dir"
+          {
+            echo "Runner \`${RUNNER_NAME:-?}\`; the node's write_request_timeout is 2000 ms; the test's exit status: $status."
+            echo
+            echo '```'
+            grep -F '[at-limit-batch ' <<<"$clean" || echo "no [at-limit-batch] line"
+            echo '```'
+          } > "$dir/at-limit.md"
+          python3 .github/scripts/ci-report.py add at-limit \
+            "The 65,535-statement batch, alone on the node (report only)" \
+            --markdown "$dir/at-limit.md" || true
+          [ "$status" -eq 0 ] || exit "$status"
+          grep -Eq '^test result: ok\. 1 passed;' <<<"$clean" \
+            || { echo "::error title=At-limit batch test::$AT_LIMIT_TEST did not run exactly once"; exit 1; }
 
       # Milestone A (roadmap Step 2, item 2.7): the real hfs binary on this
       # node, POST /Patient then GET /Patient/{id}. Built above. Like every
@@ -956,9 +1026,9 @@ jobs:
       # of every test- tenant, the consistency check over every test- tenant
       # but the test-planted- ones (one shared scan, ADR-sam-michaels-0007),
       # the intent rows left after the sweep (R4b) and the outbox's
-      # tablestats. It never runs on a shared node: the test refuses 59042.
-      # Before the CQL audit check, so the sweep's writes are audited too
-      # (rule (d), IW20 = RV20).
+      # tablestats. It runs while the audit log is on, before the CQL audit
+      # check, so the D6 check covers the sweep's writes (rule (d), IW20 =
+      # RV20). It never runs on a shared node: the test refuses 59042.
       - name: Post-suite sweep and consistency check (report only)
         if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
         continue-on-error: true
@@ -989,7 +1059,7 @@ jobs:
             grep -E '\[index-consistency .* defects=[1-9]' <<<"$clean" || true
             echo '```'
             echo
-            echo '`pending_index_writes` tablestats:'
+            echo "\`pending_index_writes\` tablestats:"
             echo
             echo '```'
             cat "$dir/outbox-tablestats.txt"
@@ -1011,9 +1081,10 @@ jobs:
           exit 0
 
       # The exit criterion's check (Step 3 plan D6), after every step that
-      # writes and before the readiness test restarts the node. It stops the
-      # audit log, which flushes it, dumps it with auditlogviewer (in the
-      # image, not on its PATH), and fails if any entry is a CQL DELETE
+      # writes, the post-suite sweep included, and before the readiness test
+      # restarts the node. It stops the audit log, which flushes it, dumps it
+      # with auditlogviewer (in the image, not on its PATH), and fails if any
+      # entry is a CQL DELETE
       # against resources or resource_versions: type DELETE with exactly that
       # scope, or a DELETE … FROM either table in the CQL text of a batch or a
       # failed statement, which carry no scope. resources_by_type (the X1
@@ -1090,7 +1161,7 @@ jobs:
           logs="$RUNNER_TEMP/ci-report/logs"
           python3 .github/scripts/ci-report.py tests tests "Tests" \
             "$logs/persistence-tests.log" "$logs/persistence-lib-tests.log" \
-            "$logs/milestone-a-round-trip.log" \
+            "$logs/persistence-lib-at-limit.log" "$logs/milestone-a-round-trip.log" \
             "$logs/boot-time.log" "$logs/latency-backend.log" "$logs/latency-rest.log" \
             "$logs/post-suite.log" "$logs/readiness.log"
           python3 .github/scripts/ci-report.py readiness readiness \

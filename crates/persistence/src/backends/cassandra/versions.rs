@@ -28,8 +28,8 @@
 //!   `delete_versioned`'s, so a writer landing after the comparison makes
 //!   that CAS miss rather than being deleted with it (#1404).
 //! - **`update_with_match`** (roadmap Step 4) has the same shape. It checks
-//!   `Operation::Update` (the SearchParameter `code` bound, G38, is
-//!   `update`'s, before any statement there),
+//!   `Operation::Update` (the 8 MiB CAS payload bound, ADR-aacruzgon-0053,
+//!   is `update`'s, after its own read and before any write there),
 //!   pre-reads the resource with `read` (absent or deleted: `NotFound`),
 //!   compares the field with its version as `delete_with_match` does (a
 //!   mismatch is `VersionConflict`, 409, with nothing written), and then
@@ -277,10 +277,10 @@ impl CassandraBackend {
         expected_version: &str,
         resource: Json,
     ) -> StorageResult<StoredResource> {
-        // Again in `update`, before any statement there too. The
-        // SearchParameter `code` bound (G38) is left to `update`, so this file
-        // does not depend on `write.rs`'s check, which Step 5's extraction
-        // pull request removes (ADR-aacruzgon-0079).
+        // Again in `update`, before any statement there too. The CAS payload
+        // bound (ADR-aacruzgon-0053) is left to `update`, which checks it
+        // after its own read and before any write; G38's 128-byte
+        // SearchParameter `code` refusal is gone (ADR-aacruzgon-0079).
         tenant.check_permission(Operation::Update, resource_type)?;
         let current = match self.read_resource(tenant, resource_type, id).await {
             Ok(Some(current)) => current,
@@ -990,9 +990,9 @@ mod node_tests {
     /// What `update_with_match` refuses, each with nothing written, as
     /// `delete_with_match` does: a stale tag (409), an absent or deleted
     /// resource (`NotFound`); a tenant without update permission, before any
-    /// statement; and a SearchParameter `code` over 128 bytes (G38), which
-    /// `update` refuses after the pre-read and before any statement of its
-    /// own.
+    /// statement; and a body over the 8 MiB CAS payload bound
+    /// (ADR-aacruzgon-0053), which `update` refuses after the pre-read and
+    /// its own read, before any write.
     #[tokio::test]
     async fn update_with_match_refuses_without_writing() {
         let Some(backend) = backend().await else {

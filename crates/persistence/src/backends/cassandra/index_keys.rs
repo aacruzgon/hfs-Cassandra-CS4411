@@ -432,8 +432,9 @@ pub(crate) fn index_text(value: &str) -> String {
     text
 }
 
-/// `K(V)` of a live version from its extracted values (IW2 to IW6, P5),
-/// sorted and deduplicated, with the `resources_by_type` key (IW5).
+/// `K(V)` of a live version from its extracted values (IW2 to IW6, P5; IW2's
+/// empty-code drop as amended by ADR-aacruzgon-0091), sorted and
+/// deduplicated, with the `resources_by_type` key (IW5).
 pub(crate) fn index_keys_from(values: &[ExtractedValue]) -> Vec<IndexKey> {
     let mut keys = BTreeSet::from([IndexKey::ResourcesByType]);
     for extracted in values {
@@ -446,11 +447,26 @@ pub(crate) fn index_keys_from(values: &[ExtractedValue]) -> Vec<IndexKey> {
         let param = index_text(&extracted.param_name);
         match (&extracted.param_type, &extracted.value) {
             (SearchParamType::Token, IndexValue::Token { system, code, .. }) => {
+                let system = index_text(system.as_deref().unwrap_or(""));
+                let real_system = !system.is_empty() && system != IMPLICIT_TOKEN_SYSTEM;
                 if code.is_empty() {
+                    // A real system and no code (an Identifier with no value,
+                    // a Coding with no code) is a match for `[system]|`, so it
+                    // keeps its `token_system_index` row, with code `''`. No
+                    // `code`, `|code` or `system|code` form matches an empty
+                    // code, so it gets no code row. With no real system it is
+                    // display-only text and has no row (P5, ADR-aacruzgon-0091,
+                    // amending IW2 of ADR-sam-michaels-0006).
+                    if real_system {
+                        keys.insert(IndexKey::TokenSystem {
+                            param,
+                            system,
+                            code: String::new(),
+                        });
+                    }
                     continue;
                 }
                 let code = index_text(code);
-                let system = index_text(system.as_deref().unwrap_or(""));
                 keys.insert(IndexKey::TokenCode {
                     param: param.clone(),
                     code: code.clone(),
@@ -461,7 +477,7 @@ pub(crate) fn index_keys_from(values: &[ExtractedValue]) -> Vec<IndexKey> {
                     system: system.clone(),
                     code: code.clone(),
                 });
-                if !system.is_empty() && system != IMPLICIT_TOKEN_SYSTEM {
+                if real_system {
                     keys.insert(IndexKey::TokenSystem {
                         param,
                         system,
@@ -978,6 +994,10 @@ mod tests {
             token("code-value-quantity", Some("http://loinc.org"), "8480-6")
                 .with_composite_group(1),
             ev_date("birthdate", "1980-05-01"),
+            // Four fraction digits: stored in milliseconds, the value's own
+            // millisecond (IW4). In microseconds, `timestamp_millis()` would
+            // give the empty range `[…123, …123)`.
+            ev_date("effective", "2020-01-01T10:00:00.1234Z"),
             ev_date("death-date", "not a date"),
             value("name", SearchParamType::String, IndexValue::string("Smith")),
             value(
@@ -1004,6 +1024,9 @@ mod tests {
             token_system_code("gender", IMPLICIT, "male"),
             token_code("active", "true", ""),
             token_system_code("active", "", "true"),
+            // A real system and no code keeps its `token_system_index` row,
+            // and gets no code row (ADR-aacruzgon-0091).
+            token_system("code", "http://loinc.org", ""),
             IndexKey::Uri {
                 param: "_profile".into(),
                 uri: "http://example.org/profile".into(),
@@ -1019,6 +1042,16 @@ mod tests {
                 start: B0,
             },
             IndexKey::Date {
+                param: "effective".into(),
+                start: 1_577_872_800_123,
+                end: 1_577_872_800_124,
+            },
+            IndexKey::DateByEnd {
+                param: "effective".into(),
+                end: 1_577_872_800_124,
+                start: 1_577_872_800_123,
+            },
+            IndexKey::Date {
                 param: "period".into(),
                 start: -62_135_596_800_000,
                 end: 253_402_300_799_999,
@@ -1032,12 +1065,45 @@ mod tests {
         expected.sort();
         let keys = index_keys_from(&values);
         assert_eq!(keys, expected);
-        assert_eq!(keys.len(), 13);
+        assert_eq!(keys.len(), 16);
         assert_eq!(keys[0], IndexKey::ResourcesByType);
         assert!(
             !keys.iter().any(|key| matches!(key,
                 IndexKey::TokenSystem { system, .. } if system.is_empty() || system == IMPLICIT)),
             "no token_system_index row for the implicit or empty system"
+        );
+    }
+
+    /// ADR-aacruzgon-0091 (amends IW2): an empty code with a real system
+    /// gives exactly one `TokenSystem` key, with code `''`; an empty code with
+    /// the implicit marker, the empty system or no system gives none.
+    #[test]
+    fn an_empty_code_keeps_only_a_real_systems_row() {
+        let keys = index_keys_from(&[token("identifier", Some(MRN), "")]);
+        assert_eq!(
+            keys,
+            vec![
+                IndexKey::ResourcesByType,
+                token_system("identifier", MRN, ""),
+            ]
+        );
+        // The stored key set keeps the empty code (`index_keys`, format 1).
+        assert_eq!(decode(&encode(&keys)).unwrap(), keys);
+        for system in [Some(IMPLICIT), Some(""), None] {
+            assert_eq!(
+                index_keys_from(&[token("identifier", system, "")]),
+                vec![IndexKey::ResourcesByType],
+                "system {system:?} with an empty code"
+            );
+        }
+        // A long system is mapped once, like any other (ADR-aacruzgon-0079).
+        let long_system = long(1025, 's');
+        assert_eq!(
+            index_keys_from(&[token("identifier", Some(&long_system), "")]),
+            vec![
+                IndexKey::ResourcesByType,
+                token_system("identifier", &digest(&long_system), ""),
+            ]
         );
     }
 

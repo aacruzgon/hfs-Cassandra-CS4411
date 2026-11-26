@@ -360,6 +360,12 @@ jobs:
       HFS_FEATURES: R4,R4B,R5,R6,cassandra,sqlite,helios-fhir/skip-r6-download
       CI_REPORT_PROFILE: dev (line-tables-only debug info, CARGO_INCREMENTAL=0)
       CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The lib test every lib run below skips: the batch of exactly 65,535
+      # statements (ADR-aacruzgon-0089), which the required job runs alone
+      # in a step of its own (fmt-clippy-cassandra.yml). Under a whole lib
+      # run it timed out on sam-7900x (R4 lib, run 45783764882 on main), and
+      # it binds the FHIR version only as a column's text.
+      AT_LIMIT_TEST: backends::cassandra::session::node_tests::a_batch_over_the_statement_limit_is_refused_and_sends_nothing
     steps:
       # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
       # the runner's own .env. Two instances on one machine share gh-runner's
@@ -521,9 +527,22 @@ jobs:
       # For each version, the three suites, each against this node and each
       # into its own log, $RUNNER_TEMP/ci-report/logs/fhir-<version>-<suite>.log,
       # which ends with `exit=<status>` for the report below:
-      #   lib    the backend's unit tests (--lib backends::cassandra); its
+      #   lib    the backend's unit tests (--lib backends::cassandra), all
+      #          but $AT_LIMIT_TEST (see the job's env); its
       #          restart_tests skip without HFS_TEST_CASSANDRA_RESTART_*,
-      #          which this job never sets
+      #          which this job never sets. R6's run, the last, also sets
+      #          HFS_TEST_CASSANDRA_LARGE=1 for the full-size byte-cut test
+      #          (ADR-aacruzgon-0089), once per CI run: it leaves about 98,000
+      #          index rows and as many tombstones on this job's node, and the
+      #          lib tests' scans of whole index tables would pay for them in
+      #          every later lib run. After it, only R6's tests and rest
+      #          suites run: they read the token tables only by partition, and
+      #          their one scan, the SELECT DISTINCT over resources_by_type's
+      #          partition keys, meets a single partition of the test's own
+      #          tenant. The step fails R6's lib run if its log lacks the
+      #          test's [piece-bytes line: the test passes as `not run:`
+      #          without the variable, so a lost variable would otherwise
+      #          drop it and stay green
       #   tests  tests/cassandra_tests.rs and backend_capability_contract.rs;
       #          --no-fail-fast, so a failure in the first binary does not
       #          keep the second from running
@@ -560,14 +579,43 @@ jobs:
               echo "::error title=FHIR versions::$version rest did not run exactly its three tests"
               status=1
             fi
+            if [ "$version" = R6 ] && [ "$suite" = lib ] && [ "$status" -eq 0 ] \
+              && ! grep -Fq '[piece-bytes code_len=' "$log"; then
+              echo "::error title=FHIR versions::R6 lib did not run the_largest_update_of_one_partition_is_cut_by_bytes_and_lands (HFS_TEST_CASSANDRA_LARGE=1)"
+              status=1
+            fi
             echo "exit=$status" | tee -a "$log"
             echo "::endgroup::"
             if [ "$status" -ne 0 ]; then failed+=("$version $suite (exit $status)"); fi
           }
+          # --skip drops every test whose name contains $AT_LIMIT_TEST (libtest
+          # matches skip filters by substring unless --exact, and --exact would
+          # make the backends::cassandra filter exact too), so check once that
+          # it drops exactly one. The list does not depend on the version:
+          # HFS_TEST_FHIR_VERSION is read only at run time. cargo's stderr goes
+          # to the log, so a failed listing shows why, and it is a failure.
+          listed() {
+            local list
+            list=$(cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
+              --lib -- backends::cassandra --list "$@") \
+              || { echo "::error title=FHIR versions::cargo test --list${*:+ $*} failed (exit $?)" >&2; return 1; }
+            grep -c ': test$' <<<"$list" || true
+          }
+          if all=$(listed) && kept=$(listed --skip "${AT_LIMIT_TEST:?}"); then
+            dropped=$(( all - kept ))
+            if [ "$dropped" -ne 1 ]; then
+              echo "::error title=FHIR versions::--skip $AT_LIMIT_TEST drops $dropped lib tests, not 1"
+              failed+=("lib skip (drops $dropped)")
+            fi
+          else
+            failed+=("lib skip guard (cargo test --list failed)")
+          fi
           for version in R4 R4B R5 R6; do
-            run_suite "$version" lib \
+            large=()
+            if [ "$version" = R6 ]; then large=(env HFS_TEST_CASSANDRA_LARGE=1); fi
+            run_suite "$version" lib "${large[@]}" \
               cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
-                --lib -- backends::cassandra --nocapture
+                --lib -- backends::cassandra --nocapture --skip "${AT_LIMIT_TEST:?}"
             run_suite "$version" tests \
               cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
                 --test cassandra_tests --test backend_capability_contract --no-fail-fast -- --nocapture

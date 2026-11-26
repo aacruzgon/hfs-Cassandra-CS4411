@@ -1241,6 +1241,7 @@ mod tests {
         assert_eq!(spent.batch + spent.write, index.batches);
         assert_eq!((spent.read, spent.serial_read, spent.cas), (0, 0, 0));
         assert_eq!((stats.queued, stats.repaired, stats.failed), (1, 1, 0));
+        assert_eq!(stats.repaired_partial, 0);
         assert_eq!(
             (stats.rows_inserted, stats.rows_deleted),
             (k2.len() as u64, 1)
@@ -1509,6 +1510,17 @@ mod tests {
             })
             .sum();
         assert_eq!(spent.batch + spent.write, batches);
+        let rows = outcomes.iter().fold((0, 0), |(i, d), o| match o {
+            RepairOutcome::Repaired { index, .. } | RepairOutcome::Failed { index, .. } => {
+                (i + index.rows_inserted, d + index.rows_deleted)
+            }
+            RepairOutcome::Skipped(_) => (i, d),
+        });
+        let RepairOutcome::Failed { index: lost, .. } = failed[0] else {
+            unreachable!()
+        };
+        assert!(lost.rows_inserted + lost.rows_deleted > 0, "{lost:?}");
+        assert_eq!((stats.rows_inserted, stats.rows_deleted), rows);
         assert_consistent(&check(&backend, &t).await);
     }
 
@@ -2099,11 +2111,14 @@ mod tests {
         assert_eq!(stale.len(), 1);
         let mut context = RepairContext::new(&t);
         context.queue("Patient", "p", Some(row.clone()), stale);
+        let before = backend.repair_stats();
         let outcomes = context.run(&backend).await;
+        let stats = backend.repair_stats().since(&before);
         let [RepairOutcome::Repaired { full: false, index }] = outcomes[..] else {
             panic!("{outcomes:?}");
         };
         assert_eq!((index.rows_inserted, index.rows_deleted), (1, 1));
+        assert_eq!((stats.repaired, stats.repaired_partial), (1, 1));
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
         let rows: Vec<_> = type_search(&backend, &t)
             .await

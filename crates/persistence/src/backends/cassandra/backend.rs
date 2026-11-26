@@ -799,8 +799,16 @@ impl CassandraBackend {
                 );
                 continue;
             };
+            // Unreachable while `create_affects_overlay` requires
+            // `"status": "active"`, which the loader maps to `Active`: a body
+            // not active was recorded as a removal above. The branch stays a
+            // guard, and records nothing.
+            debug_assert_eq!(
+                definition.status,
+                SearchParameterStatus::Active,
+                "create_affects_overlay takes only an active SearchParameter"
+            );
             if definition.status != SearchParameterStatus::Active {
-                removed.push((stored.id().to_string(), stored.last_modified()));
                 continue;
             }
             definition.source = SearchParameterSource::Stored;
@@ -1776,6 +1784,21 @@ mod reload_rules {
             "made active again"
         );
         assert_eq!(in_force(&overlay), ["sp"]);
+    }
+
+    /// SW19: a reload that read an id at a version older than a removal this
+    /// process already holds keeps the newer removal, so a read between the
+    /// two is still refused.
+    #[test]
+    fn a_reload_keeps_the_newer_of_two_removals() {
+        let mut overlay = TenantOverlay::default();
+        overlay.put(stored("http://example.org/sp", "sp", 1_000));
+        overlay.remove("sp", at(3_000));
+        overlay.merge_reload(Vec::new(), vec![("sp".to_string(), at(2_000))], 0);
+        assert!(
+            !overlay.put(stored("http://example.org/sp", "sp", 2_500)),
+            "a read older than this process's own removal at 3_000"
+        );
     }
 
     /// A removal is forgotten once a reload reads a newer version of its id

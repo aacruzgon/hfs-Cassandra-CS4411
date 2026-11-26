@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0098: A request held up since its intent's stamp writes a fresh intent before its compare-and-swap, when the compare-and-swap could end past the sweeper's grace (refines ADR-sam-michaels-0006 SW6 = IW18)
 
 - **Date:** 2026-11-26
-- **Status:** proposed
+- **Status:** accepted (Alan confirmed the entry on 2026-11-26)
 - **Context:**
     - **The question.** CodeRabbit's review of #107 (its C6, on `write.rs`) said that a request stalled between its intent's stamp and its compare-and-swap could leave a crashed write the running sweeper never finishes. The validator run `validate-107-findings` confirmed it, narrower, at L1 with the stall simulated, on `8569c663b` (its `report-coderabbit.md`, §C6).
     - **The design it refines.** ADR-sam-michaels-0006 SW6 = IW18 stamps the intent "after V3 and immediately before I1", so that the grace covers only I1's latency and clock skew. The design document's "Clocks" paragraph states the assumption: clock skew plus the time from a request's intent row to its compare-and-swap stays under the grace, and a request that stalls longer is a known limitation. `finish` already writes a fresh intent when the write it finishes leaves work (`restamp_intent`, SW6), but only when the request gets that far.
@@ -45,7 +45,7 @@
         - It took the recommendation from the validator's report, checked it against the sweeper's grace logic, SW8, SW9, SW11, SW22 and SW28, ADR-aacruzgon-0090, the design document, the walkthrough and the roadmap, and FHIR http.html for R4, R4B and R5, and found no conflict.
         - It chose a loop over a single re-stamp, and a counter and a `warn`.
         - It wrote the change, the `AfterStamp` checkpoint and the tests: two node tests that hold a writer past a 4 s grace in real time, one per window, then crash it after its compare-and-swap; a control held briefly; and a unit test of the check's bounds.
-    - **What the human changed:** Alan approved the recommendation on 2026-11-26 ("the open items lets go with the recommendations as long as they follow what would be appropriate for the specs"); he has not yet confirmed this entry's text.
+    - **What the human changed:** Alan approved the recommendation on 2026-11-26 ("the open items lets go with the recommendations as long as they follow what would be appropriate for the specs"); he had not yet confirmed this entry's text when it was drafted. Alan confirmed the entry on 2026-11-26 ('i also confirm all the ADRS').
     - **What was verified, and how:**
         - On a 5.0.9 node of `docker/cassandra/docker-compose.yml`, both window tests fail with the check mutated to `false`: the poll after the crash shows `current=0 done=0`. The control passes there.
         - With the fix, all three pass, and so do the `backends::cassandra` lib tests and `cassandra_tests`.

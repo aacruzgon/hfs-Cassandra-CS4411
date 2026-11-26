@@ -3677,7 +3677,9 @@ mod node_tests {
     /// `RETRY_MAX` retry, without a restart. Before, it gave up and the resource stayed out of `count` and
     /// search until a restart or the intent's TTL. Each refused try is counted in `retries`. Tries 1 to 3
     /// log the refusal at `error`, the third once more that the sweeper keeps trying; try 4 logs it at
-    /// `warn`, the batch's line and the sweeper's both.
+    /// `warn`, the batch's line and the sweeper's both. Each try's unconfirmed batches are logged as
+    /// leaving the intent queued for the sweeper's next try, never as kept for the sweeper, which is
+    /// the request path's line.
     #[tokio::test]
     async fn a_refused_replay_is_finished_once_the_node_takes_it() {
         let Some((backend, t, tenant, since)) = start("sweeper-refused").await else {
@@ -3731,6 +3733,9 @@ mod node_tests {
         let batch = "index batch refused as invalid; not retried";
         let hit = "an intent hit an invariant; its row is kept in the outbox";
         let kept = "the node refused an intent's writes three times";
+        let queued =
+            "index batches not confirmed; the intent stays queued for the sweeper's next try";
+        let request = "index batches not confirmed; the intent is kept for the sweeper";
         let lines = |logs: &Captured| {
             [
                 (tracing::Level::ERROR, batch),
@@ -3738,12 +3743,14 @@ mod node_tests {
                 (tracing::Level::ERROR, hit),
                 (tracing::Level::WARN, hit),
                 (tracing::Level::ERROR, kept),
+                (tracing::Level::WARN, queued),
+                (tracing::Level::WARN, request),
             ]
             .map(|(level, text)| logs.count(level, text))
         };
         assert_eq!(
             lines(&logs),
-            [3, 0, 3, 0, 1],
+            [3, 0, 3, 0, 1, 3, 0],
             "tries 1 to 3: {:?}",
             logs.all()
         );
@@ -3765,7 +3772,12 @@ mod node_tests {
             "{fourth}"
         );
         assert_eq!(state.retry.lock().len(), 1);
-        assert_eq!(lines(&logs), [3, 1, 3, 1, 1], "try 4: {:?}", logs.all());
+        assert_eq!(
+            lines(&logs),
+            [3, 1, 3, 1, 1, 4, 0],
+            "try 4: {:?}",
+            logs.all()
+        );
 
         // The faults are spent: the node takes the write. The retry due 5 minutes after try 4 finishes it.
         rewind(&state, start_mark);

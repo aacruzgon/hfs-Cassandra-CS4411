@@ -327,6 +327,15 @@ pub(crate) enum RefusalLog {
     Warn,
 }
 
+/// Who writes an index delta, for the line logged when one of its batches is
+/// not confirmed: a request leaves the intent for the sweeper, and the sweeper
+/// leaves it queued for its own next try.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeltaWriter {
+    Request,
+    Sweeper,
+}
+
 /// A `tracing` event at a [`RefusalLog`]'s level: `log_refusal!(level, fields…, "message")`.
 macro_rules! log_refusal {
     ($refusal:expr, $($arg:tt)+) => {
@@ -2712,12 +2721,22 @@ impl CassandraBackend {
         ts: i64,
         tries: u32,
     ) -> IndexOutcome {
-        self.write_index_delta_logged(key, delta, ts, tries, RefusalLog::Error)
-            .await
+        let deadline = Duration::from_millis(self.config.request_timeout_ms);
+        self.write_index_delta_within(
+            key,
+            delta,
+            ts,
+            tries,
+            deadline,
+            RefusalLog::Error,
+            DeltaWriter::Request,
+        )
+        .await
     }
 
-    /// [`Self::write_index_delta`], with a refused batch logged at `refusal`
-    /// (the sweeper's later tries, ADR-aacruzgon-0090).
+    /// [`Self::write_index_delta`] for the sweeper: a refused batch logged at
+    /// `refusal` (its later tries, ADR-aacruzgon-0090), and a batch not
+    /// confirmed logged as leaving the intent queued for its next try.
     pub(crate) async fn write_index_delta_logged(
         &self,
         key: &RowKey<'_>,
@@ -2727,12 +2746,21 @@ impl CassandraBackend {
         refusal: RefusalLog,
     ) -> IndexOutcome {
         let deadline = Duration::from_millis(self.config.request_timeout_ms);
-        self.write_index_delta_within(key, delta, ts, tries, deadline, refusal)
-            .await
+        self.write_index_delta_within(
+            key,
+            delta,
+            ts,
+            tries,
+            deadline,
+            refusal,
+            DeltaWriter::Sweeper,
+        )
+        .await
     }
 
-    /// [`Self::write_index_delta_logged`] with the phase's deadline given, so
-    /// a test can make it short.
+    /// [`Self::write_index_delta`] with the phase's deadline, the refusal's
+    /// level and the writer given, so a test can make the deadline short.
+    #[allow(clippy::too_many_arguments)]
     async fn write_index_delta_within(
         &self,
         key: &RowKey<'_>,
@@ -2741,6 +2769,7 @@ impl CassandraBackend {
         tries: u32,
         deadline: Duration,
         refusal: RefusalLog,
+        writer: DeltaWriter,
     ) -> IndexOutcome {
         let IndexBatches { batches, stats } = index_batches(key, delta, ts);
         let mut failures = Vec::new();
@@ -2781,14 +2810,24 @@ impl CassandraBackend {
             );
             Ok(())
         } else {
-            tracing::warn!(
-                resource_type = key.resource_type,
-                id = key.id,
-                version_id = delta.version_id,
-                failed = failures.len(),
-                index = %stats,
-                "index batches not confirmed; the intent is kept for the sweeper"
-            );
+            match writer {
+                DeltaWriter::Request => tracing::warn!(
+                    resource_type = key.resource_type,
+                    id = key.id,
+                    version_id = delta.version_id,
+                    failed = failures.len(),
+                    index = %stats,
+                    "index batches not confirmed; the intent is kept for the sweeper"
+                ),
+                DeltaWriter::Sweeper => tracing::warn!(
+                    resource_type = key.resource_type,
+                    id = key.id,
+                    version_id = delta.version_id,
+                    failed = failures.len(),
+                    index = %stats,
+                    "index batches not confirmed; the intent stays queued for the sweeper's next try"
+                ),
+            }
             Err([
                 WriteFailure::Permanent,
                 WriteFailure::TriesExhausted,
@@ -7784,6 +7823,7 @@ mod node_tests {
                 POST_CAS_WRITE_TRIES,
                 Duration::from_millis(15),
                 RefusalLog::Error,
+                DeltaWriter::Request,
             )
             .await;
         let elapsed = started.elapsed();
@@ -7844,6 +7884,7 @@ mod node_tests {
             POST_CAS_WRITE_TRIES,
             Duration::from_millis(15),
             RefusalLog::Error,
+            DeltaWriter::Request,
         );
         let mut phase = std::pin::pin!(phase);
         assert!(

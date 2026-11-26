@@ -1734,6 +1734,14 @@ impl CassandraBackend {
         if matches!(case, IntentCase::Current | IntentCase::Superseded)
             && intent.resource_type == "SearchParameter"
         {
+            // A test can hold the sweeper here, between R1 and the read the follow uses.
+            #[cfg(test)]
+            self.checkpoint(
+                super::checkpoint::Checkpoint::SweeperBeforeFollow,
+                &key,
+                version,
+            )
+            .await;
             let read_at = self.search_parameter_read_stamp();
             match self.read_row(intent, StatementKind::Read, rank).await {
                 Ok(fresh) => {
@@ -3826,6 +3834,127 @@ mod node_tests {
             (early.as_deref(), late.as_deref()),
             (Some("Patient.gender"), Some("Patient.gender")),
             "(stamped before the reload, stamped after it)"
+        );
+    }
+
+    /// A SearchParameter created with every `resources_by_type` insert failing, so its intent is
+    /// left for the sweeper, and dropped from the overlay by a reload, so only a follow puts it back.
+    /// Returns the backend, the tenant, its context, the `url` and the intent.
+    async fn a_searchparameter_left_for_the_sweeper(
+        prefix: &str,
+    ) -> Option<(Arc<CassandraBackend>, String, TenantContext, String, Intent)> {
+        let (a, t, tenant, since) = start(prefix).await?;
+        let url = format!("http://example.org/SearchParameter/{t}");
+        for _ in 0..3 {
+            a.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resources_by_type",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        a.create(
+            &tenant,
+            "SearchParameter",
+            search_parameter(&url),
+            test_fhir_version(),
+        )
+        .await
+        .expect("create");
+        assert_eq!(a.load_stored_search_parameters(&t).await.unwrap(), 0);
+        assert_eq!(expression_of(&a, &tenant, &url), None);
+        let found = pending(&a, &t, "sp", since).await;
+        let intent = found.first().expect("the create's intent").clone();
+        Some((a, t, tenant, url, intent))
+    }
+
+    /// SW19 (ADR-aacruzgon-0099): a replay's follow uses a read taken after the replay, not R1's row.
+    /// The sweeper is held between the replay and that read while B deletes the SearchParameter
+    /// (`delete`), or, as the control, while nothing happens. Returns whether it is in A's registry
+    /// after the intent is processed.
+    async fn replay_held_before_its_follow(delete: bool) -> Option<bool> {
+        let (a, t, tenant, url, intent) =
+            a_searchparameter_left_for_the_sweeper("sweeper-sp-reread").await?;
+        let b = harness::backend().await.expect("instance B");
+        let mut hold = a.hold_at(Checkpoint::SweeperBeforeFollow, &t, "sp", intent.version_id);
+        let task = tokio::spawn({
+            let a = a.clone();
+            async move { a.process_intent(&intent, Rank::Normal).await }
+        });
+        hold.reached().await;
+        if delete {
+            b.delete(&tenant, "SearchParameter", "sp")
+                .await
+                .expect("B's delete");
+        }
+        hold.release();
+        let result = task.await.expect("the intent's task");
+        assert_eq!(result.result, Ok(()), "delete={delete}");
+        Some(expression_of(&a, &tenant, &url).is_some())
+    }
+
+    #[tokio::test]
+    async fn a_replay_follows_a_read_taken_after_it() {
+        let Some(deleted) = replay_held_before_its_follow(true).await else {
+            return;
+        };
+        let control = replay_held_before_its_follow(false).await.unwrap();
+        assert_eq!(
+            (deleted, control),
+            (false, true),
+            "(B deleted it before the follow's read, nothing happened)"
+        );
+    }
+
+    /// SW19 (ADR-aacruzgon-0099): when the read the follow uses fails (R1 passes, the second read of
+    /// `resources` is refused), the intent is kept and nothing is followed; its next try replays it
+    /// and follows.
+    #[tokio::test]
+    async fn a_failed_read_for_the_follow_keeps_the_intent() {
+        let Some((a, t, tenant, url, intent)) =
+            a_searchparameter_left_for_the_sweeper("sweeper-sp-reread-fails").await
+        else {
+            return;
+        };
+        let before = a.sweeper_stats();
+        a.session.inject_fault(
+            StatementKind::Read,
+            "FROM resources WHERE",
+            Fault::PassThrough,
+        );
+        a.session.inject_fault(
+            StatementKind::Read,
+            "FROM resources WHERE",
+            Fault::FailWithUnavailable,
+        );
+        let first = a.process_intent(&intent, Rank::Normal).await;
+        assert_eq!(first.case, Some(IntentCase::Current));
+        assert_eq!(first.result, Err(Failure::Transient("read")));
+        assert_eq!(
+            a.sweeper_stats().since(&before).search_parameters_followed,
+            0
+        );
+        assert_eq!(expression_of(&a, &tenant, &url), None, "not followed");
+        let kept = a
+            .intent_versions(
+                &t,
+                "SearchParameter",
+                "sp",
+                intent.enqueued - chrono::Duration::seconds(1),
+            )
+            .await;
+        assert!(
+            kept.contains(&intent.version_id),
+            "the intent is kept: {kept:?}"
+        );
+        let second = a.process_intent(&intent, Rank::Normal).await;
+        assert_eq!(second.result, Ok(()));
+        assert_eq!(
+            a.sweeper_stats().since(&before).search_parameters_followed,
+            1
+        );
+        assert_eq!(
+            expression_of(&a, &tenant, &url).as_deref(),
+            Some("Patient.active")
         );
     }
 

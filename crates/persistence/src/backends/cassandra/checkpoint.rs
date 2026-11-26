@@ -33,6 +33,9 @@ pub(crate) enum Checkpoint {
     AfterVersionRow,
     /// After step 5's index rows, before I2 (`finish`).
     AfterIndex,
+    /// Not in the write path: in the sweeper, after a SearchParameter intent's replay and before
+    /// the read its follow uses (SW19, ADR-aacruzgon-0099), keyed by the intent's version.
+    SweeperBeforeFollow,
 }
 
 /// The holds armed on one backend, each one-shot.
@@ -384,6 +387,7 @@ mod tests {
                     (2, rows, expect(&want))
                 }
                 Checkpoint::AfterIndex => (2, vec![1, 2], vec![]),
+                Checkpoint::SweeperBeforeFollow => unreachable!("not a write-path point"),
             };
             assert_eq!(r1.version_id, r1_version, "{name}");
             assert_eq!(

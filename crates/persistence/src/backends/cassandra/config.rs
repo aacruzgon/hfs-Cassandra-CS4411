@@ -257,8 +257,11 @@ impl CassandraConfig {
             ));
         }
         // ADR-aacruzgon-0100: `cdrs-tokio` 10.0.0 bounds each connection
-        // attempt by the connect timeout (`cluster/connection_pool.rs:39-61`,
-        // `:224-237`), and that attempt can fall inside a statement's deadline.
+        // attempt by the connect timeout (`cluster/connection_pool.rs:39-61`),
+        // and a statement can make one inside its deadline: the send loop
+        // takes each node's connection (`cluster/send_envelope.rs:44-70`),
+        // which opens the node's pool (`cluster/topology/node.rs:279-303`,
+        // `cluster/connection_pool.rs:645-678`).
         if self.request_timeout_ms <= self.connect_timeout_ms {
             return Err(CassandraConfigError(format!(
                 "HFS_CASSANDRA_REQUEST_TIMEOUT_MS ({}) must be longer than \

@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0101: In the report-only Cassandra jobs, coverage runs the 65,535-statement batch test alone, mutation testing skips it, and the flakiness and three-node jobs are unchanged (amends ADR-aacruzgon-0095)
 
 - **Date:** 2026-11-26
-- **Status:** proposed
+- **Status:** accepted (Alan confirmed the entry on 2026-11-26)
 - **Context:**
     - **What ADR-aacruzgon-0095 left open.** It took `session::node_tests::a_batch_over_the_statement_limit_is_refused_and_sends_nothing` out of the required job's `--lib` step and the FHIR versions job's lib runs (PR #119, `04c2db43a`). Its "Revisit if" named the report-only jobs that still ran it: "`cassandra-coverage.yml` (light, report only) still runs the test inside its whole lib run, so it can still time out there on `sam-7900x`. So can `cassandra-flaky.yml` (medium, which `sam-7900x` takes) and the heavy report-only jobs (mutants, three-node), which never run on `sam-7900x`."
     - **The coverage job failed on it.** Both runs were "Cassandra coverage (report only)" on `sam-7900x`, and the test timed out inside the whole lib run, with the rest of it passing:
@@ -61,7 +61,7 @@
         - two dispatches of the three-node job on `main`, the whole `node_tests` run and the test alone;
         - `actionlint` 1.7.12 (with `shellcheck`) and `zizmor` on each changed workflow and on `main`'s copy: the same one `runner.workspace` finding on coverage as `main`, none on mutants; `zizmor` reports no findings on either;
         - PR #125's CI: the coverage job passed in three attempts of run 45855797677, on `acruzdebian`, `acruzdebian-2` and `acruzdebian-2`. Each lib run had 326 tests, 2,027 filtered out. The test passed alone in 366, 384 and 353 ms. Its lines are counted in the first attempt's `lcov.info` (`session.rs:1793`, `:1800`, `:1814`, one hit each, from the new step only, since the lib run skipped it). No attempt ran on `sam-7900x`, so the new step is not yet observed there. Alan said on 2026-11-26, through the orchestrator, that this is fine.
-    - **What the human changed:** Alan asked on 2026-11-26 that CI pass on the open PRs ('lets also make sure CI is passing in this PRs i noticed some jobs failing'), under his approval of the open items' recommendations; he has not yet confirmed this entry's text.
+    - **What the human changed:** Alan asked on 2026-11-26 that CI pass on the open PRs ('lets also make sure CI is passing in this PRs i noticed some jobs failing'), under his approval of the open items' recommendations; he had not yet confirmed this entry's text when it was drafted. Alan confirmed the entry on 2026-11-26.
 - **Links:**
     - PR #125 (`ci/cassandra-at-limit-report-jobs`), with commits `ac27c6851` (coverage) and `cec43f696` (mutants);
     - amends [ADR-aacruzgon-0095](0095-at-limit-test-own-step.md);

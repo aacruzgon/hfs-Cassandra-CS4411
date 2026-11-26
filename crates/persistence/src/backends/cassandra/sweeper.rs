@@ -421,7 +421,7 @@ fn log_retry_list_full(shards: u64, slices: u64) {
         shards_held = shards,
         slices_held = slices,
         retry_cap = RETRY_LIST_CAP,
-        "the index sweeper's retry list is full; these shards keep their marks"
+        "the index sweeper's retry list is full; what it could not take is read again"
     );
 }
 
@@ -2414,8 +2414,8 @@ mod tests {
     /// toward their tries, so a data bug among them still gives up on its third try even with more
     /// refusals than `GAVE_UP_CAP` (more bugs than that mostly do not, as the module doc says), every
     /// refusal logs at `warn`, and only the bugs are in `overflow_tries` (no insert, so no eviction
-    /// scan, for a refusal). Each round, the list fails the same intents in the same order, as a held shard is
-    /// read again on every poll: a bug first, the refusals, then a bug last.
+    /// scan, for a refusal). Each round, the list fails the same intents in the same order, as a held
+    /// shard is read again on every poll: a bug first, the refusals, then a bug last.
     #[test]
     fn past_a_full_list_refusals_are_not_counted_and_a_bug_still_gives_up() {
         let t0 = at("2026-11-22T10:00:00Z");
@@ -4806,7 +4806,7 @@ mod node_tests {
     /// The "retry list is full" `error`, and the refused intent's batch and invariant lines at `error`
     /// and at `warn`.
     fn full_list_lines(logs: &Captured) -> [usize; 5] {
-        let full = "the index sweeper's retry list is full; these shards keep their marks";
+        let full = "the index sweeper's retry list is full; what it could not take is read again";
         let batch = "index batch refused as invalid; not retried";
         let hit = "an intent hit an invariant; its row is kept in the outbox";
         [

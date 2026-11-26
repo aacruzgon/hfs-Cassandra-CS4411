@@ -36,7 +36,7 @@
         - A compare-and-swap that applies more than the grace after it was sent, which SW28 already names: it waited in a coordinator's queue (`native_transport_timeout`, 12 s by default) or behind a stalled node after HFS's own deadline returned the request.
         - Clock skew between hosts: a sweeper on another host whose wall clock is ahead of this one's, including a VM resumed from a pause whose wall clock is still behind until NTP corrects it. This host's check can't see that skew.
         - A freeze between the check and the compare-and-swap's own deadline start. There is no await there, so it takes nanoseconds to pass, and it is the same kind of window as before, much shorter.
-    - **The cost.** Nothing for a request that is not held up: one `Instant`, one wall-clock read and one comparison. A held request writes one more intent, and the sweeper later replays the earlier one, a no-op. Two node tests take about 4.5 s each in real time, since they hold a writer past a 4 s grace.
+    - **The cost.** Nothing for a request that is not held up: one `Instant`, one wall-clock read and one comparison. A held request writes one more intent, and the sweeper later replays the earlier one, a no-op. Four node tests hold a writer in real time on a backend with a 4 s grace: the two window tests take about 4.5 s each, the second-round test about 6.7 s (held about 2.2 s, then about 4.2 s), and the control under a second. Run in parallel, they add about 7 s to the `backends::cassandra` lib tests.
     - **Measure:** the `intent_restamps` counter in the CI reports. Any value above 0 there means a test process froze for 20 s.
     - **Sam's log.** This refines Sam's SW6 = IW18 and does not supersede it: the stamp stays after V3 and immediately before I1. Sam can add a pointer to this entry in his own log; no one edits it for him.
 - **AI involvement:**
@@ -45,11 +45,24 @@
         - It took the recommendation from the validator's report, checked it against the sweeper's grace logic, SW8, SW9, SW11, SW22 and SW28, ADR-aacruzgon-0090, the design document, the walkthrough and the roadmap, and FHIR http.html for R4, R4B and R5, and found no conflict.
         - It chose a loop over a single re-stamp, and a counter and a `warn`.
         - It wrote the change, the `AfterStamp` checkpoint and the tests: two node tests that hold a writer past a 4 s grace in real time, one per window, then crash it after its compare-and-swap; a control held briefly; and a unit test of the check's bounds.
+        - After the independent audit of #123 and its re-audit, it added the following, each in its own commit:
+            - F1: `connect_timeout_ms: 1_000` on the short-grace test backend, so it passes #121's check that the request timeout be longer than the connect timeout;
+            - F2: the time held as the larger of the monotonic and the wall-clock age (`Stamp`, `held_since`), with the `held_since` unit test `the_time_held_counts_a_suspend_the_monotonic_clock_misses`;
+            - R1-1: the `Stamp::held` unit test `a_stamp_held_by_the_wall_clock_alone_needs_a_fresh_intent`;
+            - F3: the reason the loop needs no cap;
+            - F4: the `AfterFreshIntent` checkpoint and the second-round node test `a_writer_held_again_after_its_fresh_intent_writes_another`;
+            - F5: the 5xx citation for all three versions, under update and create.
     - **What the human changed:** Alan approved the recommendation on 2026-11-26 ("the open items lets go with the recommendations as long as they follow what would be appropriate for the specs"); he had not yet confirmed this entry's text when it was drafted. Alan confirmed the entry on 2026-11-26 ('i also confirm all the ADRS').
     - **What was verified, and how:**
         - On a 5.0.9 node of `docker/cassandra/docker-compose.yml`, both window tests fail with the check mutated to `false`: the poll after the crash shows `current=0 done=0`. The control passes there.
         - With the fix, all three pass, and so do the `backends::cassandra` lib tests and `cassandra_tests`.
-        - `cargo fmt`, `cargo check` for R4B, and workspace clippy pass with 0 warnings.
+        - The mutants, each run against the tests that should kill it:
+            - `while` changed to `if`: only the second-round node test fails (the poll after the crash shows `current=0 done=0`), and the other node tests pass;
+            - `held_since` returning the monotonic time only: its unit test fails (`left: 5ms right: 25s`);
+            - `Stamp::held` passing a zero wall age: the `Stamp::held` unit test fails.
+        - With #121's `config.rs` swapped in, all four node tests pass.
+        - After the audit fixes, on the same node: the `backends::cassandra` lib tests pass (333, 2 ignored, as on `main`) and so do `cassandra_tests` (179). `cargo fmt`, `cargo check` for R4B (lib and test targets), and workspace clippy with CI's flags pass with 0 warnings.
+        - The independent audit and its re-audit reproduced the window tests, the mutants and the #121 interaction on their own node.
 - **Links:**
     - CodeRabbit's C6 on #107;
     - ADR-sam-michaels-0006 (SW4, SW6 = IW18, SW8, SW9, SW11, SW22, SW28);

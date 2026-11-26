@@ -3635,14 +3635,11 @@ mod node_tests {
     }
 
     /// SW19 across instances: B retires a SearchParameter that A holds, A reloads, then A follows a
-    /// row it read before B's update, as a replay that began before it would. The reload recorded the
-    /// retired version, so the stale row is refused, as a fresh read of it (the control) is; the next
-    /// reload agrees.
-    #[tokio::test]
-    async fn a_stale_replay_read_does_not_bring_back_a_retired_searchparameter() {
-        let Some((a, t, tenant, _)) = start("sweeper-sp-stale").await else {
-            return;
-        };
+    /// row as a replay does: the one it read before B's update (`stale`), or, as the control, a fresh
+    /// read. Returns whether the definition is in A's registry after the follow, and after A's next
+    /// reload.
+    async fn follow_after_a_reload_of_a_retirement(stale: bool) -> Option<(bool, bool)> {
+        let (a, t, tenant, _) = start("sweeper-sp-stale").await?;
         let b = harness::backend().await.expect("instance B");
         let url = format!("http://example.org/SearchParameter/{t}");
         let v1 = a
@@ -3658,7 +3655,7 @@ mod node_tests {
             expression_of(&a, &tenant, &url).as_deref(),
             Some("Patient.active")
         );
-        let stale = a
+        let before = a
             .serial_read_resource_row(&t, "SearchParameter", "sp")
             .await
             .unwrap()
@@ -3669,18 +3666,35 @@ mod node_tests {
         assert_eq!(expression_of(&b, &tenant, &url), None);
         a.load_stored_search_parameters(&t).await.unwrap();
         assert_eq!(expression_of(&a, &tenant, &url), None, "after A's reload");
-
-        let fresh = a
-            .serial_read_resource_row(&t, "SearchParameter", "sp")
-            .await
-            .unwrap()
-            .unwrap();
-        a.follow_stored_search_parameter(&t, "sp", Some(&fresh));
-        assert_eq!(expression_of(&a, &tenant, &url), None, "a fresh read");
-        a.follow_stored_search_parameter(&t, "sp", Some(&stale));
-        assert_eq!(expression_of(&a, &tenant, &url), None, "the stale read");
+        let row = if stale {
+            before
+        } else {
+            a.serial_read_resource_row(&t, "SearchParameter", "sp")
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        a.follow_stored_search_parameter(&t, "sp", Some(&row));
+        let followed = expression_of(&a, &tenant, &url).is_some();
         a.load_stored_search_parameters(&t).await.unwrap();
-        assert_eq!(expression_of(&a, &tenant, &url), None, "the next reload");
+        Some((followed, expression_of(&a, &tenant, &url).is_some()))
+    }
+
+    /// SW19 across instances: a replay's row read before another instance retired the
+    /// SearchParameter does not bring it back into this instance's registry after this instance's
+    /// reload saw the retirement; neither does a fresh read (the control). The next reload agrees.
+    #[tokio::test]
+    async fn a_stale_replay_read_does_not_bring_back_a_retired_searchparameter() {
+        let Some(stale) = follow_after_a_reload_of_a_retirement(true).await else {
+            return;
+        };
+        let control = follow_after_a_reload_of_a_retirement(false).await.unwrap();
+        // Each is (in force after the follow, in force after the next reload).
+        assert_eq!(
+            (stale, control),
+            ((false, false), (false, false)),
+            "(the stale read, a fresh read)"
+        );
     }
 
     /// N9: a replayed delete writes its marker, and a revive only inserts (SW16).

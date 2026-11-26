@@ -1,4 +1,4 @@
-# ADR-aacruzgon-0096: A full repair also deletes the `resources_by_type` row at each found row's `last_updated` (amends ADR-sam-michaels-0006 RV1 and ADR-aacruzgon-0017)
+# ADR-aacruzgon-0096: A full repair also deletes the older versions' `resources_by_type` rows, at each found row's `last_updated` and at each version's read from `resource_versions` (amends ADR-sam-michaels-0006 RV1 and ADR-aacruzgon-0017)
 
 - **Date:** 2026-11-26
 - **Status:** accepted (Alan confirmed the entry on 2026-11-26)
@@ -20,42 +20,60 @@
     - **ADR-sam-michaels-0008** (Step 5's implementation choices, on #109's branch `cassandra/step5-crash-tests`, not yet on `main`). Its pull request 7 item 1 sets the partial plan's rule ("A found row whose key K(current) still produces moves to `lu(R1)`"), and its alternatives reject "Partial repair, always keep `ResourcesByType`" because "it writes a second type row when only a token row was found". This entry applies the same concern to the full plan, which writes the type row always: it keeps the insert and adds the matching delete. It changes no item of 0008, and the partial rule stays as 0008 sets it.
     - **Why it is a decision.** It changes what a repair writes, a write-path change, and it deviates from RV1 as written. RV1 is in Sam's log, which only Sam edits (CLAUDE.md, "Decision records"). Alan co-authored PR #106, so the amendment is recorded here.
 - **Decision:**
-    - **What a full plan writes.** A full repair plan (at most 64 keys in K(current)) still inserts all of K(current) at `lu(R1)`. It also deletes the `resources_by_type` row at the `last_updated` of each found row that has one, once per distinct `last_updated`.
+    - **What a full plan writes.** A full repair plan (at most 64 keys in K(current)) still inserts all of K(current) at `lu(R1)`. It also deletes the `resources_by_type` row each older version may have left, each `last_updated` once:
+        - at the `last_updated` of each found row that has one;
+        - at the `last_updated` of each version from the lowest found tag up to R1, at most `MAX_TYPE_ROW_VERSIONS` (8) below R1, read from `resource_versions`.
+    - **The read.** It is ADR-aacruzgon-0097's version read, widened to one single-partition range read at `LOCAL_QUORUM`: `SELECT version_id, last_updated FROM resource_versions WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id >= ? AND version_id <= ?`, from the lower bound above up to R1's version. R1's row must be in it (0097). A partial plan reads only R1's row.
+    - **Which versions add a delete.** A version whose tag a found row with a `last_updated` carries adds none, since an index row tagged V is always at `lu(V)`, so that row already names V's type row. The others add one each: a found date row, whose key has no `last_updated` (the audit's G1), names none, and a version between the found tag and R1 is named by no found row (G2, two unfinished writes in a row).
+    - **The budget.** Admission reserves one delete for each such version, so the 512-row budget bounds what the repair writes, whatever the read returns.
+    - **Beyond the cap.** A version more than 8 below R1 adds no delete unless a found row names it. Its type row can be stale only if more than 8 consecutive writes each left their type-row batch unfinished. Each of those writes kept its intent (the request path keeps it when the index step fails), so the sweeper's replay of version V+1 deletes V's type row at `ts(V+1)` (SW11; ADR-aacruzgon-0094 for a superseded replay). Until then, or if an intent expired after 24 h, `count` reads one too many for that resource, the same exposure as a resurrected type row (`cassandra-discussion.md:370`); the next search that finds that row repairs it, since its found `last_updated` names it.
     - **Why it is safe.**
-        - A found row is tagged below R1, so the type row at its `last_updated` belongs to an older version. If it exists it is stale; if it doesn't, the delete is a tombstone.
+        - Every deleted `last_updated` is a version below R1's, or a found row's, which is tagged below R1. So the type row there belongs to an older version. If it exists it is stale; if it doesn't, the delete is a tombstone.
         - `index_delta` compares rows by row identity (IW7). So a found `last_updated` equal to R1's is upserted, not deleted, and the tie that ADR-aacruzgon-0017 guards against cannot arise.
-        - The insert and the delete share the `(tenant, type)` partition, so they travel in one batch, as step 5 requires.
+        - The insert and the deletes share the `(tenant, type)` partition, so they travel in one batch at R1's timestamp, as step 5 requires. That timestamp is above every older version's, so each delete wins over the row it names.
     - **Partial plans** (more than 64 keys) are unchanged. They write no type row unless one was found, so they never add one.
-    - **The new RV1 text:** "Re-run step 5 for the current version through the shared writer: insert all of K(current), delete the stale rows found, and, in a full repair, delete the `resources_by_type` row at each found row's `last_updated` (ADR-aacruzgon-0096)."
+    - **The new RV1 text:** "Re-run step 5 for the current version through the shared writer: insert all of K(current), delete the stale rows found, and, in a full repair, delete the `resources_by_type` row at each found row's `last_updated` and at the `last_updated` of each version from the lowest found tag up to R1, at most 8 below it, read from `resource_versions` (ADR-aacruzgon-0096)."
 - **Alternatives considered:**
     - **Write the type row only when the old type row was found (CodeRabbit's rule):** lost.
         - It fixes the case: `count` 1 → 1, and the version 1 type row stays at tag 1 for the sweeper or a type search's repair.
         - But a full repair then no longer restores a missing type row: after an unfinished revive found through a resurrected token row, `count` stays 0 until the sweeper.
         - Measured on `0b3af4577`, 4 tests failed as written, against 2 for the chosen rule.
     - **Keep RV1 as written:** lost. `count` is wrong after a repair that a search triggered, and the design's step 5 invariant fails on one node.
+    - **Only the found rows' `last_updated` (this entry's first rule, as Alan confirmed it):** lost after the independent audit of #124. It misses a repair started only from date rows (G1: `count` 1 → 2, type rows tagged `[2, 1]`), and an older type row at a `last_updated` no found row has (G2, after two unfinished writes: `count` 1 → 2, `[3, 2]`). A date search's found set is only date rows, so every repair it starts was G1's case.
+    - **An uncapped range:** lost. The read and the reserved deletes would grow with the resource's history (a resource with thousands of versions and one stale row of version 1). With the cap, the read is at most 9 rows and the reservation at most 8 deletes.
+    - **A second read only when needed** (for date-only found sets): lost. The range read replaces 0097's point read, so it costs no extra statement in any case.
     - **Leave the type row to the sweeper in every repair:** lost. It is CodeRabbit's rule plus giving up the found-type-row move, which is the case `repair_heals_a_crashed_update_at_the_first_search` pins.
 - **Consequences:**
-    - **Built** in `fix(cassandra): a full repair also deletes the type row at each found row's last_updated`, on `fix/cassandra-repair-type-and-version-rows`:
+    - **Built** in `fix(cassandra): a full repair also deletes the type row at each found row's last_updated` and widened in `fix(cassandra): a full repair finds the old type rows from a range read of resource_versions`, on `fix/cassandra-repair-type-and-version-rows`:
         - the case gives `Repaired { full: true, rows_inserted 5, rows_deleted 2 }`, with `count` 1 → 1 and one type row, at tag 2; the control gives `rows_deleted 1` and the same type row;
         - the new tests: `a_full_repair_from_a_token_row_deletes_the_old_type_row`, `a_found_row_at_r1s_last_updated_never_deletes_the_current_type_row`, `a_partial_repair_from_a_token_row_writes_no_type_row` (pure) and `a_full_repair_from_a_token_row_moves_the_type_row_and_count_stays` (node, with its control). With the rule removed, those that test it fail, and the limit tests pass.
+    - **The audit's cases, built** (5.0.9 single node):
+        - `a_full_repair_from_a_date_row_only_moves_the_type_row`: only version 1's date row found, `count` 1 and type rows `[2]`; on the found-rows rule, `count` 2 and `[2, 1]`. Its control also finds version 1's `gender` row.
+        - `a_full_repair_deletes_a_type_row_no_found_row_names`: version 2's type batch applied and its token batch not, version 3 crashed after its version row, version 1's `gender` row found: `count` 1 and `[3]`; on the found-rows rule, `count` 2 and `[3, 2]`. Its control finds version 2's type row itself.
+        - `a_full_plan_reads_back_to_the_lowest_found_tag_and_reserves_the_unnamed_versions` and `the_version_read_reaches_back_at_most_the_cap` (pure) pin the range and the cap; the cap test fails with the cap removed.
     - **Tests changed.** Two pure tests plan from made-up token rows at `lu(1)`, so under RV1 each full plan was one insert plus its found rows: `a_repair_over_the_row_limit_is_skipped_and_a_later_smaller_one_is_admitted` and `once_32_repairs_are_admitted_later_entries_still_run_the_checks_before_budget`. Each plan now also deletes the type row at `lu(1)`, so the fixtures are resized to keep each repair where it meant to land against the 512-row limit: the sizes became `[501, Budget, 3, Budget, 8, Budget]` and 32 × 3.
-    - **Cost:** at most one more delete per distinct found `last_updated`, counted in the 512-row budget, and one more tombstone where the old type row had already moved.
-    - **Also fixed by the same rule, not measured:** the unfinished-revive case (`count` 0 → 1), and ADR-aacruzgon-0081's multi-version case (versions 1, 3 and 5 left by unfinished 2 and 4), where a found row of version 1 or 3 deletes that version's stranded type row. Both follow from the same code path.
+    - **More tests changed by the range read.** `repair_retags_a_date_row_the_current_version_still_produces` found a date row tagged 1, so on the found-rows rule its repair deleted nothing; it now deletes the type row at version 1's `last_updated`, a tombstone, since the update had moved it, and expects `rows_deleted` 1. The two resized budget tests are unchanged by the range read: their found token rows name version 1, the only version below R1.
+    - **Cost:**
+        - no extra statement: the range read replaces 0097's point read, one per admitted repair, at most 32 per search, 4 in flight, inside the phase deadline; it returns at most 9 rows, from one partition of `resource_versions`, which holds no tombstones (G39);
+        - at most one more delete per distinct found `last_updated`, plus at most 8 for the versions read, each reserved in the 512-row budget;
+        - one more tombstone where an old type row had already moved, which is the usual case (a finished write moves its type row).
+    - **Also fixed by the same rule, not measured:** the unfinished-revive case (`count` 0 → 1), and ADR-aacruzgon-0081's multi-version case (versions 1, 3 and 5 left by unfinished 2 and 4), where the range from a found row of version 1 or 3 deletes those versions' stranded type rows. Both follow from the same code path.
     - **Same commit:**
-        - `cassandra-discussion.md:360` and `development-roadmap.md:441` (Step 5's repair bullet) say a full repair also deletes the type row at each found row's `last_updated`;
+        - `cassandra-discussion.md:360` and `development-roadmap.md:441` (Step 5's repair bullet) say a full repair also deletes the older versions' type rows, found as the Decision says;
         - `schema/walkthrough.md`, 5.1 step 4, says the same;
         - roadmap row 5.3's "Known open" note no longer lists this question;
-        - ADR-aacruzgon-0017's Status gets "amended by ADR-aacruzgon-0096 (a full repair also deletes the type row at each found row's `last_updated`)", with its index row to match.
+        - ADR-aacruzgon-0017's Status gets "amended by ADR-aacruzgon-0096 (a full repair also deletes the older versions' type rows)", with its index row to match.
     - **ADR-sam-michaels-0006 is not edited.** Sam can add a pointer to this entry in his own log.
 - **AI involvement:**
     - **Tools:** Claude Code (Opus 5.5), as the Rex worker `validate-106-findings`, with a web-fetch subagent for the FHIR pages.
     - **What the AI proposed:** CodeRabbit raised the case. The worker reproduced it, built and measured CodeRabbit's rule, then proposed and measured the chosen rule, built it on `main` with its tests, and drafted this entry.
-    - **What the human changed:** Alan approved the recommendation on 2026-11-26 ('the open items lets go with the recommendations as long as they follow what would be appropriate for the specs'); he had not yet confirmed this entry's text when it was drafted. Alan confirmed the entry on 2026-11-26 ('i also confirm all the ADRS').
+    - **What the human changed:** Alan approved the recommendation on 2026-11-26 ('the open items lets go with the recommendations as long as they follow what would be appropriate for the specs'); he had not yet confirmed this entry's text when it was drafted. Alan confirmed the entry on 2026-11-26 ('i also confirm all the ADRS'). After Alan's confirmation, the independent audit's G1 and G2 (2026-11-26) changed how the old type rows are found, from the found rows' `last_updated` to a capped range read of `resource_versions`; the orchestrator applied it under Alan's approval of the recommendations, and Alan is told of the change.
     - **Verified:**
         - L1 node tests on a 5.0.9 single node: the case and its control, each failing with the rule removed and passing with it, and the full `backends::cassandra` lib suite and `cassandra_tests` (logs in the worker's run folder, `logs-f5/`);
-        - code read: `plan_from`, `RepairPlan::delta` and `index_delta`'s row identity;
+        - the audit's G1 and G2 node cases and their controls, failing on the found-rows rule and passing with the range read, and the cap test failing with the cap removed (`logs-f6/`);
+        - code read: `plan_from`, `RepairPlan::delta` and `index_delta`'s row identity; `resource_versions`' key, `((tenant_id, resource_type, id), version_id)` (`schema.cql`), which allows the range on its clustering column;
         - FHIR `bundle-definitions.html` (`Bundle.total`) and `search.html` (`_total`, entry uniqueness) in R4, R4B and R5.
 - **Links:**
-    - **PR:** #106, CodeRabbit thread `PRRT_kwDOVAIJX868UFkt`; this change's pull request, branch `fix/cassandra-repair-type-and-version-rows`.
-    - **ADRs:** ADR-sam-michaels-0006 RV1; ADR-sam-michaels-0008 (pull request 7, item 1 and the rejected "always keep `ResourcesByType`"); ADR-aacruzgon-0017; ADR-aacruzgon-0081, decision 2.
+    - **PR:** #106, CodeRabbit thread `PRRT_kwDOVAIJX868UFkt`; #124, branch `fix/cassandra-repair-type-and-version-rows`, and its independent audit (G1, G2).
+    - **ADRs:** ADR-sam-michaels-0006 RV1 and SW11; ADR-aacruzgon-0094; ADR-aacruzgon-0097 (the read); ADR-sam-michaels-0008 (pull request 7, item 1 and the rejected "always keep `ResourcesByType`"); ADR-aacruzgon-0017; ADR-aacruzgon-0081, decision 2.
     - **Docs:** `cassandra-discussion.md:273` and `:360`; `development-roadmap.md:441` and row 5.3; `schema/walkthrough.md`, 5.1 step 4.

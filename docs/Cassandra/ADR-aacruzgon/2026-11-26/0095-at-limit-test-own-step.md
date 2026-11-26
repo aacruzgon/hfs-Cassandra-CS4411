@@ -62,9 +62,9 @@
         - `actionlint` (the same 3 `runner.workspace` findings as on `main`) and `zizmor` (no findings) on both workflows.
 
       An independent audit of PR #119, by a reviewer the author did not brief, recounted the CI record (8 of 9 and 17 of 17, and the second FHIR versions failure) and found nothing blocking.
-    - **What the human changed:** Alan's delegation of 2026-11-25 ('go with any recommendations when it comes to make the decisions so you can merge the PR') was given for PRs #107, #106 and #109. The orchestrator applied it to this pull request on 2026-11-26, because #106's required check cannot pass without it. Alan has not yet read this entry, and may amend or supersede it in a later entry.
+    - **What the human changed:** Alan's delegation of 2026-11-25 ('go with any recommendations when it comes to make the decisions so you can merge the PR') was given for PRs #107, #106 and #109. The orchestrator applied it to this pull request on 2026-11-26, because #106's required check fails on sam-7900x without it. Alan has not yet read this entry, and may amend or supersede it in a later entry.
 - **Links:**
-    - PR #119 (`ci/cassandra-at-limit-headroom`), with commits `0204d817b` (the test prints its batch time), `746f78a0a` (the required job's new step), `32dac4c3f` (the FHIR versions skip), `6a6fff10b` (the `--skip` guard in both workflows) and `00acc2555` (the report section written on a failed test too);
+    - PR #119 (`ci/cassandra-at-limit-headroom`), with commits `0204d817b` (the test prints its batch time), `746f78a0a` (the required job's new step), `32dac4c3f` (the FHIR versions skip), `6a6fff10b` (the `--skip` guard in both workflows), `00acc2555` (the report section written on a failed test too) and `8c0d4ea70` (the guard keeps cargo's errors and fails on a failed listing);
     - amends [ADR-aacruzgon-0054](../2026-11-06/0054-required-job-lib-step.md) (the `--lib` step's command);
     - see [ADR-aacruzgon-0058](../2026-11-06/0058-cql-audit-check.md) (the audit check on a failed native batch) and [ADR-aacruzgon-0089](../2026-11-25/0089-index-unit-split-at-statement-limit.md) (the test);
     - runs 45794643261, 45723640399, 45738993055, 45783764882, 45804008357 and 45801538029;

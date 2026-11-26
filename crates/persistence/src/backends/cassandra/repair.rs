@@ -2694,6 +2694,88 @@ mod tests {
         );
     }
 
+    /// CodeRabbit on #124 (`PRRT_kwDOVAIJX868lMDw`): a later search retries a
+    /// repair skipped as `Budget`, but a plan above 512 rows with its
+    /// reservations never fits, even alone at the head of a fresh queue. R1 at
+    /// version 9, K(current) = {type row}, 511 distinct found date rows tagged
+    /// 1: one insert and 511 deletes make 512, and the 8 reserved type-row
+    /// deletes (versions 1 to 8) make 520. The control, 503 date rows, makes
+    /// 504 + 8 = 512 and fits.
+    #[test]
+    fn a_plan_over_the_row_budget_with_its_reservations_never_fits() {
+        let rbt = IndexKey::ResourcesByType;
+        let row9 = r1(9, lu(9), std::slice::from_ref(&rbt));
+        let dates = |n: usize| -> Vec<StaleIndexRow> {
+            (0..n).map(|i| s(date(&format!("d{i}")), None, 1)).collect()
+        };
+        let found = dates(511);
+        let below: Vec<&StaleIndexRow> = found.iter().collect();
+        let plan = plan_below(&row9, &below).unwrap();
+        assert!(plan.full);
+        assert_eq!(delta_rows(&plan.delta(&row9)), 512);
+        assert_eq!(plan.type_row_versions.len(), 8);
+        assert_eq!(plan.rows(&row9), 520);
+        assert_eq!(
+            admitted_sizes(&[queued("q", Some(row9.clone()), found)]),
+            [Err(SkipReason::Budget)]
+        );
+        assert_eq!(
+            admitted_sizes(&[queued("q", Some(row9), dates(503))]),
+            [Ok(MAX_REPAIR_ROWS_PER_SEARCH)]
+        );
+    }
+
+    /// CodeRabbit on #124 (`PRRT_kwDOVAIJX868lMD0`): 8 caps the type-row
+    /// deletes the version read adds, not a repair's type-row deletes. A found
+    /// row tagged below the versions read adds its own, which the 512-row
+    /// budget counts with the rest. Each case is (type-row deletes, reserved,
+    /// `reads_from`), once the range read returns every version it reads.
+    #[test]
+    fn found_rows_below_the_versions_read_add_type_row_deletes() {
+        let rbt = IndexKey::ResourcesByType;
+        let type_deletes = |r1_version: i32, found: &[StaleIndexRow]| {
+            let row = r1(
+                r1_version,
+                lu(r1_version.into()),
+                std::slice::from_ref(&rbt),
+            );
+            let below: Vec<&StaleIndexRow> = found.iter().collect();
+            let plan = plan_below(&row, &below).unwrap();
+            let read: Vec<DateTime<Utc>> = plan
+                .type_row_versions
+                .iter()
+                .map(|v| lu((*v).into()))
+                .collect();
+            let delta = plan.delta_with(&row, &read);
+            let (_, deletes) = flat(&delta);
+            let count = deletes.iter().filter(|(k, _)| *k == rbt).count();
+            assert!(count <= plan.rows(&row), "the budget counts every delete");
+            (count, plan.type_row_versions.len(), plan.reads_from)
+        };
+        // R1 at 10, a found type row of version 1: below the versions read (2 to 9).
+        assert_eq!(
+            type_deletes(10, &[s(rbt.clone(), Some(lu(1)), 1)]),
+            (9, 8, 2)
+        );
+        // R1 at 12, found token rows of versions 1, 2 and 3; the read starts at 4.
+        assert_eq!(
+            type_deletes(
+                12,
+                &[
+                    s(token("s", "1"), Some(lu(1)), 1),
+                    s(token("s", "2"), Some(lu(2)), 2),
+                    s(token("s", "3"), Some(lu(3)), 3),
+                ],
+            ),
+            (11, 8, 4)
+        );
+        // Control: a found row inside the versions read replaces that version's reservation.
+        assert_eq!(
+            type_deletes(10, &[s(rbt.clone(), Some(lu(5)), 5)]),
+            (8, 7, 2)
+        );
+    }
+
     #[test]
     fn once_32_repairs_are_admitted_later_entries_still_run_the_checks_before_budget() {
         let rbt = IndexKey::ResourcesByType;

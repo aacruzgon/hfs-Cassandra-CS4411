@@ -6857,6 +6857,214 @@ mod node_tests {
         assert_consistent(&check(&backend, t).await);
     }
 
+    /// The `(code, id, version_id)` rows of one partition of an Observation
+    /// `code` token table: `tenant_id`, `resource_type` and `param` plus
+    /// `keys`, the rest of the table's partition key, so no read needs
+    /// `ALLOW FILTERING` (`schema.cql`, the statement rules).
+    async fn code_token_rows(
+        backend: &CassandraBackend,
+        t: &str,
+        table: &str,
+        keys: &[(&str, &str)],
+    ) -> Vec<(String, String, i32)> {
+        let mut cql = format!(
+            "SELECT code, id, version_id FROM {table} \
+             WHERE tenant_id = ? AND resource_type = ? AND param = ?"
+        );
+        let mut values = vec![
+            Value::from(t),
+            Value::from("Observation"),
+            Value::from("code"),
+        ];
+        for (column, value) in keys {
+            cql.push_str(&format!(" AND {column} = ?"));
+            values.push(Value::from(*value));
+        }
+        let mut rows: Vec<(String, String, i32)> = backend
+            .session
+            .rows(&cql, values, StatementKind::Read)
+            .await
+            .expect("token rows")
+            .iter()
+            .map(|row| {
+                (
+                    row.get_r_by_name("code").unwrap(),
+                    row.get_r_by_name("id").unwrap(),
+                    row.get_r_by_name("version_id").unwrap(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// `token_system_index`'s `(code, http://loinc.org)` partition.
+    async fn loinc_system_rows(backend: &CassandraBackend, t: &str) -> Vec<(String, String, i32)> {
+        code_token_rows(backend, t, "token_system_index", &[("system", LOINC)]).await
+    }
+
+    /// `token_code_index`'s partition for `code`, then
+    /// `token_system_code_index`'s for `(http://loinc.org, code)`.
+    async fn loinc_code_rows(
+        backend: &CassandraBackend,
+        t: &str,
+        code: &str,
+    ) -> [Vec<(String, String, i32)>; 2] {
+        [
+            code_token_rows(backend, t, "token_code_index", &[("code", code)]).await,
+            code_token_rows(
+                backend,
+                t,
+                "token_system_code_index",
+                &[("system", LOINC), ("code", code)],
+            )
+            .await,
+        ]
+    }
+
+    const LOINC: &str = "http://loinc.org";
+
+    /// ADR-aacruzgon-0091 on a node: a Coding with a system and an empty code
+    /// writes its `token_system_index` row with code `''`, and no code row;
+    /// an update to a real code deletes that row and writes the code's rows;
+    /// a delete removes them. The REST layer removes `"code": ""` before a
+    /// write (`drop_empty_elements`), so this goes through the storage API.
+    #[tokio::test]
+    async fn a_system_with_an_empty_code_keeps_its_system_row() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("system-only");
+        let t = tenant.tenant_id().as_str();
+        let observation = |code: &str| {
+            json!({"resourceType":"Observation","id":"o","status":"final",
+                   "code":{"coding":[{"system":LOINC,"code":code}]}})
+        };
+        let row = |code: &str, v: i32| vec![(code.to_string(), "o".to_string(), v)];
+        let none = || [vec![], vec![]];
+
+        let created = backend
+            .create(&tenant, "Observation", observation(""), version())
+            .await
+            .unwrap();
+        assert_eq!(loinc_system_rows(&backend, t).await, row("", 1), "v1");
+        for code in ["", "8480-6"] {
+            assert_eq!(
+                loinc_code_rows(&backend, t, code).await,
+                none(),
+                "v1 {code:?}"
+            );
+        }
+        assert_consistent(&check(&backend, t).await);
+
+        let updated = backend
+            .update(&tenant, &created, observation("8480-6"))
+            .await
+            .unwrap();
+        assert_eq!(loinc_system_rows(&backend, t).await, row("8480-6", 2), "v2");
+        assert_eq!(
+            loinc_code_rows(&backend, t, "8480-6").await,
+            [row("8480-6", 2), row("8480-6", 2)]
+        );
+        assert_eq!(loinc_code_rows(&backend, t, "").await, none(), "v2");
+        assert_consistent(&check(&backend, t).await);
+
+        backend
+            .update(&tenant, &updated, observation(""))
+            .await
+            .unwrap();
+        assert_eq!(loinc_system_rows(&backend, t).await, row("", 3), "v3");
+        for code in ["", "8480-6"] {
+            assert_eq!(
+                loinc_code_rows(&backend, t, code).await,
+                none(),
+                "v3 {code:?}"
+            );
+        }
+        assert_consistent(&check(&backend, t).await);
+
+        backend.delete(&tenant, "Observation", "o").await.unwrap();
+        assert_eq!(loinc_system_rows(&backend, t).await, vec![], "deleted");
+        assert_consistent(&check(&backend, t).await);
+    }
+
+    /// ADR-aacruzgon-0091 next to a real code of the same system: a
+    /// CodeableConcept with codings `''` and `8480-6` of LOINC writes both
+    /// `token_system_index` rows into the one `(code, LOINC)` partition, told
+    /// apart by `code`; when only `8480-6` is left, the `''` row is deleted
+    /// and the `8480-6` rows move to the new version.
+    #[tokio::test]
+    async fn an_empty_code_beside_a_real_code_of_its_system_shares_its_partition() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("system-only-mixed");
+        let t = tenant.tenant_id().as_str();
+        let observation = |codes: &[&str]| {
+            let coding: Vec<_> = codes
+                .iter()
+                .map(|code| json!({"system": LOINC, "code": code}))
+                .collect();
+            json!({"resourceType":"Observation","id":"m","status":"final",
+                   "code":{"coding":coding}})
+        };
+        let rows = |codes: &[&str], v: i32| -> Vec<(String, String, i32)> {
+            codes
+                .iter()
+                .map(|code| (code.to_string(), "m".to_string(), v))
+                .collect()
+        };
+
+        let created = backend
+            .create(
+                &tenant,
+                "Observation",
+                observation(&["", "8480-6"]),
+                version(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            loinc_system_rows(&backend, t).await,
+            rows(&["", "8480-6"], 1),
+            "v1: both rows, in one partition"
+        );
+        assert_eq!(
+            loinc_code_rows(&backend, t, "8480-6").await,
+            [rows(&["8480-6"], 1), rows(&["8480-6"], 1)]
+        );
+        assert_eq!(loinc_code_rows(&backend, t, "").await, [vec![], vec![]]);
+        assert_consistent(&check(&backend, t).await);
+
+        let updated = backend
+            .update(&tenant, &created, observation(&["8480-6"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            loinc_system_rows(&backend, t).await,
+            rows(&["8480-6"], 2),
+            "v2: the '' row is deleted"
+        );
+        assert_eq!(
+            loinc_code_rows(&backend, t, "8480-6").await,
+            [rows(&["8480-6"], 2), rows(&["8480-6"], 2)]
+        );
+        assert_consistent(&check(&backend, t).await);
+
+        backend
+            .update(&tenant, &updated, observation(&["8480-6", ""]))
+            .await
+            .unwrap();
+        assert_eq!(
+            loinc_system_rows(&backend, t).await,
+            rows(&["", "8480-6"], 3),
+            "v3: both again, in either order"
+        );
+        assert_consistent(&check(&backend, t).await);
+    }
+
     /// IW9 B (gate): when one index batch fails every try, only its units are
     /// missing; the old `resources_by_type` row is kept, the other batches are
     /// written, and the intent stays for the sweeper.

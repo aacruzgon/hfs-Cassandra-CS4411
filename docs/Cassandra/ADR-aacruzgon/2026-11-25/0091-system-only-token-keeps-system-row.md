@@ -22,7 +22,7 @@
     - A token value with an empty code and a real system (not `IMPLICIT`, not `''`) gets its `TokenSystem` key, with `code ''`, and no `TokenCode` or `TokenSystemCode` key. No `code`, `system|code` or `|code` form can match an empty code, so those rows would never be read.
     - A token with an empty code and no real system is still dropped, as P5 says (display-only text).
     - Every other IW2 and P5 drop stays.
-    - The code change is in `index_keys_from` (`index_keys.rs:449-451`): when `code` is empty, insert `IndexKey::TokenSystem { param, system, code }` if the system is real, then `continue`.
+    - The code change is in `index_keys_from` (`index_keys.rs:450-468`, PR #117): when `code` is empty, insert `IndexKey::TokenSystem { param, system, code }` if the system is real, then `continue`.
     - It lands in its own Cassandra pull request.
     - Values reach it only once the shared converter emits them (HeliosSoftware/hfs#2965). Until then it changes no write made through REST. Every REST write path removes an empty `code` before extraction (`drop_empty_elements`, HeliosSoftware/hfs#2554, in the fork since the sync of 2026-11-18; `crates/rest/src/validation.rs:212-214`, `crates/persistence/src/core/patch.rs:157`). The one exception, `$meta-add`, adds only bare Codings to `meta.tag` and `meta.security`, and the converter skips those when their code is empty (`converters.rs:500`). Only a direct caller of the storage API can pass an empty code: a CodeableConcept coding with `"code": ""` (`converters.rs:509`), or a ContactPoint with system `phone` or `email` and `"value": ""` (`converters.rs:569-580`; on a Patient it gets two keys, `phone` and `telecom`). Each then gets its `TokenSystem` key, which the pipe form on ContactPoint that ADR-aacruzgon-0027 C4 serves (`telecom=phone|`) reads, as SQLite's `value_token_system = ?` does.
 - **Alternatives considered:**
@@ -37,7 +37,10 @@
         - A new unit test: a real system with an empty code gives exactly one `TokenSystem` key; the `IMPLICIT` marker or `''` with an empty code gives none.
         - A REST-level test once Step 6 serves `system|`.
     - Rows written before the change are not rewritten. Since the converter emits no such value yet, and REST removes an empty `code` before storing (HeliosSoftware/hfs#2554), there are none to fix, except a resource stored with `"code": ""`, or a ContactPoint with `"value": ""`, before the sync of 2026-11-18 or through the storage API, which a reload or its next REST write cleans (`crates/persistence/README.md`, "Keyspaces written before index writes").
-    - **Not tested so far:** a Coding with a system and no code. It has the same shape in the converter (`converters.rs:493` for a bare Coding, `:509` for a CodeableConcept's coding, which emits one whose `code` is `""`) and in `index_keys_from`, but no run covered it. The pull request's tests must.
+    - **What PR #117's tests cover:** a CodeableConcept coding with a system and `"code": ""`, through the storage API. The unit test is `an_empty_code_keeps_only_a_real_systems_row` (`index_keys.rs`). The node tests are `a_system_with_an_empty_code_keeps_its_system_row` and `an_empty_code_beside_a_real_code_of_its_system_shares_its_partition` (`write.rs`).
+    - **Not tested end to end:** a Coding or Identifier with a system and no `code` or `value` key. It cannot reach `index_keys_from` until HeliosSoftware/hfs#2965 fixes the shared converter.
+        - That converter half was observed on SQLite through REST, in R4, R4B and R5 (`validate-116-findings`, D1): `code=http://loinc.org|` misses a coding stored as `{"system": "http://loinc.org"}`.
+        - That was one independent run, not confirmed by a second.
     - **Design documents.** `cassandra-discussion.md:188` and `walkthrough.md:959` change in the same commit as this entry.
 - **AI involvement:** Claude Code (Claude Opus 5.5), in a validation worker run by Alan.
     - **The finding and its causes.** A spec-check worker reported the gap (its M1), naming the converter and IW2. An independent validation worker reproduced it from the claim, on SQLite through REST and as Cassandra rows (R4, R4B, R5), and on upstream `fb7d12ed5`. It separated the two causes with two throwaway builds, and proposed this rule.
@@ -48,7 +51,7 @@
         - the rows on a 5.0.9 node;
         - that the existing test pins the old rule (read, not run).
     - **Not verified:** a Coding with a system and no code; a REST search on the new row (search is 501 until Step 6).
-    - **What the human changed:** Alan approved the draft as written on 2026-11-25. Alan approved the audit's corrections on 2026-11-25 (D1/F7 and E3 for 0091).
+    - **What the human changed:** Alan approved the draft as written on 2026-11-25. Alan approved the audit's corrections on 2026-11-25 (D1/F7 and E3 for 0091), and the PR #117 update of lines 25 and 40 (2026-11-25).
 - **Links:**
     - IW2's "Only invalid content…" was overtaken by the fork's sync of 2026-11-18 (HeliosSoftware/hfs#2554): through REST, no backend receives that content.
     - ADR-sam-michaels-0006, IW2 and Decision 9 (amended); ADR-aacruzgon-0027, G18/P5 (its premise corrected).

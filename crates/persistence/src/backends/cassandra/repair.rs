@@ -16,7 +16,11 @@
 //! - **Full replay (RV1).** When K(current) has at most
 //!   [`MAX_FULL_REPAIR_KEYS`] keys, repair inserts every key of it at R1's
 //!   `last_updated` and deletes every found row below R1 that K(current)
-//!   does not produce (compared by [`IndexKey::row_at`], IW7).
+//!   does not produce (compared by [`IndexKey::row_at`], IW7). It also
+//!   deletes the `resources_by_type` row at each found row's `last_updated`,
+//!   as the writer deletes the previous version's type row in the same batch
+//!   as it inserts the new one (step 5), so a repair started from a token
+//!   row never leaves two type rows (ADR-aacruzgon-0096).
 //! - **Partial replay (RV1).** Above that, repair only touches the rows the
 //!   search found. A found row whose key K(current) still produces *moves*
 //!   to R1's `last_updated`, as the update itself moves it: it is deleted at
@@ -219,7 +223,9 @@ pub(crate) enum RepairOutcome {
 struct RepairPlan {
     /// Keys inserted at R1's `last_updated`: K(current) whole, or only its keys equal to a found row's key.
     next: Vec<IndexKey>,
-    /// The found rows below R1's version, each at `delete_at()`.
+    /// The found rows below R1's version, each at `delete_at()`; in a full
+    /// plan, also the type row at each found row's `last_updated`
+    /// (ADR-aacruzgon-0096).
     previous: Vec<(IndexKey, DateTime<Utc>)>,
     full: bool,
 }
@@ -309,10 +315,28 @@ fn plan_from(below: &[&StaleIndexRow], current: Vec<IndexKey>) -> RepairPlan {
             .filter(|key| below.iter().any(|s| s.key == *key))
             .collect()
     };
-    let previous = below
+    let mut previous: Vec<(IndexKey, DateTime<Utc>)> = below
         .iter()
         .map(|s| (s.key.clone(), s.delete_at()))
         .collect();
+    // A full plan inserts R1's `resources_by_type` row, so it also deletes
+    // the type row each older version left, at each found row's
+    // `last_updated`, as the writer deletes V−1's type row in V's batch
+    // (step 5; ADR-aacruzgon-0096). Without it, a repair started from a
+    // token row leaves the old type row beside the new one, and `count`
+    // reads the resource twice. A found row is tagged below R1, so the type
+    // row at its `last_updated` is stale or absent (a tombstone); one at
+    // R1's own `last_updated` is the same row as the insert, which
+    // `index_delta` upserts only (IW7). A partial plan writes no type row it
+    // did not find, so it leaves the type rows as they are.
+    if full {
+        for at in below.iter().filter_map(|s| s.last_updated) {
+            let type_row = (IndexKey::ResourcesByType, at);
+            if !previous.contains(&type_row) {
+                previous.push(type_row);
+            }
+        }
+    }
     RepairPlan {
         next,
         previous,
@@ -906,6 +930,68 @@ mod tests {
             sorted(vec![(rbt, lu(1)), (token("t", "b"), lu(1))])
         );
         assert_eq!(plan.rows(&row), 5);
+    }
+
+    /// ADR-aacruzgon-0096: a full repair started from a token row also
+    /// deletes the type row at that row's `last_updated`, once per distinct
+    /// `last_updated`, so the resource keeps one `resources_by_type` row.
+    #[test]
+    fn a_full_repair_from_a_token_row_deletes_the_old_type_row() {
+        let rbt = IndexKey::ResourcesByType;
+        let row = r1(3, lu(3), &[rbt.clone(), token("t", "a")]);
+        let stale = [
+            s(token("t", "b"), Some(lu(1)), 1),
+            s(token("t", "c"), Some(lu(1)), 1),
+            s(token("t", "d"), Some(lu(2)), 2),
+            s(date("d"), None, 2),
+        ];
+        let plan = plan_repair(&row, &stale).unwrap();
+        assert!(plan.full);
+        let (inserts, deletes) = flat(&plan.delta(&row));
+        assert_eq!(
+            inserts,
+            sorted(vec![(rbt.clone(), lu(3)), (token("t", "a"), lu(3))])
+        );
+        assert_eq!(
+            deletes,
+            sorted(vec![
+                (rbt.clone(), lu(1)),
+                (rbt, lu(2)),
+                (token("t", "b"), lu(1)),
+                (token("t", "c"), lu(1)),
+                (token("t", "d"), lu(2)),
+                (date("d"), DateTime::UNIX_EPOCH),
+            ])
+        );
+        assert_eq!(plan.rows(&row), 8);
+    }
+
+    /// A found row tagged below R1 at R1's own `last_updated` names the
+    /// current type row: it is upserted, never deleted (IW7,
+    /// ADR-aacruzgon-0017).
+    #[test]
+    fn a_found_row_at_r1s_last_updated_never_deletes_the_current_type_row() {
+        let rbt = IndexKey::ResourcesByType;
+        let row = r1(2, lu(2), std::slice::from_ref(&rbt));
+        let stale = [s(token("t", "b"), Some(lu(2)), 1)];
+        let plan = plan_repair(&row, &stale).unwrap();
+        assert!(plan.full);
+        let (inserts, deletes) = flat(&plan.delta(&row));
+        assert_eq!(inserts, vec![(rbt, lu(2))]);
+        assert_eq!(deletes, vec![(token("t", "b"), lu(2))]);
+    }
+
+    /// A partial plan writes no type row it did not find, so it adds no
+    /// delete of one either.
+    #[test]
+    fn a_partial_repair_from_a_token_row_writes_no_type_row() {
+        let row = r1(2, lu(2), &keys_of_len(65));
+        let stale = [s(token("c", "00"), Some(lu(1)), 1)];
+        let plan = plan_repair(&row, &stale).unwrap();
+        assert!(!plan.full);
+        let (inserts, deletes) = flat(&plan.delta(&row));
+        assert_eq!(inserts, vec![(token("c", "00"), lu(2))]);
+        assert_eq!(deletes, vec![(token("c", "00"), lu(1))]);
     }
 
     fn keys_of_len(len: usize) -> Vec<IndexKey> {
@@ -2224,7 +2310,10 @@ mod tests {
             .collect()
     }
 
-    /// `n` found rows tagged 1, each its own row to delete.
+    /// `n` found token rows tagged 1 at `lu(1)`, each its own row to delete.
+    /// A full plan also deletes the type row at `lu(1)` (ADR-aacruzgon-0096),
+    /// so a repair of `n` found rows over K(current) = {type row} is
+    /// `n + 2` rows: one insert, `n` deletes and the old type row's delete.
     fn found_rows(n: usize) -> Vec<StaleIndexRow> {
         (0..n)
             .map(|i| s(token("s", &format!("{i}")), Some(lu(1)), 1))
@@ -2236,14 +2325,15 @@ mod tests {
         let rbt = IndexKey::ResourcesByType;
         let row = r1(2, lu(2), std::slice::from_ref(&rbt));
         let entry = |deletes: usize| queued("p", Some(row.clone()), found_rows(deletes));
-        // Each repair is 1 insert plus its deletes: 501, then 601 (over the 512
-        // limit), 2, 10 (503 + 10 = 513, over), 9 (512 exactly), then 2 (over).
+        // Each repair is 1 insert, its found rows' deletes and the old type
+        // row's delete: 501, then 601 (over the 512 limit), 3, 10 (504 + 10 =
+        // 514, over), 8 (512 exactly), then 3 (over).
         let queue = [
-            entry(500),
-            entry(600),
+            entry(499),
+            entry(599),
             entry(1),
-            entry(9),
             entry(8),
+            entry(6),
             entry(1),
         ];
         assert_eq!(
@@ -2251,9 +2341,9 @@ mod tests {
             [
                 Ok(501),
                 Err(SkipReason::Budget),
-                Ok(2),
+                Ok(3),
                 Err(SkipReason::Budget),
-                Ok(9),
+                Ok(8),
                 Err(SkipReason::Budget),
             ]
         );
@@ -2282,7 +2372,7 @@ mod tests {
         ));
         queue.push(queued("p", None, found_rows(1)));
         let sizes = admitted_sizes(&queue);
-        assert!(sizes[..MAX_REPAIRS_PER_SEARCH].iter().all(|r| *r == Ok(2)));
+        assert!(sizes[..MAX_REPAIRS_PER_SEARCH].iter().all(|r| *r == Ok(3)));
         assert_eq!(
             sizes[MAX_REPAIRS_PER_SEARCH..],
             [
@@ -2512,5 +2602,76 @@ mod tests {
         assert_eq!(done.result, Ok(()));
         assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
         assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// ADR-aacruzgon-0096. An update from `gender` male to female crashed
+    /// after its version row, and the search found only the stale
+    /// `gender=male` token row, not the type row. The full repair inserts
+    /// version 2's type row and also deletes version 1's, so `count` stays
+    /// 1 and the resource has one `resources_by_type` row. Before the rule,
+    /// version 1's type row stayed and `count` read 2. The control finds the
+    /// type row itself, which the repair moves as before.
+    #[tokio::test]
+    async fn a_full_repair_from_a_token_row_moves_the_type_row_and_count_stays() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        for found_type_row in [false, true] {
+            let t = tenant_id(if found_type_row {
+                "repair-type-row-found"
+            } else {
+                "repair-token-row-found"
+            });
+            let tenant = context(&t);
+            let gender = |code: &str| json!({"resourceType": "Patient", "id": "p", "gender": code});
+            let p = backend
+                .create(&tenant, "Patient", gender("male"), test_fhir_version())
+                .await
+                .expect("create p");
+            let first = r1_of(&backend, &t, "p").await;
+            let lu1 = first.last_updated;
+            let male = keys_of(&first)
+                .into_iter()
+                .find(|k| matches!(k, IndexKey::TokenCode { param, .. } if param == "gender"))
+                .expect("the gender key");
+            crash_update(&backend, &tenant, &t, &p, gender("female")).await;
+            let row = r1_of(&backend, &t, "p").await;
+            assert_eq!(row.version_id, 2);
+            let (lu2, k2) = (row.last_updated, keys_of(&row));
+            assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+
+            let stale = if found_type_row {
+                found(&type_search(&backend, &t).await, "p", 2)
+            } else {
+                vec![StaleIndexRow::new(male, Some(lu1), 1).unwrap()]
+            };
+            assert_eq!(stale.len(), 1);
+            let mut context = RepairContext::new(&t);
+            context.queue("Patient", "p", Some(row.clone()), stale);
+            let outcomes = context.run(&backend).await;
+            let [RepairOutcome::Repaired { full: true, index }] = outcomes[..] else {
+                panic!("{outcomes:?}");
+            };
+            // The found row, and version 1's type row: found, or deleted at
+            // the found row's `last_updated`.
+            assert_eq!(
+                (index.rows_inserted, index.rows_deleted),
+                (k2.len() as u64, if found_type_row { 1 } else { 2 }),
+                "found_type_row={found_type_row}"
+            );
+            assert_eq!(
+                backend.count(&tenant, Some("Patient")).await.unwrap(),
+                1,
+                "found_type_row={found_type_row}"
+            );
+            let rows: Vec<_> = type_search(&backend, &t)
+                .await
+                .into_iter()
+                .filter(|(id, ..)| id == "p")
+                .map(|(_, at, tag)| (at, tag))
+                .collect();
+            assert_eq!(rows, [(lu2, 2)], "found_type_row={found_type_row}");
+        }
     }
 }

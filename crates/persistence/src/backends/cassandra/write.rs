@@ -7915,6 +7915,65 @@ mod node_tests {
         assert_eq!(outcome.stats.batches, 1, "packed once, whatever its tries");
     }
 
+    /// The test above for repair's writer: the same 15 ms deadline, cut
+    /// during the second pause, logs the repair's deadline line once, and
+    /// never the request path's "dropped and left for the sweeper", since
+    /// repair keeps no intent ([`DeltaWriter::Repair`]). The line depends on
+    /// the writer alone, so the three tries (repair uses one) change nothing.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_repair_writer_logs_its_own_deadline_line() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("repair-deadline");
+        let key = key_of(&tenant);
+        let lu1 = Utc::now();
+        let lu2 = lu1 + chrono::Duration::milliseconds(1);
+        let x1 = [IndexKey::ResourcesByType];
+        let previous = [(&x1[0], lu1)];
+        let delta = index_delta(
+            &previous,
+            VersionKeys {
+                version_id: 2,
+                last_updated: lu2,
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                    .as_mime_param(),
+                keys: &x1,
+            },
+        );
+        for _ in 0..POST_CAS_WRITE_TRIES {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resources_by_type",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        let outcome = backend
+            .write_index_delta_within(
+                &key,
+                &delta,
+                write_ts_of(lu2),
+                POST_CAS_WRITE_TRIES,
+                Duration::from_millis(15),
+                RefusalLog::Error,
+                DeltaWriter::Repair,
+            )
+            .await;
+        assert_eq!(outcome.result, Err(WriteFailure::TriesExhausted));
+        let count = |text: &str| -> usize {
+            let n = std::cell::Cell::new(0);
+            logs_assert(|lines: &[&str]| {
+                n.set(lines.iter().filter(|line| line.contains(text)).count());
+                Ok(())
+            });
+            n.get()
+        };
+        assert_eq!(count("the repair's index phase passed its deadline"), 1);
+        assert_eq!(count("dropped and left for the sweeper"), 0);
+    }
+
     /// IW16: a stall past both the phase's deadline and the retry pause must
     /// not start another try. The tokio clock is paused after the backend is
     /// up, and the writer is polled by hand: try 1 fails at once (a fault, no

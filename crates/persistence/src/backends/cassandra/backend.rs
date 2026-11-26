@@ -406,6 +406,13 @@ pub struct CassandraBackend {
     /// Counts the SearchParameters this process has noted in the overlay
     /// ([`StoredDefinition::noted_at`]).
     note_seq: AtomicU64,
+    /// Held by each reload of a tenant's overlay from before it takes its
+    /// `since` until it has merged ([`Self::load_stored_search_parameters`]),
+    /// so two reloads in this process never overlap. The overlay orders a
+    /// follow against the last reload merged (ADR-aacruzgon-0099); a reload
+    /// that began first but merged last would put back what it read before a
+    /// delete the other reload saw.
+    reload_lock: tokio::sync::Mutex<()>,
     /// The write engine's outcome counters ([`Self::cas_stats`]).
     pub(super) cas_counters: Arc<CasCounters>,
     /// Repair on read's counters ([`Self::repair_stats`]).
@@ -498,6 +505,7 @@ impl CassandraBackend {
             registries,
             stored_by_tenant,
             note_seq: AtomicU64::new(0),
+            reload_lock: tokio::sync::Mutex::new(()),
             cas_counters: Arc::new(CasCounters::default()),
             repair_counters: Arc::new(RepairCounters::default()),
             sweeper: Default::default(),
@@ -834,11 +842,18 @@ impl CassandraBackend {
     /// overlay until the sweeper (Step 5) writes the row. Only a reload that
     /// fell back to the keys of `resources` lists it, and keeps it.
     ///
+    /// **One reload at a time.** A call waits for any reload already running
+    /// in this process, of any tenant, before it takes `since`
+    /// ([`Self::reload_lock`]). The server's startup load and TTL refresh
+    /// already run one after another; the lock keeps it so for any other
+    /// caller.
+    ///
     /// # Errors
     ///
     /// The mapped driver error of the id scan or of any read. The overlay is
     /// unchanged then.
     pub async fn load_stored_search_parameters(&self, tenant_id: &str) -> StorageResult<usize> {
+        let _reload = self.reload_lock.lock().await;
         let read = self.read_stored_search_parameters(tenant_id).await?;
         Ok(self.merge_into_overlay(tenant_id, read.loaded, read.removed, read.since))
     }
@@ -1222,6 +1237,7 @@ impl CassandraBackend {
         tenant_id: &str,
         between: F,
     ) -> StorageResult<usize> {
+        let _reload = self.reload_lock.lock().await;
         let read = self.read_stored_search_parameters(tenant_id).await?;
         between.await;
         Ok(self.merge_into_overlay(tenant_id, read.loaded, read.removed, read.since))

@@ -30,6 +30,9 @@ pub(crate) enum Checkpoint {
     AfterStamp,
     /// After I1, before the CAS (`run_cas`): the intent exists, nothing else changed.
     AfterIntent,
+    /// After a fresh I1 written before the CAS, before the check runs again (`run_cas`,
+    /// ADR-aacruzgon-0098): reached only by a request held up since its stamp.
+    AfterFreshIntent,
     /// After a CAS that applied, before step 4 (`finish`), superseded or not.
     AfterCas,
     /// After step 4's version row, before step 5 (`finish`).
@@ -384,7 +387,9 @@ mod tests {
                 .unwrap();
             let report = check(&backend, &t).await;
             let (r1_version, versions, want): (i32, Vec<i32>, Vec<&str>) = match point {
-                Checkpoint::AfterStamp | Checkpoint::AfterIntent => (1, vec![1], vec![]),
+                Checkpoint::AfterStamp | Checkpoint::AfterIntent | Checkpoint::AfterFreshIntent => {
+                    (1, vec![1], vec![])
+                }
                 Checkpoint::AfterCas | Checkpoint::AfterVersionRow => {
                     let k2 = index_keys::decode(r1.index_keys.as_deref().unwrap())
                         .unwrap()

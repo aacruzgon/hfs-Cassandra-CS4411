@@ -3606,6 +3606,66 @@ mod node_tests {
         assert_consistent(&check(&backend, &t).await);
     }
 
+    /// ADR-aacruzgon-0098 (the audit of #123, F4): a writer held again after its fresh intent, past
+    /// the grace, has that intent deleted by a running sweeper too. The check runs again and writes
+    /// a second fresh intent, so the next poll after a crash still finishes the write; a single
+    /// re-stamp (`if` for `while`) would leave no intent.
+    #[tokio::test]
+    async fn a_writer_held_again_after_its_fresh_intent_writes_another() {
+        let Some((backend, t, tenant, since)) = start_short_grace("sweeper-held-twice").await
+        else {
+            return;
+        };
+        let (state, scope) = running(&t);
+        let grace = backend.config.sweeper_grace();
+        let timeout = Duration::from_millis(backend.config.request_timeout_ms);
+        let before = backend.cas_stats();
+        let mut stamp = backend.hold_at(Checkpoint::AfterStamp, &t, "p", 1);
+        let mut fresh = backend.hold_at(Checkpoint::AfterFreshIntent, &t, "p", 1);
+        let mut cas = backend.hold_at(Checkpoint::AfterCas, &t, "p", 1);
+        let (b, ten) = (backend.clone(), tenant.clone());
+        let task = tokio::spawn(async move {
+            b.create(&ten, "Patient", patient(), test_fhir_version())
+                .await
+        });
+        stamp.reached().await;
+        // Long enough for the first re-stamp (held + timeout reaches the grace), not for a sweep.
+        tokio::time::sleep(grace - timeout + Duration::from_millis(200)).await;
+        stamp.release();
+        fresh.reached().await;
+        // Held again, past the grace since the fresh stamp: the sweeper deletes both intents.
+        tokio::time::sleep(grace + Duration::from_millis(200)).await;
+        let during = backend.poll_once(&state, Utc::now(), &scope).await;
+        assert_eq!((during.no_row, during.done), (2, 2), "{during}");
+        fresh.release();
+        cas.reached().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let spent = backend.cas_stats().since(&before);
+        let left = intents(&backend, &t, "p", since).await;
+
+        let after = backend
+            .poll_once(
+                &state,
+                Utc::now()
+                    + chrono::Duration::from_std(grace).unwrap()
+                    + chrono::Duration::seconds(1),
+                &scope,
+            )
+            .await;
+        assert_eq!(
+            (after.current, after.done),
+            (1, 1),
+            "the running sweeper finishes the crashed write: {after}"
+        );
+        assert_eq!(rbt_rows(&backend, &t, "p").await.len(), 1);
+        assert_eq!(count(&backend, &tenant).await, 1);
+        assert_eq!(spent.intent_restamps, 2, "{spent:?}");
+        assert_eq!(left, vec![1], "the second fresh intent");
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+    }
+
     /// ADR-aacruzgon-0098's control: a writer held only briefly writes no fresh intent, and the
     /// running sweeper finishes its crash from the one intent it has.
     #[tokio::test]

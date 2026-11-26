@@ -2324,6 +2324,10 @@ impl CassandraBackend {
                 )
                 .await
                 .map_err(|error| request.statement_error(&error, "intent row"))?;
+                // ADR-aacruzgon-0098: a test can hold the request after a fresh I1, before the check runs again.
+                #[cfg(test)]
+                self.checkpoint(Checkpoint::AfterFreshIntent, &key, plan.target_version())
+                    .await;
             }
 
             // Step 3.

@@ -3634,6 +3634,55 @@ mod node_tests {
         say("search-parameter", &backend, &before);
     }
 
+    /// SW19 across instances: B retires a SearchParameter that A holds, A reloads, then A follows a
+    /// row it read before B's update, as a replay that began before it would. The reload recorded the
+    /// retired version, so the stale row is refused, as a fresh read of it (the control) is; the next
+    /// reload agrees.
+    #[tokio::test]
+    async fn a_stale_replay_read_does_not_bring_back_a_retired_searchparameter() {
+        let Some((a, t, tenant, _)) = start("sweeper-sp-stale").await else {
+            return;
+        };
+        let b = harness::backend().await.expect("instance B");
+        let url = format!("http://example.org/SearchParameter/{t}");
+        let v1 = a
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter(&url),
+                test_fhir_version(),
+            )
+            .await
+            .expect("create");
+        assert_eq!(
+            expression_of(&a, &tenant, &url).as_deref(),
+            Some("Patient.active")
+        );
+        let stale = a
+            .serial_read_resource_row(&t, "SearchParameter", "sp")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut retired = search_parameter(&url);
+        retired["status"] = serde_json::json!("retired");
+        b.update(&tenant, &v1, retired).await.expect("B's update");
+        assert_eq!(expression_of(&b, &tenant, &url), None);
+        a.load_stored_search_parameters(&t).await.unwrap();
+        assert_eq!(expression_of(&a, &tenant, &url), None, "after A's reload");
+
+        let fresh = a
+            .serial_read_resource_row(&t, "SearchParameter", "sp")
+            .await
+            .unwrap()
+            .unwrap();
+        a.follow_stored_search_parameter(&t, "sp", Some(&fresh));
+        assert_eq!(expression_of(&a, &tenant, &url), None, "a fresh read");
+        a.follow_stored_search_parameter(&t, "sp", Some(&stale));
+        assert_eq!(expression_of(&a, &tenant, &url), None, "the stale read");
+        a.load_stored_search_parameters(&t).await.unwrap();
+        assert_eq!(expression_of(&a, &tenant, &url), None, "the next reload");
+    }
+
     /// N9: a replayed delete writes its marker, and a revive only inserts (SW16).
     #[tokio::test]
     async fn a_replayed_delete_writes_its_marker_and_a_revive_inserts_only() {

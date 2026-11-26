@@ -618,10 +618,13 @@ fn outcomes_of<'a, P: 'a, C>(
 /// another to finish before it starts.
 ///
 /// Each wake polls every running future once, and a future that finishes
-/// makes room for the next one at once. The futures are polled once before
-/// the clock is looked at, which starts the first `concurrency` of them: if
-/// every one is done, that is the end; if `ends_at` has already passed, it
-/// returns at once. So a deadline in the past cuts every future after its
+/// makes room for the next one at once, but only while `ends_at` has not
+/// passed: after the first fill, no future is started at or past the
+/// deadline, even in the wake the deadline falls in, so none is started only
+/// to be dropped. The futures are polled once before the clock is looked at,
+/// which starts the first `concurrency` of them: if every one is done, that
+/// is the end; if `ends_at` has already passed, it returns at once. So a
+/// deadline in the past cuts every future after its
 /// first poll, however fast the work behind it is (a timer's own check can lag
 /// the clock by a tick, and `FuturesUnordered` may stop after polling two
 /// futures that woke themselves, so neither can give that). Otherwise the rest
@@ -633,14 +636,17 @@ async fn drive_within<F: Future<Output = ()>>(
 ) {
     let mut waiting = futures.into_iter();
     let mut running: Vec<std::pin::Pin<Box<F>>> = Vec::new();
+    let mut started = false;
     let all = futures::future::poll_fn(|cx| {
         loop {
-            while running.len() < concurrency {
+            while running.len() < concurrency && (!started || tokio::time::Instant::now() < ends_at)
+            {
                 match waiting.next() {
                     Some(future) => running.push(Box::pin(future)),
                     None => break,
                 }
             }
+            started = true;
             let before = running.len();
             running.retain_mut(|future| future.as_mut().poll(cx).is_pending());
             if running.is_empty() && waiting.len() == 0 {
@@ -1978,6 +1984,51 @@ mod tests {
         drive_within(futures, 4, tokio::time::Instant::now()).await;
         assert_eq!(polled.load(SeqCst), 4);
         assert_eq!(finished.load(SeqCst), 0);
+    }
+
+    /// A future that counts its polls.
+    fn counted(polls: Arc<std::sync::atomic::AtomicUsize>, mut inner: Unit) -> Unit {
+        Box::pin(futures::future::poll_fn(move |cx| {
+            polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            inner.as_mut().poll(cx)
+        }))
+    }
+
+    /// No future is started at or past the deadline (CodeRabbit on #106):
+    /// with the deadline already past and the first four ready at once, the
+    /// fifth is never polled; with four running and the first finishing on
+    /// the deadline's own tick, the fifth is never polled either. The
+    /// controls: one finishing before the deadline starts the fifth, and one
+    /// finishing after it does not.
+    #[tokio::test(start_paused = true)]
+    async fn no_future_is_started_at_or_past_the_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        // Past the deadline, the first four ready at once.
+        let fifth = Arc::new(AtomicUsize::new(0));
+        let mut futures: Vec<Unit> = (0..4).map(|_| Box::pin(async {}) as Unit).collect();
+        futures.push(counted(fifth.clone(), Box::pin(std::future::pending())));
+        drive_within(futures, REPAIR_CONCURRENCY, tokio::time::Instant::now()).await;
+        assert_eq!(fifth.load(SeqCst), 0, "past the deadline");
+
+        // The first of four finishes on the deadline's tick (10 ms), and
+        // controls finishing at 5 ms and at 20 ms.
+        for (finish_ms, started) in [(10u64, false), (5, true), (20, false)] {
+            let fifth = Arc::new(AtomicUsize::new(0));
+            let ends_at = tokio::time::Instant::now() + Duration::from_millis(10);
+            let mut futures: Vec<Unit> = vec![Box::pin(tokio::time::sleep_until(
+                tokio::time::Instant::now() + Duration::from_millis(finish_ms),
+            ))];
+            for _ in 0..3 {
+                futures.push(Box::pin(std::future::pending()));
+            }
+            futures.push(counted(fifth.clone(), Box::pin(std::future::pending())));
+            drive_within(futures, REPAIR_CONCURRENCY, ends_at).await;
+            assert_eq!(
+                fifth.load(SeqCst) > 0,
+                started,
+                "the first finishing at {finish_ms} ms, the deadline at 10 ms"
+            );
+        }
     }
 
     #[test]

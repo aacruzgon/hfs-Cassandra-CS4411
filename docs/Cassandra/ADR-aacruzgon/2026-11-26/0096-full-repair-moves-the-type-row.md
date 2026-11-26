@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0096: A full repair also deletes the `resources_by_type` row at each found row's `last_updated` (amends ADR-sam-michaels-0006 RV1 and ADR-aacruzgon-0017)
 
 - **Date:** 2026-11-26
-- **Status:** proposed
+- **Status:** accepted (Alan confirmed the entry on 2026-11-26)
 - **Context:**
     - **The rule as written.**
         - ADR-sam-michaels-0006 RV1 (`0006-step-5-design.md:233`): "Re-run step 5 for the current version through the shared writer (insert all of K(current), delete the stale rows found), as ADR-aacruzgon-0017 says."
@@ -50,7 +50,7 @@
 - **AI involvement:**
     - **Tools:** Claude Code (Opus 5.5), as the Rex worker `validate-106-findings`, with a web-fetch subagent for the FHIR pages.
     - **What the AI proposed:** CodeRabbit raised the case. The worker reproduced it, built and measured CodeRabbit's rule, then proposed and measured the chosen rule, built it on `main` with its tests, and drafted this entry.
-    - **What the human changed:** Alan approved the recommendation on 2026-11-26 ('the open items lets go with the recommendations as long as they follow what would be appropriate for the specs'); he has not yet confirmed this entry's text.
+    - **What the human changed:** Alan approved the recommendation on 2026-11-26 ('the open items lets go with the recommendations as long as they follow what would be appropriate for the specs'); he has not yet confirmed this entry's text. Alan confirmed the entry on 2026-11-26 ('i also confirm all the ADRS').
     - **Verified:**
         - L1 node tests on a 5.0.9 single node: the case and its control, each failing with the rule removed and passing with it, and the full `backends::cassandra` lib suite and `cassandra_tests` (logs in the worker's run folder, `logs-f5/`);
         - code read: `plan_from`, `RepairPlan::delta` and `index_delta`'s row identity;

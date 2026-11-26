@@ -811,6 +811,18 @@ jobs:
       - name: cargo test --lib backends::cassandra against this node
         run: |
           set -o pipefail
+          # --skip drops every test whose name contains $AT_LIMIT_TEST (libtest
+          # matches skip filters by substring unless --exact, and --exact would
+          # make the backends::cassandra filter exact too), so check that it
+          # drops exactly one. --list needs no node and reuses the build.
+          listed() {
+            cargo test -p helios-persistence --features cassandra \
+              --lib -- backends::cassandra --list "$@" 2>/dev/null \
+              | { grep -c ': test$' || true; }
+          }
+          dropped=$(( $(listed) - $(listed --skip "${AT_LIMIT_TEST:?}") ))
+          [ "$dropped" -eq 1 ] \
+            || { echo "::error title=At-limit skip::--skip $AT_LIMIT_TEST drops $dropped lib tests, not 1"; exit 1; }
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
           HFS_TEST_CASSANDRA_TOMBSTONE_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \

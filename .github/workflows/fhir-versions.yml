@@ -588,6 +588,21 @@ jobs:
             echo "::endgroup::"
             if [ "$status" -ne 0 ]; then failed+=("$version $suite (exit $status)"); fi
           }
+          # --skip drops every test whose name contains $AT_LIMIT_TEST (libtest
+          # matches skip filters by substring unless --exact, and --exact would
+          # make the backends::cassandra filter exact too), so check once that
+          # it drops exactly one. The list does not depend on the version:
+          # HFS_TEST_FHIR_VERSION is read only at run time.
+          listed() {
+            cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
+              --lib -- backends::cassandra --list "$@" 2>/dev/null \
+              | { grep -c ': test$' || true; }
+          }
+          dropped=$(( $(listed) - $(listed --skip "${AT_LIMIT_TEST:?}") ))
+          if [ "$dropped" -ne 1 ]; then
+            echo "::error title=FHIR versions::--skip $AT_LIMIT_TEST drops $dropped lib tests, not 1"
+            failed+=("lib skip (drops $dropped)")
+          fi
           for version in R4 R4B R5 R6; do
             large=()
             if [ "$version" = R6 ]; then large=(env HFS_TEST_CASSANDRA_LARGE=1); fi

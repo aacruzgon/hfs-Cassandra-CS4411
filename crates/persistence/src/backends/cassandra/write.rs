@@ -334,11 +334,16 @@ pub(crate) enum RefusalLog {
 /// not confirmed: a request leaves the intent for the sweeper. The sweeper's
 /// line says only that the intent row stays in the outbox, since it is logged
 /// before the sweeper knows whether it tries again (at the 24 hour horizon it
-/// does not, and the row stays until its TTL).
+/// does not, and the row stays until its TTL). Repair on read writes no
+/// intent (RV7), so its line says that nothing of its own retries the
+/// batches: a later search's repair does, or the sweeper, if the write that
+/// left the stale rows kept an intent. Each is logged at `warn`, and repair
+/// also logs its own `warn` per failed repair (RV9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeltaWriter {
     Request,
     Sweeper,
+    Repair,
 }
 
 /// A `tracing` event at a [`RefusalLog`]'s level: `log_refusal!(level, fields…, "message")`.
@@ -1629,6 +1634,16 @@ fn index_batches(key: &RowKey<'_>, delta: &IndexDelta<'_>, ts: i64) -> IndexBatc
     IndexBatches { batches, stats }
 }
 
+/// What [`CassandraBackend::write_index_delta`] reports as `stats` for
+/// `delta` at `ts`: the rows and batches as packed, before anything is sent.
+pub(crate) fn index_pack_stats(
+    key: &RowKey<'_>,
+    delta: &IndexDelta<'_>,
+    ts: i64,
+) -> IndexWriteStats {
+    index_batches(key, delta, ts).stats
+}
+
 /// Why a plain write after the CAS (a version row or an index batch) was not
 /// written. Either way the write still answers success and its intent is
 /// left for the sweeper (G23); the kind tells a caller that retries on its
@@ -2814,6 +2829,30 @@ impl CassandraBackend {
         .await
     }
 
+    /// [`Self::write_index_delta`] for repair on read (RV7, IW17): the same
+    /// writes, a refused batch logged at `error` as on the request path, and
+    /// a batch not confirmed logged as repair's, which keeps no intent
+    /// ([`DeltaWriter::Repair`]).
+    pub(crate) async fn write_index_delta_repair(
+        &self,
+        key: &RowKey<'_>,
+        delta: &IndexDelta<'_>,
+        ts: i64,
+        tries: u32,
+    ) -> IndexOutcome {
+        let deadline = Duration::from_millis(self.config.request_timeout_ms);
+        self.write_index_delta_within(
+            key,
+            delta,
+            ts,
+            tries,
+            deadline,
+            RefusalLog::Error,
+            DeltaWriter::Repair,
+        )
+        .await
+    }
+
     /// [`Self::write_index_delta`] with the phase's deadline, the refusal's
     /// level and the writer given, so a test can make the deadline short.
     #[allow(clippy::too_many_arguments)]
@@ -2837,7 +2876,7 @@ impl CassandraBackend {
         let ends_at = tokio::time::Instant::now() + deadline;
         let sends: Vec<_> = batches
             .iter()
-            .map(|batch| self.send_index_batch(batch, tries, ends_at, refusal))
+            .map(|batch| self.send_index_batch(batch, tries, ends_at, refusal, writer))
             .collect();
         let sends = futures::stream::iter(sends)
             .buffer_unordered(INDEX_BATCHES_IN_FLIGHT)
@@ -2845,14 +2884,24 @@ impl CassandraBackend {
         match tokio::time::timeout(deadline, sends).await {
             Ok(results) => failures.extend(results.into_iter().filter_map(Result::err)),
             Err(_) => {
-                tracing::warn!(
-                    resource_type = key.resource_type,
-                    id = key.id,
-                    version_id = delta.version_id,
-                    deadline_ms = deadline.as_millis() as u64,
-                    "the index phase passed its deadline; the batches still running are \
-                     dropped and left for the sweeper"
-                );
+                match writer {
+                    DeltaWriter::Request | DeltaWriter::Sweeper => tracing::warn!(
+                        resource_type = key.resource_type,
+                        id = key.id,
+                        version_id = delta.version_id,
+                        deadline_ms = deadline.as_millis() as u64,
+                        "the index phase passed its deadline; the batches still running are \
+                         dropped and left for the sweeper"
+                    ),
+                    DeltaWriter::Repair => tracing::warn!(
+                        resource_type = key.resource_type,
+                        id = key.id,
+                        version_id = delta.version_id,
+                        deadline_ms = deadline.as_millis() as u64,
+                        "the repair's index phase passed its deadline; the batches still \
+                         running are dropped, and repair on read keeps no intent for them"
+                    ),
+                }
                 failures.push(WriteFailure::TriesExhausted);
             }
         }
@@ -2882,6 +2931,16 @@ impl CassandraBackend {
                     failed = failures.len(),
                     index = %stats,
                     "index batches not confirmed; the intent row stays in the outbox"
+                ),
+                DeltaWriter::Repair => tracing::warn!(
+                    resource_type = key.resource_type,
+                    id = key.id,
+                    version_id = delta.version_id,
+                    failed = failures.len(),
+                    index = %stats,
+                    "index batches not confirmed; repair on read keeps no intent, so apart from \
+                     the batchlog's replay of a batch it holds, only a later search's repair, or \
+                     the sweeper replaying an intent the original write kept, tries them again"
                 ),
             }
             Err([
@@ -2920,13 +2979,15 @@ impl CassandraBackend {
     /// polls its future before its timer, so on its own it would let a
     /// stalled writer start one more try after the deadline.
     ///
-    /// A refusal is logged at `refusal`'s level ([`RefusalLog`]).
+    /// A refusal is logged at `refusal`'s level ([`RefusalLog`]), and a
+    /// batch in the batchlog with `writer`'s text: repair keeps no intent.
     async fn send_index_batch(
         &self,
         statements: &[IndexStatement],
         tries: u32,
         ends_at: tokio::time::Instant,
         refusal: RefusalLog,
+        writer: DeltaWriter,
     ) -> Result<(), WriteFailure> {
         for attempt in 1..=tries {
             if tokio::time::Instant::now() >= ends_at {
@@ -2937,13 +2998,22 @@ impl CassandraBackend {
             };
             match classify_failure(&error) {
                 BatchFailure::InBatchlog => {
-                    tracing::warn!(
-                        attempt,
-                        statements = statements.len(),
-                        error = ?error,
-                        "index batch timed out after the batchlog was written; the batchlog \
-                         replays it, and the intent stays for the sweeper"
-                    );
+                    match writer {
+                        DeltaWriter::Request | DeltaWriter::Sweeper => tracing::warn!(
+                            attempt,
+                            statements = statements.len(),
+                            error = ?error,
+                            "index batch timed out after the batchlog was written; the batchlog \
+                             replays it, and the intent stays for the sweeper"
+                        ),
+                        DeltaWriter::Repair => tracing::warn!(
+                            attempt,
+                            statements = statements.len(),
+                            error = ?error,
+                            "index batch timed out after the batchlog was written; the batchlog \
+                             replays it, and repair on read keeps no intent for it"
+                        ),
+                    }
                     return Err(WriteFailure::InBatchlog);
                 }
                 BatchFailure::Refused => {
@@ -6534,6 +6604,7 @@ mod node_tests {
                 POST_CAS_WRITE_TRIES,
                 tokio::time::Instant::now() + Duration::from_secs(60),
                 RefusalLog::Error,
+                DeltaWriter::Request,
             )
             .await;
         let spent = backend.statement_counts().since(&counted);
@@ -6843,6 +6914,7 @@ mod node_tests {
                 POST_CAS_WRITE_TRIES,
                 tokio::time::Instant::now() + Duration::from_secs(60),
                 RefusalLog::Error,
+                DeltaWriter::Request,
             )
             .await;
         let spent = backend.statement_counts().since(&counted);
@@ -7923,6 +7995,93 @@ mod node_tests {
         );
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
         assert_eq!(outcome.stats.batches, 1, "packed once, whatever its tries");
+    }
+
+    /// The test above for repair's writer, on a paused clock stepped by hand,
+    /// so a busy runner cannot move the deadline out of the second pause
+    /// (on a real clock, a runner that wakes the writer from its first 10 ms
+    /// pause only after 15 ms takes the `Ok(results)` branch, and the line is
+    /// not logged). Try 1 fails and the writer pauses 10 ms; at 12 ms try 2
+    /// fails and it pauses 20 ms; at 18 ms, past the 15 ms deadline and inside
+    /// that pause, the phase ends. The repair's deadline line is logged once,
+    /// the request path's "dropped and left for the sweeper" never
+    /// ([`DeltaWriter::Repair`]), and no third try is sent. Nothing waits on
+    /// the node while the clock is paused, so no driver timeout fires. The
+    /// line depends on the writer alone, so the three tries (repair uses one)
+    /// change nothing.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_repair_writer_logs_its_own_deadline_line() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = tenant_context("repair-deadline");
+        let key = key_of(&tenant);
+        let lu1 = Utc::now();
+        let lu2 = lu1 + chrono::Duration::milliseconds(1);
+        let x1 = [IndexKey::ResourcesByType];
+        let previous = [(&x1[0], lu1)];
+        let delta = index_delta(
+            &previous,
+            VersionKeys {
+                version_id: 2,
+                last_updated: lu2,
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version()
+                    .as_mime_param(),
+                keys: &x1,
+            },
+        );
+        for _ in 0..POST_CAS_WRITE_TRIES {
+            backend.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resources_by_type",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        let counted = backend.statement_counts();
+        tokio::time::pause();
+        let phase = backend.write_index_delta_within(
+            &key,
+            &delta,
+            write_ts_of(lu2),
+            POST_CAS_WRITE_TRIES,
+            Duration::from_millis(15),
+            RefusalLog::Error,
+            DeltaWriter::Repair,
+        );
+        let mut phase = std::pin::pin!(phase);
+        assert!(
+            futures::poll!(phase.as_mut()).is_pending(),
+            "try 1 failed; in the 10 ms pause"
+        );
+        // 12 ms: past the 10 ms pause (timers round up to the next 1 ms
+        // tick), before the 15 ms deadline.
+        tokio::time::advance(Duration::from_millis(12)).await;
+        assert!(
+            futures::poll!(phase.as_mut()).is_pending(),
+            "try 2 failed; in the 20 ms pause"
+        );
+        assert_eq!(backend.statement_counts().since(&counted).batch, 2);
+        // 18 ms: past the deadline, inside the 20 ms pause (which ends at 32 ms).
+        tokio::time::advance(Duration::from_millis(6)).await;
+        let outcome = phase.await;
+        assert_eq!(outcome.result, Err(WriteFailure::TriesExhausted));
+        let count = |text: &str| -> usize {
+            let n = std::cell::Cell::new(0);
+            logs_assert(|lines: &[&str]| {
+                n.set(lines.iter().filter(|line| line.contains(text)).count());
+                Ok(())
+            });
+            n.get()
+        };
+        assert_eq!(count("the repair's index phase passed its deadline"), 1);
+        assert_eq!(count("dropped and left for the sweeper"), 0);
+        assert_eq!(
+            backend.statement_counts().since(&counted).batch,
+            2,
+            "no third try"
+        );
     }
 
     /// IW16: a stall past both the phase's deadline and the retry pause must

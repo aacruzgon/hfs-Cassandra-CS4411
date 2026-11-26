@@ -18,7 +18,7 @@ use super::config::CassandraConfig;
 use super::errors::{BACKEND_NAME, is_too_many_tombstones, map_driver_error};
 use super::schema;
 use super::session::{CassandraSession, DriverError, PAGE_SIZE, StatementCounts, StatementKind};
-use super::stats::{CasCounters, CasStats};
+use super::stats::{CasCounters, CasStats, RepairCounters, RepairStats};
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::{
@@ -327,6 +327,8 @@ pub struct CassandraBackend {
     note_seq: AtomicU64,
     /// The write engine's outcome counters ([`Self::cas_stats`]).
     pub(super) cas_counters: Arc<CasCounters>,
+    /// Repair on read's counters ([`Self::repair_stats`]).
+    pub(super) repair_counters: Arc<RepairCounters>,
     /// The sweeper's counters and load limit (sweeper.rs).
     pub(super) sweeper: super::sweeper::SweeperShared,
     /// Crash checkpoints a test arms in the write path (ADR-sam-michaels-0006, RV15).
@@ -416,6 +418,7 @@ impl CassandraBackend {
             stored_by_tenant,
             note_seq: AtomicU64::new(0),
             cas_counters: Arc::new(CasCounters::default()),
+            repair_counters: Arc::new(RepairCounters::default()),
             sweeper: Default::default(),
             #[cfg(test)]
             checkpoints: Default::default(),
@@ -429,6 +432,11 @@ impl CassandraBackend {
     /// snapshots with [`CasStats::since`].
     pub fn cas_stats(&self) -> CasStats {
         self.cas_counters.snapshot()
+    }
+
+    /// Repair on read's counters since this backend was built: repairs, failures, the rows they planned and the skips by reason (ADR-sam-michaels-0006, RV9). Subtract two snapshots with [`RepairStats::since`].
+    pub fn repair_stats(&self) -> RepairStats {
+        self.repair_counters.snapshot()
     }
 
     /// How many statements of each kind this backend has sent since it was

@@ -7915,11 +7915,18 @@ mod node_tests {
         assert_eq!(outcome.stats.batches, 1, "packed once, whatever its tries");
     }
 
-    /// The test above for repair's writer: the same 15 ms deadline, cut
-    /// during the second pause, logs the repair's deadline line once, and
-    /// never the request path's "dropped and left for the sweeper", since
-    /// repair keeps no intent ([`DeltaWriter::Repair`]). The line depends on
-    /// the writer alone, so the three tries (repair uses one) change nothing.
+    /// The test above for repair's writer, on a paused clock stepped by hand,
+    /// so a busy runner cannot move the deadline out of the second pause
+    /// (on a real clock, a runner that wakes the writer from its first 10 ms
+    /// pause only after 15 ms takes the `Ok(results)` branch, and the line is
+    /// not logged). Try 1 fails and the writer pauses 10 ms; at 12 ms try 2
+    /// fails and it pauses 20 ms; at 18 ms, past the 15 ms deadline and inside
+    /// that pause, the phase ends. The repair's deadline line is logged once,
+    /// the request path's "dropped and left for the sweeper" never
+    /// ([`DeltaWriter::Repair`]), and no third try is sent. Nothing waits on
+    /// the node while the clock is paused, so no driver timeout fires. The
+    /// line depends on the writer alone, so the three tries (repair uses one)
+    /// change nothing.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn the_repair_writer_logs_its_own_deadline_line() {
@@ -7950,17 +7957,33 @@ mod node_tests {
                 Fault::TimeOutWithoutApplying,
             );
         }
-        let outcome = backend
-            .write_index_delta_within(
-                &key,
-                &delta,
-                write_ts_of(lu2),
-                POST_CAS_WRITE_TRIES,
-                Duration::from_millis(15),
-                RefusalLog::Error,
-                DeltaWriter::Repair,
-            )
-            .await;
+        let counted = backend.statement_counts();
+        tokio::time::pause();
+        let phase = backend.write_index_delta_within(
+            &key,
+            &delta,
+            write_ts_of(lu2),
+            POST_CAS_WRITE_TRIES,
+            Duration::from_millis(15),
+            RefusalLog::Error,
+            DeltaWriter::Repair,
+        );
+        let mut phase = std::pin::pin!(phase);
+        assert!(
+            futures::poll!(phase.as_mut()).is_pending(),
+            "try 1 failed; in the 10 ms pause"
+        );
+        // 12 ms: past the 10 ms pause (timers round up to the next 1 ms
+        // tick), before the 15 ms deadline.
+        tokio::time::advance(Duration::from_millis(12)).await;
+        assert!(
+            futures::poll!(phase.as_mut()).is_pending(),
+            "try 2 failed; in the 20 ms pause"
+        );
+        assert_eq!(backend.statement_counts().since(&counted).batch, 2);
+        // 18 ms: past the deadline, inside the 20 ms pause (which ends at 32 ms).
+        tokio::time::advance(Duration::from_millis(6)).await;
+        let outcome = phase.await;
         assert_eq!(outcome.result, Err(WriteFailure::TriesExhausted));
         let count = |text: &str| -> usize {
             let n = std::cell::Cell::new(0);
@@ -7972,6 +7995,11 @@ mod node_tests {
         };
         assert_eq!(count("the repair's index phase passed its deadline"), 1);
         assert_eq!(count("dropped and left for the sweeper"), 0);
+        assert_eq!(
+            backend.statement_counts().since(&counted).batch,
+            2,
+            "no third try"
+        );
     }
 
     /// IW16: a stall past both the phase's deadline and the retry pause must

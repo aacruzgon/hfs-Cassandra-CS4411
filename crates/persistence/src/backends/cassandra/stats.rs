@@ -433,7 +433,8 @@ repair_counters! {
     /// Index rows packed for delete, counted as `rows_inserted` is.
     rows_deleted,
     /// Skipped: a found row is tagged above the current version. A resource's skip is the first of
-    /// these that applies: no row, tag ahead, not stale, write_ts, undecodable keys, budget.
+    /// these that applies: no row, tag ahead, not stale, write_ts, undecodable keys, budget, then,
+    /// for an admitted repair, no version row.
     skipped_tag_ahead,
     /// Skipped: the tag check found no `resources` row.
     skipped_no_row,
@@ -445,6 +446,8 @@ repair_counters! {
     skipped_not_stale,
     /// Skipped: past the search's repair budget.
     skipped_budget,
+    /// Skipped after admission: the current version has no `resource_versions` row yet (IW24).
+    skipped_no_version_row,
     /// Index rows given to `RepairContext::skip_undecodable`.
     undecodable_rows,
 }
@@ -498,6 +501,7 @@ impl RepairCounters {
             SkipReason::UndecodableKeys => &self.skipped_undecodable_keys,
             SkipReason::NotStale => &self.skipped_not_stale,
             SkipReason::Budget => &self.skipped_budget,
+            SkipReason::NoVersionRow => &self.skipped_no_version_row,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -582,6 +586,7 @@ mod tests {
         counters.failed(&index);
         counters.skipped(SkipReason::Budget);
         counters.skipped(SkipReason::TagAhead);
+        counters.skipped(SkipReason::NoVersionRow);
         counters.undecodable_rows(2);
         let delta = counters.snapshot().since(&before);
         assert_eq!(
@@ -595,10 +600,11 @@ mod tests {
         );
         assert_eq!((delta.rows_inserted, delta.rows_deleted), (12, 3));
         assert_eq!((delta.skipped_budget, delta.skipped_tag_ahead), (1, 1));
+        assert_eq!(delta.skipped_no_version_row, 1);
         assert_eq!(delta.undecodable_rows, 2);
         let printed = delta.to_string();
         assert!(printed.starts_with("queued=3 repaired=2 repaired_partial=1 failed=1 "));
         assert_eq!(printed.split(' ').count(), delta.pairs().len());
-        assert_eq!(delta.pairs().len(), 13);
+        assert_eq!(delta.pairs().len(), 14);
     }
 }

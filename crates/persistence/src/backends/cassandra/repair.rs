@@ -10,8 +10,9 @@
 //! another tag is hidden. A row below R1's version is stale: a write that
 //! crashed after its CAS left it, and the sweeper has not finished the
 //! write yet; or the search read the row just before an update landed.
-//! Repair finishes it, from R1's own `index_keys`, K(current),
-//! without reading anything else (RV4).
+//! Repair finishes it, from R1's own `index_keys`, K(current). The only
+//! other read is of R1's version row, at `LOCAL_QUORUM`, so repair never
+//! publishes a version vread cannot open (IW24; ADR-aacruzgon-0097).
 //!
 //! - **Full replay (RV1).** When K(current) has at most
 //!   [`MAX_FULL_REPAIR_KEYS`] keys, repair inserts every key of it at R1's
@@ -39,6 +40,13 @@
 //!   budget is spent ([`SkipReason::Budget`], RV5). Once the budget's 32
 //!   resources are used, an entry still runs every check up to
 //!   `UndecodableKeys`, then is skipped as `Budget` without a delta built.
+//!   An admitted repair then reads R1's version row at `LOCAL_QUORUM`
+//!   before it packs or sends anything: with no row, the write that left
+//!   the stale rows skipped its index step when its version row failed
+//!   (IW24), so the resource is skipped ([`SkipReason::NoVersionRow`]) and
+//!   left to the sweeper, which writes both; a failed read is
+//!   [`WriteFailure::TriesExhausted`] with nothing sent
+//!   (ADR-aacruzgon-0097).
 //! - **A newer version wins.** Repair writes at `write_ts_of(R1.last_updated)`
 //!   (RW10), so if the resource was updated after R1 was read, the newer
 //!   version's rows carry a higher timestamp and win over this repair's:
@@ -56,8 +64,9 @@
 //!   kept an intent.
 //!
 //! Repair never writes `resources`, `resource_versions` or an intent row,
-//! and never sends a CAS. Its only statements are the index writer's
-//! batches ([`CassandraBackend::write_index_delta_repair`], one try, IW17).
+//! and never sends a CAS or a serial read. Its only statements are the
+//! version-row read and the index writer's batches
+//! ([`CassandraBackend::write_index_delta_repair`], one try, IW17).
 //!
 //! # Step 6's contract
 //!
@@ -71,7 +80,9 @@
 //! - Queue every candidate the tag check hides for its tag: an index row
 //!   whose `version_id` is not R1's, a deleted R1, or no R1. Pass the tag
 //!   check's own R1. That R1 is `SELECT_RESOURCE`, which reads the row's
-//!   `index_keys`, so repair needs no other read (RV4).
+//!   `index_keys`, so repair reads only the current version's row of
+//!   `resource_versions`, to skip a version vread cannot open yet (RV4 as
+//!   amended by ADR-aacruzgon-0097).
 //! - Build each [`StaleIndexRow`]'s key from the stored column values as
 //!   they are, never through `index_text` again. Send a row the search
 //!   cannot decode, or one [`StaleIndexRow::new`] refuses, to
@@ -85,12 +96,14 @@
 use std::future::Future;
 use std::time::Duration;
 
+use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
 use super::backend::CassandraBackend;
 use super::index_keys::{self, IndexKey};
 use super::read::ResourceRow;
+use super::session::StatementKind;
 use super::stats::IndexWriteStats;
 use super::write::{
     IndexDelta, IndexRow, RowKey, VersionKeys, WriteFailure, index_delta, index_pack_stats,
@@ -108,6 +121,11 @@ pub(crate) const REPAIR_CONCURRENCY: usize = 4;
 pub(crate) const MAX_FULL_REPAIR_KEYS: usize = 64;
 /// Tries of each batch of a repair (IW17, RV7).
 const REPAIR_TRIES: u32 = 1;
+
+/// Whether R1's version row exists, read at `LOCAL_QUORUM` before a repair
+/// sends anything (IW24; ADR-aacruzgon-0097).
+const SELECT_VERSION_ROW_EXISTS: &str = "SELECT version_id FROM resource_versions \
+     WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
 
 /// One index row a search found and the tag check hid.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,10 +206,15 @@ pub(crate) enum SkipReason {
     NotStale,
     /// Past `MAX_REPAIRS_PER_SEARCH` or `MAX_REPAIR_ROWS_PER_SEARCH` (RV5).
     Budget,
+    /// Admitted, but R1's version has no `resource_versions` row yet: its
+    /// write skipped the index step when the version row failed (IW24), and
+    /// the sweeper writes both. Repairing it would let search find a version
+    /// vread cannot open (ADR-aacruzgon-0097).
+    NoVersionRow,
 }
 
 impl SkipReason {
-    /// "tag_ahead", "no_row", "write_ts", "undecodable_keys", "not_stale", "budget".
+    /// "tag_ahead", "no_row", "write_ts", "undecodable_keys", "not_stale", "budget", "no_version_row".
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             SkipReason::TagAhead => "tag_ahead",
@@ -200,6 +223,7 @@ impl SkipReason {
             SkipReason::UndecodableKeys => "undecodable_keys",
             SkipReason::NotStale => "not_stale",
             SkipReason::Budget => "budget",
+            SkipReason::NoVersionRow => "no_version_row",
         }
     }
 }
@@ -214,7 +238,7 @@ pub(crate) enum RepairOutcome {
         failure: WriteFailure,
         index: IndexWriteStats,
     },
-    /// Nothing sent.
+    /// No write sent (a `NoVersionRow` skip has sent its one read).
     Skipped(SkipReason),
 }
 
@@ -721,7 +745,9 @@ impl CassandraBackend {
         }
     }
 
-    /// Writes `plan` through `write_index_delta_repair` at `write_ts_of(row.last_updated)`, `REPAIR_TRIES`; logs and counts.
+    /// Reads R1's version row (IW24), then writes `plan` through `write_index_delta_repair` at
+    /// `write_ts_of(row.last_updated)`, `REPAIR_TRIES`; logs and counts. With no version row it
+    /// sends nothing and skips (`NoVersionRow`); a failed read is `Failed` with nothing packed.
     /// Sets `packed` to what the writer packs before it sends, so a repair cut by the deadline can report it.
     async fn send_repair(
         &self,
@@ -731,6 +757,44 @@ impl CassandraBackend {
         delta: &IndexDelta<'_>,
         packed: &Mutex<Option<IndexWriteStats>>,
     ) -> RepairOutcome {
+        // IW24: a write whose version row failed skips its index step, so R1
+        // can name a version with no row yet. Writing that version's index
+        // rows would let search find a version vread and `_history` cannot
+        // open, so read the row first and leave such a resource to the
+        // sweeper, which writes both (ADR-aacruzgon-0097).
+        let values = vec![
+            Value::from(key.tenant_id),
+            Value::from(key.resource_type),
+            Value::from(key.id),
+            Value::from(row.version_id),
+        ];
+        match self
+            .session
+            .rows(SELECT_VERSION_ROW_EXISTS, values, StatementKind::Read)
+            .await
+        {
+            Ok(rows) if !rows.is_empty() => {}
+            Ok(_) => {
+                self.note_repair_skip(key, Some(row.version_id), SkipReason::NoVersionRow);
+                return RepairOutcome::Skipped(SkipReason::NoVersionRow);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tenant_id = %key.tenant_id,
+                    resource_type = key.resource_type,
+                    id = key.id,
+                    version_id = row.version_id,
+                    error = ?error,
+                    "repair on read could not read the current version's row, so it sent nothing"
+                );
+                let index = IndexWriteStats::default();
+                self.repair_counters.failed(&index);
+                return RepairOutcome::Failed {
+                    failure: WriteFailure::TriesExhausted,
+                    index,
+                };
+            }
+        }
         let ts = write_ts_of(row.last_updated);
         *packed.lock() = Some(index_pack_stats(key, delta, ts));
         let outcome = self
@@ -1338,7 +1402,8 @@ mod tests {
         assert_eq!(index.rows_inserted, k2.len() as u64);
         assert_eq!(index.rows_deleted, 1);
         assert_eq!(spent.batch + spent.write, index.batches);
-        assert_eq!((spent.read, spent.serial_read, spent.cas), (0, 0, 0));
+        // One read, of the version row, per admitted repair (ADR-aacruzgon-0097).
+        assert_eq!((spent.read, spent.serial_read, spent.cas), (1, 0, 0));
         assert_eq!((stats.queued, stats.repaired, stats.failed), (1, 1, 0));
         assert_eq!(stats.repaired_partial, 0);
         assert_eq!(
@@ -1405,7 +1470,8 @@ mod tests {
         let (before, at) = (backend.repair_stats(), backend.statement_counts());
         let outcomes = context.run(&backend).await;
         let spent = backend.statement_counts().since(&at);
-        assert_eq!((spent.read, spent.serial_read, spent.cas), (0, 0, 0));
+        // One read, of the version row, per admitted repair (ADR-aacruzgon-0097).
+        assert_eq!((spent.read, spent.serial_read, spent.cas), (1, 0, 0));
         eprintln!(
             "[repair case=older-r1 {}]",
             backend.repair_stats().since(&before)
@@ -1551,7 +1617,8 @@ mod tests {
             (36, n as u64, 34 - n as u64, 1, 1, 0)
         );
         assert_eq!(spent.batch + spent.write, batches);
-        assert_eq!((spent.read, spent.serial_read, spent.cas), (0, 0, 0));
+        // One read, of the version row, per admitted repair (ADR-aacruzgon-0097).
+        assert_eq!((spent.read, spent.serial_read, spent.cas), (n as u64, 0, 0));
         assert_consistent(&check(&backend, &t).await);
     }
 
@@ -1970,7 +2037,8 @@ mod tests {
             )
             .await;
         let spent = backend.statement_counts().since(&at);
-        assert_eq!((spent.read, spent.serial_read, spent.cas), (0, 0, 0));
+        // One read, of the version row, per admitted repair (ADR-aacruzgon-0097).
+        assert_eq!((spent.read, spent.serial_read, spent.cas), (1, 0, 0));
         eprintln!(
             "[repair case=retag {}]",
             backend.repair_stats().since(&before)
@@ -2394,12 +2462,12 @@ mod tests {
     }
 
     /// The whole phase has one deadline. With a deadline of zero the driver
-    /// polls each repair once, which starts its write, then sees the deadline
+    /// polls each repair once, which sends its version-row read
+    /// (ADR-aacruzgon-0097), then sees the deadline
     /// has passed and drops them, so no repair can finish: the cut does not
     /// depend on the node's speed or the clock. Every repair is `Failed`,
-    /// counted, and `run` returns at once. The writes that were started may
-    /// have applied, so a second, ordinary run repeats them and ends
-    /// consistent.
+    /// counted, and `run` returns at once. A second, ordinary run repeats
+    /// them and ends consistent.
     #[tokio::test]
     async fn repair_returns_at_its_deadline_with_the_unfinished_failed() {
         let Some(backend) = backend().await else {
@@ -2450,11 +2518,12 @@ mod tests {
     }
 
     /// Five repairs and two skips with a deadline of zero. The driver polls
-    /// the first four repairs once, which packs their rows and starts their
-    /// writes, then drops them; the fifth never starts. So the first four are
-    /// `Failed` with their packed rows, the fifth is `Failed` with none, the
-    /// skips behind them stay skips, and the counters equal the sum of the
-    /// outcomes.
+    /// the first four repairs once, which sends their version-row reads
+    /// (ADR-aacruzgon-0097), then drops them; the fifth never starts. So all
+    /// five are `Failed` with nothing packed, since none reached its batches,
+    /// the skips behind them stay skips, and the counters equal the sum of
+    /// the outcomes. What a repair cut after it packed reports is
+    /// `a_cut_repair_reports_what_it_packed_and_one_that_never_started_nothing`'s.
     #[tokio::test]
     async fn skips_behind_cut_repairs_stay_skips_and_the_counters_add_up() {
         let Some(backend) = backend().await else {
@@ -2468,7 +2537,6 @@ mod tests {
             let id = format!("r{i}");
             rows.push((id.clone(), updated(&backend, &tenant, &t, &id).await));
         }
-        let k2_len = keys_of(&rows[0].1.0).len() as u64;
         let queue = || {
             let mut context = RepairContext::new(&t);
             for (id, (row, stale)) in &rows {
@@ -2484,20 +2552,12 @@ mod tests {
         let stats = backend.repair_stats().since(&before);
         eprintln!("[repair case=cut {stats}]");
         assert_eq!(outcomes.len(), 7);
-        for outcome in &outcomes[..4] {
-            let RepairOutcome::Failed { failure, index } = outcome else {
-                panic!("{outcomes:?}");
-            };
-            assert_eq!(*failure, WriteFailure::TriesExhausted);
-            assert_eq!((index.rows_inserted, index.rows_deleted), (k2_len, 1));
-            assert!(index.batches >= 1);
-        }
         assert_eq!(
-            outcomes[4],
-            RepairOutcome::Failed {
+            outcomes[..5],
+            [RepairOutcome::Failed {
                 failure: WriteFailure::TriesExhausted,
                 index: IndexWriteStats::default(),
-            }
+            }; 5]
         );
         assert_eq!(
             outcomes[5..],
@@ -2512,7 +2572,7 @@ mod tests {
             ),
             (7, 0, 5, 2)
         );
-        assert_eq!((stats.rows_inserted, stats.rows_deleted), (4 * k2_len, 4));
+        assert_eq!((stats.rows_inserted, stats.rows_deleted), (0, 0));
 
         let outcomes = queue().run(&backend).await;
         assert!(
@@ -2673,5 +2733,166 @@ mod tests {
                 .collect();
             assert_eq!(rows, [(lu2, 2)], "found_type_row={found_type_row}");
         }
+    }
+
+    /// The type rows of `p`, by tag, in `type_search`'s order.
+    async fn type_row_tags(backend: &CassandraBackend, t: &str) -> Vec<i32> {
+        type_search(backend, t)
+            .await
+            .into_iter()
+            .filter(|(id, ..)| id == "p")
+            .map(|(_, _, tag)| tag)
+            .collect()
+    }
+
+    /// ADR-aacruzgon-0097. An update whose version row fails all its tries
+    /// answers success and skips its index step (IW24), so R1 names version
+    /// 2 while only version 1's index rows and version row exist. The repair
+    /// reads version 2's row first, finds none and sends nothing: the type
+    /// rows stay at version 1, so search never finds a version vread cannot
+    /// open. Before the rule it wrote version 2's rows, and vread of 2 found
+    /// nothing. The control, a crash after the version row, is repaired.
+    #[tokio::test]
+    async fn repair_skips_a_version_with_no_version_row_and_sends_nothing() {
+        use crate::core::VersionedStorage;
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        for version_row_fails in [true, false] {
+            let t = tenant_id(if version_row_fails {
+                "repair-no-version-row"
+            } else {
+                "repair-version-row"
+            });
+            let tenant = context(&t);
+            let p = backend
+                .create(&tenant, "Patient", patient(), test_fhir_version())
+                .await
+                .expect("create p");
+            if version_row_fails {
+                // V3 (step 2) shares V1's text, so let it through; then V1
+                // fails every try.
+                backend.session.inject_fault(
+                    StatementKind::Write,
+                    "INSERT INTO resource_versions",
+                    Fault::PassThrough,
+                );
+                for _ in 0..3 {
+                    backend.session.inject_fault(
+                        StatementKind::Write,
+                        "INSERT INTO resource_versions",
+                        Fault::FailWithUnavailable,
+                    );
+                }
+                backend
+                    .update(&tenant, &p, changed())
+                    .await
+                    .expect("the update answers success (G23)");
+            } else {
+                crash_update(&backend, &tenant, &t, &p, changed()).await;
+            }
+            let row = r1_of(&backend, &t, "p").await;
+            assert_eq!(row.version_id, 2);
+            let versions = version_ids(&backend, &t, "Patient", "p").await;
+            assert_eq!(
+                versions,
+                if version_row_fails {
+                    vec![1]
+                } else {
+                    vec![1, 2]
+                }
+            );
+            assert_eq!(type_row_tags(&backend, &t).await, [1]);
+
+            let stale = found(&type_search(&backend, &t).await, "p", 2);
+            let mut context = RepairContext::new(&t);
+            context.queue("Patient", "p", Some(row.clone()), stale);
+            let (before, at) = (backend.repair_stats(), backend.statement_counts());
+            let outcomes = context.run(&backend).await;
+            let stats = backend.repair_stats().since(&before);
+            let spent = backend.statement_counts().since(&at);
+            eprintln!("[repair case=no-version-row={version_row_fails} {stats}]");
+            let vread = backend
+                .vread(&tenant, "Patient", "p", "2")
+                .await
+                .expect("vread");
+            if version_row_fails {
+                assert!(vread.is_none(), "no version 2 to open");
+                assert_eq!(
+                    type_row_tags(&backend, &t).await,
+                    [1],
+                    "search must not find version 2"
+                );
+                assert_eq!(outcomes, [RepairOutcome::Skipped(SkipReason::NoVersionRow)]);
+                assert_eq!(spent.batch + spent.write, 0, "nothing sent");
+                assert_eq!(
+                    (stats.skipped_no_version_row, stats.repaired, stats.failed),
+                    (1, 0, 0)
+                );
+                assert_eq!((stats.rows_inserted, stats.rows_deleted), (0, 0));
+            } else {
+                assert!(
+                    matches!(outcomes[..], [RepairOutcome::Repaired { full: true, .. }]),
+                    "{outcomes:?}"
+                );
+                assert_eq!((stats.skipped_no_version_row, stats.repaired), (0, 1));
+                assert_eq!(type_row_tags(&backend, &t).await, [2]);
+                assert!(vread.is_some());
+            }
+            assert_eq!(spent.read, 1, "the version-row read");
+            assert_eq!((spent.serial_read, spent.cas), (0, 0));
+        }
+    }
+
+    /// A version-row read that fails leaves the repair `Failed` with
+    /// nothing packed or sent, and counted (ADR-aacruzgon-0097).
+    #[tokio::test]
+    async fn a_failed_version_row_read_fails_the_repair_and_sends_nothing() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-version-read-fails");
+        let tenant = context(&t);
+        let p = backend
+            .create(&tenant, "Patient", patient(), test_fhir_version())
+            .await
+            .expect("create p");
+        crash_update(&backend, &tenant, &t, &p, changed()).await;
+        let row = r1_of(&backend, &t, "p").await;
+        let stale = found(&type_search(&backend, &t).await, "p", 2);
+        backend.session.inject_fault(
+            StatementKind::Read,
+            SELECT_VERSION_ROW_EXISTS,
+            Fault::FailWithUnavailable,
+        );
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "p", Some(row.clone()), stale.clone());
+        let (before, at) = (backend.repair_stats(), backend.statement_counts());
+        let outcomes = context.run(&backend).await;
+        let stats = backend.repair_stats().since(&before);
+        let spent = backend.statement_counts().since(&at);
+        assert_eq!(
+            outcomes,
+            [RepairOutcome::Failed {
+                failure: WriteFailure::TriesExhausted,
+                index: IndexWriteStats::default(),
+            }]
+        );
+        assert_eq!((spent.read, spent.batch + spent.write), (1, 0));
+        assert_eq!((stats.failed, stats.repaired), (1, 0));
+        assert_eq!((stats.rows_inserted, stats.rows_deleted), (0, 0));
+        assert_eq!(type_row_tags(&backend, &t).await, [1]);
+
+        // A later search's repair, with the read answered, heals it.
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "p", Some(row), stale);
+        let outcomes = context.run(&backend).await;
+        assert!(
+            matches!(outcomes[..], [RepairOutcome::Repaired { full: true, .. }]),
+            "{outcomes:?}"
+        );
+        assert_eq!(type_row_tags(&backend, &t).await, [2]);
     }
 }

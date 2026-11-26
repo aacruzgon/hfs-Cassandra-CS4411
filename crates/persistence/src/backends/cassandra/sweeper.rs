@@ -3837,6 +3837,119 @@ mod node_tests {
         );
     }
 
+    /// ADR-aacruzgon-0099 (CodeRabbit on #122): as [`follow_of_a_read_newer_than_the_reloads`],
+    /// stamped before the reload began, with v1's body one the loader cannot parse (`"type":
+    /// "invalid"`) or, as the control, a valid one. The follow is put after the reload merged
+    /// (`merged_first`) or between its reads and its merge. The reload read the id at v1 either
+    /// way, so A's read of v2 came after it, and v2 is in force.
+    async fn follow_after_a_reload_read_v1(
+        parses: bool,
+        merged_first: bool,
+    ) -> Option<Option<String>> {
+        let (a, t, tenant, _) = start("sweeper-sp-unparsed").await?;
+        let b = harness::backend().await.expect("instance B");
+        let url = format!("http://example.org/SearchParameter/{t}");
+        let mut body = search_parameter(&url);
+        if !parses {
+            body["type"] = serde_json::json!("invalid");
+        }
+        let v1 = a
+            .create(&tenant, "SearchParameter", body, test_fhir_version())
+            .await
+            .expect("create");
+        let before = a.search_parameter_read_stamp();
+        let follow_v2 = async {
+            let mut v2 = search_parameter(&url);
+            v2["expression"] = serde_json::json!("Patient.gender");
+            b.update(&tenant, &v1, v2).await.expect("B's update to v2");
+            let row = a
+                .serial_read_resource_row(&t, "SearchParameter", "sp")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.version_id, 2);
+            a.follow_stored_search_parameter(&t, "sp", Some(&row), before);
+        };
+        if merged_first {
+            a.load_stored_search_parameters(&t).await.unwrap();
+            follow_v2.await;
+        } else {
+            a.load_stored_search_parameters_around(&t, follow_v2)
+                .await
+                .unwrap();
+        }
+        Some(expression_of(&a, &tenant, &url))
+    }
+
+    #[tokio::test]
+    async fn a_follow_newer_than_an_unparsed_version_the_reload_read_is_kept() {
+        let Some(first) = follow_after_a_reload_read_v1(false, true).await else {
+            return;
+        };
+        let mut outcomes = vec![first];
+        for (parses, merged_first) in [(false, false), (true, true), (true, false)] {
+            outcomes.push(
+                follow_after_a_reload_read_v1(parses, merged_first)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let gender = Some("Patient.gender".to_string());
+        assert_eq!(
+            outcomes,
+            [gender.clone(), gender.clone(), gender.clone(), gender],
+            "(v1 does not parse: reload merged first, follow put first; v1 parses: the same)"
+        );
+    }
+
+    /// ADR-aacruzgon-0099 (CodeRabbit on #122): an id whose newest version is one the loader cannot
+    /// parse. A reads v0 (valid, `Patient.active`); B updates it to v1, which does not parse (or, as
+    /// the control, to a valid v1, `Patient.gender`); A reloads, then follows its read of v0, stamped
+    /// after the reload began so `since` does not hold it back. Returns the expression in force.
+    async fn stale_follow_after_a_reload_of(v1_parses: bool) -> Option<Option<String>> {
+        let (a, t, tenant, _) = start("sweeper-sp-unparsed-newest").await?;
+        let b = harness::backend().await.expect("instance B");
+        let url = format!("http://example.org/SearchParameter/{t}");
+        let v0 = b
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter(&url),
+                test_fhir_version(),
+            )
+            .await
+            .expect("B's create");
+        let stale = a
+            .serial_read_resource_row(&t, "SearchParameter", "sp")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut v1 = search_parameter(&url);
+        if v1_parses {
+            v1["expression"] = serde_json::json!("Patient.gender");
+        } else {
+            v1["type"] = serde_json::json!("invalid");
+        }
+        b.update(&tenant, &v0, v1).await.expect("B's update to v1");
+        a.load_stored_search_parameters(&t).await.unwrap();
+        let after = a.search_parameter_read_stamp();
+        a.follow_stored_search_parameter(&t, "sp", Some(&stale), after);
+        Some(expression_of(&a, &tenant, &url))
+    }
+
+    #[tokio::test]
+    async fn a_stale_follow_does_not_bring_back_a_version_an_unparsed_one_replaced() {
+        let Some(unparsed) = stale_follow_after_a_reload_of(false).await else {
+            return;
+        };
+        let control = stale_follow_after_a_reload_of(true).await.unwrap();
+        assert_eq!(
+            (unparsed.as_deref(), control.as_deref()),
+            (None, Some("Patient.gender")),
+            "(v1 does not parse, v1 parses)"
+        );
+    }
+
     /// A SearchParameter created with every `resources_by_type` insert failing, so its intent is
     /// left for the sweeper, and dropped from the overlay by a reload, so only a follow puts it back.
     /// Returns the backend, the tenant, its context, the `url` and the intent.

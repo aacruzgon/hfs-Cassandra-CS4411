@@ -236,8 +236,9 @@ impl TenantOverlay {
     /// Replaces the definitions with what a reload read, given that it began
     /// at `since`:
     /// - each id the reload read but the overlay does not hold (`removed`: a
-    ///   row not `active`, or one whose body the overlay does not take, at
-    ///   its `last_updated`, or a delete marker the reload read because the
+    ///   row not `active`, or one whose body the overlay does not take (a
+    ///   base `url`, or one the loader cannot parse), at its `last_updated`,
+    ///   or a delete marker the reload read because the
     ///   delete landed between its id scan and its read) is recorded as a
     ///   removal, so an older read of it, such as a replay's that began
     ///   before the change (SW19), is refused later as one of this process's
@@ -321,6 +322,18 @@ impl TenantOverlay {
 /// Each tenant's stored-SearchParameter overlay, read by the registry
 /// loader. A map lookup cannot fail, so the loader always reports success.
 type StoredByTenant = Arc<RwLock<HashMap<String, TenantOverlay>>>;
+
+/// What a reload of one tenant read, before it is merged
+/// ([`TenantOverlay::merge_reload`]).
+struct ReloadRead {
+    /// The definitions read that the overlay holds.
+    loaded: Vec<StoredDefinition>,
+    /// The ids read that the overlay does not hold, each at the
+    /// `last_updated` read.
+    removed: Vec<(String, chrono::DateTime<chrono::Utc>)>,
+    /// The [`CassandraBackend::note_seq`] value taken before the id scan.
+    since: u64,
+}
 
 /// What [`CassandraBackend::load_all_stored_search_parameters`] loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -826,6 +839,15 @@ impl CassandraBackend {
     /// The mapped driver error of the id scan or of any read. The overlay is
     /// unchanged then.
     pub async fn load_stored_search_parameters(&self, tenant_id: &str) -> StorageResult<usize> {
+        let read = self.read_stored_search_parameters(tenant_id).await?;
+        Ok(self.merge_into_overlay(tenant_id, read.loaded, read.removed, read.since))
+    }
+
+    /// The reads of a reload of `tenant_id` ([`Self::load_stored_search_parameters`]):
+    /// `since`, taken before the id scan, then what each listed id's row
+    /// holds, as a definition the overlay holds or as a removal. Changes
+    /// nothing; the merge does.
+    async fn read_stored_search_parameters(&self, tenant_id: &str) -> StorageResult<ReloadRead> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
         use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
@@ -867,12 +889,17 @@ impl CassandraBackend {
                 removed.push((stored.id().to_string(), stored.last_modified()));
                 continue;
             }
+            // A body the loader cannot parse is not held either, so it is a
+            // removal at its `last_updated`, as an update or a follow to it
+            // records one (`overlay_definition`): an older version is not put
+            // back, and a follow of a newer one is kept (ADR-aacruzgon-0099).
             let Ok(mut definition) = loader.parse_resource(stored.content()) else {
                 tracing::warn!(
                     tenant_id,
                     id = stored.id(),
                     "stored SearchParameter does not parse; leaving it out of the registry"
                 );
+                removed.push((stored.id().to_string(), stored.last_modified()));
                 continue;
             };
             // Unreachable while `create_affects_overlay` requires
@@ -896,7 +923,11 @@ impl CassandraBackend {
             });
         }
 
-        Ok(self.merge_into_overlay(tenant_id, loaded, removed, since))
+        Ok(ReloadRead {
+            loaded,
+            removed,
+            since,
+        })
     }
 
     /// The end of a reload of `tenant_id` that began at `since`, read
@@ -1178,6 +1209,22 @@ impl CassandraBackend {
             .or_default()
             .remove(id, at);
         self.registries.invalidate(tenant_id);
+    }
+
+    /// Tests only: a reload of `tenant_id` that runs `between` after its
+    /// reads and before its merge, as a follow put while the reload runs is.
+    /// Returns how many definitions the overlay holds after the merge.
+    #[cfg(test)]
+    pub(super) async fn load_stored_search_parameters_around<
+        F: std::future::Future<Output = ()>,
+    >(
+        &self,
+        tenant_id: &str,
+        between: F,
+    ) -> StorageResult<usize> {
+        let read = self.read_stored_search_parameters(tenant_id).await?;
+        between.await;
+        Ok(self.merge_into_overlay(tenant_id, read.loaded, read.removed, read.since))
     }
 
     /// Tests only: the `since` a reload beginning now takes, as

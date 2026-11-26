@@ -24,13 +24,15 @@
 //!   deletes the `resources_by_type` row each older version may have left,
 //!   as the writer deletes the previous version's type row in the same batch
 //!   as it inserts the new one (step 5): at each found row's `last_updated`,
-//!   and at the `last_updated` of every version from the lowest found tag up
-//!   to R1, at most [`MAX_TYPE_ROW_VERSIONS`] below R1, read from
-//!   `resource_versions`. So a repair started from a token or a date row,
-//!   or after two unfinished writes in a row, leaves one type row
-//!   (ADR-aacruzgon-0096). An older type row below that cap, which only a
-//!   chain of more than that many unfinished writes leaves, stays for the
-//!   sweeper's replay of those writes' intents.
+//!   and at the `last_updated` of every version from
+//!   [`MAX_TYPE_ROW_VERSIONS`] below R1 (or version 1) up to R1, whatever
+//!   the found tags, read from `resource_versions`. So a repair started from
+//!   a token or a date row, after one or more unfinished type-row batches
+//!   within those versions, leaves one type row (ADR-aacruzgon-0096). A type
+//!   row that an unfinished type-row batch left more than
+//!   `MAX_TYPE_ROW_VERSIONS` versions below R1 stays until the sweeper
+//!   replays the next version's intent, or until a search that finds that
+//!   row repairs it.
 //! - **Partial replay (RV1).** Above that, repair only touches the rows the
 //!   search found. A found row whose key K(current) still produces *moves*
 //!   to R1's `last_updated`, as the update itself moves it: it is deleted at
@@ -90,10 +92,10 @@
 //! - Queue every candidate the tag check hides for its tag: an index row
 //!   whose `version_id` is not R1's, a deleted R1, or no R1. Pass the tag
 //!   check's own R1. That R1 is `SELECT_RESOURCE`, which reads the row's
-//!   `index_keys`, so repair reads only `resource_versions`, from the
-//!   lowest found tag (at most [`MAX_TYPE_ROW_VERSIONS`] below R1) up to
-//!   R1, to skip a version vread cannot open yet and to find the old type
-//!   rows (RV4 as amended by ADR-aacruzgon-0097 and 0096).
+//!   `index_keys`, so repair reads only `resource_versions`, from
+//!   [`MAX_TYPE_ROW_VERSIONS`] below R1 (or version 1) up to R1, to skip a
+//!   version vread cannot open yet and to find the old type rows (RV4 as
+//!   amended by ADR-aacruzgon-0097 and 0096).
 //! - Build each [`StaleIndexRow`]'s key from the stored column values as
 //!   they are, never through `index_text` again. Send a row the search
 //!   cannot decode, or one [`StaleIndexRow::new`] refuses, to
@@ -276,8 +278,8 @@ struct RepairPlan {
     previous: Vec<(IndexKey, DateTime<Utc>)>,
     full: bool,
     /// The lowest version the repair's version read starts at: in a full
-    /// plan, the lowest found tag, but at most [`MAX_TYPE_ROW_VERSIONS`]
-    /// below R1; in a partial plan, R1's own version.
+    /// plan, [`MAX_TYPE_ROW_VERSIONS`] below R1, or version 1, whatever the
+    /// found tags; in a partial plan, R1's own version.
     reads_from: i32,
     /// In a full plan, the versions in `reads_from..R1` whose type row no
     /// found row names (none of them is a found row's tag with a
@@ -412,19 +414,15 @@ fn plan_from(below: &[&StaleIndexRow], current: Vec<IndexKey>, r1_version: i32) 
         }
     }
     // A found date row has no `last_updated`, and an older version's type
-    // row can sit at a `last_updated` no found row has (two unfinished
-    // writes in a row), so a full plan also reads the versions from the
-    // lowest found tag up to R1, at most `MAX_TYPE_ROW_VERSIONS` below it,
-    // and deletes the type row at each one's `last_updated` that no found
-    // row already names. An index row tagged V is always at `lu(V)`, so a
-    // found tag with a `last_updated` already names its version's type row.
+    // row can sit at a `last_updated` no found row has: one unfinished
+    // type-row batch leaves it, below or above the found tags. So a full plan
+    // also reads the versions from `MAX_TYPE_ROW_VERSIONS` below R1 (or
+    // version 1) up to R1, whatever the found tags, and deletes the type row
+    // at each one's `last_updated` that no found row already names. An index
+    // row tagged V is always at `lu(V)`, so a found tag with a
+    // `last_updated` already names its version's type row.
     let (reads_from, type_row_versions) = if full {
-        let lowest = below
-            .iter()
-            .map(|s| s.version_id)
-            .min()
-            .unwrap_or(r1_version);
-        let reads_from = lowest.max(r1_version.saturating_sub(MAX_TYPE_ROW_VERSIONS));
+        let reads_from = r1_version.saturating_sub(MAX_TYPE_ROW_VERSIONS).max(1);
         let named: Vec<i32> = below
             .iter()
             .filter(|s| s.last_updated.is_some())
@@ -1171,13 +1169,14 @@ mod tests {
         assert_eq!((plan.reads_from, plan.type_row_versions.len()), (2, 0));
     }
 
-    /// ADR-aacruzgon-0096: a full plan reads the versions from the lowest
-    /// found tag up to R1, and reserves one delete for each version no found
-    /// row with a `last_updated` names: a date row names none (G1), and an
-    /// older version between the found tag and R1 is named by no found row
-    /// (G2).
+    /// ADR-aacruzgon-0096: a full plan reads the versions from
+    /// `MAX_TYPE_ROW_VERSIONS` below R1 (here version 1) up to R1, and
+    /// reserves one delete for each version no found row with a
+    /// `last_updated` names: a date row names none (G1), an older version
+    /// between the found tag and R1 is named by no found row (G2), and
+    /// neither is one below the lowest found tag (H1).
     #[test]
-    fn a_full_plan_reads_back_to_the_lowest_found_tag_and_reserves_the_unnamed_versions() {
+    fn a_full_plan_reads_back_eight_versions_and_reserves_the_unnamed_ones() {
         let rbt = IndexKey::ResourcesByType;
         let row = r1(3, lu(3), &[rbt.clone(), token("t", "a")]);
         // A token row at version 1's `last_updated` names version 1; version 2 is unnamed.
@@ -1194,6 +1193,12 @@ mod tests {
                 .map(|u| u.inserts.len() + u.deletes.len())
                 .sum::<usize>()
                 + 1
+        );
+        // A token row of version 2 names version 2; version 1, below it, is unnamed.
+        let plan = plan_repair(&row, &[s(token("t", "b"), Some(lu(2)), 2)]).unwrap();
+        assert_eq!(
+            (plan.reads_from, plan.type_row_versions.clone()),
+            (1, vec![1])
         );
         // A date row names no version, so both 1 and 2 are read and reserved.
         let plan = plan_repair(&row, &[s(date("d"), None, 1)]).unwrap();
@@ -1229,11 +1234,11 @@ mod tests {
         expected.extend((12..20).map(|v| (rbt.clone(), lu(v))));
         assert_eq!(deletes, sorted(expected));
         assert!(!deletes.contains(&(rbt, lu(2))));
-        // A found tag inside the cap reads from it.
+        // A found tag inside the cap still reads from the cap, and names only its own version.
         let plan = plan_repair(&row, &[s(token("t", "b"), Some(lu(15)), 15)]).unwrap();
         assert_eq!(
             (plan.reads_from, plan.type_row_versions.clone()),
-            (15, (16..20).collect())
+            (12, (12..20).filter(|v| *v != 15).collect())
         );
     }
 
@@ -3222,6 +3227,95 @@ mod tests {
             let tags = type_row_tags(&backend, &t).await;
             eprintln!(
                 "[repair case=chain found_type_row={found_type_row} count={count} tags={tags:?} {outcomes:?}]"
+            );
+            assert_eq!(count, 1, "found_type_row={found_type_row}");
+            assert_eq!(tags, [3], "found_type_row={found_type_row}");
+            assert!(
+                matches!(outcomes[..], [RepairOutcome::Repaired { full: true, .. }]),
+                "{outcomes:?}"
+            );
+        }
+    }
+
+    /// The re-audit of #124's H1, the mirror of G2: version 2's token batch
+    /// applied but its type-row batch did not, so the type row stays at lu1
+    /// (tag 1); then version 3 crashed after its version row. A `gender`
+    /// search finds version 2's `female` row (tag 2, at lu2), which names
+    /// version 2 only. The repair reads back 8 versions below R1 whatever
+    /// the found tags, so version 1's type row is deleted too and `count`
+    /// stays 1. Reading only from the lowest found tag left it, and `count`
+    /// read 2. The control also hands over the type search's rows (tag 1).
+    #[tokio::test]
+    async fn a_full_repair_deletes_a_type_row_below_the_lowest_found_tag() {
+        use crate::core::VersionedStorage;
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        for found_type_row in [false, true] {
+            let t = tenant_id(if found_type_row {
+                "repair-below-tag-type-row"
+            } else {
+                "repair-below-tag-token-row"
+            });
+            let tenant = context(&t);
+            let gender = |code: &str| json!({"resourceType": "Patient", "id": "p", "gender": code});
+            let p = backend
+                .create(&tenant, "Patient", gender("male"), test_fhir_version())
+                .await
+                .expect("create p");
+            let first = r1_of(&backend, &t, "p").await;
+            let lu1 = first.last_updated;
+            let gender_key = |row: &ResourceRow| {
+                keys_of(row)
+                    .into_iter()
+                    .find(|k| matches!(k, IndexKey::TokenCode { param, .. } if param == "gender"))
+                    .expect("the gender key")
+            };
+            let male = gender_key(&first);
+            crash_update(&backend, &tenant, &t, &p, gender("female")).await;
+            let v2 = r1_of(&backend, &t, "p").await;
+            assert_eq!(v2.version_id, 2);
+            let female = gender_key(&v2);
+            // Only version 2's token partition: delete male at lu1, insert female at lu2.
+            let old = [male];
+            let previous: Vec<IndexRow<'_>> = vec![(&old[0], lu1)];
+            let next = [female.clone()];
+            let delta = index_delta(
+                &previous,
+                VersionKeys {
+                    version_id: 2,
+                    last_updated: v2.last_updated,
+                    fhir_version: v2.fhir_version_text(),
+                    keys: &next,
+                },
+            );
+            let done = backend
+                .write_index_delta(&key(&t, "p"), &delta, write_ts_of(v2.last_updated), 3)
+                .await;
+            assert_eq!(done.result, Ok(()));
+            assert_eq!(type_row_tags(&backend, &t).await, [1]);
+            let p2 = backend
+                .vread(&tenant, "Patient", "p", "2")
+                .await
+                .expect("vread 2")
+                .expect("version 2");
+            crash_update(&backend, &tenant, &t, &p2, gender("other")).await;
+            let row = r1_of(&backend, &t, "p").await;
+            assert_eq!(row.version_id, 3);
+            assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+
+            let mut stale = vec![StaleIndexRow::new(female, Some(v2.last_updated), 2).unwrap()];
+            if found_type_row {
+                stale.extend(found(&type_search(&backend, &t).await, "p", 3));
+            }
+            let mut context = RepairContext::new(&t);
+            context.queue("Patient", "p", Some(row.clone()), stale);
+            let outcomes = context.run(&backend).await;
+            let count = backend.count(&tenant, Some("Patient")).await.unwrap();
+            let tags = type_row_tags(&backend, &t).await;
+            eprintln!(
+                "[repair case=below-tag found_type_row={found_type_row} count={count} tags={tags:?} {outcomes:?}]"
             );
             assert_eq!(count, 1, "found_type_row={found_type_row}");
             assert_eq!(tags, [3], "found_type_row={found_type_row}");

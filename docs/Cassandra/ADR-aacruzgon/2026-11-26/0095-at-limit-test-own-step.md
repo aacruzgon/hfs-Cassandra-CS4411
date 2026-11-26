@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0095: The 65,535-statement batch test runs alone, in a step of its own (amends ADR-aacruzgon-0054)
 
 - **Date:** 2026-11-26
-- **Status:** accepted (by the orchestrator, which applied Alan's delegation of 2026-11-25 to this pull request; see AI involvement)
+- **Status:** proposed (drafted under Alan's delegation of 2026-11-25, applied to this pull request; awaiting Alan's confirmation of its text)
 - **Context:**
     - **The test.** `a_batch_over_the_statement_limit_is_refused_and_sends_nothing` (`session.rs`, ADR-aacruzgon-0089) sends one batch of exactly 65,535 statements, all writing one `resources_by_type` row. ADR-aacruzgon-0054 put it in the required job's step "cargo test --lib backends::cassandra against this node", where it runs alongside the rest of the suite, at libtest's default thread count.
     - **The failure.** On `sam-7900x` the batch timed out with `WriteTimeout` ("received only 0 responses", `LOCAL_QUORUM`, write type `SIMPLE`). The CQL audit check then failed as well ("cannot rule out a CQL DELETE: a failed native-protocol batch"), as ADR-aacruzgon-0058 foresaw for a timed-out native batch. The record of the schema job, from 2026-11-25 to 2026-11-26:

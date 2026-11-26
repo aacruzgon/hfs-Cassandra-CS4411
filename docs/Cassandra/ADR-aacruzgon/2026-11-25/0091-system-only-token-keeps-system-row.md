@@ -24,7 +24,7 @@
     - Every other IW2 and P5 drop stays.
     - The code change is in `index_keys_from` (`index_keys.rs:449-451`): when `code` is empty, insert `IndexKey::TokenSystem { param, system, code }` if the system is real, then `continue`.
     - It lands in its own Cassandra pull request.
-    - Values reach it only once the shared converter emits them (HeliosSoftware/hfs#2965). Until then it changes no write made through REST. Every REST write path removes an empty `code` before extraction (`drop_empty_elements`, HeliosSoftware/hfs#2554, in the fork since the sync of 2026-11-18; `crates/rest/src/validation.rs:212-214`, `crates/persistence/src/core/patch.rs:157`). The one exception, `$meta-add`, adds only bare Codings to `meta.tag` and `meta.security`, and the converter skips those when their code is empty (`converters.rs:500`). Only a direct caller of the storage API can pass a CodeableConcept coding with `"code": ""` (`converters.rs:509`), which then gets its `TokenSystem` key.
+    - Values reach it only once the shared converter emits them (HeliosSoftware/hfs#2965). Until then it changes no write made through REST. Every REST write path removes an empty `code` before extraction (`drop_empty_elements`, HeliosSoftware/hfs#2554, in the fork since the sync of 2026-11-18; `crates/rest/src/validation.rs:212-214`, `crates/persistence/src/core/patch.rs:157`). The one exception, `$meta-add`, adds only bare Codings to `meta.tag` and `meta.security`, and the converter skips those when their code is empty (`converters.rs:500`). Only a direct caller of the storage API can pass an empty code: a CodeableConcept coding with `"code": ""` (`converters.rs:509`), or a ContactPoint with system `phone` or `email` and `"value": ""` (`converters.rs:569-580`; on a Patient it gets two keys, `phone` and `telecom`). Each then gets its `TokenSystem` key, which the pipe form on ContactPoint that ADR-aacruzgon-0027 C4 serves (`telecom=phone|`) reads, as SQLite's `value_token_system = ?` does.
 - **Alternatives considered:**
     - **Keep IW2's drop.** Lost: once the converter is fixed, every backend but Cassandra would answer `system|` for these resources, and the drop rests on a premise the spec does not support.
     - **Write all three token rows for an empty code.** Lost: no query form reads a code row with an empty code, so they are dead rows and tombstones.
@@ -36,7 +36,7 @@
         - `token_forms_map_to_the_three_tables` (`index_keys.rs:954`) pins IW2. Its input has `token("code", Some("http://loinc.org"), "")` and it expects 15 keys. It must expect the new `TokenSystem { param: "code", system: "http://loinc.org", code: "" }` (16 keys).
         - A new unit test: a real system with an empty code gives exactly one `TokenSystem` key; the `IMPLICIT` marker or `''` with an empty code gives none.
         - A REST-level test once Step 6 serves `system|`.
-    - Rows written before the change are not rewritten. Since the converter emits no such value yet, and REST removes an empty `code` before storing (HeliosSoftware/hfs#2554), there are none to fix, except a resource stored with `"code": ""` before the sync of 2026-11-18 or through the storage API, which a reload or its next REST write cleans (`crates/persistence/README.md`, "Keyspaces written before index writes").
+    - Rows written before the change are not rewritten. Since the converter emits no such value yet, and REST removes an empty `code` before storing (HeliosSoftware/hfs#2554), there are none to fix, except a resource stored with `"code": ""`, or a ContactPoint with `"value": ""`, before the sync of 2026-11-18 or through the storage API, which a reload or its next REST write cleans (`crates/persistence/README.md`, "Keyspaces written before index writes").
     - **Not tested so far:** a Coding with a system and no code. It has the same shape in the converter (`converters.rs:493` for a bare Coding, `:509` for a CodeableConcept's coding, which emits one whose `code` is `""`) and in `index_keys_from`, but no run covered it. The pull request's tests must.
     - **Design documents.** `cassandra-discussion.md:188` and `walkthrough.md:959` change in the same commit as this entry.
 - **AI involvement:** Claude Code (Claude Opus 5.5), in a validation worker run by Alan.
@@ -48,7 +48,7 @@
         - the rows on a 5.0.9 node;
         - that the existing test pins the old rule (read, not run).
     - **Not verified:** a Coding with a system and no code; a REST search on the new row (search is 501 until Step 6).
-    - **What the human changed:** Alan approved the draft as written on 2026-11-25. Alan approved the audit's corrections on 2026-11-25 (D1/F7 for 0091).
+    - **What the human changed:** Alan approved the draft as written on 2026-11-25. Alan approved the audit's corrections on 2026-11-25 (D1/F7 and E3 for 0091).
 - **Links:**
     - IW2's "Only invalid content…" was overtaken by the fork's sync of 2026-11-18 (HeliosSoftware/hfs#2554): through REST, no backend receives that content.
     - ADR-sam-michaels-0006, IW2 and Decision 9 (amended); ADR-aacruzgon-0027, G18/P5 (its premise corrected).

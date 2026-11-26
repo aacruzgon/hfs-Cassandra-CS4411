@@ -67,7 +67,9 @@
 //! more to say it is kept; later tries log at `warn`, the request path always
 //! at `error`. The list holds at most [`RETRY_LIST_CAP`]
 //! entries; when it is full the intent's shard keeps its mark, so the next
-//! poll reads it again. The intent row is never deleted for a failure.
+//! poll reads it again, and logs at `error` that the list is full. A refused
+//! write the full list cannot take is not counted and logs at `warn`. The
+//! intent row is never deleted for a failure.
 //!
 //! # The load limit (RW4)
 //!
@@ -391,8 +393,8 @@ pub(crate) struct RetryList {
     gave_up: BTreeMap<RetryKey, DateTime<Utc>>,
     gave_up_order: std::collections::VecDeque<RetryKey>,
     /// Tries of intents that hit an invariant while the list was full, so the third still gives up
-    /// (SW13), and a refused write's fourth logs at `warn` ([`RetryList::refusal_log`]): each key with
-    /// the order it was first counted in, and its count. At most `GAVE_UP_CAP`.
+    /// (SW13): each key with the order it was first counted in, and its count. At most `GAVE_UP_CAP`.
+    /// A write the node refused is not counted here (ADR-aacruzgon-0090).
     overflow_tries: BTreeMap<RetryKey, (u64, u32)>,
     overflow_seen: u64,
 }
@@ -470,9 +472,10 @@ impl RetryList {
         }
         if !self.entries.contains_key(&key) && self.entries.len() >= self.cap {
             // A bug is tried three times however full the list is (SW13); a transient failure, or a write the
-            // node refused, holds the mark (SW18). A refused write's tries are counted too, never to give up,
-            // only so that its fourth logs at `warn` (ADR-aacruzgon-0090).
-            if let Failure::Invariant(invariant) = failure {
+            // node refused, holds the mark (SW18) and is not counted. A refused write off the list logs at
+            // `warn` (`refusal_log`); the poll's "retry list is full" line is the `error` (ADR-aacruzgon-0090).
+            if matches!(failure, Failure::Invariant(invariant) if invariant != Invariant::PermanentWrite)
+            {
                 let seen = self.overflow_seen;
                 let tries = {
                     let (_, tries) = self.overflow_tries.entry(key.clone()).or_insert((seen, 0));
@@ -480,7 +483,7 @@ impl RetryList {
                     *tries
                 };
                 self.overflow_seen += 1;
-                if invariant != Invariant::PermanentWrite && tries >= INVARIANT_TRIES {
+                if tries >= INVARIANT_TRIES {
                     let enqueued = intent.enqueued;
                     self.overflow_tries.remove(&key);
                     self.give_up(key, enqueued);
@@ -541,20 +544,17 @@ impl RetryList {
     }
 
     /// The level the next try of `intent` logs a refused write at (ADR-aacruzgon-0090): `warn` once the
-    /// list has counted `INVARIANT_TRIES` invariant failures for it, on the list or while it was full,
-    /// since the third refusal already logged at `error` that the sweeper keeps trying. Only a refused
-    /// write gets that far without giving up. `error` otherwise, and the request path always logs at
-    /// `error`.
+    /// list has counted `INVARIANT_TRIES` invariant failures for its entry, since the third refusal
+    /// already logged at `error` that the sweeper keeps trying (only a refused write gets that far
+    /// without giving up), and `warn` when it has no entry and the list is full, so a refusal could not
+    /// be queued: it is not counted, and the poll's "retry list is full" line is the `error`. `error`
+    /// otherwise, and the request path always logs at `error`.
     pub(crate) fn refusal_log(&self, intent: &Intent) -> RefusalLog {
-        let key = retry_key(intent);
-        let tries = match self.entries.get(&key) {
-            Some(entry) => entry.invariant_failures,
-            None => self.overflow_tries.get(&key).map_or(0, |(_, tries)| *tries),
-        };
-        if tries >= INVARIANT_TRIES {
-            RefusalLog::Warn
-        } else {
-            RefusalLog::Error
+        match self.entries.get(&retry_key(intent)) {
+            Some(entry) if entry.invariant_failures >= INVARIANT_TRIES => RefusalLog::Warn,
+            Some(_) => RefusalLog::Error,
+            None if self.entries.len() >= self.cap => RefusalLog::Warn,
+            None => RefusalLog::Error,
         }
     }
 
@@ -2268,9 +2268,9 @@ mod tests {
     }
 
     /// ADR-aacruzgon-0090: a write the node refused is tried three times at `RETRY_FIRST`, then every
-    /// `RETRY_MAX` until the horizon. It never gives up, and a full list holds its mark. Its first three
-    /// tries log at `error` and the later ones at `warn` (`refusal_log`), on the list or past its cap;
-    /// a bug never gets past `error`.
+    /// `RETRY_MAX` until the horizon. It never gives up, and a full list holds its mark. On the list, its
+    /// first three tries log at `error` and the later ones at `warn` (`refusal_log`); a full list that
+    /// cannot take it does not count it, and every try logs at `warn`. A bug never gets past `error`.
     #[test]
     fn a_refused_write_stays_on_the_retry_list_until_the_horizon() {
         let t0 = at("2026-11-22T10:00:00Z");
@@ -2323,12 +2323,11 @@ mod tests {
             Queued::Retry { .. }
         ));
         for try_ in 1..=4 {
-            let expected = if try_ <= 3 {
-                RefusalLog::Error
-            } else {
-                RefusalLog::Warn
-            };
-            assert_eq!(full.refusal_log(&b), expected, "overflowed try {try_}");
+            assert_eq!(
+                full.refusal_log(&b),
+                RefusalLog::Warn,
+                "overflowed try {try_}"
+            );
             assert_eq!(full.failed(b.clone(), refused, t0), Queued::Overflow);
         }
         assert!(!full.owns(&b, t0));
@@ -2346,6 +2345,60 @@ mod tests {
         }
         assert_eq!(bugs.failed(m.clone(), missing, t0), Queued::GaveUp);
         assert_eq!(bugs.refusal_log(&m), RefusalLog::Error);
+    }
+
+    /// ADR-aacruzgon-0090 and SW13 on a full list: refused writes the list cannot take are not counted,
+    /// so a data bug among them still gives up on its third try even with more of them than
+    /// `GAVE_UP_CAP`, every refusal logs at `warn`, and only the bugs are in `overflow_tries` (no insert,
+    /// so no eviction scan, for a refusal). Each round, the list fails the same intents in the same
+    /// order, as a held shard is read again on every poll: a bug first, the refusals, then a bug last.
+    #[test]
+    fn past_a_full_list_refusals_are_not_counted_and_a_bug_still_gives_up() {
+        let t0 = at("2026-11-22T10:00:00Z");
+        let refused = Failure::Invariant(Invariant::PermanentWrite);
+        let missing = Failure::Invariant(Invariant::MissingVersionRow);
+        // The control, well below the cap, and one past it.
+        let mut counted = Vec::new();
+        for n in [100, GAVE_UP_CAP + 1] {
+            let mut list = RetryList::new(1);
+            assert!(matches!(
+                list.failed(intent("filler", t0), Failure::Transient("index"), t0),
+                Queued::Retry { .. }
+            ));
+            let refusals: Vec<Intent> = (0..n).map(|k| intent(&format!("r{k:06}"), t0)).collect();
+            let (first, last) = (intent("m-bug", t0), intent("z-bug", t0));
+            for round in 1..=INVARIANT_TRIES {
+                let bug_outcome = if round < INVARIANT_TRIES {
+                    Queued::Overflow
+                } else {
+                    Queued::GaveUp
+                };
+                assert_eq!(
+                    list.failed(first.clone(), missing, t0),
+                    bug_outcome,
+                    "n {n}, round {round}: the first bug"
+                );
+                for r in &refusals {
+                    assert_eq!(
+                        list.refusal_log(r),
+                        RefusalLog::Warn,
+                        "n {n}, round {round}"
+                    );
+                    assert_eq!(list.failed(r.clone(), refused, t0), Queued::Overflow);
+                }
+                assert_eq!(
+                    list.failed(last.clone(), missing, t0),
+                    bug_outcome,
+                    "n {n}, round {round}: the last bug"
+                );
+                counted.push((n, round, list.overflow_tries.len()));
+            }
+            assert!(list.owns(&first, t0) && list.owns(&last, t0));
+        }
+        assert!(
+            counted.iter().all(|(_, _, keys)| *keys <= 2),
+            "keys counted off the list, by (n, round): {counted:?}"
+        );
     }
 
     /// P4: at most 32 statements in flight, the startup scan at most 8 of them.

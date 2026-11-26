@@ -2653,16 +2653,16 @@ mod tests {
             let [RepairOutcome::Repaired { full: true, index }] = outcomes[..] else {
                 panic!("{outcomes:?}");
             };
+            assert_eq!(
+                backend.count(&tenant, Some("Patient")).await.unwrap(),
+                1,
+                "found_type_row={found_type_row}"
+            );
             // The found row, and version 1's type row: found, or deleted at
             // the found row's `last_updated`.
             assert_eq!(
                 (index.rows_inserted, index.rows_deleted),
                 (k2.len() as u64, if found_type_row { 1 } else { 2 }),
-                "found_type_row={found_type_row}"
-            );
-            assert_eq!(
-                backend.count(&tenant, Some("Patient")).await.unwrap(),
-                1,
                 "found_type_row={found_type_row}"
             );
             let rows: Vec<_> = type_search(&backend, &t)

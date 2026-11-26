@@ -2301,8 +2301,9 @@ mod tests {
 
     /// ADR-aacruzgon-0090: a write the node refused is tried three times at `RETRY_FIRST`, then every
     /// `RETRY_MAX` until the horizon. It never gives up, and a full list holds its mark. On the list, its
-    /// first three tries log at `error` and the later ones at `warn` (`refusal_log`); a full list that
-    /// cannot take it does not count it, and every try logs at `warn`. A bug never gets past `error`.
+    /// first three tries log at `error` and the later ones at `warn` (`refusal_log`), also when its own
+    /// entry fills the list; a full list that cannot take it does not count it toward its tries, and
+    /// every try logs at `warn`. A bug never gets past `error`.
     #[test]
     fn a_refused_write_stays_on_the_retry_list_until_the_horizon() {
         let t0 = at("2026-11-22T10:00:00Z");
@@ -2363,6 +2364,27 @@ mod tests {
             assert_eq!(full.failed(b.clone(), refused, t0), Queued::Overflow);
         }
         assert!(!full.owns(&b, t0));
+
+        // On the list, its own entry fills a list of one: tries 1 to 3 still log at `error`, try 4 at
+        // `warn`, as on a list with room.
+        let mut own = RetryList::new(1);
+        let c = intent("c", t0);
+        for try_ in 1..=3 {
+            assert_eq!(own.refusal_log(&c), RefusalLog::Error, "on-list try {try_}");
+            assert!(matches!(
+                own.failed(c.clone(), refused, t0),
+                Queued::Retry { .. } | Queued::Refused { .. }
+            ));
+            assert_eq!(own.len(), 1);
+        }
+        assert_eq!(own.refusal_log(&c), RefusalLog::Warn, "on-list try 4");
+        assert_eq!(
+            own.failed(c.clone(), refused, t0),
+            Queued::Refused {
+                next_at: later,
+                first: false
+            }
+        );
 
         // A bug gives up on its third try, and is logged at `error` on each.
         let m = intent("m", t0);
@@ -3826,6 +3848,59 @@ mod node_tests {
         assert_eq!(count(&backend, &tenant).await, 1);
         assert_consistent(&check(&backend, &t).await);
         say("refused", &backend, &before);
+    }
+
+    /// ADR-aacruzgon-0090, the request path: a client `create` whose `resources_by_type` batch the node
+    /// refuses logs the refusal at `error`, and its unconfirmed batches at `warn` as kept for the
+    /// sweeper, never with the sweeper's line; `a_refused_replay_is_finished_once_the_node_takes_it`
+    /// checks the opposite counts for the sweeper. The write still answers success (G23), and the next
+    /// poll finishes the intent without logging either line.
+    #[tokio::test]
+    async fn a_refused_request_batch_logs_the_request_paths_line() {
+        let Some((backend, t, tenant, since)) = start("request-refused").await else {
+            return;
+        };
+        let logs = Captured::default();
+        let _logging = logs.install();
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::FailWithInvalid,
+        );
+        let created = backend
+            .create(&tenant, "Patient", patient(), test_fhir_version())
+            .await;
+        assert!(created.is_ok(), "{created:?}");
+        let batch = "index batch refused as invalid; not retried";
+        let request = "index batches not confirmed; the intent is kept for the sweeper";
+        let stays = "index batches not confirmed; the intent row stays in the outbox";
+        let lines = |logs: &Captured| {
+            [
+                (tracing::Level::ERROR, batch),
+                (tracing::Level::WARN, batch),
+                (tracing::Level::WARN, request),
+                (tracing::Level::ERROR, request),
+                (tracing::Level::WARN, stays),
+            ]
+            .map(|(level, text)| logs.count(level, text))
+        };
+        assert_eq!(lines(&logs), [1, 0, 1, 0, 0], "{:?}", logs.all());
+        // I1 and the fresh intent `finish` writes for the unfinished write are left for the sweeper.
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1, 1]);
+        assert!(rbt_rows(&backend, &t, "p").await.is_empty());
+
+        let state = SweepState::new(
+            Utc::now() - chrono::Duration::minutes(2),
+            CancellationToken::new(),
+        );
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        let report = backend
+            .poll_once(&state, Utc::now() + chrono::Duration::seconds(40), &scope)
+            .await;
+        assert_eq!((report.current, report.done), (2, 2), "{report}");
+        assert_eq!(lines(&logs), [1, 0, 1, 0, 0], "{:?}", logs.all());
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
     }
 
     /// ADR-aacruzgon-0090, the version row: a replay whose version row the node refuses as `Invalid`

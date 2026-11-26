@@ -485,7 +485,7 @@ impl RepairContext {
         // (before it sends) and its outcome (when it ends) in its slot, so
         // the outcomes come from the slots, by queue index, whatever the
         // order the repairs finished in or whether the deadline cut them.
-        // Built into a Vec first so the stream's items are plain futures
+        // Built into a Vec first, so `drive_within` is given plain futures
         // (the same `Send` reason as in `write_index_delta_within`).
         let slots: Vec<Slot> = self.queued.iter().map(|_| Slot::default()).collect();
         let futures: Vec<_> = self

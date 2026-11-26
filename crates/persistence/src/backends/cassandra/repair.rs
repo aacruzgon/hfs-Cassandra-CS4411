@@ -224,8 +224,8 @@ struct RepairPlan {
 }
 
 impl RepairPlan {
-    /// `index_delta(previous, VersionKeys { version_id: row.version_id, last_updated: row.last_updated, fhir_version: row.fhir_version, keys: &next })`.
-    fn delta<'a>(&'a self, row: &ResourceRow) -> IndexDelta<'a> {
+    /// `index_delta(previous, VersionKeys { version_id: row.version_id, last_updated: row.last_updated, fhir_version: row.fhir_version_text(), keys: &next })`.
+    fn delta<'a>(&'a self, row: &'a ResourceRow) -> IndexDelta<'a> {
         let previous: Vec<IndexRow<'a>> = self
             .previous
             .iter()
@@ -236,7 +236,7 @@ impl RepairPlan {
             VersionKeys {
                 version_id: row.version_id,
                 last_updated: row.last_updated,
-                fhir_version: row.fhir_version,
+                fhir_version: row.fhir_version_text(),
                 keys: &self.next,
             },
         )
@@ -778,6 +778,7 @@ mod tests {
             created_at: None,
             deleted_at: None,
             fhir_version: test_fhir_version(),
+            stored_fhir_version: None,
             write_ts: Some(write_ts_of(last_updated)),
             write_id: None,
             index_keys: Some(index_keys::encode(keys)),
@@ -2136,7 +2137,7 @@ mod tests {
             VersionKeys {
                 version_id: 2,
                 last_updated: lu2,
-                fhir_version: row.fhir_version,
+                fhir_version: row.fhir_version_text(),
                 keys: &k2,
             },
         );

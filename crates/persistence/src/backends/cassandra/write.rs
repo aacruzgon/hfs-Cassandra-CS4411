@@ -331,11 +331,16 @@ pub(crate) enum RefusalLog {
 /// not confirmed: a request leaves the intent for the sweeper. The sweeper's
 /// line says only that the intent row stays in the outbox, since it is logged
 /// before the sweeper knows whether it tries again (at the 24 hour horizon it
-/// does not, and the row stays until its TTL).
+/// does not, and the row stays until its TTL). Repair on read writes no
+/// intent (RV7), so its line says that nothing of its own retries the
+/// batches: a later search's repair does, or the sweeper, if the write that
+/// left the stale rows kept an intent. Each is logged at `warn`, and repair
+/// also logs its own `warn` per failed repair (RV9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeltaWriter {
     Request,
     Sweeper,
+    Repair,
 }
 
 /// A `tracing` event at a [`RefusalLog`]'s level: `log_refusal!(level, fields…, "message")`.
@@ -2774,6 +2779,30 @@ impl CassandraBackend {
         .await
     }
 
+    /// [`Self::write_index_delta`] for repair on read (RV7, IW17): the same
+    /// writes, a refused batch logged at `error` as on the request path, and
+    /// a batch not confirmed logged as repair's, which keeps no intent
+    /// ([`DeltaWriter::Repair`]).
+    pub(crate) async fn write_index_delta_repair(
+        &self,
+        key: &RowKey<'_>,
+        delta: &IndexDelta<'_>,
+        ts: i64,
+        tries: u32,
+    ) -> IndexOutcome {
+        let deadline = Duration::from_millis(self.config.request_timeout_ms);
+        self.write_index_delta_within(
+            key,
+            delta,
+            ts,
+            tries,
+            deadline,
+            RefusalLog::Error,
+            DeltaWriter::Repair,
+        )
+        .await
+    }
+
     /// [`Self::write_index_delta`] with the phase's deadline, the refusal's
     /// level and the writer given, so a test can make the deadline short.
     #[allow(clippy::too_many_arguments)]
@@ -2805,14 +2834,24 @@ impl CassandraBackend {
         match tokio::time::timeout(deadline, sends).await {
             Ok(results) => failures.extend(results.into_iter().filter_map(Result::err)),
             Err(_) => {
-                tracing::warn!(
-                    resource_type = key.resource_type,
-                    id = key.id,
-                    version_id = delta.version_id,
-                    deadline_ms = deadline.as_millis() as u64,
-                    "the index phase passed its deadline; the batches still running are \
-                     dropped and left for the sweeper"
-                );
+                match writer {
+                    DeltaWriter::Request | DeltaWriter::Sweeper => tracing::warn!(
+                        resource_type = key.resource_type,
+                        id = key.id,
+                        version_id = delta.version_id,
+                        deadline_ms = deadline.as_millis() as u64,
+                        "the index phase passed its deadline; the batches still running are \
+                         dropped and left for the sweeper"
+                    ),
+                    DeltaWriter::Repair => tracing::warn!(
+                        resource_type = key.resource_type,
+                        id = key.id,
+                        version_id = delta.version_id,
+                        deadline_ms = deadline.as_millis() as u64,
+                        "the repair's index phase passed its deadline; the batches still \
+                         running are dropped, and repair on read keeps no intent for them"
+                    ),
+                }
                 failures.push(WriteFailure::TriesExhausted);
             }
         }
@@ -2842,6 +2881,16 @@ impl CassandraBackend {
                     failed = failures.len(),
                     index = %stats,
                     "index batches not confirmed; the intent row stays in the outbox"
+                ),
+                DeltaWriter::Repair => tracing::warn!(
+                    resource_type = key.resource_type,
+                    id = key.id,
+                    version_id = delta.version_id,
+                    failed = failures.len(),
+                    index = %stats,
+                    "index batches not confirmed; repair on read keeps no intent, so only a \
+                     later search's repair, or the sweeper replaying an intent the original \
+                     write kept, tries them again"
                 ),
             }
             Err([

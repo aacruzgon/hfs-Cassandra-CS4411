@@ -52,7 +52,7 @@
 //!
 //! Repair never writes `resources`, `resource_versions` or an intent row,
 //! and never sends a CAS. Its only statements are the index writer's
-//! batches ([`CassandraBackend::write_index_delta`], one try, IW17).
+//! batches ([`CassandraBackend::write_index_delta_repair`], one try, IW17).
 //!
 //! # Step 6's contract
 //!
@@ -678,7 +678,7 @@ impl CassandraBackend {
         }
     }
 
-    /// Writes `plan` through `write_index_delta` at `write_ts_of(row.last_updated)`, `REPAIR_TRIES`; logs and counts.
+    /// Writes `plan` through `write_index_delta_repair` at `write_ts_of(row.last_updated)`, `REPAIR_TRIES`; logs and counts.
     /// Sets `packed` to what the writer packs before it sends, so a repair cut by the deadline can report it.
     async fn send_repair(
         &self,
@@ -690,7 +690,9 @@ impl CassandraBackend {
     ) -> RepairOutcome {
         let ts = write_ts_of(row.last_updated);
         *packed.lock() = Some(index_pack_stats(key, delta, ts));
-        let outcome = self.write_index_delta(key, delta, ts, REPAIR_TRIES).await;
+        let outcome = self
+            .write_index_delta_repair(key, delta, ts, REPAIR_TRIES)
+            .await;
         match outcome.result {
             Ok(()) => {
                 tracing::info!(
@@ -1514,6 +1516,81 @@ mod tests {
         assert!(lost.rows_inserted + lost.rows_deleted > 0, "{lost:?}");
         assert_eq!((stats.rows_inserted, stats.rows_deleted), rows);
         assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// The captured log lines that contain `text`. A macro, since
+    /// `#[traced_test]` defines `logs_assert` in the test's own body.
+    macro_rules! logged_lines {
+        ($text:expr) => {{
+            let found = std::cell::RefCell::new(Vec::<String>::new());
+            logs_assert(|lines: &[&str]| {
+                *found.borrow_mut() = lines
+                    .iter()
+                    .filter(|line| line.contains($text))
+                    .map(|line| line.to_string())
+                    .collect();
+                Ok(())
+            });
+            found.into_inner()
+        }};
+    }
+
+    /// A failed repair of a resource with no intent row logs the writer's
+    /// repair line, at `warn`, and never the request path's "the intent is
+    /// kept for the sweeper", which would be false here (repair writes no
+    /// intent, RV7). The other repair, which succeeds, logs neither.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_failed_repair_logs_that_it_keeps_no_intent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-failed-log");
+        let tenant = context(&t);
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let mut context = RepairContext::new(&t);
+        for id in ["p", "q"] {
+            let (row, stale) = updated(&backend, &tenant, &t, id).await;
+            context.queue("Patient", id, Some(row), stale);
+        }
+        for id in ["p", "q"] {
+            assert_eq!(
+                backend.intent_versions(&t, "Patient", id, since).await,
+                Vec::<i32>::new(),
+                "{id}: no intent before the repair"
+            );
+        }
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::FailWithUnavailable,
+        );
+
+        let outcomes = context.run(&backend).await;
+
+        let failed = outcomes
+            .iter()
+            .filter(|o| matches!(o, RepairOutcome::Failed { .. }))
+            .count();
+        assert_eq!(failed, 1, "{outcomes:?}");
+        for id in ["p", "q"] {
+            assert_eq!(
+                backend.intent_versions(&t, "Patient", id, since).await,
+                Vec::<i32>::new(),
+                "{id}: repair writes no intent"
+            );
+        }
+        let request_line = logged_lines!("the intent is kept for the sweeper");
+        let repair_line = logged_lines!("repair on read keeps no intent");
+        let repair_failed = logged_lines!("repair on read did not confirm every index batch");
+        let repaired = logged_lines!("repair on read wrote the current version's index rows");
+        assert!(request_line.is_empty(), "{request_line:?}");
+        assert_eq!(repair_line.len(), 1, "{repair_line:?}");
+        assert!(repair_line[0].contains("WARN"), "{repair_line:?}");
+        assert_eq!(repair_failed.len(), 1, "{repair_failed:?}");
+        assert!(repair_failed[0].contains("WARN"), "{repair_failed:?}");
+        assert_eq!(repaired.len(), 1, "{repaired:?}");
     }
 
     #[tokio::test]

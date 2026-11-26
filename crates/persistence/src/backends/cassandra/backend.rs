@@ -124,15 +124,24 @@ struct TenantOverlay {
     removals: Vec<Removal>,
     /// The latest `since` of a reload merged into this overlay (`None`
     /// before the first): the [`CassandraBackend::note_seq`] value it took
-    /// before its id scan. A
-    /// definition noted at or before it comes from a read that began before
-    /// that reload, which read storage after it, so it is refused
-    /// ([`Self::put`]). That reload says nothing of an id it did not list (a
-    /// delete removes the id's `resources_by_type` row), so this is the only
-    /// thing that keeps a follow of an older read from putting a deleted
-    /// SearchParameter back (ADR-aacruzgon-0099). Kept when the overlay
-    /// holds nothing else, for a tenant whose SearchParameters are all gone.
+    /// before its id scan. A definition noted at or before it comes from a
+    /// read that began before that reload, so it is refused ([`Self::put`])
+    /// unless that reload read its id at an older version
+    /// ([`Self::reload_read`]). That reload says nothing of an id it did not
+    /// list (a delete removes the id's `resources_by_type` row), so this is
+    /// the only thing that keeps a follow of an older read from putting a
+    /// deleted SearchParameter back (ADR-aacruzgon-0099). Kept when the
+    /// overlay holds nothing else, for a tenant whose SearchParameters are
+    /// all gone.
     reloaded_since: Option<u64>,
+    /// Each id the reload at [`Self::reloaded_since`] read, at the
+    /// `last_updated` it read: a definition it holds, or a row it recorded
+    /// as a removal (not `active`, a body the overlay does not take, or a
+    /// delete marker). A follow noted at or before that reload's `since`
+    /// whose version is newer than the one the reload read of its id was
+    /// read after the reload read it, so it is not held back
+    /// (ADR-aacruzgon-0099, audit F1).
+    reload_read: Vec<(String, chrono::DateTime<chrono::Utc>)>,
 }
 
 impl TenantOverlay {
@@ -170,18 +179,29 @@ impl TenantOverlay {
             .any(|r| r.id == definition.id() && r.at >= definition.last_updated())
     }
 
+    /// Whether the reload at [`Self::reloaded_since`] read `definition`'s
+    /// id at an older version than `definition`'s ([`Self::reload_read`]).
+    fn reload_read_older(&self, definition: &StoredDefinition) -> bool {
+        self.reload_read
+            .iter()
+            .any(|(id, at)| id == definition.id() && *at < definition.last_updated())
+    }
+
     /// Puts `candidate` in as its id's definition, replacing an older version
     /// of the same id. A candidate older than the id's definition, or than a
     /// removal of the id, is refused, and so is one noted at or before a
-    /// merged reload began ([`Self::reloaded_since`]): this process's own
-    /// writes are noted when they are put, after any reload already merged,
-    /// so only a follow of a read older than that reload is refused. Returns
-    /// whether the definitions in force changed, which is when the registry
-    /// must be rebuilt.
+    /// merged reload began ([`Self::reloaded_since`]), unless that reload
+    /// read the id at an older version than the candidate's: this process's
+    /// own writes are noted when they are put, after any reload already
+    /// merged, so only a follow of a read that began before that reload is
+    /// held back, and only when the reload did not see its id, or saw it at
+    /// the candidate's version or later. Returns whether the definitions in
+    /// force changed, which is when the registry must be rebuilt.
     fn put(&mut self, candidate: StoredDefinition) -> bool {
-        if self
+        if (self
             .reloaded_since
             .is_some_and(|since| candidate.noted_at <= since)
+            && !self.reload_read_older(&candidate))
             || self.removed(&candidate)
             || self
                 .defs
@@ -232,10 +252,14 @@ impl TenantOverlay {
     /// - a definition noted after `since` is kept, unless the reload read a
     ///   newer version of the same id, or a removal holds it back. A follow's
     ///   definition is noted when its read began, so one whose read began
-    ///   before this reload is dropped, however late it was put;
-    /// - `since` becomes [`Self::reloaded_since`] (the later of the two), so
-    ///   a follow of a read that began before this reload, put after it
-    ///   merged, is refused as well.
+    ///   before this reload is dropped, however late it was put, unless the
+    ///   reload read its id at an older version: the follow's read then came
+    ///   after the reload's read of that id (versions have strictly
+    ///   increasing `last_updated`), so it is the newer of the two;
+    /// - `since` becomes [`Self::reloaded_since`] (the later of the two), and
+    ///   when it is this reload's, what it read becomes
+    ///   [`Self::reload_read`], so a follow of a read that began before this
+    ///   reload, put after it merged, is held back by the same rule.
     ///
     /// Returns how many definitions the overlay holds, in force or not.
     fn merge_reload(
@@ -244,7 +268,17 @@ impl TenantOverlay {
         removed: Vec<(String, chrono::DateTime<chrono::Utc>)>,
         since: u64,
     ) -> usize {
-        self.reloaded_since = Some(self.reloaded_since.map_or(since, |was| was.max(since)));
+        // What this reload read of each id, live or as a removal.
+        let read_now: Vec<(String, chrono::DateTime<chrono::Utc>)> = read
+            .iter()
+            .map(|d| (d.id().to_string(), d.last_updated()))
+            .chain(removed.iter().cloned())
+            .collect();
+        let read_older = |d: &StoredDefinition| {
+            read_now
+                .iter()
+                .any(|(id, at)| id == d.id() && *at < d.last_updated())
+        };
         for (id, at) in removed {
             match self.removals.iter_mut().find(|r| r.id == id) {
                 Some(removal) => removal.at = removal.at.max(at),
@@ -261,7 +295,7 @@ impl TenantOverlay {
         for noted in self
             .defs
             .iter()
-            .filter(|d| d.noted_at > since && !self.removed(d))
+            .filter(|d| (d.noted_at > since || read_older(d)) && !self.removed(d))
         {
             match merged.iter().position(|m| m.id() == noted.id()) {
                 Some(at) if merged[at].last_updated() > noted.last_updated() => {}
@@ -270,6 +304,10 @@ impl TenantOverlay {
             }
         }
         self.defs = merged;
+        if self.reloaded_since.is_none_or(|was| since >= was) {
+            self.reloaded_since = Some(since);
+            self.reload_read = read_now;
+        }
         self.defs.len()
     }
 
@@ -1912,6 +1950,80 @@ mod reload_rules {
         assert_eq!(after.reloaded_since, Some(5));
         assert!(!after.is_empty(), "kept for a tenant with nothing else");
         assert!(TenantOverlay::default().is_empty());
+    }
+
+    /// ADR-aacruzgon-0099 (audit F1): a follow noted before a reload began,
+    /// of a version newer than the one that reload read of its id, was read
+    /// after the reload read it, so it is kept, whether the reload merged
+    /// first or merges after it. A follow of an id the reload did not see
+    /// (a delete before its scan), or saw at the follow's version or later,
+    /// is still held back, and a delete the reload read after the follow's
+    /// version refuses it; a retirement it read before the follow's version
+    /// does not.
+    #[test]
+    fn a_follow_newer_than_what_the_reload_read_of_its_id_is_kept() {
+        let follow = |url: &str, id: &str, millis: i64| noted(stored(url, id, millis), 4);
+        let reload = || {
+            (
+                vec![
+                    stored("http://example.org/sp", "sp", 1_000),
+                    stored("http://example.org/same", "same", 2_000),
+                ],
+                vec![
+                    ("retired".to_string(), at(1_000)),
+                    ("deleted".to_string(), at(3_000)),
+                ],
+            )
+        };
+
+        // The reload (since = 5) merged before the follows (stamped 4).
+        let mut after = TenantOverlay::default();
+        let (read, removed) = reload();
+        after.merge_reload(read, removed, 5);
+        assert!(
+            after.put(follow("http://example.org/sp", "sp", 2_000)),
+            "newer than the reload's read of sp"
+        );
+        assert!(
+            !after.put(follow("http://example.org/same", "same", 2_000)),
+            "the version the reload read"
+        );
+        assert!(
+            !after.put(follow("http://example.org/unseen", "unseen", 2_000)),
+            "an id the reload did not list"
+        );
+        assert!(
+            after.put(follow("http://example.org/retired", "retired", 2_000)),
+            "made active again after the retirement the reload read"
+        );
+        assert!(
+            !after.put(follow("http://example.org/deleted", "deleted", 2_000)),
+            "older than the delete the reload read"
+        );
+        let mut held = in_force(&after);
+        held.sort();
+        assert_eq!(held, ["retired", "same", "sp"]);
+        let sp = after.defs.iter().find(|d| d.id() == "sp").unwrap();
+        assert_eq!(sp.last_updated(), at(2_000), "the follow's version");
+
+        // The follows put first, then the reload (since = 5) merges.
+        let mut during = TenantOverlay::default();
+        for (url, id) in [
+            ("http://example.org/sp", "sp"),
+            ("http://example.org/same", "same"),
+            ("http://example.org/unseen", "unseen"),
+            ("http://example.org/retired", "retired"),
+            ("http://example.org/deleted", "deleted"),
+        ] {
+            during.put(follow(url, id, 2_000));
+        }
+        let (read, removed) = reload();
+        during.merge_reload(read, removed, 5);
+        let mut held = in_force(&during);
+        held.sort();
+        assert_eq!(held, ["retired", "same", "sp"], "the same outcome");
+        let sp = during.defs.iter().find(|d| d.id() == "sp").unwrap();
+        assert_eq!(sp.last_updated(), at(2_000), "the follow's version");
     }
 
     /// A removal is forgotten once a reload reads a newer version of its id

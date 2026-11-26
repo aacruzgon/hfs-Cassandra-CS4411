@@ -3778,6 +3778,57 @@ mod node_tests {
         neither_read_brings_it_back(Change::DeleteUnheld).await;
     }
 
+    /// ADR-aacruzgon-0099 (audit F1): A reloads, reading v1; B updates to v2; A reads v2 and follows
+    /// it, stamped before its reload began (`early`) or, as the control, after it. The reload read
+    /// the id at an older version, so A's read came after the reload's: v2 is in force either way.
+    async fn follow_of_a_read_newer_than_the_reloads(early: bool) -> Option<Option<String>> {
+        let (a, t, tenant, _) = start("sweeper-sp-newer").await?;
+        let b = harness::backend().await.expect("instance B");
+        let url = format!("http://example.org/SearchParameter/{t}");
+        let v1 = a
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter(&url),
+                test_fhir_version(),
+            )
+            .await
+            .expect("create");
+        let before = a.search_parameter_read_stamp();
+        assert_eq!(
+            a.load_stored_search_parameters(&t).await.unwrap(),
+            1,
+            "A's reload reads v1"
+        );
+        let after = a.search_parameter_read_stamp();
+        let mut v2 = search_parameter(&url);
+        v2["expression"] = serde_json::json!("Patient.gender");
+        b.update(&tenant, &v1, v2).await.expect("B's update to v2");
+        let row = a
+            .serial_read_resource_row(&t, "SearchParameter", "sp")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.version_id, 2);
+        a.follow_stored_search_parameter(&t, "sp", Some(&row), if early { before } else { after });
+        Some(expression_of(&a, &tenant, &url))
+    }
+
+    #[tokio::test]
+    async fn a_follow_of_a_read_newer_than_the_reloads_is_kept() {
+        let Some(early) = follow_of_a_read_newer_than_the_reloads(true).await else {
+            return;
+        };
+        let late = follow_of_a_read_newer_than_the_reloads(false)
+            .await
+            .unwrap();
+        assert_eq!(
+            (early.as_deref(), late.as_deref()),
+            (Some("Patient.gender"), Some("Patient.gender")),
+            "(stamped before the reload, stamped after it)"
+        );
+    }
+
     /// N9: a replayed delete writes its marker, and a revive only inserts (SW16).
     #[tokio::test]
     async fn a_replayed_delete_writes_its_marker_and_a_revive_inserts_only() {

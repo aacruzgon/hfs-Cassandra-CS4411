@@ -1642,6 +1642,44 @@ mod tests {
         assert!(repair_line[0].contains("WARN"), "{repair_line:?}");
     }
 
+    /// A repair batch the node refuses as invalid is logged at `error`, as on
+    /// the request path (`write_index_delta_repair`'s `RefusalLog::Error`),
+    /// not at the `warn` the sweeper's later tries use (ADR-aacruzgon-0090).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_refused_repair_batch_is_logged_at_error() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-refused-log");
+        let tenant = context(&t);
+        let (row, stale) = updated(&backend, &tenant, &t, "p").await;
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "p", Some(row), stale);
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::FailWithInvalid,
+        );
+
+        let outcomes = context.run(&backend).await;
+
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [RepairOutcome::Failed {
+                    failure: WriteFailure::Permanent,
+                    ..
+                }]
+            ),
+            "{outcomes:?}"
+        );
+        let refused = logged_lines!("index batch refused as invalid");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("ERROR"), "{refused:?}");
+    }
+
     /// The control of the test above: the same fault on a request's update
     /// logs the request path's per-batch line, and there the intent really
     /// is kept.

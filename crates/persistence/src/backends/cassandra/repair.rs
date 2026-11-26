@@ -1582,7 +1582,7 @@ mod tests {
             );
         }
         let request_line = logged_lines!("the intent is kept for the sweeper");
-        let repair_line = logged_lines!("repair on read keeps no intent");
+        let repair_line = logged_lines!("repair on read keeps no intent, so only");
         let repair_failed = logged_lines!("repair on read did not confirm every index batch");
         let repaired = logged_lines!("repair on read wrote the current version's index rows");
         assert!(request_line.is_empty(), "{request_line:?}");
@@ -1591,6 +1591,102 @@ mod tests {
         assert_eq!(repair_failed.len(), 1, "{repair_failed:?}");
         assert!(repair_failed[0].contains("WARN"), "{repair_failed:?}");
         assert_eq!(repaired.len(), 1, "{repaired:?}");
+    }
+
+    /// A repair batch that times out after its batchlog write
+    /// (`WriteTimeout`/`BATCH`) logs the writer's per-batch line with
+    /// repair's text, at `warn`, and never "the intent stays for the
+    /// sweeper": the resource has no intent row, before or after.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_repair_batch_in_the_batchlog_logs_that_repair_keeps_no_intent() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-batchlog-log");
+        let tenant = context(&t);
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let (row, stale) = updated(&backend, &tenant, &t, "p").await;
+        let mut context = RepairContext::new(&t);
+        context.queue("Patient", "p", Some(row), stale);
+        // The repair's batch spans partitions, so the fault answers it
+        // `WriteTimeout`/`BATCH`.
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::ApplyThenTimeOut,
+        );
+
+        let outcomes = context.run(&backend).await;
+
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [RepairOutcome::Failed {
+                    failure: WriteFailure::InBatchlog,
+                    ..
+                }]
+            ),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            backend.intent_versions(&t, "Patient", "p", since).await,
+            Vec::<i32>::new(),
+            "repair writes no intent"
+        );
+        let request_line = logged_lines!("the intent stays for the sweeper");
+        let repair_line = logged_lines!("repair on read keeps no intent for it");
+        assert!(request_line.is_empty(), "{request_line:?}");
+        assert_eq!(repair_line.len(), 1, "{repair_line:?}");
+        assert!(repair_line[0].contains("WARN"), "{repair_line:?}");
+    }
+
+    /// The control of the test above: the same fault on a request's update
+    /// logs the request path's per-batch line, and there the intent really
+    /// is kept.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_request_batch_in_the_batchlog_logs_that_its_intent_stays() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let t = tenant_id("repair-batchlog-request");
+        let tenant = context(&t);
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p", "active": true}),
+                test_fhir_version(),
+            )
+            .await
+            .expect("create");
+        backend.session.inject_fault(
+            StatementKind::Write,
+            "INSERT INTO resources_by_type",
+            Fault::ApplyThenTimeOut,
+        );
+        backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType": "Patient", "id": "p", "active": false}),
+            )
+            .await
+            .expect("the update answers success (G23)");
+
+        let intents = backend.intent_versions(&t, "Patient", "p", since).await;
+        assert!(
+            !intents.is_empty() && intents.iter().all(|v| *v == 2),
+            "the request path keeps its intent: {intents:?}"
+        );
+        let request_line = logged_lines!("the intent stays for the sweeper");
+        let repair_line = logged_lines!("repair on read keeps no intent");
+        assert_eq!(request_line.len(), 1, "{request_line:?}");
+        assert!(repair_line.is_empty(), "{repair_line:?}");
     }
 
     #[tokio::test]

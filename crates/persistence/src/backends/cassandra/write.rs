@@ -2826,7 +2826,7 @@ impl CassandraBackend {
         let ends_at = tokio::time::Instant::now() + deadline;
         let sends: Vec<_> = batches
             .iter()
-            .map(|batch| self.send_index_batch(batch, tries, ends_at, refusal))
+            .map(|batch| self.send_index_batch(batch, tries, ends_at, refusal, writer))
             .collect();
         let sends = futures::stream::iter(sends)
             .buffer_unordered(INDEX_BATCHES_IN_FLIGHT)
@@ -2929,13 +2929,15 @@ impl CassandraBackend {
     /// polls its future before its timer, so on its own it would let a
     /// stalled writer start one more try after the deadline.
     ///
-    /// A refusal is logged at `refusal`'s level ([`RefusalLog`]).
+    /// A refusal is logged at `refusal`'s level ([`RefusalLog`]), and a
+    /// batch in the batchlog with `writer`'s text: repair keeps no intent.
     async fn send_index_batch(
         &self,
         statements: &[IndexStatement],
         tries: u32,
         ends_at: tokio::time::Instant,
         refusal: RefusalLog,
+        writer: DeltaWriter,
     ) -> Result<(), WriteFailure> {
         for attempt in 1..=tries {
             if tokio::time::Instant::now() >= ends_at {
@@ -2946,13 +2948,22 @@ impl CassandraBackend {
             };
             match classify_failure(&error) {
                 BatchFailure::InBatchlog => {
-                    tracing::warn!(
-                        attempt,
-                        statements = statements.len(),
-                        error = ?error,
-                        "index batch timed out after the batchlog was written; the batchlog \
-                         replays it, and the intent stays for the sweeper"
-                    );
+                    match writer {
+                        DeltaWriter::Request | DeltaWriter::Sweeper => tracing::warn!(
+                            attempt,
+                            statements = statements.len(),
+                            error = ?error,
+                            "index batch timed out after the batchlog was written; the batchlog \
+                             replays it, and the intent stays for the sweeper"
+                        ),
+                        DeltaWriter::Repair => tracing::warn!(
+                            attempt,
+                            statements = statements.len(),
+                            error = ?error,
+                            "index batch timed out after the batchlog was written; the batchlog \
+                             replays it, and repair on read keeps no intent for it"
+                        ),
+                    }
                     return Err(WriteFailure::InBatchlog);
                 }
                 BatchFailure::Refused => {
@@ -6511,6 +6522,7 @@ mod node_tests {
                 POST_CAS_WRITE_TRIES,
                 tokio::time::Instant::now() + Duration::from_secs(60),
                 RefusalLog::Error,
+                DeltaWriter::Request,
             )
             .await;
         let spent = backend.statement_counts().since(&counted);
@@ -6820,6 +6832,7 @@ mod node_tests {
                 POST_CAS_WRITE_TRIES,
                 tokio::time::Instant::now() + Duration::from_secs(60),
                 RefusalLog::Error,
+                DeltaWriter::Request,
             )
             .await;
         let spent = backend.statement_counts().since(&counted);

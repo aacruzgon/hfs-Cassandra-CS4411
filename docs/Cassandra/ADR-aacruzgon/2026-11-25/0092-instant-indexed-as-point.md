@@ -8,7 +8,7 @@
         - `indexed_range` gives every point value one unit of its written precision (`crates/persistence/src/search/date_value.rs:52-54`: "A point value — a `date`, `dateTime` or `instant` — covers one unit of its own precision"). So an `instant` written to the second is stored as a one-second range.
         - IW4 cites no spec page and does not consider `instant`.
         - The one-unit width is upstream's rule (HeliosSoftware/hfs#1391, PR #1490; `crates/persistence/README.md`, "Date prefix semantics (range targets, #1391)"), not a decision in our logs.
-        - `_lastUpdated` is already a point here: "A stored `last_updated` `t` is a millisecond point, the range `[t, t + 1 ms)`" (`docs/Cassandra/schema/coverage.md:110`).
+        - `_lastUpdated` is already a point here: "A stored `last_updated` `t` is a millisecond point, the range `[t, t + 1 ms)`" (`docs/Cassandra/schema/coverage.md:111`).
     - **What the spec says** (search.html#date, the list of types; descriptive text, no SHALL):
         - R4, https://hl7.org/fhir/R4/search.html#date: "instant: An instant is considered a fixed point in time with an interval smaller than the precision of the system, i.e. an interval with an effective width of 0".
         - R4B, https://hl7.org/fhir/R4B/search.html#date: the same sentence.
@@ -32,7 +32,7 @@
     - Date searches on `instant` parameters agree with the spec, and with `_lastUpdated`, once the upstream fix is synced. In R4 those include `DiagnosticReport.issued`, `Observation.effectiveInstant` (`date`), `DocumentReference.date`, `Appointment.start`, `Slot.start`, `Bundle.timestamp`, `AuditEvent.recorded` and `Provenance.recorded`.
     - **Rows written before the fix** keep the one-second range until the resource is written again. They are reloaded as `crates/persistence/README.md` says ("Keyspaces written before index writes": drop the keyspace, apply the keyspace file and `schema.cql`, and load through the running server). The sync that brings the fix should say so in the README note, or add a line to it.
     - Step 6's date tests need an `instant` case: `eq…:00.000Z` matches and `gt…:00.500Z` does not, with the `dateTime` control.
-    - Revisit if upstream chooses a different representation, for example a resolution-dependent point at PostgreSQL's microseconds. Cassandra stays at milliseconds.
+    - Revisit if upstream's fix for #2962 does not give `[t, t + 1 ms)` at `StorageResolution::Millis`. The issue proposes one unit of the backend's resolution (1 ms here, 1 µs on PostgreSQL), which gives Cassandra this entry's rule with no change.
 - **AI involvement:** Claude Code (Claude Opus 5.5), in a validation worker run by Alan.
     - **The finding.** A spec-check worker reported the finding (its S1). An independent validation worker reproduced it from the claim, on SQLite through REST, as Cassandra rows (R4, R4B, R5), and on upstream `fb7d12ed5`. It showed that a throwaway converter edit changes it, checked IW4 against the spec, and drafted this entry and the upstream issue.
     - **The decision.** Alan decided to amend IW4.
@@ -41,10 +41,10 @@
         - the shared code at `2ae41258e` and `fb7d12ed5` (byte-identical `converters.rs`, `date_value.rs` and `extractor.rs`);
         - the rows on a 5.0.9 node.
     - **Not verified:** PostgreSQL and MongoDB (code only); instant parameters other than `issued`.
-    - **What the human changed:** Alan approved the draft as written on 2026-11-25.
+    - **What the human changed:** Alan approved the draft as written on 2026-11-25. Alan approved the audit's corrections on 2026-11-25 (F8/F12 for 0092).
 - **Links:**
     - ADR-sam-michaels-0006, IW4 (amended).
     - Upstream HeliosSoftware/hfs#1391, PR #1490.
     - Upstream HeliosSoftware/hfs#2962, the shared converter fix this entry waits for (filed 2026-11-25).
-    - `coverage.md` §3 (`_lastUpdated`, `:110`); `crates/persistence/README.md`, "Date prefix semantics" and "Keyspaces written before index writes".
+    - `coverage.md` §3 (`_lastUpdated`, `:111`); `crates/persistence/README.md`, "Date prefix semantics" and "Keyspaces written before index writes".
     - Evidence: the `validate-108-findings` run, `report.md`, "C1" and "ADR decisions to supersede".

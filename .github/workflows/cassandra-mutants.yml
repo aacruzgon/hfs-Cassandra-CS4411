@@ -171,6 +171,18 @@ jobs:
       CASSANDRA_BASE_PORT: 29842
       COMPOSE_PROJECT_BASE: hfs-cassandra-mutants
       CI_REPORT_PROFILE: test (debug=0, incremental; cargo-mutants build directories)
+      # The lib test every run below skips (ADR-aacruzgon-0101): the batch of
+      # exactly 65,535 statements (ADR-aacruzgon-0089), which the required
+      # job runs alone in a step of its own (ADR-aacruzgon-0095). It passes
+      # only while the node builds the batch inside its 2 s
+      # write_request_timeout, so under MUTANTS_JOBS lib runs against one
+      # node it can fail on load alone. cargo-mutants counts any test
+      # failure under a mutant as caught (src/outcome.rs, mutant_caught),
+      # and a failed baseline as no mutants tested (src/lab.rs). Without it,
+      # other node tests still caught all three `>` mutants of
+      # CassandraSession::batch's statement-limit check (a local run,
+      # ADR-aacruzgon-0101).
+      AT_LIMIT_TEST: backends::cassandra::session::node_tests::a_batch_over_the_statement_limit_is_refused_and_sends_nothing
     steps:
       # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
       # the runner's own .env. Two instances on one machine share gh-runner's
@@ -343,6 +355,44 @@ jobs:
             echo "files=$files"
           } >> "$GITHUB_OUTPUT"
 
+      # --skip drops every test whose name contains $AT_LIMIT_TEST (libtest
+      # matches skip filters by substring unless --exact, and --exact would
+      # make the backends::cassandra filter exact too), so check that it
+      # drops exactly one, as the required job does (ADR-aacruzgon-0095):
+      # the --list counts with and without it. cargo-mutants builds only in
+      # its own directories, so this is one build of the --lib tests of its
+      # own, at the CI budget's 4 processes (ADR-aacruzgon-0088), before the
+      # node starts, in the scratch directory the run step empties. Report
+      # only: a skip that drops another count, or a listing that fails, is a
+      # warning and a line in the report, and the run still skips the test.
+      - name: Check that --skip drops only the 65,535-statement batch test
+        id: skip-guard
+        if: steps.diff.outcome == 'success' && steps.diff.outputs.files != '0'
+        continue-on-error: true
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: |
+          CARGO_TARGET_DIR="${RUNNER_WORKSPACE:?}/target/${MUTANTS_SCRATCH_NAME:?}/skip-guard"
+          export CARGO_TARGET_DIR
+          rm -rf "$CARGO_TARGET_DIR"
+          listed() {
+            local list
+            list=$(nice -n 10 cargo test -p helios-persistence --features cassandra \
+              --lib -- backends::cassandra --list "$@") \
+              || { echo "::warning title=Mutation testing::cargo test --list${*:+ $*} failed (exit $?), so the --skip of the 65,535-statement batch test is unchecked" >&2; return 1; }
+            grep -c ': test$' <<<"$list" || true
+          }
+          dropped=unchecked
+          if all=$(listed) && kept=$(listed --skip "${AT_LIMIT_TEST:?}"); then
+            dropped=$(( all - kept ))
+            if [ "$dropped" -ne 1 ]; then
+              echo "::warning title=Mutation testing::--skip $AT_LIMIT_TEST drops $dropped lib tests, not 1"
+            fi
+          fi
+          echo "dropped=$dropped" >> "$GITHUB_OUTPUT"
+          rm -rf "$CARGO_TARGET_DIR"
+          [ "$dropped" = 1 ]
+
       # cargo-mutants 27.1.0 treats a return type as a Result only when its last
       # path segment is `Result` (src/fnvalue.rs:77, `path_ends_with(path,
       # "Result")`). StorageResult<T>, an alias for Result<T, StorageError>
@@ -451,7 +501,8 @@ jobs:
           echo "HFS_TEST_CASSANDRA_URL=127.0.0.1:$CASSANDRA_HOST_PORT" >> "$GITHUB_ENV"
 
       # cargo-mutants on helios-persistence with the cassandra feature, its
-      # --lib tests filtered to backends::cassandra, as in the required job.
+      # --lib tests filtered to backends::cassandra, as in the required job,
+      # all but $AT_LIMIT_TEST (the job's env, ADR-aacruzgon-0101).
       # Without a node (a dispatch with node off), the node tests skip, so
       # only the pure tests can catch a mutant; the tombstone, restart and
       # size-probe tests stay off as in the required job. Each job is a build
@@ -497,7 +548,8 @@ jobs:
                 --output "$out" --colors=never
                 --cargo-test-arg=--lib)
           if [ "$RANGE" != none ]; then args+=(--in-diff "$DIFF"); fi
-          args+=(-- -- backends::cassandra)
+          # The at-limit batch test is skipped (the job's env, AT_LIMIT_TEST).
+          args+=(-- -- backends::cassandra --skip "${AT_LIMIT_TEST:?}")
           # The scratch directory's size every 30 s, for the disk report.
           ( while sleep 30; do du -s --block-size=1M "$MUTANTS_SCRATCH" 2>/dev/null | cut -f1; done ) \
             > "$RUNNER_TEMP/mutants-scratch-mib.txt" &
@@ -528,11 +580,13 @@ jobs:
           ALIAS_SUMMARY: ${{ steps.alias.outputs.summary }}
           ALIAS_PREDATES: ${{ steps.alias.outputs.predates }}
           ALIAS_STALE: ${{ steps.alias.outputs.stale }}
+          SKIP_DROPPED: ${{ steps.skip-guard.outputs.dropped }}
         run: |
           out="$RUNNER_TEMP/ci-report/inputs/mutants"
           mkdir -p "$out"
           peak=$(sort -n "$RUNNER_TEMP/mutants-scratch-mib.txt" 2>/dev/null | tail -1)
           note="Mutated: \`$HEAD_NAME\` at \`$(git rev-parse --short HEAD)\`, range \`${RANGE:-?}\`, --lib tests $([ "$MUTANTS_NODE" = true ] && echo "against a node of this job's own" || echo "without a node (node tests skip)"), $MUTANTS_JOBS jobs. Scratch directory peak: ${peak:-?} MiB (sampled every 30 s)."
+          note+=" The --lib runs skip \`${AT_LIMIT_TEST##*::}\` (ADR-aacruzgon-0101); the skip dropped ${SKIP_DROPPED:-unchecked} lib test(s), against 1 expected."
           diff_args=()
           if [ -n "$DIFF" ]; then diff_args=(--diff "$DIFF"); fi
           alias_args=()

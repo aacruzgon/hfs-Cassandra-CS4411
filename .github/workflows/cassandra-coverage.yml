@@ -81,6 +81,9 @@ jobs:
       # and on a pull request its head, not the merge commit.
       CI_REPORT_PROFILE: test (line-tables-only debug info, -C instrument-coverage, CARGO_INCREMENTAL=0)
       CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The lib test the --lib step skips and the step after it runs alone,
+      # as in the required job (ADR-aacruzgon-0095, 0101).
+      AT_LIMIT_TEST: backends::cassandra::session::node_tests::a_batch_over_the_statement_limit_is_refused_and_sends_nothing
     steps:
       # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
       # the runner's own .env. Two instances on one machine share gh-runner's
@@ -299,15 +302,80 @@ jobs:
       # With the node's URL, so the node_tests modules in write.rs and
       # backend.rs run instead of skipping. The required job runs the same
       # --lib tests (fmt-clippy-cassandra.yml, ADR-aacruzgon-0054); this run measures
-      # their coverage.
+      # their coverage. The 65,535-statement batch test is skipped here and
+      # runs alone in the next step, as in the required job (ADR-aacruzgon-0095,
+      # 0101): inside this run it timed out on sam-7900x (runs 45840184803 and
+      # 45846259659, 2,703 and 2,563 ms against the node's 2 s
+      # write_request_timeout).
       - name: Backend unit tests (--lib, backends::cassandra) against this node
         run: |
           set -o pipefail
+          # --skip drops every test whose name contains $AT_LIMIT_TEST (libtest
+          # matches skip filters by substring unless --exact, and --exact would
+          # make the backends::cassandra filter exact too), so check that it
+          # drops exactly one. --list needs no node and reuses the build. Its
+          # LLVM_PROFILE_FILE is a scratch path, so the listing's profiles stay
+          # out of $CARGO_LLVM_COV_TARGET_DIR, the one directory the report
+          # reads. cargo's stderr goes to the log, so a failed listing shows
+          # why, and it fails the step.
+          listed() {
+            local list
+            list=$(LLVM_PROFILE_FILE="$RUNNER_TEMP/at-limit-list/list-%p.profraw" \
+              cargo test -p helios-persistence --features cassandra \
+              --lib -- backends::cassandra --list "$@") \
+              || { echo "::error title=At-limit skip::cargo test --list${*:+ $*} failed (exit $?)" >&2; return 1; }
+            grep -c ': test$' <<<"$list" || true
+          }
+          all=$(listed) || exit 1
+          kept=$(listed --skip "${AT_LIMIT_TEST:?}") || exit 1
+          dropped=$(( all - kept ))
+          [ "$dropped" -eq 1 ] \
+            || { echo "::error title=At-limit skip::--skip $AT_LIMIT_TEST drops $dropped lib tests, not 1"; exit 1; }
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-persistence --features cassandra --lib -- backends::cassandra \
-              --show-output 2>&1 \
+              --show-output --skip "${AT_LIMIT_TEST:?}" 2>&1 \
             | tee "$RUNNER_TEMP/ci-report/logs/persistence-lib-tests.log"
+
+      # The batch of exactly 65,535 statements (ADR-aacruzgon-0089), alone on
+      # this node, as the required job runs it (ADR-aacruzgon-0095), so its
+      # lines are still counted: cargo-llvm-cov's LLVM_PROFILE_FILE (show-env)
+      # names each process's own file (%p, %m), and `cargo llvm-cov report`
+      # merges every profile in its directory, this step's with the lib
+      # run's. --exact must run its one test, as in the other --exact steps.
+      # The [at-limit-batch …] line, the batch's time, goes to the report
+      # whether the test passed or failed, then the step exits with the
+      # test's status. Already built above.
+      - name: Backend unit tests (--lib), the 65,535-statement batch test alone against this node
+        run: |
+          set -o pipefail
+          logs="$RUNNER_TEMP/ci-report/logs"
+          mkdir -p "$logs"
+          log="$logs/persistence-lib-at-limit.log"
+          # The test's status, kept so the report below is written whatever it is.
+          status=0
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+            cargo test -p helios-persistence --features cassandra \
+              --lib -- --exact "${AT_LIMIT_TEST:?}" --show-output 2>&1 \
+            | tee "$log" || status=$?
+          clean="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
+          # Report only, on a pass or a failure (a time-out is the case it measures):
+          # a failed report leaves the test's result alone.
+          dir="$RUNNER_TEMP/ci-report/inputs/at-limit"
+          mkdir -p "$dir"
+          {
+            echo "Runner \`${RUNNER_NAME:-?}\`, instrumented build; the node's write_request_timeout is 2000 ms; the test's exit status: $status."
+            echo
+            echo '```'
+            grep -F '[at-limit-batch ' <<<"$clean" || echo "no [at-limit-batch] line"
+            echo '```'
+          } > "$dir/at-limit.md"
+          python3 .github/scripts/ci-report.py add at-limit \
+            "The 65,535-statement batch, alone on the node (report only)" \
+            --markdown "$dir/at-limit.md" || true
+          [ "$status" -eq 0 ] || exit "$status"
+          grep -Eq '^test result: ok\. 1 passed;' <<<"$clean" \
+            || { echo "::error title=At-limit batch test::$AT_LIMIT_TEST did not run exactly once"; exit 1; }
 
       # The test kills hfs with SIGKILL when it drops it (Child::kill), and an
       # instrumented program writes its profile only when it exits. %c asks
@@ -395,6 +463,7 @@ jobs:
           logs="$RUNNER_TEMP/ci-report/logs"
           python3 .github/scripts/ci-report.py tests tests "Tests" \
             "$logs/persistence-tests.log" "$logs/persistence-lib-tests.log" \
+            "$logs/persistence-lib-at-limit.log" \
             "$logs/milestone-a-round-trip.log" "$logs/step3-rest.log" "$logs/readiness.log"
 
       # The report keeps only the backend's files and hfs's main.rs: the

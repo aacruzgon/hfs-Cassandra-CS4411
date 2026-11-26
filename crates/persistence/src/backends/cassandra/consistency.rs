@@ -375,6 +375,12 @@ impl IndexScan {
     pub(crate) fn tenants(&self) -> impl Iterator<Item = &str> {
         self.rows.keys().map(String::as_str)
     }
+
+    /// The first read that failed, `(what, error)`, if any: the scan stopped
+    /// there, so its rows are incomplete.
+    pub(crate) fn failure(&self) -> Option<&(String, String)> {
+        self.failed.as_ref()
+    }
 }
 
 /// One thing the check found wrong. Implements `Display` by hand, one line

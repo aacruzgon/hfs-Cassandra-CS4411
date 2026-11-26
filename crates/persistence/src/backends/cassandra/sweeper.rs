@@ -5476,6 +5476,14 @@ pub(crate) mod post_suite {
                 failing.push(tenant.clone());
             }
         }
+        // The shared scan failed and no tenant's check reported it (ADR-sam-michaels-0007): with no
+        // tenant to check, nothing else would.
+        if tenants.is_empty()
+            && let Some((what, _)) = scan.failure()
+        {
+            defects += 1;
+            failing.push(format!("({what})"));
+        }
         PostSuiteReport {
             prefix: prefix.to_string(),
             sweep,
@@ -5486,6 +5494,51 @@ pub(crate) mod post_suite {
             rows_scanned: scan.scanned(),
             took: started.elapsed(),
         }
+    }
+
+    /// A failed shared scan fails the report even when the prefix has no tenant to check, which would
+    /// otherwise report nothing; an empty scan that succeeds still passes. With one tenant (the
+    /// control), its own check reports the failure, counted once.
+    #[tokio::test]
+    async fn a_failed_shared_scan_fails_the_post_suite_report() {
+        use crate::backends::cassandra::consistency::harness::{self, context, patient};
+        use crate::backends::cassandra::session::Fault;
+        use crate::backends::cassandra::test_support::test_fhir_version;
+        use crate::core::ResourceStorage;
+
+        let Some(backend) = harness::backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let since = Utc::now() - chrono::Duration::seconds(5);
+        let fail_scan = || {
+            backend.session.inject_fault_on_first_page(
+                StatementKind::Read,
+                "FROM resources_by_type",
+                Fault::FailWithUnavailable,
+            )
+        };
+
+        let empty = format!("test-postsuite-empty-{}-", Uuid::new_v4().simple());
+        let clean = post_suite_report(&backend, &empty, since).await;
+        assert_eq!((clean.tenants, clean.defects), (0, 0), "{clean}");
+        assert!(clean.failing.is_empty(), "{clean}");
+
+        fail_scan();
+        let failed = post_suite_report(&backend, &empty, since).await;
+        assert_eq!((failed.tenants, failed.defects), (0, 1), "{failed}");
+        assert_eq!(failed.failing, ["(scan resources_by_type)"], "{failed}");
+
+        let one = format!("test-postsuite-one-{}-", Uuid::new_v4().simple());
+        let tenant = context(&format!("{one}t"));
+        backend
+            .create(&tenant, "Patient", patient(), test_fhir_version())
+            .await
+            .unwrap();
+        fail_scan();
+        let control = post_suite_report(&backend, &one, since).await;
+        assert_eq!((control.tenants, control.defects), (1, 1), "{control}");
+        assert_eq!(control.failing, [format!("{one}t")], "{control}");
     }
 
     /// RV22: the CI entry point, run alone after every suite. Opt-in, and never on the shared dev node.

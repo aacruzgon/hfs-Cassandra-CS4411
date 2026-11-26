@@ -1724,12 +1724,38 @@ impl CassandraBackend {
                 noop: replay.noop,
             };
         }
-        // SW19: a SearchParameter that was replayed follows the overlay.
+        // SW19: a SearchParameter that was replayed follows the overlay, from a read of its row taken
+        // after the replay (ADR-aacruzgon-0099). The follow is stamped before that read, so a reload
+        // that began after the stamp wins over it; a reload that began after the stamp also began
+        // after the replay wrote the id's `resources_by_type` row, so it lists the id. The row the
+        // replay used was read before the replay, and a reload during the replay can miss the id,
+        // so following that row would either bring back a definition deleted since or, once the
+        // stamp held it back, lose one the replay has just indexed.
         if matches!(case, IntentCase::Current | IntentCase::Superseded)
             && intent.resource_type == "SearchParameter"
         {
-            self.follow_stored_search_parameter(&intent.tenant_id, &intent.id, row.as_ref());
-            self.sweeper.counters.followed();
+            let read_at = self.search_parameter_read_stamp();
+            match self.read_row(intent, StatementKind::Read, rank).await {
+                Ok(fresh) => {
+                    self.follow_stored_search_parameter(
+                        &intent.tenant_id,
+                        &intent.id,
+                        fresh.as_ref(),
+                        read_at,
+                    );
+                    self.sweeper.counters.followed();
+                }
+                // The replay is done and idempotent; the intent is kept, so it is replayed and
+                // followed again on its next try. Logged and counted as R1's failure is.
+                Err((failure, detail)) => {
+                    return IntentResult {
+                        case: Some(case),
+                        index: replay.index,
+                        noop: replay.noop,
+                        ..self.stopped(intent, failure, &detail)
+                    };
+                }
+            }
         }
         let deleted = {
             let _permit = self.sweeper.permits(rank, 1).await;
@@ -3637,15 +3663,32 @@ mod node_tests {
         say("search-parameter", &backend, &before);
     }
 
-    /// SW19 across instances: B retires a SearchParameter that A holds, A reloads, then A follows a
-    /// row as a replay does: the one it read before B's update (`stale`), or, as the control, a fresh
-    /// read. Returns whether the definition is in A's registry after the follow, and after A's next
-    /// reload.
-    async fn follow_after_a_reload_of_a_retirement(stale: bool) -> Option<(bool, bool)> {
+    /// What instance B does to the SearchParameter before instance A reloads.
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        /// B updates it to `status: retired`; A created it, so A held it.
+        Retire,
+        /// B deletes it; A created it, so A held it.
+        Delete,
+        /// B created it and deletes it, so A never held it, as when A's sweeper finishes B's
+        /// write.
+        DeleteUnheld,
+    }
+
+    /// SW19 across instances (ADR-aacruzgon-0099): B makes `change`, A reloads, then A follows a
+    /// row as a replay does: the one it read before B's change (`stale`), stamped before that read,
+    /// or, as the control, one it stamps and reads after its reload. Returns whether the definition
+    /// is in A's registry after the follow, and after A's next reload.
+    async fn follow_after_a_reload_of(change: Change, stale: bool) -> Option<(bool, bool)> {
         let (a, t, tenant, _) = start("sweeper-sp-stale").await?;
         let b = harness::backend().await.expect("instance B");
         let url = format!("http://example.org/SearchParameter/{t}");
-        let v1 = a
+        let creator = if matches!(change, Change::DeleteUnheld) {
+            &b
+        } else {
+            &a
+        };
+        let v1 = creator
             .create(
                 &tenant,
                 "SearchParameter",
@@ -3655,32 +3698,60 @@ mod node_tests {
             .await
             .expect("create");
         assert_eq!(
-            expression_of(&a, &tenant, &url).as_deref(),
-            Some("Patient.active")
+            expression_of(&a, &tenant, &url).is_some(),
+            !matches!(change, Change::DeleteUnheld),
+            "A holds what A created"
         );
+        let stamp = a.search_parameter_read_stamp();
         let before = a
             .serial_read_resource_row(&t, "SearchParameter", "sp")
             .await
             .unwrap()
             .unwrap();
-        let mut retired = search_parameter(&url);
-        retired["status"] = serde_json::json!("retired");
-        b.update(&tenant, &v1, retired).await.expect("B's update");
+        match change {
+            Change::Retire => {
+                let mut retired = search_parameter(&url);
+                retired["status"] = serde_json::json!("retired");
+                b.update(&tenant, &v1, retired).await.expect("B's update");
+            }
+            Change::Delete | Change::DeleteUnheld => b
+                .delete(&tenant, "SearchParameter", "sp")
+                .await
+                .expect("B's delete"),
+        }
         assert_eq!(expression_of(&b, &tenant, &url), None);
         a.load_stored_search_parameters(&t).await.unwrap();
         assert_eq!(expression_of(&a, &tenant, &url), None, "after A's reload");
-        let row = if stale {
-            before
+        let (row, read_at) = if stale {
+            (before, stamp)
         } else {
-            a.serial_read_resource_row(&t, "SearchParameter", "sp")
+            let read_at = a.search_parameter_read_stamp();
+            let row = a
+                .serial_read_resource_row(&t, "SearchParameter", "sp")
                 .await
                 .unwrap()
-                .unwrap()
+                .unwrap();
+            (row, read_at)
         };
-        a.follow_stored_search_parameter(&t, "sp", Some(&row));
+        a.follow_stored_search_parameter(&t, "sp", Some(&row), read_at);
         let followed = expression_of(&a, &tenant, &url).is_some();
         a.load_stored_search_parameters(&t).await.unwrap();
         Some((followed, expression_of(&a, &tenant, &url).is_some()))
+    }
+
+    /// Runs [`follow_after_a_reload_of`] with a stale read and with the fresh control: neither may
+    /// leave the definition in force, after the follow or after the next reload.
+    async fn neither_read_brings_it_back(change: Change) {
+        let Some(stale) = follow_after_a_reload_of(change, true).await else {
+            return;
+        };
+        let control = follow_after_a_reload_of(change, false).await.unwrap();
+        // Each is (in force after the follow, in force after the next reload).
+        assert_eq!(
+            (stale, control),
+            ((false, false), (false, false)),
+            "{change:?}: (the stale read, a fresh read)"
+        );
     }
 
     /// SW19 across instances: a replay's row read before another instance retired the
@@ -3688,16 +3759,23 @@ mod node_tests {
     /// reload saw the retirement; neither does a fresh read (the control). The next reload agrees.
     #[tokio::test]
     async fn a_stale_replay_read_does_not_bring_back_a_retired_searchparameter() {
-        let Some(stale) = follow_after_a_reload_of_a_retirement(true).await else {
-            return;
-        };
-        let control = follow_after_a_reload_of_a_retirement(false).await.unwrap();
-        // Each is (in force after the follow, in force after the next reload).
-        assert_eq!(
-            (stale, control),
-            ((false, false), (false, false)),
-            "(the stale read, a fresh read)"
-        );
+        neither_read_brings_it_back(Change::Retire).await;
+    }
+
+    /// SW19 across instances (ADR-aacruzgon-0099): the same for a delete, which leaves the reload
+    /// no `resources_by_type` row to list, so the reload records no removal; the read stamp alone
+    /// holds the stale read back.
+    #[tokio::test]
+    async fn a_stale_replay_read_does_not_bring_back_a_deleted_searchparameter() {
+        neither_read_brings_it_back(Change::Delete).await;
+    }
+
+    /// SW19 across instances (ADR-aacruzgon-0099): the same for a SearchParameter this instance
+    /// never held, created and deleted by another instance, as when this instance's sweeper
+    /// finishes the other's write.
+    #[tokio::test]
+    async fn a_stale_replay_read_does_not_put_in_a_searchparameter_deleted_elsewhere() {
+        neither_read_brings_it_back(Change::DeleteUnheld).await;
     }
 
     /// N9: a replayed delete writes its marker, and a revive only inserts (SW16).

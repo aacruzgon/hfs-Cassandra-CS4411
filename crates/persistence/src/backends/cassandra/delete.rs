@@ -218,7 +218,10 @@ impl CassandraBackend {
         let result: StorageResult<()> = async {
             loop {
                 // Step 0. After an unknown outcome, R1's error answers as R2's
-                // does (ADR-aacruzgon-0067).
+                // does (ADR-aacruzgon-0067). A SearchParameter's follow below
+                // is stamped before the read (ADR-aacruzgon-0099).
+                let read_at = (resource_type == "SearchParameter")
+                    .then(|| self.search_parameter_read_stamp());
                 let row = request.pre_read_row(pre_read().await)?;
                 if let Some(applied) = self
                     .check_earlier_attempts(&mut request, row.as_ref())
@@ -231,10 +234,10 @@ impl CassandraBackend {
                 // whose outcome this instance never learned or by another
                 // instance: the overlay catches up before the NotFound
                 // (ADR-aacruzgon-0068).
-                if resource_type == "SearchParameter"
+                if let Some(read_at) = read_at
                     && row.as_ref().is_some_and(ResourceRow::is_deleted)
                 {
-                    self.follow_stored_search_parameter(tenant_id, id, row.as_ref());
+                    self.follow_stored_search_parameter(tenant_id, id, row.as_ref(), read_at);
                 }
                 let row = deletable(row.as_ref(), expect, resource_type, id)?;
                 let expected = row.version_id;
@@ -293,11 +296,12 @@ impl CassandraBackend {
     /// ([`CassandraBackend::follow_stored_search_parameter`]). A failed read
     /// is logged and changes nothing; the call's `NotFound` is unchanged.
     async fn catch_up_with_a_deleted_miss(&self, tenant_id: &str, id: &str) {
+        let read_at = self.search_parameter_read_stamp();
         match self
             .read_resource_row(tenant_id, "SearchParameter", id)
             .await
         {
-            Ok(row) => self.follow_stored_search_parameter(tenant_id, id, row.as_ref()),
+            Ok(row) => self.follow_stored_search_parameter(tenant_id, id, row.as_ref(), read_at),
             Err(error) => tracing::warn!(
                 tenant_id,
                 id,

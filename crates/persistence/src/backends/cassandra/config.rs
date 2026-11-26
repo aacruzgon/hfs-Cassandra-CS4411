@@ -17,8 +17,8 @@
 //! | `HFS_CASSANDRA_LOCAL_DC` | `helios-dc1` | Data centre whose nodes serve every request (`LOCAL_QUORUM`, `LOCAL_SERIAL`). |
 //! | `HFS_CASSANDRA_USERNAME`, `HFS_CASSANDRA_PASSWORD` | unset | `PasswordAuthenticator` credentials; set both or neither. |
 //! | `HFS_CASSANDRA_POOL_SIZE` | `2` | Connections per local node. Each connection multiplexes many requests. |
-//! | `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection. |
-//! | `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` | `10000` | The backend's own deadline for one statement. Kept above the node's `read_request_timeout` (5 s), `write_request_timeout` (2 s) and `cas_contention_timeout` (1 s), so the node reports a typed timeout first. |
+//! | `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection. Must be shorter than the request timeout. |
+//! | `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` | `10000` | The backend's own deadline for one statement; longer than the connect timeout. Kept above the node's `read_request_timeout` (5 s), `write_request_timeout` (2 s) and `cas_contention_timeout` (1 s), so the node reports a typed timeout first. |
 //! | `HFS_CASSANDRA_SWEEPER_ENABLED` | `true` | Whether hfs runs the index sweeper (one per process). |
 //! | `HFS_CASSANDRA_SWEEPER_POLL_INTERVAL_MS` | `5000` | Pause between two polls of pending_index_writes. |
 //! | `HFS_CASSANDRA_SWEEPER_GRACE_MS` | `30000` | How old an intent must be before the sweeper takes it: at least twice the request timeout, under one hour, and not under the poll interval. |
@@ -83,7 +83,8 @@ pub struct CassandraConfig {
     /// Bound on opening the session and each pooled connection, in
     /// milliseconds.
     pub connect_timeout_ms: u64,
-    /// The backend's own deadline for one statement, in milliseconds.
+    /// The backend's own deadline for one statement, in milliseconds. Must be
+    /// longer than `connect_timeout_ms` ([`validate`](Self::validate)).
     pub request_timeout_ms: u64,
     /// Whether `hfs` runs the index sweeper (ADR-sam-michaels-0006, SW1, SW4). The backend never starts it itself.
     pub sweeper_enabled: bool,
@@ -255,6 +256,18 @@ impl CassandraConfig {
                 "Cassandra timeouts must be at least 1 ms".to_string(),
             ));
         }
+        // ADR-aacruzgon-0100: `cdrs-tokio` 10.0.0 bounds each connection
+        // attempt by the connect timeout (`cluster/connection_pool.rs:39-61`,
+        // `:224-237`), and that attempt can fall inside a statement's deadline.
+        if self.request_timeout_ms <= self.connect_timeout_ms {
+            return Err(CassandraConfigError(format!(
+                "HFS_CASSANDRA_REQUEST_TIMEOUT_MS ({}) must be longer than \
+                 HFS_CASSANDRA_CONNECT_TIMEOUT_MS ({}): one attempt to connect to a node \
+                 that does not answer waits up to the connect timeout, inside a statement's \
+                 deadline",
+                self.request_timeout_ms, self.connect_timeout_ms
+            )));
+        }
         // SW4, RW11: checked whether or not the sweeper is enabled.
         if self.sweeper_poll_interval_ms == 0 {
             return Err(CassandraConfigError(
@@ -403,10 +416,13 @@ mod tests {
             "{error}"
         );
 
+        // A connect timeout below every request timeout used here, so each case
+        // reaches the sweeper check it names (ADR-aacruzgon-0100).
         let with = |poll: u64, grace: u64, request: u64| CassandraConfig {
             sweeper_poll_interval_ms: poll,
             sweeper_grace_ms: grace,
             request_timeout_ms: request,
+            connect_timeout_ms: 1_000,
             ..CassandraConfig::default()
         };
         for (config, name) in [
@@ -431,6 +447,58 @@ mod tests {
         assert!(with(5_000, 20_000, u64::MAX).validate().is_err());
         assert!(with(5_000, 20_000, 10_000).validate().is_ok());
         assert!(with(5_000, 3_599_999, 10_000).validate().is_ok());
+    }
+
+    /// ADR-aacruzgon-0100: the request timeout must be longer than the connect
+    /// timeout, or one connection attempt to a node that does not answer can use
+    /// up a whole statement's deadline.
+    #[test]
+    fn request_timeout_must_be_longer_than_connect_timeout() {
+        let with = |connect: u64, request: u64| CassandraConfig {
+            connect_timeout_ms: connect,
+            request_timeout_ms: request,
+            ..CassandraConfig::default()
+        };
+        // Equal and smaller are refused, naming both variables and both values.
+        for (connect, request) in [(5_000, 5_000), (5_000, 4_999), (8_000, 2_000), (1, 1)] {
+            let error = with(connect, request).validate().unwrap_err().to_string();
+            for expected in [
+                format!("HFS_CASSANDRA_REQUEST_TIMEOUT_MS ({request})"),
+                format!("HFS_CASSANDRA_CONNECT_TIMEOUT_MS ({connect})"),
+                "must be longer than".to_string(),
+            ] {
+                assert!(error.contains(&expected), "{connect}/{request}: {error}");
+            }
+        }
+        // Longer is accepted, down to one millisecond more.
+        for (connect, request) in [(5_000, 5_001), (5_000, 10_000), (2_000, 3_000), (1, 2)] {
+            assert!(
+                with(connect, request).validate().is_ok(),
+                "{connect}/{request} was refused"
+            );
+        }
+        // The defaults pass: 5,000 ms against 10,000 ms.
+        assert!(CassandraConfig::default().validate().is_ok());
+        // Through the environment, as `hfs` reads it, equal values fail startup.
+        let error = CassandraConfig::from_env_with(env_of(&[
+            ("HFS_CASSANDRA_CONNECT_TIMEOUT_MS", "5000"),
+            ("HFS_CASSANDRA_REQUEST_TIMEOUT_MS", "5000"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("HFS_CASSANDRA_REQUEST_TIMEOUT_MS (5000)")
+                && error.contains("HFS_CASSANDRA_CONNECT_TIMEOUT_MS (5000)"),
+            "{error}"
+        );
+        // A connect timeout raised above the default request timeout alone fails too.
+        assert!(
+            CassandraConfig::from_env_with(env_of(&[(
+                "HFS_CASSANDRA_CONNECT_TIMEOUT_MS",
+                "10000"
+            )]))
+            .is_err()
+        );
     }
 
     #[test]

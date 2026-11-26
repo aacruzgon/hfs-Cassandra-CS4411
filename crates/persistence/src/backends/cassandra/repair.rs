@@ -2604,6 +2604,29 @@ mod tests {
         );
     }
 
+    /// The deletes reserved for the version read count against the 512-row
+    /// limit at admission (ADR-aacruzgon-0096). A repair from one date row
+    /// over K(current) = {type row} at version 9 is 2 rows of delta (the
+    /// insert and the date row's delete) plus 8 reserved (versions 1 to 8):
+    /// 10. After 504 rows it does not fit, though its delta alone would; a
+    /// later repair of 8 rows does, filling the limit exactly.
+    #[test]
+    fn the_reserved_type_row_deletes_decide_whether_a_repair_fits() {
+        let rbt = IndexKey::ResourcesByType;
+        let row2 = r1(2, lu(2), std::slice::from_ref(&rbt));
+        let row9 = r1(9, lu(9), std::slice::from_ref(&rbt));
+        let date_only = queued("q", Some(row9), vec![s(date("d"), None, 1)]);
+        let queue = [
+            queued("p", Some(row2.clone()), found_rows(502)),
+            date_only,
+            queued("r", Some(row2), found_rows(6)),
+        ];
+        assert_eq!(
+            admitted_sizes(&queue),
+            [Ok(504), Err(SkipReason::Budget), Ok(8)]
+        );
+    }
+
     #[test]
     fn once_32_repairs_are_admitted_later_entries_still_run_the_checks_before_budget() {
         let rbt = IndexKey::ResourcesByType;

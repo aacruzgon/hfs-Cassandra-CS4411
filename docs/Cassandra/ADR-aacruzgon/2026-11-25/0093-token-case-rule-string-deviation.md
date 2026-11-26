@@ -1,0 +1,66 @@
+# ADR-aacruzgon-0093: Token matching stays case-sensitive; for a token on a `string` element, a Coding or a `code` element whose system is not known to be case-sensitive, or an Identifier, that is a documented deviation from the spec, not "the spec default"
+
+- **Date:** 2026-11-25
+- **Status:** accepted
+- **Context:**
+    - **The rule being restated.** `docs/Cassandra/cassandra-discussion.md:145` says: "**Decision: token matching is case-sensitive.** That is the spec default (case-insensitive matching is a SHOULD only when the code system's case rules are unknown) and it is what PostgreSQL and MongoDB do, so all backends agree."
+        - `:75` (the spec table's Token row) says: "Matching is literal (no subsumption) and case-sensitive unless the context says otherwise; `_id` is always case-sensitive; only when it is ambiguous SHOULD servers match case-insensitively."
+        - `coverage.md` §2 had, on `2ae41258e`, "case … 200, no match: matching is case-sensitive (design decision)" (`:74`) and "ContactPoint … 200; exact, case-sensitive value" (`:76`).
+        - No ADR records the decision. It has been in the design since its first commit (`67dab9104`, 2026-10-13). `:75` cites R4 #token; `:145` cites nothing.
+    - **What the spec says** (search.html#token):
+        - R4, https://hl7.org/fhir/R4/search.html#token: "Match is case sensitive unless the underlying semantics for the context indicate that the token should be interpreted case-insensitively (see, e.g. CodeSystem.caseSensitive). Note that matches on `_id` are always case sensitive. If the underlying data type is string then the search is not case sensitive." The note under it: "When in doubt, servers SHOULD treat tokens in a case-insensitive manner". The type table, for `string`: "Token is sometimes used for string to indicate that exact matching is the correct default search strategy". For ContactPoint: "At the discretion of the server, token searches on ContactPoint may use special handling, such as ignoring punctuation, performing partial searches etc."
+        - R4B, https://hl7.org/fhir/R4B/search.html#token: the same texts.
+        - R5, https://hl7.org/fhir/R5/search.html#token: the same case paragraph ("If the underlying datatype is `string` then the search is not case sensitive"), the same SHOULD, and the same ContactPoint row. The `string` row changes to "Token is sometimes used for string to indicate that case-insensitive full-string matching is the correct default search strategy".
+        - Levels: the case paragraph is descriptive, "When in doubt" is a SHOULD, and the ContactPoint row is left to the server. The R4 and R4B `string` row ("exact matching") pulls against the case paragraph; R5 removes that conflict.
+        - `CodeSystem.caseSensitive` (R4, R4B and R5, codesystem-definitions.html): "If this value is missing, then it is not specified whether a code system is case sensitive or not." In the core packages, `http://snomed.info/sct` is `caseSensitive: false` in R4 and R4B, and `color-names` and `color-rgb` are in R5. HFS's search path reads no `caseSensitive`; only HTS does (`crates/hts/`).
+        - Some `code` elements and Codings are bound to external systems that define their own case rule. `Attachment.contentType` (`DocumentReference.content.attachment.contentType`, `Library.content.contentType`), `CapabilityStatement.format`, `Subscription.channel.payload` (R4, R4B) and `Subscription.contentType` (R5) take MIME types (`ValueSet/mimetypes`, system `urn:ietf:bcp:13`). RFC 2045 §5.1 says "Matching of media type and subtype is ALWAYS case-insensitive" and "The type, subtype, and parameter names are not case sensitive", though "Parameter values are normally case sensitive". `Attachment.language`, `CodeSystem.concept.designation.language` and R5 `Resource.language` take BCP 47 language tags as `code`, and CodeableConcepts such as those of `Patient-language` and `Practitioner-communication` take them as codings with system `urn:ietf:bcp:47`. RFC 5646 §2.1.1 says "At all times, language tags and their subtags, including private use and extensions, are to be treated as case insensitive". No core package has a CodeSystem resource for `urn:ietf:bcp:13` or `urn:ietf:bcp:47`, so the case rule comes from the RFCs. Those semantics indicate case-insensitive matching, as SNOMED CT's `caseSensitive: false` does.
+        - So the design's justification holds for `_id`, `code` elements bound to a case-sensitive code system, `uri`, `id` and `boolean`. It leaves out the `string` sentence in every version. For a Coding or `code` element whose system is `caseSensitive: false`, is case-insensitive by its own definition (MIME types, RFC 2045 §5.1; BCP 47 language tags, RFC 5646 §2.1.1) or has no known case rule, and for an Identifier, it names the "When in doubt" SHOULD but not the exception "unless the underlying semantics for the context indicate that the token should be interpreted case-insensitively", of which `CodeSystem.caseSensitive` is the spec's example and the RFCs above are the source for MIME types and language tags, and it calls the behaviour "the spec default", though HFS reads no `caseSensitive` and so does not follow that SHOULD (the audits of PR #116, F4, R3, Q1 and Q2).
+    - **What was observed** (base `2ae41258e`; the `validate-108-findings` run, `evidence/`):
+        - `Patient?gender=Female` misses `gender: female` on SQLite through REST (R4, R4B, R5). That is spec-correct for a `code` element bound to a case-sensitive code system, such as `gender` (`administrative-gender`).
+        - `Medication?lot-number=ab12C` misses `batch.lotNumber: "AB12c"` (R4, R4B, R5; `evidence/sqlite/<V>/summary.txt`, `C6s-*`). `Medication.batch.lotNumber` is `0..1 string` in all three (`evidence/spec/R*-medication.txt`). The spec says that search is not case-sensitive.
+        - The same on upstream `fb7d12ed5` (`evidence/upstream-fb7d12ed5/sqlite/<V>/summary.txt`).
+        - Cassandra stores the code as written (`token_code_index (lot-number, AB12c)`, R4, R4B, R5; `evidence/cassandra/<V>/cql-rows.txt`). It would answer the same once Step 6 serves token search.
+        - By code: SQLite compares `value_token_code = ?` on a plain `TEXT` column (`backends/sqlite/search/parameter_handlers/token.rs:93-122`, `schema.rs:574`); PostgreSQL `value_token_code = $N` (`backends/postgres/search/query_builder.rs:2530`, `:2589`); MongoDB `{"value_token_code": code}` (`backends/mongodb/search_impl.rs`, `build_token_filter`). Every Helios backend is case-sensitive here.
+- **Decision:**
+    - Token matching stays case-sensitive on every backend, and HFS reads no `CodeSystem.caseSensitive`.
+    - **`_id`, `code` elements bound to a case-sensitive code system, `uri`, `id` and `boolean`:** exact, which is the spec's rule ("case sensitive unless the underlying semantics … indicate" otherwise).
+    - **A Coding, CodeableConcept or `code` element whose system is not known to be case-sensitive, and an Identifier:** matched exactly, which is a **documented deviation** from "unless the underlying semantics … indicate" and from "When in doubt, servers SHOULD treat tokens in a case-insensitive manner". The system falls in this category in three cases:
+        - it is `caseSensitive: false`, for example SNOMED CT in the R4 and R4B core packages;
+        - it is case-insensitive by its own definition: MIME types (`urn:ietf:bcp:13`, RFC 2045 §5.1), for example `CapabilityStatement-format`, `DocumentReference-contenttype`, `Library-content-type` and `Subscription-payload` in R4, R4B and R5; and BCP 47 language tags (`urn:ietf:bcp:47`, RFC 5646 §2.1.1), for example the `code` elements of `DocumentReference-language`, `CodeSystem-language` and R5 `_language`, and the CodeableConcepts of `Patient-language` and `Practitioner-communication`. Where a binding is only preferred, this applies to the codings that use the system;
+        - it has no known case rule.
+
+      The category decides, not the examples, which are not a complete list.
+    - **ContactPoint:** exact, which the spec leaves to the server.
+    - **A token on a `string` element** (for example `Medication.batch.lotNumber`, or `version` on CodeSystem and the other conformance resources) is matched case-sensitively, which is a **documented deviation** from "If the underlying data type is string then the search is not case sensitive".
+    - Why these deviations:
+        - every Helios backend matches these tokens case-sensitively, so Cassandra agrees with them;
+        - serving them would need a case-folded code for those parameters, and for Codings a per-system case rule at write or query time, which is a schema and extraction change;
+        - the spec texts they depart from are descriptive or a SHOULD, not a SHALL.
+    - Whether to serve case-insensitive string tokens later, on Cassandra and upstream together, is the group's call. This entry does not decide it.
+    - **The design-document edits** are `cassandra-discussion.md:75` and `:145`, and `coverage.md` §2's "case" row, a new "case on a `string` element" row, and the "ContactPoint" row. They are committed with this entry, in the docs pull request.
+- **Alternatives considered:**
+    - **Keep the text as it is.** Lost: it calls the behaviour "the spec default", which is wrong in all three versions for `string` elements, for code systems not known to be case-sensitive and for Identifiers.
+    - **Serve `string` tokens case-insensitively on Cassandra now** (a folded code column or table). Lost for now: Cassandra would differ from SQLite, PostgreSQL and MongoDB, it changes the schema and extraction, and the group has not asked for it. It is left to the group, ideally with upstream.
+    - **Match every token case-insensitively** (the "When in doubt" SHOULD). Lost: it would make every Helios backend disagree, and it needs a case-folded code for every token, not only for `string` elements.
+- **Consequences:**
+    - The design says plainly where Cassandra, like every Helios backend, deviates from the spec.
+    - A client searching a `string` token with different case gets no match, on every backend.
+    - Step 6's token tests can pin both cases: `gender=Female` (no match, spec-correct) and `lot-number=ab12C` (no match, documented deviation).
+    - Revisit if upstream starts folding `string` tokens. Cassandra would then need a folded column or a folded copy of the code, and a reload.
+    - **The `string` deviation's reach.** Counted from `data/search-parameters-*.json` and the element types: 24 token parameters reach a `string` element in R4, 25 in R4B and 11 in R5 (38, 39 and 42 paths), among them `Medication-lot-number`, `NutritionProduct-lot-number` (R5), `AuditEvent-site` and `-altid` (R4, R4B), `StructureDefinition-path`, every conformance or canonical resource's `version`, and the `*-name` parameters of PackagedProductDefinition (R4B, R5) and ManufacturedItemDefinition (R5).
+- **AI involvement:** Claude Code (Claude Opus 5.5), in a validation worker run by Alan.
+    - **The finding.** A spec-check worker reported the omission (its M2). An independent validation worker quoted the spec per version, found that the ContactPoint half is the server's choice, and reproduced the `string` case on SQLite through REST, as Cassandra rows and on upstream `fb7d12ed5`. It proposed recording a deviation rather than serving folding, and drafted this entry and the design diff.
+    - **The decision.** Alan decided to record the deviation.
+    - **What was verified, and how:**
+        - the spec texts, fetched per version (`evidence/spec/`);
+        - the three backends' token predicates by code;
+        - SQLite's answers through REST;
+        - Cassandra's stored rows.
+        - The diff applies cleanly to `2ae41258e` (`git apply --check`).
+    - **Not verified:** PostgreSQL and MongoDB answers (code only).
+    - **What the human changed:** Alan approved the draft as written on 2026-11-25. Alan approved the audit's corrections on 2026-11-25 (F4/F6, R1/R3/R5 and S1/Q1–Q3/Q1′ for 0093).
+- **Links:**
+    - `cassandra-discussion.md:75`, `:145`; `coverage.md` §2.
+    - The design's first commit `67dab9104`.
+    - No upstream issue: every Helios backend matches the same way, and whether to fold `string` tokens is the group's call.
+    - Evidence: the `validate-108-findings` run, `report.md`, "C5", "C6" and "ADR decisions to supersede".

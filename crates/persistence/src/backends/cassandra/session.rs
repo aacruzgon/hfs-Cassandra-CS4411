@@ -1769,6 +1769,15 @@ mod node_tests {
     /// still reads a 65,535-statement batch but keeps one row: the
     /// consistency and checkpoint tests scan whole index tables, and 65,535
     /// rows left by every run would slow each later run on the same node.
+    ///
+    /// The node builds the batch's one mutation from its 65,535 statements
+    /// inside `write_request_timeout` (2 s), whose clock starts when it begins
+    /// the request (`cql_start_time: REQUEST`, 5.0.9). Under the whole
+    /// `backends::cassandra` run, on the CI node's 4 CPUs, it reached that
+    /// timeout on `sam-7900x`, so the required job runs this test in a step of
+    /// its own and its lib run skips it, as the FHIR versions job's lib runs
+    /// do. It prints `[at-limit-batch …]` with the batch's time, for that
+    /// step's report.
     #[tokio::test]
     async fn a_batch_over_the_statement_limit_is_refused_and_sends_nothing() {
         let Some(session) = session().await else {
@@ -1781,10 +1790,14 @@ mod node_tests {
             .collect();
         assert_eq!(statements.len(), 65_535);
         let before = session.statement_counts();
-        session
-            .batch(statements)
-            .await
-            .expect("a batch at the limit is sent");
+        let started = Instant::now();
+        let sent = session.batch(statements).await;
+        eprintln!(
+            "[at-limit-batch statements=65535 ms={} sent={}]",
+            started.elapsed().as_millis(),
+            sent.is_ok()
+        );
+        sent.expect("a batch at the limit is sent");
         let spent = session.statement_counts().since(&before);
         assert_eq!((spent.batch, spent.batched), (1, 65_535), "{spent}");
         assert_eq!(

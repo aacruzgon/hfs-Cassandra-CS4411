@@ -75,7 +75,7 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0028](2026-11-06/0028-schema-sign-off.md) | 2026-11-06 | Sign-off on `schema.cql` as merged at `67f9e0532` | accepted |
 | [0029](2026-11-06/0029-cassandra-test-node.md) | 2026-11-06 | How the Cassandra test node is reached, started and shared | accepted |
 | [0030](2026-11-06/0030-ci-cassandra-tests.md) | 2026-11-06 | The Cassandra job builds its tests before starting the node, and stays on the light runners | accepted |
-| [0031](2026-11-06/0031-cassandra-config-names.md) | 2026-11-06 | `HFS_CASSANDRA_*` configuration names and defaults | accepted; see [0081](2026-11-18/0081-what-step5-design-changes.md) |
+| [0031](2026-11-06/0031-cassandra-config-names.md) | 2026-11-06 | `HFS_CASSANDRA_*` configuration names and defaults | accepted; see [0081](2026-11-18/0081-what-step5-design-changes.md); see [0100](2026-11-26/0100-request-timeout-longer-than-connect-timeout.md) (the request timeout must be longer than the connect timeout) |
 | [0032](2026-11-06/0032-cassandra-driver-settings.md) | 2026-11-06 | `cdrs-tokio` session settings: protocol v5, local-DC routing, no driver re-send of a CAS, and a client deadline | accepted; see [0081](2026-11-18/0081-what-step5-design-changes.md) |
 | [0033](2026-11-06/0033-create-writes-resources-by-type.md) | 2026-11-06 | Step 2's `create` writes the `resources_by_type` row, and `count` is real at Milestone A | accepted |
 | [0034](2026-11-06/0034-create-details.md) | 2026-11-06 | The choices inside Step 2's `create`: post-CAS retries, every attempt's `write_id`, id and code checks | accepted; its code check retired by [0079](2026-11-17/0079-hash-oversized-index-values.md); see [0081](2026-11-18/0081-what-step5-design-changes.md) |

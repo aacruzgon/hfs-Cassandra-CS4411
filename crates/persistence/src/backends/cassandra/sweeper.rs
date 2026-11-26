@@ -628,6 +628,9 @@ pub(crate) struct SweepState {
     retry: parking_lot::Mutex<RetryList>,
     pending: parking_lot::Mutex<Vec<PendingSlice>>,
     cancel: CancellationToken,
+    /// Least time between two of the startup scan's "retry list is full" lines: `FULL_LOG_EVERY`,
+    /// which a test may change.
+    full_log_every: std::time::Duration,
 }
 
 impl SweepState {
@@ -638,6 +641,7 @@ impl SweepState {
             retry: parking_lot::Mutex::new(RetryList::new(RETRY_LIST_CAP)),
             pending: parking_lot::Mutex::new(Vec::new()),
             cancel,
+            full_log_every: FULL_LOG_EVERY,
         }
     }
 
@@ -1404,7 +1408,8 @@ impl CassandraBackend {
                     state.hold_slice(outcome.slice, 1, Utc::now());
                 }
             }
-            if slices_held > 0 && full_logged_at.is_none_or(|at| at.elapsed() >= FULL_LOG_EVERY) {
+            let every = retry.map_or(FULL_LOG_EVERY, |state| state.full_log_every);
+            if slices_held > 0 && full_logged_at.is_none_or(|at| at.elapsed() >= every) {
                 log_retry_list_full(0, slices_held);
                 slices_held = 0;
                 full_logged_at = Some(std::time::Instant::now());
@@ -2665,12 +2670,19 @@ mod node_tests {
 
     const SKIP: &str = "skipping: HFS_TEST_CASSANDRA_URL is not set";
 
-    /// Every event's level and message, recorded by a `tracing` subscriber set as this thread's default
+    /// Every event's level, message and `u64` fields, recorded by a `tracing` subscriber set as this thread's default
     /// ([`Captured::install`]). A `#[tokio::test]` runs on one thread, and the sweeper polls its intents
     /// and their batches as futures inside that task, never `tokio::spawn`, so its events land here;
     /// other tests' threads keep their own. It needs no new dev-dependency.
     #[derive(Clone, Default)]
-    struct Captured(Arc<parking_lot::Mutex<Vec<(tracing::Level, String)>>>);
+    struct Captured(Arc<parking_lot::Mutex<Vec<CapturedEvent>>>);
+
+    /// One event: its level, its message, and its `u64` fields by name.
+    struct CapturedEvent {
+        level: tracing::Level,
+        message: String,
+        numbers: Vec<(&'static str, u64)>,
+    }
 
     impl Captured {
         /// Sets this subscriber as the thread's default until the guard is dropped, with a second
@@ -2693,8 +2705,25 @@ mod node_tests {
             self.0
                 .lock()
                 .iter()
-                .filter(|(at, message)| *at == level && message.starts_with(text))
+                .filter(|event| event.level == level && event.message.starts_with(text))
                 .count()
+        }
+
+        /// The `u64` field `field` of each event at `level` whose message starts with `text`, in order
+        /// (`None` where an event has no such field).
+        fn numbers(&self, level: tracing::Level, text: &str, field: &str) -> Vec<Option<u64>> {
+            self.0
+                .lock()
+                .iter()
+                .filter(|event| event.level == level && event.message.starts_with(text))
+                .map(|event| {
+                    event
+                        .numbers
+                        .iter()
+                        .find(|(name, _)| *name == field)
+                        .map(|(_, value)| *value)
+                })
+                .collect()
         }
 
         /// The events at `warn` or `error`, for a failed assertion's message.
@@ -2702,8 +2731,8 @@ mod node_tests {
             self.0
                 .lock()
                 .iter()
-                .filter(|(level, _)| *level <= tracing::Level::WARN)
-                .cloned()
+                .filter(|event| event.level <= tracing::Level::WARN)
+                .map(|event| (event.level, event.message.clone()))
                 .collect()
         }
     }
@@ -2718,12 +2747,15 @@ mod node_tests {
         fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
         fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
         fn event(&self, event: &tracing::Event<'_>) {
-            struct Message(String);
+            struct Message(String, Vec<(&'static str, u64)>);
             impl tracing::field::Visit for Message {
                 fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
                     if field.name() == "message" {
                         self.0 = value.to_string();
                     }
+                }
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    self.1.push((field.name(), value));
                 }
                 fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
                     if field.name() == "message" {
@@ -2731,9 +2763,13 @@ mod node_tests {
                     }
                 }
             }
-            let mut message = Message(String::new());
+            let mut message = Message(String::new(), Vec::new());
             event.record(&mut message);
-            self.0.lock().push((*event.metadata().level(), message.0));
+            self.0.lock().push(CapturedEvent {
+                level: *event.metadata().level(),
+                message: message.0,
+                numbers: message.1,
+            });
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
@@ -4919,6 +4955,69 @@ mod node_tests {
         assert_eq!((report.current, report.done), (1, 1), "{report}");
         assert!(state.pending.lock().is_empty());
         assert!(intents(&backend, &t, "p", since).await.is_empty());
+    }
+
+    /// SW18: the startup scan logs that the list is full at most once per `full_log_every`, each line
+    /// naming the slices held since the one before. Three intents in three minutes of the scan each
+    /// fail their row read once, on a list of one kept full: with the interval at 0, each minute logs
+    /// its one slice; with it at "never again", only the first minute does. Once the faults are spent
+    /// and the list has room, a scan finishes the three (none has a row).
+    #[tokio::test]
+    async fn the_startup_scan_logs_a_full_retry_list_at_most_once_per_interval() {
+        let Some((backend, t, _, _)) = start("sweeper-full-interval").await else {
+            return;
+        };
+        let logs = Captured::default();
+        let _logging = logs.install();
+        let now = Utc::now();
+        let ids = ["q0", "q1", "q2"];
+        for (id, ago) in ids.into_iter().zip([3, 2, 1]) {
+            let key = RowKey {
+                tenant_id: &t,
+                resource_type: "Patient",
+                id,
+            };
+            let at = now - chrono::Duration::minutes(ago);
+            backend
+                .write_intent(&IntentKey::new(&t, id, at), &key, Uuid::new_v4(), 1)
+                .await
+                .unwrap();
+        }
+        let full = "the index sweeper's retry list is full; what it could not take is read again";
+        let scope = SweepScope::Tenants(vec![t.clone()]);
+        let (from, to) = (now - chrono::Duration::minutes(5), Utc::now());
+        for (every, expected) in [
+            (std::time::Duration::ZERO, vec![Some(1); 3]),
+            (std::time::Duration::MAX, vec![Some(1)]),
+        ] {
+            for _ in ids {
+                backend.session.inject_fault(
+                    StatementKind::Read,
+                    "FROM resources WHERE",
+                    Fault::FailWithUnavailable,
+                );
+            }
+            let mut state = SweepState::new(Utc::now(), CancellationToken::new());
+            state.full_log_every = every;
+            fill_retry_list_of_one(&state, &t);
+            let before = logs.count(tracing::Level::ERROR, full);
+            let report = backend.startup_scan(&state, from, to, &scope).await;
+            assert_eq!(report.overflow, 3, "{every:?}: {report}");
+            let lines = logs.numbers(tracing::Level::ERROR, full, "slices_held");
+            let shards = logs.numbers(tracing::Level::ERROR, full, "shards_held");
+            assert_eq!(lines[before..], expected[..], "{every:?}: {:?}", logs.all());
+            assert!(
+                shards[before..].iter().all(|held| *held == Some(0)),
+                "{shards:?}"
+            );
+        }
+
+        let state = SweepState::new(Utc::now(), CancellationToken::new());
+        let report = backend.startup_scan(&state, from, to, &scope).await;
+        assert_eq!((report.no_row, report.done), (3, 3), "{report}");
+        for id in ids {
+            assert!(intents(&backend, &t, id, from).await.is_empty(), "{id}");
+        }
     }
 
     /// SW8: a poll never reads further back than the outbox's 24 hour TTL, whatever its mark says.

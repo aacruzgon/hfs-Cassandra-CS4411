@@ -713,7 +713,7 @@ A background task in each Helios process (ADR-aacruzgon-0013 to 0015). It never 
 | --- | --- | --- |
 | no row, or `version_id < V`: the CAS never applied | — | none |
 | `V` current: a crashed or slow request | R3 for `V-1` (not for `V = 1`) | `K(V)` is the `index_keys` the read returned (G22). Step 4 for `V`'s own row (never V3), at `ts(V)`: V1, or V2 if `deleted_at > 0`, with `data`, `write_id` and `index_keys` from the `resources` row. It writes the same cells as `V`'s writer, so an existing row is unchanged. Then step 5 at `ts(V)`: delete `K(V-1) \ K(V)`, insert `K(V)` |
-| `V` superseded | R3 for `V` (for `ts(V)`) and `V-1` | delete all of `K(V-1)` at `ts(V)`; no inserts, since a later version already deleted `K(V)` and a late insert would outlive those tombstones (3 h) |
+| `V` superseded | R3 for `V` (for `ts(V)`) and `V-1` | delete `K(V-1) \ K(V)` at `ts(V)` (a row both hold was written by `V` at `ts(V)`, and a delete at the same timestamp would win the tie; ADR-aacruzgon-0094); no inserts, since a later version already deleted `K(V)` and a late insert would outlive those tombstones (3 h) |
 
 `K(V-1)` is row `V-1`'s `index_keys` (G22), since `resources` holds only the current version's. Row `V-1` always exists for `V > 1`, and row `V` once `V` is superseded: each writer wrote the previous row (V3) before its CAS (G40). A missing row `V-1` therefore never stands for an empty set: the sweeper logs it at error, keeps the intent and counts it (ADR-sam-michaels-0006, SW13). The set is empty only for version 1 and for a delete marker. Every write is older than any later version's, so it never removes a newer row, even after that row's tombstones are purged. A sweeper and a slow request may run the same writes. The grace period is the one clock comparison (G11).
 
@@ -804,8 +804,8 @@ The two date keys are the ones version 3 deleted. They come back because the ins
 - **Same crash, but version 3 (the delete) lands before the sweeper runs.**
     - The delete's R1 gives version 2's content and `K(2)`, which C2 wrote (G22). Its V3, before C3, restores row 2 at `ts(2) − 1`, with that `K(2)` as `index_keys`. It deletes `K(2)` at `ts(3)`; of those 10 keys only the two date keys exist (equal to `K(1)`'s, tag 1), so the date rows go.
     - Left behind: the 8 non-date rows of `K(1)`, tag 1: `resources_by_type (lu(1), p1)`, three identifier rows, two gender `male` rows and two `deceased` rows. The tag check hides them; `count` is 1 for a deleted patient (G7).
-    - The sweeper finds `resources` at 3, above the intent's 2: version 2 is superseded. It reads `ts(2)` from row 2 and `K(1)` from row 1's `index_keys`, deletes all 10 keys of `K(1)` at `ts(2)` (the 8 orphans, and the two date keys version 3 already deleted), inserts nothing, then runs I2.
-    - After the sweep: vread 2 is 200, `list_versions` is `["1", "2", "3"]`, `count` is 0. As in the crash-free run there are 18 index row tombstones (the two date keys carry both deletes, merged into one each); only the shadowed `K(2)` inserts are missing.
+    - The sweeper finds `resources` at 3, above the intent's 2: version 2 is superseded. It reads `ts(2)` from row 2 and `K(1)` from row 1's `index_keys`, deletes `K(1) \ K(2)` at `ts(2)`: the 8 orphans. The two date keys are in `K(2)` too, so it leaves them; version 3 already deleted them at `ts(3)` (ADR-aacruzgon-0094). It inserts nothing, then runs I2.
+    - After the sweep: vread 2 is 200, `list_versions` is `["1", "2", "3"]`, `count` is 0. As in the crash-free run there are 18 index row tombstones (the two date keys carry version 3's delete); only the shadowed `K(2)` inserts are missing.
 
 ## 8. Gaps and questions for the session
 

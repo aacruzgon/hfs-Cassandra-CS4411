@@ -1,0 +1,44 @@
+# ADR-aacruzgon-0094: A superseded replay deletes K(V−1) minus K(V), not all of K(V−1) (supersedes ADR-sam-michaels-0006 SW11's superseded case and the design text that repeats it)
+
+- **Date:** 2026-11-25
+- **Status:** accepted
+- **Context:**
+    - **The rule as written.**
+        - ADR-sam-michaels-0006, decision 4 (`0006-step-5-design.md:42`): "V superseded: K(V−1) is deleted."
+        - ADR-sam-michaels-0006 SW11 (`:213`): "V current: write V's version row, insert K(V), delete K(V−1) minus K(V). V superseded: delete K(V−1) only."
+        - `cassandra-discussion.md:351`: "If V has been superseded, the sweeper only deletes V−1's keys at `write_ts(V)`."
+        - `schema/walkthrough.md:716`, the superseded row: "delete all of `K(V-1)` at `ts(V)`".
+        - `development-roadmap.md:438`, Step 5's sweeper task: "If V has been superseded, it only deletes V−1's keys at `write_ts(V)`, with no inserts."
+    - **The deciding source.** Every index delete is a row delete at `USING TIMESTAMP ts(V)` (`write.rs`, the `DELETE FROM … USING TIMESTAMP ?` statements). In Cassandra 5.0.9 a row deletion shadows every cell whose timestamp is at most its own: `DeletionTime.deletes(long timestamp) { return timestamp <= markedForDeleteAt(); }` (`DeletionTime.java:173-176`). For cell tombstones, `Cells.resolveRegular` says the same: "Tombstones always win reconciliation with live cells of the same timstamp" (`Cells.java:94-98`). A row in both `K(V−1)` and `K(V)` with the same primary key (a date row two versions share, IW7) is written by V's own index step at `ts(V)`. So a delete of it at `ts(V)` wins the tie and removes V's row.
+    - **What the code does.** Sam's `bd3ba8ffd` (on #107, 2026-11-25) changed `replay_superseded` to delete `K(V−1)` minus `K(V)`, by row identity. It is pinned on purpose by `a_superseded_replay_keeps_a_date_row_its_version_still_has`. No ADR or design-text change came with it, so the five texts above are stale.
+    - **Evidence, L1, this session** (`.agent-share/pr107-fixes/sw11-old-rule.txt`). With the text's rule restored by hand on `3a4e0ed1d` (the delta's next keys set to empty), `a_superseded_replay_keeps_a_date_row_its_version_still_has` fails: "the shared date row is kept: []" (left 0, right 1). With the code as committed, it passes, and so do N4 and the other superseded tests.
+    - **Confirmed independently, at L2 through CQL** (the validator run `validate-107-findings`, claim V4; `v4-code.log`, `v4-text.log` and `doc-quotes.txt` in `.agent-share/validate-107-findings/`). Its own probes create version 1, update to version 2 with the same birth date (crashed after its index rows), then write version 3 with the same date, crashed after its CAS, or completed as the control. They replay each intent oldest first and read `date_index` and `date_index_by_end` with `writetime(version_id)` after each step.
+        - **The text's rule, version 3 crashed:** after version 2's superseded replay, **0 rows in both date tables**. After version 3's current replay, the row is back at version 3's timestamp.
+        - **The code's rule:** the row is kept through every step.
+        - **The control (version 3 completed first):** the row survives under both rules, because the delete at `ts(2)` loses to `ts(3)`.
+        - **So the effect is transient.** The text's rule removes a shared row only while its newest write is at `ts(V)`, which means version V+1's index rows have not been written yet. Whatever writes them next re-inserts the row at a higher timestamp, or deletes it rightly if V+1 does not have it. The gap lasts until V+1's index rows are written: in the running loop about one grace plus a poll, longer if V+1's intent itself waits on the retry list.
+        - **Not shown:** the REST effect (Cassandra search answers 501 until Step 6); a case where the row stays lost, which needs V+1's intent lost too (L0).
+    - **Why it is a decision.** The code deviates from SW11 as written, and SW11 is in Sam's log, which only Sam edits (CLAUDE.md, "Decision records"). Alan co-authors the rest of PR #107, so the supersession is recorded here, with the design documents brought in line in the same commit.
+- **Decision:** a superseded replay of V deletes the rows of `K(V−1)` that `K(V)` does not hold, compared by each table's primary key, at `ts(V)`. It inserts nothing and writes no version row. This supersedes ADR-sam-michaels-0006 SW11's "V superseded: delete K(V−1) only", and decision 4's "V superseded: K(V−1) is deleted", to read: "V superseded: delete K(V−1) minus K(V), by row identity (IW7), at `ts(V)`; no inserts (ADR-aacruzgon-0094)." From this commit, `cassandra-discussion.md:351`, `development-roadmap.md:438` (Step 5's sweeper task) and `schema/walkthrough.md` say so: its sweeper table (`:716`) and the worked example's crash case in section 7, where the replay of version 2 now leaves the two date keys `K(2)` holds (version 3 already deleted them at `ts(3)`), with the same end state.
+- **Alternatives considered:**
+    - **Keep the text's rule (delete all of `K(V−1)`).** It loses on the tie rule above: V's own row for a shared key is deleted until version V+1's index rows are written, so a search on that key misses the resource in that window.
+    - **Delete at `ts(V) − 1`.** It avoids the tie, but it breaks RW10's rule that every write of V carries `ts(V)`, and it adds a second timestamp to reason about. The set difference is exact and needs none.
+    - **Leave the text stale, since the code is right.** The design document is the record of what the backend does (CLAUDE.md, "Decision records"), and a later change made from the text would bring the gap back.
+- **Consequences:**
+    - The design text matches the code. No code changes: `bd3ba8ffd` already has the rule.
+    - The superseded case does one more decode, of row V's `index_keys`, which it already reads for `ts(V)`. An unreadable `K(V)` is `UnreadableKeys` (SW13).
+    - The no-insert reason still holds: a later version already deleted the rows of `K(V)` it does not hold, and a late insert at `ts(V)` would outlive those tombstones once they are purged (3 h, ADR-aacruzgon-0009).
+- **AI involvement:** Claude Code (Claude Opus 5.5), the PR #107 co-author worker, in a session run by Alan.
+    - **What it found:** the design text disagreed with `bd3ba8ffd` while reading the walkthrough in full.
+    - **What it checked:** the tie rule, in `Cells.java` and `DeletionTime.java` at the tag `cassandra-5.0.9`.
+    - **What it ran:** the text's rule as a hand mutation (L1, above).
+    - **What it drafted:** this entry and the two design-document edits.
+    - **What Alan changed:** Alan approved the draft as written on 2026-11-25. It was drafted as 0091 and renumbered 0094, because PR #116 holds 0091 to 0093; the validator's result (the effect is transient until the next version's rows are written) was folded in afterwards, as he asked.
+    - **What was verified, and how:** the L1 mutation above; the validator's independent L2 run (V4, confirmed as stated); both texts quoted from the branch at `3a4e0ed1d`.
+- **Links:**
+    - PR #107, `bd3ba8ffd` (Sam);
+    - [ADR-sam-michaels-0006](../../ADR-sam-michaels/2026-11-16/0006-step-5-design.md), decision 4, SW11 and IW7. Sam's log is not edited;
+    - `cassandra-discussion.md`, "What it does with an intent for version V";
+    - `development-roadmap.md`, Step 5;
+    - `schema/walkthrough.md`, sections 6 and 7;
+    - Cassandra 5.0.9 `src/java/org/apache/cassandra/db/DeletionTime.java` (`deletes`) and `src/java/org/apache/cassandra/db/rows/Cells.java` (`resolveRegular`).

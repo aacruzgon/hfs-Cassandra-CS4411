@@ -37,7 +37,7 @@
         - A new unit test: a real system with an empty code gives exactly one `TokenSystem` key; the `IMPLICIT` marker or `''` with an empty code gives none.
         - A REST-level test once Step 6 serves `system|`.
     - Rows written before the change are not rewritten. Since the converter emits no such value yet, and REST removes an empty `code` before storing (HeliosSoftware/hfs#2554), there are none to fix, except a resource stored with `"code": ""`, or a ContactPoint with `"value": ""`, before the sync of 2026-11-18 or through the storage API, which a reload or its next REST write cleans (`crates/persistence/README.md`, "Keyspaces written before index writes").
-    - **What PR #117's tests cover:** a CodeableConcept coding with a system and `"code": ""`, through the storage API, in the node tests `a_system_with_an_empty_code_keeps_its_system_row` and `an_empty_code_beside_a_real_code_of_its_system_shares_its_partition` (`write.rs`); and `index_keys_from` called directly on a synthetic Identifier token with a system and an empty value, in the unit test `an_empty_code_keeps_only_a_real_systems_row` (`index_keys.rs`).
+    - **What PR #117's tests cover:** a CodeableConcept coding with a system and `"code": ""`, through the storage API. The unit test is `an_empty_code_keeps_only_a_real_systems_row` (`index_keys.rs`). The node tests are `a_system_with_an_empty_code_keeps_its_system_row` and `an_empty_code_beside_a_real_code_of_its_system_shares_its_partition` (`write.rs`). *Corrected 2026-11-26:* only the two node tests go through the storage API and a CodeableConcept. The unit test calls `index_keys_from` directly on a synthetic Identifier token with a system and an empty value (`index_keys.rs`, `an_empty_code_keeps_only_a_real_systems_row`).
     - **Not tested end to end:** a Coding or Identifier with a system and no `code` or `value` key. It cannot reach `index_keys_from` until HeliosSoftware/hfs#2965 fixes the shared converter.
         - That converter half was observed on SQLite through REST, in R4, R4B and R5 (`validate-116-findings`, D1): `code=http://loinc.org|` misses a coding stored as `{"system": "http://loinc.org"}`.
         - That was one independent run, not confirmed by a second.
@@ -55,6 +55,6 @@
 - **Links:**
     - IW2's "Only invalid content…" was overtaken by the fork's sync of 2026-11-18 (HeliosSoftware/hfs#2554): through REST, no backend receives that content.
     - ADR-sam-michaels-0006, IW2 and Decision 9 (amended); ADR-aacruzgon-0027, G18/P5 (its premise corrected).
-    - Upstream HeliosSoftware/hfs#2965, the shared converter's half of the gap (filed 2026-11-25). The Cassandra change to `index_keys.rs:450-468` and its tests land in their own pull request, not in the docs pull request that commits this entry.
+    - Upstream HeliosSoftware/hfs#2965, the shared converter's half of the gap (filed 2026-11-25). The Cassandra change to `index_keys.rs:449-451` and its tests land in their own pull request, not in the docs pull request that commits this entry. *Corrected 2026-11-26:* since PR #117 the change is the empty-code branch at `index_keys.rs:450-468`.
     - `cassandra-discussion.md` "index rows" paragraph (`:188`); walkthrough `:959`.
     - Evidence: the `validate-108-findings` run, `report.md`, "C4" and "ADR decisions to supersede".

@@ -3528,10 +3528,11 @@ mod node_tests {
         .await;
         let lu2 = row_of(&backend, &t, "p").await.last_updated;
         let other = harness::backend().await.expect("a second backend");
+        // One millisecond past now, as `pass` does: the window's bound is in whole milliseconds (SW7).
         let options = SweepOptions {
             scope: SweepScope::Tenants(vec![t.clone()]),
             grace: Duration::ZERO,
-            now: Utc::now(),
+            now: Utc::now() + chrono::Duration::milliseconds(1),
             since,
             allow_short_grace: true,
         };
@@ -5438,11 +5439,13 @@ pub(crate) mod post_suite {
         since: DateTime<Utc>,
     ) -> PostSuiteReport {
         let started = Instant::now();
+        // One millisecond past now, so an intent stamped in this millisecond is in the window, whose bound
+        // is in whole milliseconds (SW7); every writer has returned by now.
         let sweep = backend
             .sweep_pass(SweepOptions {
                 scope: SweepScope::TenantPrefix(prefix.to_string()),
                 grace: Duration::ZERO,
-                now: Utc::now(),
+                now: Utc::now() + chrono::Duration::milliseconds(1),
                 since,
                 allow_short_grace: true,
             })

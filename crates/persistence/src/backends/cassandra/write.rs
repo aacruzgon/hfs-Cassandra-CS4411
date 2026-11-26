@@ -6441,14 +6441,15 @@ mod node_tests {
             vec![2, 2]
         );
 
-        // The sweep writes the row and the index rows, and leaves no intent of its own.
+        // The sweep writes the row and the index rows, and leaves no intent of its own. Its `now` is one
+        // millisecond past now: the window's bound is in whole milliseconds (SW7).
         let report = backend
             .sweep_pass(crate::backends::cassandra::SweepOptions {
                 scope: crate::backends::cassandra::SweepScope::Tenants(vec![
                     tenant.tenant_id().as_str().to_string(),
                 ]),
                 grace: Duration::ZERO,
-                now: Utc::now(),
+                now: Utc::now() + chrono::Duration::milliseconds(1),
                 since,
                 allow_short_grace: true,
             })

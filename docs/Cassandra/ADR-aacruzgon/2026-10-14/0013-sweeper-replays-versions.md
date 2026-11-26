@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0013: The sweeper replays the intent's version, even if superseded
 
 - **Date:** 2026-10-14
-- **Status:** accepted (team review at the schema session, roadmap item 1.4); its LOCAL_SERIAL read for every intent is replaced by a quorum read first (ADR-sam-michaels-0006, SW12), see ADR-aacruzgon-0081
+- **Status:** accepted (team review at the schema session, roadmap item 1.4); its LOCAL_SERIAL read for every intent is replaced by a quorum read first (ADR-sam-michaels-0006, SW12), see ADR-aacruzgon-0081; partly superseded by ADR-aacruzgon-0094 (a superseded replay deletes `K(V−1)` minus `K(V)`, not all of V−1's keys)
 - **Context:**
     - **What the design said.** If the resource's `write_id` differs from the intent's, the sweeper deletes the intent, because "a later version has already superseded it, whose own intent row covers it".
     - **Why that is wrong.** The later version's writer deletes only the keys of the version it read (N+1), and those were never written. The index rows of N are never deleted.
@@ -15,7 +15,7 @@
         - If V is current, it replays V's own version row and step 5 at `write_ts(V)`, with V's content from `resources`. If `deleted_at` is set, V is a delete marker: no `data`, and an empty key set.
         - The previous keys come from V−1's row. They are empty for version 1, for a delete marker, and when V−1's row is missing too.
         - The sweeper never does step 4's rewrite of V−1.
-        - If V has been superseded, it only deletes V−1's keys at `write_ts(V)`, with no inserts.
+        - If V has been superseded, it only deletes V−1's keys at `write_ts(V)`, with no inserts. (Superseded 2026-11-25 by ADR-aacruzgon-0094: it deletes only the keys of V−1 that V does not also hold, since a key both hold was written by V at `write_ts(V)` and a delete at the same timestamp wins the tie.)
         - It then deletes the intent.
     - **If V's row is missing as well** (two crashes), V never reached step 5. The sweeper deletes V−1's keys at `write_ts(V−1) + 1`, logs it, and deletes the intent.
 - **Alternatives considered:**

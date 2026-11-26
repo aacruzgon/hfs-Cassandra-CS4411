@@ -174,8 +174,9 @@ CREATE TABLE IF NOT EXISTS resource_versions (
 -- slice past its low-water mark, never the tombstones of finished intents
 -- (measured on a node: a whole-partition read scanned 3,000 of them).
 -- version_id is the version the attempt's CAS will create. The sweeper
--- replays that version's index writes while it is current, and only deletes
--- the previous version's keys once it is superseded (ADR-aacruzgon-0013).
+-- replays that version's index writes while it is current, and once it is
+-- superseded only deletes the previous version's keys that it does not also
+-- hold (ADR-aacruzgon-0013, 0094).
 -- write_id is kept for diagnostics only, so an operator can match a stuck
 -- intent to the request that wrote it; the sweeper never reads it
 -- (ADR-aacruzgon-0027, walkthrough G32).

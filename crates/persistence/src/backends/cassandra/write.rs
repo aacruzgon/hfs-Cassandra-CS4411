@@ -1164,7 +1164,8 @@ fn previous_version_row(key: &RowKey<'_>, previous: &PreviousVersion) -> Stateme
 /// One version's key set, as the index writer needs it (IW17): the rows it
 /// inserts are `keys` at `last_updated`, tagged `version_id`, and the
 /// `resources_by_type` row carries `fhir_version` (G34). The sweeper's
-/// superseded case passes an empty `keys`, so its delta only deletes.
+/// superseded case passes `K(V)` and clears the inserts, so its delta deletes
+/// only the rows of `K(V-1)` that `K(V)` does not hold (ADR-aacruzgon-0094).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct VersionKeys<'a> {
     pub(crate) version_id: i32,

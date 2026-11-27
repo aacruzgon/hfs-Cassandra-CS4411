@@ -1515,7 +1515,7 @@ def cmd_consistency(args) -> int:
     md += ("\n`registry=changed` checks skip rules 3 and 4, the comparison with a fresh extraction "
            "(ADR-sam-michaels-0006, RV14), so they prove less; their count is shown so that a rise is seen. "
            "Checks with defects in `persistence-lib-tests` are the planted-defect tests' own. In `post-suite`, "
-           "a defect fails the step once it is required (RV22).\n")
+           "a defect fails the step (RV22).\n")
     if missing:
         md += "\nNo log for: " + ", ".join(f"`{m}`" for m in missing) + ".\n"
     add(args.id, args.title, md, {"logs": logs, "post_suite": post_suite, "verdict": verdict, "defects": defects,

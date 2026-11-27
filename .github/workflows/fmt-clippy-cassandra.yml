@@ -1021,17 +1021,18 @@ jobs:
         timeout-minutes: 3
         run: python3 .github/scripts/ci-report.py intents intents "Intent rows left in pending_index_writes" "${CASSANDRA_CONTAINER:?}"
 
-      # The post-suite check (ADR-sam-michaels-0006, RV22), report only until
-      # it is made required: after every suite has exited, one grace-0 sweep
+      # The post-suite check (ADR-sam-michaels-0006, RV22), required: the job
+      # fails unless its verdict passes, that is no failed scan, a tenant
+      # checked, no defect, no failed outbox re-read and no intent left. After
+      # every suite has exited, one grace-0 sweep
       # of every test- tenant, the consistency check over every test- tenant
       # but the test-planted- ones (one shared scan, ADR-sam-michaels-0007),
       # the intent rows left after the sweep (R4b) and the outbox's
       # tablestats. It runs while the audit log is on, before the CQL audit
       # check, so the D6 check covers the sweep's writes (rule (d), IW20 =
       # RV20). It never runs on a shared node: the test refuses 59042.
-      - name: Post-suite sweep and consistency check (report only)
+      - name: Post-suite sweep and consistency check
         if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
-        continue-on-error: true
         timeout-minutes: 10
         run: |
           set -o pipefail
@@ -1039,6 +1040,7 @@ jobs:
           mkdir -p "$dir" "$RUNNER_TEMP/ci-report/logs"
           log="$RUNNER_TEMP/ci-report/logs/post-suite.log"
           rc=0
+          HFS_TEST_POST_SUITE_STRICT=1 \
           HFS_TEST_POST_SUITE_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-persistence --features cassandra --lib -- \
               --ignored --exact backends::cassandra::sweeper::post_suite::post_suite_sweep_and_check \
@@ -1051,7 +1053,7 @@ jobs:
             || echo "nodetool tablestats failed" > "$dir/outbox-tablestats.txt"
           clean="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
           {
-            echo "Report only (ADR-sam-michaels-0006, RV22)."
+            echo "Required (ADR-sam-michaels-0006, RV22): the job fails unless the verdict below passes."
             echo
             echo '```'
             grep -E '\[(post-suite|sweep-pass) ' <<<"$clean" || echo "no [post-suite] line"
@@ -1066,19 +1068,19 @@ jobs:
             echo '```'
           } > "$dir/post-suite.md"
           python3 .github/scripts/ci-report.py add post-suite \
-            "Post-suite sweep and consistency check (report only)" --markdown "$dir/post-suite.md"
+            "Post-suite sweep and consistency check" --markdown "$dir/post-suite.md"
           if grep -q 'scan_failed="' <<<"$clean"; then
-            echo "::warning title=Post-suite check::the shared index scan failed, so every tenant's check is void: $(grep -oE 'scan_failed="([^"\\]|\\.)*"' <<<"$clean" | head -1)"
+            echo "::error title=Post-suite check::the shared index scan failed, so every tenant's check is void: $(grep -oE 'scan_failed="([^"\\]|\\.)*"' <<<"$clean" | head -1)"
           fi
-          # A report step: it warns and ends 0 whatever the check found.
-          if grep -Eq '^test result: ok\. 1 passed;' <<<"$clean"; then
-            :
+          # Required: it fails the job unless the check ran once and passed.
+          if [ "$rc" -eq 0 ] && grep -Eq '^test result: ok\. 1 passed;' <<<"$clean"; then
+            exit 0
           elif [ "$rc" -ne 0 ] && grep -Eq '^test result: FAILED\. 0 passed; 1 failed;' <<<"$clean"; then
-            echo "::warning title=Post-suite check::post_suite_sweep_and_check failed; see the report above"
+            echo "::error title=Post-suite check::post_suite_sweep_and_check failed; see the report above"
           else
-            echo "::warning title=Post-suite check::post_suite_sweep_and_check did not run exactly once"
+            echo "::error title=Post-suite check::post_suite_sweep_and_check failed or did not run exactly once"
           fi
-          exit 0
+          exit 1
 
       # The exit criterion's check (Step 3 plan D6), after every step that
       # writes, the post-suite sweep included, and before the readiness test

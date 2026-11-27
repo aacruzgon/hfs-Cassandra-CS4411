@@ -6215,7 +6215,7 @@ pub(crate) mod post_suite {
         }
         if report.left_errors > 0 {
             return Err(format!(
-                "the outbox re-read failed on {} slices, so the intents left are unknown",
+                "the outbox re-read failed on {} slices or rows, so the intents left are unknown",
                 report.left_errors
             ));
         }
@@ -6228,9 +6228,30 @@ pub(crate) mod post_suite {
         Ok(())
     }
 
+    /// What `rows` leave in scope: `(intents left, rows that failed)`. An intent counts when its tenant starts with
+    /// `prefix` and passes `keep`; a row that does not decode counts as failed when its tenant passes the same test,
+    /// or when its tenant cannot be read. Any other row is ignored.
+    pub(crate) fn count_left(
+        rows: &[Result<Intent, Option<String>>],
+        prefix: &str,
+        keep: impl Fn(&str) -> bool,
+    ) -> (usize, u64) {
+        let in_scope = |tenant: &str| tenant.starts_with(prefix) && keep(tenant);
+        let (mut left, mut failed) = (0usize, 0u64);
+        for row in rows {
+            match row {
+                Ok(intent) if in_scope(&intent.tenant_id) => left += 1,
+                Err(Some(tenant)) if in_scope(tenant) => failed += 1,
+                Err(None) => failed += 1,
+                _ => {}
+            }
+        }
+        (left, failed)
+    }
+
     /// R4b over `[since, now)`: every shard's one-minute slices (`plan_slices`, as `sweep_pass` reads them) through
-    /// `read_slice`, 16 at a time, counting intents whose tenant starts with `prefix` and passes `keep`.
-    /// Returns `(intents, slices that failed)`.
+    /// `read_slice`, 16 at a time, counting intents whose tenant starts with `prefix` and passes `keep`
+    /// (`count_left`). Returns `(intents, failures)`: slices that failed, plus unreadable rows in scope.
     pub(crate) async fn intents_left(
         backend: &CassandraBackend,
         prefix: &str,
@@ -6246,26 +6267,16 @@ pub(crate) mod post_suite {
             .map(|slice| backend.read_slice(slice, Rank::Normal));
         let mut outcomes = futures::stream::iter(reads).buffer_unordered(16);
         let (mut left, mut failed) = (0usize, 0u64);
-        // `read_slice` drops a row it cannot decode and counts it, so a rise here is a slice read in part.
-        let invalid_before = backend.sweeper_stats().invariant_violations;
         while let Some(outcome) = outcomes.next().await {
             match outcome {
                 Ok(read) => {
-                    left += read
-                        .decoded()
-                        .iter()
-                        .filter(|intent| {
-                            intent.tenant_id.starts_with(prefix) && keep(&intent.tenant_id)
-                        })
-                        .count();
+                    let (found, unreadable) = count_left(&read.rows, prefix, &keep);
+                    left += found;
+                    failed += unreadable;
                 }
                 Err(_) => failed += 1,
             }
         }
-        failed += backend
-            .sweeper_stats()
-            .invariant_violations
-            .saturating_sub(invalid_before);
         (left, failed)
     }
 
@@ -6590,7 +6601,10 @@ pub(crate) mod post_suite {
             ..ok.clone()
         })
         .unwrap_err();
-        assert!(reason.contains("re-read failed on 1 slices"), "{reason}");
+        assert!(
+            reason.contains("re-read failed on 1 slices or rows"),
+            "{reason}"
+        );
         assert_eq!(
             verdict(&PostSuiteReport {
                 left: 2,
@@ -6608,6 +6622,30 @@ pub(crate) mod post_suite {
         );
         let line = format!("{scan_failed}");
         assert!(line.contains(&format!("scan_failed=\"{scan}\"")), "{line}");
+    }
+
+    /// `count_left` counts the intents and the unreadable rows of the checked tenants under the prefix, and
+    /// nothing a planted tenant or another prefix leaves.
+    #[test]
+    fn count_left_counts_only_what_is_in_scope() {
+        let at = Utc::now();
+        let intent = |tenant: &str| Intent {
+            key: IntentKey::from_parts(bucket_of(at), 1, Uuid::nil()),
+            enqueued: at,
+            tenant_id: tenant.into(),
+            resource_type: "Patient".into(),
+            id: "p".into(),
+            version_id: 1,
+        };
+        let rows = vec![
+            Ok(intent("test-checked")),
+            Ok(intent("test-planted-a")),
+            Ok(intent("other-tenant")),
+            Err(Some("test-planted-b".to_string())),
+            Err(Some("test-checked".to_string())),
+            Err(None),
+        ];
+        assert_eq!(count_left(&rows, "test-", checked), (1, 2));
     }
 
     /// PS2 (rule 9): what a planted tenant leaves is swept but neither checked nor counted as left.

@@ -93,13 +93,14 @@ async fn pause<T: Send + 'static>(
     (hold, task)
 }
 
-/// The one scoped sweep (SW28, RV19): `Tenants([t])`, grace 0, `allow_short_grace`, `now = Utc::now()`. Unwraps.
+/// The one scoped sweep (SW28, RV19): `Tenants([t])`, grace 0, `allow_short_grace`, `now = Utc::now()` plus one
+/// millisecond, so an intent stamped in this millisecond is in the window (`sweep_pass` reads whole milliseconds). Unwraps.
 async fn pass(backend: &CassandraBackend, t: &str, since: DateTime<Utc>) -> SweepReport {
     backend
         .sweep_pass(SweepOptions {
             scope: SweepScope::Tenants(vec![t.to_string()]),
             grace: Duration::ZERO,
-            now: Utc::now(),
+            now: Utc::now() + chrono::Duration::milliseconds(1),
             since,
             allow_short_grace: true,
         })

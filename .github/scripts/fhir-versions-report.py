@@ -26,7 +26,13 @@ For each log this reads:
   default version instead. The hfs tests print it with a tail, ", passed to
   hfs as HFS_DEFAULT_FHIR_VERSION=<Variant>", and assert that hfs's startup
   line names that version. The one exception is backend_capability_contract,
-  which writes no resource and never asks for a version (VERSION_NEUTRAL);
+  which writes no resource and never asks for a version (VERSION_NEUTRAL).
+  It is found anywhere in a line, not only at its start: with --nocapture,
+  libtest writes "test <name> ... " and its result as separate writes to
+  stdout, and the selector, a single write to stderr on the same pipe, can
+  land between them (run 45906110516, attempt 1). A selector cut in two by
+  another line is not read as one: the printers write it whole (runs
+  before that change printed it in pieces, run 46058677798, attempt 1);
 - the exit status from the last `exit=<n>` (or `rc=<n>`) line.
 
 Usage: fhir-versions-report.py <logs-dir> <out-dir> [--versions R4,R4B,R5,R6]
@@ -53,7 +59,8 @@ RESULT = re.compile(r"^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ig
 BINARY_START = re.compile(r"^running (\d+) tests?$")
 # cargo's line before each binary, which names it.
 CARGO_RUNNING = re.compile(r"^\s*Running (\S+(?: \S+)?) \((.+)\)\s*$")
-SELECTOR = re.compile(r"^fhir-versions: HFS_TEST_FHIR_VERSION=(\S*) -> (\S+) \(([^)]*)\)(?:,.*)?\s*$")
+# Searched for, not matched from the start of the line: see the docstring.
+SELECTOR = re.compile(r"fhir-versions: HFS_TEST_FHIR_VERSION=(\S*) -> (\S+) \(([^)]*)\)(?:,.*)?\s*$")
 # Test binaries that never ask for a version: they print no selector line.
 VERSION_NEUTRAL = ("backend_capability_contract",)
 EXIT = re.compile(r"^(?:exit|rc)=(-?\d+)\s*$")
@@ -91,7 +98,7 @@ def parse_log(text: str) -> dict:
         if match := EXIT.match(line):
             exit_status = int(match.group(1))
             continue
-        if match := SELECTOR.match(line):
+        if match := SELECTOR.search(line):
             selector = {"value": match.group(1), "variant": match.group(2), "version": match.group(3)}
             if not binaries:
                 binaries.append({"name": None, "planned": None, "result": None, "selectors": []})

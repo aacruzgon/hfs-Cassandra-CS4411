@@ -159,6 +159,45 @@ class Report(Scratch):
         self.assertFalse(data["all_ok"])
         self.assertEqual(len(data["warnings"]), 2)
 
+    def test_a_selector_written_inside_a_libtest_line_is_read(self):
+        # Cut from run 45906110516 (R4 tests) and 45488238982 (R4B rest),
+        # attempt 1 of each: with --nocapture libtest writes "test <name> ... "
+        # and "ok" separately, and the selector landed between them.
+        self.write("R5", "lib", LIB_R5.replace(
+            "fhir-versions: HFS_TEST_FHIR_VERSION=R5 -> R5 (5.0)\n"
+            "test backends::cassandra::errors::tests::refused_statements_are_query_errors ... ok\n",
+            "test backends::cassandra::errors::tests::refused_statements_are_query_errors ... "
+            "fhir-versions: HFS_TEST_FHIR_VERSION=R5 -> R5 (5.0)\nok\n"))
+        self.write("R5", "tests", TESTS_R5.replace(
+            "fhir-versions: HFS_TEST_FHIR_VERSION=R5 -> R5 (5.0)\n"
+            "test create_read::cassandra_create_then_read_round_trips ... ok\n",
+            "test create_read::cassandra_create_then_read_round_trips ... ok"
+            "fhir-versions: HFS_TEST_FHIR_VERSION=R5 -> R5 (5.0)\n\n"))
+        self.write("R5", "rest", REST_R5.replace(
+            "test the_startup_check_matches_the_whole_version ... ok\n"
+            "fhir-versions: HFS_TEST_FHIR_VERSION=R5 -> R5 (5.0), passed to hfs as HFS_DEFAULT_FHIR_VERSION=R5\n",
+            "test the_startup_check_matches_the_whole_version ... "
+            "fhir-versions: HFS_TEST_FHIR_VERSION=R5 -> R5 (5.0), passed to hfs as HFS_DEFAULT_FHIR_VERSION=R5\nok\n"))
+        data, rows = self.run_report("--versions", "R5")
+        self.assertTrue(data["all_ok"], data["warnings"])
+        for suite in ("lib", "tests", "rest"):
+            self.assertEqual(rows[("R5", suite)]["selector"], "ok (R5)")
+        self.assertEqual(rows[("R5", "rest")]["selector_line"],
+                         {"value": "R5", "variant": "R5", "version": "5.0"})
+
+    def test_a_selector_cut_in_two_by_another_line_is_not_read(self):
+        # Cut from run 46058677798, attempt 1 (R4 lib), printed by eprintln!
+        # in pieces before the printers wrote the line whole: no line holds
+        # the whole selector, so it does not count.
+        self.write("R5", "lib", LIB_R5.replace(
+            "fhir-versions: HFS_TEST_FHIR_VERSION=R5 -> R5 (5.0)\n"
+            "test backends::cassandra::errors::tests::refused_statements_are_query_errors ... ok\n",
+            "fhir-versions: HFS_TEST_FHIR_VERSION=R5 -> "
+            "test backends::cassandra::errors::tests::refused_statements_are_query_errors ... ok\n"
+            "R5 (5.0)\n"))
+        _, rows = self.run_report("--versions", "R5")
+        self.assertIn("no selector line: the version selector may not have applied", rows[("R5", "lib")]["problems"])
+
     def test_a_selector_naming_another_version_is_flagged(self):
         self.write_r5()
         self.write("R4", "lib", LIB_R5)

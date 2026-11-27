@@ -98,9 +98,10 @@ pub(crate) fn test_registry() -> Arc<RwLock<SearchParameterRegistry>> {
     Arc::new(RwLock::new(loaded.clone()))
 }
 
-/// [`SearchParameterExtractor`] over [`test_registry`].
+/// [`SearchParameterExtractor`] over [`test_registry`], for the version that
+/// registry was loaded for.
 pub(crate) fn test_extractor() -> SearchParameterExtractor {
-    SearchParameterExtractor::new(test_registry())
+    SearchParameterExtractor::new(test_registry(), test_config().fhir_version)
 }
 
 #[cfg(test)]

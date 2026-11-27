@@ -745,7 +745,13 @@ impl CassandraBackend {
         body: &Json,
     ) -> Vec<IndexKey> {
         let started = std::time::Instant::now();
-        let extractor = SearchParameterExtractor::new(self.registries.for_tenant(tenant_id));
+        // The version decides which elements are `instant`s, indexed as points
+        // (HeliosSoftware/hfs#2962): the one this backend's registry was
+        // loaded for.
+        let extractor = SearchParameterExtractor::new(
+            self.registries.for_tenant(tenant_id),
+            self.config.fhir_version,
+        );
         let extraction = index_keys::extract_index_keys(&extractor, resource_type, body);
         self.cas_counters.extraction(
             started.elapsed(),

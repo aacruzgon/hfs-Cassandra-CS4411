@@ -1,0 +1,65 @@
+# ADR-aacruzgon-0103: Three upstream fixes run in the fork ahead of their upstream merge, by merging their PR heads
+
+- **Date:** 2026-11-26
+- **Status:** accepted
+- **Context:**
+    - **The three fixes.** Alan filed three upstream issues from this project's work and opened a fix for each. All three are open upstream and awaiting review (`reviewDecision: REVIEW_REQUIRED` on 2026-11-26):
+        - **HeliosSoftware/hfs#3024**, head `307d6151a68cfcfb03cf85ab6e12c4fca2755f0a`, one commit, fixing #3015. `/metadata` lists only the operations the deployment serves. Patient and Group `$export` are listed only when Bulk Data export is enabled and a job store is wired; Patient `$everything` only when the storage searches.
+        - **HeliosSoftware/hfs#3026**, head `ae3e4ef4c3a367f269dbc4505c2f0a6db56cd312`, two commits, fixing #2965. `[system]|` matches an Identifier with a system and no value, and a Coding with a system and no code. The shared converter now emits a token with that system and an empty code.
+        - **HeliosSoftware/hfs#3043**, head `6934438cabd6131325ea2f15c29b7007b3a68db1`, six commits, fixing #2962. An `instant` is indexed as a point, not as one unit of its written precision (the rule of ADR-aacruzgon-0092). `SearchParameterExtractor::new(registry, fhir_version)` now requires the version.
+    - **Why now.** Step 6 needs #2965 and #2962 (6a's `system|` cases, and 6b's `instant` exit criterion, roadmap row 6b). Step 7's `/metadata` needs #3015. When upstream will merge them is unknown.
+    - **What makes it a decision.** The fork would run upstream code that upstream has not accepted yet. Upstream may change it on review, or reject it.
+- **Decision:**
+    - **How they come in.**
+        - Each PR's head is merged into the fork with its own signed `git merge -S`, one merge per PR, on #136 (`fix/upstream-3015-2965-2962`):
+            - `f839e042f` (#3024);
+            - `4c72b0cb3` (#3026);
+            - `dc480ef8d` (#3043).
+        - After the 2026-11-26 sync (#134), each merge added only that PR's own commits: 1, 2 and 6.
+        - Nothing is cherry-picked. Upstream merges PRs with merge commits, so the next `sync/upstream-*` merge finds these commits already in the fork.
+    - **If upstream asks for changes:** the PR's new head is merged into the fork again, as a new merge. Nothing here is rebased or force-pushed.
+    - **If upstream rejects a fix, or merges a different one in its place:** the fork reverts that PR's merge (`git revert -m 1 <merge>`) before or with the sync that brings upstream's own answer.
+    - **The Cassandra adaptation** (`a89b09592`). `index_keys_of` (`write.rs`) passes `self.config.fhir_version` to `SearchParameterExtractor::new`. That is the version its registries were loaded for, as the SQLite, PostgreSQL, MongoDB and Elasticsearch backends do.
+        - Every write, update and upsert plan site goes through it, and so does the consistency check.
+        - The backend's tests pass `test_config().fhir_version`.
+        - This amends ADR-aacruzgon-0092's "Cassandra needs no code change": the rule needed none, but the constructor now needs the version. The storage rule of 0092 is unchanged.
+- **Alternatives considered:**
+    - **Wait for upstream to merge them.** Lost: Step 6's token and date tests and Step 7's `/metadata` would wait on a review with no date. The fork would keep wrong behaviour that this project has already shown and fixed.
+    - **Cherry-pick the commits.** Lost: each upstream commit would then exist twice under different SHAs, and the next sync would conflict on the same lines.
+    - **Fork-only patches in Cassandra code.** Lost: the fixes are in shared code (`converters.rs`, `extractor.rs`, `date_value.rs`, `capabilities.rs`), so the other backends would still be wrong. Roadmap §1 has changes to upstream files go upstream first.
+    - **Pass each resource's own stored `fhir_version` to the extractor,** since one server can hold resources of several versions (`cassandra-discussion.md`, multi-version section). Lost: the registry the extractor wraps is loaded for the configured version, every upstream backend passes its configured version, and an extraction under a version that doesn't match the registry would mix two versions' rules.
+- **Consequences:**
+    - **What Cassandra serves.** HFS on Cassandra now:
+        - answers `system|` searches for system-only Identifiers and Codings from `token_system_index`, with code `''`. ADR-aacruzgon-0091 already maps such values, and #3026 makes the converter produce them.
+        - stores an `instant` as `[t, t + 1 ms)` in `date_index` and `date_index_by_end`;
+        - no longer lists Patient or Group `$export`, Patient `$everything`, the system `$export`, `$bulk-submit` or `$sql-run`, or the bulk-data `instantiates` in `/metadata`. Observed through REST on a 5.0.9 node: the base `0f56901ae` lists them, #136 lists only `$meta`, `$meta-add`, `$meta-delete`, `$validate` and `$versions` (`logs-b/metadata-ops-{base,head}.txt`). It has no bulk job store and no SOF runner, and `supports_search` is false until Step 6, which brings `$everything` back.
+    - **Instant rows written before #136** keep the one-unit range until the resource is written again. Cassandra has no `$reindex`, so a kept keyspace is reloaded as `crates/persistence/README.md` says ("Keyspaces written before the fixes for HeliosSoftware/hfs#2962 and #2965 (PR #136)", added by #136). Until it is reloaded, the test-only consistency check (RV13) reports those rows as drift. The #136 audit ran it on a keyspace written by the base `hfs` through REST: 4 defects, and none among the tenant's 1,379 untouched resources (`~/.claude/rex-agent/runs/pr136-audit/evidence/logs/test-rv13.log`). A rewrite doesn't clear the report, because the check re-extracts every stored version. CI starts from a fresh keyspace each time.
+    - **System-only tokens written before #136 have no `token_system_index` row.** An Identifier with a system and no value, or a Coding with a system and no code, stored before #3026, was written while the converter emitted no token for it. So a `system|` search would miss it, once Step 6 serves token search, until the resource is written again or the keyspace reloaded. The #136 audit saw this through CQL: `Patient/pat-old`, written by the base, has no row for its system-only identifier, while `pat-new`, written by the head, has one. RV13 reports it (`StaleExtraction Patient/pat-old2`). This ends the premise of ADR-aacruzgon-0091:39, "Since the converter emits no such value yet …, there are none to fix": true when 0091 was decided, and no longer true from #136. The same README note covers it.
+    - **The next sync** checks each PR's state upstream:
+        - merged unchanged: nothing to do;
+        - merged with more commits: they arrive with the sync;
+        - squash-merged or rejected: revert this fork's merge of that head.
+
+      Roadmap §8 gains a "Carried ahead of upstream since #136" entry, like the one for #2518, #2529 and #2530. Rows 6a and 6b, and their §6 rows, no longer wait for the fixes. Step 7's operations paragraph says what #3024 removed and what is still over-advertised (`$meta-delete`). These edits are in `adr-0103-roadmap.patch`, for this entry's commit.
+    - **`iwbench`** (`docs/Cassandra/ADR-sam-michaels/2026-11-16/0006-evidence/iwbench/src/main.rs:421`) calls `SearchParameterExtractor::new(registry)`, so it no longer builds against this tree (read from the code, not built). It is a standalone crate that CI doesn't build, and it sits inside Sam's log, which this log doesn't edit. Rebuilding that evidence needs `FhirVersion::R4` added there; its features are R4 only.
+    - **Step 6b** can wire upstream's shared `date_instant_suite::instant_targets_are_points` into the Cassandra test binary. Upstream's `token_system_only_suite` is there for 6a.
+- **AI involvement:** Claude Code (Claude Opus 5.5), in the `upstream-sync` worker run by Alan.
+    - **What the worker did:**
+        - re-checked the three heads with `gh pr view` (unchanged);
+        - merged each one, and resolved the one conflict;
+        - made the Cassandra adaptation and the two doc edits (`cassandra-discussion.md`, the persistence README);
+        - drafted this entry.
+    - **The decision.** Alan decided to bring the three fixes in this way, through the orchestrator's brief and follow-up. The worker drafted the record of it.
+    - **The conflict.** It was in `crates/rest/src/handlers/capabilities.rs`'s test helpers, where #3024's `serves_bulk_export` argument met the fork's `supports_history` (#105). It was resolved by keeping upstream's call sites unchanged and having both helpers delegate to one builder that takes both.
+    - **What was verified:**
+        - fmt, `cargo check` with Cassandra on R4B, R5 and R6, and both clippy jobs as CI runs them;
+        - on a 5.0.9 node: `cassandra_tests`, `backend_capability_contract`, the backend's lib tests, the at-limit test, and `cassandra_milestone_a`;
+        - `/metadata`'s operations on base and head;
+        - the 27 files the three PRs change, compared with upstream's `main` plus the three merges (25 identical).
+
+      The details are in the #136 report (`result.md`, run folder `upstream-sync`).
+    - **What the human changed:** nothing; Alan confirmed it as drafted on 2026-11-26, with "PR B" replaced by "#136".
+- **Links:**
+    - HeliosSoftware/hfs#3015, #3024; #2965, #3026; #2962, #3043.
+    - ADR-aacruzgon-0092 (amended, its "no code change"), 0091 (system-only token rows) and 0087 (the precedent for taking upstream fixes with no cherry-pick).
+    - Sync PR #134; #136.

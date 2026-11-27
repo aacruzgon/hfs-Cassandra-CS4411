@@ -1287,7 +1287,7 @@ async fn batch_if_match_through_rest(rest: &Rest<'_>, suffix: &str) {
 /// Until then a search still reaches `search()`: the REST search handler
 /// does not read `supports_search()`. It answers 501 while `search()`
 /// refuses it; once the framework (#128) serves it, its results, or the
-/// documented 400 or 501 for what Cassandra refuses (roadmap row 6.1;
+/// documented 400, 422 or 501 for what Cassandra refuses (roadmap row 6.1;
 /// `cassandra-discussion.md`, "Capabilities and rejection"). REST's own
 /// checks answer 400 before `search()` runs, whatever the backend: a
 /// modifier the parameter's type does not allow, since a server SHALL reject

@@ -965,10 +965,15 @@ async fn concurrent_updates_end_with_the_index_equal_to_a_fresh_extraction() {
             other => panic!("a concurrent update ended with {other:?}"),
         }
     }
-    let distinct: BTreeSet<&String> = oks.iter().collect();
-    assert_eq!(distinct.len(), oks.len(), "versions are distinct: {oks:?}");
     assert!(!oks.is_empty(), "no update succeeded");
     let last = 1 + oks.len() as i32;
+    let mut returned: Vec<i32> = oks.iter().map(|v| v.parse().expect("a version")).collect();
+    returned.sort_unstable();
+    assert_eq!(
+        returned,
+        (2..=last).collect::<Vec<i32>>(),
+        "the versions returned are 2..={last} with no gap or repeat"
+    );
     let spent = backend.cas_stats().since(&at);
     assert_eq!(spent.client_side_unknowns(), 0, "{spent}");
     let current = r1(&backend, &t, "p").await;

@@ -1986,7 +1986,7 @@ let composite = CompositeStorage::new(composite_config, backends)?
 
 ### Cassandra
 
-In development: create, read, update, delete (soft, with revive), PATCH, vread, conditional read (`If-None-Match`, `If-Modified-Since`) and batch work, and every write is a compare-and-swap; search, history, transactions and conditional create, update, delete and patch (`PATCH [type]?criteria`) answer `501`. `/metadata` lists no search, history or `transaction` interaction; it keeps `vread`, `readHistory: true`, `versioning: versioned` and `conditionalRead: full-support`, and gives `conditionalCreate` and `conditionalUpdate` `false` and `conditionalDelete` `not-supported`, with `conditionalPatch` `false` from R5 (`docs/Cassandra/development-roadmap.md`, Step 7). Standalone only; there is no Cassandra + Elasticsearch mode.
+In development: create, read, update, delete (soft, with revive), PATCH, vread, conditional read (`If-None-Match`, `If-Modified-Since`) and batch work, and every write is a compare-and-swap; search, history, transactions and conditional create, update, delete and patch (`PATCH [type]?criteria`) answer `501`. `/metadata` lists no search, history or `transaction` interaction; it keeps `vread`, `readHistory: true`, `versioning: versioned` and `conditionalRead: full-support`, and gives `conditionalCreate` and `conditionalUpdate` `false` and `conditionalDelete` `not-supported`, with `conditionalPatch` `false` from R5 (`docs/Cassandra/development-roadmap.md`, Step 7). It lists no operation the backend cannot serve (HeliosSoftware/hfs#3015): no Patient or Group `$export`, Patient `$everything`, system `$export`, `$bulk-submit`, `$bulk-submit-status` or `$sql-run`, and no bulk-data `instantiates`; the system level keeps `$meta`, `$meta-add`, `$meta-delete`, `$validate` and `$versions`. Standalone only; there is no Cassandra + Elasticsearch mode.
 
 ```bash
 # Build with Cassandra support
@@ -2004,6 +2004,13 @@ HFS_CASSANDRA_CONTACT_POINTS=127.0.0.1:9042 \
 ```
 
 **Keyspaces written before index writes (roadmap row 5.1).** A resource written before row 5.1 has only its `resources_by_type` row. Its next write adds its token, date and URI rows, but nothing adds them to a resource that is never written again, so search would miss it. Drop and reload every keyspace written before row 5.1, once: drop the keyspace, apply the keyspace file it was created with again (`docs/Cassandra/schema/keyspace-single-node.cql`, or `docker/cassandra/keyspace-three-node.cql` for the three-node cluster at RF 3), then `schema.cql`, and load the data again from its source files through the running server (create or update each resource through its REST API), whose write path writes each resource's index rows. The reload writes each resource as new, so the dropped keyspace's earlier versions are not kept, and a resource with no source file is lost; keep a copy of any keyspace you cannot reload (for example `nodetool snapshot`). A direct table import writes no index rows, so each resource loaded that way would be missing from search until its next write (ADR-sam-michaels-0006, RW6). CI starts every run from a fresh keyspace.
+
+**Keyspaces written before the fixes for HeliosSoftware/hfs#2962 and #2965 (PR #136).** Two kinds of index row changed with them, and rows stored before are not rewritten:
+
+- **`instant` values (#2962).** An `instant` value is now indexed as the point `[t, t + 1 ms)` in `date_index` and `date_index_by_end` (ADR-aacruzgon-0092; "Date prefix semantics" below). A row written before keeps one unit of the value's written precision: `2020-01-01T10:00:00Z` stays `[10:00:00.000, 10:00:01.000)`.
+- **System-only tokens (#2965).** An Identifier with a system and no value, or a Coding with a system and no code, now gets a `token_system_index` row with code `''` (ADR-aacruzgon-0091). One written before has no such row, so a `system|` search would miss it once Step 6 serves token search.
+
+The next write of the resource fixes its index rows. Cassandra has no `$reindex`, so reload such a keyspace as above. The tests' consistency check (`consistency.rs`, RV13) compares the stored keys with a fresh extraction, so it reports each such row as drift. A rewrite does not clear that, because the check also re-extracts the older versions, which keep their old key sets; only a reload does.
 
 The connection settings are read by `CassandraConfig::from_env` (`src/backends/cassandra/config.rs`), and an invalid value fails startup:
 
@@ -3211,9 +3218,24 @@ only rewritten by a reindex. MongoDB does not canonicalize and is unaffected.
 
 **Date prefix semantics (range targets, #1391):**
 
-- Every indexed date value is a range `[start, end)`. A point value such as
-  `birthDate` or `effectiveDateTime` runs to the end of its own precision
-  (`2020-03` is `[2020-03-01, 2020-04-01)`). A `Period`, and a `Timing`'s
+- Every indexed date value is a range `[start, end)`. A `date` or `dateTime`
+  value such as `birthDate` or `effectiveDateTime` runs to the end of its own
+  precision (`2020-03` is `[2020-03-01, 2020-04-01)`). An `instant` value such
+  as `DiagnosticReport.issued` or `Observation.effectiveInstant` is a point, "an
+  interval with an effective width of 0"
+  ([search.html#date](https://hl7.org/fhir/R4/search.html#date)): it runs for
+  one unit of the backend's storage resolution, whatever precision it is
+  written to, so `2020-01-01T10:00:00Z` is `[10:00:00.000, 10:00:00.001)` on
+  SQLite, MongoDB and Elasticsearch and `[10:00:00, 10:00:00.000001)` on
+  PostgreSQL (#2962). The element type comes from the backend's FHIR version
+  (`DiagnosticReport.issued` is a `dateTime` in R6), for a union member that
+  is a plain path to the element, including the `instant` arm of a choice
+  (`Observation.effective`, `effective.ofType(instant)`); a member of any other
+  shape, such as R5's `(start | requestedPeriod.start).first()` for
+  `Appointment.date`, keeps the range of its written precision. A value too
+  coarse to be a valid `instant` (`2020-01-01`) also keeps its range. Rows
+  indexed before #2962 keep the one-unit range until the resource is written
+  again or `$reindex` runs. A `Period`, and a `Timing`'s
   `repeat.boundsPeriod`, is **one** range from its `start` to the end of its
   `end` at that value's precision. A missing `start` or `end` is unbounded,
   stored as the supported-range limit (year 1 / year 9999). One rule for all

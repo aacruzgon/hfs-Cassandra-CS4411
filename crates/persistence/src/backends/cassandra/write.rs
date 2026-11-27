@@ -6729,7 +6729,8 @@ mod node_tests {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
         };
-        let mut tenant = format!("test-piece-node-{}", Uuid::new_v4().simple());
+        // Plants an index row with no resource: the post-suite check skips `test-planted-`.
+        let mut tenant = format!("test-planted-piece-node-{}", Uuid::new_v4().simple());
         while tenant.len() < crate::tenant::MAX_TENANT_ID_LEN {
             tenant.push('x');
         }

@@ -364,19 +364,10 @@ async fn wait_for<S>(
     }
 }
 
-async fn seed<S>(backend: &S, tenant: &TenantContext)
+async fn seed_periods<S>(backend: &S, tenant: &TenantContext)
 where
     S: ResourceStorage + SearchProvider,
 {
-    for id in PATIENTS {
-        create(
-            backend,
-            tenant,
-            "Patient",
-            json!({"id": id, "active": true}),
-        )
-        .await;
-    }
     for (id, period, subject) in ENCOUNTERS {
         create(
             backend,
@@ -424,6 +415,22 @@ where
         )
         .await;
     }
+}
+
+async fn seed<S>(backend: &S, tenant: &TenantContext)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    for id in PATIENTS {
+        create(
+            backend,
+            tenant,
+            "Patient",
+            json!({"id": id, "active": true}),
+        )
+        .await;
+    }
+    seed_periods(backend, tenant).await;
     for (id, encounter) in OBSERVATIONS {
         create(
             backend,
@@ -479,17 +486,20 @@ where
     .await;
 }
 
-/// Seeds the resources under a caller-unique tenant and asserts every table:
-/// each prefix against `Encounter.period`, `Procedure.performedPeriod` and a
-/// `ServiceRequest`'s `occurrenceTiming.repeat.boundsPeriod`; `_sort` both
-/// ways; and a Period as the terminal of a forward chain and of `_has`.
-pub async fn period_targets_are_ranges<S>(backend: &S, tenant_base: &str)
+/// Runs the date-only Period cases on a backend with synchronous index writes.
+pub async fn date_period_prefixes<S>(backend: &S, tenant_base: &str)
 where
     S: ResourceStorage + SearchProvider,
 {
     let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
-    seed(backend, &tenant).await;
+    seed_periods(backend, &tenant).await;
+    assert_period_prefixes(backend, &tenant).await;
+}
 
+async fn assert_period_prefixes<S>(backend: &S, tenant: &TenantContext)
+where
+    S: ResourceStorage + SearchProvider,
+{
     // Positive control: every Encounter has a date index entry, whichever
     // side of its Period is open. No Period lies within 1800, so `ne` finds
     // them all.
@@ -497,7 +507,7 @@ where
     assert_eq!(
         matched(
             backend,
-            &tenant,
+            tenant,
             &query("Encounter", "date", SearchParamType::Date, "ne1800")
         )
         .await,
@@ -509,7 +519,7 @@ where
         assert_eq!(
             matched(
                 backend,
-                &tenant,
+                tenant,
                 &query("Encounter", "date", SearchParamType::Date, value)
             )
             .await,
@@ -522,7 +532,7 @@ where
         assert_eq!(
             matched(
                 backend,
-                &tenant,
+                tenant,
                 &query("Procedure", "date", SearchParamType::Date, value)
             )
             .await,
@@ -535,7 +545,7 @@ where
         assert_eq!(
             matched(
                 backend,
-                &tenant,
+                tenant,
                 &query("ServiceRequest", "occurrence", SearchParamType::Date, value)
             )
             .await,
@@ -543,6 +553,20 @@ where
             "ServiceRequest?occurrence={value} (occurrenceTiming.repeat.boundsPeriod)"
         );
     }
+}
+
+/// Seeds the resources under a caller-unique tenant and asserts every table:
+/// each prefix against `Encounter.period`, `Procedure.performedPeriod` and a
+/// `ServiceRequest`'s `occurrenceTiming.repeat.boundsPeriod`; `_sort` both
+/// ways; and a Period as the terminal of a forward chain and of `_has`.
+pub async fn period_targets_are_ranges<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    seed(backend, &tenant).await;
+
+    assert_period_prefixes(backend, &tenant).await;
 
     // _sort=date orders by where each Period starts, an open start first;
     // _sort=-date by where it ends, an open end first.

@@ -35729,6 +35729,13 @@ mod postgres_integration {
         .await;
     }
 
+    #[tokio::test]
+    async fn postgres_integration_step6b_date_period_prefixes() {
+        let backend = create_backend().await;
+        super::date_period_suite::date_period_prefixes(&backend, &unique_base("step6b_period"))
+            .await;
+    }
+
     /// #1391: a Period was indexed as two unrelated points, so `eq`/`ap`
     /// over-matched, `sa`/`eb` could match on the wrong end and an open end
     /// was an instant. It is one `[value_date, value_date_end)` range now.

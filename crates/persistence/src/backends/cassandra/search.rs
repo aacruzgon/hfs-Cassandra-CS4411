@@ -72,7 +72,7 @@ use crate::types::{
 };
 use last_updated::{LastUpdatedFilter, Slice};
 use paging::{Order, OrderKey, Position};
-use planner::{Compiled, Driver};
+use planner::{Checks, Compiled, Driver};
 
 /// One index row as read, for the tag check and for repair.
 ///
@@ -417,12 +417,25 @@ impl SearchProvider for CassandraBackend {
             SearchResult::new(Page::new(Vec::new(), PageInfo::end()))
         } else {
             match &plan {
-                Plan::Unfiltered | Plan::TypeScan => self.type_search(tenant, query).await?,
-                Plan::Ids(ids) => self.id_search(tenant, query, ids).await?,
+                Plan::Unfiltered | Plan::TypeScan => {
+                    self.type_search(tenant, query, &Checks::none()).await?
+                }
+                Plan::Ids(ids) => self.id_search(tenant, query, ids, &Checks::none()).await?,
                 Plan::Modules => {
                     let compiled = self.compile_modules(tenant, query)?;
-                    let driver = single_driver(query, &compiled)?;
-                    self.plan_search(tenant, query, driver).await?
+                    let driver = choose_driver(query, &compiled);
+                    let checks = Checks::besides(&compiled, driver);
+                    match driver {
+                        Driver::Plan(index) => {
+                            let plan = compiled[index].plan.as_ref();
+                            self.plan_search(tenant, query, plan, &checks).await?
+                        }
+                        Driver::Ids => {
+                            self.id_search(tenant, query, &id_set(query), &checks)
+                                .await?
+                        }
+                        Driver::TypeScan => self.type_search(tenant, query, &checks).await?,
+                    }
                 }
             }
         };
@@ -454,36 +467,20 @@ impl SearchProvider for CassandraBackend {
             },
             // The stream of 5.1 run to the end, with tag checks, under the
             // cap; a filtered `search_count` queues no repairs (5.9).
-            Some(Plan::TypeScan) => {
-                let filter = LastUpdatedFilter::of(query)?;
-                let budget = CandidateBudget::new(max_candidates());
-                let mut unrun = RepairContext::new(tenant.tenant_id().as_str());
-                let scan = self
-                    .type_scan(
-                        tenant,
-                        query,
-                        &filter,
-                        Position::First(Order::Default),
-                        &budget,
-                        &mut unrun,
-                        None,
-                    )
-                    .await?;
-                Ok(scan.matched as u64)
-            }
-            // Every live id, under the cap; no repairs (walkthrough 5.4, 5.9).
-            Some(Plan::Ids(ids)) => {
-                let filter = LastUpdatedFilter::of(query)?;
-                let budget = CandidateBudget::new(max_candidates());
-                let found = self
-                    .live_by_id(tenant, query, &ids, &filter, &budget)
-                    .await?;
-                Ok(found.len() as u64)
-            }
+            Some(Plan::TypeScan) => self.type_count(tenant, query, &Checks::none()).await,
+            Some(Plan::Ids(ids)) => self.id_count(tenant, query, &ids, &Checks::none()).await,
             Some(Plan::Modules) => {
                 let compiled = self.compile_modules(tenant, query)?;
-                let driver = single_driver(query, &compiled)?;
-                self.plan_count(tenant, query, driver).await
+                let driver = choose_driver(query, &compiled);
+                let checks = Checks::besides(&compiled, driver);
+                match driver {
+                    Driver::Plan(index) => {
+                        let plan = compiled[index].plan.as_ref();
+                        self.plan_count(tenant, query, plan, &checks).await
+                    }
+                    Driver::Ids => self.id_count(tenant, query, &id_set(query), &checks).await,
+                    Driver::TypeScan => self.type_count(tenant, query, &checks).await,
+                }
             }
             None => Err(unsupported("search_count")),
         }
@@ -735,26 +732,33 @@ impl Plan {
         if query.parameters.iter().all(|param| param.name != "_id") {
             return Some(Plan::TypeScan);
         }
-        // Several `_id` parameters are ANDed: their sets are intersected
-        // before any read (G37). Each value is compared whole with the id,
-        // so `_id=sys|abc` reads an id that cannot exist (C2).
-        let mut sets = query
-            .parameters
-            .iter()
-            .filter(|param| param.name == "_id")
-            .map(|param| {
-                param
-                    .values
-                    .iter()
-                    .map(|value| value.value.clone())
-                    .collect::<std::collections::BTreeSet<String>>()
-            });
-        let first = sets.next()?;
-        let ids = sets.fold(first, |kept, set| {
-            kept.intersection(&set).cloned().collect()
-        });
-        Some(Plan::Ids(ids.into_iter().collect()))
+        Some(Plan::Ids(id_set(query)))
     }
+}
+
+/// The ids an `_id` search reads: several `_id` parameters are ANDed, so
+/// their sets are intersected before any read (G37). Each value is compared
+/// whole with the id, so `_id=sys|abc` reads an id that cannot exist (C2).
+fn id_set(query: &SearchQuery) -> Vec<String> {
+    let mut sets = query
+        .parameters
+        .iter()
+        .filter(|param| param.name == "_id")
+        .map(|param| {
+            param
+                .values
+                .iter()
+                .map(|value| value.value.clone())
+                .collect::<std::collections::BTreeSet<String>>()
+        });
+    let Some(first) = sets.next() else {
+        return Vec::new();
+    };
+    sets.fold(first, |kept, set| {
+        kept.intersection(&set).cloned().collect()
+    })
+    .into_iter()
+    .collect()
 }
 
 /// `search_count` with no filters and a FHIR version named (G34): the whole
@@ -849,13 +853,22 @@ impl CassandraBackend {
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
+        checks: &Checks<'_>,
     ) -> StorageResult<SearchResult> {
         let position = paging::decode(query.cursor.as_deref(), Order::Default)?;
         let filter = LastUpdatedFilter::of(query)?;
         let budget = CandidateBudget::new(max_candidates());
         let mut repairs = RepairContext::new(tenant.tenant_id().as_str());
         let page = self
-            .type_page(tenant, query, &filter, position, &budget, &mut repairs)
+            .type_page(
+                tenant,
+                query,
+                checks,
+                &filter,
+                position,
+                &budget,
+                &mut repairs,
+            )
             .await;
         if matches!(
             &page,
@@ -868,10 +881,12 @@ impl CassandraBackend {
 
     /// The page itself: up to `_count + 1` kept resources; the extra one
     /// decides whether `next` exists.
+    #[allow(clippy::too_many_arguments)]
     async fn type_page(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
+        checks: &Checks<'_>,
         filter: &LastUpdatedFilter,
         position: Position,
         budget: &CandidateBudget,
@@ -885,6 +900,7 @@ impl CassandraBackend {
             .type_scan(
                 tenant,
                 query,
+                checks,
                 filter,
                 position,
                 budget,
@@ -905,6 +921,7 @@ impl CassandraBackend {
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
+        checks: &Checks<'_>,
         filter: &LastUpdatedFilter,
         position: Position,
         budget: &CandidateBudget,
@@ -914,6 +931,12 @@ impl CassandraBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = query.resource_type.as_str();
         let wanted_version = query.stored_fhir_version();
+        let ctx = ReadCtx {
+            tenant,
+            resource_type,
+            session: &self.session,
+            budget,
+        };
 
         let mut scan = TypeScan::default();
         let mut after = position;
@@ -969,16 +992,9 @@ impl CassandraBackend {
                                 continue;
                             }
                             let resource = stored_resource(tenant, resource_type, &row.id, &r1)?;
-                            if let Some(compartment) = &query.compartment {
-                                let loaded = self.load_for_residuals(
-                                    tenant_id,
-                                    resource_type,
-                                    r1,
-                                    resource.content(),
-                                );
-                                if !residual::in_compartment(&loaded, compartment) {
-                                    continue;
-                                }
+                            let loaded = self.loaded(&ctx, query, r1, &resource);
+                            if !self.passes(&ctx, query, checks, &loaded, &row.id).await? {
+                                continue;
                             }
                             scan.matched += 1;
                             if let Some(keep) = keep {
@@ -1008,6 +1024,7 @@ impl CassandraBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
         ids: &[String],
+        checks: &Checks<'_>,
     ) -> StorageResult<SearchResult> {
         let position = paging::decode(query.cursor.as_deref(), Order::Default)?;
         let page_size = query.count.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
@@ -1017,7 +1034,7 @@ impl CassandraBackend {
         let filter = LastUpdatedFilter::of(query)?;
         let budget = CandidateBudget::new(max_candidates());
         let mut found = self
-            .live_by_id(tenant, query, ids, &filter, &budget)
+            .live_by_id(tenant, query, ids, checks, &filter, &budget)
             .await?;
         if let Position::After { at, id, .. } = &position {
             found.retain(|(lu, resource)| (*lu, resource.id()) < (*at, id.as_str()));
@@ -1048,11 +1065,18 @@ impl CassandraBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
         ids: &[String],
+        checks: &Checks<'_>,
         filter: &LastUpdatedFilter,
         budget: &CandidateBudget,
     ) -> StorageResult<Vec<(DateTime<Utc>, StoredResource)>> {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = query.resource_type.as_str();
+        let ctx = ReadCtx {
+            tenant,
+            resource_type,
+            session: &self.session,
+            budget,
+        };
         // Futures do nothing until polled, so building them all first starts
         // no read; `buffered` polls `R1_CONCURRENCY` at a time.
         let reads: Vec<_> = ids
@@ -1072,12 +1096,9 @@ impl CassandraBackend {
             };
             let last_updated = r1.last_updated;
             let resource = stored_resource(tenant, resource_type, id, &r1)?;
-            if let Some(compartment) = &query.compartment {
-                let loaded =
-                    self.load_for_residuals(tenant_id, resource_type, r1, resource.content());
-                if !residual::in_compartment(&loaded, compartment) {
-                    continue;
-                }
+            let loaded = self.loaded(&ctx, query, r1, &resource);
+            if !self.passes(&ctx, query, checks, &loaded, id).await? {
+                continue;
             }
             found.push((last_updated, resource));
         }
@@ -1131,21 +1152,122 @@ impl CassandraBackend {
     }
 }
 
-/// The driving plan, while a search has one module parameter and nothing
-/// for it to AND with. Two or more, or one beside `_id` or a date-only
-/// `_lastUpdated`, need the AND of 6.3f.
-fn single_driver<'c>(
-    query: &SearchQuery,
-    compiled: &'c [Compiled],
-) -> StorageResult<&'c dyn ParamPlan> {
+/// The planner's driver for `query`'s compiled module parameters.
+fn choose_driver(query: &SearchQuery, compiled: &[Compiled]) -> Driver {
     let has_ids = query.parameters.iter().any(|param| param.name == "_id");
     let has_last_updated = query
         .parameters
         .iter()
         .any(|param| param.name == last_updated::PARAM);
-    match planner::choose(compiled, has_ids, has_last_updated) {
-        Driver::Plan(index) if compiled.len() == 1 => Ok(compiled[index].plan.as_ref()),
-        _ => Err(unsupported("search with several parameters (AND, #128)")),
+    planner::choose(compiled, has_ids, has_last_updated)
+}
+
+/// Whether a residual reads the loaded resource's values: a compartment, or
+/// a date parameter (as a residual, or as the driver's own `residual`).
+fn needs_values(query: &SearchQuery) -> bool {
+    query.compartment.is_some()
+        || query.parameters.iter().any(|param| {
+            param.param_type == SearchParamType::Date && param.name != last_updated::PARAM
+        })
+}
+
+impl CassandraBackend {
+    /// A tag-checked R1 for the residuals: extracted once when a residual
+    /// reads values ([`needs_values`]), and with no values otherwise.
+    fn loaded(
+        &self,
+        ctx: &ReadCtx<'_>,
+        query: &SearchQuery,
+        r1: ResourceRow,
+        resource: &StoredResource,
+    ) -> LoadedResource {
+        if needs_values(query) {
+            self.load_for_residuals(
+                ctx.tenant.tenant_id().as_str(),
+                ctx.resource_type,
+                r1,
+                resource.content(),
+            )
+        } else {
+            LoadedResource {
+                row: r1,
+                extracted: Vec::new(),
+            }
+        }
+    }
+
+    /// The checks every tag-checked candidate passes besides its driver
+    /// (walkthrough 5.8): the compartment (5.11) and each date residual on
+    /// the loaded resource first, then each other token or URI parameter's
+    /// clustering point read at `resources.last_updated`, which is not a
+    /// candidate point-read and so is not charged to the cap
+    /// (ADR-anastasiabryz-0001).
+    async fn passes(
+        &self,
+        ctx: &ReadCtx<'_>,
+        query: &SearchQuery,
+        checks: &Checks<'_>,
+        loaded: &LoadedResource,
+        id: &str,
+    ) -> StorageResult<bool> {
+        if let Some(compartment) = &query.compartment
+            && !residual::in_compartment(loaded, compartment)
+        {
+            return Ok(false);
+        }
+        if !checks.residuals.iter().all(|plan| plan.residual(loaded)) {
+            return Ok(false);
+        }
+        for plan in &checks.contains {
+            if !plan.contains(ctx, loaded.row.last_updated, id).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// A filtered `search_count` on `resources_by_type`: the stream of 5.1
+    /// run to the end, with tag checks, under the cap; it queues no repairs
+    /// (walkthrough 5.9).
+    async fn type_count(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        checks: &Checks<'_>,
+    ) -> StorageResult<u64> {
+        let filter = LastUpdatedFilter::of(query)?;
+        let budget = CandidateBudget::new(max_candidates());
+        let mut unrun = RepairContext::new(tenant.tenant_id().as_str());
+        let scan = self
+            .type_scan(
+                tenant,
+                query,
+                checks,
+                &filter,
+                Position::First(Order::Default),
+                &budget,
+                &mut unrun,
+                None,
+            )
+            .await?;
+        Ok(scan.matched as u64)
+    }
+
+    /// An `_id` count: every live id that passes, under the cap; no repairs
+    /// (walkthrough 5.4, 5.9).
+    async fn id_count(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        ids: &[String],
+        checks: &Checks<'_>,
+    ) -> StorageResult<u64> {
+        let filter = LastUpdatedFilter::of(query)?;
+        let budget = CandidateBudget::new(max_candidates());
+        let found = self
+            .live_by_id(tenant, query, ids, checks, &filter, &budget)
+            .await?;
+        Ok(found.len() as u64)
     }
 }
 

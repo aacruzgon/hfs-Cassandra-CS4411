@@ -26,11 +26,12 @@ use std::collections::HashSet;
 
 use futures::StreamExt;
 
-use super::last_updated::{self, LastUpdatedFilter};
+use super::last_updated::LastUpdatedFilter;
 use super::paging::{self, OrderKey};
+use super::planner::Checks;
 use super::{
-    CandidateBudget, DEFAULT_PAGE_SIZE, LoadedResource, ParamPlan, R1_CONCURRENCY, ReadCtx,
-    finish_page_in, max_candidates, residual, stored_resource,
+    CandidateBudget, DEFAULT_PAGE_SIZE, ParamPlan, R1_CONCURRENCY, ReadCtx, finish_page_in,
+    max_candidates, stored_resource,
 };
 use crate::backends::cassandra::backend::CassandraBackend;
 use crate::backends::cassandra::index_keys::IndexKey;
@@ -38,7 +39,7 @@ use crate::backends::cassandra::repair::{RepairContext, StaleIndexRow};
 use crate::core::SearchResult;
 use crate::error::{SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
-use crate::types::{Page, PageInfo, SearchParamType, SearchQuery, StoredResource};
+use crate::types::{Page, PageInfo, SearchQuery, StoredResource};
 
 /// What a plan scan found: the resources it kept, in the plan's order, and
 /// how many candidates passed every check.
@@ -57,6 +58,7 @@ impl CassandraBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
         driver: &dyn ParamPlan,
+        checks: &Checks<'_>,
     ) -> StorageResult<SearchResult> {
         let order = driver.order();
         let position = paging::decode(query.cursor.as_deref(), order)?;
@@ -72,6 +74,7 @@ impl CassandraBackend {
                 tenant,
                 query,
                 driver,
+                checks,
                 &filter,
                 &position,
                 &budget,
@@ -96,6 +99,7 @@ impl CassandraBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
         driver: &dyn ParamPlan,
+        checks: &Checks<'_>,
     ) -> StorageResult<u64> {
         let filter = LastUpdatedFilter::of(query)?;
         let budget = CandidateBudget::new(max_candidates());
@@ -103,7 +107,7 @@ impl CassandraBackend {
         let first = paging::Position::First(driver.order());
         let scan = self
             .plan_scan(
-                tenant, query, driver, &filter, &first, &budget, &mut unrun, None,
+                tenant, query, driver, checks, &filter, &first, &budget, &mut unrun, None,
             )
             .await?;
         Ok(scan.matched as u64)
@@ -117,6 +121,7 @@ impl CassandraBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
         driver: &dyn ParamPlan,
+        checks: &Checks<'_>,
         filter: &LastUpdatedFilter,
         position: &paging::Position,
         budget: &CandidateBudget,
@@ -131,11 +136,6 @@ impl CassandraBackend {
             session: &self.session,
             budget,
         };
-        // The values are extracted only when a residual reads them.
-        let extract = query.compartment.is_some()
-            || query.parameters.iter().any(|param| {
-                param.param_type == SearchParamType::Date && param.name != last_updated::PARAM
-            });
 
         let mut scan = PlanScan::default();
         let mut previous: Option<(OrderKey, String)> = None;
@@ -191,20 +191,12 @@ impl CassandraBackend {
                 continue;
             }
             let resource = stored_resource(tenant, resource_type, &candidate.id, &r1)?;
-            let loaded = if extract {
-                self.load_for_residuals(tenant_id, resource_type, r1, resource.content())
-            } else {
-                LoadedResource {
-                    row: r1,
-                    extracted: Vec::new(),
-                }
-            };
-            if let Some(compartment) = &query.compartment
-                && !residual::in_compartment(&loaded, compartment)
+            let loaded = self.loaded(&ctx, query, r1, &resource);
+            if !driver.residual(&loaded)
+                || !self
+                    .passes(&ctx, query, checks, &loaded, &candidate.id)
+                    .await?
             {
-                continue;
-            }
-            if !driver.residual(&loaded) {
                 continue;
             }
 
@@ -436,7 +428,7 @@ mod node_tests {
         let mut pages = Vec::new();
         loop {
             let page = backend
-                .plan_search(tenant, &query, driver)
+                .plan_search(tenant, &query, driver, &Checks::none())
                 .await
                 .expect("plan search");
             let next = page.resources.page_info.next_cursor.clone();
@@ -475,7 +467,12 @@ mod node_tests {
         assert_eq!(ids(&pages), expected);
         assert_eq!(
             backend
-                .plan_count(&tenant, &SearchQuery::new("Patient"), &TypeRowsPlan)
+                .plan_count(
+                    &tenant,
+                    &SearchQuery::new("Patient"),
+                    &TypeRowsPlan,
+                    &Checks::none()
+                )
                 .await
                 .unwrap(),
             7
@@ -525,5 +522,225 @@ mod node_tests {
             ran.queued, 2,
             "the stale row was queued by each page that read it: {ran:?}"
         );
+    }
+
+    /// A non-driving token or URI plan: `contains` is true for these ids,
+    /// and only when asked at the resource's own `last_updated`, as the
+    /// clustering point read is (walkthrough 5.8).
+    struct MemberAt(std::collections::HashMap<String, DateTime<Utc>>);
+
+    #[async_trait]
+    impl ParamPlan for MemberAt {
+        fn param(&self) -> &str {
+            "fake-member"
+        }
+        fn drive(&self) -> super::super::Drive {
+            super::super::Drive::Shared
+        }
+        fn stream<'a>(
+            &'a self,
+            _ctx: &'a ReadCtx<'a>,
+            _from: &'a Position,
+        ) -> BoxStream<'a, StorageResult<Candidate>> {
+            unreachable!("the fake check never drives")
+        }
+        async fn contains(
+            &self,
+            _ctx: &ReadCtx<'_>,
+            last_updated: DateTime<Utc>,
+            id: &str,
+        ) -> StorageResult<bool> {
+            Ok(self.0.get(id) == Some(&last_updated))
+        }
+    }
+
+    /// A non-driving date plan: its `residual` keeps a female Patient.
+    struct Female;
+
+    #[async_trait]
+    impl ParamPlan for Female {
+        fn param(&self) -> &str {
+            "fake-female"
+        }
+        fn drive(&self) -> super::super::Drive {
+            super::super::Drive::DateOnly
+        }
+        fn stream<'a>(
+            &'a self,
+            _ctx: &'a ReadCtx<'a>,
+            _from: &'a Position,
+        ) -> BoxStream<'a, StorageResult<Candidate>> {
+            unreachable!("the fake residual never drives")
+        }
+        async fn contains(
+            &self,
+            _ctx: &ReadCtx<'_>,
+            _last_updated: DateTime<Utc>,
+            _id: &str,
+        ) -> StorageResult<bool> {
+            unreachable!("a date beside another parameter is a residual")
+        }
+        fn residual(&self, loaded: &super::super::LoadedResource) -> bool {
+            loaded
+                .row
+                .data
+                .as_deref()
+                .is_some_and(|data| data.contains("\"female\""))
+        }
+    }
+
+    /// 6 Patients, alternately female and male, newest last; with their
+    /// stored `last_updated`.
+    async fn create_genders(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+    ) -> Vec<(DateTime<Utc>, String, bool)> {
+        let mut made = Vec::new();
+        for n in 0..6 {
+            let female = n % 2 == 0;
+            let stored = crate::core::ResourceStorage::create(
+                backend,
+                tenant,
+                "Patient",
+                serde_json::json!({
+                    "resourceType": "Patient",
+                    "gender": if female { "female" } else { "male" },
+                }),
+                test_fhir_version(),
+            )
+            .await
+            .expect("create");
+            made.push((stored.last_modified(), stored.id().to_string(), female));
+        }
+        made
+    }
+
+    /// The ids of `made` that `keep` accepts, newest first.
+    fn newest_first(
+        made: &[(DateTime<Utc>, String, bool)],
+        keep: impl Fn(&(DateTime<Utc>, String, bool)) -> bool,
+    ) -> Vec<String> {
+        let mut kept: Vec<_> = made.iter().filter(|m| keep(m)).collect();
+        kept.sort_by(|a, b| (b.0, &b.1).cmp(&(a.0, &a.1)));
+        kept.into_iter().map(|(_, id, _)| id.clone()).collect()
+    }
+
+    fn page_ids(page: &SearchResult) -> Vec<String> {
+        page.resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()
+    }
+
+    /// AND, whichever path drives: a module plan, `_id`, or the type scan.
+    /// Each candidate that passes the tag check is checked by every other
+    /// token or URI plan's `contains`, at `resources.last_updated`, and by
+    /// every date plan's `residual` (walkthrough 5.8).
+    #[tokio::test]
+    async fn and_checks_every_candidate_against_the_other_parameters() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-engine-and");
+        let made = create_genders(&backend, &tenant).await;
+        // Members: the first four created, at their real `last_updated`.
+        let members: std::collections::HashMap<String, DateTime<Utc>> = made[..4]
+            .iter()
+            .map(|(at, id, _)| (id.clone(), *at))
+            .collect();
+        let member_ids: std::collections::HashSet<String> = members.keys().cloned().collect();
+        let member = MemberAt(members);
+        let both = Checks {
+            contains: vec![&member],
+            residuals: vec![&Female],
+        };
+        let expected = newest_first(&made, |(_, id, female)| *female && member_ids.contains(id));
+        assert_eq!(expected.len(), 2);
+        let query = SearchQuery::new("Patient").with_count(10);
+
+        // A module plan drives.
+        let page = backend
+            .plan_search(&tenant, &query, &TypeRowsPlan, &both)
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page), expected, "a module plan drives");
+        assert_eq!(
+            backend
+                .plan_count(&tenant, &query, &TypeRowsPlan, &both)
+                .await
+                .unwrap(),
+            2
+        );
+
+        // `_id` drives.
+        let ids: Vec<String> = made.iter().map(|(_, id, _)| id.clone()).collect();
+        let page = backend
+            .id_search(&tenant, &query, &ids, &both)
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page), expected, "_id drives");
+        assert_eq!(
+            backend
+                .id_count(&tenant, &query, &ids, &both)
+                .await
+                .unwrap(),
+            2
+        );
+
+        // The type scan drives (a date-only search with `_lastUpdated`).
+        let page = backend.type_search(&tenant, &query, &both).await.unwrap();
+        assert_eq!(page_ids(&page), expected, "the type scan drives");
+        assert_eq!(backend.type_count(&tenant, &query, &both).await.unwrap(), 2);
+
+        // A `contains` asked at another `last_updated` does not match.
+        let moved = MemberAt(
+            made.iter()
+                .map(|(at, id, _)| (id.clone(), *at + chrono::Duration::milliseconds(1)))
+                .collect(),
+        );
+        let wrong_time = Checks {
+            contains: vec![&moved],
+            residuals: Vec::new(),
+        };
+        let page = backend
+            .plan_search(&tenant, &query, &TypeRowsPlan, &wrong_time)
+            .await
+            .unwrap();
+        assert!(page_ids(&page).is_empty());
+    }
+
+    /// AND pages through the cursor like any search: 2 a page over the 3
+    /// females, each once, newest first.
+    #[tokio::test]
+    async fn and_pages_through_the_cursor() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-engine-and-paging");
+        let made = create_genders(&backend, &tenant).await;
+        let checks = Checks {
+            contains: Vec::new(),
+            residuals: vec![&Female],
+        };
+        let mut query = SearchQuery::new("Patient").with_count(2);
+        let mut found = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = backend
+                .plan_search(&tenant, &query, &TypeRowsPlan, &checks)
+                .await
+                .unwrap();
+            pages += 1;
+            found.extend(page_ids(&page));
+            match page.resources.page_info.next_cursor {
+                Some(cursor) => query.cursor = Some(cursor),
+                None => break,
+            }
+        }
+        assert_eq!(found, newest_first(&made, |(_, _, female)| *female));
+        assert_eq!(pages, 2);
     }
 }

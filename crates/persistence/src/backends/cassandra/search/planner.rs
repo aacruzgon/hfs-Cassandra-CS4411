@@ -58,6 +58,41 @@ pub(super) fn choose(compiled: &[Compiled], has_ids: bool, has_last_updated: boo
         .expect("a parameter that is not a date")
 }
 
+/// The plans a candidate is checked against besides its driver
+/// (walkthrough 5.8): every other token or URI parameter by a clustering
+/// point read, and every date parameter as a residual on the loaded
+/// resource.
+#[derive(Default)]
+pub(super) struct Checks<'p> {
+    /// Token and URI plans: `contains`.
+    pub(super) contains: Vec<&'p dyn ParamPlan>,
+    /// Date plans: `residual`.
+    pub(super) residuals: Vec<&'p dyn ParamPlan>,
+}
+
+impl<'p> Checks<'p> {
+    /// No checks: a search whose parameters are all the framework's.
+    pub(super) fn none() -> Self {
+        Self::default()
+    }
+
+    /// Every compiled parameter but the one `driver` names.
+    pub(super) fn besides(compiled: &'p [Compiled], driver: Driver) -> Self {
+        let mut checks = Self::default();
+        for (index, parameter) in compiled.iter().enumerate() {
+            if driver == Driver::Plan(index) {
+                continue;
+            }
+            if parameter.is_date {
+                checks.residuals.push(parameter.plan.as_ref());
+            } else {
+                checks.contains.push(parameter.plan.as_ref());
+            }
+        }
+        checks
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +213,28 @@ mod tests {
         assert_eq!(choose(&[date(), date()], false, false), Driver::Plan(0));
         // With `_lastUpdated` among them, `_lastUpdated` is sliced.
         assert_eq!(choose(&[date(), date()], false, true), Driver::TypeScan);
+    }
+
+    #[test]
+    fn every_other_parameter_is_a_check_dates_as_residuals() {
+        let compiled = [
+            date(),
+            token(Drive::Shared),
+            token(Drive::SystemCode),
+            date(),
+        ];
+        let driver = choose(&compiled, false, false);
+        assert_eq!(driver, Driver::Plan(2));
+        let checks = Checks::besides(&compiled, driver);
+        assert_eq!(checks.contains.len(), 1, "the other token");
+        assert_eq!(checks.residuals.len(), 2, "both dates");
+
+        let by_id = Checks::besides(&compiled, Driver::Ids);
+        assert_eq!(
+            (by_id.contains.len(), by_id.residuals.len()),
+            (2, 2),
+            "_id drives: all checked"
+        );
+        assert!(Checks::none().contains.is_empty() && Checks::none().residuals.is_empty());
     }
 }

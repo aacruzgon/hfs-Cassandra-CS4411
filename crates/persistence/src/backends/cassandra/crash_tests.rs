@@ -482,6 +482,55 @@ async fn cas_then_crash_then_superseded_loses_no_version_and_leaves_no_old_row()
     );
 }
 
+/// A writer killed between its version row and its index rows (`AfterVersionRow`): version 2 is stored and
+/// current, but the index rows still carry version 1's tag. The sweep finds its CAS applied and writes the
+/// index rows (IW24: the version row first, so no index row names a version `vread` cannot open).
+#[tokio::test]
+async fn a_writer_killed_between_its_version_row_and_its_index_rows_heals_after_the_sweep() {
+    let Some((backend, since, before)) = start().await else {
+        return;
+    };
+    let t = tenant_id("crash-version-row");
+    let tenant = context(&t);
+    let version = test_fhir_version();
+    let v1 = backend
+        .create(&tenant, "Patient", body("p", true, "male"), version)
+        .await
+        .unwrap();
+    let (b, ten) = (backend.clone(), tenant.clone());
+    crash(
+        &backend,
+        Checkpoint::AfterVersionRow,
+        &t,
+        "p",
+        2,
+        async move { b.update(&ten, &v1, body("p", false, "female")).await },
+    )
+    .await;
+
+    // The control: the version row is there, the index rows are still version 1's.
+    let vread2 = backend
+        .vread(&tenant, "Patient", "p", "2")
+        .await
+        .unwrap()
+        .expect("the version row");
+    assert_eq!(gender(&vread2), "female");
+    assert_eq!(r1(&backend, &t, "p").await.version_id, 2);
+    assert_eq!(tags(&backend, &t, "p").await, BTreeSet::from([1]));
+    assert_eq!(intents(&backend, &t, "p", since).await, vec![2]);
+
+    let report = pass(&backend, &t, since).await;
+    assert_eq!((report.current, report.done), (1, 1), "{report}");
+    assert!(report.is_complete(), "{report}");
+
+    assert_eq!(tags(&backend, &t, "p").await, BTreeSet::from([2]));
+    assert_healed(&backend, &t, "p", since, &[1, 2], 1, Registry::Fixed).await;
+    eprintln!(
+        "[crash case=version-row {}]",
+        backend.sweeper_stats().since(&before)
+    );
+}
+
 /// The same row, G40: two crashes in a row (versions 2 and 3, each after its CAS) lose no version either.
 #[tokio::test]
 async fn two_crashes_in_a_row_lose_nothing() {

@@ -58,8 +58,8 @@ use crate::error::{SearchError, StorageResult};
 use crate::search::{ExtractedValue, SearchParameterDefinition, SearchParameterRegistry};
 use crate::tenant::TenantContext;
 use crate::types::{
-    PaginationCapability, ResultModeCapability, SearchParamFullCapability, SearchParamType,
-    SearchQuery, SpecialSearchParam,
+    IncludeType, PaginationCapability, ResultModeCapability, SearchParamFullCapability,
+    SearchParamType, SearchQuery, SortDirection, SpecialSearchParam,
 };
 use paging::{Order, OrderKey, Position};
 
@@ -259,6 +259,112 @@ fn special_params() -> Vec<SpecialSearchParam> {
     ]
 }
 
+/// Entry validation, which `search()` and `search_count()` both run before
+/// anything is read (roadmap Step 6, "Entry validation in order";
+/// `coverage.md` section 6). The first refusal wins, in this order:
+///
+/// 1. the shared gates, so a value is refused here as on every backend:
+///    `validate_date_values` (400 `InvalidDateValue`),
+///    `validate_value_presence` (400 `EmptyValue`) and
+///    `reject_unsupported_metadata_modifier` (400 `UnsupportedModifier`);
+/// 2. `_text` and `_content` (501 `TextSearchNotAvailable`) and `_filter`
+///    (501 `UnsupportedCapability`), by name and before the type check,
+///    which would otherwise answer 400 for R4's string-typed `_text` and
+///    `_content` (C10, C11);
+/// 3. a parameter type other than token, date and URI (400
+///    `UnsupportedParameterType`);
+/// 4. any modifier (400 `UnsupportedModifier`);
+/// 5. `_include` or `_revinclude` (501 `IncludeNotSupported`);
+/// 6. `_offset`, and a `_sort` other than the search's native order (400
+///    `QueryParseError`; C9).
+///
+/// `query.compartment` and `query.fhir_version` are residual filters and are
+/// never refused (ADR-aacruzgon-0026).
+pub(super) fn validate(query: &SearchQuery) -> StorageResult<()> {
+    crate::search::validate_date_values(query)?;
+    crate::search::validate_value_presence(query)?;
+    crate::search::reject_unsupported_metadata_modifier(query)?;
+
+    for param in &query.parameters {
+        match param.name.as_str() {
+            "_text" | "_content" => return Err(SearchError::TextSearchNotAvailable.into()),
+            "_filter" => return Err(unsupported("_filter")),
+            _ => {}
+        }
+    }
+
+    if let Some(param) = query
+        .parameters
+        .iter()
+        .find(|param| !SUPPORTED_PARAM_TYPES.contains(&param.param_type))
+    {
+        return Err(SearchError::UnsupportedParameterType {
+            param_type: param.param_type.to_string(),
+        }
+        .into());
+    }
+
+    if let Some((param, modifier)) = query
+        .parameters
+        .iter()
+        .find_map(|param| param.modifier.as_ref().map(|modifier| (param, modifier)))
+    {
+        return Err(SearchError::UnsupportedModifier {
+            modifier: modifier.to_string(),
+            param_type: param.param_type.to_string(),
+        }
+        .into());
+    }
+
+    if let Some(include) = query.includes.first() {
+        let operation = match include.include_type {
+            IncludeType::Include => "_include",
+            IncludeType::Revinclude => "_revinclude",
+        };
+        return Err(SearchError::IncludeNotSupported {
+            operation: operation.to_string(),
+        }
+        .into());
+    }
+
+    if query.offset.is_some() {
+        return Err(SearchError::QueryParseError {
+            message: "_offset is not supported: Cassandra pages by cursor only".to_string(),
+        }
+        .into());
+    }
+    if !sort_is_native(query) {
+        return Err(SearchError::QueryParseError {
+            message: "_sort is not supported: Cassandra returns its native order only \
+                      (none, or -_lastUpdated where that is the order)"
+                .to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Whether `query`'s `_sort` asks for the order the search returns anyway
+/// (C9): no `_sort`, or exactly `-_lastUpdated` when the order is
+/// `(last_updated DESC, id DESC)`. That is every search except a date-only
+/// one sliced on a date table: one whose parameters are all dates, none of
+/// them `_lastUpdated` (which, when present, is sliced instead; G20).
+fn sort_is_native(query: &SearchQuery) -> bool {
+    match query.sort.as_slice() {
+        [] => true,
+        [sort] => {
+            let date_table = !query.parameters.is_empty()
+                && query.parameters.iter().all(|param| {
+                    param.param_type == SearchParamType::Date && param.name != "_lastUpdated"
+                });
+            sort.parameter == "_lastUpdated"
+                && sort.direction == SortDirection::Descending
+                && !date_table
+        }
+        _ => false,
+    }
+}
+
 fn pagination() -> Vec<PaginationCapability> {
     vec![
         PaginationCapability::Count,
@@ -286,16 +392,18 @@ impl SearchProvider for CassandraBackend {
     async fn search(
         &self,
         _tenant: &TenantContext,
-        _query: &SearchQuery,
+        query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        validate(query)?;
         Err(unsupported("search"))
     }
 
     async fn search_count(
         &self,
         _tenant: &TenantContext,
-        _query: &SearchQuery,
+        query: &SearchQuery,
     ) -> StorageResult<u64> {
+        validate(query)?;
         Err(unsupported("search_count"))
     }
 
@@ -459,5 +567,366 @@ mod tests {
                 "{module}::compile should refuse until its issue lands"
             );
         }
+    }
+}
+
+/// Entry validation (roadmap row 6.1): each documented refusal, its error,
+/// and the order the refusals run in (`coverage.md` section 6).
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::error::{BackendError, StorageError};
+    use crate::types::{
+        CompartmentMembership, IncludeDirective, SearchModifier, SearchParameter, SearchValue,
+        SortDirective,
+    };
+
+    fn param(name: &str, param_type: SearchParamType, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type,
+            values: vec![SearchValue::parse(value)],
+            ..Default::default()
+        }
+    }
+
+    fn with_modifier(mut param: SearchParameter, modifier: SearchModifier) -> SearchParameter {
+        param.modifier = Some(modifier);
+        param
+    }
+
+    fn query(params: Vec<SearchParameter>) -> SearchQuery {
+        params
+            .into_iter()
+            .fold(SearchQuery::new("Patient"), SearchQuery::with_parameter)
+    }
+
+    fn gender() -> SearchParameter {
+        param("gender", SearchParamType::Token, "female")
+    }
+
+    fn birthdate() -> SearchParameter {
+        param("birthdate", SearchParamType::Date, "ge1980-01-01")
+    }
+
+    fn refusal(query: &SearchQuery) -> StorageError {
+        validate(query).expect_err("validate should refuse this query")
+    }
+
+    fn include(include_type: IncludeType) -> IncludeDirective {
+        IncludeDirective {
+            include_type,
+            source_type: "Observation".to_string(),
+            search_param: "patient".to_string(),
+            target_type: None,
+            iterate: false,
+        }
+    }
+
+    #[test]
+    fn a_served_query_passes() {
+        let mut served = query(vec![
+            gender(),
+            birthdate(),
+            param("_profile", SearchParamType::Uri, "http://example.org/p"),
+            param("_id", SearchParamType::Token, "abc"),
+            param("_lastUpdated", SearchParamType::Date, "gt2020-01-01"),
+        ]);
+        // Residual filters, never refused (ADR-aacruzgon-0026).
+        served.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string()],
+            reference: "Patient/123".to_string(),
+        });
+        validate(&served).unwrap();
+        validate(&SearchQuery::new("Patient")).unwrap();
+    }
+
+    #[test]
+    fn the_shared_gates_refuse_first() {
+        let bad_date = param("birthdate", SearchParamType::Date, "not-a-date");
+        assert!(matches!(
+            refusal(&query(vec![bad_date])),
+            StorageError::Search(SearchError::InvalidDateValue { .. })
+        ));
+        let empty = param("gender", SearchParamType::Token, "");
+        assert!(matches!(
+            refusal(&query(vec![empty])),
+            StorageError::Search(SearchError::EmptyValue { .. })
+        ));
+        let last_updated_not = with_modifier(
+            param("_lastUpdated", SearchParamType::Date, "gt2020-01-01"),
+            SearchModifier::Not,
+        );
+        assert!(matches!(
+            refusal(&query(vec![last_updated_not])),
+            StorageError::Search(SearchError::UnsupportedModifier { .. })
+        ));
+    }
+
+    #[test]
+    fn text_and_content_are_501_by_name_before_the_type_check() {
+        for name in ["_text", "_content"] {
+            // R4 types both as string, which the type check would refuse
+            // with 400 if it ran first (C10).
+            let text = param(name, SearchParamType::String, "fever");
+            assert!(
+                matches!(
+                    refusal(&query(vec![text])),
+                    StorageError::Search(SearchError::TextSearchNotAvailable)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_is_501_unsupported_capability_before_the_type_check() {
+        let filter = param("_filter", SearchParamType::String, "name eq smith");
+        assert!(matches!(
+            refusal(&query(vec![filter])),
+            StorageError::Backend(BackendError::UnsupportedCapability { .. })
+        ));
+    }
+
+    #[test]
+    fn every_other_parameter_type_is_400() {
+        for (name, param_type, value) in [
+            ("name", SearchParamType::String, "smith"),
+            (
+                "general-practitioner",
+                SearchParamType::Reference,
+                "Practitioner/1",
+            ),
+            ("value-quantity", SearchParamType::Quantity, "5.4"),
+            (
+                "code-value-quantity",
+                SearchParamType::Composite,
+                "8480-6$100",
+            ),
+            ("probability", SearchParamType::Number, "0.8"),
+            ("near", SearchParamType::Special, "1|2|3|km"),
+        ] {
+            match refusal(&query(vec![gender(), param(name, param_type, value)])) {
+                StorageError::Search(SearchError::UnsupportedParameterType {
+                    param_type: found,
+                }) => {
+                    assert_eq!(found, param_type.to_string(), "{name}");
+                }
+                other => panic!("{name}: expected UnsupportedParameterType, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_modifier_is_400() {
+        for (served, modifier) in [
+            (gender(), SearchModifier::Missing),
+            (gender(), SearchModifier::Not),
+            (gender(), SearchModifier::Text),
+            (gender(), SearchModifier::OfType),
+            (gender(), SearchModifier::CodeText),
+            (gender(), SearchModifier::TextAdvanced),
+            (birthdate(), SearchModifier::Missing),
+            (
+                param("_profile", SearchParamType::Uri, "http://x"),
+                SearchModifier::Below,
+            ),
+            (
+                param("_profile", SearchParamType::Uri, "http://x"),
+                SearchModifier::Above,
+            ),
+            (
+                param("_profile", SearchParamType::Uri, "http://x"),
+                SearchModifier::Contains,
+            ),
+            (
+                param("_id", SearchParamType::Token, "abc"),
+                SearchModifier::Not,
+            ),
+            (
+                param("_id", SearchParamType::Token, "abc"),
+                SearchModifier::Missing,
+            ),
+        ] {
+            let name = served.name.clone();
+            match refusal(&query(vec![with_modifier(served, modifier.clone())])) {
+                StorageError::Search(SearchError::UnsupportedModifier {
+                    modifier: found, ..
+                }) => {
+                    assert_eq!(found, modifier.to_string(), "{name}");
+                }
+                other => panic!("{name}:{modifier}: expected UnsupportedModifier, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn include_and_revinclude_are_501() {
+        for (include_type, operation) in [
+            (IncludeType::Include, "_include"),
+            (IncludeType::Revinclude, "_revinclude"),
+        ] {
+            match refusal(&query(vec![gender()]).with_include(include(include_type))) {
+                StorageError::Search(SearchError::IncludeNotSupported { operation: found }) => {
+                    assert_eq!(found, operation);
+                }
+                other => panic!("{operation}: expected IncludeNotSupported, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn offset_is_400() {
+        let mut offset = query(vec![gender()]);
+        offset.offset = Some(20);
+        assert!(matches!(
+            refusal(&offset),
+            StorageError::Search(SearchError::QueryParseError { .. })
+        ));
+    }
+
+    #[test]
+    fn only_the_native_sort_is_accepted() {
+        let sorted = |params: Vec<SearchParameter>, sorts: &[&str]| {
+            sorts.iter().fold(query(params), |q, sort| {
+                q.with_sort(SortDirective::parse(sort))
+            })
+        };
+        // The default order is (last_updated DESC, id DESC).
+        validate(&sorted(vec![gender()], &["-_lastUpdated"])).unwrap();
+        validate(&sorted(vec![], &["-_lastUpdated"])).unwrap();
+        // With _lastUpdated present, a date-only search slices it (G20).
+        validate(&sorted(
+            vec![
+                birthdate(),
+                param("_lastUpdated", SearchParamType::Date, "gt2020-01-01"),
+            ],
+            &["-_lastUpdated"],
+        ))
+        .unwrap();
+
+        for (case, refused) in [
+            ("_sort=birthdate", sorted(vec![gender()], &["birthdate"])),
+            (
+                "_sort=_lastUpdated",
+                sorted(vec![gender()], &["_lastUpdated"]),
+            ),
+            (
+                "two sorts",
+                sorted(vec![gender()], &["-_lastUpdated", "_id"]),
+            ),
+            // A date-only search on a date table is in its table's order.
+            ("date-only", sorted(vec![birthdate()], &["-_lastUpdated"])),
+        ] {
+            assert!(
+                matches!(
+                    refusal(&refused),
+                    StorageError::Search(SearchError::QueryParseError { .. })
+                ),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusals_run_in_the_documented_order() {
+        let string = param("name", SearchParamType::String, "smith");
+        let bad_date = param("birthdate", SearchParamType::Date, "not-a-date");
+        let text = param("_text", SearchParamType::String, "fever");
+        let modified = with_modifier(gender(), SearchModifier::Missing);
+
+        // A date value, before a type.
+        assert!(matches!(
+            refusal(&query(vec![string.clone(), bad_date])),
+            StorageError::Search(SearchError::InvalidDateValue { .. })
+        ));
+        // _text by name, before a type that comes earlier in the query.
+        assert!(matches!(
+            refusal(&query(vec![string.clone(), text])),
+            StorageError::Search(SearchError::TextSearchNotAvailable)
+        ));
+        // A type, before a modifier that comes earlier in the query.
+        assert!(matches!(
+            refusal(&query(vec![modified.clone(), string])),
+            StorageError::Search(SearchError::UnsupportedParameterType { .. })
+        ));
+        // A modifier, before an include.
+        let modified_with_include =
+            query(vec![modified]).with_include(include(IncludeType::Include));
+        assert!(matches!(
+            refusal(&modified_with_include),
+            StorageError::Search(SearchError::UnsupportedModifier { .. })
+        ));
+        // An include, before _offset and _sort.
+        let mut include_and_offset = query(vec![gender()])
+            .with_include(include(IncludeType::Revinclude))
+            .with_sort(SortDirective::parse("birthdate"));
+        include_and_offset.offset = Some(5);
+        assert!(matches!(
+            refusal(&include_and_offset),
+            StorageError::Search(SearchError::IncludeNotSupported { .. })
+        ));
+    }
+}
+
+/// `search()` and `search_count()` on a backend connected to the node at
+/// `HFS_TEST_CASSANDRA_URL` (skipped when unset): both validate first, so a
+/// refused query gets its own error, and a served one still gets 501 until
+/// the engine lands.
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+    use crate::backends::cassandra::test_support::test_config;
+    use crate::error::{BackendError, StorageError};
+    use crate::tenant::{TenantId, TenantPermissions};
+
+    async fn backend() -> Option<CassandraBackend> {
+        let url = std::env::var("HFS_TEST_CASSANDRA_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())?;
+        Some(
+            CassandraBackend::connect(crate::backends::cassandra::CassandraConfig {
+                contact_points: vec![url],
+                ..test_config()
+            })
+            .await
+            .expect("connect"),
+        )
+    }
+
+    #[tokio::test]
+    async fn search_and_search_count_validate_before_anything_else() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = TenantContext::new(
+            TenantId::new(format!("test-validation-{}", uuid::Uuid::new_v4().simple())),
+            TenantPermissions::full_access(),
+        );
+        let mut refused = SearchQuery::new("Patient");
+        refused.offset = Some(20);
+        let served = SearchQuery::new("Patient");
+
+        assert!(matches!(
+            backend.search(&tenant, &refused).await,
+            Err(StorageError::Search(SearchError::QueryParseError { .. }))
+        ));
+        assert!(matches!(
+            backend.search_count(&tenant, &refused).await,
+            Err(StorageError::Search(SearchError::QueryParseError { .. }))
+        ));
+        assert!(matches!(
+            backend.search(&tenant, &served).await,
+            Err(StorageError::Backend(
+                BackendError::UnsupportedCapability { .. }
+            ))
+        ));
+        assert!(matches!(
+            backend.search_count(&tenant, &served).await,
+            Err(StorageError::Backend(
+                BackendError::UnsupportedCapability { .. }
+            ))
+        ));
     }
 }

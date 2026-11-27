@@ -1,7 +1,7 @@
 # ADR-aacruzgon-0037: Declare each Cassandra capability when its step lands, not at Step 2
 
 - **Date:** 2026-11-06
-- **Status:** accepted
+- **Status:** accepted; narrowed by [ADR-aacruzgon-0085](../2026-11-22/0085-step7-phased-capability-hooks.md) (`BasicSearch` in Step 6's last commit); amended by [ADR-aacruzgon-0104](../2026-11-27/0104-declare-date-and-cursor-with-basic-search.md) (`DateSearch` and `CursorPagination` there too)
 - **Context:**
     - The design ("Structs and enums", `BackendCapability` row) and roadmap item 2.4 have the backend declare `Crud`, `Versioning`, `OptimisticLocking`, `BasicSearch`, `DateSearch`, `CursorPagination` and `SharedSchema` from Step 2, and PR #37's `CassandraBackend::declared_capabilities()` does.
     - `crates/persistence/src/core/backend.rs:62-68` says a capability "must never be declared for aspirational, planned, or implemented-but-unwired behavior", and the contract test's failure message repeats it (`tests/backend_capability_contract.rs:131-133` at PR #41's head). That rule came from upstream #369, a false tenancy claim.

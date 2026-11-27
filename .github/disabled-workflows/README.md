@@ -14,7 +14,8 @@ Eleven workflows are active. Ten run on the team's self-hosted runners
 `[self-hosted, hfs-cassandra-light]`; the two clippy jobs,
 `fhir-versions.yml`'s all-versions test job and the flakiness job
 `[self-hosted, hfs-cassandra-medium]`; and the mutation-testing job, which runs
-only on a pull request labelled `mutants`, and the report-only three-node job,
+only on a pull request labelled `mutants` or by manual dispatch, and the
+report-only three-node job,
 nightly and by dispatch, `[self-hosted, hfs-cassandra-heavy]`, on `acruzdebian`
 alone (ADR-aacruzgon-0082). The Rust jobs keep a bounded cargo
 target directory on each machine instead of a cache (ADR-sam-michaels-0002).

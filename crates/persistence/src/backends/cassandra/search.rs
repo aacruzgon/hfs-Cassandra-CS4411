@@ -61,7 +61,7 @@ use crate::types::{
     PaginationCapability, ResultModeCapability, SearchParamFullCapability, SearchParamType,
     SearchQuery, SpecialSearchParam,
 };
-use paging::{OrderKey, Position};
+use paging::{Order, OrderKey, Position};
 
 /// One index row as read, for the tag check and for repair.
 ///
@@ -198,6 +198,14 @@ pub(crate) trait ParamPlan: Send + Sync {
 
     /// Its rank as a driver.
     fn drive(&self) -> Drive;
+
+    /// The order its stream is in, which the framework passes to
+    /// `paging::decode` for the request's cursor and uses to start the first
+    /// page (#128, item 4: "the plan says which"). Default:
+    /// `(last_updated DESC, id DESC)`; a date plan returns its table's order.
+    fn order(&self) -> Order {
+        Order::Default
+    }
 
     /// Its candidates strictly after `from`, in `from`'s order, merged across
     /// its partitions and OR values and collapsed on the order key. Each CQL
@@ -393,6 +401,7 @@ mod tests {
         let plan: Box<dyn ParamPlan> = Box::new(NoMatches);
         assert_eq!(plan.param(), "status");
         assert_eq!(plan.drive(), Drive::Shared);
+        assert_eq!(plan.order(), Order::Default);
     }
 
     #[test]

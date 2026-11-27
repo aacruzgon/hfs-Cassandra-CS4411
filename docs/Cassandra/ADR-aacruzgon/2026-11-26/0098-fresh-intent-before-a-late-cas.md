@@ -1,0 +1,73 @@
+# ADR-aacruzgon-0098: A request held up since its intent's stamp writes a fresh intent before its compare-and-swap, when the compare-and-swap could end past the sweeper's grace (refines ADR-sam-michaels-0006 SW6 = IW18)
+
+- **Date:** 2026-11-26
+- **Status:** accepted (Alan confirmed the entry on 2026-11-26)
+- **Context:**
+    - **The question.** CodeRabbit's review of #107 (its C6, on `write.rs`) said that a request stalled between its intent's stamp and its compare-and-swap could leave a crashed write the running sweeper never finishes. The validator run `validate-107-findings` confirmed it, narrower, at L1 with the stall simulated, on `8569c663b` (its `report-coderabbit.md`, §C6).
+    - **The design it refines.** ADR-sam-michaels-0006 SW6 = IW18 stamps the intent "after V3 and immediately before I1", so that the grace covers only I1's latency and clock skew. The design document's "Clocks" paragraph states the assumption: clock skew plus the time from a request's intent row to its compare-and-swap stays under the grace, and a request that stalls longer is a known limitation. `finish` already writes a fresh intent when the write it finishes leaves work (`restamp_intent`, SW6), but only when the request gets that far.
+    - **The two windows, on `04c2db43a`.** Both need a freeze of the thread or process: between the stamp (`write.rs`, `run_cas`) and the statement deadline's start (`session.rs`, `let started = Instant::now()` in `send_with`), and between I1's answer and the compare-and-swap, nothing waits. I1 itself ends within `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` (10 s), or fails, and then no compare-and-swap is sent.
+        1. **Held between the stamp and I1** for longer than the grace: the running sweeper's marks pass the stamp before I1 is visible (a poll reads `[mark, now − grace)`, SW8). If the compare-and-swap then applies and the request crashes before `finish`, no poll ever reads the intent. Only the next process's startup scan (SW9) finishes the write, within the intent's 24 h TTL.
+        2. **Held between I1 and the compare-and-swap** for longer than the grace: a poll reads the intent, sees no row or a version below V (SW11), and deletes it. If the compare-and-swap then applies and the request crashes before `finish`, no intent is left at all. Nothing finishes the write until the resource is next written: for a create, it stays out of `count` and search, though `read` finds it.
+    - **Reproduced on `04c2db43a`** by this entry's node tests, with the fix mutated out (`cas_may_outlive_grace` returning `false`). In both windows, the poll after the crash found nothing to do (`current=0 done=0`). The control, a writer held briefly, was finished by that poll. With the fix, all three pass (see "AI involvement").
+    - **What the specs say.** No FHIR version speaks to it. In http.html, each version read from its own page (fetched 2026-11-26):
+        - R4 and R4B, #update: "the server SHALL return either a `200` OK HTTP status code if the resource was updated, or a `201` Created status code if the resource was created" (SHALL).
+        - R5, #update: "If the interaction is successful and the resource was updated, the server SHALL return a `200 OK` HTTP status code." and "If the interaction is successful and the resource was created, the server SHALL return a `201 Created` HTTP status code." (SHALL).
+        - R4, R4B and R5, #create: "The server returns a `201` Created HTTP status code, and SHALL also return a `Location` header" (SHALL).
+
+      None of the three requires a successful write to be searchable at once, and none says how a server times its own writes. So the fix is free to keep the response as it is. The response doesn't change: the client gets the same 201 or 200. Search visibility after a crash is the design's own promise: "searchable within one poll interval plus the grace period" (G23, ADR-aacruzgon-0027). Discussion #28 allows an index to be eventually consistent and asks for a way to reconcile it ("you'd need a reindex operation to reconcile if the cache ever got out of sync"); the sweeper is that reconciliation here.
+- **Decision:**
+    - **The check.** Just before the compare-and-swap, `run_cas` checks how long the request has been held since its intent's stamp. If that time plus `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` reaches `HFS_CASSANDRA_SWEEPER_GRACE_MS`, it writes a fresh intent, stamped then, with the same `write_id` and target version. It checks again after that and sends the compare-and-swap only once the check passes. The time held is the larger of two clocks' ages of the stamp, a negative one counting as 0 (`held_since` in `write.rs`, amended after the audit of #123, F2):
+        - the monotonic clock's (`std::time::Instant`), which counts a frozen thread, `SIGSTOP` and a starved runtime, whatever the wall clock does;
+        - the wall clock's (`Utc::now()` minus the intent's own stamp), which is what the sweeper compares (`poll_once`: `now − grace`). Rust's std says of `Instant` that whether "system suspends count as elapsed time or not" varies by platform; on Linux it is `CLOCK_MONOTONIC` and on macOS `CLOCK_UPTIME_RAW`, and neither counts a suspend. The wall clock does, so a suspended host or paused VM is covered too, once its wall clock has moved on when the check runs.
+
+      A wall clock stepped forward only adds a harmless fresh intent; one stepped back leaves the monotonic time. The check is `cas_may_outlive_grace` in `write.rs`. At the defaults, it fires after 20 s held.
+    - **The fresh intent.** The attempt keeps the fresh intent's key, so `finish` and a definite miss delete the fresh one. The earlier intent stays where it is. Its replay is harmless (SW22): it is a compare-and-swap that applied (the current case), or one that never did (no row, never applied).
+    - **Its error.** A failed fresh intent fails the request as a failed I1 does. Nothing has been decided yet: the request answers 503 or 504, by the table for plain statements, or by R2's rule after an earlier unknown outcome (ADR-aacruzgon-0067).
+    - **What an operator sees.** Each fresh intent logs a `warn` and counts in a new CAS counter, `CasStats::intent_restamps`.
+    - **Two test-only checkpoints.** `Checkpoint::AfterStamp`, between the stamp and I1, and `Checkpoint::AfterFreshIntent`, after a fresh I1 and before the check runs again, let a test hold a request there. Both are `#[cfg(test)]`, like the other checkpoints (RV15, RV16).
+- **Alternatives considered:**
+    - **Refuse the write with a retryable error instead** (503, nothing applied). It is simpler, and the spec allows it. The http.html page of each of R4, R4B and R5 says "In practice, servers may also return 5xx errors in these cases without being deemed non-conformant", twice: under update's "Rejecting Updates" (#rejecting-updates: §3.1.0.4.2 in R4 and R4B, §3.2.0.4.2 in R5) and under create (#create: §3.1.0.8, §3.2.0.8). It is a lowercase "may", descriptive, not a conformance MAY. It loses because it fails a write that can still succeed, over a delay inside HFS that the client never saw. A fresh intent costs one plain insert, and only after a freeze of 20 s or more at the defaults. It also follows the precedent `finish` already set (SW6's `restamp_intent`).
+    - **Re-stamp once, without the second check.** It loses to the loop. The loop sends the compare-and-swap only while the check passes, whatever happened during the fresh I1. With the grace at least twice the request timeout (SW4), a fresh I1 well inside one timeout passes the check. At the least grace, `grace = 2 × timeout`, a fresh I1 that answers close to its own deadline can fail the check again and write one more fresh intent; at the defaults (10 s and 30 s) a fresh I1 has 10 s of margin. Each round is bounded by the request timeout: its I1 either answers within it or fails the request. So the loop needs no cap, and it can't spin (the audit of #123, F3). A node test needs the second round: `a_writer_held_again_after_its_fresh_intent_writes_another` holds the writer past the grace again after its fresh I1, so the sweeper deletes that one too. It fails when `while` becomes `if` (the audit of #123, F4).
+    - **Stamp the intent with an older time, or widen the grace.** A wider grace delays every crashed write's repair and does not close either window; an older stamp makes window 1 worse.
+    - **Leave it as the stated limitation.** That leaves window 2 with no repair at all after a crash, for a stall HFS can see coming at no cost.
+- **Consequences:**
+    - **What it covers.** A request held up in HFS before it sends its compare-and-swap no longer leaves a crashed write that the running sweeper can't finish. The design document's "Clocks" paragraph, walkthrough G11 and the roadmap's Step 5 say so.
+    - **What it leaves.**
+        - A compare-and-swap that applies more than the grace after it was sent, which SW28 already names: it waited in a coordinator's queue (`native_transport_timeout`, 12 s by default) or behind a stalled node after HFS's own deadline returned the request.
+        - Clock skew between hosts: a sweeper on another host whose wall clock is ahead of this one's, including a VM resumed from a pause whose wall clock is still behind until NTP corrects it. This host's check can't see that skew.
+        - A freeze between the check and the compare-and-swap's own deadline start. There is no await there, so it takes nanoseconds to pass, and it is the same kind of window as before, much shorter.
+    - **The cost.** Nothing for a request that is not held up: one `Instant`, one wall-clock read and one comparison. A held request writes one more intent, and the sweeper later replays the earlier one, a no-op. Four node tests hold a writer in real time on a backend with a 4 s grace: the two window tests take about 4.5 s each, the second-round test about 6.7 s (held about 2.2 s, then about 4.2 s), and the control under a second. Run in parallel, they add about 7 s to the `backends::cassandra` lib tests.
+    - **Measure:** the `intent_restamps` counter in the CI reports. Any value above 0 there means a test process froze for 20 s.
+    - **Sam's log.** This refines Sam's SW6 = IW18 and does not supersede it: the stamp stays after V3 and immediately before I1. Sam can add a pointer to this entry in his own log; no one edits it for him.
+- **AI involvement:**
+    - **Tool and model:** Claude Code (Claude Opus 5.5), as a Rex worker on branch `fix/cassandra-intent-restamp`.
+    - **What the assistant did:**
+        - It took the recommendation from the validator's report, checked it against the sweeper's grace logic, SW8, SW9, SW11, SW22 and SW28, ADR-aacruzgon-0090, the design document, the walkthrough and the roadmap, and FHIR http.html for R4, R4B and R5, and found no conflict.
+        - It chose a loop over a single re-stamp, and a counter and a `warn`.
+        - It wrote the change, the `AfterStamp` checkpoint and the tests: two node tests that hold a writer past a 4 s grace in real time, one per window, then crash it after its compare-and-swap; a control held briefly; and a unit test of the check's bounds.
+        - After the independent audit of #123 and its re-audit, it added the following, each in its own commit:
+            - F1: `connect_timeout_ms: 1_000` on the short-grace test backend, so it passes #121's check that the request timeout be longer than the connect timeout;
+            - F2: the time held as the larger of the monotonic and the wall-clock age (`Stamp`, `held_since`), with the `held_since` unit test `the_time_held_counts_a_suspend_the_monotonic_clock_misses`;
+            - R1-1: the `Stamp::held` unit test `a_stamp_held_by_the_wall_clock_alone_needs_a_fresh_intent`;
+            - F3: the reason the loop needs no cap;
+            - F4: the `AfterFreshIntent` checkpoint and the second-round node test `a_writer_held_again_after_its_fresh_intent_writes_another`;
+            - F5: the 5xx citation for all three versions, under update and create.
+    - **What the human changed:** Alan approved the recommendation on 2026-11-26 ("the open items lets go with the recommendations as long as they follow what would be appropriate for the specs"); he had not yet confirmed this entry's text when it was drafted. Alan confirmed the entry on 2026-11-26 ('i also confirm all the ADRS').
+    - **What was verified, and how:**
+        - On a 5.0.9 node of `docker/cassandra/docker-compose.yml`, both window tests fail with the check mutated to `false`: the poll after the crash shows `current=0 done=0`. The control passes there.
+        - With the fix, all three pass, and so do the `backends::cassandra` lib tests and `cassandra_tests`.
+        - The mutants, each run against the tests that should kill it:
+            - `while` changed to `if`: only the second-round node test fails (the poll after the crash shows `current=0 done=0`), and the other node tests pass;
+            - `held_since` returning the monotonic time only: its unit test fails (`left: 5ms right: 25s`);
+            - `Stamp::held` passing a zero wall age: the `Stamp::held` unit test fails.
+        - With #121's `config.rs` swapped in, all four node tests pass.
+        - After the audit fixes, on the same node: the `backends::cassandra` lib tests pass (333, 2 ignored, as on `main`) and so do `cassandra_tests` (179). `cargo fmt`, `cargo check` for R4B (lib and test targets), and workspace clippy with CI's flags pass with 0 warnings.
+        - The independent audit and its re-audit reproduced the window tests, the mutants and the #121 interaction on their own node.
+- **Links:**
+    - CodeRabbit's C6 on #107;
+    - ADR-sam-michaels-0006 (SW4, SW6 = IW18, SW8, SW9, SW11, SW22, SW28);
+    - ADR-aacruzgon-0027 (G23), 0067, 0090;
+    - `cassandra-discussion.md`, failure handling, "Clocks";
+    - `schema/walkthrough.md` G11;
+    - `development-roadmap.md` Step 5 (the 5.2 row and the sweeper's tasks);
+    - the pull request from `fix/cassandra-intent-restamp`.

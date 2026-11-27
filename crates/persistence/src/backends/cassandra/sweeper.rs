@@ -1724,12 +1724,46 @@ impl CassandraBackend {
                 noop: replay.noop,
             };
         }
-        // SW19: a SearchParameter that was replayed follows the overlay.
+        // SW19: a SearchParameter that was replayed follows the overlay, from a read of its row taken
+        // after the replay (ADR-aacruzgon-0099). The follow is stamped before that read, so a reload
+        // that began after the stamp wins over it; a reload that began after the stamp also began
+        // after the replay wrote the id's `resources_by_type` row, so it lists the id. The row the
+        // replay used was read before the replay, and a reload during the replay can miss the id,
+        // so following that row would either bring back a definition deleted since or, once the
+        // stamp held it back, lose one the replay has just indexed.
         if matches!(case, IntentCase::Current | IntentCase::Superseded)
             && intent.resource_type == "SearchParameter"
         {
-            self.follow_stored_search_parameter(&intent.tenant_id, &intent.id, row.as_ref());
-            self.sweeper.counters.followed();
+            // A test can hold the sweeper here, between R1 and the read the follow uses.
+            #[cfg(test)]
+            self.checkpoint(
+                super::checkpoint::Checkpoint::SweeperBeforeFollow,
+                &key,
+                version,
+            )
+            .await;
+            let read_at = self.search_parameter_read_stamp();
+            match self.read_row(intent, StatementKind::Read, rank).await {
+                Ok(fresh) => {
+                    self.follow_stored_search_parameter(
+                        &intent.tenant_id,
+                        &intent.id,
+                        fresh.as_ref(),
+                        read_at,
+                    );
+                    self.sweeper.counters.followed();
+                }
+                // The replay is done and idempotent; the intent is kept, so it is replayed and
+                // followed again on its next try. Logged and counted as R1's failure is.
+                Err((failure, detail)) => {
+                    return IntentResult {
+                        case: Some(case),
+                        index: replay.index,
+                        noop: replay.noop,
+                        ..self.stopped(intent, failure, &detail)
+                    };
+                }
+            }
         }
         let deleted = {
             let _permit = self.sweeper.permits(rank, 1).await;
@@ -2842,6 +2876,10 @@ mod node_tests {
         }
     }
 
+    /// A grace-0 pass over every intent enqueued before this call. The pass reads `[since, now)` in whole
+    /// milliseconds (SW7), so its `now` is one millisecond past the call, as `pending`'s `to` is: at
+    /// `Utc::now()` a pass taken in the same millisecond as an intent's stamp misses it (SW6's test, after
+    /// an I1 write of under a millisecond).
     async fn pass(
         backend: &CassandraBackend,
         tenants: &[&str],
@@ -2851,7 +2889,7 @@ mod node_tests {
             .sweep_pass(SweepOptions {
                 scope: SweepScope::Tenants(tenants.iter().map(|t| t.to_string()).collect()),
                 grace: Duration::ZERO,
-                now: Utc::now(),
+                now: Utc::now() + chrono::Duration::milliseconds(1),
                 since,
                 allow_short_grace: true,
             })
@@ -3431,6 +3469,281 @@ mod node_tests {
         assert_consistent(&check(&backend, &t).await);
     }
 
+    /// ADR-aacruzgon-0098: a backend whose grace (4 s) is SW4's least for its 2 s deadline, so a
+    /// test can hold a writer past it in real time; with a fresh tenant and `since`. Its connect
+    /// timeout (1 s) stays under the request timeout, as #121's check requires.
+    async fn start_short_grace(
+        prefix: &str,
+    ) -> Option<(Arc<CassandraBackend>, String, TenantContext, DateTime<Utc>)> {
+        let Ok(url) = std::env::var("HFS_TEST_CASSANDRA_URL") else {
+            eprintln!("{SKIP}");
+            return None;
+        };
+        if url.trim().is_empty() {
+            eprintln!("{SKIP}");
+            return None;
+        }
+        let backend = Arc::new(
+            CassandraBackend::connect(crate::backends::cassandra::CassandraConfig {
+                contact_points: vec![url],
+                // Under the request timeout, as `connect` to a local node needs far less.
+                connect_timeout_ms: 1_000,
+                request_timeout_ms: 2_000,
+                sweeper_poll_interval_ms: 1_000,
+                sweeper_grace_ms: 4_000,
+                ..crate::backends::cassandra::test_support::test_config()
+            })
+            .await
+            .expect("connect"),
+        );
+        let t = tenant_id(prefix);
+        let tenant = context(&t);
+        Some((
+            backend,
+            t,
+            tenant,
+            Utc::now() - chrono::Duration::seconds(5),
+        ))
+    }
+
+    /// ADR-aacruzgon-0098: a running sweeper's state for `t` (marks two minutes back) and its scope.
+    fn running(t: &str) -> (SweepState, SweepScope) {
+        (
+            SweepState::new(
+                Utc::now() - chrono::Duration::minutes(2),
+                CancellationToken::new(),
+            ),
+            SweepScope::Tenants(vec![t.to_string()]),
+        )
+    }
+
+    /// ADR-aacruzgon-0098: a create held at `held` for longer than the grace while a running sweeper
+    /// polls, then crashed after its CAS. Returns the poll made during the hold and the CAS counters
+    /// the create spent.
+    async fn held_past_the_grace_then_crashed(
+        backend: &Arc<CassandraBackend>,
+        held: Checkpoint,
+        t: &str,
+        tenant: &TenantContext,
+        state: &SweepState,
+        scope: &SweepScope,
+    ) -> (SweepReport, crate::backends::cassandra::CasStats) {
+        let before = backend.cas_stats();
+        let mut hold = backend.hold_at(held, t, "p", 1);
+        let mut cas = backend.hold_at(Checkpoint::AfterCas, t, "p", 1);
+        let (b, ten) = (backend.clone(), tenant.clone());
+        let task = tokio::spawn(async move {
+            b.create(&ten, "Patient", patient(), test_fhir_version())
+                .await
+        });
+        hold.reached().await;
+        // A real stall, past the grace since the stamp; the sweeper polls meanwhile.
+        tokio::time::sleep(backend.config.sweeper_grace() + Duration::from_millis(200)).await;
+        let during = backend.poll_once(state, Utc::now(), scope).await;
+        hold.release();
+        cas.reached().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        (during, backend.cas_stats().since(&before))
+    }
+
+    /// ADR-aacruzgon-0098 (CodeRabbit C6 on #107): a writer held between its intent's stamp and I1
+    /// for longer than the grace writes its intent after a running sweeper's marks passed its
+    /// stamp. It writes a fresh intent before its CAS, so when it crashes after the CAS the next
+    /// poll still finishes the write; without the fresh intent only a restart's startup scan would.
+    #[tokio::test]
+    async fn a_writer_held_before_its_intent_past_the_grace_writes_a_fresh_one() {
+        let Some((backend, t, tenant, since)) =
+            start_short_grace("sweeper-held-before-intent").await
+        else {
+            return;
+        };
+        let (state, scope) = running(&t);
+        let (during, spent) = held_past_the_grace_then_crashed(
+            &backend,
+            Checkpoint::AfterStamp,
+            &t,
+            &tenant,
+            &state,
+            &scope,
+        )
+        .await;
+        assert_eq!(
+            during.intents, 0,
+            "nothing to see during the hold: {during}"
+        );
+        let left = intents(&backend, &t, "p", since).await;
+        assert!(rbt_rows(&backend, &t, "p").await.is_empty());
+
+        let grace = chrono::Duration::from_std(backend.config.sweeper_grace()).unwrap();
+        let after = backend
+            .poll_once(
+                &state,
+                Utc::now() + grace + chrono::Duration::seconds(1),
+                &scope,
+            )
+            .await;
+        assert_eq!(
+            (after.current, after.done),
+            (1, 1),
+            "the running sweeper finishes the crashed write: {after}"
+        );
+        assert_eq!(rbt_rows(&backend, &t, "p").await.len(), 1);
+        assert_eq!(count(&backend, &tenant).await, 1);
+        assert_eq!(version_ids(&backend, &t, "Patient", "p").await, vec![1]);
+        assert_eq!(spent.intent_restamps, 1, "{spent:?}");
+        assert_eq!(left, vec![1, 1], "the first intent and the fresh one");
+        // The first intent, behind the marks, is left for a startup scan, whose replay is harmless (SW22).
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// ADR-aacruzgon-0098: a writer held between I1 and its CAS for longer than the grace has its
+    /// intent deleted by a running sweeper as "no row". It writes a fresh intent before its CAS, so
+    /// when it crashes after the CAS the next poll still finishes the write; without it nothing
+    /// would, not even a startup scan, until the resource's next write.
+    #[tokio::test]
+    async fn a_writer_held_after_its_intent_past_the_grace_writes_a_fresh_one() {
+        let Some((backend, t, tenant, since)) =
+            start_short_grace("sweeper-held-after-intent").await
+        else {
+            return;
+        };
+        let (state, scope) = running(&t);
+        let (during, spent) = held_past_the_grace_then_crashed(
+            &backend,
+            Checkpoint::AfterIntent,
+            &t,
+            &tenant,
+            &state,
+            &scope,
+        )
+        .await;
+        assert_eq!((during.no_row, during.done), (1, 1), "{during}");
+        let left = intents(&backend, &t, "p", since).await;
+        assert!(rbt_rows(&backend, &t, "p").await.is_empty());
+
+        let grace = chrono::Duration::from_std(backend.config.sweeper_grace()).unwrap();
+        let after = backend
+            .poll_once(
+                &state,
+                Utc::now() + grace + chrono::Duration::seconds(1),
+                &scope,
+            )
+            .await;
+        assert_eq!(
+            (after.current, after.done),
+            (1, 1),
+            "the running sweeper finishes the crashed write: {after}"
+        );
+        assert_eq!(rbt_rows(&backend, &t, "p").await.len(), 1);
+        assert_eq!(count(&backend, &tenant).await, 1);
+        assert_eq!(spent.intent_restamps, 1, "{spent:?}");
+        assert_eq!(left, vec![1], "the fresh intent");
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// ADR-aacruzgon-0098 (the audit of #123, F4): a writer held again after its fresh intent, past
+    /// the grace, has that intent deleted by a running sweeper too. The check runs again and writes
+    /// a second fresh intent, so the next poll after a crash still finishes the write; a single
+    /// re-stamp (`if` for `while`) would leave no intent.
+    #[tokio::test]
+    async fn a_writer_held_again_after_its_fresh_intent_writes_another() {
+        let Some((backend, t, tenant, since)) = start_short_grace("sweeper-held-twice").await
+        else {
+            return;
+        };
+        let (state, scope) = running(&t);
+        let grace = backend.config.sweeper_grace();
+        let timeout = Duration::from_millis(backend.config.request_timeout_ms);
+        let before = backend.cas_stats();
+        let mut stamp = backend.hold_at(Checkpoint::AfterStamp, &t, "p", 1);
+        let mut fresh = backend.hold_at(Checkpoint::AfterFreshIntent, &t, "p", 1);
+        let mut cas = backend.hold_at(Checkpoint::AfterCas, &t, "p", 1);
+        let (b, ten) = (backend.clone(), tenant.clone());
+        let task = tokio::spawn(async move {
+            b.create(&ten, "Patient", patient(), test_fhir_version())
+                .await
+        });
+        stamp.reached().await;
+        // Long enough for the first re-stamp (held + timeout reaches the grace), not for a sweep.
+        tokio::time::sleep(grace - timeout + Duration::from_millis(200)).await;
+        stamp.release();
+        fresh.reached().await;
+        // Held again, past the grace since the fresh stamp: the sweeper deletes both intents.
+        tokio::time::sleep(grace + Duration::from_millis(200)).await;
+        let during = backend.poll_once(&state, Utc::now(), &scope).await;
+        assert_eq!((during.no_row, during.done), (2, 2), "{during}");
+        fresh.release();
+        cas.reached().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let spent = backend.cas_stats().since(&before);
+        let left = intents(&backend, &t, "p", since).await;
+
+        let after = backend
+            .poll_once(
+                &state,
+                Utc::now()
+                    + chrono::Duration::from_std(grace).unwrap()
+                    + chrono::Duration::seconds(1),
+                &scope,
+            )
+            .await;
+        assert_eq!(
+            (after.current, after.done),
+            (1, 1),
+            "the running sweeper finishes the crashed write: {after}"
+        );
+        assert_eq!(rbt_rows(&backend, &t, "p").await.len(), 1);
+        assert_eq!(count(&backend, &tenant).await, 1);
+        assert_eq!(spent.intent_restamps, 2, "{spent:?}");
+        assert_eq!(left, vec![1], "the second fresh intent");
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+    }
+
+    /// ADR-aacruzgon-0098's control: a writer held only briefly writes no fresh intent, and the
+    /// running sweeper finishes its crash from the one intent it has.
+    #[tokio::test]
+    async fn a_writer_held_briefly_writes_no_fresh_intent() {
+        let Some((backend, t, tenant, since)) = start_short_grace("sweeper-held-briefly").await
+        else {
+            return;
+        };
+        let (state, scope) = running(&t);
+        let before = backend.cas_stats();
+        let mut hold = backend.hold_at(Checkpoint::AfterStamp, &t, "p", 1);
+        let mut cas = backend.hold_at(Checkpoint::AfterCas, &t, "p", 1);
+        let (b, ten) = (backend.clone(), tenant.clone());
+        let task = tokio::spawn(async move {
+            b.create(&ten, "Patient", patient(), test_fhir_version())
+                .await
+        });
+        hold.reached().await;
+        hold.release();
+        cas.reached().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let spent = backend.cas_stats().since(&before);
+        assert_eq!(spent.intent_restamps, 0, "{spent:?}");
+        assert_eq!(intents(&backend, &t, "p", since).await, vec![1]);
+
+        let grace = chrono::Duration::from_std(backend.config.sweeper_grace()).unwrap();
+        let after = backend
+            .poll_once(
+                &state,
+                Utc::now() + grace + chrono::Duration::seconds(1),
+                &scope,
+            )
+            .await;
+        assert_eq!((after.current, after.done), (1, 1), "{after}");
+        assert_eq!(rbt_rows(&backend, &t, "p").await.len(), 1);
+        assert!(intents(&backend, &t, "p", since).await.is_empty());
+        assert_consistent(&check(&backend, &t).await);
+    }
+
     /// N6 (exit criterion): the running loop heals a crash within poll + grace. SW4 sets the grace (10 s) from
     /// the request timeout (5 s). With a node of three down, `connect`'s local DC check can try that node
     /// first, so the connect timeout (2 s) is kept well under the request timeout: at the default 5 s the try
@@ -3524,10 +3837,11 @@ mod node_tests {
         .await;
         let lu2 = row_of(&backend, &t, "p").await.last_updated;
         let other = harness::backend().await.expect("a second backend");
+        // One millisecond past now, as `pass` does: the window's bound is in whole milliseconds (SW7).
         let options = SweepOptions {
             scope: SweepScope::Tenants(vec![t.clone()]),
             grace: Duration::ZERO,
-            now: Utc::now(),
+            now: Utc::now() + chrono::Duration::milliseconds(1),
             since,
             allow_short_grace: true,
         };
@@ -3637,12 +3951,126 @@ mod node_tests {
         say("search-parameter", &backend, &before);
     }
 
-    /// SW19 across instances: B retires a SearchParameter that A holds, A reloads, then A follows a
-    /// row as a replay does: the one it read before B's update (`stale`), or, as the control, a fresh
-    /// read. Returns whether the definition is in A's registry after the follow, and after A's next
-    /// reload.
-    async fn follow_after_a_reload_of_a_retirement(stale: bool) -> Option<(bool, bool)> {
+    /// What instance B does to the SearchParameter before instance A reloads.
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        /// B updates it to `status: retired`; A created it, so A held it.
+        Retire,
+        /// B deletes it; A created it, so A held it.
+        Delete,
+        /// B created it and deletes it, so A never held it, as when A's sweeper finishes B's
+        /// write.
+        DeleteUnheld,
+    }
+
+    /// SW19 across instances (ADR-aacruzgon-0099): B makes `change`, A reloads, then A follows a
+    /// row as a replay does: the one it read before B's change (`stale`), stamped before that read,
+    /// or, as the control, one it stamps and reads after its reload. Returns whether the definition
+    /// is in A's registry after the follow, and after A's next reload.
+    async fn follow_after_a_reload_of(change: Change, stale: bool) -> Option<(bool, bool)> {
         let (a, t, tenant, _) = start("sweeper-sp-stale").await?;
+        let b = harness::backend().await.expect("instance B");
+        let url = format!("http://example.org/SearchParameter/{t}");
+        let creator = if matches!(change, Change::DeleteUnheld) {
+            &b
+        } else {
+            &a
+        };
+        let v1 = creator
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter(&url),
+                test_fhir_version(),
+            )
+            .await
+            .expect("create");
+        assert_eq!(
+            expression_of(&a, &tenant, &url).is_some(),
+            !matches!(change, Change::DeleteUnheld),
+            "A holds what A created"
+        );
+        let stamp = a.search_parameter_read_stamp();
+        let before = a
+            .serial_read_resource_row(&t, "SearchParameter", "sp")
+            .await
+            .unwrap()
+            .unwrap();
+        match change {
+            Change::Retire => {
+                let mut retired = search_parameter(&url);
+                retired["status"] = serde_json::json!("retired");
+                b.update(&tenant, &v1, retired).await.expect("B's update");
+            }
+            Change::Delete | Change::DeleteUnheld => b
+                .delete(&tenant, "SearchParameter", "sp")
+                .await
+                .expect("B's delete"),
+        }
+        assert_eq!(expression_of(&b, &tenant, &url), None);
+        a.load_stored_search_parameters(&t).await.unwrap();
+        assert_eq!(expression_of(&a, &tenant, &url), None, "after A's reload");
+        let (row, read_at) = if stale {
+            (before, stamp)
+        } else {
+            let read_at = a.search_parameter_read_stamp();
+            let row = a
+                .serial_read_resource_row(&t, "SearchParameter", "sp")
+                .await
+                .unwrap()
+                .unwrap();
+            (row, read_at)
+        };
+        a.follow_stored_search_parameter(&t, "sp", Some(&row), read_at);
+        let followed = expression_of(&a, &tenant, &url).is_some();
+        a.load_stored_search_parameters(&t).await.unwrap();
+        Some((followed, expression_of(&a, &tenant, &url).is_some()))
+    }
+
+    /// Runs [`follow_after_a_reload_of`] with a stale read and with the fresh control: neither may
+    /// leave the definition in force, after the follow or after the next reload.
+    async fn neither_read_brings_it_back(change: Change) {
+        let Some(stale) = follow_after_a_reload_of(change, true).await else {
+            return;
+        };
+        let control = follow_after_a_reload_of(change, false).await.unwrap();
+        // Each is (in force after the follow, in force after the next reload).
+        assert_eq!(
+            (stale, control),
+            ((false, false), (false, false)),
+            "{change:?}: (the stale read, a fresh read)"
+        );
+    }
+
+    /// SW19 across instances: a replay's row read before another instance retired the
+    /// SearchParameter does not bring it back into this instance's registry after this instance's
+    /// reload saw the retirement; neither does a fresh read (the control). The next reload agrees.
+    #[tokio::test]
+    async fn a_stale_replay_read_does_not_bring_back_a_retired_searchparameter() {
+        neither_read_brings_it_back(Change::Retire).await;
+    }
+
+    /// SW19 across instances (ADR-aacruzgon-0099): the same for a delete, which leaves the reload
+    /// no `resources_by_type` row to list, so the reload records no removal; the read stamp alone
+    /// holds the stale read back.
+    #[tokio::test]
+    async fn a_stale_replay_read_does_not_bring_back_a_deleted_searchparameter() {
+        neither_read_brings_it_back(Change::Delete).await;
+    }
+
+    /// SW19 across instances (ADR-aacruzgon-0099): the same for a SearchParameter this instance
+    /// never held, created and deleted by another instance, as when this instance's sweeper
+    /// finishes the other's write.
+    #[tokio::test]
+    async fn a_stale_replay_read_does_not_put_in_a_searchparameter_deleted_elsewhere() {
+        neither_read_brings_it_back(Change::DeleteUnheld).await;
+    }
+
+    /// ADR-aacruzgon-0099 (audit F1): A reloads, reading v1; B updates to v2; A reads v2 and follows
+    /// it, stamped before its reload began (`early`) or, as the control, after it. The reload read
+    /// the id at an older version, so A's read came after the reload's: v2 is in force either way.
+    async fn follow_of_a_read_newer_than_the_reloads(early: bool) -> Option<Option<String>> {
+        let (a, t, tenant, _) = start("sweeper-sp-newer").await?;
         let b = harness::backend().await.expect("instance B");
         let url = format!("http://example.org/SearchParameter/{t}");
         let v1 = a
@@ -3654,49 +4082,365 @@ mod node_tests {
             )
             .await
             .expect("create");
+        let before = a.search_parameter_read_stamp();
         assert_eq!(
-            expression_of(&a, &tenant, &url).as_deref(),
-            Some("Patient.active")
+            a.load_stored_search_parameters(&t).await.unwrap(),
+            1,
+            "A's reload reads v1"
         );
-        let before = a
+        let after = a.search_parameter_read_stamp();
+        let mut v2 = search_parameter(&url);
+        v2["expression"] = serde_json::json!("Patient.gender");
+        b.update(&tenant, &v1, v2).await.expect("B's update to v2");
+        let row = a
             .serial_read_resource_row(&t, "SearchParameter", "sp")
             .await
             .unwrap()
             .unwrap();
-        let mut retired = search_parameter(&url);
-        retired["status"] = serde_json::json!("retired");
-        b.update(&tenant, &v1, retired).await.expect("B's update");
-        assert_eq!(expression_of(&b, &tenant, &url), None);
-        a.load_stored_search_parameters(&t).await.unwrap();
-        assert_eq!(expression_of(&a, &tenant, &url), None, "after A's reload");
-        let row = if stale {
-            before
-        } else {
-            a.serial_read_resource_row(&t, "SearchParameter", "sp")
-                .await
-                .unwrap()
-                .unwrap()
-        };
-        a.follow_stored_search_parameter(&t, "sp", Some(&row));
-        let followed = expression_of(&a, &tenant, &url).is_some();
-        a.load_stored_search_parameters(&t).await.unwrap();
-        Some((followed, expression_of(&a, &tenant, &url).is_some()))
+        assert_eq!(row.version_id, 2);
+        a.follow_stored_search_parameter(&t, "sp", Some(&row), if early { before } else { after });
+        Some(expression_of(&a, &tenant, &url))
     }
 
-    /// SW19 across instances: a replay's row read before another instance retired the
-    /// SearchParameter does not bring it back into this instance's registry after this instance's
-    /// reload saw the retirement; neither does a fresh read (the control). The next reload agrees.
     #[tokio::test]
-    async fn a_stale_replay_read_does_not_bring_back_a_retired_searchparameter() {
-        let Some(stale) = follow_after_a_reload_of_a_retirement(true).await else {
+    async fn a_follow_of_a_read_newer_than_the_reloads_is_kept() {
+        let Some(early) = follow_of_a_read_newer_than_the_reloads(true).await else {
             return;
         };
-        let control = follow_after_a_reload_of_a_retirement(false).await.unwrap();
-        // Each is (in force after the follow, in force after the next reload).
+        let late = follow_of_a_read_newer_than_the_reloads(false)
+            .await
+            .unwrap();
         assert_eq!(
-            (stale, control),
-            ((false, false), (false, false)),
-            "(the stale read, a fresh read)"
+            (early.as_deref(), late.as_deref()),
+            (Some("Patient.gender"), Some("Patient.gender")),
+            "(stamped before the reload, stamped after it)"
+        );
+    }
+
+    /// ADR-aacruzgon-0099 (CodeRabbit on #122): as [`follow_of_a_read_newer_than_the_reloads`],
+    /// stamped before the reload began, with v1's body one the loader cannot parse (`"type":
+    /// "invalid"`) or, as the control, a valid one. The follow is put after the reload merged
+    /// (`merged_first`) or between its reads and its merge. The reload read the id at v1 either
+    /// way, so A's read of v2 came after it, and v2 is in force.
+    async fn follow_after_a_reload_read_v1(
+        parses: bool,
+        merged_first: bool,
+    ) -> Option<Option<String>> {
+        let (a, t, tenant, _) = start("sweeper-sp-unparsed").await?;
+        let b = harness::backend().await.expect("instance B");
+        let url = format!("http://example.org/SearchParameter/{t}");
+        let mut body = search_parameter(&url);
+        if !parses {
+            body["type"] = serde_json::json!("invalid");
+        }
+        let v1 = a
+            .create(&tenant, "SearchParameter", body, test_fhir_version())
+            .await
+            .expect("create");
+        let before = a.search_parameter_read_stamp();
+        let follow_v2 = async {
+            let mut v2 = search_parameter(&url);
+            v2["expression"] = serde_json::json!("Patient.gender");
+            b.update(&tenant, &v1, v2).await.expect("B's update to v2");
+            let row = a
+                .serial_read_resource_row(&t, "SearchParameter", "sp")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.version_id, 2);
+            a.follow_stored_search_parameter(&t, "sp", Some(&row), before);
+        };
+        if merged_first {
+            a.load_stored_search_parameters(&t).await.unwrap();
+            follow_v2.await;
+        } else {
+            a.load_stored_search_parameters_around(&t, follow_v2)
+                .await
+                .unwrap();
+        }
+        Some(expression_of(&a, &tenant, &url))
+    }
+
+    #[tokio::test]
+    async fn a_follow_newer_than_an_unparsed_version_the_reload_read_is_kept() {
+        let Some(first) = follow_after_a_reload_read_v1(false, true).await else {
+            return;
+        };
+        let mut outcomes = vec![first];
+        for (parses, merged_first) in [(false, false), (true, true), (true, false)] {
+            outcomes.push(
+                follow_after_a_reload_read_v1(parses, merged_first)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let gender = Some("Patient.gender".to_string());
+        assert_eq!(
+            outcomes,
+            [gender.clone(), gender.clone(), gender.clone(), gender],
+            "(v1 does not parse: reload merged first, follow put first; v1 parses: the same)"
+        );
+    }
+
+    /// ADR-aacruzgon-0099 (CodeRabbit on #122): an id whose newest version is one the loader cannot
+    /// parse. A reads v0 (valid, `Patient.active`); B updates it to v1, which does not parse (or, as
+    /// the control, to a valid v1, `Patient.gender`); A reloads, then follows its read of v0, stamped
+    /// after the reload began so `since` does not hold it back. Returns the expression in force.
+    async fn stale_follow_after_a_reload_of(v1_parses: bool) -> Option<Option<String>> {
+        let (a, t, tenant, _) = start("sweeper-sp-unparsed-newest").await?;
+        let b = harness::backend().await.expect("instance B");
+        let url = format!("http://example.org/SearchParameter/{t}");
+        let v0 = b
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter(&url),
+                test_fhir_version(),
+            )
+            .await
+            .expect("B's create");
+        let stale = a
+            .serial_read_resource_row(&t, "SearchParameter", "sp")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut v1 = search_parameter(&url);
+        if v1_parses {
+            v1["expression"] = serde_json::json!("Patient.gender");
+        } else {
+            v1["type"] = serde_json::json!("invalid");
+        }
+        b.update(&tenant, &v0, v1).await.expect("B's update to v1");
+        a.load_stored_search_parameters(&t).await.unwrap();
+        let after = a.search_parameter_read_stamp();
+        a.follow_stored_search_parameter(&t, "sp", Some(&stale), after);
+        Some(expression_of(&a, &tenant, &url))
+    }
+
+    #[tokio::test]
+    async fn a_stale_follow_does_not_bring_back_a_version_an_unparsed_one_replaced() {
+        let Some(unparsed) = stale_follow_after_a_reload_of(false).await else {
+            return;
+        };
+        let control = stale_follow_after_a_reload_of(true).await.unwrap();
+        assert_eq!(
+            (unparsed.as_deref(), control.as_deref()),
+            (None, Some("Patient.gender")),
+            "(v1 does not parse, v1 parses)"
+        );
+    }
+
+    /// ADR-aacruzgon-0099 (CodeRabbit on #122): two reloads of one tenant on A, called at once. The
+    /// follow takes its stamp; A's first reload reads B's v1 and, before it merges, B updates to v2
+    /// (`Patient.gender`), A reads v2 for the follow, B deletes the SearchParameter (`delete`) or, as
+    /// the control, does not, and a second reload is started. With the delete, the first reload
+    /// awaits the second for up to [`SECOND_RELOAD_WAIT`] before it merges: without the lock the
+    /// second finishes in that time, whatever the load, and merges first; with it, it waits for the
+    /// first. The follow is put after both merged. Returns what is in force before the follow and
+    /// after it, and whether the second reload finished before the first merged.
+    async fn overlapping_reloads(delete: bool) -> Option<(Option<String>, Option<String>, bool)> {
+        let (a, t, tenant, _) = start("sweeper-sp-overlap").await?;
+        let b = harness::backend().await.expect("instance B");
+        let url = format!("http://example.org/SearchParameter/{t}");
+        let v1 = b
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter(&url),
+                test_fhir_version(),
+            )
+            .await
+            .expect("B's create");
+        let stamp = a.search_parameter_read_stamp();
+        let mut row = None;
+        let mut second = None;
+        a.load_stored_search_parameters_around(&t, async {
+            let mut v2 = search_parameter(&url);
+            v2["expression"] = serde_json::json!("Patient.gender");
+            b.update(&tenant, &v1, v2).await.expect("B's update to v2");
+            row = a
+                .serial_read_resource_row(&t, "SearchParameter", "sp")
+                .await
+                .unwrap();
+            if delete {
+                b.delete(&tenant, "SearchParameter", "sp")
+                    .await
+                    .expect("B's delete");
+            }
+            let mut task = tokio::spawn({
+                let (a, t) = (a.clone(), t.clone());
+                async move { a.load_stored_search_parameters(&t).await }
+            });
+            // A finished `JoinHandle` cannot be awaited again, so its result is kept.
+            let finished = if delete {
+                tokio::time::timeout(SECOND_RELOAD_WAIT, &mut task)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            second = Some((task, finished));
+        })
+        .await
+        .unwrap();
+        let (task, finished) = second.unwrap();
+        let overlapped = finished.is_some();
+        match finished {
+            Some(result) => result,
+            None => task.await,
+        }
+        .expect("the second reload")
+        .unwrap();
+        let row = row.expect("v2's row");
+        assert_eq!(row.version_id, 2);
+        let before = expression_of(&a, &tenant, &url);
+        a.follow_stored_search_parameter(&t, "sp", Some(&row), stamp);
+        Some((before, expression_of(&a, &tenant, &url), overlapped))
+    }
+
+    /// How long the first reload of [`overlapping_reloads`] awaits the second, which only the lock
+    /// holds back; a reload of one SearchParameter takes milliseconds.
+    const SECOND_RELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn a_reload_called_during_another_does_not_bring_back_a_deleted_searchparameter() {
+        let Some(deleted) = overlapping_reloads(true).await else {
+            return;
+        };
+        let control = overlapping_reloads(false).await.unwrap();
+        let outcome = |(before, after, _): &(Option<String>, Option<String>, bool)| {
+            (before.clone(), after.clone())
+        };
+        let gender = Some("Patient.gender".to_string());
+        assert_eq!(
+            (outcome(&deleted), outcome(&control)),
+            ((None, None), (gender.clone(), gender)),
+            "((B deleted it: before the follow, after it), (B did not: the same)); the second \
+             reload finished before the first merged: {}, {}",
+            deleted.2,
+            control.2
+        );
+        assert!(!deleted.2, "the second reload waits for the first");
+    }
+
+    /// A SearchParameter created with every `resources_by_type` insert failing, so its intent is
+    /// left for the sweeper, and dropped from the overlay by a reload, so only a follow puts it back.
+    /// Returns the backend, the tenant, its context, the `url` and the intent.
+    async fn a_searchparameter_left_for_the_sweeper(
+        prefix: &str,
+    ) -> Option<(Arc<CassandraBackend>, String, TenantContext, String, Intent)> {
+        let (a, t, tenant, since) = start(prefix).await?;
+        let url = format!("http://example.org/SearchParameter/{t}");
+        for _ in 0..3 {
+            a.session.inject_fault(
+                StatementKind::Write,
+                "INSERT INTO resources_by_type",
+                Fault::TimeOutWithoutApplying,
+            );
+        }
+        a.create(
+            &tenant,
+            "SearchParameter",
+            search_parameter(&url),
+            test_fhir_version(),
+        )
+        .await
+        .expect("create");
+        assert_eq!(a.load_stored_search_parameters(&t).await.unwrap(), 0);
+        assert_eq!(expression_of(&a, &tenant, &url), None);
+        let found = pending(&a, &t, "sp", since).await;
+        let intent = found.first().expect("the create's intent").clone();
+        Some((a, t, tenant, url, intent))
+    }
+
+    /// SW19 (ADR-aacruzgon-0099): a replay's follow uses a read taken after the replay, not R1's row.
+    /// The sweeper is held between the replay and that read while B deletes the SearchParameter
+    /// (`delete`), or, as the control, while nothing happens. Returns whether it is in A's registry
+    /// after the intent is processed.
+    async fn replay_held_before_its_follow(delete: bool) -> Option<bool> {
+        let (a, t, tenant, url, intent) =
+            a_searchparameter_left_for_the_sweeper("sweeper-sp-reread").await?;
+        let b = harness::backend().await.expect("instance B");
+        let mut hold = a.hold_at(Checkpoint::SweeperBeforeFollow, &t, "sp", intent.version_id);
+        let task = tokio::spawn({
+            let a = a.clone();
+            async move { a.process_intent(&intent, Rank::Normal).await }
+        });
+        hold.reached().await;
+        if delete {
+            b.delete(&tenant, "SearchParameter", "sp")
+                .await
+                .expect("B's delete");
+        }
+        hold.release();
+        let result = task.await.expect("the intent's task");
+        assert_eq!(result.result, Ok(()), "delete={delete}");
+        Some(expression_of(&a, &tenant, &url).is_some())
+    }
+
+    #[tokio::test]
+    async fn a_replay_follows_a_read_taken_after_it() {
+        let Some(deleted) = replay_held_before_its_follow(true).await else {
+            return;
+        };
+        let control = replay_held_before_its_follow(false).await.unwrap();
+        assert_eq!(
+            (deleted, control),
+            (false, true),
+            "(B deleted it before the follow's read, nothing happened)"
+        );
+    }
+
+    /// SW19 (ADR-aacruzgon-0099): when the read the follow uses fails (R1 passes, the second read of
+    /// `resources` is refused), the intent is kept and nothing is followed; its next try replays it
+    /// and follows.
+    #[tokio::test]
+    async fn a_failed_read_for_the_follow_keeps_the_intent() {
+        let Some((a, t, tenant, url, intent)) =
+            a_searchparameter_left_for_the_sweeper("sweeper-sp-reread-fails").await
+        else {
+            return;
+        };
+        let before = a.sweeper_stats();
+        a.session.inject_fault(
+            StatementKind::Read,
+            "FROM resources WHERE",
+            Fault::PassThrough,
+        );
+        a.session.inject_fault(
+            StatementKind::Read,
+            "FROM resources WHERE",
+            Fault::FailWithUnavailable,
+        );
+        let first = a.process_intent(&intent, Rank::Normal).await;
+        assert_eq!(first.case, Some(IntentCase::Current));
+        assert_eq!(first.result, Err(Failure::Transient("read")));
+        assert_eq!(
+            a.sweeper_stats().since(&before).search_parameters_followed,
+            0
+        );
+        assert_eq!(expression_of(&a, &tenant, &url), None, "not followed");
+        let kept = a
+            .intent_versions(
+                &t,
+                "SearchParameter",
+                "sp",
+                intent.enqueued - chrono::Duration::seconds(1),
+            )
+            .await;
+        assert!(
+            kept.contains(&intent.version_id),
+            "the intent is kept: {kept:?}"
+        );
+        let second = a.process_intent(&intent, Rank::Normal).await;
+        assert_eq!(second.result, Ok(()));
+        assert_eq!(
+            a.sweeper_stats().since(&before).search_parameters_followed,
+            1
+        );
+        assert_eq!(
+            expression_of(&a, &tenant, &url).as_deref(),
+            Some("Patient.active")
         );
     }
 
@@ -5532,7 +6276,9 @@ pub(crate) mod post_suite {
         since: DateTime<Utc>,
     ) -> PostSuiteReport {
         let started = Instant::now();
-        let now = Utc::now();
+        // One millisecond past now, so an intent stamped in this millisecond is in the window, whose bound
+        // is in whole milliseconds (SW7); every writer has returned by now.
+        let now = Utc::now() + chrono::Duration::milliseconds(1);
         let sweep = backend
             .sweep_pass(SweepOptions {
                 scope: SweepScope::TenantPrefix(prefix.to_string()),

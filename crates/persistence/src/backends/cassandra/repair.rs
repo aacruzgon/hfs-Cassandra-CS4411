@@ -3290,10 +3290,11 @@ mod tests {
         };
         for case in ["no-data", "not-json", "whole-row"] {
             // `not-json` plants non-JSON `data`: the post-suite check skips `test-planted-`.
+            // Each id is at most `MAX_TENANT_ID_LEN` (64) bytes, as `TenantId::parse` requires.
             let t = if case == "not-json" {
-                tenant_id("planted-repair-version-row-not-json")
+                tenant_id("planted-repair-not-json")
             } else {
-                tenant_id(&format!("repair-version-row-{case}"))
+                tenant_id(&format!("repair-vrow-{case}"))
             };
             let tenant = context(&t);
             let p = backend

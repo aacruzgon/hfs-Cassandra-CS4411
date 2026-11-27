@@ -33,6 +33,7 @@
 //! module issue before it merges.
 
 mod date;
+mod engine;
 mod last_updated;
 mod paging;
 mod residual;
@@ -1073,22 +1074,33 @@ impl CassandraBackend {
 /// the extra one decides whether `next` exists, and `next` is minted from
 /// the last resource of the page (walkthrough 5.1, step 6; 5.10).
 fn finish_page(
-    mut kept: Vec<(DateTime<Utc>, StoredResource)>,
+    kept: Vec<(DateTime<Utc>, StoredResource)>,
     page_size: usize,
+) -> StorageResult<SearchResult> {
+    let kept = kept
+        .into_iter()
+        .map(|(at, resource)| (OrderKey { at, table: None }, resource))
+        .collect();
+    finish_page_in(kept, page_size, Order::Default)
+}
+
+/// [`finish_page`] in any order: `next` is minted with the last resource's
+/// own order key, so a date-order page's cursor names its table.
+fn finish_page_in(
+    mut kept: Vec<(OrderKey, StoredResource)>,
+    page_size: usize,
+    order: Order,
 ) -> StorageResult<SearchResult> {
     let has_next = kept.len() > page_size;
     kept.truncate(page_size);
     let next_cursor = match kept.last() {
-        Some((at, resource)) if has_next => Some(paging::mint(
+        Some((key, resource)) if has_next => Some(paging::mint(
             &Candidate {
-                order: OrderKey {
-                    at: *at,
-                    table: None,
-                },
+                order: key.clone(),
                 id: resource.id().to_string(),
                 rows: Vec::new(),
             },
-            Order::Default,
+            order,
         )?),
         _ => None,
     };

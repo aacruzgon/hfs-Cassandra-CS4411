@@ -1,14 +1,15 @@
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
+use std::ops::RangeBounds;
 
 use cdrs_tokio::types::{rows::Row, value::Value};
 use chrono::{DateTime, Utc};
 
 use super::super::session::{CassandraSession, DriverError, StatementKind};
 
-use crate::search::date_value::{FhirDateValue, StorageResolution};
+use crate::search::date_value::{FhirDateValue, RangePredicate, StorageResolution};
 use crate::types::SearchPrefix;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum DateIndex {
     Start,
     End,
@@ -132,6 +133,65 @@ fn date_slices(value: &FhirDateValue, prefix: SearchPrefix) -> Vec<DateSlice> {
     }
 }
 
+type IndexedRange = (DateTime<Utc>, DateTime<Utc>);
+
+/// The public position identifies an emitted resource in the order of its
+/// table. It is separate from the internal position of a physical row.
+type DateResourcePosition<'a> = (DateIndex, DateTime<Utc>, &'a str);
+
+struct DatePlan {
+    slices: Vec<(DateSlice, RangePredicate)>,
+}
+
+impl DatePlan {
+    fn new(values: &[(SearchPrefix, FhirDateValue)]) -> Self {
+        let mut slices = Vec::new();
+        for (prefix, value) in values {
+            let predicate = value.range_predicate(*prefix, StorageResolution::Millis);
+            slices.extend(
+                date_slices(value, *prefix)
+                    .into_iter()
+                    .map(|slice| (slice, predicate.clone())),
+            );
+        }
+        slices.sort_by_key(|(slice, _)| slice.index);
+        Self { slices }
+    }
+
+    /// Recompute the first matching row from the candidate's current values.
+    /// Earlier matches can be recognized even after a page or table change.
+    fn first_match(
+        &self,
+        ranges: &[IndexedRange],
+    ) -> Option<(DateIndex, DateTime<Utc>, DateTime<Utc>)> {
+        self.slices
+            .iter()
+            .flat_map(|(slice, predicate)| {
+                ranges.iter().filter_map(move |&(start, end)| {
+                    let (time, other_time) = match slice.index {
+                        DateIndex::Start => (start, end),
+                        DateIndex::End => (end, start),
+                    };
+                    ((slice.lower, slice.upper).contains(&time) && predicate.matches(start, end))
+                        .then_some((slice.index, time, other_time))
+                })
+            })
+            .min()
+    }
+
+    fn emits_row(
+        &self,
+        index: DateIndex,
+        row: DateRowPosition<'_>,
+        ranges: &[IndexedRange],
+        after: Option<DateResourcePosition<'_>>,
+    ) -> bool {
+        let (time, id, other_time) = row;
+        after.is_none_or(|cursor| (index, time, id) > cursor)
+            && self.first_match(ranges) == Some((index, time, other_time))
+    }
+}
+
 #[test]
 fn date_prefixes_select_the_documented_slices() {
     use DateIndex::{End, Start};
@@ -168,8 +228,6 @@ fn date_prefixes_select_the_documented_slices() {
 
 #[test]
 fn date_slices_cover_every_matching_range_at_precision_boundaries() {
-    use std::ops::RangeBounds;
-
     use chrono::TimeDelta;
 
     use crate::search::date_value::{open_end, open_start};
@@ -418,5 +476,73 @@ async fn date_slices_read_written_rows_and_resume_on_both_tables() {
                 "{prefix:?}2020-03"
             );
         }
+    }
+}
+
+#[test]
+fn date_pages_cross_tables_without_repeating_multivalued_resources() {
+    use DateIndex::{End, Start};
+    use SearchPrefix::*;
+
+    let value = FhirDateValue::parse("2020-03").unwrap();
+    let at = |raw| {
+        FhirDateValue::parse(raw)
+            .unwrap()
+            .range_at(StorageResolution::Millis)
+            .0
+    };
+    let ranges: [(&str, &[IndexedRange]); 4] = [
+        (
+            "both",
+            &[
+                (at("2020-01-01"), at("2020-01-02")),
+                (at("2020-02-01"), at("2020-02-02")),
+                (at("2020-04-01"), at("2020-04-02")),
+            ],
+        ),
+        ("start", &[(at("2020-02-01"), at("2020-02-02"))]),
+        ("end", &[(at("2020-05-01"), at("2020-05-02"))]),
+        ("inside", &[(at("2020-03-10"), at("2020-03-11"))]),
+    ];
+
+    // The fixture models the rows from both Cassandra tables in native
+    // clustering order. Each page resumes from the last emitted resource.
+    let mut rows = Vec::new();
+    for (id, values) in ranges {
+        for &(start, end) in values {
+            rows.extend([
+                (Start, start, id, end, values),
+                (End, end, id, start, values),
+            ]);
+        }
+    }
+    rows.sort_by_key(|&(table, time, id, other_time, _)| (table, time, id, other_time));
+
+    for query in [
+        vec![(Ne, value.clone())],
+        vec![
+            (Gt, value.clone()),
+            (Lt, value.clone()),
+            (Eb, value.clone()),
+        ],
+    ] {
+        let plan = DatePlan::new(&query);
+        assert_eq!(plan.slices.first().unwrap().0.index, Start);
+        assert_eq!(plan.slices.last().unwrap().0.index, End);
+        let mut cursor = None;
+        let mut emitted = Vec::new();
+        // Request one resource at a time, forcing a page boundary at the
+        // table transition and before the second physical row of "both".
+        for _ in 0..4 {
+            let next = rows.iter().find(|&&(table, time, id, other_time, values)| {
+                plan.emits_row(table, (time, id, other_time), values, cursor)
+            });
+            let Some(&(table, time, id, _, _)) = next else {
+                break;
+            };
+            emitted.push((table, id));
+            cursor = Some((table, time, id));
+        }
+        assert_eq!(emitted, [(Start, "both"), (Start, "start"), (End, "end")]);
     }
 }

@@ -1151,7 +1151,14 @@ mod node_tests {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
         };
-        let t = tenant("wm-between");
+        // Plants a CAS with no version or index rows: the post-suite check skips `test-planted-`.
+        let t = TenantContext::new(
+            TenantId::new(format!(
+                "test-planted-l2c-wm-between-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        );
         for (method, deleting) in [
             ("update", false),
             ("update", true),

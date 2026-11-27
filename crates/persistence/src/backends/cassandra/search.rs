@@ -33,6 +33,7 @@
 //! module issue before it merges.
 
 mod date;
+mod last_updated;
 mod paging;
 mod token;
 mod uri;
@@ -66,6 +67,7 @@ use crate::types::{
     SearchParamFullCapability, SearchParamType, SearchQuery, SortDirection, SpecialSearchParam,
     StoredResource, SummaryMode,
 };
+use last_updated::{LastUpdatedFilter, Slice};
 use paging::{Order, OrderKey, Position};
 
 /// One index row as read, for the tag check and for repair.
@@ -411,7 +413,7 @@ impl SearchProvider for CassandraBackend {
             SearchResult::new(Page::new(Vec::new(), PageInfo::end()))
         } else {
             match &plan {
-                Plan::Unfiltered => self.unfiltered_search(tenant, query).await?,
+                Plan::Unfiltered | Plan::LastUpdated => self.type_search(tenant, query).await?,
                 Plan::Ids(ids) => self.id_search(tenant, query, ids).await?,
             }
         };
@@ -441,10 +443,32 @@ impl SearchProvider for CassandraBackend {
                         .await
                 }
             },
+            // The stream of 5.1 run to the end, with tag checks, under the
+            // cap; a filtered `search_count` queues no repairs (5.9).
+            Some(Plan::LastUpdated) => {
+                let filter = LastUpdatedFilter::of(query)?;
+                let budget = CandidateBudget::new(DEFAULT_MAX_CANDIDATES);
+                let mut unrun = RepairContext::new(tenant.tenant_id().as_str());
+                let scan = self
+                    .type_scan(
+                        tenant,
+                        query,
+                        &filter,
+                        Position::First(Order::Default),
+                        &budget,
+                        &mut unrun,
+                        None,
+                    )
+                    .await?;
+                Ok(scan.matched as u64)
+            }
             // Every live id, under the cap; no repairs (walkthrough 5.4, 5.9).
             Some(Plan::Ids(ids)) => {
+                let filter = LastUpdatedFilter::of(query)?;
                 let budget = CandidateBudget::new(DEFAULT_MAX_CANDIDATES);
-                let found = self.live_by_id(tenant, query, &ids, &budget).await?;
+                let found = self
+                    .live_by_id(tenant, query, &ids, &filter, &budget)
+                    .await?;
                 Ok(found.len() as u64)
             }
             None => Err(unsupported("search_count")),
@@ -646,36 +670,50 @@ fn is_unfiltered(query: &SearchQuery) -> bool {
 enum Plan {
     /// No parameters: walkthrough 5.6.
     Unfiltered,
-    /// Only `_id` parameters: point reads of these ids, the intersection of
-    /// every `_id` parameter's values (walkthrough 5.4, G37).
+    /// Only `_lastUpdated` parameters: slices of `resources_by_type`
+    /// (walkthrough 5.5).
+    LastUpdated,
+    /// `_id` parameters, and maybe `_lastUpdated`: point reads of these ids,
+    /// the intersection of every `_id` parameter's values (walkthrough 5.4,
+    /// G37), with `_lastUpdated` a residual on `resources.last_updated`.
     Ids(Vec<String>),
 }
 
 impl Plan {
     /// `None` for a query the engine does not serve yet: a token, URI or
-    /// date parameter (6a to 6c), `_lastUpdated` (row 6.2), a compartment
-    /// (5.11), chains, `_has` or `_list`.
+    /// date parameter (6a to 6c), a compartment (5.11), chains, `_has` or
+    /// `_list`.
     fn of(query: &SearchQuery) -> Option<Self> {
         if is_unfiltered(query) {
             return Some(Plan::Unfiltered);
         }
-        let only_ids = query.reverse_chains.is_empty()
+        let served = query.reverse_chains.is_empty()
             && query.list.is_empty()
             && query.compartment.is_none()
-            && query.parameters.iter().all(|param| param.name == "_id");
-        if !only_ids {
+            && query
+                .parameters
+                .iter()
+                .all(|param| param.name == "_id" || param.name == last_updated::PARAM);
+        if !served {
             return None;
+        }
+        if query.parameters.iter().all(|param| param.name != "_id") {
+            return Some(Plan::LastUpdated);
         }
         // Several `_id` parameters are ANDed: their sets are intersected
         // before any read (G37). Each value is compared whole with the id,
         // so `_id=sys|abc` reads an id that cannot exist (C2).
-        let mut sets = query.parameters.iter().map(|param| {
-            param
-                .values
-                .iter()
-                .map(|value| value.value.clone())
-                .collect::<std::collections::BTreeSet<String>>()
-        });
+        let mut sets = query
+            .parameters
+            .iter()
+            .filter(|param| param.name == "_id")
+            .map(|param| {
+                param
+                    .values
+                    .iter()
+                    .map(|value| value.value.clone())
+                    .collect::<std::collections::BTreeSet<String>>()
+            });
         let first = sets.next()?;
         let ids = sets.fold(first, |kept, set| {
             kept.intersection(&set).cloned().collect()
@@ -697,6 +735,14 @@ fn internal(message: String) -> StorageError {
         message,
         source: None,
     })
+}
+
+/// What a `resources_by_type` scan found: the resources it kept, in order,
+/// and how many rows passed every check.
+#[derive(Debug, Default)]
+struct TypeScan {
+    kept: Vec<(DateTime<Utc>, StoredResource)>,
+    matched: usize,
 }
 
 /// One row of `resources_by_type`.
@@ -759,20 +805,22 @@ fn stored_resource(
 }
 
 impl CassandraBackend {
-    /// `GET /Patient`: one partition of `resources_by_type`, keyset-paged
-    /// from the cursor, each row tag-checked against R1 (walkthrough 5.1,
-    /// 5.6). One repair context for the response, run once at its end, on
-    /// success and on `TooManyResults` (`repair.rs`, "Step 6's contract").
-    async fn unfiltered_search(
+    /// `GET /Patient`, or `_lastUpdated` alone: one partition of
+    /// `resources_by_type`, keyset-paged from the cursor, each row
+    /// tag-checked against R1 (walkthrough 5.1, 5.5, 5.6). One repair context
+    /// for the response, run once at its end, on success and on
+    /// `TooManyResults` (`repair.rs`, "Step 6's contract").
+    async fn type_search(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         let position = paging::decode(query.cursor.as_deref(), Order::Default)?;
+        let filter = LastUpdatedFilter::of(query)?;
         let budget = CandidateBudget::new(DEFAULT_MAX_CANDIDATES);
         let mut repairs = RepairContext::new(tenant.tenant_id().as_str());
         let page = self
-            .type_page(tenant, query, position, &budget, &mut repairs)
+            .type_page(tenant, query, &filter, position, &budget, &mut repairs)
             .await;
         if matches!(
             &page,
@@ -783,13 +831,13 @@ impl CassandraBackend {
         page
     }
 
-    /// The page itself: read batches of `resources_by_type` after
-    /// `position`, keep the rows that pass the tag check, and stop at
-    /// `_count + 1` kept; the extra one decides whether `next` exists.
+    /// The page itself: up to `_count + 1` kept resources; the extra one
+    /// decides whether `next` exists.
     async fn type_page(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
+        filter: &LastUpdatedFilter,
         position: Position,
         budget: &CandidateBudget,
         repairs: &mut RepairContext,
@@ -798,64 +846,112 @@ impl CassandraBackend {
         if page_size == 0 {
             return Ok(SearchResult::new(Page::new(Vec::new(), PageInfo::end())));
         }
+        let scan = self
+            .type_scan(
+                tenant,
+                query,
+                filter,
+                position,
+                budget,
+                repairs,
+                Some(page_size + 1),
+            )
+            .await?;
+        finish_page(scan.kept, page_size)
+    }
+
+    /// Reads `filter`'s slices of `resources_by_type`, newest first, in
+    /// batches after `position`, and tag-checks each row that passes
+    /// `filter` and the FHIR version (walkthrough 5.1). With `keep` set,
+    /// returns the first `keep` kept resources; with `None`, reads to the
+    /// end and only counts them (`search_count`, 5.9).
+    #[allow(clippy::too_many_arguments)]
+    async fn type_scan(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        filter: &LastUpdatedFilter,
+        position: Position,
+        budget: &CandidateBudget,
+        repairs: &mut RepairContext,
+        keep: Option<usize>,
+    ) -> StorageResult<TypeScan> {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = query.resource_type.as_str();
         let wanted_version = query.stored_fhir_version();
 
-        let mut kept: Vec<(DateTime<Utc>, StoredResource)> = Vec::new();
+        let mut scan = TypeScan::default();
         let mut after = position;
-        'reading: loop {
-            let rows = self.type_rows(tenant_id, resource_type, &after).await?;
-            let Some(last) = rows.last() else {
-                break;
-            };
-            let more = rows.len() == BATCH_ROWS;
-            after = Position::After {
-                order: Order::Default,
-                at: last.last_updated,
-                id: last.id.clone(),
-                table: None,
-            };
+        'reading: for slice in filter.slices() {
+            // A slice wholly above the cursor holds nothing after it.
+            if let Position::After { at, .. } = &after
+                && slice.from.is_some_and(|from| from > *at)
+            {
+                continue;
+            }
+            loop {
+                let rows = self
+                    .type_rows(tenant_id, resource_type, slice, &after)
+                    .await?;
+                let Some(last) = rows.last() else {
+                    break;
+                };
+                let more = rows.len() == BATCH_ROWS;
+                after = Position::After {
+                    order: Order::Default,
+                    at: last.last_updated,
+                    id: last.id.clone(),
+                    table: None,
+                };
 
-            // G34: another FHIR version is dropped from the row's own
-            // column, before any point read.
-            let candidates = rows.into_iter().filter(|row| match wanted_version {
-                Some(wanted) => row
-                    .fhir_version
-                    .as_deref()
-                    .is_none_or(|stored| stored == wanted),
-                None => true,
-            });
-            let mut checked = stream::iter(candidates)
-                .map(|row| async move {
-                    budget.charge(&row.id)?;
-                    let r1 = self
-                        .read_resource_row(tenant_id, resource_type, &row.id)
-                        .await?;
-                    Ok::<_, StorageError>((row, r1))
-                })
-                .buffered(R1_CONCURRENCY);
-            while let Some(checked_row) = checked.next().await {
-                let (row, r1) = checked_row?;
-                match r1 {
-                    Some(r1) if !r1.is_deleted() && Some(r1.version_id) == row.version_id => {
-                        if query.matches_fhir_version(r1.fhir_version) {
-                            let resource = stored_resource(tenant, resource_type, &row.id, &r1)?;
-                            kept.push((row.last_updated, resource));
-                            if kept.len() > page_size {
-                                break 'reading;
+                // Checks on the row's own columns, before any point read:
+                // `_lastUpdated`'s exact predicate (5.5), and another FHIR
+                // version dropped (G34).
+                let candidates = rows.into_iter().filter(|row| {
+                    filter.matches(row.last_updated)
+                        && match wanted_version {
+                            Some(wanted) => row
+                                .fhir_version
+                                .as_deref()
+                                .is_none_or(|stored| stored == wanted),
+                            None => true,
+                        }
+                });
+                let mut checked = stream::iter(candidates)
+                    .map(|row| async move {
+                        budget.charge(&row.id)?;
+                        let r1 = self
+                            .read_resource_row(tenant_id, resource_type, &row.id)
+                            .await?;
+                        Ok::<_, StorageError>((row, r1))
+                    })
+                    .buffered(R1_CONCURRENCY);
+                while let Some(checked_row) = checked.next().await {
+                    let (row, r1) = checked_row?;
+                    match r1 {
+                        Some(r1) if !r1.is_deleted() && Some(r1.version_id) == row.version_id => {
+                            if !query.matches_fhir_version(r1.fhir_version) {
+                                continue;
+                            }
+                            scan.matched += 1;
+                            if let Some(keep) = keep {
+                                let resource =
+                                    stored_resource(tenant, resource_type, &row.id, &r1)?;
+                                scan.kept.push((row.last_updated, resource));
+                                if scan.kept.len() >= keep {
+                                    break 'reading;
+                                }
                             }
                         }
+                        r1 => queue_hidden(repairs, resource_type, &row, r1),
                     }
-                    r1 => queue_hidden(repairs, resource_type, &row, r1),
+                }
+                if !more {
+                    break;
                 }
             }
-            if !more {
-                break;
-            }
         }
-
-        finish_page(kept, page_size)
+        Ok(scan)
     }
 
     /// `_id=a,b,c`: R1 for each id, concurrently, under the cap; no index
@@ -873,8 +969,11 @@ impl CassandraBackend {
         if page_size == 0 {
             return Ok(SearchResult::new(Page::new(Vec::new(), PageInfo::end())));
         }
+        let filter = LastUpdatedFilter::of(query)?;
         let budget = CandidateBudget::new(DEFAULT_MAX_CANDIDATES);
-        let mut found = self.live_by_id(tenant, query, ids, &budget).await?;
+        let mut found = self
+            .live_by_id(tenant, query, ids, &filter, &budget)
+            .await?;
         if let Position::After { at, id, .. } = &position {
             found.retain(|(lu, resource)| (*lu, resource.id()) < (*at, id.as_str()));
         }
@@ -896,13 +995,15 @@ impl CassandraBackend {
     }
 
     /// The live resources among `ids`, in `(last_updated DESC, id DESC)`
-    /// order, with the query's FHIR version applied (G34). Every id read is
-    /// a candidate point-read, charged to `budget` (G27).
+    /// order, with `_lastUpdated` (a residual on `resources.last_updated`)
+    /// and the query's FHIR version applied (G34). Every id read is a
+    /// candidate point-read, charged to `budget` (G27).
     async fn live_by_id(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
         ids: &[String],
+        filter: &LastUpdatedFilter,
         budget: &CandidateBudget,
     ) -> StorageResult<Vec<(DateTime<Utc>, StoredResource)>> {
         let tenant_id = tenant.tenant_id().as_str();
@@ -918,6 +1019,7 @@ impl CassandraBackend {
         while let Some(read) = reads.next().await {
             let (id, r1) = read?;
             if let Some(r1) = r1.filter(|r1| !r1.is_deleted())
+                && filter.matches(r1.last_updated)
                 && query.matches_fhir_version(r1.fhir_version)
             {
                 found.push((
@@ -996,21 +1098,43 @@ impl CassandraBackend {
         Ok(rows.len() as u64)
     }
 
-    /// One batch of `resources_by_type` rows strictly after `after`.
+    /// One batch of `slice`'s rows strictly after `after` (walkthrough 5.5,
+    /// L1 and L2). The node takes one end bound per query (G19), so the
+    /// slice's upper bound and the cursor are never sent together: the
+    /// bound alone when it is at or below the cursor's `last_updated`
+    /// (every row below it is then below the cursor too), the cursor alone
+    /// otherwise. A lower bound goes with either.
     async fn type_rows(
         &self,
         tenant_id: &str,
         resource_type: &str,
+        slice: &Slice,
         after: &Position,
     ) -> StorageResult<Vec<TypeRow>> {
         let mut values = vec![Value::from(tenant_id), Value::from(resource_type)];
-        let cql = match paging::keyset(after) {
-            None => format!("{SELECT_TYPE_ROWS} LIMIT ?"),
-            Some((relation, bound)) => {
-                values.extend(bound);
-                format!("{SELECT_TYPE_ROWS} AND {relation} LIMIT ?")
+        let mut cql = SELECT_TYPE_ROWS.to_string();
+        if let Some(from) = slice.from {
+            cql.push_str(" AND last_updated >= ?");
+            values.push(Value::from(from));
+        }
+        match (slice.until, after) {
+            (Some(until), Position::After { at, .. }) if until <= *at => {
+                cql.push_str(" AND last_updated < ?");
+                values.push(Value::from(until));
             }
-        };
+            (_, Position::After { .. }) => {
+                let (relation, bound) = paging::keyset(after).expect("a position after a row");
+                cql.push_str(" AND ");
+                cql.push_str(relation);
+                values.extend(bound);
+            }
+            (Some(until), Position::First(_)) => {
+                cql.push_str(" AND last_updated < ?");
+                values.push(Value::from(until));
+            }
+            (None, Position::First(_)) => {}
+        }
+        cql.push_str(" LIMIT ?");
         values.push(Value::from(BATCH_ROWS as i32));
         let rows = self
             .session
@@ -1883,6 +2007,142 @@ mod node_tests {
         assert_eq!(
             backend.search(&tenant, &total).await.unwrap().total,
             Some(5)
+        );
+    }
+
+    /// 5 Patients a few milliseconds apart, oldest first, with their stored
+    /// `last_updated`.
+    async fn create_spaced(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+    ) -> Vec<(String, String)> {
+        let mut made = Vec::new();
+        for _ in 0..5 {
+            let stored = crate::core::ResourceStorage::create(
+                backend,
+                tenant,
+                "Patient",
+                serde_json::json!({ "resourceType": "Patient" }),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
+            .await
+            .expect("create");
+            made.push((
+                stored
+                    .last_modified()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                stored.id().to_string(),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        made
+    }
+
+    fn last_updated(values: &[&[String]]) -> SearchQuery {
+        values
+            .iter()
+            .fold(SearchQuery::new("Patient"), |query, values| {
+                query.with_parameter(crate::types::SearchParameter {
+                    name: "_lastUpdated".to_string(),
+                    param_type: SearchParamType::Date,
+                    values: values
+                        .iter()
+                        .map(|value| crate::types::SearchValue::parse(value))
+                        .collect(),
+                    ..Default::default()
+                })
+            })
+    }
+
+    /// Each prefix on `resources_by_type` (walkthrough 5.5; `coverage.md`
+    /// section 3), a comma list, two `_lastUpdated` ANDed, and `_id` with
+    /// `_lastUpdated` as a residual: the right resources, newest first.
+    #[tokio::test]
+    async fn last_updated_slices_return_the_matching_resources_newest_first() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-last-updated");
+        let made = create_spaced(&backend, &tenant).await;
+        let t = |n: usize| made[n].0.clone();
+        let ids = |ns: &[usize]| -> Vec<String> { ns.iter().map(|&n| made[n].1.clone()).collect() };
+        let found = |query: SearchQuery| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move { ids_of(&backend.search(tenant, &query.with_count(50)).await.unwrap()) }
+        };
+
+        for (prefix, expected) in [
+            ("eq", vec![2]),
+            ("ge", vec![4, 3, 2]),
+            ("gt", vec![4, 3]),
+            ("sa", vec![4, 3]),
+            ("le", vec![2, 1, 0]),
+            ("lt", vec![1, 0]),
+            ("eb", vec![1, 0]),
+            ("ne", vec![4, 3, 1, 0]),
+        ] {
+            assert_eq!(
+                found(last_updated(&[&[format!("{prefix}{}", t(2))]])).await,
+                ids(&expected),
+                "_lastUpdated={prefix}t2"
+            );
+        }
+        assert_eq!(
+            found(last_updated(&[&[
+                format!("eq{}", t(1)),
+                format!("eq{}", t(3))
+            ]]))
+            .await,
+            ids(&[3, 1]),
+            "a comma list"
+        );
+        assert_eq!(
+            found(last_updated(&[
+                &[format!("ge{}", t(1))],
+                &[format!("lt{}", t(3))]
+            ]))
+            .await,
+            ids(&[2, 1]),
+            "two parameters, ANDed"
+        );
+        let mut with_ids = last_updated(&[&[format!("ge{}", t(2))]]);
+        with_ids.parameters.extend(
+            id_query(&made.iter().map(|(_, id)| id.as_str()).collect::<Vec<_>>()).parameters,
+        );
+        assert_eq!(
+            found(with_ids).await,
+            ids(&[4, 3, 2]),
+            "_id drives, _lastUpdated is a residual"
+        );
+    }
+
+    /// `ne` read one resource a page: the cursor carries the read from the
+    /// slice above the value into the slice below it, each resource once;
+    /// `search_count` and `_total` count the matches.
+    #[tokio::test]
+    async fn last_updated_ne_pages_across_its_two_slices_and_counts() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-last-updated-ne");
+        let made = create_spaced(&backend, &tenant).await;
+        let ne = last_updated(&[&[format!("ne{}", made[2].0)]]);
+
+        let pages = every_page(&backend, &tenant, ne.clone().with_count(1)).await;
+        let found: Vec<String> = pages.iter().flat_map(ids_of).collect();
+        let expected: Vec<String> = [4, 3, 1, 0].iter().map(|&n| made[n].1.clone()).collect();
+        assert_eq!(found, expected);
+        assert_eq!(pages.len(), 4, "one a page, no empty last page");
+
+        assert_eq!(backend.search_count(&tenant, &ne).await.unwrap(), 4);
+        let mut total = ne.with_count(2);
+        total.total = Some(crate::types::TotalMode::Accurate);
+        assert_eq!(
+            backend.search(&tenant, &total).await.unwrap().total,
+            Some(4)
         );
     }
 }

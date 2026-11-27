@@ -203,6 +203,10 @@ pub(crate) trait ParamPlan: Send + Sync {
     /// `paging::decode` for the request's cursor and uses to start the first
     /// page (#128, item 4: "the plan says which"). Default:
     /// `(last_updated DESC, id DESC)`; a date plan returns its table's order.
+    ///
+    /// The framework reads it from the plan that drives the search only. A
+    /// date plan beside a token, or a second date, still returns its date
+    /// order, and the framework ignores it.
     fn order(&self) -> Order {
         Order::Default
     }
@@ -228,7 +232,18 @@ pub(crate) trait ParamPlan: Send + Sync {
     ) -> StorageResult<bool>;
 
     /// The residual check on the loaded resource. Default: it matches.
-    fn residual(&self, _loaded: &LoadedResource) -> bool {
+    ///
+    /// `at` is where the candidate sits in the stream's order: `Some` only
+    /// for the plan that drives the search, and `None` for a plan checked
+    /// beside another driver. Without it, two rows of one resource give a
+    /// date plan identical inputs. With it, the driving date plan can apply
+    /// walkthrough 5.7's "first matching row" rule, as Diya decides it for
+    /// 6b (#128, open choice 4), within a page, on a resumed page and across
+    /// `ne`'s two tables. Within one page, a resource appears once in any
+    /// case (bundle.html's `bdl-7`, in R4, R4B and R5). A check beside the
+    /// driver gets `None`, not the driver's position: a second date judged
+    /// by the first date's position would drop a real match.
+    fn residual(&self, _loaded: &LoadedResource, _at: Option<&OrderKey>) -> bool {
         true
     }
 }
@@ -402,6 +417,10 @@ mod tests {
         assert_eq!(plan.param(), "status");
         assert_eq!(plan.drive(), Drive::Shared);
         assert_eq!(plan.order(), Order::Default);
+        // `residual` takes the candidate's position, `None` beside a driver
+        // (#133, Alan's audit point 2).
+        let _residual: fn(&NoMatches, &LoadedResource, Option<&OrderKey>) -> bool =
+            <NoMatches as ParamPlan>::residual;
     }
 
     #[test]

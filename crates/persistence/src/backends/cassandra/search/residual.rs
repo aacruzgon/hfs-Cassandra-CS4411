@@ -19,7 +19,8 @@ use serde_json::Value as Json;
 use super::LoadedResource;
 use crate::backends::cassandra::backend::CassandraBackend;
 use crate::backends::cassandra::read::ResourceRow;
-use crate::search::{ExtractedValue, SearchParameterExtractor};
+use crate::search::{ExtractedValue, IndexValue, SearchParameterExtractor};
+use crate::types::{CompartmentMembership, strip_reference_version};
 
 /// The stack a debug build extracts on: the write path's
 /// `EXTRACTION_STACK_BYTES` (`C/index_keys.rs`), for the same reason.
@@ -28,7 +29,6 @@ const EXTRACTION_STACK_BYTES: usize = 64 * 1024 * 1024;
 impl CassandraBackend {
     /// `row`, with `body` (its parsed `data`) extracted once for the
     /// residuals, under the tenant's registry.
-    #[allow(dead_code)] // The compartment residual (6.3b) calls it.
     pub(super) fn load_for_residuals(
         &self,
         tenant_id: &str,
@@ -50,6 +50,27 @@ impl CassandraBackend {
         });
         LoadedResource { row, extracted }
     }
+}
+
+/// Whether `loaded` is a member of `compartment` (walkthrough 5.11, G33):
+/// one of its `IndexValue::Reference` values of the compartment's params
+/// equals `strip_reference_version(reference)`, or starts with it followed
+/// by `/_history/`, the rule SQLite and MongoDB apply to their reference
+/// rows. A compartment with no params has no members: it is never read as
+/// "no compartment".
+pub(super) fn in_compartment(loaded: &LoadedResource, compartment: &CompartmentMembership) -> bool {
+    let base = strip_reference_version(&compartment.reference);
+    let versioned = format!("{base}/_history/");
+    loaded
+        .extracted
+        .iter()
+        .filter(|value| compartment.params.contains(&value.param_name))
+        .any(|value| match &value.value {
+            IndexValue::Reference { reference, .. } => {
+                reference == base || reference.starts_with(&versioned)
+            }
+            _ => false,
+        })
 }
 
 /// `extractor.extract(body, resource_type)`, on a thread with an
@@ -128,5 +149,98 @@ mod tests {
             refused.unwrap_err(),
             "Invalid resource: Resource must be a JSON object"
         );
+    }
+
+    fn loaded(body: serde_json::Value) -> LoadedResource {
+        let extracted = residual_values(&test_extractor(), "Observation", &body).unwrap();
+        LoadedResource {
+            row: crate::backends::cassandra::read::ResourceRow {
+                version_id: 1,
+                data: None,
+                last_updated: chrono::Utc::now(),
+                created_at: None,
+                deleted_at: None,
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                stored_fhir_version: None,
+                write_ts: None,
+                write_id: None,
+                index_keys: None,
+            },
+            extracted,
+        }
+    }
+
+    fn observation(subject: Option<&str>, performer: Option<&str>) -> serde_json::Value {
+        let mut body = json!({ "resourceType": "Observation", "status": "final" });
+        if let Some(subject) = subject {
+            body["subject"] = json!({ "reference": subject });
+        }
+        if let Some(performer) = performer {
+            body["performer"] = json!([{ "reference": performer }]);
+        }
+        body
+    }
+
+    fn patient_123(params: &[&str]) -> CompartmentMembership {
+        CompartmentMembership {
+            params: params.iter().map(|param| param.to_string()).collect(),
+            reference: "Patient/123".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_member_references_the_compartment_through_one_of_its_params() {
+        let compartment = patient_123(&["subject", "performer"]);
+        for (case, body, member) in [
+            ("subject", observation(Some("Patient/123"), None), true),
+            ("performer", observation(None, Some("Patient/123")), true),
+            (
+                "a version",
+                observation(Some("Patient/123/_history/2"), None),
+                true,
+            ),
+            (
+                "another patient",
+                observation(Some("Patient/1234"), None),
+                false,
+            ),
+            (
+                "a prefix only",
+                observation(Some("Patient/12"), None),
+                false,
+            ),
+            ("no reference", observation(None, None), false),
+        ] {
+            assert_eq!(
+                in_compartment(&loaded(body), &compartment),
+                member,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_compartments_own_params_count() {
+        let body = observation(None, Some("Patient/123"));
+        assert!(!in_compartment(
+            &loaded(body.clone()),
+            &patient_123(&["subject"])
+        ));
+        assert!(
+            !in_compartment(&loaded(body), &patient_123(&[])),
+            "no params, no members"
+        );
+    }
+
+    #[test]
+    fn a_versioned_compartment_reference_is_compared_without_its_version() {
+        let compartment = CompartmentMembership {
+            params: vec!["subject".to_string()],
+            reference: "Patient/123/_history/7".to_string(),
+        };
+        assert!(in_compartment(
+            &loaded(observation(Some("Patient/123"), None)),
+            &compartment
+        ));
     }
 }

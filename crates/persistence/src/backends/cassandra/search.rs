@@ -414,7 +414,7 @@ impl SearchProvider for CassandraBackend {
             SearchResult::new(Page::new(Vec::new(), PageInfo::end()))
         } else {
             match &plan {
-                Plan::Unfiltered | Plan::LastUpdated => self.type_search(tenant, query).await?,
+                Plan::Unfiltered | Plan::TypeScan => self.type_search(tenant, query).await?,
                 Plan::Ids(ids) => self.id_search(tenant, query, ids).await?,
             }
         };
@@ -446,7 +446,7 @@ impl SearchProvider for CassandraBackend {
             },
             // The stream of 5.1 run to the end, with tag checks, under the
             // cap; a filtered `search_count` queues no repairs (5.9).
-            Some(Plan::LastUpdated) => {
+            Some(Plan::TypeScan) => {
                 let filter = LastUpdatedFilter::of(query)?;
                 let budget = CandidateBudget::new(DEFAULT_MAX_CANDIDATES);
                 let mut unrun = RepairContext::new(tenant.tenant_id().as_str());
@@ -671,9 +671,9 @@ fn is_unfiltered(query: &SearchQuery) -> bool {
 enum Plan {
     /// No parameters: walkthrough 5.6.
     Unfiltered,
-    /// Only `_lastUpdated` parameters: slices of `resources_by_type`
-    /// (walkthrough 5.5).
-    LastUpdated,
+    /// `resources_by_type` scanned with checks: `_lastUpdated` slices
+    /// (walkthrough 5.5), a compartment (5.11), or both.
+    TypeScan,
     /// `_id` parameters, and maybe `_lastUpdated`: point reads of these ids,
     /// the intersection of every `_id` parameter's values (walkthrough 5.4,
     /// G37), with `_lastUpdated` a residual on `resources.last_updated`.
@@ -682,15 +682,14 @@ enum Plan {
 
 impl Plan {
     /// `None` for a query the engine does not serve yet: a token, URI or
-    /// date parameter (6a to 6c), a compartment (5.11), chains, `_has` or
-    /// `_list`.
+    /// date parameter (6a to 6c), chains, `_has` or `_list`. A compartment
+    /// is a residual on any plan but `Unfiltered`, which has none.
     fn of(query: &SearchQuery) -> Option<Self> {
         if is_unfiltered(query) {
             return Some(Plan::Unfiltered);
         }
         let served = query.reverse_chains.is_empty()
             && query.list.is_empty()
-            && query.compartment.is_none()
             && query
                 .parameters
                 .iter()
@@ -699,7 +698,7 @@ impl Plan {
             return None;
         }
         if query.parameters.iter().all(|param| param.name != "_id") {
-            return Some(Plan::LastUpdated);
+            return Some(Plan::TypeScan);
         }
         // Several `_id` parameters are ANDed: their sets are intersected
         // before any read (G37). Each value is compared whole with the id,
@@ -934,10 +933,20 @@ impl CassandraBackend {
                             if !query.matches_fhir_version(r1.fhir_version) {
                                 continue;
                             }
+                            let resource = stored_resource(tenant, resource_type, &row.id, &r1)?;
+                            if let Some(compartment) = &query.compartment {
+                                let loaded = self.load_for_residuals(
+                                    tenant_id,
+                                    resource_type,
+                                    r1,
+                                    resource.content(),
+                                );
+                                if !residual::in_compartment(&loaded, compartment) {
+                                    continue;
+                                }
+                            }
                             scan.matched += 1;
                             if let Some(keep) = keep {
-                                let resource =
-                                    stored_resource(tenant, resource_type, &row.id, &r1)?;
                                 scan.kept.push((row.last_updated, resource));
                                 if scan.kept.len() >= keep {
                                     break 'reading;
@@ -1019,15 +1028,23 @@ impl CassandraBackend {
         let mut found = Vec::new();
         while let Some(read) = reads.next().await {
             let (id, r1) = read?;
-            if let Some(r1) = r1.filter(|r1| !r1.is_deleted())
-                && filter.matches(r1.last_updated)
-                && query.matches_fhir_version(r1.fhir_version)
-            {
-                found.push((
-                    r1.last_updated,
-                    stored_resource(tenant, resource_type, id, &r1)?,
-                ));
+            let Some(r1) = r1.filter(|r1| {
+                !r1.is_deleted()
+                    && filter.matches(r1.last_updated)
+                    && query.matches_fhir_version(r1.fhir_version)
+            }) else {
+                continue;
+            };
+            let last_updated = r1.last_updated;
+            let resource = stored_resource(tenant, resource_type, id, &r1)?;
+            if let Some(compartment) = &query.compartment {
+                let loaded =
+                    self.load_for_residuals(tenant_id, resource_type, r1, resource.content());
+                if !residual::in_compartment(&loaded, compartment) {
+                    continue;
+                }
             }
+            found.push((last_updated, resource));
         }
         found.sort_by(|(a_lu, a), (b_lu, b)| (b_lu, b.id()).cmp(&(a_lu, a.id())));
         Ok(found)
@@ -1503,7 +1520,7 @@ mod plan_tests {
     }
 
     #[test]
-    fn only_unfiltered_and_id_only_queries_are_planned() {
+    fn only_the_queries_the_engine_serves_are_planned() {
         assert_eq!(
             Plan::of(&SearchQuery::new("Patient")),
             Some(Plan::Unfiltered)
@@ -1520,7 +1537,18 @@ mod plan_tests {
             params: vec!["link".to_string()],
             reference: "Patient/p".to_string(),
         });
-        assert_eq!(Plan::of(&in_compartment), None);
+        assert_eq!(
+            Plan::of(&in_compartment),
+            Some(Plan::Ids(vec!["a".to_string()])),
+            "a compartment is a residual on the _id plan"
+        );
+        let mut whole_type = SearchQuery::new("Patient");
+        whole_type.compartment = in_compartment.compartment.clone();
+        assert_eq!(
+            Plan::of(&whole_type),
+            Some(Plan::TypeScan),
+            "never Unfiltered, whose count has no residuals"
+        );
     }
 }
 
@@ -1821,35 +1849,135 @@ mod node_tests {
         );
     }
 
-    /// A compartment is a residual filter (5.11), so a search or count
-    /// with one is never answered from `resources_by_type` alone: until the
-    /// compartment residual lands, it is refused rather than returning the
-    /// whole type.
+    /// Observations of three kinds: members of `Patient/p1` through
+    /// `subject`, through `performer` or through a versioned reference, and
+    /// non-members (another patient, no reference). Oldest first.
+    async fn create_observations(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+    ) -> Vec<(String, bool)> {
+        let bodies = [
+            (
+                serde_json::json!({ "subject": { "reference": "Patient/p1" } }),
+                true,
+            ),
+            (
+                serde_json::json!({ "subject": { "reference": "Patient/p2" } }),
+                false,
+            ),
+            (
+                serde_json::json!({ "performer": [{ "reference": "Patient/p1" }] }),
+                true,
+            ),
+            (serde_json::json!({}), false),
+            (
+                serde_json::json!({ "subject": { "reference": "Patient/p1/_history/3" } }),
+                true,
+            ),
+            (
+                serde_json::json!({ "subject": { "reference": "Patient/p11" } }),
+                false,
+            ),
+        ];
+        let mut made = Vec::new();
+        for (mut body, member) in bodies {
+            body["resourceType"] = serde_json::json!("Observation");
+            body["status"] = serde_json::json!("final");
+            let stored = crate::core::ResourceStorage::create(
+                backend,
+                tenant,
+                "Observation",
+                body,
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
+            .await
+            .expect("create");
+            made.push((stored.id().to_string(), member));
+        }
+        made
+    }
+
+    fn in_p1(mut query: SearchQuery) -> SearchQuery {
+        query.compartment = Some(crate::types::CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        query
+    }
+
+    /// `GET /Patient/p1/Observation`, and any search under a `patient/`
+    /// scope: only members, newest first, paged through the cursor and
+    /// counted, never the whole type (walkthrough 5.11, G33).
     #[tokio::test]
-    async fn a_compartment_is_never_read_as_unfiltered() {
+    async fn a_compartment_search_returns_and_counts_only_members() {
         let Some(backend) = backend().await else {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
         };
         let tenant = fresh_tenant("test-search-compartment");
-        create_patients(&backend, &tenant, 2).await;
-        let mut query = SearchQuery::new("Patient");
-        query.compartment = Some(crate::types::CompartmentMembership {
-            params: vec!["link".to_string()],
-            reference: "Patient/someone-else".to_string(),
-        });
-        assert!(matches!(
-            backend.search(&tenant, &query).await,
-            Err(StorageError::Backend(
-                BackendError::UnsupportedCapability { .. }
-            ))
-        ));
-        assert!(matches!(
-            backend.search_count(&tenant, &query).await,
-            Err(StorageError::Backend(
-                BackendError::UnsupportedCapability { .. }
-            ))
-        ));
+        let made = create_observations(&backend, &tenant).await;
+        let members: Vec<&str> = made
+            .iter()
+            .filter(|(_, member)| *member)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let mut expected = Vec::new();
+        for id in &members {
+            let resource = crate::core::ResourceStorage::read(&backend, &tenant, "Observation", id)
+                .await
+                .unwrap()
+                .unwrap();
+            expected.push((resource.last_modified(), id.to_string()));
+        }
+        expected.sort_by(|a, b| b.cmp(a));
+        let expected: Vec<String> = expected.into_iter().map(|(_, id)| id).collect();
+
+        let query = in_p1(SearchQuery::new("Observation"));
+        let pages = every_page(&backend, &tenant, query.clone().with_count(1)).await;
+        let found: Vec<String> = pages.iter().flat_map(ids_of).collect();
+        assert_eq!(found, expected, "members only, newest first, one a page");
+        assert_eq!(pages.len(), 3);
+
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 3);
+        let mut total = query.clone();
+        total.total = Some(crate::types::TotalMode::Accurate);
+        assert_eq!(
+            backend.search(&tenant, &total).await.unwrap().total,
+            Some(3)
+        );
+
+        // A compartment with no params has no members.
+        let mut no_params = query;
+        no_params.compartment.as_mut().unwrap().params.clear();
+        assert!(ids_of(&backend.search(&tenant, &no_params).await.unwrap()).is_empty());
+        assert_eq!(backend.search_count(&tenant, &no_params).await.unwrap(), 0);
+    }
+
+    /// The compartment is a residual on the `_id` and `_lastUpdated` plans
+    /// too: `_id` naming a member and a non-member returns the member.
+    #[tokio::test]
+    async fn a_compartment_filters_the_id_and_last_updated_plans() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-compartment-plans");
+        let made = create_observations(&backend, &tenant).await;
+        let (member, other) = (made[0].0.as_str(), made[1].0.as_str());
+
+        let mut by_id = id_query(&[member, other]);
+        by_id.resource_type = "Observation".to_string();
+        assert_eq!(
+            ids_of(&backend.search(&tenant, &in_p1(by_id)).await.unwrap()),
+            [member]
+        );
+
+        let mut since = last_updated(&[&["ge2000-01-01".to_string()]]);
+        since.resource_type = "Observation".to_string();
+        assert_eq!(
+            backend.search_count(&tenant, &in_p1(since)).await.unwrap(),
+            3
+        );
     }
 
     /// `_total=accurate` (and `estimate`) adds the count to the page;

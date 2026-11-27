@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -538,6 +539,24 @@ class CqlAuditCommand(Scratch):
         self.assertIn("over half of the step's 300 s timeout", ci_report.audit_parse_warning(151.0))
         self.assertIsNone(ci_report.audit_parse_warning(150.0))
 
+    def test_the_parse_time_includes_the_classification(self):
+        # A fake clock that jumps 200 s inside the classifier: only a reading taken after the classification
+        # loop sees it, and the warning then fires.
+        clock = [0.0]
+        classify = ci_report.audit_violation
+
+        def slow(entry, keyspace):
+            clock[0] = 200.0
+            return classify(entry, keyspace)
+
+        with mock.patch.object(ci_report.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(ci_report, "audit_violation", slow):
+            status, _ = self.audit(CLEAN)
+        self.assertEqual(status, 0)
+        data = self.report("cql-audit")
+        self.assertEqual(data["parse_seconds"], 200.0)
+        self.assertTrue(any("the parse took 200 s" in w for w in data["warnings"]), data["warnings"])
+
     def test_clean_log_passes(self):
         status, _ = self.audit(CLEAN)
         self.assertEqual(status, 0)
@@ -902,6 +921,21 @@ class ConsistencyCommand(Scratch):
         self.assertIn("Post-suite check: 2 defects in 1 tenants: test-a", warnings)
         self.assertIn("Consistency checks: the post-suite step printed no [post-suite] line", warnings)
         self.assertIn("Consistency checks: no log absent-tests.log", warnings)
+
+
+    def test_a_malformed_counter_warns_and_a_valid_zero_does_not(self):
+        bad = self.write("persistence-lib-tests.log",
+                         consistency_line("test-a-" + "0" * 32, "fixed", "full", "broken"))
+        status, _ = self.run_command([bad])
+        self.assertEqual(status, 0)
+        warnings = self.report("consistency")["warnings"]
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("test-a-" + "0" * 32, warnings[0])
+        self.assertIn("defects='broken'", warnings[0])
+        good = self.write("good.log", consistency_line("test-a-" + "0" * 32, "fixed", "full", 0))
+        status, _ = self.run_command([good])
+        self.assertEqual(status, 0)
+        self.assertEqual(self.report("consistency")["warnings"], [])
 
 
 class RepairCommand(Scratch):

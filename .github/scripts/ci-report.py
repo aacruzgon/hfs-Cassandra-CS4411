@@ -1262,7 +1262,6 @@ def cmd_cql_audit(args) -> int:
     started = time.monotonic()
     text = open_text(path) if path.exists() else None
     entries = audit_records(text or "")
-    took = time.monotonic() - started
     ours = [e for e in entries if e["ks"] == args.keyspace]
     dml = [e for e in ours if e["category"] == "DML"]
     violations, unverifiable = [], []
@@ -1272,6 +1271,7 @@ def cmd_cql_audit(args) -> int:
             if reason:
                 found.append({"reason": reason, "type": entry["type"], "scope": entry["scope"],
                               "operation": " ".join((entry["operation"] or "").split())[:500]})
+    took = time.monotonic() - started
     counts = {}
     for entry in ours:
         key = (entry["scope"] or "(none)", entry["type"] or "?")
@@ -1439,6 +1439,23 @@ CONSISTENCY_FIXED = {"tenant", "scope", "scan", "registry", "resources", "live",
                      "rows_scanned", "rows_checked", "defects", "took_ms"}
 
 
+# The keys of an `[index-consistency …]` line that are not numbers.
+CONSISTENCY_TEXT = {"tenant", "scope", "scan", "registry"}
+
+
+def _malformed_counts(pairs: dict) -> list[tuple[str, str]]:
+    """The `(key, value)` of every numeric field of one `[index-consistency …]` line that is not a number."""
+    bad = []
+    for key, value in pairs.items():
+        if key in CONSISTENCY_TEXT:
+            continue
+        try:
+            int(float(value))
+        except (TypeError, ValueError):
+            bad.append((key, value))
+    return bad
+
+
 def _count(value) -> int:
     try:
         return int(float(value))
@@ -1464,6 +1481,9 @@ def cmd_consistency(args) -> int:
                "took_ms": sum(_count(p.get("took_ms")) for p in lines)}
         logs.append(row)
         for pairs in lines:
+            for key, value in _malformed_counts(pairs):
+                warnings.append(f"Consistency checks: {path.name}: tenant {pairs.get('tenant', '?')} has "
+                                f"{key}={value!r}, which is not a number; it counts as 0")
             if _count(pairs.get("defects")) > 0 and len(defects) < 50:
                 tenant = pairs.get("tenant", "?")
                 match = TEST_TENANT.match(tenant)

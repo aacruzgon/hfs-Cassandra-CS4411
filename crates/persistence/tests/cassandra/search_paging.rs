@@ -20,10 +20,10 @@
 //!   `test_pagination_with_asc_sort` sort by `name`, a string; Cassandra has
 //!   only its native order and refuses `_sort` (design, "Sorting is ✗").
 //!   [`parity`] lists them on `EXCLUDED`, with the reason;
-//! - **every test is `#[ignore]`d until search answers.** Cassandra's
-//!   `search()` answers 501 until the framework's unfiltered search (#128,
-//!   row 6.2), and `test_pagination_with_filter` also needs date search
-//!   (#132). Each `#[ignore]` goes in the commit that makes its test pass.
+//! - **`test_pagination_with_filter` is `#[ignore]`d until date search
+//!   answers** (#132): it pages a date-only `birthdate=sa1970-01-01`
+//!   search. The other 8 run, on the framework's unfiltered search (#128,
+//!   row 6.2). Its `#[ignore]` goes in the commit that makes it pass.
 //!
 //! [`parity`] reads `tests/search/pagination_tests.rs` when it runs, so an
 //! upstream sync that adds, renames or removes a test there, or changes the
@@ -86,7 +86,6 @@ pub mod pagination_tests {
 
     /// Test _count limits results.
     #[tokio::test]
-    #[ignore = "search answers 501 until the unfiltered search (#128, row 6.2)"]
     async fn test_pagination_count() {
         let backend = cassandra_backend!("test_pagination_count");
         let tenant = create_tenant();
@@ -100,7 +99,6 @@ pub mod pagination_tests {
 
     /// Test total count is returned.
     #[tokio::test]
-    #[ignore = "search answers 501 until the unfiltered search (#128, row 6.2)"]
     async fn test_pagination_total() {
         let backend = cassandra_backend!("test_pagination_total");
         let tenant = create_tenant();
@@ -121,7 +119,6 @@ pub mod pagination_tests {
 
     /// Test cursor-based pagination forward.
     #[tokio::test]
-    #[ignore = "search answers 501 until the unfiltered search (#128, row 6.2)"]
     async fn test_cursor_pagination_forward() {
         let backend = cassandra_backend!("test_cursor_pagination_forward");
         let tenant = create_tenant();
@@ -159,7 +156,6 @@ pub mod pagination_tests {
 
     /// Test paginating through all results.
     #[tokio::test]
-    #[ignore = "search answers 501 until the unfiltered search (#128, row 6.2)"]
     async fn test_paginate_all_results() {
         let backend = cassandra_backend!("test_paginate_all_results");
         let tenant = create_tenant();
@@ -190,7 +186,6 @@ pub mod pagination_tests {
 
     /// Test last page has no next cursor.
     #[tokio::test]
-    #[ignore = "search answers 501 until the unfiltered search (#128, row 6.2)"]
     async fn test_last_page_no_cursor() {
         let backend = cassandra_backend!("test_last_page_no_cursor");
         let tenant = create_tenant();
@@ -221,7 +216,6 @@ pub mod pagination_tests {
 
     /// Test pagination with no results.
     #[tokio::test]
-    #[ignore = "search answers 501 until the unfiltered search (#128, row 6.2)"]
     async fn test_pagination_empty_results() {
         let backend = cassandra_backend!("test_pagination_empty_results");
         let tenant = create_tenant();
@@ -235,7 +229,6 @@ pub mod pagination_tests {
 
     /// Test pagination with count larger than results.
     #[tokio::test]
-    #[ignore = "search answers 501 until the unfiltered search (#128, row 6.2)"]
     async fn test_pagination_count_larger_than_results() {
         let backend = cassandra_backend!("test_pagination_count_larger_than_results");
         let tenant = create_tenant();
@@ -250,7 +243,6 @@ pub mod pagination_tests {
 
     /// Test pagination count of 1.
     #[tokio::test]
-    #[ignore = "search answers 501 until the unfiltered search (#128, row 6.2)"]
     async fn test_pagination_count_one() {
         let backend = cassandra_backend!("test_pagination_count_one");
         let tenant = create_tenant();
@@ -282,7 +274,7 @@ pub mod pagination_tests {
 
     /// Test pagination with search filter.
     #[tokio::test]
-    #[ignore = "search answers 501 until the framework (#128) and date search (#132)"]
+    #[ignore = "a date-only search answers 501 until date search (#132)"]
     async fn test_pagination_with_filter() {
         let backend = cassandra_backend!("test_pagination_with_filter");
         let tenant = create_tenant();

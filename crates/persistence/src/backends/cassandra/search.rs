@@ -41,25 +41,30 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cdrs_tokio::types::IntoRustByName;
+use cdrs_tokio::types::rows::Row;
+use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, Utc};
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream, StreamExt};
 use parking_lot::{Mutex, RwLock};
 
 use super::backend::CassandraBackend;
-use super::errors::unsupported;
+use super::errors::{BACKEND_NAME, map_driver_error, unsupported};
 use super::index_keys::IndexKey;
 use super::read::ResourceRow;
-use super::session::CassandraSession;
+use super::repair::{RepairContext, StaleIndexRow};
+use super::session::{CassandraSession, StatementKind};
 use crate::core::capabilities::{
     GlobalSearchCapabilities, ResourceSearchCapabilities, SearchCapabilityProvider,
 };
 use crate::core::{SearchProvider, SearchResult};
-use crate::error::{SearchError, StorageResult};
+use crate::error::{BackendError, SearchError, StorageError, StorageResult};
 use crate::search::{ExtractedValue, SearchParameterDefinition, SearchParameterRegistry};
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeType, PaginationCapability, ResultModeCapability, SearchParamFullCapability,
-    SearchParamType, SearchQuery, SortDirection, SpecialSearchParam,
+    IncludeType, Page, PageInfo, PaginationCapability, ResultModeCapability,
+    SearchParamFullCapability, SearchParamType, SearchQuery, SortDirection, SpecialSearchParam,
+    StoredResource,
 };
 use paging::{Order, OrderKey, Position};
 
@@ -391,10 +396,13 @@ impl SearchProvider for CassandraBackend {
 
     async fn search(
         &self,
-        _tenant: &TenantContext,
+        tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         validate(query)?;
+        if is_unfiltered(query) {
+            return self.unfiltered_search(tenant, query).await;
+        }
         Err(unsupported("search"))
     }
 
@@ -567,6 +575,260 @@ mod tests {
                 "{module}::compile should refuse until its issue lands"
             );
         }
+    }
+}
+
+/// The candidate cap until `HFS_CASSANDRA_SEARCH_MAX_CANDIDATES` is read from
+/// the configuration (ADR-anastasiabryz-0002; the setting goes in Sam's
+/// `config.rs`).
+const DEFAULT_MAX_CANDIDATES: usize = 100_000;
+/// Rows one index read asks for: a batch size, not the page size
+/// (walkthrough 5.1, step 6).
+const BATCH_ROWS: usize = 100;
+/// R1 point reads in flight at once, for one batch of index rows.
+const R1_CONCURRENCY: usize = 8;
+
+/// Walkthrough 5.6's read of `resources_by_type`, without its keyset and
+/// `LIMIT` (added per read).
+const SELECT_TYPE_ROWS: &str = "SELECT last_updated, id, version_id, fhir_version \
+     FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?";
+
+/// A search with no parameters, chains, `_has` or `_list`: the unfiltered
+/// type search of walkthrough 5.6.
+fn is_unfiltered(query: &SearchQuery) -> bool {
+    query.parameters.is_empty() && query.reverse_chains.is_empty() && query.list.is_empty()
+}
+
+fn internal(message: String) -> StorageError {
+    StorageError::Backend(BackendError::Internal {
+        backend_name: BACKEND_NAME.to_string(),
+        message,
+        source: None,
+    })
+}
+
+/// One row of `resources_by_type`.
+#[derive(Debug, Clone)]
+struct TypeRow {
+    last_updated: DateTime<Utc>,
+    id: String,
+    /// The row's tag; `None` only for a row written without one.
+    version_id: Option<i32>,
+    /// The resource's `fhir_version`, as `resources` stores it (G34).
+    fhir_version: Option<String>,
+}
+
+impl TypeRow {
+    fn decode(row: &Row) -> StorageResult<Self> {
+        let field = |name: &str, error: cdrs_tokio::error::Error| {
+            internal(format!("search: resources_by_type.{name}: {error}"))
+        };
+        Ok(Self {
+            last_updated: row
+                .get_r_by_name("last_updated")
+                .map_err(|error| field("last_updated", error))?,
+            id: row
+                .get_r_by_name("id")
+                .map_err(|error| field("id", error))?,
+            version_id: row
+                .get_by_name("version_id")
+                .map_err(|error| field("version_id", error))?,
+            fhir_version: row
+                .get_by_name("fhir_version")
+                .map_err(|error| field("fhir_version", error))?,
+        })
+    }
+}
+
+/// The resource an R1 row holds, as a search returns it.
+fn stored_resource(
+    tenant: &TenantContext,
+    resource_type: &str,
+    id: &str,
+    row: &ResourceRow,
+) -> StorageResult<StoredResource> {
+    let data = row
+        .data
+        .as_deref()
+        .ok_or_else(|| internal("search: a live resources row has no data".to_string()))?;
+    let content = serde_json::from_str(data)
+        .map_err(|error| internal(format!("search: stored JSON: {error}")))?;
+    Ok(StoredResource::from_storage(
+        resource_type,
+        id,
+        row.version_id.to_string(),
+        tenant.tenant_id().clone(),
+        content,
+        row.created_at.unwrap_or(row.last_updated),
+        row.last_updated,
+        None,
+        row.fhir_version,
+    ))
+}
+
+impl CassandraBackend {
+    /// `GET /Patient`: one partition of `resources_by_type`, keyset-paged
+    /// from the cursor, each row tag-checked against R1 (walkthrough 5.1,
+    /// 5.6). One repair context for the response, run once at its end, on
+    /// success and on `TooManyResults` (`repair.rs`, "Step 6's contract").
+    async fn unfiltered_search(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        let position = paging::decode(query.cursor.as_deref(), Order::Default)?;
+        let budget = CandidateBudget::new(DEFAULT_MAX_CANDIDATES);
+        let mut repairs = RepairContext::new(tenant.tenant_id().as_str());
+        let page = self
+            .type_page(tenant, query, position, &budget, &mut repairs)
+            .await;
+        if matches!(
+            &page,
+            Ok(_) | Err(StorageError::Search(SearchError::TooManyResults { .. }))
+        ) {
+            repairs.run(self).await;
+        }
+        page
+    }
+
+    /// The page itself: read batches of `resources_by_type` after
+    /// `position`, keep the rows that pass the tag check, and stop at
+    /// `_count + 1` kept; the extra one decides whether `next` exists.
+    async fn type_page(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        position: Position,
+        budget: &CandidateBudget,
+        repairs: &mut RepairContext,
+    ) -> StorageResult<SearchResult> {
+        let page_size = query.count.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
+        if page_size == 0 {
+            return Ok(SearchResult::new(Page::new(Vec::new(), PageInfo::end())));
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = query.resource_type.as_str();
+        let wanted_version = query.stored_fhir_version();
+
+        let mut kept: Vec<(DateTime<Utc>, StoredResource)> = Vec::new();
+        let mut after = position;
+        'reading: loop {
+            let rows = self.type_rows(tenant_id, resource_type, &after).await?;
+            let Some(last) = rows.last() else {
+                break;
+            };
+            let more = rows.len() == BATCH_ROWS;
+            after = Position::After {
+                order: Order::Default,
+                at: last.last_updated,
+                id: last.id.clone(),
+                table: None,
+            };
+
+            // G34: another FHIR version is dropped from the row's own
+            // column, before any point read.
+            let candidates = rows.into_iter().filter(|row| match wanted_version {
+                Some(wanted) => row
+                    .fhir_version
+                    .as_deref()
+                    .is_none_or(|stored| stored == wanted),
+                None => true,
+            });
+            let mut checked = stream::iter(candidates)
+                .map(|row| async move {
+                    budget.charge(&row.id)?;
+                    let r1 = self
+                        .read_resource_row(tenant_id, resource_type, &row.id)
+                        .await?;
+                    Ok::<_, StorageError>((row, r1))
+                })
+                .buffered(R1_CONCURRENCY);
+            while let Some(checked_row) = checked.next().await {
+                let (row, r1) = checked_row?;
+                match r1 {
+                    Some(r1) if !r1.is_deleted() && Some(r1.version_id) == row.version_id => {
+                        if query.matches_fhir_version(r1.fhir_version) {
+                            let resource = stored_resource(tenant, resource_type, &row.id, &r1)?;
+                            kept.push((row.last_updated, resource));
+                            if kept.len() > page_size {
+                                break 'reading;
+                            }
+                        }
+                    }
+                    r1 => queue_hidden(repairs, resource_type, &row, r1),
+                }
+            }
+            if !more {
+                break;
+            }
+        }
+
+        let has_next = kept.len() > page_size;
+        kept.truncate(page_size);
+        let next_cursor = match kept.last() {
+            Some((at, resource)) if has_next => Some(paging::mint(
+                &Candidate {
+                    order: OrderKey {
+                        at: *at,
+                        table: None,
+                    },
+                    id: resource.id().to_string(),
+                    rows: Vec::new(),
+                },
+                Order::Default,
+            )?),
+            _ => None,
+        };
+        let page_info = PageInfo {
+            next_cursor,
+            has_next,
+            ..PageInfo::end()
+        };
+        let items = kept.into_iter().map(|(_, resource)| resource).collect();
+        Ok(SearchResult::new(Page::new(items, page_info)))
+    }
+
+    /// One batch of `resources_by_type` rows strictly after `after`.
+    async fn type_rows(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        after: &Position,
+    ) -> StorageResult<Vec<TypeRow>> {
+        let mut values = vec![Value::from(tenant_id), Value::from(resource_type)];
+        let cql = match paging::keyset(after) {
+            None => format!("{SELECT_TYPE_ROWS} LIMIT ?"),
+            Some((relation, bound)) => {
+                values.extend(bound);
+                format!("{SELECT_TYPE_ROWS} AND {relation} LIMIT ?")
+            }
+        };
+        values.push(Value::from(BATCH_ROWS as i32));
+        let rows = self
+            .session
+            .rows(&cql, values, StatementKind::Read)
+            .await
+            .map_err(|error| StorageError::Backend(map_driver_error(&error, "search")))?;
+        rows.iter().map(TypeRow::decode).collect()
+    }
+}
+
+/// A `resources_by_type` row the tag check hid: queued for repair with the
+/// tag check's own R1, or counted as undecodable when it has no tag
+/// (`repair.rs`, "Step 6's contract").
+fn queue_hidden(
+    repairs: &mut RepairContext,
+    resource_type: &str,
+    row: &TypeRow,
+    r1: Option<ResourceRow>,
+) {
+    let Some(tag) = row.version_id else {
+        repairs.skip_undecodable("resources_by_type", "an index row with no version_id tag");
+        return;
+    };
+    match StaleIndexRow::new(IndexKey::ResourcesByType, Some(row.last_updated), tag) {
+        Ok(stale) => repairs.queue(resource_type, &row.id, r1, vec![stale]),
+        Err(error) => repairs.skip_undecodable("resources_by_type", &error),
     }
 }
 
@@ -870,9 +1132,7 @@ mod validation_tests {
 }
 
 /// `search()` and `search_count()` on a backend connected to the node at
-/// `HFS_TEST_CASSANDRA_URL` (skipped when unset): both validate first, so a
-/// refused query gets its own error, and a served one still gets 501 until
-/// the engine lands.
+/// `HFS_TEST_CASSANDRA_URL` (skipped when unset).
 #[cfg(test)]
 mod node_tests {
     use super::*;
@@ -894,6 +1154,8 @@ mod node_tests {
         )
     }
 
+    /// Both validate first, so a refused query gets its own error, and a
+    /// query the engine does not serve yet still gets 501.
     #[tokio::test]
     async fn search_and_search_count_validate_before_anything_else() {
         let Some(backend) = backend().await else {
@@ -906,7 +1168,13 @@ mod node_tests {
         );
         let mut refused = SearchQuery::new("Patient");
         refused.offset = Some(20);
-        let served = SearchQuery::new("Patient");
+        // A token parameter: served by 6a, so still 501 until it lands.
+        let served = SearchQuery::new("Patient").with_parameter(crate::types::SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![crate::types::SearchValue::eq("female")],
+            ..Default::default()
+        });
 
         assert!(matches!(
             backend.search(&tenant, &refused).await,
@@ -927,6 +1195,166 @@ mod node_tests {
             Err(StorageError::Backend(
                 BackendError::UnsupportedCapability { .. }
             ))
+        ));
+    }
+
+    fn fresh_tenant(label: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!("{label}-{}", uuid::Uuid::new_v4().simple())),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    async fn create_patients(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        n: usize,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            let stored = crate::core::ResourceStorage::create(
+                backend,
+                tenant,
+                "Patient",
+                serde_json::json!({ "resourceType": "Patient" }),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
+            .await
+            .expect("create");
+            ids.push(stored.id().to_string());
+        }
+        ids
+    }
+
+    /// Every page of `query`, following `next` to the end.
+    async fn every_page(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        mut query: SearchQuery,
+    ) -> Vec<SearchResult> {
+        let mut pages = Vec::new();
+        loop {
+            let page = backend.search(tenant, &query).await.expect("search");
+            let next = page.resources.page_info.next_cursor.clone();
+            pages.push(page);
+            match next {
+                Some(cursor) => query.cursor = Some(cursor),
+                None => break,
+            }
+        }
+        pages
+    }
+
+    /// `GET /Patient?_count=10` over 25 Patients, 3 of them deleted: 10, 10
+    /// and 2, newest first, each live one once; `next` on every page but
+    /// the last; no `previous` (walkthrough 5.6, 5.10).
+    #[tokio::test]
+    async fn an_unfiltered_search_pages_every_live_resource_once() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-unfiltered");
+        let ids = create_patients(&backend, &tenant, 25).await;
+        for id in &ids[..3] {
+            crate::core::ResourceStorage::delete(&backend, &tenant, "Patient", id)
+                .await
+                .expect("delete");
+        }
+        let live: std::collections::BTreeSet<String> = ids[3..].iter().cloned().collect();
+
+        let pages = every_page(
+            &backend,
+            &tenant,
+            SearchQuery::new("Patient").with_count(10),
+        )
+        .await;
+        let sizes: Vec<usize> = pages.iter().map(|page| page.resources.len()).collect();
+        assert_eq!(sizes, [10, 10, 2]);
+        for (n, page) in pages.iter().enumerate() {
+            let info = &page.resources.page_info;
+            assert_eq!(info.has_next, n < 2, "page {n}: has_next");
+            assert_eq!(info.next_cursor.is_some(), n < 2, "page {n}: next");
+            assert!(info.previous_cursor.is_none(), "page {n}: no previous");
+        }
+        let found: Vec<&StoredResource> = pages
+            .iter()
+            .flat_map(|page| &page.resources.items)
+            .collect();
+        let distinct: std::collections::BTreeSet<String> = found
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        assert_eq!(found.len(), distinct.len(), "no resource on two pages");
+        assert_eq!(distinct, live, "every live Patient, no deleted one");
+        assert!(
+            found
+                .windows(2)
+                .all(|pair| (pair[0].last_modified(), pair[0].id())
+                    >= (pair[1].last_modified(), pair[1].id())),
+            "newest first: (last_updated DESC, id DESC)"
+        );
+    }
+
+    /// An index row with no `resources` row is a candidate the tag check
+    /// hides: it is never returned. Planted, so the tenant is
+    /// `test-planted-` (#127).
+    #[tokio::test]
+    async fn an_orphan_index_row_is_hidden() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-planted-search-orphan");
+        let ids = create_patients(&backend, &tenant, 3).await;
+        backend
+            .session
+            .execute(
+                "INSERT INTO resources_by_type \
+                 (tenant_id, resource_type, last_updated, id, version_id, fhir_version) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from(Utc::now() + chrono::Duration::hours(1)),
+                    Value::from("orphan"),
+                    Value::from(1_i32),
+                    Value::from("4.0"),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect("plant");
+
+        let page = backend
+            .search(&tenant, &SearchQuery::new("Patient"))
+            .await
+            .expect("search");
+        let found: std::collections::BTreeSet<String> = page
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        assert_eq!(found, ids.into_iter().collect());
+        assert!(page.resources.page_info.next_cursor.is_none());
+    }
+
+    /// A cursor `mint` did not make is 400 `InvalidCursor` (`coverage.md`
+    /// section 5).
+    #[tokio::test]
+    async fn a_malformed_cursor_is_invalid() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let mut query = SearchQuery::new("Patient");
+        query.cursor = Some("garbage".to_string());
+        assert!(matches!(
+            backend
+                .search(&fresh_tenant("test-search-cursor"), &query)
+                .await,
+            Err(StorageError::Search(SearchError::InvalidCursor { .. }))
         ));
     }
 }

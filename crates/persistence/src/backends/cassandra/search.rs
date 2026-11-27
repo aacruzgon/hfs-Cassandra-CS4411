@@ -36,6 +36,7 @@ mod date;
 mod engine;
 mod last_updated;
 mod paging;
+mod planner;
 mod residual;
 mod token;
 mod uri;
@@ -71,6 +72,7 @@ use crate::types::{
 };
 use last_updated::{LastUpdatedFilter, Slice};
 use paging::{Order, OrderKey, Position};
+use planner::{Compiled, Driver};
 
 /// One index row as read, for the tag check and for repair.
 ///
@@ -417,6 +419,11 @@ impl SearchProvider for CassandraBackend {
             match &plan {
                 Plan::Unfiltered | Plan::TypeScan => self.type_search(tenant, query).await?,
                 Plan::Ids(ids) => self.id_search(tenant, query, ids).await?,
+                Plan::Modules => {
+                    let compiled = self.compile_modules(tenant, query)?;
+                    let driver = single_driver(query, &compiled)?;
+                    self.plan_search(tenant, query, driver).await?
+                }
             }
         };
         // The page as usual, plus one `search_count` of the same query
@@ -472,6 +479,11 @@ impl SearchProvider for CassandraBackend {
                     .live_by_id(tenant, query, &ids, &filter, &budget)
                     .await?;
                 Ok(found.len() as u64)
+            }
+            Some(Plan::Modules) => {
+                let compiled = self.compile_modules(tenant, query)?;
+                let driver = single_driver(query, &compiled)?;
+                self.plan_count(tenant, query, driver).await
             }
             None => Err(unsupported("search_count")),
         }
@@ -697,24 +709,28 @@ enum Plan {
     /// the intersection of every `_id` parameter's values (walkthrough 5.4,
     /// G37), with `_lastUpdated` a residual on `resources.last_updated`.
     Ids(Vec<String>),
+    /// Token, URI or date parameters: compiled by their modules, and the
+    /// driver chosen by the planner (C5, G20).
+    Modules,
 }
 
 impl Plan {
-    /// `None` for a query the engine does not serve yet: a token, URI or
-    /// date parameter (6a to 6c), chains, `_has` or `_list`. A compartment
-    /// is a residual on any plan but `Unfiltered`, which has none.
+    /// `None` for a query the engine does not serve: chains, `_has` or
+    /// `_list`. A compartment is a residual on any plan but `Unfiltered`,
+    /// which has none.
     fn of(query: &SearchQuery) -> Option<Self> {
         if is_unfiltered(query) {
             return Some(Plan::Unfiltered);
         }
-        let served = query.reverse_chains.is_empty()
-            && query.list.is_empty()
-            && query
-                .parameters
-                .iter()
-                .all(|param| param.name == "_id" || param.name == last_updated::PARAM);
-        if !served {
+        if !query.reverse_chains.is_empty() || !query.list.is_empty() {
             return None;
+        }
+        if !query
+            .parameters
+            .iter()
+            .all(|param| param.name == "_id" || param.name == last_updated::PARAM)
+        {
+            return Some(Plan::Modules);
         }
         if query.parameters.iter().all(|param| param.name != "_id") {
             return Some(Plan::TypeScan);
@@ -1067,6 +1083,69 @@ impl CassandraBackend {
         }
         found.sort_by(|(a_lu, a), (b_lu, b)| (b_lu, b.id()).cmp(&(a_lu, a.id())));
         Ok(found)
+    }
+}
+
+impl CassandraBackend {
+    /// Each token, URI and date parameter of `query`, in query order,
+    /// compiled by its module (ADR-anastasiabryz-0001) with its registered
+    /// definition: the type's own, or a common parameter's under
+    /// `Resource`. A module that has not landed refuses its parameter, so
+    /// the search answers 501 (`token.rs`, `uri.rs`, `date.rs`).
+    fn compile_modules(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Vec<Compiled>> {
+        let registry = self.registries.for_tenant(tenant.tenant_id().as_str());
+        let registry = registry.read();
+        let resource_type = query.resource_type.as_str();
+        query
+            .parameters
+            .iter()
+            .filter(|param| param.name != "_id" && param.name != last_updated::PARAM)
+            .map(|param| {
+                let definition = registry
+                    .get_param(resource_type, &param.name)
+                    .or_else(|| registry.get_param("Resource", &param.name));
+                let ctx = CompileCtx {
+                    resource_type,
+                    definition: definition.as_deref(),
+                };
+                let plan = match param.param_type {
+                    SearchParamType::Token => token::compile(param, &ctx),
+                    SearchParamType::Uri => uri::compile(param, &ctx),
+                    SearchParamType::Date => date::compile(param, &ctx),
+                    // `validate` refused every other type first.
+                    other => Err(SearchError::UnsupportedParameterType {
+                        param_type: other.to_string(),
+                    }
+                    .into()),
+                }?;
+                Ok(Compiled {
+                    plan,
+                    is_date: param.param_type == SearchParamType::Date,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The driving plan, while a search has one module parameter and nothing
+/// for it to AND with. Two or more, or one beside `_id` or a date-only
+/// `_lastUpdated`, need the AND of 6.3f.
+fn single_driver<'c>(
+    query: &SearchQuery,
+    compiled: &'c [Compiled],
+) -> StorageResult<&'c dyn ParamPlan> {
+    let has_ids = query.parameters.iter().any(|param| param.name == "_id");
+    let has_last_updated = query
+        .parameters
+        .iter()
+        .any(|param| param.name == last_updated::PARAM);
+    match planner::choose(compiled, has_ids, has_last_updated) {
+        Driver::Plan(index) if compiled.len() == 1 => Ok(compiled[index].plan.as_ref()),
+        _ => Err(unsupported("search with several parameters (AND, #128)")),
     }
 }
 
@@ -1561,7 +1640,10 @@ mod plan_tests {
             values: vec![SearchValue::eq("female")],
             ..Default::default()
         };
-        assert_eq!(Plan::of(&query(vec![ids(&["a"]), gender])), None);
+        assert_eq!(
+            Plan::of(&query(vec![ids(&["a"]), gender])),
+            Some(Plan::Modules)
+        );
         let mut in_compartment = query(vec![ids(&["a"])]);
         in_compartment.compartment = Some(crate::types::CompartmentMembership {
             params: vec!["link".to_string()],
@@ -2451,5 +2533,51 @@ mod node_tests {
             "the orphan was queued and the repair phase ran"
         );
         assert_eq!(ran.skipped_no_row, 1);
+    }
+
+    /// The planner compiles each parameter through its own module: until a
+    /// module lands, its `compile` refuses, so the search answers 501 naming
+    /// that module's issue; `search_count` the same.
+    #[tokio::test]
+    async fn each_parameter_type_is_compiled_by_its_module() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-modules");
+        let one = |name: &str, param_type: SearchParamType, value: &str| {
+            SearchQuery::new("Patient").with_parameter(crate::types::SearchParameter {
+                name: name.to_string(),
+                param_type,
+                values: vec![crate::types::SearchValue::parse(value)],
+                ..Default::default()
+            })
+        };
+        for (query, issue) in [
+            (one("gender", SearchParamType::Token, "female"), "#130"),
+            (one("_tag", SearchParamType::Token, "http://x|y"), "#130"),
+            (
+                one("_profile", SearchParamType::Uri, "http://example.org/p"),
+                "#131",
+            ),
+            (
+                one("birthdate", SearchParamType::Date, "ge1980-01-01"),
+                "#132",
+            ),
+        ] {
+            let name = query.parameters[0].name.clone();
+            for result in [
+                backend.search(&tenant, &query).await.map(|_| ()),
+                backend.search_count(&tenant, &query).await.map(|_| ()),
+            ] {
+                match result {
+                    Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                        capability,
+                        ..
+                    })) => assert!(capability.contains(issue), "{name}: {capability}"),
+                    other => panic!("{name}: expected its module's 501, got {other:?}"),
+                }
+            }
+        }
     }
 }

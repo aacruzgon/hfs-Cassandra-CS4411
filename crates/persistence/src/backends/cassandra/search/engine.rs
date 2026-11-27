@@ -17,13 +17,10 @@
 //! 4. stops at `_count + 1` kept, and mints `next` in the plan's order.
 //!
 //! A candidate repeated with the same order key, or a resource already kept
-//! on this page, is kept once. The other plans of an AND (6.3f) and the
-//! planner that picks the driver (6.3e) come next; this file holds the
-//! loop.
+//! on this page, is kept once. The planner (`planner.rs`) picks the driver;
+//! the other plans of an AND come next (6.3f).
 //!
 //! This is the framework's own file (ADR-anastasiabryz-0001; #128).
-
-#![allow(dead_code)] // The planner (6.3e) calls it; until then only its tests do.
 
 use std::collections::HashSet;
 

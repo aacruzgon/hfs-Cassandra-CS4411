@@ -822,8 +822,11 @@ async fn a_paused_writer_after_a_crashed_successor_leaves_no_row_of_its_version(
     );
 }
 
-/// The same row after a registry change: a SearchParameter is stored while writer 2 is paused, so the late
-/// writer's key set was extracted under the old registry, and the successor's under the new one.
+/// The same row after a registry change that rewrites an expression: a SearchParameter indexes `gender` when
+/// writer 2 extracts its keys, and is updated to index `active` while writer 2 is paused. The stored `K(2)` then
+/// holds a key (`gender`'s `female`) that the new registry no longer produces, so the successor has to delete
+/// `K(2)` as R1 stores it, not re-derive it: a writer that extracts the previous version's keys again leaves
+/// that row tagged 2.
 #[tokio::test]
 async fn stale_batch_ordering_after_a_registry_change_leaves_no_row_of_the_late_version() {
     let Some((backend, since, before)) = start().await else {
@@ -833,16 +836,7 @@ async fn stale_batch_ordering_after_a_registry_change_leaves_no_row_of_the_late_
     let tenant = context(&t);
     let version = test_fhir_version();
     let url = format!("http://example.org/SearchParameter/{t}");
-    let v1 = backend
-        .create(&tenant, "Patient", body("p", true, "male"), version)
-        .await
-        .unwrap();
-    let (b, ten) = (backend.clone(), tenant.clone());
-    let (hold, task) = pause(&backend, Checkpoint::AfterCas, &t, "p", 2, async move {
-        b.update(&ten, &v1, body("p", false, "female")).await
-    })
-    .await;
-    backend
+    let sp = backend
         .create(
             &tenant,
             "SearchParameter",
@@ -855,6 +849,42 @@ async fn stale_batch_ordering_after_a_registry_change_leaves_no_row_of_the_late_
         expression_of(&backend, &tenant, &url).as_deref(),
         Some("Patient.gender")
     );
+    let v1 = backend
+        .create(&tenant, "Patient", body("p", true, "male"), version)
+        .await
+        .unwrap();
+    let (b, ten) = (backend.clone(), tenant.clone());
+    let (hold, task) = pause(&backend, Checkpoint::AfterCas, &t, "p", 2, async move {
+        b.update(&ten, &v1, body("p", false, "female")).await
+    })
+    .await;
+    backend
+        .update(
+            &tenant,
+            &sp,
+            search_parameter("crash-sp", &url, "Patient.active"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        expression_of(&backend, &tenant, &url).as_deref(),
+        Some("Patient.active")
+    );
+    // K(2) as R1 stores it holds the custom parameter's `female` key; a fresh extraction of v2 no longer does.
+    let custom = |keys: &[index_keys::IndexKey]| {
+        keys.iter()
+            .filter(|key| {
+                matches!(key, index_keys::IndexKey::TokenCode { param, code, .. }
+                    if param == "crash-crash-sp" && code == "female")
+            })
+            .count()
+    };
+    let at_v2 = r1(&backend, &t, "p").await;
+    assert_eq!(at_v2.version_id, 2);
+    let stored_k2 = index_keys::decode(at_v2.index_keys.as_deref().expect("K(2)")).expect("K(2)");
+    assert_eq!(custom(&stored_k2), 1, "{stored_k2:?}");
+    let fresh_k2 = backend.index_keys_of(&t, "Patient", &body("p", false, "female"));
+    assert_eq!(custom(&fresh_k2), 0, "{fresh_k2:?}");
     let v2 = backend
         .read(&tenant, "Patient", "p")
         .await

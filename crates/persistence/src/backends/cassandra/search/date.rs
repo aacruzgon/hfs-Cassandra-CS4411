@@ -139,6 +139,29 @@ type IndexedRange = (DateTime<Utc>, DateTime<Utc>);
 /// table. It is separate from the internal position of a physical row.
 type DateResourcePosition<'a> = (DateIndex, DateTime<Utc>, &'a str);
 
+/// Merge slice streams already sorted by their native clustering keys.
+/// Equal heads refer to the same physical row, even if several slices read it.
+fn merge_date_slices<T, K: Ord + Copy>(
+    slices: Vec<impl Iterator<Item = T>>,
+    key: impl Fn(&T) -> K,
+) -> impl Iterator<Item = T> {
+    let mut slices: Vec<_> = slices.into_iter().map(Iterator::peekable).collect();
+    std::iter::from_fn(move || {
+        let (first, first_key) = slices
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, slice)| slice.peek().map(|row| (i, key(row))))
+            .min_by_key(|&(_, key)| key)?;
+        let row = slices[first].next();
+        for slice in &mut slices {
+            if slice.peek().is_some_and(|row| key(row) == first_key) {
+                slice.next();
+            }
+        }
+        row
+    })
+}
+
 struct DatePlan {
     slices: Vec<(DateSlice, RangePredicate)>,
 }
@@ -524,25 +547,60 @@ fn date_pages_cross_tables_without_repeating_multivalued_resources() {
             (Gt, value.clone()),
             (Lt, value.clone()),
             (Eb, value.clone()),
+            (Lt, FhirDateValue::parse("2020-02-15").unwrap()),
         ],
     ] {
         let plan = DatePlan::new(&query);
         assert_eq!(plan.slices.first().unwrap().0.index, Start);
         assert_eq!(plan.slices.last().unwrap().0.index, End);
-        let mut cursor = None;
-        let mut emitted = Vec::new();
-        // Request one resource at a time, forcing a page boundary at the
-        // table transition and before the second physical row of "both".
-        for _ in 0..4 {
-            let next = rows.iter().find(|&&(table, time, id, other_time, values)| {
-                plan.emits_row(table, (time, id, other_time), values, cursor)
-            });
-            let Some(&(table, time, id, _, _)) = next else {
-                break;
-            };
-            emitted.push((table, id));
-            cursor = Some((table, time, id));
+        let key = |&(table, time, id, other_time, _): &(DateIndex, _, _, _, _)| {
+            (table, time, id, other_time)
+        };
+        let scan = || {
+            let streams = plan
+                .slices
+                .iter()
+                .map(|(slice, _)| {
+                    rows.iter().copied().filter(move |&(table, time, _, _, _)| {
+                        table == slice.index && (slice.lower, slice.upper).contains(&time)
+                    })
+                })
+                .collect();
+            merge_date_slices(streams, key)
+        };
+
+        // The overlapping start slices both supply the canonical row for
+        // "both". Check the merged physical stream before paging resources.
+        let physical_keys: Vec<_> = scan().map(|row| key(&row)).collect();
+        assert!(physical_keys.windows(2).all(|pair| pair[0] < pair[1]));
+
+        for page_size in [1, 2] {
+            let mut cursor = None;
+            let mut pages = Vec::new();
+            for _ in 0..4 {
+                let page: Vec<_> = scan()
+                    .filter(|&(table, time, id, other_time, values)| {
+                        plan.emits_row(table, (time, id, other_time), values, cursor)
+                    })
+                    .take(page_size)
+                    .map(|(table, time, id, _, _)| (table, time, id))
+                    .collect();
+                let Some(&last) = page.last() else { break };
+                cursor = Some(last);
+                pages.push(
+                    page.into_iter()
+                        .map(|(table, _, id)| (table, id))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            let expected = [(Start, "both"), (Start, "start"), (End, "end")];
+            assert_eq!(
+                pages,
+                expected
+                    .chunks(page_size)
+                    .map(<[_]>::to_vec)
+                    .collect::<Vec<_>>()
+            );
         }
-        assert_eq!(emitted, [(Start, "both"), (Start, "start"), (End, "end")]);
     }
 }

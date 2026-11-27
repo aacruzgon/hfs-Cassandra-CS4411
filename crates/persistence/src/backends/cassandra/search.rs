@@ -64,7 +64,7 @@ use crate::tenant::TenantContext;
 use crate::types::{
     IncludeType, Page, PageInfo, PaginationCapability, ResultModeCapability,
     SearchParamFullCapability, SearchParamType, SearchQuery, SortDirection, SpecialSearchParam,
-    StoredResource,
+    StoredResource, SummaryMode,
 };
 use paging::{Order, OrderKey, Position};
 
@@ -400,10 +400,24 @@ impl SearchProvider for CassandraBackend {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         validate(query)?;
-        if is_unfiltered(query) {
-            return self.unfiltered_search(tenant, query).await;
+        if !is_unfiltered(query) {
+            return Err(unsupported("search"));
         }
-        Err(unsupported("search"))
+        // `_count=0` behaves as `_summary=count` (`cassandra-discussion.md`,
+        // "`_count=0` and `count`"): a total and no entries, so no page is
+        // read. REST turns `_summary=count` into `_total=accurate`.
+        let count_only = query.count == Some(0) || query.summary == Some(SummaryMode::Count);
+        let mut result = if count_only {
+            SearchResult::new(Page::new(Vec::new(), PageInfo::end()))
+        } else {
+            self.unfiltered_search(tenant, query).await?
+        };
+        // The page as usual, plus one `search_count` of the same query
+        // (walkthrough 5.9); `_total=none` or absent computes none.
+        if count_only || query.wants_total() {
+            result.total = Some(self.search_count(tenant, query).await?);
+        }
+        Ok(result)
     }
 
     async fn search_count(
@@ -1515,5 +1529,54 @@ mod node_tests {
                 BackendError::UnsupportedCapability { .. }
             ))
         ));
+    }
+
+    /// `_total=accurate` (and `estimate`) adds the count to the page;
+    /// `_total=none` or absent adds none; `_count=0` and `_summary=count`
+    /// give the total and no entries (walkthrough 5.9).
+    #[tokio::test]
+    async fn totals_and_count_zero_carry_the_count() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-total");
+        create_patients(&backend, &tenant, 7).await;
+        let page_of = |total: Option<crate::types::TotalMode>| {
+            let mut query = SearchQuery::new("Patient").with_count(3);
+            query.total = total;
+            query
+        };
+
+        for total in [
+            crate::types::TotalMode::Accurate,
+            crate::types::TotalMode::Estimate,
+        ] {
+            let result = backend
+                .search(&tenant, &page_of(Some(total)))
+                .await
+                .unwrap();
+            assert_eq!(result.resources.len(), 3, "{total:?}: the page as usual");
+            assert_eq!(result.total, Some(7), "{total:?}");
+        }
+        for total in [None, Some(crate::types::TotalMode::None)] {
+            let result = backend.search(&tenant, &page_of(total)).await.unwrap();
+            assert_eq!(result.resources.len(), 3);
+            assert_eq!(result.total, None, "{total:?}: no total computed");
+        }
+
+        let count_zero = SearchQuery::new("Patient").with_count(0);
+        let mut summary_count = SearchQuery::new("Patient");
+        summary_count.summary = Some(SummaryMode::Count);
+        summary_count.total = Some(crate::types::TotalMode::Accurate);
+        for (case, query) in [("_count=0", count_zero), ("_summary=count", summary_count)] {
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert!(result.resources.is_empty(), "{case}: no entries");
+            assert!(
+                result.resources.page_info.next_cursor.is_none(),
+                "{case}: no next"
+            );
+            assert_eq!(result.total, Some(7), "{case}");
+        }
     }
 }

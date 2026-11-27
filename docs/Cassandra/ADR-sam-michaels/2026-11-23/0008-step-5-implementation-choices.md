@@ -1,7 +1,9 @@
 # ADR-sam-michaels-0008: Step 5's implementation choices, pull requests 5 to 8
 
 - **Date:** 2026-11-23
-- **Status:** accepted
+- **Status:** accepted; *Update 2026-11-27:* a dated note at the end updates pull request 5
+  item 8, pull request 6 items 1 and 10, pull request 7 items 1 and 2, and pull request 8
+  items 1, 2 and 6
 - **Context:**
   - ADR-sam-michaels-0006 and the plan fix Step 5's design. They leave some choices open: a
     constant, a budget, a tie between two decisions.
@@ -204,3 +206,43 @@
   - ADR-sam-michaels-0006: IW1, IW2, IW3, IW24, RW4, RW8, SW13, SW18, SW26, SW28, RV1, RV3,
     RV17, RV20 to RV22. ADR-sam-michaels-0007. ADR-aacruzgon-0079 and -0081. Issue #89.
   - Roadmap rows 5.1 to 5.4; `walkthrough.md` section 7.
+
+*Update 2026-11-27:* entries accepted on `main` since this one, and Alan's review of #109,
+change or extend these items. Everything else above stands.
+
+- **Pull request 5, item 8:** a unit is split at 8 MiB of statements (`MAX_PIECE_BYTES`) as
+  well as at 65,535 statements. `CassandraSession::batch` refuses a longer batch as
+  `TooManyStatements`, read as permanent (ADR-aacruzgon-0089).
+- **Pull request 6, item 1:** a refused (`Permanent`) write no longer gives up after 3 tries.
+  It stays on the retry list and is tried every 5 minutes until 24 h after the intent was
+  enqueued (ADR-aacruzgon-0090). The other invariants (a missing version row, an unreadable
+  row, a `write_ts` mismatch) still give up after 3.
+- **Pull request 6, item 10:** a request also writes a fresh intent *before* its CAS, when the
+  time held since the stamp plus `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` reaches the grace
+  (ADR-aacruzgon-0098). Item 10 covers only the fresh intent after `finish`.
+- **Pull request 7, item 1:** a full repair also deletes the `resources_by_type` row at each
+  found row's `last_updated`, and at each version's `last_updated` from 8 below R1, read from
+  `resource_versions` (ADR-aacruzgon-0096).
+- **Pull request 7, item 2:** after admission and before packing, each repair reads R1's
+  version row as vread does, and skips a resource whose version row vread cannot open, as
+  `NoVersionRow` (ADR-aacruzgon-0097). A full repair's admission also reserves one delete for
+  each type row it may remove, so those deletes count toward the 512-row budget (0096).
+- **Pull request 8, item 1:**
+  - The registry-change test now changes an existing SearchParameter's expression instead of
+    adding one. Adding one let a writer that re-derives K(V−1), instead of using R1's stored
+    key set, pass every crash test.
+  - An eleventh crash test kills the writer between its version row and its index rows, then
+    sweeps and checks.
+- **Pull request 8, item 2:** the verdict has five conditions, not four. The fifth is a failed
+  outbox re-read (`left_errors > 0`). The re-read counts an unreadable intent only when its
+  tenant is unreadable or checked, so a planted tenant's unreadable intent no longer fails the
+  run.
+- **Pull request 8, item 6:** the settle is 20 s, not 15 s.
+  - **Why:** in Cassandra 5.0.9 a Paxos v2 CAS takes its deadlines from when the node starts
+    processing it, not from when it arrived (`Paxos.java:632-636`, `StorageProxy.java:326-327`).
+    So a CAS that leaves the native-transport queue just before 12 s can commit until about
+    12 + max(1, 2) = 14 s at CI's settings.
+  - 20 s leaves 6 s of margin. A node that stalls still has no bound.
+  - The "15 s settle" in Consequences reads 20 s.
+- **Links:** ADR-aacruzgon-0089, 0090, 0096, 0097 and 0098; Alan's review of #109 on
+  2026-11-27.

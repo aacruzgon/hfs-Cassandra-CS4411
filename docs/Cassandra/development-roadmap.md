@@ -294,7 +294,7 @@ Step 3's ADRs (0050 to 0064), this roadmap and the walkthrough cite names from t
 | D14 | An 8 MiB bound on what a compare-and-swap carries | 0053 |
 | D16 | A revive answers 201 in every FHIR version | 0064 item 2 |
 | D17 | PATCH is in Step 3, with no backend code, tested through REST | 0060 item 2 |
-| D18 | `HFS_RETURN_GONE` affects vread only; correct the documents that said otherwise | 0064 item 11 |
+| D18 | `HFS_RETURN_GONE` affected vread only; correct the documents that said otherwise. Since upstream #2583, which the fork carries through #134, it also governs read, HEAD and batch GET | 0064 item 11, superseded by 0102 |
 | D19 | With vread real, every versioned `Location` resolves from Step 3 | 0060 item 1 |
 | D20 | Apply PR #50's unresolved CodeRabbit comments to the documents | 0050, 0051 |
 | D21 | Realign six places where the roadmap contradicted the design or an ADR (its rows 1 to 6) | 0050, 0060 |
@@ -323,7 +323,7 @@ A letter after a D-number (D1 b, D9 a′) is one of that decision's options; the
 | B-3 | Two batch entries on one resource are not rejected (0064 item 7) |
 | CS-2 | `readHistory: true` is true only if vread works (0060) |
 | CS-4, G1 | `/metadata` over-advertised the history interactions and every search parameter until Step 7 (0064 item 8); since Step 7's phases 1 to 3 it lists neither (ADR-aacruzgon-0085); this G1 is a matrix row, not the walkthrough's gap G1 |
-| DS-1 | `read` of a deleted resource is 410 whatever `HFS_RETURN_GONE` says; only vread reads the flag (0064 item 11) |
+| DS-1 | `read` of a deleted resource was 410 whatever `HFS_RETURN_GONE` said, until upstream #2583, which the fork carries through #134. Read, HEAD and batch GET now answer 410 by default and 404 with the flag false, as vread does (0064 item 11, superseded by 0102) |
 | DS-2, DS-3, DS-4 | Corrections to the design's CRUD row and its "Where R4 and the build differ" paragraph (0064) |
 | DS-6 | An `If-Match` PUT that races a delete answers 404 (0064 item 3) |
 | DS-7 | PATCH works through `update`, and neither the design nor the roadmap named it (0060) |

@@ -2,9 +2,9 @@
 //!
 //! **`read`** (`docs/Cassandra/schema/walkthrough.md` 4.1): R1 at
 //! `LOCAL_QUORUM` on `resources (T, P, id)`. No row is `Ok(None)` (404); a
-//! row with `deleted_at > 0` is `ResourceError::Gone`, which REST always
-//! answers with 410 (`crates/rest/src/error.rs`, `From<ResourceError>`;
-//! `HFS_RETURN_GONE` is read only by `vread`, `handlers/vread.rs`); otherwise
+//! row with `deleted_at > 0` is `ResourceError::Gone`, which REST answers
+//! with 410, or 404 when `HFS_RETURN_GONE` is false
+//! (`RestError::gone_as_configured`, `crates/rest/src/error.rs`); otherwise
 //! the row is built with
 //! `StoredResource::from_storage`, with `deleted_at` 0 passed as `None`
 //! (walkthrough section 2, "`deleted_at` and its readers"; G39). The version

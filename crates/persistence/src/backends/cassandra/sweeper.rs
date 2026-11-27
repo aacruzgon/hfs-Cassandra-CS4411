@@ -6132,9 +6132,13 @@ pub(crate) mod post_suite {
     };
     use crate::backends::cassandra::test_support::test_config;
 
-    /// How long the CI entry point waits before its grace-0 sweep (SW28): above `native_transport_timeout` (12 s), so a
-    /// CAS still queued at the coordinator when its writer's process exited has applied by then.
-    const POST_SUITE_SETTLE: Duration = Duration::from_secs(15);
+    /// How long the CI entry point waits before its grace-0 sweep (SW28). In Cassandra 5.0.9 a Paxos v2 CAS takes its
+    /// deadlines from when the node starts processing it, not from when it arrived (`Paxos.java:632-636`,
+    /// `StorageProxy.java:326-327` at `cassandra-5.0.9`). A CAS that leaves the native-transport queue just before
+    /// `native_transport_timeout` (12 s) can so commit until about 12 s + max(`cas_contention_timeout` 1 s,
+    /// `write_request_timeout` 2 s) = 14 s at CI's settings (the defaults). 20 s leaves 6 s of margin; a node that
+    /// stalls has no bound.
+    const POST_SUITE_SETTLE: Duration = Duration::from_secs(20);
 
     /// RV22's exclusion: the tenants that plant defects on purpose are swept but not checked.
     pub(crate) fn checked(tenant_id: &str) -> bool {

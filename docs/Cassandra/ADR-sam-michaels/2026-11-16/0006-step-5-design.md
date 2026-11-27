@@ -1,7 +1,7 @@
 # ADR-sam-michaels-0006: Step 5's design: index rows by partition, the version row first, a quorum-first sweeper, bounded repair and a report-first CI check
 
 - **Date:** 2026-11-16
-- **Status:** accepted; amended on 2026-11-17 and 2026-11-18 after Alan's two reviews on #86 (see "Amendments after review"); *Update 2026-11-18:* RV13 is superseded by [ADR-sam-michaels-0007](../2026-11-17/0007-consistency-check-scan-modes.md); *Update 2026-11-19 and 2026-11-23:* two dated notes at the end of "Amendments after review" correct `count`'s bound (ADR-aacruzgon-0081) and widen SW28 and RV19's grace-0 precondition; *Update 2026-11-27:* a dated note at the end of "Amendments after review" lists the IDs that ADR-aacruzgon-0089, 0090, 0094, 0096, 0097, 0098 and 0099 amend
+- **Status:** accepted; amended on 2026-11-17 and 2026-11-18 after Alan's two reviews on #86 (see "Amendments after review"); *Update 2026-11-18:* RV13 is superseded by [ADR-sam-michaels-0007](../2026-11-17/0007-consistency-check-scan-modes.md); *Update 2026-11-19 and 2026-11-23:* two dated notes at the end of "Amendments after review" correct `count`'s bound (ADR-aacruzgon-0081) and widen SW28 and RV19's grace-0 precondition; *Update 2026-11-27:* a dated note at the end of "Amendments after review" lists the IDs that ADR-aacruzgon-0089 to 0092, 0094 and 0096 to 0099 amend
 - **Context:**
     - I own roadmap Step 5, rows 5.1 to 5.4: index rows on every write, the sweeper over `pending_index_writes`, repair on read, and the index consistency check. Alan built Steps 2 and 3, so all six steps of the write path already run on `main` (`b4b6d6ddd`). Step 5 of the path writes only the `resources_by_type` row, because the key set is hard-coded to `[IndexKey::ResourcesByType]` at `write.rs:1936`, `update.rs:206` and `upsert.rs:205` and `:216`. Sara owns Step 4, which does not block this.
     - My plan of 2026-11-05 was written before Alan's Steps 2 and 3 and is wrong on several facts. The biggest: every old key set is now read from a stored `index_keys` column and never re-extracted (G22, G40, ADR-aacruzgon-0027). Step 5 had to be planned again against the real code.
@@ -169,13 +169,15 @@ Alan reviewed this entry on #86. Sam chose D1 to D6; the mechanical fixes follow
 
 *Update 2026-11-27:* accepted entries in Alan's log amend these IDs. Each ID above now reads as amended there.
 
-- **IW11:** a unit of more than 65,535 statements, or more than 8 MiB of statements, is split into pieces of whole rows (ADR-aacruzgon-0089).
-- **IW17, for the sweeper:** a refused (`Invalid`) write is permanent only for the node's settings at the time. The sweeper retries it every 5 minutes until the intent's 24 h, while the request path still does not retry it (ADR-aacruzgon-0090).
+- **IW2:** a token with a real system (not `IMPLICIT`, not `''`) and an empty code gets its `TokenSystem` row, with code `''`, and no `TokenCode` or `TokenSystemCode` row. A token with an empty code and no real system is still dropped (ADR-aacruzgon-0091).
+- **IW4, for `instant` elements:** an `instant` value is stored as the point `[t, t + 1 ms)`, as `_lastUpdated` is. `date` and `dateTime` values keep one unit of their own precision (ADR-aacruzgon-0092).
+- **IW11:** a unit of more than 65,535 statements, or more than 8 MiB of statements, is split into pieces of whole rows. Every other unit is still sent whole, and the `resources_by_type` unit is never split (ADR-aacruzgon-0089).
+- **IW17, for the sweeper:** a refused (`Invalid`) write is permanent only for the node's settings at the time. The sweeper retries it every 5 minutes until the intent's 24 h, while the request path still does not retry it (ADR-aacruzgon-0090). The bugs SW13 names are still tried three times and given up.
 - **SW6 = IW18:** a request held so long that its CAS could end past the grace writes a fresh intent, stamped then, before the CAS (ADR-aacruzgon-0098).
 - **SW11 and Decision 4, the superseded case:** a superseded replay deletes the rows of K(V−1) that K(V) does not hold, compared by each table's primary key. ADR-aacruzgon-0094 supersedes that case.
-- **SW19:** after a SearchParameter replay, the sweeper takes a stamp, reads the row again and follows that read. A follow loses to a reload that began after its stamp (ADR-aacruzgon-0099).
+- **SW19:** after a SearchParameter replay, the sweeper takes a stamp, reads the row again and follows that read. A follow loses to a reload that began after its stamp, unless that reload read the id at an older version (ADR-aacruzgon-0099).
 - **RV1:** a full repair also deletes the `resources_by_type` row at each found row's `last_updated`, and at each version's from 8 below R1 (ADR-aacruzgon-0096).
-- **RV4:** repair reads R1's version row with vread's statement at `LOCAL_QUORUM` and skips a resource vread cannot open; a full repair also reads the older versions' `last_updated` (ADR-aacruzgon-0097). RV3 is unchanged.
+- **RV3 and RV4:** repair reads R1's version row with vread's statement at `LOCAL_QUORUM` and skips a resource vread cannot open, a new skip reason for RV3; a full repair also reads the older versions' `last_updated` (ADR-aacruzgon-0097). Repair still never writes `resources`, `resource_versions` or intents.
 
 ## The 74 decisions
 

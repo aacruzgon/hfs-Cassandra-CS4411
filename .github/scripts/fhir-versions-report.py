@@ -29,10 +29,12 @@ For each log this reads:
   which writes no resource and never asks for a version (VERSION_NEUTRAL).
   It is found anywhere in a line, not only at its start: with --nocapture,
   libtest writes "test <name> ... " and its result as separate writes to
-  stdout, and the selector, a single write to stderr on the same pipe, can
-  land between them (run 45906110516, attempt 1). A selector cut in two by
-  another line is not read as one: the printers write it whole (runs
-  before that change printed it in pieces, run 46058677798, attempt 1);
+  stdout, and the selector, written to stderr on the same pipe, can land
+  between them: whole, as in run 45906110516, attempt 1, even under the old
+  printer that wrote it in pieces, and still now that it is one write. A
+  selector cut in two by another line is not read as one: the printers
+  write it whole (runs before that change printed it in pieces, run
+  46058677798, attempt 1);
 - the exit status from the last `exit=<n>` (or `rc=<n>`) line.
 
 Usage: fhir-versions-report.py <logs-dir> <out-dir> [--versions R4,R4B,R5,R6]

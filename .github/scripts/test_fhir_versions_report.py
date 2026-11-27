@@ -160,9 +160,12 @@ class Report(Scratch):
         self.assertEqual(len(data["warnings"]), 2)
 
     def test_a_selector_written_inside_a_libtest_line_is_read(self):
-        # Cut from run 45906110516 (R4 tests) and 45488238982 (R4B rest),
-        # attempt 1 of each: with --nocapture libtest writes "test <name> ... "
-        # and "ok" separately, and the selector landed between them.
+        # The lib fixture is the shape of run 45906110516 (R4 tests) and
+        # 45488238982 (R4B rest), attempt 1 of each: with --nocapture libtest
+        # writes "test <name> ... " and "ok" separately, and the selector
+        # landed between them. The tests fixture puts it after "ok", before
+        # libtest's newline, which the same separate writes allow; it was not
+        # seen in CI.
         self.write("R5", "lib", LIB_R5.replace(
             "fhir-versions: HFS_TEST_FHIR_VERSION=R5 -> R5 (5.0)\n"
             "test backends::cassandra::errors::tests::refused_statements_are_query_errors ... ok\n",

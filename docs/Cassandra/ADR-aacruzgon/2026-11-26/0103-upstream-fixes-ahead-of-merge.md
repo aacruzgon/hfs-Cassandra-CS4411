@@ -26,7 +26,7 @@
 - **Alternatives considered:**
     - **Wait for upstream to merge them.** Lost: Step 6's token and date tests and Step 7's `/metadata` would wait on a review with no date. The fork would keep wrong behaviour that this project has already shown and fixed.
     - **Cherry-pick the commits.** Lost: each upstream commit would then exist twice under different SHAs, and the next sync would conflict on the same lines.
-    - **Fork-only patches in Cassandra code.** Lost: the fixes are in shared code (`converters.rs`, `extractor.rs`, `date_value.rs`, `capabilities.rs`), so the other backends would still be wrong. Roadmap §1 has changes to upstream files go upstream first.
+    - **Fork-only patches in Cassandra code.** Lost: the fixes are in shared code (`converters.rs`, `extractor.rs`, `date_value.rs`, `capabilities.rs`), so the other backends would still be wrong. The fork's practice is to send changes to upstream files upstream first (roadmap §1's 'Upstream-shaped from day one' and touch-list rule, ADR-aacruzgon-0087).
     - **Pass each resource's own stored `fhir_version` to the extractor,** since one server can hold resources of several versions (`cassandra-discussion.md`, multi-version section). Lost: the registry the extractor wraps is loaded for the configured version, every upstream backend passes its configured version, and an extraction under a version that doesn't match the registry would mix two versions' rules.
 - **Consequences:**
     - **What Cassandra serves.** HFS on Cassandra now:
@@ -59,6 +59,7 @@
 
       The details are in the #136 report (`result.md`, run folder `upstream-sync`).
     - **What the human changed:** nothing; Alan confirmed it as drafted on 2026-11-26, with "PR B" replaced by "#136".
+    - *Update 2026-11-26:* the #136 re-audit found that line 29 misquoted roadmap §1; Alan approved the corrected sentence.
 - **Links:**
     - HeliosSoftware/hfs#3015, #3024; #2965, #3026; #2962, #3043.
     - ADR-aacruzgon-0092 (amended, its "no code change"), 0091 (system-only token rows) and 0087 (the precedent for taking upstream fixes with no cherry-pick).

@@ -448,7 +448,7 @@ impl SearchProvider for CassandraBackend {
             // cap; a filtered `search_count` queues no repairs (5.9).
             Some(Plan::TypeScan) => {
                 let filter = LastUpdatedFilter::of(query)?;
-                let budget = CandidateBudget::new(DEFAULT_MAX_CANDIDATES);
+                let budget = CandidateBudget::new(max_candidates());
                 let mut unrun = RepairContext::new(tenant.tenant_id().as_str());
                 let scan = self
                     .type_scan(
@@ -466,7 +466,7 @@ impl SearchProvider for CassandraBackend {
             // Every live id, under the cap; no repairs (walkthrough 5.4, 5.9).
             Some(Plan::Ids(ids)) => {
                 let filter = LastUpdatedFilter::of(query)?;
-                let budget = CandidateBudget::new(DEFAULT_MAX_CANDIDATES);
+                let budget = CandidateBudget::new(max_candidates());
                 let found = self
                     .live_by_id(tenant, query, &ids, &filter, &budget)
                     .await?;
@@ -643,6 +643,24 @@ mod tests {
 /// the configuration (ADR-anastasiabryz-0002; the setting goes in Sam's
 /// `config.rs`).
 const DEFAULT_MAX_CANDIDATES: usize = 100_000;
+
+/// The cap a search runs under: [`DEFAULT_MAX_CANDIDATES`], or in a test the
+/// value [`TEST_MAX_CANDIDATES`] holds on the test's thread, so a test can
+/// reach the cap with a handful of resources.
+fn max_candidates() -> usize {
+    #[cfg(test)]
+    if let Some(max) = TEST_MAX_CANDIDATES.with(std::cell::Cell::get) {
+        return max;
+    }
+    DEFAULT_MAX_CANDIDATES
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's cap. A `#[tokio::test]` runs its future on its own thread,
+    /// so this never leaks into another test.
+    static TEST_MAX_CANDIDATES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
 /// Rows one index read asks for: a batch size, not the page size
 /// (walkthrough 5.1, step 6).
 const BATCH_ROWS: usize = 100;
@@ -817,7 +835,7 @@ impl CassandraBackend {
     ) -> StorageResult<SearchResult> {
         let position = paging::decode(query.cursor.as_deref(), Order::Default)?;
         let filter = LastUpdatedFilter::of(query)?;
-        let budget = CandidateBudget::new(DEFAULT_MAX_CANDIDATES);
+        let budget = CandidateBudget::new(max_candidates());
         let mut repairs = RepairContext::new(tenant.tenant_id().as_str());
         let page = self
             .type_page(tenant, query, &filter, position, &budget, &mut repairs)
@@ -980,7 +998,7 @@ impl CassandraBackend {
             return Ok(SearchResult::new(Page::new(Vec::new(), PageInfo::end())));
         }
         let filter = LastUpdatedFilter::of(query)?;
-        let budget = CandidateBudget::new(DEFAULT_MAX_CANDIDATES);
+        let budget = CandidateBudget::new(max_candidates());
         let mut found = self
             .live_by_id(tenant, query, ids, &filter, &budget)
             .await?;
@@ -2273,5 +2291,153 @@ mod node_tests {
             backend.search(&tenant, &total).await.unwrap().total,
             Some(4)
         );
+    }
+
+    /// Sets this test's candidate cap until dropped.
+    struct TestCap;
+
+    impl TestCap {
+        fn set(max: usize) -> Self {
+            TEST_MAX_CANDIDATES.with(|cap| cap.set(Some(max)));
+            TestCap
+        }
+    }
+
+    impl Drop for TestCap {
+        fn drop(&mut self) {
+            TEST_MAX_CANDIDATES.with(|cap| cap.set(None));
+        }
+    }
+
+    fn is_too_many(result: &StorageResult<impl std::fmt::Debug>, count: usize, max: usize) -> bool {
+        matches!(
+            result,
+            Err(StorageError::Search(SearchError::TooManyResults { count: c, max: m }))
+                if *c == count && *m == max
+        )
+    }
+
+    /// Past the cap, a search or a filtered count fails with 422
+    /// `TooManyResults`, never a partial page or count; a page that fills
+    /// before the cap is returned. `count`'s path, an unfiltered
+    /// `search_count`, has no point reads, so no cap (G7, G27).
+    #[tokio::test]
+    async fn past_the_cap_a_search_or_count_is_too_many_results() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-cap");
+        let ids = create_patients(&backend, &tenant, 6).await;
+        let _cap = TestCap::set(3);
+
+        let whole = SearchQuery::new("Patient").with_count(10);
+        assert!(
+            is_too_many(&backend.search(&tenant, &whole).await, 4, 3),
+            "the 4th point read is past 3"
+        );
+        // 2 kept and 1 more to decide `next`: 3 point reads, at the cap.
+        let page = backend
+            .search(&tenant, &SearchQuery::new("Patient").with_count(2))
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), 2);
+        assert!(page.resources.page_info.next_cursor.is_some());
+
+        let filtered = last_updated(&[&["ge2000-01-01".to_string()]]);
+        assert!(is_too_many(
+            &backend.search_count(&tenant, &filtered).await,
+            4,
+            3
+        ));
+        let values: Vec<&str> = ids.iter().map(String::as_str).collect();
+        assert!(is_too_many(
+            &backend.search(&tenant, &id_query(&values)).await,
+            4,
+            3
+        ));
+        assert!(is_too_many(
+            &backend.search_count(&tenant, &id_query(&values)).await,
+            4,
+            3
+        ));
+
+        assert_eq!(
+            backend
+                .search_count(&tenant, &SearchQuery::new("Patient"))
+                .await
+                .unwrap(),
+            6,
+            "count reads no resources, so it runs under no cap"
+        );
+    }
+
+    /// A compartment count past the cap is 422, never a count of the
+    /// members found so far (walkthrough 5.11, "Cap").
+    #[tokio::test]
+    async fn a_compartment_count_past_the_cap_is_too_many_results() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-cap-compartment");
+        create_observations(&backend, &tenant).await;
+        let _cap = TestCap::set(2);
+        let query = in_p1(SearchQuery::new("Observation"));
+        assert!(is_too_many(
+            &backend.search_count(&tenant, &query).await,
+            3,
+            2
+        ));
+        assert!(is_too_many(
+            &backend.search(&tenant, &query.with_count(10)).await,
+            3,
+            2
+        ));
+    }
+
+    /// The repairs a search queued run on `TooManyResults` as on success
+    /// (`repair.rs`, "Step 6's contract"): here an orphan row, read first,
+    /// is queued and its repair skipped for having no `resources` row.
+    /// Planted, so the tenant is `test-planted-` (#127).
+    #[tokio::test]
+    async fn repairs_still_run_when_the_cap_is_reached() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-planted-search-cap-repair");
+        create_patients(&backend, &tenant, 3).await;
+        backend
+            .session
+            .execute(
+                "INSERT INTO resources_by_type \
+                 (tenant_id, resource_type, last_updated, id, version_id, fhir_version) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from(Utc::now() + chrono::Duration::hours(1)),
+                    Value::from("orphan"),
+                    Value::from(1_i32),
+                    Value::from("4.0"),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect("plant");
+        let _cap = TestCap::set(2);
+        let before = backend.repair_stats();
+
+        let result = backend
+            .search(&tenant, &SearchQuery::new("Patient").with_count(10))
+            .await;
+        assert!(is_too_many(&result, 3, 2), "{result:?}");
+        let ran = backend.repair_stats().since(&before);
+        assert_eq!(
+            ran.queued, 1,
+            "the orphan was queued and the repair phase ran"
+        );
+        assert_eq!(ran.skipped_no_row, 1);
     }
 }

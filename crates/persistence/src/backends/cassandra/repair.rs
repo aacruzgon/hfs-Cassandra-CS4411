@@ -3289,7 +3289,12 @@ mod tests {
             return;
         };
         for case in ["no-data", "not-json", "whole-row"] {
-            let t = tenant_id(&format!("repair-version-row-{case}"));
+            // `not-json` plants non-JSON `data`: the post-suite check skips `test-planted-`.
+            let t = if case == "not-json" {
+                tenant_id("planted-repair-version-row-not-json")
+            } else {
+                tenant_id(&format!("repair-version-row-{case}"))
+            };
             let tenant = context(&t);
             let p = backend
                 .create(&tenant, "Patient", patient(), test_fhir_version())

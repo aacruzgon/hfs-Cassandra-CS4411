@@ -408,10 +408,23 @@ impl SearchProvider for CassandraBackend {
 
     async fn search_count(
         &self,
-        _tenant: &TenantContext,
+        tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
         validate(query)?;
+        if is_unfiltered(query) {
+            return match query.stored_fhir_version() {
+                // `count(tenant, Some(type))`, no tag check (walkthrough 5.9, G7).
+                None => {
+                    self.count_resources(tenant, Some(&query.resource_type))
+                        .await
+                }
+                Some(version) => {
+                    self.count_type_version(tenant, &query.resource_type, version)
+                        .await
+                }
+            };
+        }
         Err(unsupported("search_count"))
     }
 
@@ -593,11 +606,24 @@ const R1_CONCURRENCY: usize = 8;
 const SELECT_TYPE_ROWS: &str = "SELECT last_updated, id, version_id, fhir_version \
      FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?";
 
-/// A search with no parameters, chains, `_has` or `_list`: the unfiltered
-/// type search of walkthrough 5.6.
+/// A search with no parameters, chains, `_has`, `_list` or compartment: the
+/// unfiltered type search of walkthrough 5.6. A compartment (a compartment
+/// search, or any search under a `patient/` scope) is a residual filter
+/// (5.11, G33), so a search with one is never unfiltered: answering it from
+/// `resources_by_type` alone would return the whole type.
 fn is_unfiltered(query: &SearchQuery) -> bool {
-    query.parameters.is_empty() && query.reverse_chains.is_empty() && query.list.is_empty()
+    query.parameters.is_empty()
+        && query.reverse_chains.is_empty()
+        && query.list.is_empty()
+        && query.compartment.is_none()
 }
+
+/// `search_count` with no filters and a FHIR version named (G34): the whole
+/// partition's `fhir_version` column, counted in Rust.
+const SELECT_TYPE_VERSIONS: &str =
+    "SELECT fhir_version FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?";
+/// Rows per page of that scan.
+const VERSION_SCAN_PAGE: i32 = 5000;
 
 fn internal(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -786,6 +812,38 @@ impl CassandraBackend {
         };
         let items = kept.into_iter().map(|(_, resource)| resource).collect();
         Ok(SearchResult::new(Page::new(items, page_info)))
+    }
+
+    /// `search_count` with no filters and `query.fhir_version` set: the rows
+    /// of `(tenant, resource_type)` whose `fhir_version` is `version`, read
+    /// from `resources_by_type` alone, with no point reads (walkthrough 5.9,
+    /// G34). Like `count`, it has no tag check.
+    async fn count_type_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        version: &str,
+    ) -> StorageResult<u64> {
+        let rows = self
+            .session
+            .rows_paged_keeping(
+                SELECT_TYPE_VERSIONS,
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from(resource_type),
+                ],
+                StatementKind::Read,
+                VERSION_SCAN_PAGE,
+                |row| {
+                    IntoRustByName::<String>::get_by_name(row, "fhir_version")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|stored| stored == version)
+                },
+            )
+            .await
+            .map_err(|error| StorageError::Backend(map_driver_error(&error, "count")))?;
+        Ok(rows.len() as u64)
     }
 
     /// One batch of `resources_by_type` rows strictly after `after`.
@@ -1355,6 +1413,107 @@ mod node_tests {
                 .search(&fresh_tenant("test-search-cursor"), &query)
                 .await,
             Err(StorageError::Search(SearchError::InvalidCursor { .. }))
+        ));
+    }
+
+    /// Plants a `resources_by_type` row with no `resources` row behind it.
+    async fn plant_type_row(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        id: &str,
+        fhir_version: &str,
+    ) {
+        backend
+            .session
+            .execute(
+                "INSERT INTO resources_by_type \
+                 (tenant_id, resource_type, last_updated, id, version_id, fhir_version) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from(Utc::now()),
+                    Value::from(id),
+                    Value::from(1_i32),
+                    Value::from(fhir_version),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect("plant");
+    }
+
+    /// `search_count` with no filters is `count(tenant, Some(type))`: the
+    /// live rows of `resources_by_type`, with no tag check, so a planted
+    /// orphan row counts too (walkthrough 5.9, G7). With a FHIR version
+    /// named, only that version's rows count (G34). Planted, so the tenant
+    /// is `test-planted-` (#127).
+    #[tokio::test]
+    async fn an_unfiltered_count_counts_the_type_and_its_version() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-planted-search-count");
+        let ids = create_patients(&backend, &tenant, 5).await;
+        crate::core::ResourceStorage::delete(&backend, &tenant, "Patient", &ids[0])
+            .await
+            .expect("delete");
+        // Two rows of a version no resource here has.
+        plant_type_row(&backend, &tenant, "other-1", "0.0-planted").await;
+        plant_type_row(&backend, &tenant, "other-2", "0.0-planted").await;
+
+        let all = SearchQuery::new("Patient");
+        assert_eq!(
+            backend.search_count(&tenant, &all).await.unwrap(),
+            6,
+            "4 live + 2 planted"
+        );
+
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        let one_version = SearchQuery::new("Patient").with_fhir_version(version);
+        assert_eq!(
+            backend.search_count(&tenant, &one_version).await.unwrap(),
+            4,
+            "only the live rows of {version:?}"
+        );
+        assert_eq!(
+            backend
+                .search_count(&fresh_tenant("test-search-count-empty"), &all)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A compartment is a residual filter (5.11), so a search or count
+    /// with one is never answered from `resources_by_type` alone: until the
+    /// compartment residual lands, it is refused rather than returning the
+    /// whole type.
+    #[tokio::test]
+    async fn a_compartment_is_never_read_as_unfiltered() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-compartment");
+        create_patients(&backend, &tenant, 2).await;
+        let mut query = SearchQuery::new("Patient");
+        query.compartment = Some(crate::types::CompartmentMembership {
+            params: vec!["link".to_string()],
+            reference: "Patient/someone-else".to_string(),
+        });
+        assert!(matches!(
+            backend.search(&tenant, &query).await,
+            Err(StorageError::Backend(
+                BackendError::UnsupportedCapability { .. }
+            ))
+        ));
+        assert!(matches!(
+            backend.search_count(&tenant, &query).await,
+            Err(StorageError::Backend(
+                BackendError::UnsupportedCapability { .. }
+            ))
         ));
     }
 }

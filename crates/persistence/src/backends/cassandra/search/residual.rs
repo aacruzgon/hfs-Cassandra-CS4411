@@ -28,6 +28,11 @@ use crate::types::{CompartmentMembership, strip_reference_version};
 
 /// The stack a debug build extracts on: the write path's
 /// `EXTRACTION_STACK_BYTES` (`C/index_keys.rs`), for the same reason.
+///
+/// A copy, with its own thread below, not a shared helper: the write path's
+/// `extract_index_keys` returns index keys, not the values a residual reads,
+/// and keeps its stack size private to `C/index_keys.rs`, which is Sam's.
+/// Sharing one helper is a change to that file, so it is his to make.
 const EXTRACTION_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 impl CassandraBackend {

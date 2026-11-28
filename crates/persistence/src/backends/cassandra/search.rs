@@ -182,13 +182,42 @@ impl CandidateBudget {
     }
 }
 
+/// Index rows a plan read but could not decode. A plan skips such a row,
+/// never returns it and never fails the search for it, and records it here;
+/// the framework hands each one to the request's repair context, which logs
+/// and counts it (`RepairContext::skip_undecodable`, `repair.rs`).
+#[derive(Debug, Default)]
+pub(crate) struct Undecodable(Mutex<Vec<(&'static str, String)>>);
+
+impl Undecodable {
+    /// Records one row of `table` that could not be decoded. `error` is
+    /// logged as is, so it must name no indexed value: a token code or a URI
+    /// can be an identifier.
+    #[allow(dead_code)] // The modules' plans (#130–#132) call it.
+    pub(crate) fn skip(&self, table: &'static str, error: impl Into<String>) {
+        self.0.lock().push((table, error.into()));
+    }
+
+    /// Hands every recorded row to `repairs`.
+    fn drain_into(&self, repairs: &mut RepairContext) {
+        for (table, error) in self.0.lock().drain(..) {
+            repairs.skip_undecodable(table, &error);
+        }
+    }
+}
+
 /// What every read of a search needs.
-#[allow(dead_code)] // The modules' plans (#130–#132) read `session` and `budget`.
+#[allow(dead_code)] // The modules' plans (#130–#132) read `session`, `budget`, `batch_rows` and `undecodable`.
 pub(crate) struct ReadCtx<'a> {
     pub(crate) tenant: &'a TenantContext,
     pub(crate) resource_type: &'a str,
     pub(crate) session: &'a CassandraSession,
     pub(crate) budget: &'a CandidateBudget,
+    /// Rows each index read asks for (`LIMIT`): a batch size, not the page
+    /// size (walkthrough 5.1, step 6), the same for every plan.
+    pub(crate) batch_rows: usize,
+    /// Where a plan records an index row it could not decode.
+    pub(crate) undecodable: &'a Undecodable,
 }
 
 /// What a module's `compile` gets besides the parameter itself.
@@ -224,8 +253,12 @@ pub(crate) trait ParamPlan: Send + Sync {
 
     /// Its candidates strictly after `from`, in `from`'s order, merged across
     /// its partitions and OR values and collapsed on the order key. Each CQL
-    /// read takes a `LIMIT` batch (a batch size, not the page size) through
-    /// [`CassandraSession::rows`].
+    /// read asks for `ctx.batch_rows` rows (`LIMIT`, a batch size, not the
+    /// page size) through [`CassandraSession::rows`]. An index row it cannot
+    /// decode is skipped and recorded in `ctx.undecodable`.
+    ///
+    /// Only the driving plan streams. A date plan drives only in a search of
+    /// dates alone (G20); beside any other parameter, it is a residual.
     fn stream<'a>(
         &'a self,
         ctx: &'a ReadCtx<'a>,
@@ -235,6 +268,11 @@ pub(crate) trait ParamPlan: Send + Sync {
     /// Whether a candidate another plan drives matches this parameter: the
     /// clustering point reads at `last_updated = ? AND id = ?`, one per
     /// partition and per OR value, ORed (walkthrough 5.8).
+    ///
+    /// The framework calls it for token and URI plans only. A date plan
+    /// beside another parameter is checked by its `residual(loaded, None)`
+    /// alone, since the date tables have no `last_updated` to point-read, so
+    /// its `contains` is never called and can return `true`.
     async fn contains(
         &self,
         ctx: &ReadCtx<'_>,
@@ -244,6 +282,16 @@ pub(crate) trait ParamPlan: Send + Sync {
 
     /// The residual check on the loaded resource. Default: it matches.
     ///
+    /// It decides from its arguments alone. A resumed page compiles a new
+    /// plan, and the framework checks several candidates at once
+    /// (ADR-anastasiabryz-0005), so state kept in the plan between calls is
+    /// lost or raced.
+    ///
+    /// `loaded.extracted` holds the resource's values, extracted once per
+    /// candidate after the tag check, and only when a residual reads values:
+    /// a compartment, or a date parameter other than `_lastUpdated`.
+    /// Otherwise it is empty.
+    ///
     /// `at` is where the candidate sits in the stream's order: `Some` only
     /// for the plan that drives the search, and `None` for a plan checked
     /// beside another driver. Without it, two rows of one resource give a
@@ -252,8 +300,10 @@ pub(crate) trait ParamPlan: Send + Sync {
     /// ADR-aacruzgon-0027) within a page, on a resumed page and across
     /// `ne`'s two tables. Whether the date plan's `residual` is where the
     /// rule is enforced stays Diya's call for 6b (#128, open choice 4).
-    /// Within one page, a resource appears once in any case (bundle.html's
-    /// `bdl-7`, in R4, R4B and R5). A check beside the driver gets `None`,
+    /// Within one page, the framework keeps a resource once whatever the
+    /// residuals return, as the spec requires (bundle.html#bundle-unique and
+    /// `bdl-7`, in R4, R4B and R5); across pages, the rule is the driving
+    /// plan's. A check beside the driver gets `None`,
     /// not the driver's position: a second date judged by the first date's
     /// position would drop a real match.
     fn residual(&self, _loaded: &LoadedResource, _at: Option<&OrderKey>) -> bool {
@@ -610,6 +660,28 @@ mod tests {
         // (#133, Alan's audit point 2).
         let _residual: fn(&NoMatches, &LoadedResource, Option<&OrderKey>) -> bool =
             <NoMatches as ParamPlan>::residual;
+        // The default residual matches, with a position or without.
+        let loaded = LoadedResource {
+            row: crate::backends::cassandra::read::ResourceRow {
+                version_id: 1,
+                data: None,
+                last_updated: Utc::now(),
+                created_at: None,
+                deleted_at: None,
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                stored_fhir_version: None,
+                write_ts: None,
+                write_id: None,
+                index_keys: None,
+            },
+            extracted: Vec::new(),
+        };
+        let at = OrderKey {
+            at: Utc::now(),
+            table: None,
+        };
+        assert!(plan.residual(&loaded, None));
+        assert!(plan.residual(&loaded, Some(&at)));
     }
 
     #[test]
@@ -957,11 +1029,14 @@ impl CassandraBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = query.resource_type.as_str();
         let wanted_version = query.stored_fhir_version();
+        let undecodable = Undecodable::default();
         let ctx = ReadCtx {
             tenant,
             resource_type,
             session: &self.session,
             budget,
+            batch_rows: BATCH_ROWS,
+            undecodable: &undecodable,
         };
 
         // One stream of rows across every batch and slice, so up to
@@ -1038,6 +1113,8 @@ impl CassandraBackend {
                 }
             }
         }
+        drop(checked);
+        undecodable.drain_into(repairs);
         Ok(scan)
     }
 
@@ -1097,11 +1174,14 @@ impl CassandraBackend {
     ) -> StorageResult<Vec<(DateTime<Utc>, StoredResource)>> {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = query.resource_type.as_str();
+        let undecodable = Undecodable::default();
         let ctx = ReadCtx {
             tenant,
             resource_type,
             session: &self.session,
             budget,
+            batch_rows: BATCH_ROWS,
+            undecodable: &undecodable,
         };
         // Futures do nothing until polled, so building them all first starts
         // no read; `buffered` polls `R1_CONCURRENCY` at a time.
@@ -1143,6 +1223,9 @@ impl CassandraBackend {
                 found.push(kept);
             }
         }
+        drop(checked);
+        // `_id` runs no repair phase; handing them over logs them.
+        undecodable.drain_into(&mut RepairContext::new(tenant_id));
         found.sort_by(|(a_lu, a), (b_lu, b)| (b_lu, b.id()).cmp(&(a_lu, a.id())));
         Ok(found)
     }

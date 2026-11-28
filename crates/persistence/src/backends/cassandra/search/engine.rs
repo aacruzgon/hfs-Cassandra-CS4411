@@ -35,8 +35,8 @@ use super::last_updated::LastUpdatedFilter;
 use super::paging::{self, OrderKey};
 use super::planner::Checks;
 use super::{
-    CandidateBudget, DEFAULT_PAGE_SIZE, ParamPlan, R1_CONCURRENCY, ReadCtx, finish_page_in,
-    max_candidates, stored_resource,
+    BATCH_ROWS, CandidateBudget, DEFAULT_PAGE_SIZE, ParamPlan, R1_CONCURRENCY, ReadCtx,
+    Undecodable, finish_page_in, max_candidates, stored_resource,
 };
 use crate::backends::cassandra::backend::CassandraBackend;
 use crate::backends::cassandra::index_keys::IndexKey;
@@ -135,11 +135,14 @@ impl CassandraBackend {
     ) -> StorageResult<PlanScan> {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = query.resource_type.as_str();
+        let undecodable = Undecodable::default();
         let ctx = ReadCtx {
             tenant,
             resource_type,
             session: &self.session,
             budget,
+            batch_rows: BATCH_ROWS,
+            undecodable: &undecodable,
         };
 
         // R1, `R1_CONCURRENCY` in flight.
@@ -226,19 +229,21 @@ impl CassandraBackend {
             let Some((candidate, resource)) = next? else {
                 continue;
             };
-            // A resource already kept on this page is kept once.
-            if kept_ids.contains(&candidate.id) {
+            // A resource the stream yields at several order keys is kept,
+            // and counted, once.
+            if !kept_ids.insert(candidate.id.clone()) {
                 continue;
             }
             scan.matched += 1;
             if let Some(keep) = keep {
-                kept_ids.insert(candidate.id.clone());
                 scan.kept.push((candidate.order, resource));
                 if scan.kept.len() >= keep {
                     break;
                 }
             }
         }
+        drop(checked);
+        undecodable.drain_into(repairs);
         Ok(scan)
     }
 }
@@ -596,6 +601,76 @@ mod node_tests {
         assert_eq!(ids(&pages), [a.clone(), b.clone()], "each resource once");
         let ran = backend.repair_stats().since(&before);
         assert_eq!(ran.queued, 1, "b's leftover row was queued: {ran:?}");
+        assert_eq!(
+            backend
+                .plan_count(
+                    &tenant,
+                    &SearchQuery::new("Patient"),
+                    &plan,
+                    &Checks::none()
+                )
+                .await
+                .unwrap(),
+            2,
+            "a count counts each resource once, as a page keeps it once"
+        );
+    }
+
+    /// A plan that records one undecodable index row, then streams like its
+    /// inner plan.
+    struct SkipsOne(ListPlan);
+
+    #[async_trait]
+    impl ParamPlan for SkipsOne {
+        fn param(&self) -> &str {
+            "fake-skips-one"
+        }
+        fn drive(&self) -> super::super::Drive {
+            self.0.drive()
+        }
+        fn order(&self) -> Order {
+            self.0.order()
+        }
+        fn stream<'a>(
+            &'a self,
+            ctx: &'a ReadCtx<'a>,
+            from: &'a Position,
+        ) -> BoxStream<'a, StorageResult<Candidate>> {
+            ctx.undecodable.skip("date_index", "a planted test row");
+            self.0.stream(ctx, from)
+        }
+        async fn contains(
+            &self,
+            _ctx: &ReadCtx<'_>,
+            _last_updated: DateTime<Utc>,
+            _id: &str,
+        ) -> StorageResult<bool> {
+            unreachable!("the fake plan only drives")
+        }
+        fn residual(&self, loaded: &super::super::LoadedResource, at: Option<&OrderKey>) -> bool {
+            self.0.residual(loaded, at)
+        }
+    }
+
+    /// An index row a plan could not decode reaches the request's repair
+    /// phase, which counts it (`RepairContext::skip_undecodable`); the
+    /// search still answers.
+    #[tokio::test]
+    async fn a_plans_undecodable_row_reaches_repair() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-engine-undecodable");
+        let made = create_patients(&backend, &tenant, 1).await;
+        let day = DateTime::<Utc>::from_timestamp(0, 0).unwrap() + chrono::Duration::days(10_001);
+        let plan = SkipsOne(ListPlan(vec![date_candidate(day, &made[0].1, 1)]));
+        let before = backend.repair_stats();
+
+        let pages = every_page(&backend, &tenant, &plan, 10).await;
+        assert_eq!(ids(&pages), [made[0].1.clone()]);
+        let ran = backend.repair_stats().since(&before);
+        assert_eq!(ran.undecodable_rows, 1, "{ran:?}");
     }
 
     /// A non-driving token or URI plan: `contains` is true for these ids,

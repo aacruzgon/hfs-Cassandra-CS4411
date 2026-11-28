@@ -983,6 +983,10 @@ pub(crate) enum Fault {
     /// sent at `LOCAL_QUORUM`: a response the caller cannot decode, though no bad row is stored.
     /// A batch is not a read, so it never matches.
     AnswerWithForeignRow,
+    /// Never send it and never answer: the statement or batch stays pending
+    /// until its caller drops it, as behind a stalled coordinator. A test
+    /// holds a write this way to cut its caller at a deadline after it began.
+    Hold,
 }
 
 #[cfg(test)]
@@ -1135,6 +1139,7 @@ mod faults {
                             .await,
                     );
                 }
+                Fault::Hold => std::future::pending::<()>().await,
                 Fault::TimeOutWithoutApplying | Fault::FailWithCasTimeout => {}
             }
             let (consistency, write_type) = match fault {
@@ -1204,6 +1209,7 @@ mod faults {
                 Fault::AnswerWithForeignRow => {
                     unreachable!("an injected foreign row is for reads, not a batch")
                 }
+                Fault::Hold => std::future::pending().await,
             })
         }
     }

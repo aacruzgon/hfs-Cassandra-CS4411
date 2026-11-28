@@ -1,13 +1,13 @@
 # ADR-aacruzgon-0037: Declare each Cassandra capability when its step lands, not at Step 2
 
 - **Date:** 2026-11-06
-- **Status:** accepted
+- **Status:** accepted; narrowed by [ADR-aacruzgon-0085](../2026-11-22/0085-step7-phased-capability-hooks.md) (`BasicSearch` in Step 6's last commit); amended by [ADR-aacruzgon-0104](../2026-11-27/0104-declare-date-and-cursor-with-basic-search.md) (`DateSearch` and `CursorPagination` there too)
 - **Context:**
     - The design ("Structs and enums", `BackendCapability` row) and roadmap item 2.4 have the backend declare `Crud`, `Versioning`, `OptimisticLocking`, `BasicSearch`, `DateSearch`, `CursorPagination` and `SharedSchema` from Step 2, and PR #37's `CassandraBackend::declared_capabilities()` does.
     - `crates/persistence/src/core/backend.rs:62-68` says a capability "must never be declared for aspirational, planned, or implemented-but-unwired behavior", and the contract test's failure message repeats it (`tests/backend_capability_contract.rs:131-133` at PR #41's head). That rule came from upstream #369, a false tenancy claim.
     - At Step 2 every method behind those six is a stub; PR #38 makes only `create`, `read` and `count` real (ADR-aacruzgon-0033). Nothing outside the persistence crate's tests reads `BackendCapability` today (`git grep` over `crates/rest/src` and `crates/hfs/src`), so no client sees the claim, but `main` would carry it from Step 2 until Step 6d.
     - Declaring at Step 2 only what PR #38 makes real gives the same result as this decision: `Crud` means all four of create, read, update and delete, so `create` and `read` alone do not qualify, and only `SharedSchema` is left.
-- **Decision:** Step 2 declares only `SharedSchema`. Each later step adds its capability to `declared_capabilities()` and to the golden list in `backend_capability_contract.rs` in the same commit: `Crud` and `OptimisticLocking` at Step 3, `Versioning` at Step 4, `BasicSearch`, `DateSearch` and `CursorPagination` at Steps 6a to 6d. The design's list stays the end state.
+- **Decision:** Step 2 declares only `SharedSchema`. Each later step adds its capability to `declared_capabilities()` and to the golden list in `backend_capability_contract.rs` in the same commit: `Crud` and `OptimisticLocking` at Step 3, `Versioning` at Step 4, `BasicSearch`, `DateSearch` and `CursorPagination` at Steps 6a to 6d. The design's list stays the end state. *Update 2026-11-27:* `BasicSearch` moved to Step 6's last commit with ADR-aacruzgon-0085, and `DateSearch` and `CursorPagination` follow it there: see [ADR-aacruzgon-0104](../2026-11-27/0104-declare-date-and-cursor-with-basic-search.md).
 - **Alternatives considered:**
     - **Declare all seven from Step 2, as the design says (what PRs #37 and #41 were written to do):** simpler, and harmless while nothing reads the enum, but it breaks the crate's documented rule and makes the contract test assert a claim the code does not meet.
     - **Keep the seven and narrow the rule in `core/backend.rs`:** lost. It is upstream's rule (#369, a false tenancy claim), and work meant to go upstream (roadmap section 1) should not weaken it.

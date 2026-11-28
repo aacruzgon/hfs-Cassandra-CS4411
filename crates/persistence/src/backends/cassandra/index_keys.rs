@@ -601,7 +601,7 @@ fn extract_on_this_stack(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::cassandra::test_support::{test_extractor, test_registry};
+    use crate::backends::cassandra::test_support::{test_config, test_extractor, test_registry};
     use crate::search::registry::SearchParameterDefinition;
     use crate::search::{DateEnd, OPEN_START};
     use crate::types::DatePrecision;
@@ -1215,7 +1215,7 @@ mod tests {
                 .with_base(vec!["Patient"]),
             )
             .unwrap();
-        let extractor = SearchParameterExtractor::new(registry);
+        let extractor = SearchParameterExtractor::new(registry, test_config().fhir_version);
         let body = json!({
             "resourceType": "Patient", "id": "p", "gender": "male",
             "name": [{"family": "One"}, {"family": "Two"}]
@@ -1273,7 +1273,7 @@ mod tests {
                 .with_base(vec!["Patient"]),
             )
             .unwrap();
-        let extractor = SearchParameterExtractor::new(registry);
+        let extractor = SearchParameterExtractor::new(registry, test_config().fhir_version);
         let body = json!({"resourceType": "Patient", "id": "p", "gender": "male"});
         let extraction = std::thread::Builder::new()
             .stack_size(2 << 20)

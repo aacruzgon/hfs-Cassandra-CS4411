@@ -20,6 +20,9 @@ import { SharedArray } from 'k6/data';
 const OP = __ENV.OP;
 const BASE = __ENV.BASE_URL;
 const VUS = Number(__ENV.VUS);
+// maxVUs on an open-loop run: the concurrency unless bench.py's --max-vus-factor
+// raises it. All of them are allocated before the run, so none is created mid-window.
+const MAX_VUS = Number(__ENV.MAX_VUS || VUS);
 const DURATION = __ENV.DURATION;
 const MODE = __ENV.MODE || 'open';
 const RATE = Number(__ENV.RATE || 0);
@@ -36,8 +39,8 @@ const scenario =
         rate: RATE,
         timeUnit: '1s',
         duration: DURATION,
-        preAllocatedVUs: VUS,
-        maxVUs: VUS,
+        preAllocatedVUs: MAX_VUS,
+        maxVUs: MAX_VUS,
         gracefulStop: GRACEFUL_STOP,
       }
     : { executor: 'constant-vus', vus: VUS, duration: DURATION, gracefulStop: GRACEFUL_STOP };

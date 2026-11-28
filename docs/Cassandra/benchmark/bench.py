@@ -77,6 +77,12 @@ EXTRA_OPS = ("hotkey",)
 SEARCH_OPS = ("token", "date", "uri")
 
 SNAPSHOT_MARKER = ".hfsbench-snapshot-complete"
+# The index tables every Observation of the dataset writes to (code, effective date, profile).
+RW6_INDEX_TABLES = ("token_code_index", "date_index", "uri_index")
+# The tables nodetool tablehistograms reads after each Cassandra run: those the
+# operations write (resources, versions, intents) and those the searches will read.
+HISTOGRAM_TABLES = ("resources", "resource_versions", "pending_index_writes", "token_system_code_index",
+                    "date_index", "uri_index")
 
 # Refused outright: these are the shared development containers.
 FORBIDDEN_PROJECTS = {"hfs-cassandra", "hfs-postgres"}
@@ -99,6 +105,16 @@ DOCKER_VM_PROCESSES = (
     "OrbStack Helper", "com.docker.virtualization", "com.docker.krun", "com.docker.hyperkit",
     "com.apple.Virtualization.VirtualMachine", "qemu-system-", "limactl", "vmmem",
 )
+# A CI runner's job: GitHub's runner starts one Runner.Worker per job. While one
+# runs the host is busy, whatever its CPU at that moment (acruzdebian is a runner).
+CI_JOB_PROCESSES = ("Runner.Worker",)
+# On Linux, CPU is the change in /proc over this many seconds (see cpu_between).
+LINUX_CPU_INTERVAL_SECONDS = 2.0
+# How often the host is read during a measured window (HostWatch).
+HOST_WATCH_SECONDS = 10.0
+HOST_WATCH_FIRST_SECONDS = 5.0
+# A pause between the readings before the window and k6's start.
+WINDOW_SETTLE_SECONDS = 3.0
 BATCH_WORKERS = 4
 SAMPLE_SECONDS = 2.0
 SETTLE_TIMEOUT_SECONDS = 1800
@@ -255,16 +271,125 @@ def open_text(path: Path, mode: str):
     return path.open(mode, encoding="utf-8", newline="")
 
 
+# Tail percentiles need enough requests beyond them to mean anything: fewer
+# than this many and the value is kept but flagged unreliable.
+TAIL_MIN_BEYOND = 10
+PERCENTILES = (("p50", 0.50), ("p90", 0.90), ("p95", 0.95), ("p99", 0.99), ("p999", 0.999), ("p9999", 0.9999))
+# The 95 % interval of p95 and p99: a bootstrap (fixed seed) up to this many requests,
+# above it the distribution-free order-statistic interval, which a bootstrap of that
+# size converges to and which costs nothing (pure Python resampling of millions of
+# requests would take minutes per run).
+BOOTSTRAP_RESAMPLES = 200
+BOOTSTRAP_SEED = 4411
+BOOTSTRAP_MAX_N = 20000
+# The latency histogram: 10 buckets per decade from 0.1 ms to 10^4.8 ms (63 s), plus
+# one below and one above.
+HISTOGRAM_PER_DECADE = 10
+HISTOGRAM_LOW_EXP = -10   # 10^(-10/10) = 0.1 ms
+HISTOGRAM_HIGH_EXP = 48   # 10^(48/10) = 63,096 ms
+K6_PHASES = ("blocked", "connecting", "sending", "waiting", "receiving")
+STATUS_LATENCY_CLASSES = ("s2xx", "s409", "s412", "s4xx_other", "s5xx_other")
+
+
+def reliable(n: int, fraction: float) -> bool:
+    """At least TAIL_MIN_BEYOND requests lie beyond this percentile: n >= 10,000 for p99.9."""
+    return n * (1.0 - fraction) >= TAIL_MIN_BEYOND - 1e-9
+
+
+def latency_stats(ordered: Sequence[float], suffix: str = "") -> dict:
+    """Every percentile, min, max, mean and standard deviation of sorted latencies, in ms.
+
+    suffix "" names the figures over every response (p50_ms), "_ok" over 2xx (p50_ok_ms).
+    """
+    n = len(ordered)
+    stats: dict = {f"n{suffix}": n}
+    for name, fraction in PERCENTILES:
+        stats[f"{name}{suffix}_ms"] = percentile(ordered, fraction)
+    for name, fraction in (("p999", 0.999), ("p9999", 0.9999)):
+        stats[f"{name}{suffix}_reliable"] = reliable(n, fraction)
+    stats[f"min{suffix}_ms"] = ordered[0] if n else float("nan")
+    stats[f"max{suffix}_ms"] = ordered[-1] if n else float("nan")
+    stats[f"mean{suffix}_ms"] = statistics.fmean(ordered) if n else float("nan")
+    stats[f"stddev{suffix}_ms"] = statistics.pstdev(ordered) if n > 1 else float("nan")
+    return stats
+
+
+def percentile_intervals(ordered: Sequence[float], fractions: Sequence[float]) -> Tuple[Dict[float, Tuple[float, float]], str]:
+    """A 95 % interval for each nearest-rank percentile of sorted values, and how they were made.
+
+    Up to BOOTSTRAP_MAX_N values: a bootstrap with a fixed seed, every percentile
+    read from the same resamples. Above it: the order-statistic interval.
+    """
+    n = len(ordered)
+    if n < 2:
+        return {f: (float("nan"), float("nan")) for f in fractions}, "none"
+    if n <= BOOTSTRAP_MAX_N:
+        import random
+        rng = random.Random(BOOTSTRAP_SEED)
+        estimates: Dict[float, List[float]] = {f: [] for f in fractions}
+        for _ in range(BOOTSTRAP_RESAMPLES):
+            resample = sorted(rng.choices(ordered, k=n))
+            for f in fractions:
+                estimates[f].append(percentile(resample, f))
+        low_at, high_at = int(0.025 * BOOTSTRAP_RESAMPLES), int(0.975 * BOOTSTRAP_RESAMPLES) - 1
+        return ({f: (sorted(v)[low_at], sorted(v)[high_at]) for f, v in estimates.items()},
+                f"bootstrap {BOOTSTRAP_RESAMPLES} resamples, seed {BOOTSTRAP_SEED}")
+    result = {}
+    for f in fractions:
+        centre = n * f
+        spread = 1.96 * math.sqrt(n * f * (1.0 - f))
+        result[f] = (ordered[max(1, math.floor(centre - spread)) - 1], ordered[min(n, math.ceil(centre + spread)) - 1])
+    return result, "order statistic (binomial, normal approximation)"
+
+
+def intervals(ordered: Sequence[float], suffix: str = "") -> dict:
+    bounds, method = percentile_intervals(ordered, (0.95, 0.99))
+    result: dict = {f"ci{suffix}_method": method}
+    for name, fraction in (("p95", 0.95), ("p99", 0.99)):
+        result[f"{name}{suffix}_ci_low_ms"], result[f"{name}{suffix}_ci_high_ms"] = bounds[fraction]
+    return result
+
+
+def histogram_bucket(value_ms: float) -> int:
+    """The bucket of a latency: -1 below 0.1 ms, then one per tenth of a decade, the last one open."""
+    if value_ms < 10 ** (HISTOGRAM_LOW_EXP / HISTOGRAM_PER_DECADE):
+        return -1
+    index = math.floor(HISTOGRAM_PER_DECADE * math.log10(value_ms)) - HISTOGRAM_LOW_EXP
+    return min(index, HISTOGRAM_HIGH_EXP - HISTOGRAM_LOW_EXP)
+
+
+def write_histogram(rows: Sequence[Tuple[float, float, str]], out: Path) -> None:
+    """histogram.csv: log-spaced latency buckets, counted per status class."""
+    counts: Dict[int, collections.Counter] = collections.defaultdict(collections.Counter)
+    for _, value, status in rows:
+        counts[histogram_bucket(value)][status_class(status)] += 1
+    top = HISTOGRAM_HIGH_EXP - HISTOGRAM_LOW_EXP
+    with out.open("w", encoding="utf-8", newline="") as sink:
+        writer = csv.writer(sink)
+        writer.writerow(["lower_ms", "upper_ms", "total"] + list(CLASSES))
+        for index in range(-1, top + 1):
+            lower = 0.0 if index < 0 else 10 ** ((index + HISTOGRAM_LOW_EXP) / HISTOGRAM_PER_DECADE)
+            upper = (10 ** (HISTOGRAM_LOW_EXP / HISTOGRAM_PER_DECADE) if index < 0
+                     else "" if index == top else 10 ** ((index + 1 + HISTOGRAM_LOW_EXP) / HISTOGRAM_PER_DECADE))
+            bucket = counts.get(index, collections.Counter())
+            writer.writerow([f"{lower:.4g}", upper if upper == "" else f"{upper:.4g}", sum(bucket.values())]
+                            + [bucket[name] for name in CLASSES])
+
+
 def analyse(
     k6_csv: Path,
     requests_out: Path,
     bins_out: Path,
     duration_s: float,
     bin_seconds: int,
+    histogram_out: Optional[Path] = None,
 ) -> dict:
     """Reduce k6's CSV to per-request rows and time bins, and return the run's metrics."""
+    import array
     rows: List[Tuple[float, float, str]] = []  # end time ms, duration ms, status
     dropped: List[Tuple[float, float]] = []
+    phases = {phase: array.array("d") for phase in K6_PHASES}
+    data = {"data_sent": 0.0, "data_received": 0.0}
     with open_text(k6_csv, "r") as source, open_text(requests_out, "w") as sink:
         writer = csv.writer(sink)
         writer.writerow(["end_ms", "op", "status", "duration_ms", "error_code"])
@@ -280,6 +405,10 @@ def analyse(
                 )
             elif name == "dropped_iterations":
                 dropped.append((float(row["timestamp"]), float(row["metric_value"])))
+            elif name.startswith("http_req_") and name[9:] in phases:
+                phases[name[9:]].append(float(row["metric_value"]))
+            elif name in data:
+                data[name] += float(row["metric_value"])
 
     metrics: dict = {"completed": len(rows)}
     statuses: collections.Counter = collections.Counter(r[2] for r in rows)
@@ -293,14 +422,28 @@ def analyse(
     metrics["throughput_rps"] = len(rows) / duration_s
     metrics["ok_rps"] = classes["s2xx"] / duration_s
     ordered = sorted(r[1] for r in rows)
-    for label, fraction in (("p50_ms", 0.50), ("p95_ms", 0.95), ("p99_ms", 0.99)):
-        metrics[label] = percentile(ordered, fraction)
-    metrics["max_ms"] = ordered[-1] if ordered else float("nan")
+    metrics.update(latency_stats(ordered))
     # The same, over 2xx only: a fast 503 or 409 would otherwise pull the figures down.
     ok_only = sorted(r[1] for r in rows if status_class(r[2]) == "s2xx")
-    for label, fraction in (("p50_ok_ms", 0.50), ("p95_ok_ms", 0.95), ("p99_ok_ms", 0.99)):
-        metrics[label] = percentile(ok_only, fraction)
+    metrics.update(latency_stats(ok_only, "_ok"))
+    metrics.update(intervals(ordered))
+    metrics.update(intervals(ok_only, "_ok"))
+    # A slow 409 shows apart from a slow 201.
+    for name in STATUS_LATENCY_CLASSES:
+        members = sorted(r[1] for r in rows if status_class(r[2]) == name)
+        metrics[f"{name}_p50_ms"] = percentile(members, 0.50) if members else None
+        metrics[f"{name}_p99_ms"] = percentile(members, 0.99) if members else None
+        metrics[f"{name}_max_ms"] = members[-1] if members else None
+    # Where the time went, as k6 saw it: queueing for a connection, connecting, sending, waiting, receiving.
+    for phase, values in phases.items():
+        ordered_phase = sorted(values)
+        metrics[f"k6_{phase}_p50_ms"] = percentile(ordered_phase, 0.50) if ordered_phase else None
+        metrics[f"k6_{phase}_p99_ms"] = percentile(ordered_phase, 0.99) if ordered_phase else None
+    metrics["k6_data_sent_bytes"] = int(data["data_sent"])
+    metrics["k6_data_received_bytes"] = int(data["data_received"])
     metrics.update(saturation(len(rows), metrics["dropped_iterations"]))
+    if histogram_out is not None:
+        write_histogram(rows, histogram_out)
 
     # Bins are counted from the first event, so bin 0 is the start of the run
     # and a slow start or a decline shows in the sequence.
@@ -452,7 +595,94 @@ def foreign_processes(processes: Dict[int, Tuple[int, float, str]], root_pid: in
 
 
 def host_is_quiet(record: dict) -> bool:
-    return record["foreign_cpu_pct"] <= QUIET_FOREIGN_CPU_PCT
+    return record["foreign_cpu_pct"] <= QUIET_FOREIGN_CPU_PCT and not record.get("ci_jobs")
+
+
+def is_ci_job(command: str) -> bool:
+    return any(name in command for name in CI_JOB_PROCESSES)
+
+
+def parse_proc_stat(text: str) -> Optional[Tuple[int, str, int]]:
+    """(ppid, comm, utime + stime in clock ticks) from one /proc/<pid>/stat, or None."""
+    left, right = text.find("("), text.rfind(")")
+    if left < 0 or right < left:
+        return None
+    fields = text[right + 2:].split()
+    try:
+        return int(fields[1]), text[left + 1:right], int(fields[11]) + int(fields[12])
+    except (IndexError, ValueError):
+        return None
+
+
+def read_proc(root: Path = Path("/proc"), cmdlines: Optional[Iterable[int]] = None) -> Dict[int, Tuple[int, str, int, int, str]]:
+    """pid -> (ppid, comm, CPU ticks, uid, cmdline) for every process /proc shows.
+
+    One read of `stat` per process; `cmdline` only for the pids named (all when
+    None), since reading it for every process doubles the cost of a reading.
+    """
+    wanted = None if cmdlines is None else set(cmdlines)
+    processes: Dict[int, Tuple[int, str, int, int, str]] = {}
+    for entry in root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            parsed = parse_proc_stat((entry / "stat").read_text(encoding="utf-8", errors="replace"))
+            uid = entry.stat().st_uid
+            cmdline = ""
+            if wanted is None or int(entry.name) in wanted:
+                cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        except OSError:  # It exited between the listing and the read.
+            continue
+        if parsed is not None:
+            processes[int(entry.name)] = (parsed[0], parsed[1], parsed[2], uid, cmdline)
+    return processes
+
+
+def read_cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+
+def needs_cmdline(comm: str) -> bool:
+    """The processes whose command line decides whose they are (docker_plumbing) or that are CI jobs."""
+    return comm in ("docker-proxy", "dockerd", "containerd") or comm.startswith("containerd-shim") or is_ci_job(comm)
+
+
+def cpu_between(before: Dict[int, Tuple[int, str, int, int, str]], after: Dict[int, Tuple[int, str, int, int, str]],
+                seconds: float, ticks_per_second: float) -> Dict[int, Tuple[int, float, str]]:
+    """Each process's CPU over the interval, in percent of one core, as parse_ps gives it.
+
+    `ps` on Linux reports a process's CPU over its whole life, so a long-lived
+    process that has just become busy (a CI runner's daemon, an IDE) barely
+    shows there. Two readings of /proc a few seconds apart show it.
+    """
+    result: Dict[int, Tuple[int, float, str]] = {}
+    for pid, (ppid, comm, ticks, _, cmdline) in after.items():
+        earlier = before.get(pid)
+        used = ticks - earlier[2] if earlier is not None else 0
+        result[pid] = (ppid, 100.0 * used / ticks_per_second / seconds if seconds > 0 else 0.0, cmdline or comm)
+    return result
+
+
+def docker_plumbing(processes: Dict[int, Tuple[int, str, int, int, str]], port: int, container: str) -> List[int]:
+    """The system Docker's processes that serve this harness's container, on Linux.
+
+    The root-owned dockerd and containerd answer the harness's own `docker exec`
+    and `docker stats`; docker-proxy carries HFS's traffic to the database's host
+    port; the container's shim is the parent of the database. A rootless Docker
+    (a CI runner's) runs as its own user and stays foreign.
+    """
+    own = []
+    for pid, (_, comm, _, uid, cmdline) in processes.items():
+        if uid == 0 and comm in ("dockerd", "containerd"):
+            own.append(pid)
+        elif uid == 0 and comm == "docker-proxy" and f"-host-port {port}" in cmdline:
+            own.append(pid)
+        elif uid == 0 and comm.startswith("containerd-shim") and container and container[:12] in cmdline:
+            own.append(pid)
+    return own
 
 
 def own_database_pid(backend: "Backend") -> List[int]:
@@ -467,22 +697,207 @@ def own_database_pid(backend: "Backend") -> List[int]:
     return [int(pid)] if pid.isdigit() and int(pid) > 0 else []
 
 
-def host_load(backend: "Backend") -> dict:
-    """The host's load, as `ps` and the kernel see it, without the harness's own processes."""
+def host_load(backend: "Backend", with_docker: bool = True) -> dict:
+    """The host's load, as the kernel sees it, without the harness's own processes.
+
+    On Linux, CPU is measured over LINUX_CPU_INTERVAL_SECONDS from /proc; on
+    macOS `ps` already gives recent CPU. A CI runner's job (Runner.Worker) makes
+    the host busy whatever its CPU, since it can start a build at any moment.
+    """
     load_1m, load_5m, load_15m = os.getloadavg()
-    processes = parse_ps(run_cmd(["ps", "-A", "-o", "pid=,ppid=,pcpu=,comm="], check=False).stdout)
-    foreign = foreign_processes(processes, os.getpid(), own_database_pid(backend))
-    stats = run_cmd(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"], check=False)
-    if stats.returncode == 0 and platform.system() != "Linux":
-        # Inside the VM, which `ps` no longer counts. On Linux `ps` already sees them.
-        foreign = sorted(foreign + other_containers_cpu(stats.stdout.splitlines(), backend.project),
-                         key=lambda item: -item["cpu_pct"])
+    ci_jobs: List[str] = []
+    if platform.system() == "Linux":
+        before = read_proc(cmdlines=())
+        time.sleep(LINUX_CPU_INTERVAL_SECONDS)
+        light = read_proc(cmdlines=())
+        ticks = os.sysconf("SC_CLK_TCK")
+        busy = cpu_between(before, light, LINUX_CPU_INTERVAL_SECONDS, ticks)
+        # Command lines only where they matter: docker's and the CI's processes, and those above the threshold.
+        named = [pid for pid, (_, comm, _, _, _) in light.items()
+                 if needs_cmdline(comm) or busy.get(pid, (0, 0.0, ""))[1] >= HOST_PROCESS_MIN_PCT]
+        after = dict(light)
+        for pid in named:
+            after[pid] = light[pid][:4] + (read_cmdline(pid) or light[pid][1],)
+        processes = cpu_between(before, after, LINUX_CPU_INTERVAL_SECONDS, ticks)
+        try:
+            container = backend.container_id()
+        except (Failure, OSError, subprocess.SubprocessError):
+            container = ""
+        own = own_database_pid(backend) + docker_plumbing(after, backend.port, container)
+        ci_jobs = sorted({f"{pid} {cmdline[:80]}" for pid, (_, comm, _, _, cmdline) in after.items()
+                          if is_ci_job(comm) or is_ci_job(cmdline)})
+    else:
+        processes = parse_ps(run_cmd(["ps", "-A", "-o", "pid=,ppid=,pcpu=,comm="], check=False).stdout)
+        own = []
+        ci_jobs = sorted({f"{pid} {command[-80:]}" for pid, (_, _, command) in processes.items() if is_ci_job(command)})
+    foreign = foreign_processes(processes, os.getpid(), own)
+    stats = None
+    if with_docker:
+        stats = run_cmd(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"], check=False)
+        if stats.returncode == 0 and platform.system() != "Linux":
+            # Inside the VM, which `ps` no longer counts. On Linux the processes are the host's.
+            foreign = sorted(foreign + other_containers_cpu(stats.stdout.splitlines(), backend.project),
+                             key=lambda item: -item["cpu_pct"])
     return {
         "load_1m": load_1m, "load_5m": load_5m, "load_15m": load_15m,
         "cpus": os.cpu_count(),
         "foreign_cpu_pct": sum(item["cpu_pct"] for item in foreign),
         "processes_above_5pct": foreign,
-        "docker_limits_gib": docker_limits_gib(stats.stdout.splitlines()) if stats.returncode == 0 else None,
+        "ci_jobs": ci_jobs,
+        "docker_limits_gib": docker_limits_gib(stats.stdout.splitlines()) if stats is not None and stats.returncode == 0 else None,
+    }
+
+
+def proc_ticks(pid: int, children: bool = True) -> Optional[int]:
+    """A process's CPU ticks so far, with those of the children it has reaped (cutime, cstime)."""
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    fields = text[text.rfind(")") + 2:].split()
+    try:
+        return sum(int(fields[i]) for i in ((11, 12, 13, 14) if children else (11, 12)))
+    except (IndexError, ValueError):
+        return None
+
+
+def host_busy_ticks(text: str) -> Optional[int]:
+    """Every CPU's non-idle ticks since boot, from /proc/stat's first line (idle and iowait left out)."""
+    for line in text.splitlines():
+        fields = line.split()
+        if fields and fields[0] == "cpu":
+            values = [int(v) for v in fields[1:]]
+            # user nice system idle iowait irq softirq steal (guest time is inside user).
+            return sum(values[:3]) + sum(values[5:8])
+    return None
+
+
+def own_processes(processes: Dict[int, Tuple[int, str, int, int, str]], roots: Iterable[int]) -> List[int]:
+    """The roots and every descendant of them in one reading of /proc."""
+    own = set(roots)
+    grew = True
+    while grew:
+        grew = False
+        for pid, entry in processes.items():
+            if entry[0] in own and pid not in own:
+                own.add(pid)
+                grew = True
+    return sorted(own)
+
+
+class HostWatch(threading.Thread):
+    """The host's load during the measured window, so a job that starts mid-run is seen.
+
+    The reading before the run (wait_for_quiet_host) can't see what starts
+    after it: a CI job, a build, another worker's container.
+
+    On Linux it does nothing heavy inside the window. prepare() reads /proc once,
+    before k6 starts, to find the harness's own processes (its tree, the database
+    container's, and the system Docker's plumbing for it). Each reading then takes
+    /proc/stat, those processes' ticks, and the comm of any process that is new
+    since the last reading: foreign CPU is the host's non-idle CPU less the
+    harness's own, and a new Runner.Worker is a CI job. Only a reading that finds
+    the host busy scans every process, to name them. The first version scanned
+    every process every 10 s and lifted the run's tail (bench-checkpoint-prep's
+    overhead control). On macOS each reading is host_load (ps).
+    """
+
+    def __init__(self, backend: "Backend", every_seconds: float = HOST_WATCH_SECONDS):
+        super().__init__(daemon=True)
+        self.backend = backend
+        self.every = every_seconds
+        self.halt = threading.Event()
+        self.samples: List[dict] = []
+        self.linux = platform.system() == "Linux"
+        self.own: List[int] = []
+        self.seen: set = set()
+        self.ci_jobs: Dict[int, str] = {}
+
+    def prepare(self, extra_own: Iterable[int] = ()) -> None:
+        """Before the window: which processes are the harness's own, and which exist already."""
+        if not self.linux:
+            return
+        processes = read_proc(cmdlines=[])
+        named = {pid: read_cmdline(pid) for pid, entry in processes.items() if needs_cmdline(entry[1])}
+        processes = {pid: (entry[:4] + (named.get(pid, ""),)) for pid, entry in processes.items()}
+        try:
+            container = self.backend.container_id()
+        except (Failure, OSError, subprocess.SubprocessError):
+            container = ""
+        roots = [os.getpid(), *extra_own, *own_database_pid(self.backend),
+                 *docker_plumbing(processes, self.backend.port, container)]
+        self.own = own_processes(processes, roots)
+        self.seen = set(processes)
+        self.ci_jobs = {pid: entry[4] or entry[1] for pid, entry in processes.items() if is_ci_job(entry[1])}
+
+    def linux_reading(self, last: Optional[Tuple[float, int, int]]) -> Tuple[dict, Tuple[float, int, int]]:
+        now = time.monotonic()
+        busy = host_busy_ticks(Path("/proc/stat").read_text(encoding="utf-8")) or 0
+        own = sum(t for t in (proc_ticks(pid) for pid in self.own) if t is not None)
+        current = set(int(name) for name in os.listdir("/proc") if name.isdigit())
+        for pid in current - self.seen:
+            try:
+                comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if is_ci_job(comm):
+                self.ci_jobs[pid] = comm
+        self.seen = current
+        # A job counts while its Runner.Worker runs; one that ended between readings was seen when new.
+        jobs = sorted(f"{pid} {command[:80]}" for pid, command in self.ci_jobs.items())
+        self.ci_jobs = {pid: command for pid, command in self.ci_jobs.items() if pid in current}
+        record: dict = {"ci_jobs": jobs, "processes_above_5pct": []}
+        if last is None:
+            record["foreign_cpu_pct"] = 0.0
+            record["baseline"] = True
+        else:
+            seconds = now - last[0]
+            foreign_ticks = (busy - last[1]) - (own - last[2])
+            record["foreign_cpu_pct"] = max(0.0, 100.0 * foreign_ticks / os.sysconf("SC_CLK_TCK") / seconds) if seconds > 0 else 0.0
+            if not host_is_quiet(record):
+                # Busy already: name what is busy, as the reading before a run does.
+                record["processes_above_5pct"] = host_load(self.backend, with_docker=False)["processes_above_5pct"]
+        return record, (now, busy, own)
+
+    def run(self) -> None:
+        # Not during k6's start-up, when every VU starts at once.
+        self.halt.wait(HOST_WATCH_FIRST_SECONDS)
+        last = None
+        while not self.halt.is_set():
+            try:
+                if self.linux:
+                    record, last = self.linux_reading(last)
+                else:
+                    record = host_load(self.backend, with_docker=True)
+            except Exception as error:  # A failed reading must not end the run.
+                record = {"error": str(error)[:200], "foreign_cpu_pct": 0.0, "ci_jobs": [], "processes_above_5pct": []}
+            record["t_s"] = round(time.monotonic(), 1)
+            if not record.get("baseline"):
+                self.samples.append(record)
+            self.halt.wait(self.every)
+
+    def stop(self) -> None:
+        self.halt.set()
+        self.join(timeout=30)
+
+    def summary(self) -> dict:
+        return host_watch_summary(self.samples)
+
+
+def host_watch_summary(samples: Sequence[dict]) -> dict:
+    """What the samples taken during a run say: its peak foreign CPU and whether it was ever busy."""
+    readings = [s for s in samples if "error" not in s]
+    busy = [s for s in readings if not host_is_quiet(s)]
+    peak = max(readings, key=lambda s: s["foreign_cpu_pct"], default=None)
+    jobs = sorted({job for s in readings for job in s.get("ci_jobs", [])})
+    return {
+        "host_watch_samples": len(readings),
+        "host_watch_failed_samples": len(samples) - len(readings),
+        "host_busy_during": bool(busy),
+        "host_busy_during_samples": len(busy),
+        "host_foreign_cpu_max_pct": peak["foreign_cpu_pct"] if peak else None,
+        "host_peak_processes": peak["processes_above_5pct"][:8] if peak else [],
+        "host_ci_jobs_during": jobs,
     }
 
 
@@ -497,15 +912,75 @@ def wait_for_quiet_host(cap_seconds: float, backend: "Backend") -> dict:
         if quiet or waited >= cap_seconds:
             record.update(busy=not quiet, waited_s=round(waited, 1))
             if not quiet:
-                log(f"warning: busy host, recorded: load {record['load_1m']:.1f}, foreign CPU {record['foreign_cpu_pct']:.0f}%")
+                log(f"warning: busy host, recorded: load {record['load_1m']:.1f}, foreign CPU {record['foreign_cpu_pct']:.0f}%"
+                    + (f", CI jobs {record['ci_jobs']}" if record.get("ci_jobs") else ""))
             return record
         if not warned:
-            log(f"host not quiet (load {record['load_1m']:.1f}, foreign CPU {record['foreign_cpu_pct']:.0f}%); waiting up to {cap_seconds:.0f} s")
+            log(f"host not quiet (load {record['load_1m']:.1f}, foreign CPU {record['foreign_cpu_pct']:.0f}%"
+                + (f", CI jobs {record['ci_jobs']}" if record.get("ci_jobs") else "")
+                + f"); waiting up to {cap_seconds:.0f} s")
             warned = True
         time.sleep(10)
 
 
 # --- the database containers ---------------------------------------------------
+
+
+TCP_STATES = {"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV", "04": "FIN_WAIT1", "05": "FIN_WAIT2",
+              "06": "TIME_WAIT", "07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK", "0A": "LISTEN", "0B": "CLOSING"}
+# TIME-WAIT lasts 60 s on Linux (TCP_TIMEWAIT_LEN); the wait covers it with a margin.
+PORT_WAIT_SECONDS = 90
+
+
+def sockets_on_port(port: int, tables: Sequence[str]) -> List[str]:
+    """The states of the sockets whose local port is `port`, from /proc/net/tcp's format."""
+    states = []
+    for text in tables:
+        for line in text.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 4 or ":" not in fields[1]:
+                continue
+            try:
+                local_port = int(fields[1].rsplit(":", 1)[1], 16)
+            except ValueError:
+                continue
+            if local_port == port:
+                states.append(TCP_STATES.get(fields[3].upper(), fields[3]))
+    return states
+
+
+def held_by_client_sockets(port: int) -> List[str]:
+    """On Linux, the sockets that would refuse a listener on `port`; elsewhere, none.
+
+    The harness's database ports (59542, 55632) are inside Linux's ephemeral range
+    (32768-60999), so any client socket on the machine can be given one, and in
+    TIME-WAIT it refuses a listener for about 60 s, SO_REUSEADDR or not
+    (ADR-aacruzgon-0082, 0086, measured on acruzdebian). Each reset binds the port
+    again, so the harness waits for it to be free.
+    """
+    if platform.system() != "Linux":
+        return []
+    tables = []
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            tables.append(Path(name).read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return sockets_on_port(port, tables)
+
+
+def wait_for_port(port: int, cap_seconds: float = PORT_WAIT_SECONDS) -> float:
+    """Wait until no socket holds the port, up to the cap; return the seconds waited."""
+    started = time.monotonic()
+    held = held_by_client_sockets(port)
+    if held:
+        log(f"port {port} is held by {len(held)} socket(s) ({', '.join(sorted(set(held)))}); waiting up to {cap_seconds:.0f} s")
+    while held:
+        if time.monotonic() - started > cap_seconds:
+            raise Failure(f"port {port} still held after {cap_seconds:.0f} s by sockets in {sorted(set(held))}")
+        time.sleep(2)
+        held = held_by_client_sockets(port)
+    return time.monotonic() - started
 
 
 class Backend:
@@ -524,6 +999,7 @@ class Backend:
         self.baseline = getattr(args, "baseline", "on")
         self.project = args.project or f"hfsbench-{self.name}"
         self.port = args.db_port or self.default_port
+        self.port_wait_s = 0.0
         if self.project in FORBIDDEN_PROJECTS:
             raise Failure(f"refusing the shared Compose project {self.project}")
         if self.port in FORBIDDEN_PORTS:
@@ -564,8 +1040,12 @@ class Backend:
         self._wait_for_budget()
         if before_start:
             before_start()
-        self.compose("up", "-d", "--wait", "--remove-orphans")
+        self.up()
         self.prepare()
+
+    def up(self) -> None:
+        self.port_wait_s = wait_for_port(self.port)
+        self.compose("up", "-d", "--wait", "--remove-orphans")
 
     def stop(self) -> None:
         # The cleanup after a stop, too: out of the terminal's reach (see run_cmd).
@@ -582,9 +1062,37 @@ class Backend:
     def data_volume(self) -> str:
         return f"{self.project}_{self.volume_key}"
 
+    def schema_files(self) -> List[Path]:
+        """The files that make the database's schema before HFS writes to it."""
+        return []
+
+    def schema_sha256(self) -> str:
+        digest = hashlib.sha256()
+        for path in self.schema_files():
+            digest.update(path.name.encode())
+            digest.update(sha256_file(path).encode())
+        return digest.hexdigest()
+
     def snapshot_volume(self, dataset: "Dataset", hfs_commit: str) -> str:
-        # The backend is named: `--project` gives both backends one project.
-        return f"{self.project}_snapshot-{self.name}-{dataset.size}-{dataset.sha256[:12]}-{hfs_commit[:12]}"
+        # The backend is named: `--project` gives both backends one project. So
+        # are the hfs commit that loaded it and the schema it was loaded into: a
+        # snapshot from an older write path is never restored (RW6, ADR-sam-michaels-0006).
+        return (f"{self.project}_snapshot-{self.name}-{dataset.size}-{dataset.sha256[:12]}-{hfs_commit[:12]}"
+                f"-{self.schema_sha256()[:8]}")
+
+    def snapshot_provenance(self, volume: str) -> Optional[dict]:
+        """What the snapshot's marker says about how it was built, or None for an older marker."""
+        probe = ["docker", "run", "--rm", "--network", "none", "--entrypoint", "cat", "-v", f"{volume}:/s:ro",
+                 self._image(), f"/s/{SNAPSHOT_MARKER}"]
+        result = run_cmd(probe, check=False, timeout=120)
+        try:
+            return json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else None
+        except ValueError:
+            return None
+
+    def verify_loaded(self) -> dict:
+        """Checks on a freshly loaded database before its snapshot is kept."""
+        return {}
 
     def has_snapshot(self, volume: str) -> bool:
         """True only for a finished copy: the marker is written after the copy succeeds."""
@@ -617,10 +1125,13 @@ class Backend:
     def quiesce(self) -> None:
         self.compose("stop", "-t", "120", timeout=300)
 
-    def save_snapshot(self, volume: str) -> None:
+    def save_snapshot(self, volume: str, provenance: Optional[dict] = None) -> None:
         self.quiesce()
         run_cmd(["docker", "volume", "create", "--label", f"hfsbench.project={self.project}", volume])
-        self._copy_volume(self.data_volume, volume, f"touch /to/{SNAPSHOT_MARKER}")
+        # The marker is written last, so its presence still means a finished copy;
+        # it holds how the snapshot was made, which every run restoring it records.
+        text = shlex.quote(json.dumps(provenance or {}, sort_keys=True))
+        self._copy_volume(self.data_volume, volume, f"printf '%s' {text} > /to/{SNAPSHOT_MARKER}")
 
     def restore_snapshot(self, volume: str, before_start=None) -> None:
         self.quiesce()
@@ -628,7 +1139,7 @@ class Backend:
         if before_start:
             before_start()
         self._copy_volume(volume, self.data_volume, f"rm -f /to/{SNAPSHOT_MARKER}")
-        self.compose("up", "-d", "--wait", "--remove-orphans")
+        self.up()
 
     def drop_snapshots(self, volumes: Optional[Sequence[str]] = None) -> None:
         """Remove the named snapshots, or every snapshot of this project."""
@@ -662,6 +1173,10 @@ class Backend:
     def prepare(self) -> None:
         """Whatever the database needs before HFS starts."""
 
+    def hfs_log_checks(self) -> Sequence[str]:
+        """Lines hfs's log must hold once it is ready, or the run is not of the write path it names."""
+        return ()
+
     def hfs_env(self) -> Dict[str, str]:
         raise NotImplementedError
 
@@ -676,6 +1191,16 @@ class Backend:
 
     def before_measure(self, out_dir: Path) -> None:
         """Just before the measured window: reset what can be reset, and read what can't for comparison."""
+
+    # Read the database's counters before the warm-up (early_db_counters).
+    db_counters_before_warmup = False
+
+    def window_counters(self) -> dict:
+        """The database's own counters (since its start) that the window is the difference of."""
+        return {}
+
+    def extra_collect(self, out_dir: Path) -> None:
+        """Further readings after the window, kept as files (`--extra-metrics on`)."""
 
 
 class Cassandra(Backend):
@@ -692,20 +1217,50 @@ class Cassandra(Backend):
             paths.append(base / "docker-compose.heap2g.yml")
         return paths
 
-    def prepare(self) -> None:
+    def schema_files(self) -> List[Path]:
         schema = REPO / "docs" / "Cassandra" / "schema"
+        return [schema / "keyspace-single-node.cql", schema / "schema.cql"]
+
+    def prepare(self) -> None:
+        # A fresh node (`down -v` came first), so `helios` is created here, empty:
+        # no keyspace written before Step 5.1 is ever measured (RW6).
         # schema.cql names no keyspace: it is applied inside the one created first.
-        for name, arguments in (("keyspace-single-node.cql", []), ("schema.cql", ["-k", "helios"])):
+        keyspace, schema = self.schema_files()
+        for path, arguments in ((keyspace, []), (schema, ["-k", "helios"])):
             command = ["docker", "exec", "-i", self.container_id(), "cqlsh", *arguments]
-            run_cmd(command, stdin_path=schema / name, timeout=300)
+            run_cmd(command, stdin_path=path, timeout=300)
+
+    def verify_loaded(self) -> dict:
+        # Step 5's write path writes index rows with every resource. A load whose
+        # index tables are empty went through some other write path, and search
+        # would miss every resource in it (RW6): refuse to keep it.
+        found = {}
+        for table in RW6_INDEX_TABLES:
+            text = self.exec_("cqlsh", "-e", f"SELECT id FROM helios.{table} LIMIT 1;").stdout
+            found[table] = bool(re.search(r"\((1) rows?\)", text))
+        empty = [table for table, present in found.items() if not present]
+        if empty:
+            raise Failure(f"after the load, {', '.join(empty)} hold no rows: the index writes of Step 5 did not run")
+        return {"index_tables_with_rows": found}
 
     def hfs_env(self) -> Dict[str, str]:
+        # Every setting of the write path is named, at today's defaults, so a run
+        # records what it ran with and an exported variable can't change it.
+        # The sweeper runs with the server, as in production (ADR-sam-michaels-0006,
+        # SW1). The request timeout must exceed the connect timeout or hfs refuses
+        # to start (ADR-aacruzgon-0100).
         return {
             "HFS_STORAGE_BACKEND": "cassandra",
             "HFS_CASSANDRA_CONTACT_POINTS": f"127.0.0.1:{self.port}",
             "HFS_CASSANDRA_KEYSPACE": "helios",
             "HFS_CASSANDRA_LOCAL_DC": "helios-dc1",
+            "HFS_CASSANDRA_CONNECT_TIMEOUT_MS": "5000",
+            "HFS_CASSANDRA_REQUEST_TIMEOUT_MS": "10000",
+            "HFS_CASSANDRA_SWEEPER_ENABLED": "true",
         }
+
+    def hfs_log_checks(self) -> Sequence[str]:
+        return (CASSANDRA_SWEEPER_STARTED,) if self.hfs_env().get("HFS_CASSANDRA_SWEEPER_ENABLED") == "true" else ()
 
     def settle(self, flush: bool) -> dict:
         if flush:
@@ -770,6 +1325,25 @@ class Cassandra(Backend):
         ):
             result = self.exec_(*command, check=False)
             (out_dir / f"{name}.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
+
+    db_counters_before_warmup = True
+
+    def window_counters(self) -> dict:
+        return parse_tpstats(self.exec_("nodetool", "tpstats").stdout)
+
+    def extra_collect(self, out_dir: Path) -> None:
+        # tablehistograms are recent-decaying histograms over the node's life, so
+        # they include the warm-up; compactionhistory lists every compaction since start.
+        for name, command in (("tpstats", ["nodetool", "tpstats"]),
+                              ("compactionhistory", ["nodetool", "compactionhistory"])):
+            result = self.exec_(*command, check=False)
+            (out_dir / f"{name}.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
+        # One table per call in 5.0 ("requires <keyspace> <table> or <keyspace.table>"),
+        # all in one exec: the tables the operations read and write.
+        script = "; ".join(f"echo '== helios.{table}'; nodetool tablehistograms helios.{table}"
+                           for table in HISTOGRAM_TABLES)
+        result = self.exec_("sh", "-c", script, check=False)
+        (out_dir / "tablehistograms.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
 
     def before_measure(self, out_dir: Path) -> None:
         # Only gcstats covers the window after this: it restarts on being read.
@@ -848,6 +1422,36 @@ class Postgres(Backend):
             )
         }
 
+    def window_counters(self) -> dict:
+        query = (
+            "SELECT json_build_object("
+            "'db', (SELECT row_to_json(d) FROM (SELECT xact_commit, xact_rollback, blks_read, blks_hit, tup_inserted,"
+            " tup_updated, tup_deleted, conflicts, temp_files, temp_bytes, deadlocks FROM pg_stat_database"
+            " WHERE datname = 'helios') d),"
+            "'wal', (SELECT row_to_json(w) FROM (SELECT wal_records, wal_fpi, wal_bytes FROM pg_stat_wal) w),"
+            "'checkpointer', (SELECT row_to_json(c) FROM (SELECT num_timed, num_requested, num_done, buffers_written"
+            " FROM pg_stat_checkpointer) c),"
+            "'bgwriter', (SELECT row_to_json(b) FROM (SELECT buffers_clean, maxwritten_clean, buffers_alloc"
+            " FROM pg_stat_bgwriter) b),"
+            "'tables', (SELECT row_to_json(t) FROM (SELECT sum(n_tup_ins) AS n_tup_ins, sum(n_tup_upd) AS n_tup_upd,"
+            " sum(n_dead_tup) AS n_dead_tup, sum(autovacuum_count) AS autovacuum_count,"
+            " sum(autoanalyze_count) AS autoanalyze_count FROM pg_stat_user_tables) t),"
+            "'lock_waits', (SELECT count(*) FROM pg_locks WHERE NOT granted));"
+        )
+        return json.loads(self.psql(query))
+
+    def extra_collect(self, out_dir: Path) -> None:
+        queries = {
+            "pg_stat_user_tables": "SELECT relname, seq_scan, idx_scan, n_tup_ins, n_tup_upd, n_tup_hot_upd, n_live_tup, n_dead_tup, autovacuum_count, autoanalyze_count FROM pg_stat_user_tables ORDER BY n_tup_ins + n_tup_upd DESC;",
+            "pg_stat_wal": "SELECT * FROM pg_stat_wal;",
+            "pg_stat_bgwriter": "SELECT * FROM pg_stat_bgwriter;",
+            "pg_stat_checkpointer": "SELECT * FROM pg_stat_checkpointer;",
+            "pg_locks_waiting": "SELECT locktype, mode, count(*) FROM pg_locks WHERE NOT granted GROUP BY 1, 2;",
+        }
+        for name, sql in queries.items():
+            result = self.exec_("psql", "-U", "helios", "-d", "helios", "-c", sql, check=False)
+            (out_dir / f"{name}.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
+
     def before_measure(self, out_dir: Path) -> None:
         # The statements of the load and the warm-up go; the database's own
         # counters are kept, for autovacuum's sake, and read before and after.
@@ -870,20 +1474,39 @@ class Postgres(Backend):
 # --- HFS ------------------------------------------------------------------------
 
 
+CASSANDRA_SWEEPER_STARTED = "Cassandra index sweeper started"
+
+
+def hfs_environment(port: int, backend_env: Dict[str, str]) -> Dict[str, str]:
+    """What hfs runs with: the harness's settings only, never an HFS_* exported in the shell."""
+    settings = dict(backend_env)
+    settings.update(
+        {
+            "HFS_SERVER_HOST": "127.0.0.1",
+            "HFS_SERVER_PORT": str(port),
+            "HFS_LOG_LEVEL": "warn",
+            # warn, except hfs's own startup lines: they say which background tasks started.
+            "RUST_LOG": "warn,hfs=info",
+            "HFS_BASE_URL": f"http://127.0.0.1:{port}",
+            # The spec bundles, without which HFS seeds no SearchParameters.
+            "HFS_DATA_DIR": str(REPO / "data"),
+        }
+    )
+    return settings
+
+
+def hfs_process_env(port: int, backend_env: Dict[str, str], inherited: Dict[str, str]) -> Dict[str, str]:
+    """The process environment: the shell's, less any HFS_*, RUST_LOG or OTEL_* in it, plus hfs_environment."""
+    env = {key: value for key, value in inherited.items() if not key.startswith(("HFS_", "RUST_LOG", "OTEL_", "HELIOS_"))}
+    env.update(hfs_environment(port, backend_env))
+    return env
+
+
 class Hfs:
-    def __init__(self, binary: Path, port: int, log_path: Path, backend_env: Dict[str, str]):
-        env = dict(os.environ)
-        env.update(backend_env)
-        env.update(
-            {
-                "HFS_SERVER_HOST": "127.0.0.1",
-                "HFS_SERVER_PORT": str(port),
-                "HFS_LOG_LEVEL": "warn",
-                "HFS_BASE_URL": f"http://127.0.0.1:{port}",
-                # The spec bundles, without which HFS seeds no SearchParameters.
-                "HFS_DATA_DIR": str(REPO / "data"),
-            }
-        )
+    def __init__(self, binary: Path, port: int, log_path: Path, backend_env: Dict[str, str],
+                 log_checks: Sequence[str] = ()):
+        env = hfs_process_env(port, backend_env, os.environ)
+        self.log_checks = tuple(log_checks)
         with socket.socket() as probe:
             probe.settimeout(1)
             if probe.connect_ex(("127.0.0.1", port)) == 0:
@@ -921,6 +1544,9 @@ class Hfs:
         for phrase in ("Could not load spec SearchParameters", "no spec bundle loaded"):
             if phrase in log_text:
                 raise Failure(f"hfs started without its spec bundles ({phrase}): check HFS_DATA_DIR")
+        for phrase in self.log_checks:
+            if phrase not in log_text:
+                raise Failure(f"hfs is ready but its log lacks {phrase!r}: not the write path this run names")
 
     def tail(self) -> str:
         try:
@@ -1167,6 +1793,33 @@ def machine_record() -> dict:
                 record["ram_bytes"] = int(line.split()[1]) * 1024
                 break
         record["os"] = Path("/etc/os-release").read_text(encoding="utf-8").split("\n", 1)[0]
+        record["kernel"] = platform.version()
+        record["cpu_governor"] = read_first(Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"))
+    record["disk"] = disk_record()
+    return record
+
+
+def read_first(path: Path) -> Optional[str]:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def disk_record() -> dict:
+    """Where the databases' volumes live: Docker's root, its file system, and on Linux the device behind it."""
+    root = run_cmd(["docker", "info", "--format", "{{.DockerRootDir}}"], check=False).stdout.strip()
+    record: dict = {"docker_root": root or None}
+    if root and platform.system() == "Linux":
+        df = run_cmd(["df", "--output=source,fstype,size,avail", root], check=False).stdout.split("\n")
+        if len(df) > 1 and df[1].split():
+            source, fstype, size, avail = (df[1].split() + ["", "", "", ""])[:4]
+            record.update(source=source, fstype=fstype, size_kib=size, avail_kib=avail)
+            device = Path(source).name
+            # nvme0n1p6 -> nvme0n1, sda2 -> sda
+            base = re.sub(r"p\d+$", "", device) if device.startswith("nvme") else re.sub(r"\d+$", "", device)
+            record["model"] = read_first(Path(f"/sys/block/{base}/device/model"))
+            record["rotational"] = read_first(Path(f"/sys/block/{base}/queue/rotational"))
     return record
 
 
@@ -1194,6 +1847,11 @@ def environment_record(args: argparse.Namespace, backend: Backend) -> dict:
         "backend": backend.label,
         "profile": backend.profile,
         "compose_files": [str(p.relative_to(REPO)) for p in backend.files()],
+        "compose_sha256": {str(p.relative_to(REPO)): sha256_file(p) for p in backend.files()},
+        "schema_sha256": backend.schema_sha256() if backend.schema_files() else None,
+        "hfs_environment": hfs_environment(args.hfs_port, backend.hfs_env()),
+        "db_port": backend.port,
+        "max_vus_factor": getattr(args, "max_vus_factor", 1),
         "project": backend.project,
         "operating_note": args.note or "",
     }
@@ -1239,9 +1897,17 @@ class MemorySampler(threading.Thread):
         self.halt = threading.Event()
         self.missed = 0
         self.peaks = {"used_bytes": 0, "anon_bytes": 0, "current_bytes": 0, "hfs_rss_kib": 0, "k6_rss_kib": 0}
+        # The container's CPU and I/O counters at the first and the last good sample: the
+        # window's cgroup figures come from the sampler's own reads, so no extra
+        # `docker exec` touches the container at the window's edge (overhead control).
+        self.cgroup_first: Optional[Dict[str, int]] = None
+        self.cgroup_last: Optional[Dict[str, int]] = None
+        self.cgroup_first_t: Optional[float] = None
+        self.cgroup_last_t: Optional[float] = None
 
     def sample_container(self) -> Dict[str, int]:
-        script = "cat /sys/fs/cgroup/memory.current; cat /sys/fs/cgroup/memory.stat"
+        script = ("cat /sys/fs/cgroup/memory.current; cat /sys/fs/cgroup/memory.stat; echo '==cpu'; "
+                  "cat /sys/fs/cgroup/cpu.stat; echo '==io'; cat /sys/fs/cgroup/io.stat")
         try:
             result = run_cmd(["docker", "exec", self.container, "sh", "-c", script], check=False, timeout=20)
         except (subprocess.SubprocessError, OSError):
@@ -1250,10 +1916,18 @@ class MemorySampler(threading.Thread):
         if result.returncode != 0:
             self.missed += 1
             return {}
-        lines = result.stdout.splitlines()
+        memory, _, rest = result.stdout.partition("==cpu")
+        cpu, _, io = rest.partition("==io")
+        lines = memory.splitlines()
         try:
             current = int(lines[0])
-            stat = dict(line.split() for line in lines[1:])
+            stat = dict(line.split() for line in lines[1:] if line.strip())
+            counters = dict(parse_cpu_stat(cpu), **parse_io_stat(io))
+            if "usage_usec" in counters:
+                now = time.monotonic()
+                if self.cgroup_first is None:
+                    self.cgroup_first, self.cgroup_first_t = counters, now
+                self.cgroup_last, self.cgroup_last_t = counters, now
             return {
                 "current_bytes": current,
                 "used_bytes": current - int(stat.get("inactive_file", 0)),
@@ -1297,6 +1971,203 @@ class MemorySampler(threading.Thread):
         return int(text) if text.isdigit() else None
 
 
+# --- counters read before and after the measured window -------------------------
+# Everything here is report-only: a reading that fails is left out, and no
+# figure changes a run's status. `--extra-metrics off` skips all of it, and
+# the host watch, for the overhead control.
+
+
+def parse_cpu_stat(text: str) -> Dict[str, int]:
+    """cgroup v2 cpu.stat: usage_usec, user_usec, system_usec, nr_periods, nr_throttled, throttled_usec."""
+    values = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1].lstrip("-").isdigit():
+            values[fields[0]] = int(fields[1])
+    return values
+
+
+def parse_io_stat(text: str) -> Dict[str, int]:
+    """cgroup v2 io.stat, summed over devices: rbytes, wbytes, rios, wios."""
+    totals = collections.Counter()
+    for line in text.splitlines():
+        for field in line.split()[1:]:
+            key, _, value = field.partition("=")
+            if key in ("rbytes", "wbytes", "rios", "wios") and value.isdigit():
+                totals[key] += int(value)
+    return dict(totals)
+
+
+def parse_tpstats(text: str) -> Dict[str, int]:
+    """nodetool tpstats: each pool's counters and each message type's dropped count, since the node started."""
+    values: Dict[str, int] = {}
+    section = None
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if fields[0] == "Pool" and "Name" in fields:
+            section = "pool"
+            continue
+        if fields[0] == "Message" and len(fields) > 1 and fields[1] == "type":
+            section = "dropped"
+            continue
+        if section == "pool" and len(fields) >= 6 and all(f.lstrip("-").isdigit() for f in fields[-5:]):
+            for key, value in zip(("active", "pending", "completed", "blocked", "all_time_blocked"), fields[-5:]):
+                values[f"pool.{fields[0]}.{key}"] = int(value)
+        elif section == "dropped" and len(fields) >= 2 and fields[1].isdigit() and fields[0].isupper():
+            values[f"dropped.{fields[0]}"] = int(fields[1])
+    return values
+
+
+def flatten(prefix: str, value, into: Dict[str, float]) -> None:
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            flatten(f"{prefix}.{key}" if prefix else str(key), inner, into)
+    elif isinstance(value, bool):
+        return
+    elif isinstance(value, (int, float)):
+        into[prefix] = value
+    elif isinstance(value, str):
+        try:
+            into[prefix] = float(value)
+        except ValueError:
+            pass
+
+
+def process_cpu_seconds(pid: int) -> Optional[float]:
+    """A process's CPU time so far (user and system), or None."""
+    if platform.system() == "Linux":
+        try:
+            parsed = parse_proc_stat(Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            return None
+        return parsed[2] / os.sysconf("SC_CLK_TCK") if parsed else None
+    text = run_cmd(["ps", "-o", "cputime=", "-p", str(pid)], check=False).stdout.strip()
+    try:
+        seconds = 0.0
+        for part in text.replace("-", ":").split(":"):
+            seconds = seconds * 60 + float(part)
+        return seconds if text else None
+    except ValueError:
+        return None
+
+
+def host_counters() -> Dict[str, float]:
+    """Linux: context switches and the CPU's steal and iowait since boot, and the cores' mean frequency now."""
+    values: Dict[str, float] = {}
+    if platform.system() != "Linux":
+        return values
+    try:
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            fields = line.split()
+            if fields[0] == "ctxt":
+                values["ctxt"] = int(fields[1])
+            elif fields[0] == "cpu" and len(fields) >= 9:
+                ticks = os.sysconf("SC_CLK_TCK")
+                values["iowait_s"] = int(fields[5]) / ticks
+                values["steal_s"] = int(fields[8]) / ticks
+    except OSError:
+        pass
+    frequencies = []
+    for path in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_cur_freq"):
+        text = read_first(path)
+        if text and text.isdigit():
+            frequencies.append(int(text) / 1000.0)
+    if frequencies:
+        values["cpu_mhz_mean"] = statistics.fmean(frequencies)
+    return values
+
+
+def read_window(backend: "Backend", hfs: "Hfs", container: str, db: Optional[dict] = None) -> Dict[str, float]:
+    """One reading of every counter the window is measured by (taken before and after it).
+
+    db, when given, is the database's own reading taken earlier (early_db_counters).
+    """
+    values: Dict[str, float] = {}
+    # The container's cgroup counters are not read here: the memory sampler reads them
+    # during the window (MemorySampler.cgroup_first, cgroup_last).
+    readings = (
+        ("db", (lambda: db) if db is not None else backend.window_counters),
+        ("host", host_counters),
+        ("hfs", lambda: {"cpu_s": process_cpu_seconds(hfs.process.pid)}),
+    )
+    for prefix, read in readings:
+        try:
+            flatten(prefix, read(), values)
+        except (Failure, OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
+            values[f"{prefix}.error"] = 1
+            log(f"warning: the {prefix} reading for the window failed: {str(error)[:200]}")
+    return values
+
+
+def window_delta(before: Dict[str, float], after: Dict[str, float]) -> Dict[str, float]:
+    """after less before, for every counter in both; gauges (frequency, pending) are kept as read after."""
+    delta = {}
+    for key, value in after.items():
+        if key in before and not key.endswith((".error",)):
+            delta[key] = value - before[key]
+    return delta
+
+
+# The columns of runs.csv taken from the window's readings: (column, key, scale, kind).
+# kind "delta" is after less before; "after" is the reading after the window.
+WINDOW_COLUMNS = (
+    ("db_cpu_s", "cgroup.usage_usec", 1e-6, "delta"),
+    ("db_nr_throttled", "cgroup.nr_throttled", 1, "delta"),
+    ("db_throttled_s", "cgroup.throttled_usec", 1e-6, "delta"),
+    ("db_io_read_mib", "cgroup.rbytes", 1 / 1024**2, "delta"),
+    ("db_io_write_mib", "cgroup.wbytes", 1 / 1024**2, "delta"),
+    ("db_io_read_ops", "cgroup.rios", 1, "delta"),
+    ("db_io_write_ops", "cgroup.wios", 1, "delta"),
+    ("hfs_cpu_s", "hfs.cpu_s", 1, "delta"),
+    ("host_ctxt_switches", "host.ctxt", 1, "delta"),
+    ("host_steal_s", "host.steal_s", 1, "delta"),
+    ("host_iowait_s", "host.iowait_s", 1, "delta"),
+    ("host_cpu_mhz_mean", "host.cpu_mhz_mean", 1, "after"),
+    ("pg_xact_commit", "db.db.xact_commit", 1, "delta"),
+    ("pg_xact_rollback", "db.db.xact_rollback", 1, "delta"),
+    ("pg_blks_read", "db.db.blks_read", 1, "delta"),
+    ("pg_blks_hit", "db.db.blks_hit", 1, "delta"),
+    ("pg_deadlocks", "db.db.deadlocks", 1, "delta"),
+    ("pg_temp_files", "db.db.temp_files", 1, "delta"),
+    ("pg_conflicts", "db.db.conflicts", 1, "delta"),
+    ("pg_wal_records", "db.wal.wal_records", 1, "delta"),
+    ("pg_wal_mib", "db.wal.wal_bytes", 1 / 1024**2, "delta"),
+    ("pg_checkpoints", "db.checkpointer.num_done", 1, "delta"),
+    ("pg_autovacuum_runs", "db.tables.autovacuum_count", 1, "delta"),
+    ("pg_dead_tuples_after", "db.tables.n_dead_tup", 1, "after"),
+    ("pg_lock_waits_after", "db.lock_waits", 1, "after"),
+)
+
+
+def window_columns(window: dict) -> dict:
+    """The runs.csv figures from a window record; Cassandra's dropped messages are summed over types."""
+    if not window:
+        return {}
+    before, after, delta = window.get("before", {}), window.get("after", {}), window.get("delta", {})
+    row = {}
+    for column, key, scale, kind in WINDOW_COLUMNS:
+        source = delta if kind == "delta" else after
+        if key in source:
+            row[column] = source[key] * scale
+    dropped = [value for key, value in delta.items() if key.startswith("db.dropped.")]
+    if dropped or any(key.startswith("db.pool.") for key in after):
+        row["cassandra_dropped_messages"] = sum(dropped)
+        row["cassandra_pending_after"] = sum(v for k, v in after.items() if k.startswith("db.pool.") and k.endswith(".pending"))
+        row["cassandra_blocked"] = sum(v for k, v in delta.items() if k.startswith("db.pool.") and k.endswith(".all_time_blocked"))
+    return row
+
+
+def scrape_metrics(hfs: "Hfs", path: Path) -> None:
+    """hfs's Prometheus /metrics (helios-observability), saved as served; nothing if it isn't."""
+    try:
+        with urllib.request.urlopen(f"{hfs.base}/metrics", timeout=10) as response:
+            path.write_bytes(response.read())
+    except (urllib.error.URLError, OSError) as error:
+        path.write_text(f"# not scraped: {error}\n", encoding="utf-8")
+
+
 # --- k6 and one measured run ---------------------------------------------------
 
 
@@ -1307,7 +2178,7 @@ def k6_command(args: argparse.Namespace, op: str, base: str, vus: int, mode: str
         command += ["--out", f"csv={csv_out}"]
     command += ["--system-tags", "status,name,error_code"]
     environment = {
-        "OP": op, "BASE_URL": base, "VUS": vus, "MODE": mode, "RATE": rate,
+        "OP": op, "BASE_URL": base, "VUS": vus, "MAX_VUS": max_vus(args, vus), "MODE": mode, "RATE": rate,
         "DURATION": f"{seconds}s", "IDS_FILE": dataset.ids_file,
         "BODIES_FILE": dataset.path, "SEARCH_FILE": dataset.search_file,
     }
@@ -1316,16 +2187,52 @@ def k6_command(args: argparse.Namespace, op: str, base: str, vus: int, mode: str
     return command + [str(HERE / "load.js")]
 
 
+def max_vus(args: argparse.Namespace, vus: int) -> int:
+    """k6's maxVUs on an open-loop run: the concurrency, times --max-vus-factor (1 unless chosen)."""
+    return vus * max(1, int(getattr(args, "max_vus_factor", 1) or 1))
+
+
 def k6_environment() -> Dict[str, str]:
     env = dict(os.environ)
     env["K6_CSV_TIME_FORMAT"] = "unix_milli"
     return env
 
 
+def early_db_counters(args: argparse.Namespace, backend: "Backend") -> Optional[dict]:
+    """The database counters a backend must read before the warm-up rather than just before the window.
+
+    Cassandra's `nodetool tpstats` just before the window lifted the run's start-up
+    max by 2 ms in every pair of bench-checkpoint-prep's overhead control, and
+    taking it out alone removed that; read earlier, its delta covers the warm-up
+    and the window. None when nothing needs it.
+    """
+    if not extra_metrics(args) or not backend.db_counters_before_warmup or "window" in skipped_collectors(args):
+        return None
+    try:
+        return backend.window_counters()
+    except (Failure, OSError, subprocess.SubprocessError, ValueError) as error:
+        log(f"warning: the database's counters before the warm-up failed: {str(error)[:200]}")
+        return {}
+
+
 def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: int, mode: str,
-            rate: int, seconds: int, dataset: Dataset, run_dir: Path) -> dict:
+            rate: int, seconds: int, dataset: Dataset, run_dir: Path, early_db: Optional[dict] = None) -> dict:
     container = backend.container_id()
     k6_csv = run_dir / "k6.csv.gz"
+    extra = extra_metrics(args)
+    watch = HostWatch(backend)
+    skip = skipped_collectors(args)
+    window_before: Dict[str, float] = {}
+    if extra:
+        # Read before k6 starts, so the readings themselves stay out of the window,
+        # then let the node settle before the first request.
+        if "metrics-scrape" not in skip:
+            scrape_metrics(hfs, run_dir / "metrics-before.txt")
+        if "window" not in skip:
+            window_before = read_window(backend, hfs, container, early_db)
+        if "host-watch" not in skip:
+            watch.prepare([hfs.process.pid])
+        time.sleep(WINDOW_SETTLE_SECONDS)
     started = clocks()
     with (run_dir / "k6.log").open("w", encoding="utf-8") as output:
         process = subprocess.Popen(
@@ -1335,6 +2242,10 @@ def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: 
         CLEANUP["processes"][process.pid] = "k6"
         sampler = MemorySampler(container, {"hfs": hfs.process.pid, "k6": process.pid}, run_dir / "memory.csv")
         sampler.start()
+        watching = extra and "host-watch" not in skip
+        if watching:
+            watch.own.append(process.pid)  # k6, started after prepare()
+            watch.start()
         try:
             code = process.wait(timeout=seconds + 900)
         except subprocess.TimeoutExpired:
@@ -1348,13 +2259,35 @@ def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: 
         finally:
             CLEANUP["processes"].pop(process.pid, None)
             sampler.stop()
+            if watching:
+                watch.stop()
     ended = clocks()
+    window: dict = {}
+    if extra:
+        if watching:
+            (run_dir / "host-watch.json").write_text(json.dumps(watch.samples, indent=1), encoding="utf-8")
+        window_after = read_window(backend, hfs, container) if "window" not in skip else {}
+        if "metrics-scrape" not in skip:
+            scrape_metrics(hfs, run_dir / "metrics-after.txt")
+        cgroup_covers = None
+        if sampler.cgroup_first is not None and sampler.cgroup_last is not None and "window" not in skip:
+            flatten("cgroup", sampler.cgroup_first, window_before)
+            flatten("cgroup", sampler.cgroup_last, window_after)
+            cgroup_covers = (f"{sampler.cgroup_last_t - sampler.cgroup_first_t:.1f} s, from the memory sampler's "
+                             f"first good sample (at k6's start) to its last (at most 2 s before k6 exits)")
+        window = {"before": window_before, "after": window_after, "delta": window_delta(window_before, window_after),
+                  "covers": "the measured window and k6's graceful stop; the readings are taken just before k6 "
+                            "starts and just after it exits",
+                  "db_covers": ("the warm-up, the window and k6's graceful stop (read before the warm-up)"
+                                if early_db is not None else "as covers"),
+                  "cgroup_covers": cgroup_covers}
     if code != 0:
         raise Failure(f"k6 exited {code}; see {run_dir / 'k6.log'}")
     # 3. A run during which HFS died is not a measurement of HFS.
     if hfs.process.poll() is not None:
         raise Failure(f"hfs exited {hfs.process.returncode} during the measurement: {hfs.tail()}")
-    metrics = analyse(k6_csv, run_dir / "requests.csv.gz", run_dir / "bins.csv", seconds, args.bin_seconds)
+    metrics = analyse(k6_csv, run_dir / "requests.csv.gz", run_dir / "bins.csv", seconds, args.bin_seconds,
+                      run_dir / "histogram.csv")
     k6_csv.unlink()
     record = container_record(container)
     peak_file = sampler.memory_peak_file()
@@ -1376,7 +2309,29 @@ def measure(args: argparse.Namespace, backend: Backend, hfs: Hfs, op: str, vus: 
             "host_slept_s": round(seconds_asleep(started, ended), 3),
         }
     )
+    if watching:
+        metrics.update(watch.summary())
+    metrics["skipped_collectors"] = ",".join(sorted(skip))
+    metrics["window"] = window
+    metrics.update(window_columns(window))
+    metrics["extra_metrics"] = extra
     return metrics
+
+
+COLLECTORS = ("metrics-scrape", "window", "host-watch")
+
+
+def skipped_collectors(args: argparse.Namespace) -> set:
+    """The run-time collectors `--skip-collectors` turns off, one at a time, to attribute an overhead."""
+    names = {name.strip() for name in (getattr(args, "skip_collectors", "") or "").split(",") if name.strip()}
+    unknown = names - set(COLLECTORS)
+    if unknown:
+        raise Failure(f"unknown collector {sorted(unknown)}; expected any of {COLLECTORS}")
+    return names
+
+
+def extra_metrics(args: argparse.Namespace) -> bool:
+    return getattr(args, "extra_metrics", "on") != "off"
 
 
 def run_status(metrics: dict) -> str:
@@ -1469,12 +2424,19 @@ def note_run_seconds(args: argparse.Namespace, backend: Backend, dataset: "Datas
 
 
 def host_fields(host: Optional[dict]) -> dict:
+    """The reading before the run. host_busy also takes the readings during it (busy_overall)."""
     if not host:
         return {}
     return {
-        "host": host, "host_busy": host["busy"], "host_load_1m": host["load_1m"],
+        "host": host, "host_busy": host["busy"], "host_busy_before": host["busy"], "host_load_1m": host["load_1m"],
         "host_foreign_cpu_pct": host["foreign_cpu_pct"], "host_docker_limits_gib": host["docker_limits_gib"],
+        "host_ci_jobs_before": host.get("ci_jobs", []),
     }
+
+
+def busy_overall(record: dict) -> bool:
+    """A run is busy if the host was busy before it or at any reading during it."""
+    return bool(record.get("host_busy_before") or record.get("host_busy_during"))
 
 
 def build_snapshot(args: argparse.Namespace, backend: Backend, dataset: "Dataset", volume: str, run_dir: Path) -> dict:
@@ -1482,14 +2444,25 @@ def build_snapshot(args: argparse.Namespace, backend: Backend, dataset: "Dataset
     log(f"{backend.label} {dataset.size}: building the snapshot")
     started = time.monotonic()
     backend.reset()
-    hfs = Hfs(args.hfs_bin, args.hfs_port, run_dir / "hfs-snapshot-build.log", backend.hfs_env())
+    hfs = Hfs(args.hfs_bin, args.hfs_port, run_dir / "hfs-snapshot-build.log", backend.hfs_env(), backend.hfs_log_checks())
     try:
         load = load_dataset(hfs.base, dataset)
         settle = backend.settle(flush=True)
+        checks = backend.verify_loaded()
     finally:
         hfs.stop()
-    backend.save_snapshot(volume)
-    return {"seconds": time.monotonic() - started, "load": load, "settle": settle}
+    provenance = {
+        "volume": volume, "built_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "built_by_label": args.label or "", "built_by_backend": backend.label, "hfs_commit": hfs_commit_of(args),
+        "schema_sha256": backend.schema_sha256(), "dataset_sha256": dataset.sha256, "fresh_keyspace": True,
+        "checks": checks,
+    }
+    backend.save_snapshot(volume, provenance)
+    return {"seconds": time.monotonic() - started, "load": load, "settle": settle, "provenance": provenance}
+
+
+def hfs_commit_of(args: argparse.Namespace) -> str:
+    return getattr(args, "hfs_commit", "") or ""
 
 
 def check_restored(hfs: Hfs, dataset: "Dataset") -> None:
@@ -1508,6 +2481,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         "label": args.label or "", "backend": backend.label, "profile": backend.profile,
         "size": dataset.size, "op": op, "concurrency": vus, "mode": args.mode,
         "target_rate": rate, "duration_s": args.duration, "warmup_s": args.warmup,
+        "max_vus": max_vus(args, vus) if args.mode == "open" else vus,
         "dataset_file": dataset.path.name, "dataset_sha256": dataset.sha256,
         "dataset_verified": dataset.verified, "reset": args.reset, "synchronous_commit": backend.baseline if backend.name == "postgres" else None,
         "hfs_commit": environment["hfs_commit"], "hfs_build_profile": environment["hfs_build_profile"],
@@ -1521,10 +2495,16 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
         return recorded.get("status") in ("ok", "not_implemented", "refused") and recorded.get("dataset_sha256") == dataset.sha256
 
     def cell_refused() -> bool:
-        path = cell_dir / "run1" / "run.json"
-        return args.resume and path.is_file() and json.loads(path.read_text(encoding="utf-8")).get("status") in ("not_implemented", "refused")
+        # Recorded by whichever run probed first: an interleaved night may reach run 2 first.
+        for path in sorted(cell_dir.glob("run*/run.json")) if args.resume else []:
+            if json.loads(path.read_text(encoding="utf-8")).get("status") in ("not_implemented", "refused"):
+                return True
+        return False
 
-    if cell_refused() or all(already_done(n) for n in range(1, args.runs + 1)):
+    # An interleaved night runs one repetition of a cell at a time (overnight's --order).
+    only = getattr(args, "only_run", None)
+    numbers = [only] if only else list(range(1, args.runs + 1))
+    if cell_refused() or all(already_done(n) for n in numbers):
         log(f"skip {cell_id(dataset.size, op, vus)}: already recorded")
         return True
 
@@ -1552,22 +2532,26 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                 timing["snapshot_build"] = build_snapshot(args, backend, dataset, volume, run_dir)
                 args.built_snapshots.append(volume)
                 started = time.monotonic()
+            # Which load this run measures: its marker, written when it was built.
+            timing["snapshot"] = backend.snapshot_provenance(volume) or {"volume": volume, "provenance": "unrecorded"}
             backend.restore_snapshot(volume, before_start)
         else:
             backend.reset(before_start)
-        hfs = Hfs(args.hfs_bin, args.hfs_port, run_dir / "hfs.log", backend.hfs_env())
+            timing["snapshot"] = {"volume": None, "fresh_keyspace": True, "reloaded": True}
+        timing["port_wait_s"] = round(backend.port_wait_s, 1)
+        hfs = Hfs(args.hfs_bin, args.hfs_port, run_dir / "hfs.log", backend.hfs_env(), backend.hfs_log_checks())
         timing["reset_and_boot_s"] = time.monotonic() - started
         return timing
 
     try:
-        for number in range(1, args.runs + 1):
+        for number in numbers:
             run_dir = cell_dir / f"run{number}"
             run_dir.mkdir(parents=True, exist_ok=True)
             record = dict(base_record, run=number, status="failed")
             if already_done(number):
                 continue
-            fresh = number == 1 or not args.no_reset
-            runs_left = sum(1 for later in range(number, args.runs + 1) if not already_done(later))
+            fresh = number == numbers[0] or not args.no_reset
+            runs_left = sum(1 for later in numbers if later >= number and not already_done(later))
             refusal = out_of_budget(args, backend, dataset, runs_left, fresh)
             if refusal:
                 args.budget_stopped = True
@@ -1577,6 +2561,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
             run_started = time.monotonic()
             try:
                 timing: dict = {}
+                early_db: Optional[dict] = None
                 if fresh:
                     dataset.check_before_load()
                     log(f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: reset")
@@ -1598,6 +2583,7 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                     else:
                         timing["load"] = load_dataset(hfs.base, dataset)
                         timing["settle_after_load"] = backend.settle(flush=True)
+                        timing["load_checks"] = backend.verify_loaded()
                     if op in SEARCH_OPS:
                         # After the settle, once PostgreSQL has statistics. A query
                         # that matches nothing would measure an empty answer.
@@ -1606,21 +2592,34 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                         timing["first_query_entries"] = entries
                         if not entries:
                             log(f"warning: {op}'s first query answered {code} with {entries} entries")
+                    early_db = early_db_counters(args, backend)
                     warm_up(args, hfs, op, vus, args.mode, rate, dataset, run_dir)
                     timing["settle_after_warmup"] = backend.settle(flush=False)
                 else:
+                    early_db = early_db_counters(args, backend)
                     timing["host"] = wait_for_quiet_host(0, backend)
                 record.update(host_fields(timing.get("host")))
                 backend_settings = backend.settings()
                 (run_dir / "db-settings.json").write_text(json.dumps(backend_settings, indent=1), encoding="utf-8")
                 backend.before_measure(run_dir)
+                # When, on the wall clock: legs of one cell measured far apart may meet a different host.
+                record["measure_started_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 log(f"{backend.label} {cell_id(dataset.size, op, vus)} run {number}: measure ({args.mode}, rate {rate}, {args.duration} s)")
-                metrics = measure(args, backend, hfs, op, vus, args.mode, rate, args.duration, dataset, run_dir)
+                metrics = measure(args, backend, hfs, op, vus, args.mode, rate, args.duration, dataset, run_dir,
+                                  early_db=early_db)
                 backend.collect(run_dir)
+                if extra_metrics(args):
+                    backend.extra_collect(run_dir)
                 environment["container"] = metrics["container"]
                 status = run_status(metrics)
                 ok = ok and status == "ok"
                 record.update(metrics, status=status, timing=timing, no_reset=bool(args.no_reset))
+                record["host_busy"] = busy_overall(record)
+                if record.get("host_busy_during"):
+                    log(f"warning: the host was busy during {cell_id(dataset.size, op, vus)} run {number}: "
+                        f"foreign CPU up to {metrics['host_foreign_cpu_max_pct']:.0f}%"
+                        + (f", CI jobs {metrics['host_ci_jobs_during']}" if metrics["host_ci_jobs_during"] else "")
+                        + "; recorded as host_busy")
                 if status == "host_slept":
                     record["failure"] = (f"the host slept {metrics['host_slept_s']:.0f} s during the measurement "
                                          f"(it took {metrics['measure_wall_s']:.0f} s for {args.duration} s); not a measurement")
@@ -1628,7 +2627,8 @@ def run_cell(args: argparse.Namespace, backend: Backend, dataset: Dataset, op: s
                         "recorded as host_slept, not ok; --resume measures it again")
                 log(
                     f"  completed {metrics['completed']} ok_rps {metrics['ok_rps']:.1f} "
-                    f"p50 {metrics['p50_ms']:.2f} p95 {metrics['p95_ms']:.2f} dropped {metrics['dropped_iterations']}"
+                    f"p50 {metrics['p50_ms']:.2f} p95 {metrics['p95_ms']:.2f} p99 {metrics['p99_ms']:.2f} "
+                    f"max {metrics['max_ms']:.2f} dropped {metrics['dropped_iterations']}"
                     + (f"; SATURATED, {metrics['drop_pct']:.1f}% of the schedule dropped: these latencies are only of the requests that got a VU"
                        if metrics["saturated"] else "")
                 )
@@ -1715,6 +2715,7 @@ def run_plan(args: argparse.Namespace) -> Tuple[Path, bool]:
         for size in args.sizes
     }
     environment = environment_record(args, backend)
+    args.hfs_commit = environment["hfs_commit"]
     if f"v{K6_VERSION}" not in environment["k6"]:
         raise Failure(f"k6 is not the pinned v{K6_VERSION}: {environment['k6']}; see fetch-k6")
     environment_path = out_root / f"environment-{backend.label}.json"
@@ -1754,20 +2755,46 @@ RUN_FIELDS = [
     "synchronous_commit", "hfs_commit", "hfs_build_profile", "dataset_file", "dataset_sha256",
     "dataset_verified", "memory_samples_missed", "host_busy", "host_load_1m", "host_foreign_cpu_pct",
     "host_docker_limits_gib", "host_slept_s", "measure_wall_s", "failure",
+] + [
+    # Added on 2026-11-28 (bench-checkpoint-prep), after every earlier column so readers by position still work.
+    "max_vus", "measure_started_utc", "extra_metrics", "skipped_collectors",
+    "host_busy_before", "host_busy_during", "host_foreign_cpu_max_pct", "host_ci_jobs_during",
+    # Latency, every response then 2xx only (ms); n is the request count each is over.
+    "n", "min_ms", "mean_ms", "stddev_ms", "p90_ms", "p999_ms", "p999_reliable", "p9999_ms", "p9999_reliable",
+    "n_ok", "min_ok_ms", "mean_ok_ms", "stddev_ok_ms", "max_ok_ms", "p90_ok_ms", "p999_ok_ms", "p999_ok_reliable",
+    "p9999_ok_ms", "p9999_ok_reliable",
+    "p95_ci_low_ms", "p95_ci_high_ms", "p99_ci_low_ms", "p99_ci_high_ms", "ci_method",
+    "p95_ok_ci_low_ms", "p95_ok_ci_high_ms", "p99_ok_ci_low_ms", "p99_ok_ci_high_ms", "ci_ok_method",
+] + [f"{name}_{stat}_ms" for name in STATUS_LATENCY_CLASSES for stat in ("p50", "p99", "max")] + [
+    f"k6_{phase}_{stat}_ms" for phase in K6_PHASES for stat in ("p50", "p99")] + [
+    "k6_data_sent_bytes", "k6_data_received_bytes",
+] + [column for column, *_ in WINDOW_COLUMNS] + [
+    "cassandra_dropped_messages", "cassandra_pending_after", "cassandra_blocked",
 ]
 
 SUMMARY_KEY = [
-    "label", "backend", "profile", "size", "op", "concurrency", "mode", "target_rate", "synchronous_commit",
+    "label", "backend", "profile", "size", "op", "concurrency", "max_vus", "mode", "target_rate", "synchronous_commit",
     "dataset_file", "dataset_sha256", "dataset_verified", "reset",
 ]
 
-SUMMARY_FIELDS = [field for field in SUMMARY_KEY if field != "reset"] + [
+# Every percentile and max, over the runs of a cell: mean, min, max and coefficient of variation.
+SPREAD_METRICS = ("p50_ms", "p90_ms", "p95_ms", "p99_ms", "p999_ms", "p9999_ms", "max_ms",
+                  "p50_ok_ms", "p90_ok_ms", "p95_ok_ms", "p99_ok_ms", "p999_ok_ms", "p9999_ok_ms", "max_ok_ms")
+
+SUMMARY_FIELDS = [field for field in SUMMARY_KEY if field not in ("reset", "max_vus")] + [
     "cell_status", "latency_reading", "saturated_runs", "runs_ok", "runs_recorded", "throughput_rps_mean", "throughput_rps_min",
     "throughput_rps_max", "throughput_cv_pct", "ok_rps_mean", "drop_pct_mean", "p50_ms_mean", "p50_cv_pct",
     "p95_ms_mean", "p95_cv_pct", "p99_ms_mean", "p50_ok_ms_mean", "p95_ok_ms_mean", "p99_ok_ms_mean", "s2xx", "s409", "s412", "s4xx_other", "s501",
     "s5xx_other", "s_other", "dropped_iterations", "steady_change_pct_mean", "reset", "mem_peak_used_mib",
     "mem_peak_anon_mib", "memory_peak_file_mib", "mem_limit_mib", "hfs_peak_rss_mib",
     "k6_peak_rss_mib", "oom_killed", "host_busy_runs", "host_slept_runs", "memory_samples_missed",
+] + [
+    # Added on 2026-11-28, after every earlier column.
+    "max_vus", "host_busy_during_runs",
+] + [f"{metric}_{stat}" for metric in SPREAD_METRICS for stat in ("mean", "min", "max", "cv_pct")
+     if f"{metric}_{stat}" not in ("p50_ms_mean", "p95_ms_mean", "p99_ms_mean", "p50_ok_ms_mean", "p95_ok_ms_mean", "p99_ok_ms_mean")] + [
+    "db_cpu_s_mean", "hfs_cpu_s_mean", "db_throttled_s_mean", "db_io_write_mib_mean", "cassandra_dropped_messages_total",
+    "pg_wal_mib_mean", "pg_deadlocks_total",
 ]
 
 
@@ -1857,7 +2884,20 @@ def summarize(out_root: Path) -> None:
                 host_slept_runs=sum(1 for m in members if m.get("status") == "host_slept"),
                 # Over the runs the peaks come from: a missed sample is a gap in them.
                 memory_samples_missed=total("memory_samples_missed"),
+                max_vus=key[SUMMARY_KEY.index("max_vus")],
+                host_busy_during_runs=sum(1 for m in members if m.get("host_busy_during")),
+                db_cpu_s_mean=mean("db_cpu_s"), hfs_cpu_s_mean=mean("hfs_cpu_s"),
+                db_throttled_s_mean=mean("db_throttled_s"), db_io_write_mib_mean=mean("db_io_write_mib"),
+                cassandra_dropped_messages_total=total("cassandra_dropped_messages") if column("cassandra_dropped_messages") else None,
+                pg_wal_mib_mean=mean("pg_wal_mib"),
+                pg_deadlocks_total=total("pg_deadlocks") if column("pg_deadlocks") else None,
             )
+            for metric in SPREAD_METRICS:
+                values = column(metric)
+                row.setdefault(f"{metric}_mean", statistics.fmean(values) if values else None)
+                row[f"{metric}_min"] = min(values) if values else None
+                row[f"{metric}_max"] = max(values) if values else None
+                row[f"{metric}_cv_pct"] = cv_pct(values)
             writer.writerow([fmt(row.get(field)) for field in SUMMARY_FIELDS])
     log(f"wrote {out_root / 'runs.csv'} and {out_root / 'summary.csv'}")
 
@@ -1905,6 +2945,14 @@ def add_run_arguments(parser: argparse.ArgumentParser, out_required: bool = True
     parser.add_argument("--docker-budget-gib", type=float, help="wait until running limits plus this leg's fit (for shared machines)")
     parser.add_argument("--note", help="free text recorded with the environment")
     parser.add_argument("--label", help="recorded with each run")
+    parser.add_argument("--extra-metrics", choices=("on", "off"), default="on",
+                        help="the host watch and the readings before and after each window (report-only); "
+                             "off is for the overhead control (default: %(default)s)")
+    parser.add_argument("--skip-collectors", default="",
+                        help="with --extra-metrics on, turn off some of: %s (diagnostic, for the overhead control)" % ",".join(COLLECTORS))
+    parser.add_argument("--max-vus-factor", type=int, default=1,
+                        help="open loop: k6's maxVUs is the concurrency times this; 1 is row 0.6's rule "
+                             "(an open question for Alan, see README \"Saturated runs\") (default: %(default)s)")
 
 
 # --- a stop the terminal cuts short ----------------------------------------------
@@ -2063,11 +3111,39 @@ def cmd_reap(args: argparse.Namespace) -> int:
         lock.close()  # after the plan is gone: a second reaper then finds nothing to do
 
 
-def reaper_at_work() -> Optional[Path]:
-    """The log of a reaper still finishing a stop (it holds its plan's lock), or None.
+def plan_overlaps(plan: dict, projects: Iterable[str], outs: Iterable[Path]) -> bool:
+    """Whether a stop's cleanup would touch what a starting command uses: its Compose projects or its results.
 
-    A plan nobody holds is a leftover (a reaper killed with -9) and is passed over.
+    A cleanup takes down only the projects its plan names and writes only into its
+    own output folders, so another project's stop (another worker's, on the same
+    machine and temporary directory) can't harm this start (pr76-delta4, m2).
     """
+    mine = set(projects)
+    for backend in plan.get("backends", []):
+        compose = backend.get("compose", [])
+        if "-p" in compose and compose.index("-p") + 1 < len(compose) and compose[compose.index("-p") + 1] in mine:
+            return True
+    wanted = {Path(out).expanduser().resolve() for out in outs if out}
+    named = [backend.get("out") for backend in plan.get("backends", [])]
+    named.append((plan.get("overnight") or {}).get("out_root"))
+    for out in named:
+        if out:
+            path = Path(out).resolve()
+            if any(path == w or w in path.parents or path in w.parents for w in wanted):
+                return True
+    return False
+
+
+def reaper_at_work(projects: Optional[Iterable[str]] = None, outs: Iterable[Path] = ()) -> Optional[Path]:
+    """The log of a stop still being cleaned up that this start would collide with, or None.
+
+    The plan's lock is held from the stop until its cleanup is over, by the stopped
+    harness's reaper. A plan nobody holds is a leftover (a reaper killed with -9) and
+    is passed over. Given `projects`, a plan that names none of them and none of
+    `outs` is passed over too; without them, any plan refuses.
+    """
+    projects = list(projects) if projects is not None else None
+    outs = list(outs)
     for plan in sorted(Path(tempfile.gettempdir()).glob("hfsbench-cleanup-*.json")):
         try:
             handle = plan.open("rb")
@@ -2076,6 +3152,13 @@ def reaper_at_work() -> Optional[Path]:
         with handle:
             if plan.with_suffix(".done").exists():
                 continue  # that harness finished its own cleanup; its reaper is only leaving
+            if projects is not None:
+                try:
+                    content = json.loads(handle.read().decode("utf-8"))
+                except ValueError:
+                    content = None  # unreadable: assume it is ours
+                if content is not None and not plan_overlaps(content, projects, outs):
+                    continue
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -2084,12 +3167,26 @@ def reaper_at_work() -> Optional[Path]:
     return None
 
 
-def require_no_reaper() -> None:
-    """Refuse to start while a stop is still being cleaned up: it would take this run's database down."""
-    log_path = reaper_at_work()
+def require_no_reaper(projects: Optional[Iterable[str]] = None, outs: Iterable[Path] = ()) -> None:
+    """Refuse to start while a stop of the same projects or results is still being cleaned up.
+
+    That cleanup would take this run's database down.
+    """
+    log_path = reaper_at_work(projects, outs)
     if log_path is not None:
-        raise Failure(f"a stopped run is still being cleaned up (its log is {log_path}): "
-                      "start again in a few seconds, once that log says the cleanup is done")
+        # The log stays empty while the stopped harness does the cleanup itself, and
+        # is removed when it finishes (pr76-delta4, m1).
+        raise Failure(f"a stopped run of the same Compose project or results is still being cleaned up "
+                      f"(its log is {log_path}): start again in a few seconds, once that log says the cleanup "
+                      "is done or the log is gone")
+
+
+def default_project(args: argparse.Namespace, backend: str) -> str:
+    return getattr(args, "project", None) or f"hfsbench-{backend}"
+
+
+def overnight_projects(args: argparse.Namespace) -> List[str]:
+    return [default_project(args, "cassandra"), default_project(args, "postgres")]
 
 
 # A stop that arrives while a cleanup is under way waits for it (cleanup_shield).
@@ -2170,7 +3267,7 @@ def stops_cleanly(command):
 
 @stops_cleanly
 def cmd_run(args: argparse.Namespace) -> int:
-    require_no_reaper()
+    require_no_reaper([default_project(args, args.backend)], [args.out])
     args.rates = args.rates if args.rates else HERE / "rates.json"
     if args.resume and args.no_reset:
         raise Failure("--resume cannot continue a --no-reset cell")
@@ -2180,7 +3277,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 @stops_cleanly
 def cmd_calibrate(args: argparse.Namespace) -> int:
-    require_no_reaper()
+    require_no_reaper([default_project(args, "postgres")], [args.out])
     args.resume = False
     args.label = "calibration"
     return run_calibration(args)
@@ -2232,17 +3329,60 @@ def run_calibration(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-LAPTOP_BANNER = (
-    "LAPTOP DRY RUN, NOT FOR THE REPORT. These are numbers from a laptop, for timings and for finding "
-    "bugs. ADR-aacruzgon-0002: laptop numbers never go in the report."
-)
+PURPOSES = {
+    "laptop-dry-run": (
+        "LAPTOP DRY RUN, NOT FOR THE REPORT. These are numbers from a laptop, for timings and for finding "
+        "bugs. ADR-aacruzgon-0002: laptop numbers never go in the report."
+    ),
+    "checkpoint": (
+        "CHECKPOINT RUN, NOT THE STEP 8 REPORT RUN. A comparison of the write path at one moment of the project, "
+        "on one machine; the report's numbers come from Step 8's own run (roadmap row 8.4)."
+    ),
+}
+LAPTOP_BANNER = PURPOSES["laptop-dry-run"]
 OVERNIGHT_LABEL = "laptop-dry-run"
 CALIBRATION_SECONDS = 60  # What `calibrate` measures per cell by default.
 BUDGET_MARGIN_SECONDS = 120
 
 
+def default_purpose() -> str:
+    return "laptop-dry-run" if platform.system() == "Darwin" else "checkpoint"
+
+
+def overnight_purpose(args: argparse.Namespace) -> str:
+    return getattr(args, "purpose", None) or default_purpose()
+
+
+def overnight_banner(args: argparse.Namespace) -> str:
+    return PURPOSES[overnight_purpose(args)]
+
+
+def leg_label(leg: dict) -> str:
+    return "cassandra" if leg["backend"] == "cassandra" else f"postgres-sync-{leg.get('baseline', 'on')}"
+
+
+def matrix_legs(ops: Sequence[str]) -> List[dict]:
+    """The legs of the matrix in their first order: PostgreSQL on, Cassandra, PostgreSQL off (writes only)."""
+    write_ops = [op for op in ops if op in ("create", "update")]
+    legs = [{"backend": "postgres", "baseline": "on", "ops": list(ops)},
+            {"backend": "cassandra", "ops": list(ops)}]
+    if write_ops:
+        legs.append({"backend": "postgres", "baseline": "off", "ops": write_ops})
+    return legs
+
+
 def overnight_parts(args: argparse.Namespace) -> List[dict]:
-    """The parts in the order they run. A part is a list of `run` plans sharing one purpose."""
+    """The parts in the order they run.
+
+    `--order interleaved` (the default): one part per repetition, and inside it
+    each cell's legs back to back, their order rotated from one repetition to
+    the next. A leg is never measured hours after the others it is compared
+    with, and each leg's three runs are spread across the night, so a host that
+    changes speed shows as spread between a leg's runs, not as a difference
+    between legs (pg-off-oddity, 2026-11-11). `--order blocks` keeps the old
+    order: each leg's whole matrix in turn.
+    """
+    purpose = overnight_purpose(args)
     ops = expand_ops(args.ops)
     write_ops = [op for op in ops if op in ("create", "update")]
     conc = args.concurrency
@@ -2250,26 +3390,56 @@ def overnight_parts(args: argparse.Namespace) -> List[dict]:
     parts: List[dict] = [{"name": "calibration", "kind": "calibrate", "backend": "postgres", "sizes": sizes,
                           "ops": ops, "concurrency": conc, "runs": 1, "out": "calibration",
                           "duration": min(args.duration, CALIBRATION_SECONDS),
-                          "label": f"{OVERNIGHT_LABEL}-calibration"}]
-    for size in sizes:
-        parts.append({"name": f"postgres-on-{size}", "kind": "run", "backend": "postgres", "baseline": "on",
-                      "sizes": [size], "ops": ops, "concurrency": conc, "runs": args.runs, "out": "matrix"})
-    for size in sizes:
-        parts.append({"name": f"cassandra-{size}", "kind": "run", "backend": "cassandra",
-                      "sizes": [size], "ops": ops, "concurrency": conc, "runs": args.runs, "out": "matrix"})
-    if write_ops:
-        parts.append({"name": "postgres-off", "kind": "run", "backend": "postgres", "baseline": "off",
-                      "sizes": sizes, "ops": write_ops, "concurrency": conc, "runs": args.runs, "out": "matrix"})
+                          "label": f"{purpose}-calibration"}]
+    if getattr(args, "order", "interleaved") == "interleaved":
+        for number in range(1, args.runs + 1):
+            parts.append({"name": f"matrix-run{number}", "kind": "interleaved", "legs": matrix_legs(ops),
+                          "sizes": sizes, "ops": ops, "concurrency": conc, "runs": args.runs, "run": number,
+                          "out": "matrix", "label": purpose})
+    else:
+        for size in sizes:
+            parts.append({"name": f"postgres-on-{size}", "kind": "run", "backend": "postgres", "baseline": "on",
+                          "sizes": [size], "ops": ops, "concurrency": conc, "runs": args.runs, "out": "matrix",
+                          "label": purpose})
+        for size in sizes:
+            parts.append({"name": f"cassandra-{size}", "kind": "run", "backend": "cassandra",
+                          "sizes": [size], "ops": ops, "concurrency": conc, "runs": args.runs, "out": "matrix",
+                          "label": purpose})
+        if write_ops:
+            parts.append({"name": "postgres-off", "kind": "run", "backend": "postgres", "baseline": "off",
+                          "sizes": sizes, "ops": write_ops, "concurrency": conc, "runs": args.runs, "out": "matrix",
+                          "label": purpose})
     for backend in ("cassandra", "postgres"):
         parts.append({"name": f"lwt-steady-{backend}", "kind": "run", "backend": backend, "baseline": "on",
                       "sizes": sizes[:1], "ops": ["create"], "concurrency": [max(conc)], "runs": 3, "out": "lwt-steady",
                       "mode": "closed", "duration": args.lwt_duration, "no_reset": True,
-                      "label": f"{OVERNIGHT_LABEL}-lwt-steady"})
+                      "label": f"{purpose}-lwt-steady"})
     return parts
 
 
+def interleaved_schedule(part: dict) -> List[Tuple[int, str, int, dict]]:
+    """(size, op, concurrency, leg) in the order an interleaved part runs them.
+
+    The legs of one cell run back to back. Their order turns by one place each
+    repetition, so each leg goes first, second and third once in three runs and
+    no leg always meets the host straight after the same other one.
+    """
+    number = part["run"]
+    schedule = []
+    for size in part["sizes"]:
+        for op in part["ops"]:
+            legs = [leg for leg in part["legs"] if op in leg["ops"]]
+            if legs:
+                turn = (number - 1) % len(legs)
+                legs = legs[turn:] + legs[:turn]
+            for vus in part["concurrency"]:
+                for leg in legs:
+                    schedule.append((size, op, vus, leg))
+    return schedule
+
+
 def overnight_preflight(args: argparse.Namespace, parts: List[dict]) -> None:
-    require_no_reaper()
+    require_no_reaper(overnight_projects(args), [args.out])
     require_free_port(args.hfs_port)
     for size in sorted({size for part in parts for size in part["sizes"]}):
         verify_dataset(args.dataset_dir.resolve() / f"patient-observation-{size}.ndjson", args.sha256sums.resolve())
@@ -2292,34 +3462,56 @@ def overnight_preflight(args: argparse.Namespace, parts: List[dict]) -> None:
     lines = run_cmd(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}"]).stdout.splitlines()
     others = [line for line in lines if not line.startswith("hfsbench-")]
     used = docker_limits_gib(others)
-    # 3 GiB per leg: legs run one at a time.
-    if used + 3 > args.docker_budget_gib:
-        raise Failure(f"docker budget: {used:.1f} GiB of limits are running, plus 3 for a leg is over {args.docker_budget_gib}; running: {others}")
-    log(f"preflight: docker limits {used:.1f} GiB running ({len(others)} containers) + 3 per leg, budget {args.docker_budget_gib}")
+    leg_gib = 5 if args.profile == "5g" else 3
+    # Legs run one at a time.
+    if args.docker_budget_gib and used + leg_gib > args.docker_budget_gib:
+        raise Failure(f"docker budget: {used:.1f} GiB of limits are running, plus {leg_gib} for a leg is over {args.docker_budget_gib}; running: {others}")
+    log(f"preflight: docker limits {used:.1f} GiB running ({len(others)} containers) + {leg_gib} per leg, "
+        f"budget {args.docker_budget_gib or 'none'}; profile {args.profile}")
     free = shutil.disk_usage(args.out).free / 1024**3
     if free < 20:
         log(f"warning: only {free:.0f} GiB free for results and Docker volumes")
+    host = host_load(Postgres(args))
+    if not host_is_quiet(host):
+        log(f"warning: the host is busy at the start: foreign CPU {host['foreign_cpu_pct']:.0f}%"
+            + (f", CI jobs {host['ci_jobs']}" if host.get("ci_jobs") else "") + "; every run records its own reading")
+
+
+def part_legs(part: dict) -> List[dict]:
+    return part.get("legs") or [{"backend": part.get("backend", "postgres"), "baseline": part.get("baseline", "on"),
+                                 "ops": part["ops"]}]
+
+
+DECLINED = ("not_implemented", "refused")
 
 
 def part_records(out_root: Path, part: dict) -> List[dict]:
+    """The run records that belong to a part: its label, sizes, legs and, for one repetition, its run."""
     label = part.get("label", OVERNIGHT_LABEL)
+    legs = {leg_label(leg): set(leg["ops"]) for leg in part_legs(part)}
+    only = part.get("run") if part.get("kind") == "interleaved" else None
     records = []
-    for path in sorted((out_root / part["out"]).rglob("run.json")):
+    directory = out_root / part["out"]
+    for path in sorted(directory.rglob("run.json")) if directory.is_dir() else []:
         record = json.loads(path.read_text(encoding="utf-8"))
-        if record.get("label") != label or record.get("size") not in part["sizes"] or record.get("op") not in part["ops"]:
+        if record.get("label") != label or record.get("size") not in part["sizes"]:
             continue
-        expected_backend = part["backend"] if part["backend"] == "cassandra" else f"postgres-sync-{part.get('baseline', 'on')}"
-        if record.get("backend") == expected_backend:
-            records.append(record)
+        if record.get("op") not in legs.get(record.get("backend"), set()):
+            continue
+        # A declined cell is recorded once, by whichever run probed it, and is done for every repetition.
+        if only is not None and record.get("run") != only and record.get("status") not in DECLINED:
+            continue
+        records.append(record)
     return records
 
 
 def part_counts(records: List[dict], part: dict) -> dict:
-    declined = {(r["size"], r["op"], r["concurrency"]) for r in records if r.get("status") in ("not_implemented", "refused")}
+    declined = {(r.get("backend"), r["size"], r["op"], r["concurrency"]) for r in records if r.get("status") in DECLINED}
     ok = [r for r in records if r.get("status") == "ok"]
+    runs = 1 if part.get("kind") == "interleaved" else part["runs"]
     # A cell the server declined is complete after its one probe.
-    done = len(ok) + len(declined) * part["runs"]
-    total = len(part["sizes"]) * len(part["ops"]) * len(part["concurrency"]) * part["runs"]
+    done = len(ok) + len(declined) * runs
+    total = sum(len(part["sizes"]) * len(leg["ops"]) * len(part["concurrency"]) for leg in part_legs(part)) * runs
     return {
         "ok": len(ok), "declined_cells": len(declined),
         "failed": sum(1 for r in records if r.get("status") in ("failed", "no_success")),
@@ -2331,11 +3523,117 @@ def part_counts(records: List[dict], part: dict) -> dict:
     }
 
 
-def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume_command: str) -> None:
+def parse_utc(text: Optional[str]) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(text) if text else None
+    except ValueError:
+        return None
+
+
+COMPARISON_FIELDS = ["size", "op", "concurrency", "run", "legs", "first_started_utc", "span_min",
+                     "host_busy_differs", "foreign_cpu_max_pct_spread"]
+
+
+def leg_comparisons(records: Sequence[dict]) -> List[dict]:
+    """For each cell and repetition measured on more than one leg: how far apart the legs ran, and on what host.
+
+    A difference between two legs is the backends' only if they met the same
+    host. span_min is the time between the first and last leg's start;
+    host_busy_differs says one leg's run met a busy host and another's didn't.
+    """
+    groups: Dict[Tuple, List[dict]] = collections.defaultdict(list)
+    for record in records:
+        if record.get("status") == "ok" and record.get("measure_started_utc"):
+            groups[(record["size"], record["op"], record["concurrency"], record.get("run"))].append(record)
+    rows = []
+    for (size, op, vus, number), members in sorted(groups.items(), key=lambda kv: tuple(str(k) for k in kv[0])):
+        if len({m["backend"] for m in members}) < 2:
+            continue
+        starts = [parse_utc(m["measure_started_utc"]) for m in members]
+        starts = [t for t in starts if t is not None]
+        cpu = [m.get("host_foreign_cpu_max_pct") for m in members if isinstance(m.get("host_foreign_cpu_max_pct"), (int, float))]
+        rows.append({
+            "size": size, "op": op, "concurrency": vus, "run": number,
+            "legs": ";".join(sorted(m["backend"] for m in members)),
+            "first_started_utc": min(starts).isoformat(timespec="seconds") if starts else "",
+            "span_min": round((max(starts) - min(starts)).total_seconds() / 60, 1) if starts else None,
+            "host_busy_differs": len({bool(m.get("host_busy")) for m in members}) > 1,
+            "foreign_cpu_max_pct_spread": round(max(cpu) - min(cpu), 1) if len(cpu) == len(members) else None,
+        })
+    return rows
+
+
+def write_comparisons(directory: Path) -> List[dict]:
+    """comparisons.csv beside runs.csv: one row per cell and repetition run on several legs."""
+    records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(directory.rglob("run.json"))] if directory.is_dir() else []
+    rows = leg_comparisons(records)
+    if directory.is_dir():
+        with (directory / "comparisons.csv").open("w", encoding="utf-8", newline="") as sink:
+            writer = csv.writer(sink)
+            writer.writerow(COMPARISON_FIELDS)
+            for row in rows:
+                writer.writerow([fmt(row.get(field)) for field in COMPARISON_FIELDS])
+    return rows
+
+
+def drift_lines(rows: Sequence[dict]) -> List[str]:
+    """The morning summary's section on host drift between the legs it compares."""
+    if not rows:
+        return ["No cell has been measured on two legs yet."]
+    spans = [row["span_min"] for row in rows if row["span_min"] is not None]
+    differs = [row for row in rows if row["host_busy_differs"]]
+    lines = [f"{len(rows)} cell repetitions were measured on two or more legs. The legs of one cell started "
+             f"at most {max(spans):.0f} min apart (median {statistics.median(spans):.0f} min)." if spans else
+             f"{len(rows)} cell repetitions were measured on two or more legs.",
+             "",
+             f"**{len(differs)} of them met a busy host on one leg and a quiet one on another**: compare those legs with care."
+             if differs else "None met a busy host on one leg and a quiet one on another."]
+    for row in differs[:20]:
+        lines.append(f"- `{row['size']}/{row['op']}/c{row['concurrency']}` run {row['run']}: {row['legs']}")
+    if len(differs) > 20:
+        lines.append(f"- and {len(differs) - 20} more, in `comparisons.csv`")
+    lines += ["", "Each leg's own runs are spread across the night, so `throughput_cv_pct` and `p95_cv_pct` in "
+              "`summary.csv` show how much the host changed under one leg. `comparisons.csv` has every row."]
+    return lines
+
+
+def latency_lines(directory: Path) -> List[str]:
+    """The morning summary's table of each measured cell: throughput, drops and the 2xx latency, means over its runs."""
+    path = directory / "summary.csv"
+    if not path.is_file():
+        return ["No cell has been measured yet."]
+    with path.open(encoding="utf-8", newline="") as source:
+        rows = [row for row in csv.DictReader(source) if row.get("runs_ok") not in ("", "0", None)]
+    if not rows:
+        return ["No cell has been measured yet."]
+
+    def number(row: dict, name: str, digits: int = 2) -> str:
+        value = row.get(name, "")
+        try:
+            return f"{float(value):.{digits}f}"
+        except ValueError:
+            return ""
+
+    lines = ["Means over each cell's ok runs, 2xx responses only, in ms. `summary.csv` has every figure.", "",
+             "| Leg | Size | Op | c | max VUs | Runs ok | ok/s | Dropped % | p50 | p95 | p99 | max | Saturated runs |",
+             "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    rows.sort(key=lambda r: (int(r["size"] or 0), r["op"], int(r["concurrency"] or 0), r["backend"]))
+    for row in rows:
+        lines.append(f"| {row['backend']} | {row['size']} | {row['op']} | {row['concurrency']} | {row.get('max_vus', '')} | "
+                     f"{row['runs_ok']} | {number(row, 'ok_rps_mean', 1)} | {number(row, 'drop_pct_mean', 1)} | "
+                     f"{number(row, 'p50_ok_ms_mean')} | {number(row, 'p95_ok_ms_mean')} | {number(row, 'p99_ok_ms_mean')} | "
+                     f"{number(row, 'max_ok_ms_mean')} | {row.get('saturated_runs', '')} |")
+    return lines
+
+
+def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume_command: str,
+                          banner: str = LAPTOP_BANNER, title: str = "Overnight dry run") -> None:
     finished = datetime.now(timezone.utc)
     budget_end = datetime.fromisoformat(state["budget_end_utc"])
     against_budget = round((finished - budget_end).total_seconds() / 60)
-    lines = [f"# Overnight dry run, {out_root.name}", "", f"**{LAPTOP_BANNER}**", "",
+    banner = state.get("banner", banner)
+    title = state.get("title", title)
+    lines = [f"# {title}, {out_root.name}", "", f"**{banner}**", "",
              f"Started {state['started_utc']}, finished {finished.isoformat(timespec='seconds')}. "
              f"Budget {state['hours']} h, ending {state['budget_end_utc']}: "
              + (f"finished {against_budget} min after the end of the budget." if against_budget > 0
@@ -2358,10 +3656,18 @@ def write_morning_summary(out_root: Path, state: dict, parts: List[dict], resume
         failures += [f"- `{r['backend']} {r['size']}/{r['op']}/c{r['concurrency']} run {r['run']}`: {r.get('status')}: {str(r.get('failure', ''))[:300]}"
                      for r in records if r.get("status") in ("failed", "no_success", "host_slept")]
     lines += ["", "## Failed or refused", ""] + (failures or ["None."])
+    lines += ["", "## Host drift between legs", ""] + drift_lines(write_comparisons(out_root / "matrix"))
+    lines += ["", "## Latency by cell", ""] + latency_lines(out_root / "matrix")
     lines += ["", "## What is left", ""]
     lines += [f"Continue, from the directory this run was started in, with:\n\n```bash\n{resume_command}\n```"] if left_any else ["Nothing: every part is complete."]
-    lines += ["", f"Results are under `{out_root}`: `matrix/`, `calibration/` and `lwt-steady/`, each with `runs.csv` and `summary.csv`."]
+    lines += ["", f"Results are under `{out_root}`: `matrix/`, `calibration/` and `lwt-steady/`, each with `runs.csv` and `summary.csv`, and `matrix/comparisons.csv`."]
     (out_root / "morning-summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # The markers a watcher waits on: FINISHED once the night has ended, however
+    # it ended; COMPLETE only if nothing is left to resume.
+    (out_root / "FINISHED").write_text(f"{finished.isoformat(timespec='seconds')} {state['stopped_by']}\n", encoding="utf-8")
+    if not left_any:
+        (out_root / "COMPLETE").write_text(finished.isoformat(timespec="seconds") + "\n", encoding="utf-8")
+
 
 
 def resume_arguments(argv: Sequence[str]) -> List[str]:
@@ -2382,7 +3688,13 @@ def cmd_overnight(args: argparse.Namespace) -> int:
     global LOG_SINK
     # It catches the stop itself, to save the state and write the morning summary.
     stopping = stop_on_signals()
-    args.profile = "3g"
+    # The 3 GiB profile is the only one an 8.8 GiB Docker VM fits; elsewhere the report's 5 GiB (ADR-aacruzgon-0002).
+    if not args.profile:
+        args.profile = "3g" if platform.system() == "Darwin" else "5g"
+    if args.docker_budget_gib is None and platform.system() == "Darwin":
+        args.docker_budget_gib = 8.3  # The Mac's shared budget (step3/docker-budget.md).
+    args.purpose = overnight_purpose(args)
+    banner = overnight_banner(args)
     if args.resume and args.out is None:
         raise Failure("--resume needs --out, the directory named in the morning summary")
     out_root = (args.out or Path.home() / "hfs-bench" / datetime.now().strftime("%Y-%m-%d")).expanduser().resolve()
@@ -2394,8 +3706,12 @@ def cmd_overnight(args: argparse.Namespace) -> int:
         raise Failure(f"{out_root} already holds an overnight run: pass --resume to continue it, or another --out")
     parts = overnight_parts(args)
     overnight_preflight(args, parts)
-    (out_root / "NOT-FOR-REPORT.txt").write_text(LAPTOP_BANNER + "\n", encoding="utf-8")
+    (out_root / "NOT-FOR-REPORT.txt").write_text(banner + "\n", encoding="utf-8")
+    for marker in ("FINISHED", "COMPLETE"):
+        (out_root / marker).unlink(missing_ok=True)
     LOG_SINK = (out_root / "overnight.log").open("a", encoding="utf-8")
+    log(f"overnight {args.purpose}: order {args.order}, profile {args.profile}, runs {args.runs}, "
+        f"duration {args.duration} s, warm-up {args.warmup} s, max-vus-factor {args.max_vus_factor}")
     if platform.system() == "Darwin":
         # Held until this process exits, so one process is all there is to stop.
         subprocess.Popen(["caffeinate", "-dimsu", "-w", str(os.getpid())],
@@ -2404,14 +3720,16 @@ def cmd_overnight(args: argparse.Namespace) -> int:
     state = json.loads(state_path.read_text(encoding="utf-8")) if args.resume and state_path.exists() else {"parts": {}}
     started_at = datetime.now(timezone.utc)
     state.update(started_utc=started_at.isoformat(timespec="seconds"), hours=args.hours, stopped_by="running",
-                 budget_end_utc=(started_at + timedelta(hours=args.hours)).isoformat(timespec="seconds"))
+                 budget_end_utc=(started_at + timedelta(hours=args.hours)).isoformat(timespec="seconds"),
+                 banner=banner, title="Overnight dry run" if args.purpose == "laptop-dry-run" else "Overnight checkpoint run",
+                 purpose=args.purpose, order=args.order, profile=args.profile)
     # On the wall clock: a sleeping Mac must not push the end of the night out.
     deadline = time.time() + args.hours * 3600 - BUDGET_MARGIN_SECONDS
     run_seconds: Dict[Tuple[str, int], float] = {}
-    rates_path = out_root / "rates-laptop-dry-run.json"
+    rates_path = out_root / f"rates-{args.purpose}.json"
     resume_command = shlex.join(
-        ["python3", str(Path(__file__).resolve()), "overnight", "--resume", "--out", str(out_root), "--hours", "8",
-         *resume_arguments(sys.argv[2:])])
+        ["python3", str(Path(__file__).resolve()), "overnight", "--resume", "--out", str(out_root),
+         "--hours", f"{args.hours:g}", *resume_arguments(sys.argv[2:])])
 
     def save_state() -> None:
         # Whole or not at all: a signal can arrive during the write.
@@ -2440,39 +3758,52 @@ def cmd_overnight(args: argparse.Namespace) -> int:
             CLEANUP["overnight"]["part_started"] = None
             # An error from an earlier night is about that attempt; this one records its own.
             entry.pop("error", None)
-            plan = argparse.Namespace(**vars(args))
-            plan.backend = part["backend"]
-            plan.baseline = part.get("baseline", "on")
-            plan.out = out_root / part["out"]
-            plan.sizes = part["sizes"]
-            plan.ops = ",".join(part["ops"])
-            plan.concurrency = part["concurrency"]
-            plan.runs = part["runs"]
-            plan.mode = part.get("mode", "open")
-            plan.no_reset = part.get("no_reset", False)
-            plan.duration = part.get("duration", args.duration)
-            plan.label = part.get("label", OVERNIGHT_LABEL)
-            plan.note = f"{LAPTOP_BANNER} {args.note or ''}".strip()
-            plan.rate = None
-            plan.rates = rates_path
-            plan.resume = True
-            plan.unverified_dataset = False
-            plan.keep_snapshots = True
-            plan.deadline = deadline
-            plan.run_seconds = run_seconds
-            plan.budget_stopped = False
-            plan.budget_stop_reason = None
+            def plan_for(backend: str, baseline: str, sizes: List[int], ops: Sequence[str],
+                         concurrency: List[int], only_run: Optional[int] = None) -> argparse.Namespace:
+                plan = argparse.Namespace(**vars(args))
+                plan.backend = backend
+                plan.baseline = baseline
+                plan.out = out_root / part["out"]
+                plan.sizes = sizes
+                plan.ops = ",".join(ops)
+                plan.concurrency = concurrency
+                plan.runs = part["runs"]
+                plan.only_run = only_run
+                plan.mode = part.get("mode", "open")
+                plan.no_reset = part.get("no_reset", False)
+                plan.duration = part.get("duration", args.duration)
+                plan.label = part.get("label", OVERNIGHT_LABEL)
+                plan.note = f"{banner} {args.note or ''}".strip()
+                plan.rate = None
+                plan.rates = None if plan.mode == "closed" else rates_path
+                plan.resume = True
+                plan.unverified_dataset = False
+                plan.keep_snapshots = True
+                plan.deadline = deadline
+                plan.run_seconds = run_seconds
+                plan.budget_stopped = False
+                plan.budget_stop_reason = None
+                return plan
+
             # Awake time: the monotonic clock stops while the host sleeps (Took (awake) in the summary).
             started = time.monotonic()
             CLEANUP["overnight"]["part_started"] = started  # so a reaper can add this part's time
+            plan = plan_for(part.get("backend", "postgres"), part.get("baseline", "on"), part["sizes"], part["ops"],
+                            part["concurrency"])
             try:
                 if part["kind"] == "calibrate":
                     plan.rates_out = rates_path
                     code = run_calibration(plan)
                     ok = code == 0
+                elif part["kind"] == "interleaved":
+                    ok = True
+                    for size, op, vus, leg in interleaved_schedule(part):
+                        plan = plan_for(leg["backend"], leg.get("baseline", "on"), [size], [op], [vus], part["run"])
+                        _, leg_ok = run_plan(plan)
+                        ok = ok and leg_ok
+                        if plan.budget_stopped:
+                            break
                 else:
-                    if plan.mode == "closed":
-                        plan.rates = None
                     _, ok = run_plan(plan)
             except Failure as failure:
                 ok = False
@@ -2554,7 +3885,7 @@ def check_clean(base: str, dirt: dict) -> dict:
 @stops_cleanly
 def cmd_snapshot_check(args: argparse.Namespace) -> int:
     """Measure a reset by reloading against a snapshot restore, and that a restore is exact."""
-    require_no_reaper()
+    require_no_reaper([default_project(args, args.backend)], [args.out])
     args.reset = "snapshot"
     backend: Backend = Cassandra(args) if args.backend == "cassandra" else Postgres(args)
     out_root = args.out.resolve()
@@ -2566,7 +3897,7 @@ def cmd_snapshot_check(args: argparse.Namespace) -> int:
     log_path = out_root / f"hfs-snapshot-check-{backend.name}.log"
 
     def start() -> Hfs:
-        return Hfs(args.hfs_bin, args.hfs_port, log_path, backend.hfs_env())
+        return Hfs(args.hfs_bin, args.hfs_port, log_path, backend.hfs_env(), backend.hfs_log_checks())
 
     all_clean = True
     CLEANUP["plans"][id(args)] = (backend, args, None, [volume])
@@ -2666,7 +3997,11 @@ def cmd_fetch_k6(args: argparse.Namespace) -> int:
                 bundle.extractall(destination.parent)
         else:
             with tarfile.open(archive) as bundle:
-                bundle.extractall(destination.parent)
+                # The checksum is verified; the data filter also refuses odd members (Python 3.12+, backported).
+                if hasattr(tarfile, "data_filter"):
+                    bundle.extractall(destination.parent, filter="data")
+                else:
+                    bundle.extractall(destination.parent)
     binary.chmod(0o755)
     print(binary)
     return 0
@@ -2709,7 +4044,15 @@ def build_parser() -> argparse.ArgumentParser:
     overnight_parser.add_argument("--runs", type=int, default=3)
     overnight_parser.add_argument("--resume", action="store_true", help="continue the overnight run in --out")
     overnight_parser.add_argument("--lwt-duration", type=int, default=600, help="seconds of each LWT steady-state run (default: %(default)s)")
-    overnight_parser.set_defaults(handler=cmd_overnight, docker_budget_gib=8.3, backend="postgres", baseline="on")
+    overnight_parser.add_argument("--order", choices=("interleaved", "blocks"), default="interleaved",
+                                  help="interleaved: each cell's legs back to back, one repetition at a time; "
+                                       "blocks: each leg's whole matrix in turn (default: %(default)s)")
+    overnight_parser.add_argument("--purpose", choices=sorted(PURPOSES),
+                                  help="what the night is, written on every run and the summary "
+                                       "(default: laptop-dry-run on macOS, checkpoint elsewhere)")
+    # --profile: 3g on macOS, 5g elsewhere; --docker-budget-gib: 8.3 on macOS, none elsewhere.
+    overnight_parser.set_defaults(handler=cmd_overnight, docker_budget_gib=None, profile=None,
+                                  backend="postgres", baseline="on")
 
     summarize_parser = commands.add_parser("summarize", help="rewrite runs.csv and summary.csv from the run records")
     summarize_parser.add_argument("out", type=Path)

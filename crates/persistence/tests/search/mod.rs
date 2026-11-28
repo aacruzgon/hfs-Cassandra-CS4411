@@ -58,6 +58,9 @@ pub mod chained_tests;
 /// The date component of a composite compares as a point on a Period's start,
 /// not as the range a date parameter compares (#1391).
 pub mod composite_period_pin;
+/// Backend-agnostic scenarios for `instant` targets, shared with the
+/// PostgreSQL, MongoDB and Elasticsearch test binaries via `#[path]` (#2962).
+pub mod date_instant_suite;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1293, #1295, #1296, #1297).
 /// Backend-agnostic scenarios, shared with the PostgreSQL and MongoDB test
@@ -122,7 +125,13 @@ pub mod tiebreak_order_suite;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1379).
 pub mod token_code_system_suite;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#2965).
+pub mod token_system_only_suite;
 pub mod token_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL test binary via
+/// `#[path]` (#2731).
+pub mod unfiltered_date_sort_suite;
 
 /// The shared Period table (#1391): a Period is one range, a missing side is
 /// unbounded, and every prefix follows the FHIR rules for range targets.
@@ -132,6 +141,43 @@ pub mod token_tests;
 async fn date_period_targets_are_ranges() {
     let backend = make_sqlite_backend();
     date_period_suite::period_targets_are_ranges(&backend, "date-period").await;
+}
+
+/// The shared `instant` table (#2962): an `instant` is a point, so a
+/// millisecond search finds one written to the second, and a `dateTime` with
+/// the same text keeps its one-second range. PostgreSQL, MongoDB and
+/// Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn date_instant_targets_are_points() {
+    let backend = make_sqlite_backend();
+    date_instant_suite::instant_targets_are_points(&backend, "date-instant").await;
+}
+
+/// The backend's configured FHIR version decides which elements are
+/// `instant`s (#2962): R6 makes `DiagnosticReport.issued` a `dateTime`.
+/// PostgreSQL, MongoDB and Elasticsearch run the same three.
+#[cfg(all(feature = "sqlite", feature = "R6"))]
+#[tokio::test]
+async fn date_instant_types_follow_an_r6_backend() {
+    let backend = make_sqlite_backend_for(FhirVersion::R6);
+    date_instant_suite::r6_backend_types_by_r6(&backend, "date-instant-r6").await;
+}
+
+/// The R4 control for `date_instant_types_follow_an_r6_backend`.
+#[cfg(all(feature = "sqlite", feature = "R4"))]
+#[tokio::test]
+async fn date_instant_types_follow_an_r4_backend() {
+    let backend = make_sqlite_backend_for(FhirVersion::R4);
+    date_instant_suite::r4_backend_types_by_r4(&backend, "date-instant-r4").await;
+}
+
+/// R5's `ImagingSelection.issued`, an `instant` that R4 does not have.
+#[cfg(all(feature = "sqlite", feature = "R5"))]
+#[tokio::test]
+async fn date_instant_types_follow_an_r5_backend() {
+    let backend = make_sqlite_backend_for(FhirVersion::R5);
+    date_instant_suite::r5_backend_types_by_r5(&backend, "date-instant-r5").await;
 }
 
 /// The shared quantity `Range` table (#2602): a `Range` is one closed
@@ -167,6 +213,19 @@ async fn empty_compartment_membership_matches_nothing() {
 async fn sort_missing_values_sort_last() {
     let backend = make_sqlite_backend();
     sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing", true).await;
+}
+
+/// An unfiltered sort by a date parameter read from the date index returns what
+/// the general path returns, page by page and cursor by cursor (#2731).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn unfiltered_date_sort_matches_the_general_path() {
+    let backend = make_sqlite_backend();
+    unfiltered_date_sort_suite::unfiltered_date_sort_matches_the_general_path(
+        &backend,
+        "unfiltered-date-sort",
+    )
+    .await;
 }
 
 /// `_sort` on `_tag`, `_security`, `_profile` and `_source` orders by the

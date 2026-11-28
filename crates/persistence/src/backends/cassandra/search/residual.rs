@@ -36,7 +36,11 @@ impl CassandraBackend {
         row: ResourceRow,
         body: &Json,
     ) -> LoadedResource {
-        let extractor = SearchParameterExtractor::new(self.registries.for_tenant(tenant_id));
+        // The resource's own version decides which of its elements are
+        // `instant`s, extracted as points (HeliosSoftware/hfs#2962; #128,
+        // item 3: "under the resource's own `fhir_version`").
+        let extractor =
+            SearchParameterExtractor::new(self.registries.for_tenant(tenant_id), row.fhir_version);
         let extracted = residual_values(&extractor, resource_type, body).unwrap_or_else(|error| {
             // No values: every residual then fails to match, so a resource
             // whose values cannot be read is hidden, never shown unfiltered.

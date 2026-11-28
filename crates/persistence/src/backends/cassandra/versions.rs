@@ -71,8 +71,10 @@ use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, 
 use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
-/// R3, reduced to what `vread` needs (walkthrough section 2, "Reads").
-const SELECT_VERSION: &str = "SELECT data, last_updated, deleted_at, fhir_version \
+/// R3, reduced to what `vread` needs (walkthrough section 2, "Reads"). Repair
+/// on read reads R1's version row with it too, so the row it checks is the
+/// one vread would open (ADR-aacruzgon-0097).
+pub(super) const SELECT_VERSION: &str = "SELECT data, last_updated, deleted_at, fhir_version \
      FROM resource_versions \
      WHERE tenant_id = ? AND resource_type = ? AND id = ? AND version_id = ?";
 
@@ -148,6 +150,28 @@ fn stored_version(
     version_id: &str,
     row: &Row,
 ) -> StorageResult<StoredResource> {
+    let (last_updated, deleted_at, content) = decode_version(row)?;
+    Ok(StoredResource::from_storage(
+        resource_type,
+        id,
+        version_id,
+        tenant.tenant_id().clone(),
+        content,
+        last_updated,
+        last_updated,
+        deleted_at,
+        fhir_version_of(row),
+    ))
+}
+
+/// What vread decodes from a row of [`SELECT_VERSION`]: its `last_updated`,
+/// its `deleted_at`, and its content, `null` for a marker. An error is what
+/// vread answers as a 500: a row with no `last_updated`, or with neither
+/// `deleted_at` nor `data` that parses as JSON. Repair on read checks R1's
+/// version row with it (ADR-aacruzgon-0097).
+pub(super) fn decode_version(
+    row: &Row,
+) -> StorageResult<(DateTime<Utc>, Option<DateTime<Utc>>, Json)> {
     let last_updated: DateTime<Utc> = row
         .get_r_by_name("last_updated")
         .map_err(|error| internal(format!("vread: last_updated: {error}")))?;
@@ -162,17 +186,7 @@ fn stored_version(
                 .map_err(|error| internal(format!("vread: stored JSON: {error}")))?
         }
     };
-    Ok(StoredResource::from_storage(
-        resource_type,
-        id,
-        version_id,
-        tenant.tenant_id().clone(),
-        content,
-        last_updated,
-        last_updated,
-        deleted_at,
-        fhir_version_of(row),
-    ))
+    Ok((last_updated, deleted_at, content))
 }
 
 impl CassandraBackend {
@@ -1137,7 +1151,14 @@ mod node_tests {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
         };
-        let t = tenant("wm-between");
+        // Plants a CAS with no version or index rows: the post-suite check skips `test-planted-`.
+        let t = TenantContext::new(
+            TenantId::new(format!(
+                "test-planted-l2c-wm-between-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        );
         for (method, deleting) in [
             ("update", false),
             ("update", true),

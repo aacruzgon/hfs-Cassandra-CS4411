@@ -22,8 +22,18 @@
 //!   [`parity`] lists them on `EXCLUDED`, with the reason;
 //! - **`test_pagination_with_filter` is `#[ignore]`d until date search
 //!   answers** (#132): it pages a date-only `birthdate=sa1970-01-01`
-//!   search. The other 8 run, on the framework's unfiltered search (#128,
-//!   row 6.2). Its `#[ignore]` goes in the commit that makes it pass.
+//!   search. Its `#[ignore]` goes in the commit that makes it pass. The
+//!   other 8 pass on the framework's unfiltered search (#128, row 6.2);
+//! - **`test_pagination_total` checks nothing on Cassandra.** It asserts
+//!   only inside `if let Some(total)`, and Cassandra leaves `total` unset
+//!   unless `_total` asks for one, as search.html#total allows, so it
+//!   passes whatever the count. Totals are tested by the framework's own
+//!   tests, and will be by the copy of `total_mode_suite.rs` that Step 6's
+//!   exit criterion asks for.
+//!
+//! **Not compiled in CI yet:** `tests/cassandra_tests.rs` (Sara's file) has
+//! no `#[path] mod` line for this file, which has been asked of her, so CI
+//! neither builds nor runs it until then.
 //!
 //! [`parity`] reads `tests/search/pagination_tests.rs` when it runs, so an
 //! upstream sync that adds, renames or removes a test there, or changes the

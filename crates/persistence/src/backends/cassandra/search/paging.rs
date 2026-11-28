@@ -21,8 +21,6 @@
 //!
 //! [`PageCursor`]: crate::types::PageCursor
 
-#![allow(dead_code)] // The search engine (#128) calls it; until then only its tests and search.rs's types do. #128 removes this.
-
 use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, SecondsFormat, Utc};
 
@@ -32,6 +30,7 @@ use crate::error::{BackendError, SearchError, StorageResult};
 use crate::types::{CursorDirection, CursorValue, PageCursor};
 
 /// The order a search's candidates stream in, which the plan decides.
+#[allow(dead_code)] // 6b's date plans (#132) return the date orders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Order {
     /// `(last_updated DESC, id DESC)`, on every table but the two date tables
@@ -115,6 +114,7 @@ pub(crate) enum Position {
 
 impl Position {
     /// The order this position is in.
+    #[allow(dead_code)] // For 6b's date plans (#132).
     pub(crate) fn order(&self) -> Order {
         match self {
             Position::First(order) | Position::After { order, .. } => *order,

@@ -3,13 +3,17 @@
 //!
 //! The date residuals (dates beside another parameter, 5.8) and the
 //! compartment filter (5.11, G33) both read one extraction of the loaded
-//! `resources` row, never a second. It is the write path's extraction: the
+//! `resources` row, never a second. It uses the write path's extractor, the
 //! shared `SearchParameterExtractor` with the tenant's registry
-//! (`CassandraBackend::index_keys_of`, `C/write.rs`), so a residual sees the
-//! values the index rows were written from. A debug build runs it on a
-//! thread with a large stack, as the write path does
-//! (`C/index_keys.rs`, `extract_index_keys`): a deep FHIRPath union in a
-//! SearchParameter expression overflows a 2 MiB debug stack
+//! (`CassandraBackend::index_keys_of`, `C/write.rs`), but under the
+//! resource's own `fhir_version` (#128, item 3), where the write path uses
+//! the backend's configured one. The two differ only for a resource stored
+//! under another version, whose `instant` elements (HeliosSoftware/hfs#2962)
+//! a date residual may then read differently from its index rows.
+//!
+//! A debug build runs it on a thread with a large stack, as the write path
+//! does (`C/index_keys.rs`, `extract_index_keys`): a deep FHIRPath union in
+//! a SearchParameter expression overflows a 2 MiB debug stack
 //! (HeliosSoftware/hfs#3025), and a stack overflow aborts the process.
 //!
 //! This is the framework's own file (ADR-anastasiabryz-0001; #128).
@@ -59,9 +63,12 @@ impl CassandraBackend {
 /// Whether `loaded` is a member of `compartment` (walkthrough 5.11, G33):
 /// one of its `IndexValue::Reference` values of the compartment's params
 /// equals `strip_reference_version(reference)`, or starts with it followed
-/// by `/_history/`, the rule SQLite and MongoDB apply to their reference
-/// rows. A compartment with no params has no members: it is never read as
-/// "no compartment".
+/// by `/_history/`. That is MongoDB's rule (`compartment_membership_filter`,
+/// `backends/mongodb/search_impl.rs`). SQLite also matches an absolute-URL
+/// reference such as `https://example.org/fhir/Patient/123`, through its
+/// `value_reference_target` column; Cassandra, like MongoDB, does not. A
+/// compartment with no params has no members: it is never read as "no
+/// compartment".
 pub(super) fn in_compartment(loaded: &LoadedResource, compartment: &CompartmentMembership) -> bool {
     let base = strip_reference_version(&compartment.reference);
     let versioned = format!("{base}/_history/");

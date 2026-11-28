@@ -558,6 +558,46 @@ mod node_tests {
         );
     }
 
+    /// A resource the plan streams at two order keys is kept once on a page
+    /// (bundle.html#bundle-unique: "A given version of a resource SHALL only
+    /// appear once in each Bundle"), and a kept candidate's leftover stale
+    /// row, beside its live one, is still queued for repair (the module docs,
+    /// step 2).
+    #[tokio::test]
+    async fn a_resource_is_kept_once_and_its_leftover_row_repaired() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-engine-kept-once");
+        let made = create_patients(&backend, &tenant, 2).await;
+        let day = |n: i64| {
+            DateTime::<Utc>::from_timestamp(0, 0).unwrap() + chrono::Duration::days(10_000 + n)
+        };
+        let (a, b) = (&made[0].1, &made[1].1);
+        let mut leftover = date_candidate(day(3), b, 1);
+        leftover.rows.push(FoundRow {
+            key: IndexKey::Date {
+                param: "birthdate".to_string(),
+                start: day(3).timestamp_millis(),
+                end: day(3).timestamp_millis() + 1,
+            },
+            last_updated: None,
+            version_id: 99,
+        });
+        let plan = ListPlan(vec![
+            date_candidate(day(1), a, 1),
+            date_candidate(day(2), a, 1), // the same resource, another order key
+            leftover,
+        ]);
+        let before = backend.repair_stats();
+
+        let pages = every_page(&backend, &tenant, &plan, 10).await;
+        assert_eq!(ids(&pages), [a.clone(), b.clone()], "each resource once");
+        let ran = backend.repair_stats().since(&before);
+        assert_eq!(ran.queued, 1, "b's leftover row was queued: {ran:?}");
+    }
+
     /// A non-driving token or URI plan: `contains` is true for these ids,
     /// and only when asked at the resource's own `last_updated`, as the
     /// clustering point read is (walkthrough 5.8).

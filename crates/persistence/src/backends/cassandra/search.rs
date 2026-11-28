@@ -1,11 +1,14 @@
 //! [`SearchProvider`] and [`SearchCapabilityProvider`] for
 //! [`CassandraBackend`].
 //!
-//! `search` and `search_count` are Step 6's; until then they return
-//! `UnsupportedCapability` (501), and `supports_search` is `false`, so
-//! `/metadata` lists no `search-type` and no search parameters (roadmap Step 7,
-//! ADR-aacruzgon-0085). `search_param_registry` is real from Step 2 on, because
-//! the CapabilityStatement, batch, compartment, `$everything`, bulk export and
+//! `search` and `search_count` validate the query (row 6.1), then serve
+//! `_id`, `_lastUpdated`, the unfiltered type search and every parameter
+//! whose module has landed; a parameter whose module has not answers 501.
+//! `supports_search` stays `false` until Step 6's last commit declares
+//! `BasicSearch`, so `/metadata` lists no `search-type` and no search
+//! parameters (roadmap Step 7, ADR-aacruzgon-0085, 0104).
+//! `search_param_registry` is real from Step 2 on, because the
+//! CapabilityStatement, batch, compartment, `$everything`, bulk export and
 //! SQL-on-FHIR all call it, with or without search (roadmap Step 2, item 2.3).
 //!
 //! The capability declaration is the design's: token, date and URI
@@ -81,7 +84,6 @@ use planner::{Checks, Compiled, Driver};
 /// again: a stored value is already what `index_text` produced
 /// (ADR-aacruzgon-0079). The fields are the arguments of
 /// [`StaleIndexRow::new`](super::repair::StaleIndexRow::new).
-#[allow(dead_code)] // The search engine (#128) reads it; until then only the modules' types do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FoundRow {
     pub(crate) key: IndexKey,
@@ -95,7 +97,6 @@ pub(crate) struct FoundRow {
 /// One resource a plan's stream yields: where it sits in the stream's order,
 /// its id, and every index row of it read at that order key (for example its
 /// rows in both the named system's and the `IMPLICIT` partition).
-#[allow(dead_code)] // The search engine (#128) reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Candidate {
     pub(crate) order: OrderKey,
@@ -108,7 +109,6 @@ pub(crate) struct Candidate {
 /// tenant's registry, on the write path's large-stack thread in debug
 /// builds), which the date and compartment residuals both read. `extracted`
 /// is empty when no residual needs it.
-#[allow(dead_code)] // The search engine (#128) builds it.
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedResource {
     pub(crate) row: ResourceRow,
@@ -119,7 +119,7 @@ pub(crate) struct LoadedResource {
 /// fixed order (walkthrough 5.8, ADR-aacruzgon-0027), most specific first.
 /// The planner takes the lowest across the whole query; ties go by query
 /// order.
-#[allow(dead_code)] // The modules' plans return it once they exist.
+#[allow(dead_code)] // The modules' plans (#130–#132) return the token, URI and date ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Drive {
     /// The framework's own `_id` plan (walkthrough 5.4).
@@ -147,14 +147,12 @@ pub(crate) enum Drive {
 /// candidate. Modules never do: neither their index reads nor their
 /// `contains` point reads are candidates point-read. A search is of one
 /// resource type, so the id alone tells candidates apart.
-#[allow(dead_code)] // The search engine (#128) charges it.
 #[derive(Debug)]
 pub(crate) struct CandidateBudget {
     max: usize,
     seen: Mutex<HashSet<String>>,
 }
 
-#[allow(dead_code)] // The search engine (#128) charges it.
 impl CandidateBudget {
     pub(crate) fn new(max: usize) -> Self {
         Self {
@@ -178,13 +176,14 @@ impl CandidateBudget {
     }
 
     /// How many distinct candidates have been charged.
+    #[allow(dead_code)] // Only tests read it.
     pub(crate) fn used(&self) -> usize {
         self.seen.lock().len()
     }
 }
 
 /// What every read of a search needs.
-#[allow(dead_code)] // The search engine (#128) builds it.
+#[allow(dead_code)] // The modules' plans (#130–#132) read `session` and `budget`.
 pub(crate) struct ReadCtx<'a> {
     pub(crate) tenant: &'a TenantContext,
     pub(crate) resource_type: &'a str,
@@ -193,7 +192,7 @@ pub(crate) struct ReadCtx<'a> {
 }
 
 /// What a module's `compile` gets besides the parameter itself.
-#[allow(dead_code)] // The search engine (#128) builds it.
+#[allow(dead_code)] // The modules' `compile` (#130–#132) reads it.
 pub(crate) struct CompileCtx<'a> {
     pub(crate) resource_type: &'a str,
     /// The parameter's registered definition, when the tenant's registry has
@@ -202,7 +201,7 @@ pub(crate) struct CompileCtx<'a> {
 }
 
 /// One parameter of a search, compiled by its module (ADR-anastasiabryz-0001).
-#[allow(dead_code)] // The modules implement it and the search engine (#128) calls it.
+#[allow(dead_code)] // `param` is for the modules' messages (#130–#132).
 #[async_trait]
 pub(crate) trait ParamPlan: Send + Sync {
     /// The parameter's name.
@@ -2251,6 +2250,104 @@ mod node_tests {
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    /// A `resources_by_type` row of a live resource, tagged with a version
+    /// it no longer has, is stale: the type scan's tag check hides it, so
+    /// the resource comes back once, from its live row, and queues the stale
+    /// row for repair (walkthrough 5.1, step 4). Planted, so the tenant is
+    /// `test-planted-` (#127).
+    #[tokio::test]
+    async fn a_stale_type_row_of_a_live_resource_is_hidden_and_repaired() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-planted-search-stale-tag");
+        let ids = create_patients(&backend, &tenant, 2).await;
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        backend
+            .session
+            .execute(
+                "INSERT INTO resources_by_type \
+                 (tenant_id, resource_type, last_updated, id, version_id, fhir_version) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from(Utc::now() + chrono::Duration::hours(1)),
+                    Value::from(ids[0].as_str()),
+                    Value::from(99_i32),
+                    Value::from(version.as_mime_param()),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect("plant");
+        let before = backend.repair_stats();
+
+        let page = backend
+            .search(&tenant, &SearchQuery::new("Patient").with_count(10))
+            .await
+            .expect("search");
+        let mut found: Vec<String> = page
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        found.sort();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(found, expected, "each Patient once, the stale row hidden");
+        let ran = backend.repair_stats().since(&before);
+        assert_eq!(ran.queued, 1, "the stale row was queued: {ran:?}");
+    }
+
+    /// With a FHIR version named, the type scan drops another version's
+    /// `resources_by_type` rows on the row's own column, before any point
+    /// read (G34): a planted row of another version is never read, so it is
+    /// not queued, while the same search without a version reads it.
+    /// Planted, so the tenant is `test-planted-` (#127).
+    #[tokio::test]
+    async fn a_version_filter_drops_other_versions_rows_before_reading_them() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-planted-search-version-page");
+        let ids = create_patients(&backend, &tenant, 2).await;
+        plant_type_row(&backend, &tenant, "other-version", "0.0-planted").await;
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        let page_ids = |page: &SearchResult| -> std::collections::BTreeSet<String> {
+            page.resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect()
+        };
+
+        let before = backend.repair_stats();
+        let one_version = SearchQuery::new("Patient")
+            .with_fhir_version(version)
+            .with_count(10);
+        let page = backend.search(&tenant, &one_version).await.expect("search");
+        assert_eq!(page_ids(&page), ids.iter().cloned().collect());
+        assert_eq!(
+            backend.repair_stats().since(&before).queued,
+            0,
+            "the other version's row was never read"
+        );
+
+        let before = backend.repair_stats();
+        let any_version = SearchQuery::new("Patient").with_count(10);
+        let page = backend.search(&tenant, &any_version).await.expect("search");
+        assert_eq!(page_ids(&page), ids.iter().cloned().collect());
+        assert_eq!(
+            backend.repair_stats().since(&before).queued,
+            1,
+            "without a version, the row is read and hidden as an orphan"
         );
     }
 

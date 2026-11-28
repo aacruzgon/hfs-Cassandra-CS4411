@@ -80,7 +80,7 @@ The walk-through found places where the design document was wrong. These are now
 | 0055 | **An R2 or R3 error after an unknown outcome was 500 (Step 3)** for a write that may have applied. | Walkthrough 3.1: 504 for a timeout, 503 for anything else. | None |
 | 0061 | **`update`'s V3 left `write_id` unset (G36, Step 3),** so an outcome it superseded stayed undecidable. | V3 is built from `update`'s own R1 and carries its `write_id`; R2 still below `N` is 409. | None (a `schema.cql` comment) |
 | 0063 | **`create_or_update` could not check its permission before any statement (Step 3).** | Walkthrough section 3 and 3.5: each turn checks `Create` or `Update` after its R1; a fourth definite miss is 409 whatever it was. | None |
-| 0064 | **`HFS_RETURN_GONE` was said to change `read` (Step 3).** Only vread reads it. | Walkthrough section 2 and 4.1 corrected. | None |
+| 0064 | **`HFS_RETURN_GONE` was said to change `read` (Step 3).** Until HeliosSoftware/hfs#2583, only vread read it. | Walkthrough section 2 and 4.1 corrected. Since #2583, `read` follows the flag, and ADR-aacruzgon-0102 corrects them again. | None |
 
 Two corrections need no ADR because they fix a statement, not a decision:
 - **The sweeper does compare clocks.** "No clocks are compared" was wrong: the grace period is a clock comparison. The design now states its assumption (G11).

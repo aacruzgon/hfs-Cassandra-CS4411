@@ -97,10 +97,15 @@ pub fn test_fhir_version() -> helios_fhir::FhirVersion {
                         enabled.join(", ")
                     )
                 });
-            eprintln!(
-                "fhir-versions: {FHIR_VERSION_VAR}={value} -> {version:?} ({})",
+            // One finished line, printed in one write, as the lib tests'
+            // test_support.rs does: `eprintln!` writes each piece of its
+            // format on its own, and libtest's stdout lines can land between
+            // them under `--nocapture`.
+            let line = format!(
+                "fhir-versions: {FHIR_VERSION_VAR}={value} -> {version:?} ({})\n",
                 version.as_mime_param()
             );
+            eprint!("{line}");
             version
         }
         None => helios_fhir::FhirVersion::default_enabled(),

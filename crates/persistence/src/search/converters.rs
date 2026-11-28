@@ -47,7 +47,9 @@ pub enum IndexValue {
     Token {
         /// Code system URI (e.g., "http://loinc.org").
         system: Option<String>,
-        /// Code value.
+        /// Code value. Empty for display-only text (`CodeableConcept.text`),
+        /// and for an Identifier with a system and no value or a Coding with a
+        /// system and no code, which only `[system]|` matches (#2965).
         code: String,
         /// Display text (Coding.display or CodeableConcept.text) for :text modifier.
         display: Option<String>,
@@ -112,10 +114,16 @@ pub enum IndexValue {
 /// [`super::date_value::indexed_range`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DateEnd {
-    /// A point value (`date`, `dateTime`, `instant`): the range is one unit of
-    /// its own precision, so `2020-06` ends on July 1st.
+    /// A `date` or `dateTime`: the range is one unit of its own precision, so
+    /// `2020-06` ends on July 1st.
     #[default]
     Precision,
+    /// An `instant`: a point, "an interval with an effective width of 0"
+    /// (<https://hl7.org/fhir/R4/search.html#date>), whatever precision it is
+    /// written to. The range is one unit of the backend's storage resolution,
+    /// so `10:00:00Z` ends at `10:00:00.001` on a millisecond backend, not at
+    /// `10:00:01` (#2962).
+    Point,
     /// The `end` of a `Period`, as written; the range ends where the range of
     /// that value does, so `end: "2020-06"` also ends on July 1st.
     At(String),
@@ -234,8 +242,8 @@ impl IndexValue {
         }
     }
 
-    /// Creates a date index value for a point (`date`, `dateTime`,
-    /// `instant`), whose range is one unit of its own precision.
+    /// Creates a date index value for a `date` or `dateTime`, whose range is
+    /// one unit of its own precision.
     pub fn date(value: impl Into<String>) -> Self {
         let value = value.into();
         let precision = DatePrecision::from_date_string(&value);
@@ -243,6 +251,36 @@ impl IndexValue {
             value,
             precision,
             end: DateEnd::Precision,
+        }
+    }
+
+    /// Creates a date index value for an `instant`: the point
+    /// [`DateEnd::Point`] (#2962).
+    ///
+    /// An `instant` "SHALL" be written at least to the second
+    /// (<https://hl7.org/fhir/R4/datatypes.html#instant>). A value written
+    /// more coarsely is not a valid `instant`, so it keeps the range of what
+    /// it does say, as [`Self::date`] gives it: `2020-01-01` is still the whole
+    /// day.
+    pub fn instant(value: impl Into<String>) -> Self {
+        Self::date(value).into_instant()
+    }
+
+    /// This value read as an `instant` (see [`Self::instant`]): a `date` value
+    /// with second or finer precision becomes a point. Anything else is
+    /// returned unchanged.
+    pub fn into_instant(self) -> Self {
+        match self {
+            IndexValue::Date {
+                value,
+                precision: precision @ (DatePrecision::Second | DatePrecision::Millisecond),
+                end: DateEnd::Precision,
+            } => IndexValue::Date {
+                value,
+                precision,
+                end: DateEnd::Point,
+            },
+            other => other,
         }
     }
 
@@ -499,6 +537,11 @@ impl ValueConverter {
                         .map(String::from);
                     if !code.is_empty() {
                         results.push(IndexValue::token_with_display(system, code, display));
+                    } else if let Some(system) = named_system(obj) {
+                        // `"code": ""` reaches here only through `$meta-add`,
+                        // which keeps empty strings (#2554). `[system]|`
+                        // matches the Coding by its system alone (#2965).
+                        results.push(IndexValue::token_with_display(Some(system), "", display));
                     }
                 }
 
@@ -506,11 +549,14 @@ impl ValueConverter {
                 if let Some(coding) = obj.get("coding").and_then(|v| v.as_array()) {
                     let first_coding_row = results.len();
                     for c in coding {
+                        let display = c.get("display").and_then(|v| v.as_str()).map(String::from);
                         if let Some(code) = c.get("code").and_then(|v| v.as_str()) {
                             let system = c.get("system").and_then(|v| v.as_str()).map(String::from);
-                            let display =
-                                c.get("display").and_then(|v| v.as_str()).map(String::from);
                             results.push(IndexValue::token_with_display(system, code, display));
+                        } else if let Some(system) = c.as_object().and_then(named_system) {
+                            // A Coding with a system and no code matches
+                            // `[system]|` (#2965).
+                            results.push(IndexValue::token_with_display(Some(system), "", display));
                         }
                     }
                     // Also index CodeableConcept.text for :text modifier searches —
@@ -524,8 +570,10 @@ impl ValueConverter {
                     }
                 }
 
-                // Identifier (has value, may have system and type)
-                if obj.contains_key("value")
+                // Identifier (has a value or a system, may have type). A bare
+                // Coding with a system and no `code` key has the same shape
+                // and lands here too.
+                if (obj.contains_key("value") || obj.contains_key("system"))
                     && !obj.contains_key("code")
                     && !obj.contains_key("coding")
                 {
@@ -562,6 +610,38 @@ impl ValueConverter {
                             type_system,
                             type_code,
                         ));
+                    } else if obj.get("value").is_none_or(|v| v.as_str() == Some(""))
+                        && let Some(system) = named_system(obj)
+                        && !is_contact_point_system(&system)
+                    {
+                        // `[system]|` is "any element where the value of
+                        // [system] matches the system property of the
+                        // Identifier or Coding" (search.html#token), and
+                        // `Identifier.value` and `Coding.code` are 0..1, so a
+                        // system alone is enough to match (#2965). The row's
+                        // code is empty: no `code`, `|code` or `system|code`
+                        // form can match it.
+                        //
+                        // A ContactPoint with no value has a `system` too, but
+                        // a token's URI portion is not used for ContactPoints,
+                        // so it still gets no row. The converter sees no
+                        // datatype, so it tells them apart by the system's
+                        // value: an Identifier or Coding with no value whose
+                        // system is literally a ContactPointSystem code (such
+                        // as `phone`) is skipped as well. That is a valid
+                        // string, but not the URL `Identifier.system` and
+                        // `Coding.system` are defined as. A non-string
+                        // `value` is not an Identifier's.
+                        results.push(IndexValue::Token {
+                            system: Some(system),
+                            code: String::new(),
+                            display: obj
+                                .get("display")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            identifier_type_system: type_system,
+                            identifier_type_code: type_code,
+                        });
                     }
                 }
 
@@ -803,6 +883,27 @@ impl ValueConverter {
             _ => Ok(Vec::new()),
         }
     }
+}
+
+/// The `system` of a Coding or Identifier, when it names one: a non-empty
+/// string (#2965).
+fn named_system(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    obj.get("system")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// Whether `system` is a `ContactPoint.system` code (the required
+/// ContactPointSystem value set, the same in R4, R4B and R5), so an object
+/// that has only that and no value is taken for a ContactPoint rather than an
+/// Identifier or Coding (#2965). An Identifier or Coding whose system is
+/// literally one of these codes is taken for one too.
+fn is_contact_point_system(system: &str) -> bool {
+    matches!(
+        system,
+        "phone" | "fax" | "email" | "pager" | "url" | "sms" | "other"
+    )
 }
 
 /// Places a `CodeableConcept.text` onto one of the concept's own coding rows,
@@ -1179,6 +1280,157 @@ mod tests {
         }
     }
 
+    /// A token row as `(system, code, display, type system, type code)`.
+    type TokenRow = (
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    /// The token rows `value` converts to.
+    fn token_rows(value: Value) -> Vec<TokenRow> {
+        ValueConverter::convert(&value, SearchParamType::Token, "identifier")
+            .unwrap()
+            .into_iter()
+            .map(|v| match v {
+                IndexValue::Token {
+                    system,
+                    code,
+                    display,
+                    identifier_type_system,
+                    identifier_type_code,
+                } => (
+                    system,
+                    code,
+                    display,
+                    identifier_type_system,
+                    identifier_type_code,
+                ),
+                other => panic!("expected a token, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The row of a system with an empty code and nothing else.
+    fn system_row(system: &str) -> TokenRow {
+        (Some(system.to_string()), String::new(), None, None, None)
+    }
+
+    /// #2965: `[system]|` matches an Identifier by its system alone, so one
+    /// with a system and no value keeps a row, with an empty code.
+    #[test]
+    fn an_identifier_with_a_system_and_no_value_keeps_its_system() {
+        const MRN: &str = "http://hospital.example/mrn";
+        assert_eq!(token_rows(json!({"system": MRN})), vec![system_row(MRN)]);
+        // `"value": ""` reaches the converter only through the storage API:
+        // REST drops empty strings before indexing (#2554).
+        assert_eq!(
+            token_rows(json!({"system": MRN, "value": ""})),
+            vec![system_row(MRN)]
+        );
+        assert_eq!(
+            token_rows(json!({"use": "official", "system": MRN})),
+            vec![system_row(MRN)]
+        );
+        // Its type still serves `:of-type`.
+        assert_eq!(
+            token_rows(json!({
+                "type": {"coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+                    "code": "MR"
+                }]},
+                "system": MRN
+            })),
+            vec![(
+                Some(MRN.to_string()),
+                String::new(),
+                None,
+                Some("http://terminology.hl7.org/CodeSystem/v2-0203".to_string()),
+                Some("MR".to_string()),
+            )]
+        );
+        // The control: a value is indexed as before.
+        assert_eq!(
+            token_rows(json!({"system": MRN, "value": "123"})),
+            vec![(Some(MRN.to_string()), "123".to_string(), None, None, None)]
+        );
+    }
+
+    /// #2965: the same for a Coding with a system and no code, bare (as in
+    /// `meta.tag`) or inside a CodeableConcept.
+    #[test]
+    fn a_coding_with_a_system_and_no_code_keeps_its_system() {
+        const TAGS: &str = "http://example.org/tags";
+        const LOINC: &str = "http://loinc.org";
+        assert_eq!(token_rows(json!({"system": TAGS})), vec![system_row(TAGS)]);
+        // What `$meta-add` stores: it keeps empty strings.
+        assert_eq!(
+            token_rows(json!({"system": TAGS, "code": ""})),
+            vec![system_row(TAGS)]
+        );
+        assert_eq!(
+            token_rows(json!({"system": TAGS, "code": "", "display": "Tag"})),
+            vec![(
+                Some(TAGS.to_string()),
+                String::new(),
+                Some("Tag".to_string()),
+                None,
+                None
+            )]
+        );
+        assert_eq!(
+            token_rows(json!({"coding": [{"system": LOINC}, {"system": LOINC, "code": "1234-5"}]})),
+            vec![
+                system_row(LOINC),
+                (
+                    Some(LOINC.to_string()),
+                    "1234-5".to_string(),
+                    None,
+                    None,
+                    None
+                ),
+            ]
+        );
+        // The concept's text rides on the code-less coding, as on any coding
+        // without a display of its own.
+        assert_eq!(
+            token_rows(json!({"coding": [{"system": LOINC}], "text": "Heart rate"})),
+            vec![(
+                Some(LOINC.to_string()),
+                String::new(),
+                Some("Heart rate".to_string()),
+                None,
+                None
+            )]
+        );
+    }
+
+    /// #2965 changes nothing for an element with no system to match, nor for a
+    /// ContactPoint, whose `system` is not a token's URI portion.
+    #[test]
+    fn no_system_row_without_a_named_system() {
+        for value in [
+            json!({"use": "official"}),
+            json!({"system": ""}),
+            json!({"system": "", "value": ""}),
+            json!({"code": ""}),
+            json!({"coding": [{"display": "Heart rate"}]}),
+            json!({"coding": [{"system": ""}]}),
+            // Not an Identifier's value.
+            json!({"system": "http://unitsofmeasure.org", "value": 5}),
+            // ContactPoints without a value.
+            json!({"system": "phone"}),
+            json!({"system": "email", "use": "home"}),
+            json!({"system": "url", "rank": 1}),
+        ] {
+            assert_eq!(token_rows(value.clone()), vec![], "{value}");
+        }
+        // The control: a ContactPoint with a value is indexed as before.
+        assert!(!token_rows(json!({"system": "phone", "value": "555-0100"})).is_empty());
+    }
+
     #[test]
     fn test_convert_date() {
         let value = json!("2024-01-15T10:30:00Z");
@@ -1232,6 +1484,40 @@ mod tests {
         assert_eq!(
             precision_of(json!("2016-01-23T17:07-04:00")),
             vec![DatePrecision::Minute]
+        );
+    }
+
+    /// An `instant` written to the second or finer is a point (#2962); a
+    /// value too coarse to be an `instant` keeps the range it says.
+    #[test]
+    fn an_instant_value_is_a_point_from_the_second_down() {
+        for (value, precision) in [
+            ("2020-01-01T10:00:00Z", DatePrecision::Second),
+            ("2020-01-01T10:00:00.000Z", DatePrecision::Millisecond),
+            (
+                "2020-01-01T10:00:00.123456+02:00",
+                DatePrecision::Millisecond,
+            ),
+        ] {
+            assert_eq!(
+                IndexValue::instant(value),
+                date_index(value, precision, DateEnd::Point),
+                "{value}"
+            );
+        }
+        for value in ["2020", "2020-01", "2020-01-01", "2020-01-01T10:00Z"] {
+            assert_eq!(
+                IndexValue::instant(value),
+                IndexValue::date(value),
+                "{value}"
+            );
+        }
+        // Only a point's end changes: a Period and a non-date are untouched.
+        let period = IndexValue::date_range(Some("2020-01-01T10:00:00Z"), None).unwrap();
+        assert_eq!(period.clone().into_instant(), period);
+        assert_eq!(
+            IndexValue::string("x").into_instant(),
+            IndexValue::string("x")
         );
     }
 

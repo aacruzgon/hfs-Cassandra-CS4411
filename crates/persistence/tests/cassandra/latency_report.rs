@@ -35,7 +35,9 @@
 //! layer L1). For each operation, and for the
 //! whole report, it prints a `[cas case=… key=value …]` line, the shape the
 //! engine's own node tests print (`CasStats`'s `Display`), which
-//! `ci-report.py cas` tabulates.
+//! `ci-report.py cas` tabulates. The `cas` deltas of `extract_us` and
+//! `cas_payload_bytes`, divided by the calls, are the report's "extract" and
+//! "CAS payload" columns, per call (IW21, IW22).
 //!
 //! It writes `cassandra-latency.json` and `cassandra-latency.md` into the
 //! directory: p50, p95, p99 and max per operation (nearest rank), with the
@@ -115,7 +117,9 @@ mod counters {
     /// CAS outcomes so far (R2, R3, R8), every `CasStats` counter by its
     /// field name (`CasStats::pairs`): attempts, applied, misses by kind,
     /// unknown outcomes by trigger, serial and version reads, re-runs,
-    /// undecidable, `miss_budget_exhausted`, `post_cas_failures`. The names
+    /// undecidable, `miss_budget_exhausted`, `post_cas_failures`; and
+    /// `extract_us` and `cas_payload_bytes`, which the report divides by the
+    /// calls into its two per-call columns (IW21, IW22). The names
     /// become `ci-report.py cas` columns; it warns on any `undecidable`,
     /// `exhausted` or `post_cas` counter above 0.
     pub fn cas(backend: &CassandraBackend) -> Option<Counts> {
@@ -190,8 +194,17 @@ impl Figures {
             "p99_ms": ms(percentile(&sorted, 0.99)),
             "max_ms": ms(*sorted.last().expect("samples")),
             "statements_per_op": self.statements,
+            "extract_us_per_call": self.per_call("extract_us"),
+            "cas_payload_bytes_per_call": self.per_call("cas_payload_bytes"),
             "cas": self.cas,
         })
+    }
+
+    /// The `cas` delta of counter `name` over the measured calls, per call,
+    /// rounded to 0.1; `None` without counters.
+    fn per_call(&self, name: &str) -> Option<f64> {
+        let total = *self.cas.as_ref()?.get(name)?;
+        Some((total as f64 / self.samples.len() as f64 * 10.0).round() / 10.0)
     }
 
     /// The `[cas case=…]` line for `ci-report.py cas`, if there are counters.
@@ -551,8 +564,9 @@ async fn cassandra_latency_report() {
          `CassandraBackend`, one operation at a time, on a fresh tenant, after \
          {WARM_UP} unmeasured creates and {WARM_EACH} unmeasured calls of each \
          later write operation. Total {:.1} s.\n\n\
-         | Operation | n | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) | Statements per call (R5) |\n\
-         | --- | ---: | ---: | ---: | ---: | ---: | --- |\n",
+         | Operation | n | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) | \
+         Extract (µs per call) | CAS payload (bytes per call) | Statements per call (R5) |\n\
+         | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
         total.as_secs_f64()
     );
     for (row, figure) in rows.iter().zip(&figures) {
@@ -567,13 +581,19 @@ async fn cassandra_latency_report() {
             None => "–".to_string(),
         };
         md.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             figure.operation,
             row["n"],
             row["p50_ms"],
             row["p95_ms"],
             row["p99_ms"],
             row["max_ms"],
+            figure
+                .per_call("extract_us")
+                .map_or("–".to_string(), |v| v.to_string()),
+            figure
+                .per_call("cas_payload_bytes")
+                .map_or("–".to_string(), |v| v.to_string()),
             statements,
         ));
     }

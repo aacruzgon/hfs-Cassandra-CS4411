@@ -61,6 +61,22 @@ db.runCommand({
         "tenant_id": 1,
         "resource_type": 1,
         "param_name": 1,
+        "value_date_end": 1,
+        "value_date": 1,
+        "resource_id": 1
+      },
+      "name": "idx_search_date_end",
+      "partialFilterExpression": {
+        "value_date": {
+          "$exists": true
+        }
+      }
+    },
+    {
+      "key": {
+        "tenant_id": 1,
+        "resource_type": 1,
+        "param_name": 1,
         "value_number": 1,
         "resource_id": 1
       },
@@ -83,6 +99,38 @@ db.runCommand({
       "name": "idx_search_quantity_v2",
       "partialFilterExpression": {
         "value_quantity_value": {
+          "$exists": true
+        }
+      }
+    },
+    {
+      "key": {
+        "tenant_id": 1,
+        "resource_type": 1,
+        "param_name": 1,
+        "value_quantity_high": 1,
+        "value_quantity_value": 1,
+        "resource_id": 1
+      },
+      "name": "idx_search_quantity_high",
+      "partialFilterExpression": {
+        "value_quantity_value": {
+          "$exists": true
+        }
+      }
+    },
+    {
+      "key": {
+        "tenant_id": 1,
+        "resource_type": 1,
+        "param_name": 1,
+        "value_quantity_range_high": 1,
+        "value_quantity_value": 1,
+        "resource_id": 1
+      },
+      "name": "idx_search_quantity_range",
+      "partialFilterExpression": {
+        "value_quantity_range_high": {
           "$exists": true
         }
       }

@@ -6,8 +6,8 @@
 //! answers [`InstanceHistoryProvider::supports_history`] and
 //! [`SearchProvider::serves_search_param`] from its own fields. It is served by
 //! [`metadata_server`], a router with only the capabilities route: the handler's
-//! bound is all the stub has to meet, so no history, export or include trait is
-//! implemented here.
+//! bound is all the stub has to meet, so no type or system history, export or
+//! include trait is implemented here.
 //!
 //! Included with `#[path = "common/capability_hooks.rs"] mod capability_hooks;`.
 

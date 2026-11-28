@@ -24,11 +24,11 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
-use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
+use helios_persistence::core::sof_runner::{NativeSqlQuery, RowStream, SofRunner, ViewFilters};
 use helios_sof::columnar_stream::{ParquetStreamWriter, STREAM_BATCH_ROWS};
 use helios_sof::parquet_schema::{SCHEMA_SAMPLE_ROWS, resolve_arrow_schema};
 use helios_sof::sqlquery::engine::try_declared_columns;
-use helios_sof::sqlquery::{InMemorySqlEngine, QueryResult};
+use helios_sof::sqlquery::{NativeDialect, QueryResult, SqlQueryError};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -67,8 +67,9 @@ struct JobFailure {
 /// says, as opposed to the detailed text the job log gets.
 #[derive(Debug)]
 enum ResultWording {
-    /// The request's own failure: the 4xx wording `$sql-run` gives the same
-    /// failure, which names no backend detail.
+    /// The request's own failure: the wording `$sql-run` gives the same
+    /// failure (a 4xx, or the 504 of a statement that ran out of its time
+    /// limit), which names no backend detail.
     Own,
     /// The store was unavailable: fixed wording naming `prefix`, the subject
     /// (the client's own input), and nothing of the backend's error, whose
@@ -124,7 +125,10 @@ impl JobFailure {
         let (status, code, message) = err.client_response();
         if status == StatusCode::SERVICE_UNAVAILABLE {
             Self::unavailable(prefix, detail)
-        } else if status.is_client_error() {
+        } else if status.is_client_error() || status == StatusCode::GATEWAY_TIMEOUT {
+            // A statement the store stopped at its time limit is a limit the
+            // request ran into, not a server fault: 504 `timeout`, with the
+            // REST wording, which names no backend (#2577).
             Self {
                 message: format!("{prefix}: {message}"),
                 status,
@@ -958,6 +962,28 @@ async fn until_not_running(jobs: Arc<DashMap<String, JobStatus>>, jid: String) {
 
 #[async_trait]
 impl SofRunner for StopWhenNotRunning {
+    fn native_sql_dialect(&self) -> Option<NativeDialect> {
+        self.inner.native_sql_dialect()
+    }
+
+    /// A SQL query the backend runs itself is one statement: a cancel or
+    /// expiry drops the call, which ends the statement's transaction, and the
+    /// backend stops the statement at the query's time limit.
+    async fn run_sql_query(
+        &self,
+        tenant: &TenantContext,
+        query: NativeSqlQuery,
+    ) -> Result<QueryResult, SqlQueryError> {
+        let cancelled = || SqlQueryError::SourceStream(SofError::Cancelled.to_string());
+        if !is_running(&self.jobs, &self.jid) {
+            return Err(cancelled());
+        }
+        tokio::select! {
+            result = self.inner.run_sql_query(tenant, query) => result,
+            () = until_not_running(Arc::clone(&self.jobs), self.jid.clone()) => Err(cancelled()),
+        }
+    }
+
     async fn run_view(
         &self,
         tenant: &TenantContext,
@@ -1003,6 +1029,18 @@ impl SofRunner for StopWhenNotRunning {
 
     fn runner_name(&self) -> &'static str {
         self.inner.runner_name()
+    }
+
+    /// The inner runner bounded by `budget`, still stopped with the job: a
+    /// SQL query subject's dependencies run their statements under the
+    /// query's time limit in a job as they do in `$sql-run` (#2577).
+    fn with_statement_timeout(&self, budget: Duration) -> Option<Arc<dyn SofRunner>> {
+        let inner = self.inner.with_statement_timeout(budget)?;
+        Some(Arc::new(StopWhenNotRunning {
+            inner,
+            jobs: Arc::clone(&self.jobs),
+            jid: self.jid.clone(),
+        }))
     }
 }
 
@@ -1576,15 +1614,17 @@ async fn execute_sql_query(
     query: &NamedSqlQuery,
     limits: SqlExportLimits,
 ) -> Result<QueryResult, ExportError> {
-    let engine = InMemorySqlEngine::open().map_err(|e| ExportError::Runner(e.to_string()))?;
     let exec_limits = crate::handlers::sof::graph::ExecLimits {
         max_source_rows_per_vd: limits.max_source_rows_per_vd,
         max_rows: limits.max_rows,
         timeout_secs: limits.timeout_secs,
+        // A job reads a dependency for as long as it takes: its statements
+        // are bounded (by the runner, see `StopWhenNotRunning`), not the
+        // whole read, and a cancel or expiry stops it (#2577).
+        bound_materialization: false,
     };
 
     let (result, _leaf_schemas) = crate::handlers::sof::graph::execute_plan(
-        engine,
         runner,
         &task.tenant,
         &task.filters,
@@ -1596,14 +1636,16 @@ async fn execute_sql_query(
     .await
     .map_err(|e| {
         // A limit the request ran into, or a subject the engine refuses, is
-        // the client's answer; the REST wording of a server fault hides the
+        // the client's answer; so is a statement that ran out of the query's
+        // time limit (504 `timeout`, #2577), whose wording names the budget
+        // and no backend. The REST wording of a server fault hides the
         // backend detail, so that path keeps the engine's own text. The same
         // goes for an unavailable store: the job reports it as such (#2048),
         // but with the engine's text for the job log and fixed wording for
         // the stored result, because that text can name the backend.
         let detail = e.to_string();
         let (status, code, message) = sqlquery_err_to_rest(e).client_response();
-        if status.is_client_error() {
+        if status.is_client_error() || status == StatusCode::GATEWAY_TIMEOUT {
             ExportError::Client {
                 status,
                 code,
@@ -2510,6 +2552,80 @@ mod tests {
         assert_eq!(
             server.stored_message("job-1"),
             server_fault_message("job-1")
+        );
+    }
+
+    /// #2577: a job whose statement ran out of its time limit is a `504` /
+    /// `timeout` with wording the client can act on, not a server fault, for
+    /// a view subject and for a SQL Query subject; the store's text reaches
+    /// neither the stored result.
+    #[test]
+    fn a_timed_out_statement_fails_a_job_as_a_504_timeout() {
+        let view = JobFailure::from_sof(
+            "view 'v'",
+            SofError::Timeout("ERROR (SQLSTATE 57014): canceling statement".to_string()),
+        );
+        let (status, code, message) = crate::handlers::sof::sqlquery::sqlquery_err_to_rest(
+            helios_sof::sqlquery::SqlQueryError::Timeout { secs: 30 },
+        )
+        .client_response();
+        let query = JobFailure::from_export(
+            "query 'q'",
+            ExportError::Client {
+                status,
+                code,
+                message,
+            },
+        );
+        for (prefix, failure) in [("view 'v'", view), ("query 'q'", query)] {
+            assert_eq!(failure.status, StatusCode::GATEWAY_TIMEOUT, "{prefix}");
+            assert_eq!(failure.code, "timeout", "{prefix}");
+            let stored = failure.stored_message("job-1");
+            assert!(stored.starts_with(&format!("{prefix}: ")), "{stored}");
+            assert!(stored.contains("time limit"), "{stored}");
+            assert!(!stored.contains("57014"), "no backend text: {stored}");
+        }
+    }
+
+    /// #2577: the job's runner hands the statement budget to the runner it
+    /// wraps, so a SQL Query subject's dependencies are bounded per statement
+    /// in a job too; a runner with no statement to bound still answers `None`.
+    #[test]
+    fn the_job_runner_forwards_the_statement_budget() {
+        struct Budgeted(Arc<std::sync::Mutex<Option<Duration>>>);
+        #[async_trait]
+        impl SofRunner for Budgeted {
+            async fn run_view(
+                &self,
+                _tenant: &TenantContext,
+                _view_definition: serde_json::Value,
+                _filters: ViewFilters,
+            ) -> Result<RowStream, SofError> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+            fn runner_name(&self) -> &'static str {
+                "budgeted-test-runner"
+            }
+            fn with_statement_timeout(&self, budget: Duration) -> Option<Arc<dyn SofRunner>> {
+                *self.0.lock().unwrap() = Some(budget);
+                Some(Arc::new(Budgeted(Arc::clone(&self.0))))
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let wrap = |inner: Arc<dyn SofRunner>| StopWhenNotRunning {
+            inner,
+            jobs: Arc::new(DashMap::new()),
+            jid: "job-1".to_string(),
+        };
+        let bounded = wrap(Arc::new(Budgeted(Arc::clone(&seen))))
+            .with_statement_timeout(Duration::from_secs(7))
+            .expect("the inner runner bounds its statements");
+        assert_eq!(bounded.runner_name(), "budgeted-test-runner");
+        assert_eq!(*seen.lock().unwrap(), Some(Duration::from_secs(7)));
+        assert!(
+            wrap(Arc::new(UnavailableStoreRunner))
+                .with_statement_timeout(Duration::from_secs(7))
+                .is_none()
         );
     }
 

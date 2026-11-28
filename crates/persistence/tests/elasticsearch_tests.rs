@@ -697,6 +697,16 @@ mod date_precision_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for `instant` targets (#2962). Same `#[path]`
+/// arrangement.
+#[path = "search/date_instant_suite.rs"]
+mod date_instant_suite;
+
+/// The backend-agnostic suite for quantity `Range` targets (#2602).
+/// Same `#[path]` arrangement.
+#[path = "search/quantity_range_suite.rs"]
+mod quantity_range_suite;
+
 /// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
 /// Same `#[path]` arrangement.
 #[path = "search/sort_missing_suite.rs"]
@@ -735,6 +745,11 @@ mod numeric_validation_suite;
 /// `#[path]` arrangement.
 #[path = "search/token_code_system_suite.rs"]
 mod token_code_system_suite;
+
+/// The backend-agnostic `[system]|` on a system-only Identifier or Coding
+/// suite (#2965). Same `#[path]` arrangement.
+#[path = "search/token_system_only_suite.rs"]
+mod token_system_only_suite;
 
 /// The backend-agnostic empty search value suite (#1380). Same `#[path]`
 /// arrangement.
@@ -914,13 +929,18 @@ mod es_integration {
 
     /// Builds a search parameter registry loaded from the FHIR spec data files.
     fn build_search_registry() -> Arc<TenantSearchRegistries> {
+        build_search_registry_for(FhirVersion::default())
+    }
+
+    /// [`build_search_registry`] for `version`'s spec data files.
+    fn build_search_registry_for(version: FhirVersion) -> Arc<TenantSearchRegistries> {
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
             .map(|p| p.join("data"))
             .unwrap_or_else(|| PathBuf::from("data"));
 
-        let loader = SearchParameterLoader::new(FhirVersion::default());
+        let loader = SearchParameterLoader::new(version);
         let registries = Arc::new(TenantSearchRegistries::base_only());
         let mut registry = registries.base().write();
 
@@ -2070,6 +2090,72 @@ mod es_integration {
         super::date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
     }
 
+    /// #2962: an `instant` written to the second was indexed as the whole
+    /// second, so `eq…:00.000Z` missed it and `gt…:00.500Z` found it. It is
+    /// the point `[t, t + 1 ms)` now; a `dateTime` keeps its range.
+    #[tokio::test]
+    async fn es_date_instant_targets_are_points() {
+        let backend = create_backend().await;
+        super::date_instant_suite::instant_targets_are_points(&backend, "date-instant-2962").await;
+    }
+
+    /// [`create_backend`] configured for `version`, with that version's
+    /// search parameters loaded.
+    async fn create_backend_for(version: FhirVersion) -> ElasticsearchBackend {
+        let es = shared_es().await;
+        let config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            request_timeout_ms: SHARED_NODE_REQUEST_TIMEOUT_MS,
+            index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
+            number_of_replicas: 0,
+            refresh_interval: "1ms".to_string(),
+            fhir_version: version,
+            ..Default::default()
+        };
+        let backend =
+            ElasticsearchBackend::with_shared_registry(config, build_search_registry_for(version))
+                .expect("Failed to create ElasticsearchBackend");
+        backend
+            .initialize()
+            .await
+            .expect("Failed to initialize ES backend");
+        backend
+    }
+
+    /// #2962: the backend's configured FHIR version decides which elements
+    /// are `instant`s; R6 makes `DiagnosticReport.issued` a `dateTime`.
+    #[cfg(feature = "R6")]
+    #[tokio::test]
+    async fn es_date_instant_types_follow_an_r6_backend() {
+        let backend = create_backend_for(FhirVersion::R6).await;
+        super::date_instant_suite::r6_backend_types_by_r6(&backend, "date-instant-r6").await;
+    }
+
+    /// The R4 control for the R6 case.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn es_date_instant_types_follow_an_r4_backend() {
+        let backend = create_backend_for(FhirVersion::R4).await;
+        super::date_instant_suite::r4_backend_types_by_r4(&backend, "date-instant-r4").await;
+    }
+
+    /// R5's `ImagingSelection.issued`, an `instant` that R4 does not have.
+    #[cfg(feature = "R5")]
+    #[tokio::test]
+    async fn es_date_instant_types_follow_an_r5_backend() {
+        let backend = create_backend_for(FhirVersion::R5).await;
+        super::date_instant_suite::r5_backend_types_by_r5(&backend, "date-instant-r5").await;
+    }
+
+    /// #2602: a `Range` was not indexed for quantity parameters. It is one
+    /// nested `{value, high}` interval now.
+    #[tokio::test]
+    async fn es_quantity_range_targets_are_intervals() {
+        let backend = create_backend().await;
+        super::quantity_range_suite::quantity_ranges_are_intervals(&backend, "quantity-range-2602")
+            .await;
+    }
+
     /// #1606: a missing value came first on a descending sort. It comes last
     /// both ways now, and a `Previous` page still mirrors a `Next` one.
     #[tokio::test]
@@ -2204,6 +2290,18 @@ mod es_integration {
         super::token_code_system_suite::system_qualified_tokens_in_chains(
             &backend,
             "token-code-system-chain-1379",
+        )
+        .await;
+    }
+
+    /// #2965: `system|` matches an Identifier with no value and a Coding with
+    /// no code.
+    #[tokio::test]
+    async fn es_system_only_tokens_match_system_pipe() {
+        let backend = create_backend().await;
+        super::token_system_only_suite::system_only_tokens_match_system_pipe(
+            &backend,
+            "token-system-only-2965",
         )
         .await;
     }
@@ -5798,9 +5896,12 @@ mod es_integration {
     /// `create_many` is one `_bulk` request per batch, so under
     /// `refresh=wait_for` a batch pays one refresh wait — not one per
     /// document. With a 5s refresh interval, 40 per-document writes would
-    /// take over three minutes; the batch must finish in a few seconds. This
-    /// is the shape of the startup conformance seed that stalled the
-    /// sqlite-elasticsearch server past its readiness timeout.
+    /// take over three minutes; the batch finishes in a few seconds. The
+    /// bound is 60s, not tighter: a loaded CI runner has taken 20s for the
+    /// batch path (#2961), and 60s still sits far below the ~200s that one
+    /// wait per document costs. This is the shape of the startup conformance
+    /// seed that stalled the sqlite-elasticsearch server past its readiness
+    /// timeout.
     #[tokio::test]
     async fn es_integration_create_many_pays_one_refresh_wait_per_batch() {
         use helios_persistence::core::SearchProvider;
@@ -5834,7 +5935,7 @@ mod es_integration {
             assert_eq!(stored.version_id(), "1");
         }
         assert!(
-            elapsed < std::time::Duration::from_secs(20),
+            elapsed < std::time::Duration::from_secs(60),
             "40 resources under wait_for with a 5s refresh interval took {elapsed:?}; \
              a batch must not pay one refresh wait per document"
         );

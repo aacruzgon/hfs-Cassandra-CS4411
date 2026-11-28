@@ -218,7 +218,10 @@ impl CassandraBackend {
         let result: StorageResult<()> = async {
             loop {
                 // Step 0. After an unknown outcome, R1's error answers as R2's
-                // does (ADR-aacruzgon-0067).
+                // does (ADR-aacruzgon-0067). A SearchParameter's follow below
+                // is stamped before the read (ADR-aacruzgon-0099).
+                let read_at = (resource_type == "SearchParameter")
+                    .then(|| self.search_parameter_read_stamp());
                 let row = request.pre_read_row(pre_read().await)?;
                 if let Some(applied) = self
                     .check_earlier_attempts(&mut request, row.as_ref())
@@ -231,10 +234,10 @@ impl CassandraBackend {
                 // whose outcome this instance never learned or by another
                 // instance: the overlay catches up before the NotFound
                 // (ADR-aacruzgon-0068).
-                if resource_type == "SearchParameter"
+                if let Some(read_at) = read_at
                     && row.as_ref().is_some_and(ResourceRow::is_deleted)
                 {
-                    self.follow_stored_search_parameter(tenant_id, id, row.as_ref());
+                    self.follow_stored_search_parameter(tenant_id, id, row.as_ref(), read_at);
                 }
                 let row = deletable(row.as_ref(), expect, resource_type, id)?;
                 let expected = row.version_id;
@@ -293,11 +296,12 @@ impl CassandraBackend {
     /// ([`CassandraBackend::follow_stored_search_parameter`]). A failed read
     /// is logged and changes nothing; the call's `NotFound` is unchanged.
     async fn catch_up_with_a_deleted_miss(&self, tenant_id: &str, id: &str) {
+        let read_at = self.search_parameter_read_stamp();
         match self
             .read_resource_row(tenant_id, "SearchParameter", id)
             .await
         {
-            Ok(row) => self.follow_stored_search_parameter(tenant_id, id, row.as_ref()),
+            Ok(row) => self.follow_stored_search_parameter(tenant_id, id, row.as_ref(), read_at),
             Err(error) => tracing::warn!(
                 tenant_id,
                 id,
@@ -335,6 +339,7 @@ mod tests {
             created_at: Some(at),
             deleted_at: deleted.then_some(at),
             fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            stored_fhir_version: None,
             write_ts: Some(at.timestamp_millis() * 1000),
             write_id: None,
             index_keys: Some(super::super::index_keys::EMPTY.to_vec()),
@@ -449,7 +454,7 @@ mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
     use crate::backends::cassandra::index_keys::{self, IndexKey};
-    use crate::backends::cassandra::session::{Fault, StatementKind};
+    use crate::backends::cassandra::session::{Fault, StatementKind, TimeoutWriteType};
     use crate::backends::cassandra::write::{PreviousVersion, normalized_body};
     use crate::core::{ResourceStorage, SearchProvider};
     use crate::error::BackendError;
@@ -470,6 +475,18 @@ mod node_tests {
             })
             .await
             .expect("connect"),
+        )
+    }
+
+    /// Like `tenant_context`, for a case that plants another writer's CAS or
+    /// a stored version row by raw CQL (RV22).
+    fn planted_tenant_context(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-planted-delete-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
         )
     }
 
@@ -516,12 +533,8 @@ mod node_tests {
         let row = r1(backend, tenant).await.expect("a row to update");
         let (json, data) = normalized_body("update", "Patient", "p", patient("p")).unwrap();
         let mut request = backend.cas_request("update", key(tenant));
-        let plan = CasPlan::update(
-            PreviousVersion::from_row(&row).unwrap(),
-            json,
-            data,
-            vec![IndexKey::ResourcesByType],
-        );
+        let keys = backend.index_keys_of(tenant, "Patient", &json);
+        let plan = CasPlan::update(PreviousVersion::from_row(&row).unwrap(), json, data, keys);
         match backend.run_cas(&mut request, plan).await.unwrap() {
             CasOutcome::Applied(_) => {}
             other => panic!("the other writer's update: {other:?}"),
@@ -772,10 +785,11 @@ mod node_tests {
     /// T-8, T-13, the statements a delete costs, and no CQL `DELETE` on
     /// `resources` or `resource_versions`: tripwires on every write and CAS
     /// that names either table in a `FROM` clause (only a `DELETE` does) are
-    /// still armed afterwards, so the delete sent none. Its one `DELETE` is
-    /// X1's, on `resources_by_type`.
+    /// still armed afterwards, so the delete sent none. Its only `DELETE`s are
+    /// the `k` rows of K(N), in one batch (IW9, IW14); the tripwires show that
+    /// none names `resources` or `resource_versions`.
     #[tokio::test]
-    async fn a_delete_writes_the_marker_and_removes_only_the_x1_row() {
+    async fn a_delete_writes_the_marker_and_deletes_only_index_rows() {
         let Some(backend) = backend().await else {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
@@ -808,13 +822,15 @@ mod node_tests {
         let stats = backend.cas_stats().since(&before.1);
         eprintln!("[statements op=delete {spent}]");
         eprintln!("[cas case=delete {stats}]");
-        // R1; V3, I1, V2, the X1 delete, I2; one C3. The delete is the only
-        // row of its unit, so it goes as a plain write, not as a batch (IW13).
+        // R1; V3, I1, V2, I2; one C3. Every row of K(N), `k` deletes, is in
+        // one batch (IW9 B, IW14).
+        let k = row1.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
         assert_eq!(
             (spent.read, spent.write, spent.cas, spent.serial_read),
-            (1, 5, 1, 0)
+            (1, 4, 1, 0)
         );
-        assert_eq!((spent.batch, spent.batched), (0, 0), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (1, k), "{spent}");
         assert_eq!(
             (stats.attempts, stats.applied, stats.post_cas_failures),
             (1, 1, 0)
@@ -1300,6 +1316,7 @@ mod node_tests {
             C3_ONLY,
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();
@@ -1385,7 +1402,7 @@ mod node_tests {
         );
 
         // Past V, row V without a write_id: undecidable, 504, no retry.
-        let tenant = tenant_context("undecidable");
+        let tenant = planted_tenant_context("undecidable");
         create(&backend, &tenant, "p").await;
         backend
             .session
@@ -1625,6 +1642,18 @@ mod node_tests {
         );
     }
 
+    /// Like `hardening_tenant`, for a case that plants an undecodable key
+    /// set by raw CQL (RV22).
+    fn planted_hardening_tenant(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-planted-s3-hardening-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
+    }
+
     /// Fresh `test-` tenants for the hardening tests (ADR-aacruzgon-0020).
     fn hardening_tenant(case: &str) -> TenantContext {
         TenantContext::new(
@@ -1857,7 +1886,7 @@ mod node_tests {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
         };
-        let tenant = hardening_tenant("later-r1-undecodable");
+        let tenant = planted_hardening_tenant("later-r1-undecodable");
         let t = tenant.tenant_id().as_str();
         create(&backend, &tenant, "p").await;
         backend

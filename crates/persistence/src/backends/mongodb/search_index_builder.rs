@@ -91,9 +91,11 @@ use super::schema::{
     set_search_index_empty_at_generation, set_search_index_generation,
 };
 use super::search_index_catalog::{
-    DATE_RANGE_GENERATION, IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION,
-    SEARCH_INDEX_GENERATION, SearchIndexSpec, create_indexes_command, current_specs,
-    superseded_contained_spec, superseded_date_v2_spec, superseded_v1_specs,
+    DATE_RANGE_GENERATION, IndexBuild, QUANTITY_RANGE_GENERATION, SEARCH_DATE_END_INDEX,
+    SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION, SEARCH_INDEX_GENERATION,
+    SEARCH_QUANTITY_HIGH_INDEX, SEARCH_QUANTITY_RANGE_INDEX, SearchIndexSpec,
+    create_indexes_command, current_specs, superseded_contained_spec, superseded_date_v2_spec,
+    superseded_v1_specs,
 };
 use crate::types::{absolute_reference_target, strip_reference_version};
 
@@ -110,9 +112,9 @@ pub enum BuildOutcome {
         /// value indexes, `idx_search_date_v2`, the old contained index).
         dropped: Vec<String>,
     },
-    /// `IndexBuildMode::Off`: these background specs are missing; nothing changed.
+    /// `IndexBuildMode::Off`: these background specs are not ready; nothing changed.
     Skipped {
-        /// Names of the background specs that are missing.
+        /// Names of the background specs that are missing or still building.
         missing: Vec<String>,
     },
     /// The run stopped. Nothing was dropped. The message is what was logged.
@@ -189,6 +191,44 @@ struct Inspection {
     /// generation-2 `idx_search_date_v2` (#1391), plus the generation-2
     /// `search_index` contained-row index name if it is still there.
     superseded_present: Vec<String>,
+}
+
+impl Inspection {
+    fn from_existing(existing: &[ListedIndex]) -> Self {
+        let mut inspection = Inspection::default();
+        for spec in current_specs()
+            .into_iter()
+            .filter(|s| s.build == IndexBuild::Background)
+        {
+            match existing.iter().find(|d| d.name == spec.name) {
+                None => inspection.missing.push(spec),
+                Some(actual) => match classify_spec(&spec, actual) {
+                    SpecStatus::Conflicting => inspection
+                        .conflicting
+                        .push((spec.name.to_string(), actual.clone())),
+                    SpecStatus::InProgress => inspection.in_progress.push(spec.name.to_string()),
+                    SpecStatus::Ready => {}
+                },
+            }
+        }
+        inspection.superseded_present = superseded_present(existing);
+        inspection
+    }
+
+    /// An unavailable generation-7 date-end index or generation-8 quantity
+    /// high index must not disable verified generation-6 plans. Every older
+    /// background index still has to pass the same key, partial-filter,
+    /// options and buildUUID checks as a full build.
+    fn existing_indexes_ready(&self) -> bool {
+        let additive = |name: &str| {
+            name == SEARCH_DATE_END_INDEX
+                || name == SEARCH_QUANTITY_HIGH_INDEX
+                || name == SEARCH_QUANTITY_RANGE_INDEX
+        };
+        self.missing.iter().all(|spec| additive(spec.name))
+            && self.in_progress.iter().all(|name| additive(name))
+            && self.conflicting.iter().all(|(name, _)| additive(name))
+    }
 }
 
 /// One `listIndexes` `firstBatch` entry, normalised to the fields this module
@@ -303,6 +343,143 @@ fn date_rows_notice(recorded: Option<i32>, at_boot: &RowsAtBoot) -> DateRowsNoti
     }
 }
 
+/// Whether `record_if_needed` logs the #2602 reminder: only on a transition
+/// from a recorded generation below [`QUANTITY_RANGE_GENERATION`]. A database
+/// with no generation recorded is new (or its rows are covered by the date
+/// reminder's own boot read), and a `Range` produced no quantity row before
+/// #2602, so a database already at the generation has nothing to reindex.
+fn quantity_range_reindex_reminder(recorded: Option<i32>) -> bool {
+    recorded.is_some_and(|generation| generation < QUANTITY_RANGE_GENERATION)
+}
+
+/// Sets `value_quantity_high = value_quantity_value` on every quantity row
+/// that has no high yet (#2602), in one server-side `update_many` per
+/// collection. Idempotent: a row that has a high is not selected, so it is
+/// safe to rerun after a failure and a no-op on a database written by this
+/// version. A `Quantity` or `Age` is a point, so this is exactly what
+/// the writer stores for one.
+pub(super) fn quantity_high_backfill_filter() -> Document {
+    doc! {
+        "value_quantity_value": { "$exists": true },
+        "value_quantity_high": { "$exists": false },
+    }
+}
+
+/// The pipeline update paired with [`quantity_high_backfill_filter`].
+pub(super) fn quantity_high_backfill_update() -> Vec<Document> {
+    vec![doc! { "$set": { "value_quantity_high": "$value_quantity_value" } }]
+}
+
+/// Rows rewritten per `update_many` by the `value_quantity_high` backfill.
+const QUANTITY_HIGH_BACKFILL_BATCH: usize = 10_000;
+
+/// Attempts per batch before the backfill gives up and returns the error.
+const QUANTITY_HIGH_BACKFILL_ATTEMPTS: u32 = 4;
+
+/// Backfills `value_quantity_high = value_quantity_value` (#2602) in `_id`
+/// order, `batch_size` rows at a time, logging progress per batch. A failed
+/// batch is retried with a growing pause before the error is returned.
+/// Idempotent: a row that has a high no longer matches the filter, so a
+/// second run modifies nothing and a stored high is never overwritten.
+/// Returns the number of rows modified.
+pub(super) async fn backfill_quantity_high_batched(
+    database: &Database,
+    batch_size: usize,
+) -> StorageResult<u64> {
+    let mut total = 0u64;
+    for collection in [SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION] {
+        let coll = database.collection::<Document>(collection);
+        // The pass runs at every boot, so a clean collection must cost one
+        // `find_one` and no update.
+        if !quantity_high_stale_row_exists(&coll).await? {
+            continue;
+        }
+        let mut last_id: Option<Bson> = None;
+        loop {
+            let mut attempt = 0u32;
+            let step = loop {
+                attempt += 1;
+                match backfill_quantity_high_batch(&coll, last_id.as_ref(), batch_size).await {
+                    Ok(step) => break step,
+                    Err(e) if attempt < QUANTITY_HIGH_BACKFILL_ATTEMPTS => {
+                        tracing::warn!(
+                            collection,
+                            attempt,
+                            error = %e,
+                            "quantity high backfill batch failed; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            200 * u64::from(attempt),
+                        ))
+                        .await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            let Some((upper, modified)) = step else {
+                break;
+            };
+            total += modified;
+            last_id = Some(upper);
+            tracing::info!(
+                collection,
+                rows_so_far = total,
+                "quantity high backfill progress"
+            );
+        }
+    }
+    Ok(total)
+}
+
+/// Whether `coll` holds a quantity row with no `value_quantity_high`: one
+/// `find_one` with the backfill filter, no hint (a whole-collection filter
+/// without a tenant prefix is cheaper as a collection scan than an index scan).
+pub(super) async fn quantity_high_stale_row_exists(
+    coll: &mongodb::Collection<Document>,
+) -> StorageResult<bool> {
+    Ok(coll
+        .find_one(quantity_high_backfill_filter())
+        .projection(doc! { "_id": 1 })
+        .await?
+        .is_some())
+}
+
+/// One batch: the next `batch_size` unfilled quantity rows after `after`, in
+/// `_id` order. `None` when there are none left; otherwise the batch's last
+/// `_id` and the rows modified.
+async fn backfill_quantity_high_batch(
+    coll: &mongodb::Collection<Document>,
+    after: Option<&Bson>,
+    batch_size: usize,
+) -> StorageResult<Option<(Bson, u64)>> {
+    use futures::stream::TryStreamExt;
+
+    let mut filter = quantity_high_backfill_filter();
+    if let Some(after) = after {
+        filter.insert("_id", doc! { "$gt": after.clone() });
+    }
+    let ids: Vec<Bson> = coll
+        .find(filter)
+        .sort(doc! { "_id": 1 })
+        .limit(batch_size as i64)
+        .projection(doc! { "_id": 1 })
+        .await?
+        .map_ok(|d| d.get("_id").cloned().unwrap_or(Bson::Null))
+        .try_collect()
+        .await?;
+    let (Some(first), Some(last)) = (ids.first().cloned(), ids.last().cloned()) else {
+        return Ok(None);
+    };
+    // The batch is the next matching rows in `_id` order, so the range holds
+    // exactly them; the filter keeps a concurrently written row out.
+    let mut update_filter = quantity_high_backfill_filter();
+    update_filter.insert("_id", doc! { "$gte": first, "$lte": last.clone() });
+    let result = coll
+        .update_many(update_filter, quantity_high_backfill_update())
+        .await?;
+    Ok(Some((last, result.modified_count)))
+}
+
 pub(super) struct SearchIndexBuilder {
     database: Database,
     mode: IndexBuildMode,
@@ -310,6 +487,9 @@ pub(super) struct SearchIndexBuilder {
     /// Published to `MongoBackend` once the reference backfill is complete
     /// (#2394). `None` in tests that do not care.
     references_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Independent readiness of the pre-generation-7 indexes, after the
+    /// existing maintenance steps. None in builder-only tests.
+    existing_readiness_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SearchIndexBuilder {
@@ -319,6 +499,7 @@ impl SearchIndexBuilder {
             mode,
             rows_at_boot,
             references_flag: None,
+            existing_readiness_flag: None,
         }
     }
 
@@ -330,6 +511,33 @@ impl SearchIndexBuilder {
     ) -> Self {
         self.references_flag = Some(flag);
         self
+    }
+
+    pub(super) fn with_existing_readiness_flag(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.existing_readiness_flag = Some(flag);
+        self
+    }
+
+    fn publish_existing_readiness(&self, ready: bool) {
+        if let Some(flag) = &self.existing_readiness_flag {
+            flag.store(ready, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Prime an already-maintained database before serving. A database still
+    /// needing either correctness backfill waits for run_inner to finish it.
+    /// The recorded index generation is deliberately not readiness evidence.
+    pub(super) async fn prime_existing_readiness(&self) -> StorageResult<()> {
+        self.publish_existing_readiness(false);
+        if contained_rows_moved(&self.database).await?
+            && references_normalized(&self.database).await?
+        {
+            self.inspect().await?;
+        }
+        Ok(())
     }
 
     /// What `search_index` held at boot (#2268). `init_schema` awaits this
@@ -424,6 +632,14 @@ impl SearchIndexBuilder {
                 "normalized value_reference rows in search_index / search_index_contained"
             );
         }
+
+        // #2602: a quantity row without `value_quantity_high` fails every
+        // comparison on it. Runs at EVERY boot, in every mode (including
+        // `off`), not only while the generation is unrecorded: a pre-#2602
+        // instance that is still running keeps writing such rows, and this
+        // pass is the detector. A clean database pays one `find_one` per
+        // collection. A failure is retried per batch and then returned.
+        self.heal_quantity_high().await?;
 
         let mut inspection = self.inspect().await?;
 
@@ -533,9 +749,47 @@ impl SearchIndexBuilder {
         }
     }
 
+    /// The every-boot pass: heals rows without `value_quantity_high`, warns
+    /// with the count when it is above zero (an old writer is active) and logs
+    /// a `debug!` otherwise. Returns the count.
+    async fn heal_quantity_high(&self) -> StorageResult<u64> {
+        let backfilled = self.backfill_quantity_high().await.map_err(|e| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message: format!("quantity high backfill failed: {e}"),
+                source: Some(Box::new(e)),
+            })
+        })?;
+        if backfilled > 0 {
+            tracing::warn!(
+                rows = backfilled,
+                "set value_quantity_high on quantity rows that had none; an instance older than \
+                 #2602 is probably still writing to this database (stop it)"
+            );
+        } else {
+            tracing::debug!(rows = 0, "no quantity rows lack value_quantity_high");
+        }
+        Ok(backfilled)
+    }
+
+    /// Backfill of `value_quantity_high` (#2602), run at every boot, over `search_index`
+    /// and `search_index_contained`. Returns the number of rows rewritten.
+    async fn backfill_quantity_high(&self) -> StorageResult<u64> {
+        backfill_quantity_high_batched(&self.database, QUANTITY_HIGH_BACKFILL_BATCH).await
+    }
+
     async fn record_if_needed(&self) -> StorageResult<()> {
         let recorded = get_search_index_generation(&self.database).await?;
         if recorded != Some(SEARCH_INDEX_GENERATION) {
+            if quantity_range_reindex_reminder(recorded) {
+                tracing::warn!(
+                    from_generation = ?recorded,
+                    to_generation = SEARCH_INDEX_GENERATION,
+                    "a Range indexed before #2602 produced no quantity row, so Condition onset-age \
+                     and abatement-age, and context-quantity, will not match it until it is \
+                     reindexed; run `$reindex` (Quantity and Age rows are not affected)"
+                );
+            }
             // The one moment an upgrade is visible: once this generation is
             // recorded, this branch is not taken again. `date_rows_notice`
             // gives the #1391 reminder only on a transition from below
@@ -585,6 +839,16 @@ impl SearchIndexBuilder {
     /// has at most 21, well under the default batch, so `firstBatch` is
     /// complete.
     async fn inspect(&self) -> StorageResult<Inspection> {
+        let inspection = self.inspect_specs().await;
+        self.publish_existing_readiness(
+            inspection
+                .as_ref()
+                .is_ok_and(Inspection::existing_indexes_ready),
+        );
+        inspection
+    }
+
+    async fn inspect_specs(&self) -> StorageResult<Inspection> {
         let reply = match self
             .database
             .run_command(list_indexes_command(SEARCH_INDEX_COLLECTION))
@@ -606,24 +870,7 @@ impl SearchIndexBuilder {
         };
         let existing = listed_indexes(&reply, SEARCH_INDEX_COLLECTION)?;
 
-        let mut inspection = Inspection::default();
-        for spec in current_specs()
-            .into_iter()
-            .filter(|s| s.build == IndexBuild::Background)
-        {
-            match existing.iter().find(|d| d.name == spec.name) {
-                None => inspection.missing.push(spec),
-                Some(actual) => match classify_spec(&spec, actual) {
-                    SpecStatus::Conflicting => inspection
-                        .conflicting
-                        .push((spec.name.to_string(), actual.clone())),
-                    SpecStatus::InProgress => inspection.in_progress.push(spec.name.to_string()),
-                    SpecStatus::Ready => {}
-                },
-            }
-        }
-        inspection.superseded_present = superseded_present(&existing);
-        Ok(inspection)
+        Ok(Inspection::from_existing(&existing))
     }
 
     /// One-time move of contained rows out of `search_index` (#1160). Runs
@@ -865,15 +1112,18 @@ fn is_only_duplicate_keys(e: &mongodb::error::Error) -> bool {
 }
 
 /// [`IndexBuildMode::Off`]'s decision for one [`Inspection`]: `None` when
-/// every background spec is present and no superseded index remains (the
+/// every background spec is ready and no superseded index remains (the
 /// caller then records the generation and reports `UpToDate`); otherwise
-/// warns about every missing spec and every superseded name — including
+/// warns about missing or building specs and every superseded name — including
 /// `idx_search_contained` once [`SearchIndexBuilder::inspect`] marks it
 /// superseded (#1160) — and reports `Skipped`. Never builds or drops
 /// anything. Pure apart from the `tracing` calls, so it is unit-testable
 /// without a live server.
 fn off_mode_decision(inspection: &Inspection) -> Option<BuildOutcome> {
-    if inspection.missing.is_empty() && inspection.superseded_present.is_empty() {
+    if inspection.missing.is_empty()
+        && inspection.in_progress.is_empty()
+        && inspection.superseded_present.is_empty()
+    {
         return None;
     }
     for spec in &inspection.missing {
@@ -881,6 +1131,13 @@ fn off_mode_decision(inspection: &Inspection) -> Option<BuildOutcome> {
             index = spec.name,
             "HFS_MONGODB_INDEX_BUILD=off: generation-{SEARCH_INDEX_GENERATION} search_index index is missing; \
              build it with crates/persistence/mongodb/search-index-v2.mongosh.js"
+        );
+    }
+    for name in &inspection.in_progress {
+        tracing::warn!(
+            index = %name,
+            "HFS_MONGODB_INDEX_BUILD=off: search_index index is still building; \
+             leaving the build incomplete until the index is usable"
         );
     }
     for name in &inspection.superseded_present {
@@ -895,6 +1152,7 @@ fn off_mode_decision(inspection: &Inspection) -> Option<BuildOutcome> {
             .missing
             .iter()
             .map(|s| s.name.to_string())
+            .chain(inspection.in_progress.iter().cloned())
             .collect(),
     })
 }
@@ -1050,6 +1308,56 @@ pub(super) fn classify_spec(spec: &SearchIndexSpec, actual: &ListedIndex) -> Spe
 #[cfg(test)]
 mod builder_tests {
     use super::*;
+
+    fn ready_background_indexes() -> Vec<ListedIndex> {
+        current_specs()
+            .into_iter()
+            .filter(|spec| spec.build == IndexBuild::Background)
+            .map(|spec| ListedIndex {
+                name: spec.name.to_string(),
+                key: spec.keys,
+                partial: spec.partial,
+                in_progress: false,
+                extra_options: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn existing_index_readiness_ignores_only_the_additive_date_end_and_quantity_high_indexes() {
+        let ready = ready_background_indexes();
+        assert!(Inspection::from_existing(&ready).existing_indexes_ready());
+        for name in ready.iter().map(|index| index.name.as_str()) {
+            let mut missing = ready.clone();
+            missing.retain(|index| index.name != name);
+            assert_eq!(
+                Inspection::from_existing(&missing).existing_indexes_ready(),
+                name == SEARCH_DATE_END_INDEX
+                    || name == SEARCH_QUANTITY_HIGH_INDEX
+                    || name == SEARCH_QUANTITY_RANGE_INDEX,
+                "missing {name}"
+            );
+            for defect in ["keys", "partial", "hidden", "building"] {
+                let mut changed = ready.clone();
+                let index = changed.iter_mut().find(|index| index.name == name).unwrap();
+                match defect {
+                    "keys" => index.key = doc! { "resource_id": 1 },
+                    "partial" => index.partial = None,
+                    "hidden" => index.extra_options.push("hidden".into()),
+                    "building" => index.in_progress = true,
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    Inspection::from_existing(&changed).existing_indexes_ready(),
+                    name == SEARCH_DATE_END_INDEX
+                        || name == SEARCH_QUANTITY_HIGH_INDEX
+                        || name == SEARCH_QUANTITY_RANGE_INDEX,
+                    "{defect}: {name}"
+                );
+            }
+        }
+        assert!(!Inspection::from_existing(&[]).existing_indexes_ready());
+    }
 
     #[test]
     fn list_indexes_command_includes_build_uuids() {
@@ -1447,6 +1755,42 @@ mod builder_tests {
     }
 
     #[test]
+    fn off_mode_does_not_complete_while_an_exact_spec_is_still_building() {
+        for name in [SEARCH_DATE_END_INDEX, "idx_search_date_v3"] {
+            let entries: Vec<Document> = ready_background_indexes()
+                .into_iter()
+                .map(|index| {
+                    let building = index.name == name;
+                    let spec = doc! {
+                        "name": index.name,
+                        "key": index.key,
+                        "partialFilterExpression": index.partial.unwrap(),
+                    };
+                    if building {
+                        doc! { "spec": spec, "buildUUID": "unfinished-build" }
+                    } else {
+                        spec
+                    }
+                })
+                .collect();
+            let listed = listed_indexes(
+                &doc! { "cursor": { "firstBatch": entries } },
+                SEARCH_INDEX_COLLECTION,
+            )
+            .unwrap();
+            let inspection = Inspection::from_existing(&listed);
+            assert!(inspection.missing.is_empty());
+            assert_eq!(inspection.in_progress, vec![name.to_string()]);
+            assert_eq!(
+                off_mode_decision(&inspection),
+                Some(BuildOutcome::Skipped {
+                    missing: vec![name.to_string()],
+                })
+            );
+        }
+    }
+
+    #[test]
     fn off_mode_decision_is_none_when_nothing_missing_or_superseded() {
         let inspection = Inspection::default();
         assert_eq!(off_mode_decision(&inspection), None);
@@ -1464,7 +1808,7 @@ mod tuple_marker_record_tests {
 
     /// A fresh database on the test server, `None` (and a skip line) without
     /// one. The caller drops it.
-    async fn scratch_database(label: &str) -> Option<Database> {
+    pub(super) async fn scratch_database(label: &str) -> Option<Database> {
         let Ok(uri) = std::env::var("HFS_TEST_MONGODB_URL") else {
             if std::env::var("HFS_TEST_REQUIRE_MONGODB").is_ok_and(|value| !value.is_empty()) {
                 panic!("{label}: HFS_TEST_MONGODB_URL unset");
@@ -1584,5 +1928,368 @@ mod tuple_marker_record_tests {
         database.drop().await.unwrap();
         assert!(outcome.is_err(), "the delete on a view must fail");
         assert_eq!(recorded, Some(5));
+    }
+}
+
+/// `prime_existing_readiness` against a real server, called without `run`, so
+/// the result cannot come from a builder inspection that raced ahead.
+#[cfg(test)]
+mod existing_readiness_prime_tests {
+    use super::super::search_index_catalog::SEARCH_DATE_RANGE_INDEX;
+    use super::tuple_marker_record_tests::scratch_database;
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A database a full build left with every index and both maintenance
+    /// markers complete.
+    async fn built_database(label: &str) -> Option<Database> {
+        let database = scratch_database(label).await?;
+        let outcome = SearchIndexBuilder::new(
+            database.clone(),
+            IndexBuildMode::Inline,
+            RowsAtBoot::NoEarlierRows,
+        )
+        .run()
+        .await;
+        assert!(matches!(outcome, BuildOutcome::Built { .. }), "{outcome:?}");
+        Some(database)
+    }
+
+    fn off_builder(database: &Database, flag: &Arc<AtomicBool>) -> SearchIndexBuilder {
+        SearchIndexBuilder::new(
+            database.clone(),
+            IndexBuildMode::Off,
+            RowsAtBoot::DateRangesRecorded,
+        )
+        .with_existing_readiness_flag(Arc::clone(flag))
+    }
+
+    async fn primed(database: &Database) -> bool {
+        let flag = Arc::new(AtomicBool::new(false));
+        off_builder(database, &flag)
+            .prime_existing_readiness()
+            .await
+            .unwrap();
+        flag.load(Ordering::Acquire)
+    }
+
+    async fn drop_search_index(database: &Database, name: &str) {
+        database
+            .collection::<Document>(SEARCH_INDEX_COLLECTION)
+            .drop_index(name)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn priming_publishes_existing_indexes_while_date_end_is_missing() {
+        let Some(database) = built_database("priming_with_date_end_missing").await else {
+            return;
+        };
+        drop_search_index(&database, SEARCH_DATE_END_INDEX).await;
+        let flag = Arc::new(AtomicBool::new(false));
+        let builder = off_builder(&database, &flag);
+        builder.prime_existing_readiness().await.unwrap();
+        let primed = flag.load(Ordering::Acquire);
+        // The date-end capability follows the build outcome, not this flag.
+        let outcome = builder.run().await;
+        database.drop().await.unwrap();
+        assert!(
+            primed,
+            "verified existing indexes must be primed before run"
+        );
+        assert_eq!(
+            outcome,
+            BuildOutcome::Skipped {
+                missing: vec![SEARCH_DATE_END_INDEX.to_string()],
+            }
+        );
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn priming_waits_for_both_maintenance_markers() {
+        for marker in ["contained_rows_moved", "references_normalized"] {
+            let Some(database) = built_database("priming_with_a_marker_unset").await else {
+                return;
+            };
+            let field = format!("search_indexes.{marker}");
+            database
+                .collection::<Document>("schema_version")
+                .update_one(
+                    doc! { "_id": "schema_version" },
+                    doc! { "$unset": { field: "" } },
+                )
+                .await
+                .unwrap();
+            let primed = primed(&database).await;
+            database.drop().await.unwrap();
+            assert!(!primed, "{marker} unset");
+        }
+    }
+
+    #[tokio::test]
+    async fn priming_rejects_a_missing_existing_index() {
+        let Some(database) = built_database("priming_with_an_existing_index_missing").await else {
+            return;
+        };
+        drop_search_index(&database, SEARCH_DATE_RANGE_INDEX).await;
+        let primed = primed(&database).await;
+        database.drop().await.unwrap();
+        assert!(!primed);
+    }
+}
+
+#[cfg(test)]
+mod quantity_range_tests {
+    use super::*;
+
+    /// #2602: the reminder is given only on the way up from below the
+    /// generation that stores the interval, never on a new database.
+    #[test]
+    fn quantity_reindex_reminder_fires_only_when_crossing_the_generation() {
+        assert!(!quantity_range_reindex_reminder(None));
+        assert!(quantity_range_reindex_reminder(Some(
+            QUANTITY_RANGE_GENERATION - 1
+        )));
+        assert!(quantity_range_reindex_reminder(Some(4)));
+        assert!(!quantity_range_reindex_reminder(Some(
+            QUANTITY_RANGE_GENERATION
+        )));
+    }
+
+    /// The backfill selects only quantity rows with no high and makes each a
+    /// point, so rerunning it is a no-op.
+    #[test]
+    fn quantity_high_backfill_selects_unfilled_quantity_rows_and_copies_the_value() {
+        assert_eq!(
+            quantity_high_backfill_filter(),
+            doc! {
+                "value_quantity_value": { "$exists": true },
+                "value_quantity_high": { "$exists": false },
+            }
+        );
+        assert_eq!(
+            quantity_high_backfill_update(),
+            vec![doc! { "$set": { "value_quantity_high": "$value_quantity_value" } }]
+        );
+    }
+
+    #[test]
+    fn the_quantity_high_index_does_not_disable_existing_plans() {
+        let existing = Inspection {
+            missing: vec![
+                current_specs()
+                    .into_iter()
+                    .find(|s| s.name == SEARCH_QUANTITY_HIGH_INDEX)
+                    .unwrap(),
+            ],
+            ..Inspection::default()
+        };
+        assert!(existing.existing_indexes_ready());
+    }
+}
+
+/// `backfill_quantity_high_batched` against a real server (skipped without
+/// `HFS_TEST_MONGODB_URL`, see `tuple_marker_record_tests`), with a small
+/// batch so several batches run.
+#[cfg(test)]
+mod quantity_high_backfill_tests {
+    use super::tuple_marker_record_tests::scratch_database;
+    use super::*;
+    use futures::stream::TryStreamExt;
+
+    const BATCH: usize = 7;
+
+    async fn fetch(database: &Database, collection: &str, id: i32) -> Document {
+        database
+            .collection::<Document>(collection)
+            .find_one(doc! { "_id": id })
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// 30 old quantity rows in each collection (several batches), plus a row
+    /// of another type, a row that already has a high, and a row with no
+    /// `value_quantity_value`.
+    async fn seed(database: &Database) {
+        for (collection, base) in [
+            (SEARCH_INDEX_COLLECTION, 0),
+            (SEARCH_INDEX_CONTAINED_COLLECTION, 1000),
+        ] {
+            let coll = database.collection::<Document>(collection);
+            let mut rows: Vec<Document> = (0..30)
+                .map(|i| doc! { "_id": base + i, "value_quantity_value": f64::from(i) + 0.5 })
+                .collect();
+            rows.push(doc! { "_id": base + 100, "value_string": "abc" });
+            rows.push(
+                doc! { "_id": base + 101, "value_quantity_value": 1.0, "value_quantity_high": 9.0 },
+            );
+            rows.push(doc! { "_id": base + 102, "value_quantity_unit": "mg" });
+            coll.insert_many(rows).await.unwrap();
+        }
+    }
+
+    async fn assert_untouched_rows(database: &Database, collection: &str, base: i32) {
+        let other = fetch(database, collection, base + 100).await;
+        assert!(!other.contains_key("value_quantity_high"), "{other:?}");
+        let kept = fetch(database, collection, base + 101).await;
+        assert_eq!(kept.get_f64("value_quantity_high").unwrap(), 9.0);
+        // No `value_quantity_value` field: not a quantity row, left alone.
+        let no_value = fetch(database, collection, base + 102).await;
+        assert!(
+            !no_value.contains_key("value_quantity_high"),
+            "{no_value:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_fills_every_old_row_in_batches_and_is_idempotent() {
+        let Some(database) = scratch_database("quantity_high_backfill").await else {
+            return;
+        };
+        seed(&database).await;
+
+        let first = backfill_quantity_high_batched(&database, BATCH).await;
+        let second = backfill_quantity_high_batched(&database, BATCH).await;
+        let mut checks = Vec::new();
+        for (collection, base) in [
+            (SEARCH_INDEX_COLLECTION, 0),
+            (SEARCH_INDEX_CONTAINED_COLLECTION, 1000),
+        ] {
+            let rows: Vec<Document> = database
+                .collection::<Document>(collection)
+                .find(doc! { "_id": { "$gte": base, "$lt": base + 30 } })
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            checks.push((collection, base, rows));
+        }
+        let outcome = (first, second);
+        for (collection, base, rows) in &checks {
+            assert_eq!(rows.len(), 30);
+            for row in rows {
+                assert_eq!(
+                    row.get_f64("value_quantity_high").unwrap(),
+                    row.get_f64("value_quantity_value").unwrap(),
+                    "{collection}: {row:?}"
+                );
+            }
+            assert_untouched_rows(&database, collection, *base).await;
+        }
+        database.drop().await.unwrap();
+        assert_eq!(outcome.0.unwrap(), 60, "both collections, every old row");
+        assert_eq!(outcome.1.unwrap(), 0, "a second run modifies nothing");
+    }
+
+    #[tokio::test]
+    async fn backfill_on_rows_without_a_quantity_value_modifies_nothing() {
+        let Some(database) = scratch_database("quantity_high_backfill_none").await else {
+            return;
+        };
+        database
+            .collection::<Document>(SEARCH_INDEX_COLLECTION)
+            .insert_many(vec![
+                doc! { "_id": 1, "value_string": "a" },
+                doc! { "_id": 2, "value_quantity_unit": "mg" },
+            ])
+            .await
+            .unwrap();
+
+        let modified = backfill_quantity_high_batched(&database, BATCH).await;
+        let rows = database
+            .collection::<Document>(SEARCH_INDEX_COLLECTION)
+            .count_documents(doc! { "value_quantity_high": { "$exists": true } })
+            .await
+            .unwrap();
+        database.drop().await.unwrap();
+        assert_eq!(modified.unwrap(), 0);
+        assert_eq!(rows, 0);
+    }
+}
+
+/// The every-boot heal of `value_quantity_high` against a real server.
+#[cfg(test)]
+mod quantity_high_boot_heal_tests {
+    use super::tuple_marker_record_tests::scratch_database;
+    use super::*;
+
+    fn builder(database: &Database) -> SearchIndexBuilder {
+        SearchIndexBuilder::new(
+            database.clone(),
+            IndexBuildMode::Inline,
+            RowsAtBoot::NoEarlierRows,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_boot_heals_a_row_an_old_writer_left_and_a_clean_boot_heals_none() {
+        let Some(database) = scratch_database("quantity_high_boot_heal").await else {
+            return;
+        };
+        // Generation 8 recorded and every index built.
+        let built = builder(&database).run().await;
+        assert!(matches!(built, BuildOutcome::Built { .. }), "{built:?}");
+        assert_eq!(
+            get_search_index_generation(&database).await.unwrap(),
+            Some(SEARCH_INDEX_GENERATION)
+        );
+        let probe = |name: &'static str| {
+            let coll = database.collection::<Document>(name);
+            async move { quantity_high_stale_row_exists(&coll).await.unwrap() }
+        };
+
+        // Clean database: the cheap probe finds nothing, so no update runs.
+        assert!(!probe(SEARCH_INDEX_COLLECTION).await);
+        assert!(!probe(SEARCH_INDEX_CONTAINED_COLLECTION).await);
+        let clean = builder(&database).heal_quantity_high().await.unwrap();
+
+        // An old writer inserts rows behind the builder's back.
+        for (name, id) in [
+            (SEARCH_INDEX_COLLECTION, 1),
+            (SEARCH_INDEX_CONTAINED_COLLECTION, 2),
+        ] {
+            database
+                .collection::<Document>(name)
+                .insert_one(doc! { "_id": id, "value_quantity_value": 4.5 })
+                .await
+                .unwrap();
+        }
+        assert!(probe(SEARCH_INDEX_COLLECTION).await);
+        assert!(probe(SEARCH_INDEX_CONTAINED_COLLECTION).await);
+
+        let healed = builder(&database).heal_quantity_high().await.unwrap();
+        let second = builder(&database).run().await;
+        let after = builder(&database).heal_quantity_high().await.unwrap();
+        let rows: Vec<Document> = {
+            use futures::stream::TryStreamExt;
+            let mut all = Vec::new();
+            for name in [SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION] {
+                all.extend(
+                    database
+                        .collection::<Document>(name)
+                        .find(doc! { "value_quantity_value": 4.5 })
+                        .await
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap(),
+                );
+            }
+            all
+        };
+        database.drop().await.unwrap();
+        assert_eq!(clean, 0);
+        assert_eq!(healed, 2, "one row per collection");
+        assert!(matches!(second, BuildOutcome::UpToDate), "{second:?}");
+        assert_eq!(after, 0, "a second boot heals nothing");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row.get_f64("value_quantity_high").unwrap(), 4.5);
+        }
     }
 }

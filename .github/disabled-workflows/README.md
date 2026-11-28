@@ -4,17 +4,20 @@ These inherited workflows are outside the Cassandra project scope and are
 preserved here for reference. GitHub Actions only loads workflows from
 `.github/workflows/`, so the YAML files in this directory do not run.
 
-Ten workflows are active. Nine run on the team's self-hosted runners
+Eleven workflows are active. Ten run on the team's self-hosted runners
 (ADR-aacruzgon-0018, ADR-sam-michaels-0001, ADR-aacruzgon-0023):
 `r4b-compile-check.yml` (roadmap item 0.4), `fmt-clippy-cassandra.yml` (0.5),
 `upstream-canary.yml` (0.11), `runner-docker-prune.yml`,
 `cassandra-coverage.yml`, `fhir-versions.yml`, `benchmark-datasets.yml` (0.7),
-`cassandra-mutants.yml` and `cassandra-flaky.yml` (0.13). Light jobs use
+`cassandra-mutants.yml`, `cassandra-flaky.yml` (0.13) and
+`cassandra-three-node.yml` (ADR-aacruzgon-0083). Light jobs use
 `[self-hosted, hfs-cassandra-light]`; the two clippy jobs,
 `fhir-versions.yml`'s all-versions test job and the flakiness job
 `[self-hosted, hfs-cassandra-medium]`; and the mutation-testing job, which runs
-only on a pull request labelled `mutants`, `[self-hosted, hfs-cassandra-heavy]`,
-on `acruzdebian` alone (ADR-aacruzgon-0082). The Rust jobs keep a bounded cargo
+only on a pull request labelled `mutants` or by manual dispatch, and the
+report-only three-node job,
+nightly and by dispatch, `[self-hosted, hfs-cassandra-heavy]`, on `acruzdebian`
+alone (ADR-aacruzgon-0082). The Rust jobs keep a bounded cargo
 target directory on each machine instead of a cache (ADR-sam-michaels-0002).
 
 The standalone `.github/workflows/coverage.yml` workflow runs on standard
@@ -44,6 +47,13 @@ runners match, so a restored copy must be retargeted to
 guard from ADR-aacruzgon-0018 first. Follow-up CI, including
 adapting the benchmark to Cassandra/PostgreSQL, runs on the self-hosted runners
 (ADR-aacruzgon-0018).
+
+`docker-lint.yml` came with the 2026-11-24 upstream sync
+(HeliosSoftware/hfs#2592, for issue #2591) and was moved here before that sync
+merged, as every workflow a sync adds is (ADR-aacruzgon-0022). It runs on
+GitHub-hosted `ubuntu-latest` on any pull request that changes `Dockerfile`,
+`.dockerignore` or `.hadolint.yaml`, and uses `actions/checkout` by tag, so the
+repository's SHA-pinning setting would fail it before its first step.
 
 `cassandra-integration.yml` is intentionally empty. Implement its triggers and
 jobs before moving it into `.github/workflows/`; an empty active workflow would

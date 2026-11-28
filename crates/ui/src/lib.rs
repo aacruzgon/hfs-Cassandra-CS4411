@@ -66,11 +66,13 @@ mod sql_views;
 mod subscriptions;
 // Public but hidden: the coordinator's counters and view are what #1849's
 // integration tests and evidence harnesses observe.
+mod cross_site;
 #[doc(hidden)]
 pub mod tenant_inventory;
 mod tenants;
 mod vd_complete;
 
+pub use bulk_import::set_bulk_submit_trusted_providers;
 pub use login::{LoginRuntime, SignedIn, set_interactive_login};
 pub use tenants::register_tenant_purge_output;
 
@@ -188,10 +190,6 @@ struct WebState {
     /// Trusted loopback base used for UI calls back into this HFS process.
     /// Unlike `public_base_url`, this never carries a reverse-proxy prefix.
     self_base_url: String,
-    /// Credential for the UI's self-calls that carry no caller identity
-    /// (the Import page's own kick-offs and polls, the Export workspace,
-    /// #1436/#1438): the same provider the conformance source uses.
-    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     /// Runtime capability cache. A standards-compliant 501 from Patient name
     /// search downgrades this process to exact-id lookup only.
     patient_name_search: Arc<AtomicBool>,
@@ -257,6 +255,17 @@ impl WebState {
 const SETTINGS_VERSION_KEY: &str = "fhirVersion";
 const SETTINGS_TENANT_KEY: &str = "tenantId";
 const LOCAL_USER_KEY: &str = "l2:";
+
+/// Whether the settings document `user_key` names is withheld from this
+/// request (#2802): in the bearer-only posture no principal ever reaches
+/// `/ui`, so every caller resolves to the `l2:` document reserved for the
+/// auth-disabled deployment. The pages that stay open there neither read it
+/// (the stored FHIR version, tenant, rail and dashboard state) nor write it
+/// (a page load recording a rail or chart selection); they render from the
+/// server defaults instead.
+pub(crate) fn settings_withheld(user_key: &str) -> bool {
+    user_key == LOCAL_USER_KEY && bearer_only_auth()
+}
 
 fn settings_user_key(principal: Option<&helios_auth::Principal>) -> String {
     match principal {
@@ -367,8 +376,10 @@ async fn resolve_prefs(
     // stamped below) is built from too — reading it again per page would break
     // that module's zero-extra-reads contract.
     let stored = match &state.settings {
-        Some(store) => store.get_settings(&user_key).await.ok().flatten(),
-        None => None,
+        Some(store) if !settings_withheld(&user_key) => {
+            store.get_settings(&user_key).await.ok().flatten()
+        }
+        _ => None,
     };
     if let Some(stored) = &stored {
         let document = &stored.document;
@@ -1391,9 +1402,11 @@ struct HistoryDiffFragment {
 /// The SearchParameter and CompartmentDefinition viewers read the server's own
 /// FHIR API over HTTP (storage is the source of truth): `self_base_url` is the
 /// loopback base URL the UI calls itself at, and `outbound_auth` supplies the
-/// credentials for that self-call (a service token when auth is enabled, a
-/// no-op otherwise). `data_dir` (`HFS_DATA_DIR`) and `fhir_version` are used to
-/// seed a newly-provisioned tenant from the tenant-maintenance page. `tenants`
+/// credentials for those conformance reads when the request brought none (a
+/// service token when auth is enabled, a no-op otherwise). It is never lent
+/// to a self-call that reads or writes tenant data (#2692). `data_dir`
+/// (`HFS_DATA_DIR`) and `fhir_version` are used to seed a newly-provisioned
+/// tenant from the tenant-maintenance page. `tenants`
 /// is the storage handle that page reads and writes; pass `None` to render the
 /// UI without a live registry (the page then reports it as unavailable).
 ///
@@ -1499,7 +1512,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url.clone(),
-        outbound_auth.clone(),
+        outbound_auth,
         fhir_version,
         data_dir.clone(),
     ));
@@ -1519,7 +1532,6 @@ pub fn mount_with_body_limit_and_tenant_routing(
         tenant_path_routing,
         bulk_provider,
         self_base_url,
-        outbound_auth,
         patient_name_search,
         write_observer,
     )
@@ -1633,7 +1645,6 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         tenant_path_routing,
         bulk_provider,
         public_base_url,
-        Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
         PatientNameSearchSupport::Enabled,
         None,
     )
@@ -1658,7 +1669,6 @@ pub fn mount_with_conformance_source_and_runtime(
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
     self_base_url: String,
-    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     patient_name_search: PatientNameSearchSupport,
     write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
 ) -> Router {
@@ -1966,7 +1976,6 @@ pub fn mount_with_conformance_source_and_runtime(
         terminology,
         public_base_url,
         self_base_url,
-        outbound_auth,
         patient_name_search: Arc::new(AtomicBool::new(matches!(
             patient_name_search,
             PatientNameSearchSupport::Enabled
@@ -1984,6 +1993,15 @@ pub fn mount_with_conformance_source_and_runtime(
         // than act for an anonymous caller (#1619). Inside the locale layer
         // so the refusal is worded in the request's language.
         .layer(middleware::from_fn(refuse_anonymous_storage_access))
+        // With a login installed, the tenant registry and the bulk-import
+        // workspace act for the session only when its verified token carries
+        // a `system/*` scope with the method's permission, as `/admin/tenants`
+        // requires; a session without one is answered `403`. Inside the
+        // locale layer so the refusal is worded in the request's language.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            login::require_system_scope,
+        ))
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
         // don't cross a fragment response with a full-page one.
         .layer(AutoVaryLayer)
@@ -1995,7 +2013,8 @@ pub fn mount_with_conformance_source_and_runtime(
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
         // Every self-call a page makes on the user's behalf carries the
         // browser's credential, else the signed-in session's bearer, ahead
-        // of the outbound service credential (#1671).
+        // of the outbound service credential (#1671), which only the
+        // conformance reads may fall back to (#2692).
         .layer(middleware::from_fn_with_state(
             state.clone(),
             scope_request_authorization,
@@ -2007,6 +2026,13 @@ pub fn mount_with_conformance_source_and_runtime(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             login::require_session,
+        ))
+        // Outside the session gate: a form posted by a page on another site
+        // is refused before it can ride the browser's session or, with
+        // authentication off, act for anyone who can reach the UI.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            cross_site::refuse_cross_site_writes,
         ))
         .with_state(state)
         // Registered after the UI layers so neither arm of `/` picks them up:
@@ -2069,8 +2095,10 @@ fn lowercase_ui_prefix(uri: &axum::http::Uri) -> Option<String> {
 /// Middleware (#1671): runs the rest of the request with its own credential
 /// in scope for every self-call — the browser's `Authorization`, else the
 /// signed-in session's bearer — so a page never depends on the outbound
-/// service token while its user has a valid session. Assets make no
-/// self-calls and skip the session lookup.
+/// service token while its user has a valid session. Without either, only
+/// the conformance reads fall back to that token; every other self-call goes
+/// out with no credential (#2692). Assets make no self-calls and skip the
+/// session lookup.
 async fn scope_request_authorization(
     State(state): State<WebState>,
     request: axum::extract::Request,
@@ -2085,10 +2113,19 @@ async fn scope_request_authorization(
     conformance::with_request_authorization(authorization, next.run(request)).await
 }
 
-/// The UI routes whose handlers act on storage themselves — the tenant
-/// registry and the bulk-submit store — rather than through the FHIR API.
-/// The API-backed pages carry the browser's credential on their self-call and
-/// so already answer `401` without one; these would act with none.
+/// The UI routes refused outright to an anonymous caller in the bearer-only
+/// posture. The tenant registry and the bulk-submit store act on storage
+/// themselves rather than through the FHIR API, so nothing downstream would
+/// refuse them. The bulk-export pages exist only to start, poll and download
+/// exports, none of which an anonymous caller can do (#2692): refusing them
+/// here answers with the shell's notice instead of a page of failed jobs.
+///
+/// Every other page reaches data through a self-call, and a self-call made
+/// for a caller that brought no credential carries none — only the
+/// SearchParameter, CompartmentDefinition and `/metadata` reads may fall back
+/// to the outbound service credential (`HFS_OUTBOUND_BEARER_TOKEN`), see
+/// `conformance::SelfCall` and `bulk_export::forward_credential` — so the API
+/// itself answers those `401`.
 fn acts_on_storage_directly(path: &str) -> bool {
     path == "/ui/tenants"
         || path.starts_with("/ui/tenants/")
@@ -2096,24 +2133,38 @@ fn acts_on_storage_directly(path: &str) -> bool {
         || path.starts_with("/ui/tenant/")
         || path == "/ui/bulk-import"
         || path.starts_with("/ui/bulk-import/")
+        || path == "/ui/bulk-export"
+        || path.starts_with("/ui/bulk-export/")
+}
+
+/// The UI routes that read or write the caller's settings document with
+/// nothing but the request to key it on: the SQL Export workspace (its job
+/// records live in that document) and the preference writes. In the
+/// bearer-only posture no principal ever reaches `/ui`, so every caller,
+/// including one presenting a bearer, would share the `l2:` document that
+/// is reserved for the auth-disabled deployment; these are refused there.
+fn keeps_shared_settings(method: &axum::http::Method, path: &str) -> bool {
+    path == "/ui/sql/export"
+        || path.starts_with("/ui/sql/export/")
+        || (*method == axum::http::Method::POST
+            && matches!(path, "/ui/version" | "/ui/sql/views" | "/ui/sql/queries"))
 }
 
 /// Middleware (#1619): in the bearer-only posture — authentication enabled,
 /// no interactive login installed, so no session principal can ever be
-/// stamped — a request for a route that acts on storage directly is refused
-/// with `401` and the same notice the shell shows. With a login installed
-/// `require_session` gates every page instead, and with authentication off
-/// there is nothing to refuse.
+/// stamped — a request for a route that acts on storage directly, or that
+/// keeps settings for a caller it cannot name, is refused with `401` and the
+/// same notice the shell shows. With a login installed `require_session`
+/// gates every page instead, and with authentication off there is nothing to
+/// refuse.
 async fn refuse_anonymous_storage_access(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
     if bearer_only_auth()
-        && acts_on_storage_directly(request.uri().path())
-        && request
-            .extensions()
-            .get::<helios_auth::SessionPrincipal>()
-            .is_none()
+        && (acts_on_storage_directly(request.uri().path())
+            || keeps_shared_settings(request.method(), request.uri().path()))
+        && request.extensions().get::<login::SignedIn>().is_none()
     {
         let locale = request
             .extensions()

@@ -2,8 +2,9 @@
 //! hold, how many bytes one may carry, and what a failed one means.
 //!
 //! Step 5 of the write path sends a version's index rows in logged batches at
-//! `LOCAL_QUORUM`, each under 5 KiB (a unit over the limit is never split and
-//! goes alone, as one batch), sent concurrently (design step 5;
+//! `LOCAL_QUORUM`, each under 5 KiB (a unit over the limit goes alone, as one
+//! batch, and is split only past [`MAX_BATCH_STATEMENTS`] statements or
+//! [`MAX_PIECE_BYTES`]), sent concurrently (design step 5;
 //! `docs/Cassandra/schema/walkthrough.md` section 2, "Index rows"). The
 //! session sends one batch, [`CassandraSession::batch`]; this module holds
 //! the parts that need no node, each tested on its own. The decisions are
@@ -16,8 +17,10 @@
 //!   intent table.
 //! - [`wire_bytes`], [`MAX_BATCH_BYTES`] and [`pack`] (IW11): a batch is
 //!   measured by every byte its statements take on the wire, and units (one
-//!   partition's rows, IW9) are packed into batches without ever splitting
-//!   one.
+//!   partition's rows, IW9) are packed into batches. A unit is split only
+//!   when it has more than [`MAX_BATCH_STATEMENTS`] statements or more than
+//!   [`MAX_PIECE_BYTES`] of them ([`piece_len`]; never the
+//!   `resources_by_type` unit; ADR-aacruzgon-0089).
 //! - [`classify_failure`] (IW15): what a failed batch means for the writer,
 //!   from the error the node sent.
 //!
@@ -210,15 +213,82 @@ pub(crate) fn wire_bytes(statements: &[IndexStatement]) -> usize {
 }
 
 /// The most bytes one batch may carry by [`wire_bytes`] (IW11): the node's
-/// `batch_size_warn_threshold` of 5 KiB, less a 256-byte margin.
+/// `batch_size_warn_threshold` of 5 KiB, less a 256-byte margin. It assumes
+/// the node's `batch_size_fail_threshold` (50 KiB by default) stays above it:
+/// below 4,864 bytes the node could refuse a batch of several partitions as
+/// `Invalid` (`crates/persistence/README.md`, "Node settings HFS depends on").
 pub(crate) const MAX_BATCH_BYTES: usize = 5 * 1024 - 256;
+
+/// The most statements one batch may hold (IW11): the native protocol counts
+/// them in 16 bits, so a longer batch would wrap. A unit with more is split
+/// by `index_batches` into consecutive pieces of at most this many
+/// (ADR-aacruzgon-0089), and [`CassandraSession::batch`] refuses a longer
+/// batch rather than send it.
+///
+/// **Pinned at 65,535.** A BATCH frame's statement count is a `[short]`, a
+/// 2-byte unsigned integer (`native_protocol_v5.spec`, sections 3 and
+/// 4.1.7), so 65,535 is the most a node reads. `cdrs-tokio` writes it as
+/// `self.queries.len() as CIntShort`, an `i16`
+/// (`cassandra-protocol-5.0.0/src/frame/message_batch.rs:56`): 65,535 goes
+/// out as `0xFFFF`, which the node reads as 65,535, and 65,536 wraps to 0,
+/// so the node reads the first statement's bytes as the consistency
+/// (`ProtocolException: Unknown code 256 for a consistency level`, the F1
+/// reproduction in ADR-aacruzgon-0089). A larger limit would bring that
+/// back, so the assertion below holds it at the protocol's.
+///
+/// [`CassandraSession::batch`]: super::session::CassandraSession::batch
+pub(crate) const MAX_BATCH_STATEMENTS: usize = u16::MAX as usize;
+const _: () = assert!(
+    MAX_BATCH_STATEMENTS == 65_535,
+    "a batch's statement count is a protocol [short]"
+);
+
+/// The most bytes one piece of a split unit may carry by [`wire_bytes`]
+/// (ADR-aacruzgon-0089): 8 MiB, half the node's default 16 MiB limit on a
+/// whole native-protocol message (less on a heap under 640 MiB). The node
+/// refuses a larger BATCH frame before it looks at the batch at all
+/// (`OversizedCQLMessageException: CQL Message of size 17366788 bytes
+/// exceeds allowed maximum of 16777216 bytes`, Cassandra 5.0.9 with
+/// `native_transport_max_message_size` unset, `Config.java:288`),
+/// and a single-partition batch is exempt from `batch_size_fail_threshold`
+/// (`BatchStatement.java:333-335`), so this is the limit a big unit meets.
+/// The other half leaves room for the frame's own bytes and for a node set
+/// lower. It is the same 8 MiB as `MAX_CAS_PAYLOAD_BYTES`.
+///
+/// It assumes the node's `native_transport_max_message_size` is at least
+/// 8 MiB plus the batch's own few bytes. Unset, that is
+/// `min(max_mutation_size, heap / 10, heap / 40)`
+/// (`DatabaseDescriptor.java:903-905`, `:3237-3245`): 16 MiB on a heap of
+/// 640 MiB or more, 12.8 MiB on 512 MiB, and under 8 MiB on a heap under
+/// about 321 MiB, where a full piece would be refused
+/// (`crates/persistence/README.md`, "Node settings HFS depends on").
+pub(crate) const MAX_PIECE_BYTES: usize = 8 * 1024 * 1024;
+
+/// How many of `statements`, from the first, go in the next piece of a unit
+/// (ADR-aacruzgon-0089): as many as fit in [`MAX_BATCH_STATEMENTS`]
+/// statements and [`MAX_PIECE_BYTES`] by [`wire_bytes`], whichever ends
+/// first, and always at least one, so a lone statement over the byte budget
+/// still goes, alone. A unit within both limits is one piece: all of it.
+pub(crate) fn piece_len(statements: &[IndexStatement]) -> usize {
+    let mut bytes = 0;
+    for (taken, statement) in statements.iter().take(MAX_BATCH_STATEMENTS).enumerate() {
+        bytes += wire_bytes(std::slice::from_ref(statement));
+        if taken > 0 && bytes > MAX_PIECE_BYTES {
+            return taken;
+        }
+    }
+    statements.len().min(MAX_BATCH_STATEMENTS)
+}
 
 /// Packs units into batches of at most `bound` bytes, given each unit's size
 /// by [`wire_bytes`]. Returns each batch as the run of unit indices it holds
 /// (IW11).
 ///
-/// - **A unit is never split.** A unit is every row of one partition key, its
-///   inserts and its deletes (IW9 B). Cassandra applies one partition's
+/// - **A unit is not split here.** A unit is every row of one partition key,
+///   its inserts and its deletes (IW9 B); a unit of more than
+///   [`MAX_BATCH_STATEMENTS`] statements or [`MAX_PIECE_BYTES`] is split
+///   into pieces by `index_batches` before it gets here ([`piece_len`]),
+///   and `pack` sees each piece as a unit. Cassandra applies one partition's
 ///   mutation whole on each replica; most of all, once the batch has
 ///   reached a quorum, an update alone never lets `count` see an updated
 ///   resource's `resources_by_type` row at both `last_updated` values.
@@ -290,14 +360,16 @@ pub(crate) enum BatchFailure {
     /// a key over 64 KiB). Another try gets the same answer, so none is
     /// made, and the writer logs it at `error`. The 1,024-byte mapping of
     /// G35 as amended (ADR-aacruzgon-0079) and [`MAX_BATCH_BYTES`] should
-    /// make it impossible.
+    /// make it impossible. Also the session's own refusal of a batch over
+    /// [`MAX_BATCH_STATEMENTS`] ([`DriverError::TooManyStatements`],
+    /// ADR-aacruzgon-0089), which `index_batches` should make impossible.
     Refused,
 }
 
 /// Classifies a failed index batch or index statement (IW15); see
 /// [`BatchFailure`].
 pub(crate) fn classify_failure(error: &DriverError) -> BatchFailure {
-    if is_invalid(error) {
+    if is_invalid(error) || matches!(error, DriverError::TooManyStatements { .. }) {
         return BatchFailure::Refused;
     }
     let DriverError::Driver(error) = error else {
@@ -589,6 +661,57 @@ mod tests {
     fn an_invalid_batch_is_refused_and_not_retried() {
         assert_eq!(
             classify_failure(&server(ErrorType::Invalid)),
+            BatchFailure::Refused
+        );
+    }
+
+    /// ADR-aacruzgon-0089: a piece is as long as both limits allow. A run
+    /// within both is one piece; past 65,535 statements the count ends it;
+    /// past `MAX_PIECE_BYTES` the bytes do; and a lone statement over the
+    /// byte budget still goes, alone.
+    #[test]
+    fn a_piece_ends_at_the_statement_count_or_the_byte_budget() {
+        let row =
+            |bytes: usize| IndexStatement::new(INSERT_ROW, vec![Value::Some(vec![b'x'; bytes])]);
+        assert_eq!(piece_len(&[]), 0);
+        let small: Vec<IndexStatement> = (0..10).map(|_| row(10)).collect();
+        assert_eq!(piece_len(&small), 10);
+
+        let many: Vec<IndexStatement> = (0..70_000).map(|_| row(1)).collect();
+        assert!(wire_bytes(&many) < MAX_PIECE_BYTES);
+        assert_eq!(piece_len(&many), MAX_BATCH_STATEMENTS);
+
+        // 1,000-byte values: 4 + 1,000 + the head, so the budget ends the
+        // piece well before the count does.
+        let wide: Vec<IndexStatement> = (0..10_000).map(|_| row(1_000)).collect();
+        let each = wire_bytes(&wide[..1]);
+        let cut = piece_len(&wide);
+        assert_eq!(cut, MAX_PIECE_BYTES / each);
+        assert!(wire_bytes(&wide[..cut]) <= MAX_PIECE_BYTES);
+        assert!(wire_bytes(&wide[..=cut]) > MAX_PIECE_BYTES);
+
+        // Exactly at the budget: 21 + 4 + 4,071 = 4,096 bytes each, so
+        // 2,048 of them are 8 MiB to the byte. A piece holds all 2,048, and
+        // the 2,049th starts the next one.
+        let exact: Vec<IndexStatement> = (0..2_049).map(|_| row(4_071)).collect();
+        assert_eq!(wire_bytes(&exact[..1]), 4_096);
+        assert_eq!(wire_bytes(&exact[..2_048]), MAX_PIECE_BYTES);
+        assert_eq!(piece_len(&exact), 2_048);
+
+        let huge = [row(MAX_PIECE_BYTES), row(10)];
+        assert_eq!(piece_len(&huge), 1, "an oversized statement goes alone");
+        assert_eq!(piece_len(&huge[..1]), 1);
+    }
+
+    /// The session's own refusal of a batch over the statement limit is
+    /// permanent too: nothing was sent, and another try gets the same answer
+    /// (ADR-aacruzgon-0089).
+    #[test]
+    fn a_batch_over_the_statement_limit_is_refused_and_not_retried() {
+        assert_eq!(
+            classify_failure(&DriverError::TooManyStatements {
+                statements: MAX_BATCH_STATEMENTS + 1
+            }),
             BatchFailure::Refused
         );
     }

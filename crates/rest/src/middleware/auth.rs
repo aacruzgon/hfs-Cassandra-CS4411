@@ -372,6 +372,7 @@ fn patient_compartment_path_check(
     };
     let is_control = |s: &str| s.starts_with('_') || s.starts_with('$');
     match segments.as_slice() {
+        ["_history"] => refuse("system-level history"),
         // Type-level: search and create confine themselves; conditional
         // update/patch/delete resolve their target by criteria the handler
         // cannot vouch for.
@@ -386,14 +387,24 @@ fn patient_compartment_path_check(
         [_type, second] if is_control(second) => refuse(routed_path),
         // Instance level: the handler checks the stored payload.
         [_type, _id] => Ok(()),
-        [_type, _id, "_history"] => Ok(()),
+        // Instance history is read through a per-version filter; the
+        // trial-use history deletes would erase versions from before the
+        // resource joined the compartment, which the same token may not read,
+        // so a patient/ scope keeps the reads only.
+        [_type, _id, "_history"] => match method {
+            "GET" | "HEAD" => Ok(()),
+            _ => refuse("deleting a resource's history"),
+        },
         ["Patient", id, "$everything"] if *id == patient_id => Ok(()),
         [_type, _id, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
         [_type, _id, third] if third.starts_with('_') => refuse(routed_path),
         // Compartment search: the launch patient's own compartment only.
         ["Patient", id, _target] if *id == patient_id => Ok(()),
         [_compartment, _id, _target] => refuse("a search in another compartment"),
-        [_type, _id, "_history", _vid] => Ok(()),
+        [_type, _id, "_history", _vid] => match method {
+            "GET" | "HEAD" => Ok(()),
+            _ => refuse("deleting a version of a resource"),
+        },
         _ => refuse(routed_path),
     }
 }
@@ -404,8 +415,15 @@ fn patient_compartment_path_check(
 /// These surface data spanning every tenant — the full tenant roster and sizes,
 /// server-wide traffic — so, unlike the per-tenant console endpoints, they must
 /// not be reachable by ordinary user- or patient-context tokens. This layer
-/// requires a **system-context, all-resource** scope (`system/*.r`); anything
-/// less is rejected `403`.
+/// requires a **system-context, all-resource** scope carrying the permission
+/// bit the request's method implies (see [`admin_tier_permission`]): `system/*.r`
+/// to look, `system/*.c` to register a tenant, `system/*.d` to deregister or
+/// purge one. Anything less is rejected `403`.
+///
+/// A token that carries a tenant claim is rejected `403` on every method,
+/// whatever its scopes: the claim confines it to one tenant on the FHIR routes,
+/// so it is not a cross-tenant administrator (#2673). Only a token without a
+/// tenant claim reaches the scope check.
 ///
 /// Consistent with [`authz_middleware`], if no [`Principal`] is present (auth
 /// disabled server-wide, or an exempt path) the request passes through, so this
@@ -422,17 +440,49 @@ pub async fn admin_authz_middleware(
     };
 
     let path = request.uri().path().to_string();
+    let method = request.method().clone();
+    let (permission, letter) = admin_tier_permission(&method);
 
-    if principal.scopes.has_system_scope(SmartPermissions::READ) {
+    // A token bound to a tenant by its claim is not a cross-tenant
+    // administrator, whatever scopes it holds: the FHIR routes confine it to
+    // its own tenant, and this tier lists, registers and purges every tenant.
+    // The test is the tenant extractor's: only an empty claim counts as no
+    // claim. A blank or unparseable one is refused on the FHIR routes, so it
+    // is refused here too rather than read as a system token.
+    if let Some(tenant) = principal.tenant_id().filter(|t| !t.is_empty()) {
+        warn!(
+            sub = %principal.subject(),
+            tenant = %tenant,
+            method = %method,
+            path = %path,
+            "Console admin authorization denied: token is bound to a tenant"
+        );
+        let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+            .action(AuditAction::Execute)
+            .outcome("8")
+            .outcome_desc(format!(
+                "Forbidden: console admin access to {method} {path} refused for a token bound to tenant {tenant}"
+            ))
+            .principal(&principal)
+            .build();
+        auth_state.audit_sink.record(event).await;
+        return forbidden_response(
+            "A token bound to a tenant cannot use the cross-tenant admin API; use a \
+             system-level token that carries no tenant claim",
+        );
+    }
+
+    if principal.scopes.has_system_scope(permission) {
         debug!(
             sub = %principal.subject(),
+            method = %method,
             path = %path,
             "Console admin authorization granted"
         );
         let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
             .action(AuditAction::Execute)
             .outcome("0")
-            .outcome_desc(format!("Granted: console admin access to {path}"))
+            .outcome_desc(format!("Granted: console admin access to {method} {path}"))
             .principal(&principal)
             .build();
         auth_state.audit_sink.record(event).await;
@@ -440,19 +490,37 @@ pub async fn admin_authz_middleware(
     } else {
         warn!(
             sub = %principal.subject(),
+            method = %method,
             path = %path,
-            "Console admin authorization denied: system-level scope required"
+            "Console admin authorization denied: system-level scope with `{letter}` required"
         );
         let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
             .action(AuditAction::Execute)
             .outcome("8")
             .outcome_desc(format!(
-                "Forbidden: console admin access to {path} requires a system-level scope"
+                "Forbidden: console admin access to {method} {path} requires a system-level scope with `{letter}`"
             ))
             .principal(&principal)
             .build();
         auth_state.audit_sink.record(event).await;
-        forbidden_response("This endpoint requires a system-level scope (system/*.read)")
+        forbidden_response(&format!(
+            "This endpoint requires a system-level scope with the `{letter}` permission (system/*.{letter})"
+        ))
+    }
+}
+
+/// The `system/*` permission bit the admin tier demands for a method, with
+/// its SMART letter for the refusal: `r` to look (GET, HEAD, OPTIONS), `c` to
+/// register (POST), `u` to change (PUT, PATCH), `d` to deregister or purge
+/// (DELETE). No admin route mounts any other method; one that appeared would
+/// be held to the delete bit rather than admitted on a read.
+fn admin_tier_permission(method: &axum::http::Method) -> (SmartPermissions, &'static str) {
+    use axum::http::Method;
+    match *method {
+        Method::GET | Method::HEAD | Method::OPTIONS => (SmartPermissions::READ, "r"),
+        Method::POST => (SmartPermissions::CREATE, "c"),
+        Method::PUT | Method::PATCH => (SmartPermissions::UPDATE, "u"),
+        _ => (SmartPermissions::DELETE, "d"),
     }
 }
 
@@ -506,15 +574,6 @@ fn routed_path(path: &str, tenant_url_routing: bool) -> String {
     path.to_string()
 }
 
-/// Operation endpoints whose handlers run their own scope check, so the
-/// middleware defers to them instead of classifying them by HTTP method.
-///
-/// Adding an entry here **removes** the middleware's authorization check for
-/// that path. Only add one whose handler enforces a scope itself — see
-/// `check_purge_scope` / `check_reindex_scope` in `handlers::purge` /
-/// `handlers::reindex`.
-const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-status"];
-
 /// Operations that are read-shaped regardless of HTTP method: both
 /// `GET /{type}/$op` and `POST /{type}/{id}/$op` (and their instance-level
 /// equivalents) return data and must be authorized as `FhirOperation::Read`,
@@ -522,8 +581,9 @@ const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-statu
 ///
 /// This MUST stay a narrow, explicit allowlist — add an operation only after
 /// confirming it is read-only and needs no scope of its own. A destructive or
-/// write-shaped `$`-operation (e.g. `$bulk-submit`, a genuine write) belongs in
-/// `HANDLER_AUTHORIZED_OPS` instead, with its own handler-level check.
+/// write-shaped `$`-operation (e.g. `$bulk-submit`, a genuine write) belongs
+/// with the handler-authorized route shapes in `extract_operation` instead,
+/// with its own handler-level check.
 ///
 /// `$export` (Bulk Data) is read-shaped: type-level `/{type}/$export` and
 /// Group-instance `/Group/{id}/$export` return the exported data and are
@@ -566,7 +626,19 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
         return None;
     }
 
-    // System-level paths
+    // System history spans every resource type, so it is a Read on the
+    // all-resource type `*`: only a wildcard-type scope (`user/*.r`,
+    // `system/*.r`) grants it, and a `patient/` wildcard is refused by
+    // `patient_compartment_path_check` because the handler cannot confine it.
+    if first == "_history" && segments.len() == 1 {
+        return Some(("*".to_string(), FhirOperation::Read));
+    }
+
+    // Other system-level paths. The ones that read or change data authorize
+    // themselves in their handlers: `$export` and `$bulk-submit` check their
+    // own scopes, `$reindex` the `system/reindex` operation scope, and
+    // `$sql-run` / `$sql-export` require a Search grant on every resource
+    // type the resolved subject reads (`handlers::sof::authz`).
     if first.starts_with('_') || first.starts_with('$') || first == "metadata" || first == "health"
     {
         return None;
@@ -576,7 +648,10 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
     let resource_type = first.to_string();
 
     // Type- and instance-scoped `$purge` / `$reindex` carry their own scope
-    // semantics that do not map onto the HTTP method: POST /Patient/$purge is a
+    // semantics that do not map onto the HTTP method (`check_purge_scope` /
+    // `check_reindex_scope` in `handlers::purge` / `handlers::reindex`), and
+    // adding a shape below **removes** the middleware's authorization check
+    // for it. POST /Patient/$purge is a
     // destructive delete, not a Create, and gating it as a Create would both
     // over-restrict a least-privilege token and label the audit trail
     // "Granted: Create on Patient" for what is really a purge. Their handlers
@@ -585,16 +660,23 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
     // batch and $export already use.
     //
     // This MUST stay an explicit allowlist. Returning None for *any* $-suffixed
-    // path would silently remove the only authorization check from every
-    // SQL-on-FHIR operation ($sql-run, $sql-run, and their
-    // -export variants) and the subscription operations — none of which run a
-    // handler-level scope check. That would let any authenticated token execute
-    // arbitrary ViewDefinitions and SQL.
-    if segments
-        .iter()
-        .skip(1)
-        .any(|s| HANDLER_AUTHORIZED_OPS.contains(s))
-    {
+    // path would silently remove the only authorization check from the
+    // type- and instance-level operations that run no handler-level scope
+    // check of their own (the subscription operations among them).
+    //
+    // The match is on the route shape, not on the segment text: only
+    // `/{type}/$purge`, `/{type}/$reindex` and `/{type}/{id}/$purge` are
+    // routed to those handlers (the system-level forms are `$`-first and
+    // declined below). A path that carries one of these names where a
+    // resource id or version id goes (`/{type}/$reindex-status`,
+    // `/{type}/{id}/_history/$purge`) is dispatched to the ordinary instance
+    // handlers, which check nothing, so it is classified like any other id.
+    let handler_authorized = match segments.as_slice() {
+        [_, op] => matches!(*op, "$purge" | "$reindex"),
+        [_, _, op] => *op == "$purge",
+        _ => false,
+    };
+    if handler_authorized {
         return None;
     }
 
@@ -764,6 +846,9 @@ mod tests {
             // Type history.
             ("/Observation/_history", "GET"),
             ("/Patient/_history", "GET"),
+            // History deletes: versions the token may not read.
+            ("/Observation/o1/_history", "DELETE"),
+            ("/Observation/o1/_history/3", "DELETE"),
             // Operations other than the two that narrow themselves.
             ("/Observation/$validate", "POST"),
             ("/ValueSet/$expand", "GET"),
@@ -856,7 +941,55 @@ mod tests {
 
     #[test]
     fn test_extract_operation_system_history() {
-        assert!(extract_operation("/_history", "GET").is_none());
+        assert_eq!(
+            extract_operation("/_history", "GET"),
+            Some(("*".to_string(), FhirOperation::Read)),
+            "system history spans every type, so only an all-resource read grant may reach it"
+        );
+        assert_eq!(
+            extract_operation_for_routing("/acme/_history", "GET", true),
+            Some(("*".to_string(), FhirOperation::Read))
+        );
+    }
+
+    #[test]
+    fn test_patient_wildcard_cannot_reach_system_history() {
+        assert!(patient_compartment_path_check("/_history", "GET", "p1").is_err());
+    }
+
+    #[test]
+    fn test_admin_tier_permission_follows_the_method() {
+        use axum::http::Method;
+        assert_eq!(
+            admin_tier_permission(&Method::GET).0,
+            SmartPermissions::READ
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::HEAD).0,
+            SmartPermissions::READ
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::POST).0,
+            SmartPermissions::CREATE
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::PUT).0,
+            SmartPermissions::UPDATE
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::PATCH).0,
+            SmartPermissions::UPDATE
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::DELETE).0,
+            SmartPermissions::DELETE
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::TRACE).0,
+            SmartPermissions::DELETE
+        );
+        assert_eq!(admin_tier_permission(&Method::POST).1, "c");
+        assert_eq!(admin_tier_permission(&Method::DELETE).1, "d");
     }
 
     #[test]
@@ -1079,17 +1212,24 @@ mod tests {
     }
 
     #[test]
-    fn test_url_routing_system_paths_none() {
+    fn test_url_routing_system_paths() {
         // `metadata` and `_history` are reserved first segments (never stripped as
-        // tenants), so they fall through to raw classification → system-level None.
+        // tenants), so they fall through to raw classification: `metadata` is
+        // unclassified, system history is a Read on every resource type.
         assert!(extract_operation_for_routing("/metadata", "GET", true).is_none());
-        assert!(extract_operation_for_routing("/_history", "GET", true).is_none());
+        assert_eq!(
+            extract_operation_for_routing("/_history", "GET", true),
+            Some(("*".to_string(), FhirOperation::Read))
+        );
     }
 
     #[test]
-    fn test_url_routing_tenant_system_history_none() {
-        // GET /{tenant}/_history strips to /_history → system-level, no per-type authz.
-        assert!(extract_operation_for_routing("/acme/_history", "GET", true).is_none());
+    fn test_url_routing_tenant_system_history() {
+        // GET /{tenant}/_history strips to /_history → a Read on every resource type.
+        assert_eq!(
+            extract_operation_for_routing("/acme/_history", "GET", true),
+            Some(("*".to_string(), FhirOperation::Read))
+        );
     }
 
     #[test]
@@ -1183,30 +1323,66 @@ mod tests {
         assert!(extract_operation_for_routing("/acme/Patient/$purge", "POST", true).is_none());
     }
 
-    /// Guards a security regression: the SQL-on-FHIR handlers do NOT run their
-    /// own scope check, so the middleware's classification is the *only* thing
-    /// authorizing them. A blanket "any $-suffixed path returns None" rule —
-    /// which is what the first attempt at $purge/$reindex shipped — would let
-    /// any authenticated token execute arbitrary ViewDefinitions and SQL.
+    /// The SQL-on-FHIR operations are mounted at the system level only
+    /// (`/$sql-run`, `/$sql-export`), where this classifier cannot name the
+    /// resource types a request reads; their handlers check a Search grant on
+    /// every type the resolved subject names instead
+    /// (`handlers::sof::authz`, covered by
+    /// `tests/system_level_operation_scopes.rs`). Type- and instance-level
+    /// operations without a handler-level check stay classified here.
     ///
-    /// If you are here because you added an entry to HANDLER_AUTHORIZED_OPS and
-    /// this failed: that endpoint's handler must enforce a scope itself.
+    /// If you are here because you added a handler-authorized route shape to
+    /// `extract_operation` and this failed: that endpoint's handler must
+    /// enforce a scope itself.
+    /// The handler-authorized operations are recognised by route shape. A
+    /// resource id or version id that merely spells one of their names stays
+    /// an ordinary instance request and keeps its scope check.
     #[test]
-    fn test_sof_and_subscription_ops_still_require_scope() {
+    fn an_id_spelled_like_a_handler_authorized_operation_keeps_its_scope_check() {
+        for (path, method) in [
+            ("/Observation/$purge", "POST"),
+            ("/Observation/$reindex", "POST"),
+            ("/Observation/o1/$purge", "POST"),
+            ("/$reindex", "POST"),
+            ("/$reindex-status/job-1", "GET"),
+            ("/$reindex-status/job-1", "DELETE"),
+        ] {
+            assert!(
+                extract_operation(path, method).is_none(),
+                "{method} {path} is authorized by its handler"
+            );
+        }
         assert_eq!(
-            extract_operation("/ViewDefinition/$sql-run", "POST"),
-            Some(("ViewDefinition".to_string(), FhirOperation::Create)),
-            "SQL-on-FHIR run must still be scope-checked by the middleware"
+            extract_operation("/Observation/$reindex-status", "PUT"),
+            Some(("Observation".to_string(), FhirOperation::Update))
         );
         assert_eq!(
-            extract_operation("/Library/$sql-run", "POST"),
-            Some(("Library".to_string(), FhirOperation::Create)),
-            "SQL query run must still be scope-checked by the middleware"
+            extract_operation("/Observation/$reindex-status", "GET"),
+            Some(("Observation".to_string(), FhirOperation::Read))
         );
         assert_eq!(
-            extract_operation("/ViewDefinition/123/$sql-export", "POST"),
-            Some(("ViewDefinition".to_string(), FhirOperation::Create)),
+            extract_operation("/Observation/$reindex-status", "DELETE"),
+            Some(("Observation".to_string(), FhirOperation::Delete))
         );
+        assert_eq!(
+            extract_operation("/Observation/o1/_history/$purge", "GET"),
+            Some(("Observation".to_string(), FhirOperation::Read))
+        );
+        assert_eq!(
+            extract_operation("/Observation/o1/_history/$purge", "DELETE"),
+            Some(("Observation".to_string(), FhirOperation::Delete))
+        );
+        assert_eq!(
+            extract_operation("/Observation/$reindex-status/_history", "GET"),
+            Some(("Observation".to_string(), FhirOperation::Read))
+        );
+    }
+
+    #[test]
+    fn test_sof_ops_are_handler_authorized_and_subscription_ops_still_require_scope() {
+        assert!(extract_operation("/$sql-run", "POST").is_none());
+        assert!(extract_operation("/$sql-run", "GET").is_none());
+        assert!(extract_operation("/$sql-export", "POST").is_none());
         assert!(
             extract_operation("/Subscription/123/$status", "GET").is_some(),
             "subscription operations must still be scope-checked"

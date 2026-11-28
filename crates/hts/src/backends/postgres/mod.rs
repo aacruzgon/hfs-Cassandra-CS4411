@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use deadpool_postgres::{Config, GenericClient, Pool, Runtime};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use tokio_postgres::NoTls;
 use tracing::info;
 
 use crate::error::HtsError;
@@ -25,6 +24,7 @@ use crate::traits::{TerminologyCaches, TerminologyMetadata};
 use crate::types::{
     ExpansionContains, LookupResponse, ResourceSearchQuery, SubsumesResponse, TranslateResponse,
 };
+use helios_persistence::backends::postgres::tls::{self, PostgresSslMode, PostgresTlsSettings};
 use helios_persistence::core::database_url::redact_database_url;
 use helios_persistence::tenant::TenantContext;
 
@@ -314,7 +314,7 @@ impl PostgresTerminologyBackend {
     /// Returns [`HtsError::StorageError`] if the pool cannot be created or the
     /// schema migration fails.
     pub async fn new(database_url: &str) -> Result<Self, HtsError> {
-        let pool = build_pool(database_url)?;
+        let (pool, target, tls_settings) = build_pool(database_url)?;
 
         {
             let mut client = pool.get().await.map_err(|e| {
@@ -323,6 +323,9 @@ impl PostgresTerminologyBackend {
                     error_chain(&e)
                 ))
             })?;
+
+            // Say once whether the link is encrypted, read from the server (#2746).
+            tls::log_connection_security(&client, "hts", &target, &tls_settings).await;
 
             schema::apply(&client).await.map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply HTS schema: {}", error_chain(&e)))
@@ -457,9 +460,51 @@ pub(super) fn error_chain(e: &dyn std::error::Error) -> String {
     out
 }
 
-fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
+/// Builds the pool, with the TLS connector the URL's `sslmode`, `sslrootcert`,
+/// `sslcert` and `sslkey` ask for (#2746). Those parameters are read here and
+/// taken off the URL, since the driver knows neither the verify modes nor the
+/// certificate parameters. Returns the pool, the `host:port` it connects to
+/// (for the startup log) and the TLS settings.
+fn build_pool(database_url: &str) -> Result<(Pool, String, PostgresTlsSettings), HtsError> {
+    let config_error = |message: String| {
+        HtsError::StorageError(format!("Invalid PostgreSQL configuration: {message}"))
+    };
+    let (url, params) =
+        tls::split_tls_params(database_url, "HTS_DATABASE_URL").map_err(config_error)?;
+    let pg_config: tokio_postgres::Config = url
+        .parse()
+        .map_err(|e| config_error(format!("HTS_DATABASE_URL: {}", error_chain(&e))))?;
+    // A `key=value` string keeps its `sslmode` (disable / prefer / require)
+    // with the driver; read it back so the connector and the log agree.
+    let mode = params.mode.unwrap_or(match pg_config.get_ssl_mode() {
+        tokio_postgres::config::SslMode::Disable => PostgresSslMode::Disable,
+        tokio_postgres::config::SslMode::Require => PostgresSslMode::Require,
+        _ => PostgresSslMode::Prefer,
+    });
+    let tls_settings = PostgresTlsSettings {
+        mode,
+        root_cert: params.root_cert,
+        cert: params.cert,
+        key: params.key,
+    };
+    let host = match pg_config.get_hosts().first() {
+        Some(tokio_postgres::config::Host::Tcp(host)) => host.clone(),
+        #[cfg(unix)]
+        Some(tokio_postgres::config::Host::Unix(path)) => path.display().to_string(),
+        None => "localhost".to_string(),
+    };
+    let port = pg_config.get_ports().first().copied().unwrap_or(5432);
+    let target = format!("{host}:{port}");
+    let connector = tls_settings.connector().map_err(|message| {
+        config_error(format!(
+            "TLS for {target} (sslmode={}): {message}",
+            mode.as_str()
+        ))
+    })?;
+
     let mut cfg = Config::new();
-    cfg.url = Some(database_url.to_string());
+    cfg.url = Some(url);
+    cfg.ssl_mode = Some(mode.driver_mode());
     // 32 connections: warm requests bypass the pool entirely (see the
     // closure-page / inline-compose warm-hit fast paths in value_set.rs), so
     // the pool only gates *cold* expansions. 16 was too few to warm a
@@ -467,9 +512,12 @@ fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
     // cold-warming throughput while staying well under PG's
     // `max_connections=100`.
     cfg.pool = Some(deadpool_postgres::PoolConfig::new(32));
-    cfg.create_pool(Some(Runtime::Tokio1), NoTls).map_err(|e| {
-        HtsError::StorageError(format!("Failed to create PG pool: {}", error_chain(&e)))
-    })
+    let pool = cfg
+        .create_pool(Some(Runtime::Tokio1), connector)
+        .map_err(|e| {
+            HtsError::StorageError(format!("Failed to create PG pool: {}", error_chain(&e)))
+        })?;
+    Ok((pool, target, tls_settings))
 }
 
 // ── TerminologyMetadata ────────────────────────────────────────────────────────
@@ -689,13 +737,21 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     stats
                         .errors
                         .push(format!("CodeSystem '{}' import failed: {error}", cs.url));
+                    stats.count_owner_refusal(&error);
                     systems_needing_closure
                         .retain(|(url, version)| url != &cs.url || version != &cs.version);
                     continue;
                 }
             }
-            if let Err(e) =
-                write_code_system(&tx, cs, &mut identities, &mut stats, parsed.fresh_load).await
+            if let Err(e) = write_code_system(
+                &tx,
+                cs,
+                &mut identities,
+                &mut stats,
+                parsed.fresh_load,
+                parsed.defer_closure,
+            )
+            .await
             {
                 stats
                     .errors
@@ -713,6 +769,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     stats
                         .errors
                         .push(format!("ValueSet '{}' import failed: {error}", vs.url));
+                    stats.count_owner_refusal(&error);
                     continue;
                 }
             }
@@ -733,6 +790,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     stats
                         .errors
                         .push(format!("ConceptMap '{}' import failed: {error}", cm.url));
+                    stats.count_owner_refusal(&error);
                     continue;
                 }
             }
@@ -933,7 +991,7 @@ pub(crate) async fn write_resource_in_transaction(
     let mut identities = resource_identity::ImportIdentities::load(client, &parsed, true).await?;
     let mut stats = ImportStats::default();
     for cs in &parsed.code_systems {
-        write_code_system(client, cs, &mut identities, &mut stats, false).await?;
+        write_code_system(client, cs, &mut identities, &mut stats, false, false).await?;
         let row = client
             .query_one(
                 "SELECT id FROM code_systems WHERE url = $1 AND \
@@ -1039,6 +1097,10 @@ async fn write_code_system(
     // properties/designations is skipped (fast path for first-time bulk loads).
     // See [`crate::import::bundle_parser::ParsedBundle::fresh_load`].
     skip_child_delete: bool,
+    // When `true` this write is one chunk of a bulk load: a closure the system
+    // already has is kept and marked stale instead of dropped. See
+    // [`crate::import::bundle_parser::ParsedBundle::defer_closure`].
+    defer_closure: bool,
 ) -> Result<(), HtsError> {
     let now = utc_now();
 
@@ -1053,6 +1115,15 @@ async fn write_code_system(
     // sqlite/import/fhir_bundle.rs:189-215.
     // [`resource_identity::ImportIdentities::assign`] makes the choice from
     // rows read once for the whole write.
+    check_stored_authority(
+        client,
+        "code_systems",
+        "CodeSystem",
+        &cs.url,
+        cs.version.as_deref(),
+        cs.authority_rank,
+    )
+    .await?;
     let (storage_id, public_id) = identities.assign(
         crate::backends::resource_identity::ResourceKind::CodeSystem,
         &cs.id,
@@ -1255,17 +1326,28 @@ async fn write_code_system(
         }
     }
 
-    // Invalidate stale closure rows so the post-import / startup migration
-    // knows to (re)build the full closure once all batches are loaded. Without
-    // this, a partial closure from an earlier batch would be mistakenly treated
-    // as complete. Mirrors sqlite/import/fhir_bundle.rs.
-    client
-        .execute(
-            "DELETE FROM concept_closure WHERE system_id = $1",
-            &[&system_id],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    // A plain write drops the closure; the caller rebuilds it once the
+    // transaction commits. A deferred (chunked) write keeps the closure the
+    // system already has and marks it stale, so readers keep answering from
+    // it until the load's finalize or the next startup rebuilds it. Mirrors
+    // sqlite/import/fhir_bundle.rs.
+    if defer_closure {
+        client
+            .execute(
+                "INSERT INTO concept_closure_stale (system_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                &[&system_id],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    } else {
+        client
+            .execute(
+                "DELETE FROM concept_closure WHERE system_id = $1",
+                &[&system_id],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    }
 
     invalidate_expansion_cache_for_system(client, &cs.url).await?;
     stats.code_systems += 1;
@@ -1287,6 +1369,30 @@ async fn insert_hierarchy(
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    Ok(())
+}
+
+/// Refuse an import that would put weaker-ranked content on a stored
+/// `(url, version)` row (see [`bundle_parser::check_authority`]).
+async fn check_stored_authority(
+    client: &impl GenericClient,
+    table: &str,
+    kind: &str,
+    url: &str,
+    version: Option<&str>,
+    incoming_rank: i32,
+) -> Result<(), HtsError> {
+    let query = format!(
+        "SELECT authority_rank FROM {table} \
+         WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')"
+    );
+    let existing = client
+        .query_opt(&query, &[&url, &version])
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    if let Some(existing_rank) = existing.and_then(|row| row.get::<_, Option<i32>>(0)) {
+        bundle_parser::check_authority(kind, url, version, existing_rank, incoming_rank)?;
+    }
     Ok(())
 }
 
@@ -1327,6 +1433,15 @@ async fn write_value_set(
     // Mirrors sqlite/import/fhir_bundle.rs:443-478.
     // [`resource_identity::ImportIdentities::assign`] makes the choice from
     // rows read once for the whole write.
+    check_stored_authority(
+        client,
+        "value_sets",
+        "ValueSet",
+        &vs.url,
+        vs.version.as_deref(),
+        vs.authority_rank,
+    )
+    .await?;
     let (storage_id, public_id) = identities.assign(
         crate::backends::resource_identity::ResourceKind::ValueSet,
         &vs.id,

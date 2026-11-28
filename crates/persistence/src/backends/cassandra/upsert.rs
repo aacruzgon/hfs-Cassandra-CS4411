@@ -16,7 +16,7 @@
 //!       request's success, so the body is never written twice (D13);
 //!    3. the branch R1 picks ([`Branch::of`]), then its own step 1: the
 //!       permission, as SQLite checks it inside `create`, `update` and
-//!       `restore_deleted`, then the G38 bound on a SearchParameter's `code`:
+//!       `restore_deleted`:
 //!       - **a**, no row: C1 ([`CasPlan::create`]) with the request's
 //!         `fhir_version`, permission `Create`;
 //!       - **b**, a live row: C2 through [`CassandraBackend::update_attempt`]
@@ -48,11 +48,10 @@ use serde_json::Value as Json;
 
 use super::backend::CassandraBackend;
 use super::errors::BACKEND_NAME;
-use super::index_keys::IndexKey;
 use super::read::ResourceRow;
 use super::write::{
     Applied, CasKind, CasMiss, CasOutcome, CasPlan, RowKey, UPSERT_MISS_RETRIES, check_id,
-    check_search_parameter_code, normalized_body,
+    normalized_body,
 };
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
@@ -188,7 +187,6 @@ impl CassandraBackend {
 
                 let branch = Branch::of(row.as_ref());
                 tenant.check_permission(branch.operation(), resource_type)?;
-                check_search_parameter_code(resource_type, &resource)?;
                 seam.before_cas(turn).await;
 
                 let body = resource.clone();
@@ -201,20 +199,16 @@ impl CassandraBackend {
                         let previous = request.previous_version(row)?;
                         let (body, data) =
                             normalized_body("create_or_update", resource_type, id, body)?;
-                        let plan =
-                            CasPlan::revive(previous, body, data, vec![IndexKey::ResourcesByType]);
+                        let keys = self.index_keys_of(tenant_id, resource_type, &body);
+                        let plan = CasPlan::revive(previous, body, data, keys);
                         (self.run_cas(&mut request, plan).await?, row.version_id)
                     }
                     // Branch a, the only one `Branch::of` picks for no row.
                     _ => {
                         let (body, data) =
                             normalized_body("create_or_update", resource_type, id, body)?;
-                        let plan = CasPlan::create(
-                            body,
-                            data,
-                            fhir_version,
-                            vec![IndexKey::ResourcesByType],
-                        );
+                        let keys = self.index_keys_of(tenant_id, resource_type, &body);
+                        let plan = CasPlan::create(body, data, fhir_version, keys);
                         (self.run_cas(&mut request, plan).await?, 0)
                     }
                 };
@@ -305,6 +299,7 @@ mod tests {
             created_at: Some(at),
             deleted_at: deleted.then_some(at),
             fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            stored_fhir_version: None,
             write_ts: Some(at.timestamp_millis() * 1000),
             write_id: None,
             index_keys: Some(vec![1, 0]),
@@ -372,7 +367,7 @@ mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
     use crate::backends::cassandra::index_keys;
-    use crate::backends::cassandra::session::{Fault, StatementKind};
+    use crate::backends::cassandra::session::{Fault, StatementKind, TimeoutWriteType};
     use crate::backends::cassandra::write::{
         INSERT_VERSION, PreviousVersion, REVIVE_RESOURCE_IF_VERSION,
         SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, next_last_updated,
@@ -414,6 +409,18 @@ mod node_tests {
 
     fn tenant_context(case: &str) -> TenantContext {
         tenant_with(case, TenantPermissions::full_access())
+    }
+
+    /// Like `tenant_context`, for a case that plants another writer's CAS by
+    /// raw CQL, which leaves a version with no intent and no rows (RV22).
+    fn planted_tenant_context(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-planted-upsert-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
     }
 
     fn tenant_with(case: &str, permissions: TenantPermissions) -> TenantContext {
@@ -557,9 +564,14 @@ mod node_tests {
         } else {
             C2
         };
-        backend
-            .session
-            .inject_fault(StatementKind::Cas, marker, Fault::ApplyLate { before });
+        backend.session.inject_fault(
+            StatementKind::Cas,
+            marker,
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
+        );
         let lu = next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50 * i64::from(from));
         let values = vec![
@@ -571,7 +583,11 @@ mod node_tests {
             ),
             Value::from(write_ts_of(lu)),
             Value::from(write_id),
-            Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+            Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                tenant.tenant_id().as_str(),
+                "Patient",
+                &patient("Theirs"),
+            )))),
             Value::from(tenant.tenant_id().as_str()),
             Value::from("Patient"),
             Value::from("p"),
@@ -587,6 +603,11 @@ mod node_tests {
     /// A marker at version 2: create, then delete.
     async fn deleted(backend: &CassandraBackend, case: &str) -> TenantContext {
         let tenant = tenant_context(case);
+        deleted_in(backend, tenant).await
+    }
+
+    /// `deleted` in a tenant the caller made.
+    async fn deleted_in(backend: &CassandraBackend, tenant: TenantContext) -> TenantContext {
         put(backend, &tenant, patient("Smith")).await.unwrap();
         delete(backend, &tenant).await;
         tenant
@@ -737,8 +758,7 @@ mod node_tests {
     }
 
     /// Each branch checks its own permission after R1 and before writing:
-    /// `Create` on a, `Update` on b and c. G38 refuses a long
-    /// SearchParameter `code` the same way, with nothing written.
+    /// `Create` on a, `Update` on b and c.
     #[tokio::test]
     async fn each_branch_checks_its_own_permission() {
         let backend = backend_or_skip!();
@@ -801,32 +821,6 @@ mod node_tests {
         assert_eq!((revived.version_id(), created), ("3", true));
         let (updated, created) = put(&backend, &update_only, patient("Again")).await.unwrap();
         assert_eq!((updated.version_id(), created), ("4", false));
-
-        // G38, before any write.
-        let long_code = serde_json::json!({
-            "resourceType": "SearchParameter",
-            "url": "http://example.org/sp",
-            "status": "active",
-            "code": "c".repeat(129),
-            "base": ["Patient"],
-            "type": "token",
-            "expression": "Patient.gender"
-        });
-        let counts = backend.statement_counts();
-        assert!(matches!(
-            backend
-                .create_or_update(
-                    &full,
-                    "SearchParameter",
-                    "sp",
-                    long_code,
-                    crate::backends::cassandra::test_support::test_fhir_version()
-                )
-                .await,
-            Err(StorageError::Validation(_))
-        ));
-        let spent = backend.statement_counts().since(&counts);
-        assert_eq!((spent.read, spent.write, spent.cas), (1, 0, 0), "{spent}");
     }
 
     /// The loop budget (walkthrough 3.5; plan §6): another writer wins
@@ -1010,7 +1004,7 @@ mod node_tests {
             (Fault::TimeOutWithoutApplying, true),
             (Fault::FailWithWriteFailure, false),
         ] {
-            let tenant = deleted(&backend, "c4-undecidable").await;
+            let tenant = deleted_in(&backend, planted_tenant_context("c4-undecidable")).await;
             another_writer_late(
                 &backend,
                 &tenant,
@@ -1087,7 +1081,11 @@ mod node_tests {
                     ),
                     Value::from(write_ts_of(lu)),
                     Value::from(theirs),
-                    Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+                    Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                        tenant.tenant_id().as_str(),
+                        "Patient",
+                        &patient("Theirs"),
+                    )))),
                     Value::from(write_ts_of(lu)),
                 ],
                 StatementKind::Write,
@@ -1183,6 +1181,7 @@ mod node_tests {
             C4,
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();
@@ -1296,6 +1295,7 @@ mod node_tests {
                         C2,
                         Fault::ApplyLate {
                             before: StatementKind::Cas,
+                            write_type: TimeoutWriteType::Cas,
                         },
                     ),
                     _ => panic!("a third turn"),
@@ -1449,11 +1449,11 @@ mod node_tests {
         );
     }
 
-    /// Fresh `test-` tenants for the hardening tests (ADR-aacruzgon-0020).
-    fn hardening_tenant(case: &str) -> TenantContext {
+    /// Fresh `test-planted-` tenants for the hardening tests that plant an undecodable key set by raw CQL (ADR-aacruzgon-0020, RV22).
+    fn planted_hardening_tenant(case: &str) -> TenantContext {
         TenantContext::new(
             TenantId::new(format!(
-                "test-s3-hardening-{case}-{}",
+                "test-planted-s3-hardening-{case}-{}",
                 Uuid::new_v4().simple()
             )),
             TenantPermissions::full_access(),
@@ -1472,7 +1472,10 @@ mod node_tests {
         backend.session.inject_fault(
             StatementKind::Cas,
             "deleted_at = ?, last_updated",
-            Fault::ApplyLate { before },
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
         );
         let lu = next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50 * i64::from(from));
@@ -1512,6 +1515,7 @@ mod node_tests {
             "index_keys = 0xff",
             Fault::ApplyLate {
                 before: StatementKind::Read,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let sent = backend
@@ -1539,7 +1543,7 @@ mod node_tests {
     #[tokio::test]
     async fn a_later_turns_undecodable_live_row_after_an_unknown_outcome_is_503() {
         let backend = backend_or_skip!();
-        let tenant = hardening_tenant("upsert-undecodable-live");
+        let tenant = planted_hardening_tenant("upsert-undecodable-live");
         put(&backend, &tenant, patient("One")).await.unwrap();
         another_writer_late(
             &backend,
@@ -1596,7 +1600,7 @@ mod node_tests {
     #[tokio::test]
     async fn a_later_turns_undecodable_marker_after_an_unknown_outcome_is_503() {
         let backend = backend_or_skip!();
-        let tenant = hardening_tenant("upsert-undecodable-marker");
+        let tenant = planted_hardening_tenant("upsert-undecodable-marker");
         put(&backend, &tenant, patient("One")).await.unwrap();
         another_delete_late(&backend, &tenant, 1, StatementKind::SerialRead).await;
         backend

@@ -8,6 +8,12 @@
 //! before and after what it measures, and prints [`CasStats::since`] as
 //! `key=value` pairs (its `Display`).
 //!
+//! [`RepairStats`] counts repair on read (`repair.rs`), read with
+//! [`CassandraBackend::repair_stats`](super::CassandraBackend::repair_stats).
+//!
+//! The five extraction and payload counters at the end of [`CasStats`] are
+//! the writer's step 1 (roadmap row 5.1).
+//!
 //! The statements themselves are counted per kind in `session.rs`
 //! ([`StatementCounts`](super::StatementCounts), report R5).
 //!
@@ -17,10 +23,12 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use cdrs_tokio::error::Error as CdrsError;
 use cdrs_tokio::frame::message_error::{ErrorType, WriteType};
 
+use super::repair::SkipReason;
 use super::session::DriverError;
 
 macro_rules! cas_counters {
@@ -131,9 +139,32 @@ cas_counters! {
     /// Applied writes whose version or index rows still failed after their
     /// retries, leaving the intent row for the sweeper (G23).
     post_cas_failures,
+    /// Fresh intent rows written before a CAS because the request was held
+    /// up so long since its intent's stamp that the CAS could end past the
+    /// sweeper's grace (ADR-aacruzgon-0098).
+    intent_restamps,
     /// Writes refused before any statement because what the CAS would carry
     /// is over the size bound.
     too_large,
+    /// Extractions run for a new key set: one per plan built, and one per
+    /// live resource a consistency check re-extracts (IW8).
+    extractions,
+    /// Microseconds those extractions took, summed (IW22).
+    extract_us,
+    /// Search parameters whose extraction failed, so the key set it returned
+    /// has no rows for them (IW1, IW22). Counted per extraction, when a plan
+    /// is built, before the compare-and-swap: an attempt that then misses or
+    /// fails counts too, and so does each re-extraction of a consistency
+    /// check.
+    extraction_failures,
+    /// Extractions that failed for the whole resource, so the key set they
+    /// returned holds only its `resources_by_type` row (IW1, IW22, D6).
+    /// Counted the same way as `extraction_failures`.
+    extraction_fallbacks,
+    /// Bytes of `data` and `index_keys` of every compare-and-swap attempted,
+    /// counted with `attempts` just before it is sent (an attempt whose
+    /// prepare failed counts too) (IW21).
+    cas_payload_bytes,
 }
 
 impl fmt::Display for CasStats {
@@ -148,6 +179,15 @@ impl fmt::Display for CasStats {
             write!(f, "{name}={value}")?;
         }
         Ok(())
+    }
+}
+
+impl CasStats {
+    /// Unknown outcomes the node did not answer: HFS's own deadline after the CAS was sent, or a dropped
+    /// connection after it may have left. A grace-0 `sweep_pass` is safe only when, for every writer of the swept
+    /// tenants, this did not move (SW28, RV19, issue #89).
+    pub fn client_side_unknowns(&self) -> u64 {
+        self.unknown_deadline + self.unknown_connection
     }
 }
 
@@ -263,6 +303,10 @@ impl CasCounters {
     pub(crate) fn unknown(&self, error: &DriverError) {
         Self::bump(match error {
             DriverError::Deadline { .. } => &self.unknown_deadline,
+            // Never reached: only an index batch is refused this way, and
+            // `unknown` is called only for a CAS. Counted as a server error
+            // if that ever changes.
+            DriverError::TooManyStatements { .. } => &self.unknown_server_error,
             DriverError::Driver(inner) => match inner.as_ref() {
                 CdrsError::Server { body, .. } => match &body.ty {
                     ErrorType::WriteTimeout(timeout) => match timeout.write_type {
@@ -312,8 +356,167 @@ impl CasCounters {
         Self::bump(&self.post_cas_failures);
     }
 
+    pub(crate) fn intent_restamped(&self) {
+        Self::bump(&self.intent_restamps);
+    }
+
     pub(crate) fn too_large(&self) {
         Self::bump(&self.too_large);
+    }
+
+    /// One extraction for a new key set (IW1, IW22).
+    pub(crate) fn extraction(&self, took: Duration, failed_params: u64, failed_resource: bool) {
+        Self::bump(&self.extractions);
+        self.extract_us.fetch_add(
+            u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.extraction_failures
+            .fetch_add(failed_params, Ordering::Relaxed);
+        if failed_resource {
+            Self::bump(&self.extraction_fallbacks);
+        }
+    }
+
+    /// What one compare-and-swap attempt carries, `data` plus `index_keys`,
+    /// counted before it is sent (IW21).
+    pub(crate) fn cas_payload(&self, bytes: u64) {
+        self.cas_payload_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+macro_rules! repair_counters {
+    ($($(#[doc = $doc:literal])* $name:ident,)*) => {
+        /// Repair on read's counters, one atomic per field of [`RepairStats`].
+        #[derive(Debug, Default)]
+        pub(crate) struct RepairCounters {
+            $($name: AtomicU64,)*
+        }
+
+        impl RepairCounters {
+            /// A snapshot of every counter.
+            pub(crate) fn snapshot(&self) -> RepairStats {
+                RepairStats {
+                    $($name: self.$name.load(Ordering::Relaxed),)*
+                }
+            }
+        }
+
+        /// A snapshot of repair on read's counters since the backend was
+        /// built. Every field only grows, so two snapshots subtract
+        /// ([`RepairStats::since`]).
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+        #[non_exhaustive]
+        pub struct RepairStats {
+            $($(#[doc = $doc])* pub $name: u64,)*
+        }
+
+        impl RepairStats {
+            /// What happened between `earlier` and `self`.
+            pub fn since(&self, earlier: &RepairStats) -> RepairStats {
+                RepairStats {
+                    $($name: self.$name.saturating_sub(earlier.$name),)*
+                }
+            }
+
+            /// Every counter as `(name, value)`, in declaration order.
+            pub fn pairs(&self) -> Vec<(&'static str, u64)> {
+                vec![$((stringify!($name), self.$name),)*]
+            }
+        }
+    };
+}
+
+repair_counters! {
+    /// Resources a repair run was given.
+    queued,
+    /// Repairs whose every batch was confirmed.
+    repaired,
+    /// Of `repaired`, those that wrote only the found rows.
+    repaired_partial,
+    /// Repairs the writer did not confirm, or the phase's deadline cut.
+    failed,
+    /// Index rows packed for insert by every repair that started, confirmed or not; a repair the
+    /// deadline cut after it started counts the rows it packed, one that never started counts none.
+    rows_inserted,
+    /// Index rows packed for delete, counted as `rows_inserted` is.
+    rows_deleted,
+    /// Skipped: a found row is tagged above the current version. A resource's skip is the first of
+    /// these that applies: no row, tag ahead, not stale, write_ts, undecodable keys, budget, then,
+    /// for an admitted repair, no version row.
+    skipped_tag_ahead,
+    /// Skipped: the tag check found no `resources` row.
+    skipped_no_row,
+    /// Skipped: the current row's `write_ts` is not its `last_updated`'s.
+    skipped_write_ts,
+    /// Skipped: the current row's key set is unset or not decodable.
+    skipped_undecodable_keys,
+    /// Skipped: no found row is below the current version.
+    skipped_not_stale,
+    /// Skipped: past the search's repair budget.
+    skipped_budget,
+    /// Skipped after admission: the current version has no `resource_versions` row yet (IW24).
+    skipped_no_version_row,
+    /// Index rows given to `RepairContext::skip_undecodable`.
+    undecodable_rows,
+}
+
+impl fmt::Display for RepairStats {
+    /// `queued=3 repaired=2 …`, every counter, space-separated.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for (name, value) in self.pairs() {
+            if !first {
+                f.write_str(" ")?;
+            }
+            first = false;
+            write!(f, "{name}={value}")?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)] // Called by repair.rs, which Step 6's search calls (RV6).
+impl RepairCounters {
+    pub(crate) fn queued(&self, resources: u64) {
+        self.queued.fetch_add(resources, Ordering::Relaxed);
+    }
+
+    pub(crate) fn repaired(&self, full: bool, index: &IndexWriteStats) {
+        self.repaired.fetch_add(1, Ordering::Relaxed);
+        if !full {
+            self.repaired_partial.fetch_add(1, Ordering::Relaxed);
+        }
+        self.rows(index);
+    }
+
+    pub(crate) fn failed(&self, index: &IndexWriteStats) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        self.rows(index);
+    }
+
+    fn rows(&self, index: &IndexWriteStats) {
+        self.rows_inserted
+            .fetch_add(index.rows_inserted, Ordering::Relaxed);
+        self.rows_deleted
+            .fetch_add(index.rows_deleted, Ordering::Relaxed);
+    }
+
+    pub(crate) fn skipped(&self, reason: SkipReason) {
+        let counter = match reason {
+            SkipReason::TagAhead => &self.skipped_tag_ahead,
+            SkipReason::NoRow => &self.skipped_no_row,
+            SkipReason::WriteTsMismatch => &self.skipped_write_ts,
+            SkipReason::UndecodableKeys => &self.skipped_undecodable_keys,
+            SkipReason::NotStale => &self.skipped_not_stale,
+            SkipReason::Budget => &self.skipped_budget,
+            SkipReason::NoVersionRow => &self.skipped_no_version_row,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn undecodable_rows(&self, rows: u64) {
+        self.undecodable_rows.fetch_add(rows, Ordering::Relaxed);
     }
 }
 
@@ -333,8 +536,20 @@ mod tests {
             after: std::time::Duration::from_secs(1),
             sent: true,
         });
+        counters.extraction(Duration::from_micros(130), 2, true);
+        counters.cas_payload(900);
         let delta = counters.snapshot().since(&before);
         assert_eq!(delta.attempts, 2);
+        assert_eq!(
+            (
+                delta.extractions,
+                delta.extract_us,
+                delta.extraction_failures,
+                delta.extraction_fallbacks,
+                delta.cas_payload_bytes
+            ),
+            (1, 130, 2, 1, 900)
+        );
         assert_eq!((delta.applied, delta.applied_late), (1, 1));
         assert_eq!(delta.miss_version_conflict, 1);
         assert_eq!(delta.unknown_deadline, 1);
@@ -362,5 +577,43 @@ mod tests {
             stats.to_string(),
             "rows_inserted=4 rows_deleted=6 batches=3 largest_batch_bytes=4800"
         );
+    }
+
+    #[test]
+    fn repair_stats_subtract_and_print_every_counter() {
+        let counters = RepairCounters::default();
+        let before = counters.snapshot();
+        counters.queued(3);
+        let index = IndexWriteStats {
+            rows_inserted: 4,
+            rows_deleted: 1,
+            batches: 2,
+            largest_batch_bytes: 100,
+        };
+        counters.repaired(true, &index);
+        counters.repaired(false, &index);
+        counters.failed(&index);
+        counters.skipped(SkipReason::Budget);
+        counters.skipped(SkipReason::TagAhead);
+        counters.skipped(SkipReason::NoVersionRow);
+        counters.undecodable_rows(2);
+        let delta = counters.snapshot().since(&before);
+        assert_eq!(
+            (
+                delta.queued,
+                delta.repaired,
+                delta.repaired_partial,
+                delta.failed
+            ),
+            (3, 2, 1, 1)
+        );
+        assert_eq!((delta.rows_inserted, delta.rows_deleted), (12, 3));
+        assert_eq!((delta.skipped_budget, delta.skipped_tag_ahead), (1, 1));
+        assert_eq!(delta.skipped_no_version_row, 1);
+        assert_eq!(delta.undecodable_rows, 2);
+        let printed = delta.to_string();
+        assert!(printed.starts_with("queued=3 repaired=2 repaired_partial=1 failed=1 "));
+        assert_eq!(printed.split(' ').count(), delta.pairs().len());
+        assert_eq!(delta.pairs().len(), 14);
     }
 }

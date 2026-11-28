@@ -34,6 +34,7 @@ use helios_persistence::types::{SearchParameter, StoredResource};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
+use crate::chain_access::ChainAccess;
 use crate::error::{RestError, RestResult, create_operation_outcome};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::fhir_types::{
@@ -596,6 +597,20 @@ where
                 // `/metadata` says this deployment lacks (#1384, #1535).
                 if let Some(interaction) = transaction_conditional_interaction(&bundle_entry) {
                     super::conditional_support::require(state.storage(), interaction)?;
+                    if principal.is_some() {
+                        let (resource_type, _) =
+                            parse_request_url(&bundle_entry.url).map_err(|e| {
+                                RestError::InvalidElementValue {
+                                    message: format!("Entry {index}: {e}"),
+                                }
+                            })?;
+                        super::conditional_support::require_search_grant(
+                            principal,
+                            &resource_type,
+                            interaction,
+                            Some(&format!("transaction entry {index}")),
+                        )?;
+                    }
                 }
                 if !matches!(bundle_entry.method, BundleMethod::Get) {
                     match conditional_entry_criteria(
@@ -632,7 +647,7 @@ where
                             message: format!("Entry {}: {}", index, e),
                         }
                     })?;
-                    let operation = bundle_method_to_fhir_operation(&bundle_entry.method);
+                    let operation = entry_operation(&bundle_entry.method, get_target.as_ref());
                     let scope = SmartScopePolicy::check(principal, &resource_type, operation)
                         .map_err(|_| RestError::Forbidden {
                             message: format!(
@@ -675,6 +690,12 @@ where
                             });
                         }
                     }
+                }
+                // An instance read runs inside the storage transaction on
+                // `bundle_entry.url`; it reads the address judged above and
+                // nothing else.
+                if let Some(GetEntryTarget::Read { resource_type, id }) = &get_target {
+                    bundle_entry.url = format!("{resource_type}/{id}");
                 }
                 // Everything but an instance read runs after the commit (see
                 // below), with the compartment judged above.
@@ -833,7 +854,16 @@ where
     // `fullUrl`s, which the storage layer resolves during processing. Runs on
     // the write entries only — the deferred GET entries were partitioned out
     // above, and their query strings are searches, not conditional references.
-    resolve_conditional_references(state, &tenant, &mut indexed_entries).await?;
+    // Each lookup is judged against the caller's scopes as `GET [type]?query`
+    // would be, before any of them runs.
+    resolve_conditional_references(
+        state,
+        &tenant,
+        fhir_version,
+        principal,
+        &mut indexed_entries,
+    )
+    .await?;
 
     // Empty-element cleanup (#2554) and write-path validation: transactions
     // are atomic, so any invalid write entry rejects the whole bundle before
@@ -966,6 +996,7 @@ where
                     state,
                     &tenant,
                     &deferred.compartment,
+                    &ChainAccess::for_principal(principal),
                     deferred.target,
                     prefer.is_strict(),
                     entry.if_none_match.as_deref(),
@@ -1350,7 +1381,7 @@ where
         // safe while an unsupported method was caught further down — with the
         // catch-all gone, a method that slipped through would have been
         // authorized as a read and then executed as whatever it was.
-        let operation = bundle_method_to_fhir_operation(&method);
+        let operation = entry_operation(&method, get_target.as_ref());
         match SmartScopePolicy::check(principal, &resource_type, operation) {
             Ok(AccessScope::Unrestricted) => {}
             // A grant confined to a patient compartment (#1618): a GET entry
@@ -1424,6 +1455,24 @@ where
         }
     }
 
+    let conditional_interaction = match method {
+        BundleMethod::Post => if_none_exist.map(|_| ConditionalInteraction::Create),
+        BundleMethod::Put => criteria.map(|_| ConditionalInteraction::Update),
+        BundleMethod::Patch => criteria.map(|_| ConditionalInteraction::Patch),
+        BundleMethod::Delete => criteria.map(|_| ConditionalInteraction::Delete),
+        BundleMethod::Get => None,
+    };
+    if let Some(interaction) = conditional_interaction
+        && let Err(error) = super::conditional_support::require_search_grant(
+            principal,
+            &resource_type,
+            interaction,
+            Some(&format!("batch entry {index}")),
+        )
+    {
+        return entry_failure(error);
+    }
+
     // `ifMatch` on a conditional update or delete is honoured below, against
     // the resource the criteria resolve to (#1381). What is left to refuse is
     // the pairing FHIR gives no meaning: a precondition on a version beside
@@ -1456,6 +1505,7 @@ where
                 state,
                 tenant,
                 &compartment,
+                &ChainAccess::for_principal(principal),
                 get_target.expect("GET entries are classified above"),
                 strict,
                 if_none_match,
@@ -2246,7 +2296,11 @@ fn admit_bundle_mutation(
         admit_resource_type(resource_type, resource, fhir_version)?;
     }
 
-    if matches!(method, BundleMethod::Patch)
+    // A DELETE entry has no payload to admit the type through, and a URL
+    // deeper than `[type]/[id]` is read as its last two segments, so without
+    // this `DELETE Patient/p1/foo` deleted id `foo` of type `p1` and answered
+    // 204 for a resource type that does not exist.
+    if matches!(method, BundleMethod::Patch | BundleMethod::Delete)
         && !is_valid_resource_type_for_version(resource_type, fhir_version)
     {
         return Err(RestError::UnknownResourceType {
@@ -2996,31 +3050,6 @@ impl EntryParseError {
     }
 }
 
-/// Interprets a bundle-entry GET url as a type-level search, if it is one.
-///
-/// Per the FHIR spec, a GET entry may carry any read OR search URL
-/// (`Patient?name=x`, or bare `Patient` for an unfiltered type search).
-/// Returns the resource type and the parsed query pairs, or `None` when the
-/// url addresses a specific instance (`Patient/123`) and should be a read.
-fn parse_search_entry_url(url: &str) -> Option<(String, Vec<(String, String)>)> {
-    let (path, query) = match url.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (url, None),
-    };
-    let parts: Vec<&str> = path
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    match parts.as_slice() {
-        [resource_type] => Some((
-            resource_type.to_string(),
-            crate::extractors::query_pairs::parse_query_pairs(query),
-        )),
-        _ => None,
-    }
-}
-
 /// What a `GET` entry's `request.url` asks for, decided once before dispatch the
 /// way the router decides the direct request (#478, #2380).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3059,13 +3088,14 @@ struct DeferredGet {
 
 /// Classifies a `GET` entry's `request.url`.
 ///
-/// The path is read as [`parse_search_entry_url`] reads it: a leading `/` is
-/// tolerated and empty segments are dropped. The history shapes are `_history`,
-/// `[type]/_history`, `[type]/[id]/_history` and `[type]/[id]/_history/[vid]`;
-/// a path with a `_history` segment in any other place is an error, because
-/// answering it as a read of its first two segments would return different data
-/// from what the URL asks for. Anything else is a search (one segment) or a read
-/// of the first two segments, as before; a query on a read or vread is ignored.
+/// A leading `/` is tolerated and empty segments are dropped. The history
+/// shapes are `_history`, `[type]/_history`, `[type]/[id]/_history` and
+/// `[type]/[id]/_history/[vid]`; a path with a `_history` segment in any other
+/// place is an error, because answering it as a read of its first two segments
+/// would return different data from what the URL asks for. One segment is a
+/// search and exactly two are a read; a deeper path is an error for the same
+/// reason, since the storage layer reads the last two segments of an entry
+/// URL. A query on a read or vread is ignored.
 ///
 /// The error is the message of the `400` / `value` entry (batch) or of the
 /// failed bundle (transaction).
@@ -3117,16 +3147,20 @@ fn classify_get_entry_url(url: &str) -> Result<GetEntryTarget, String> {
             "GET {url} is not a read, vread, history or search URL: _history may only end a \
              [type]/[id], [type] or system URL, or be followed by a version id"
         )),
-        _ => Ok(match parse_search_entry_url(url) {
-            Some((resource_type, pairs)) => GetEntryTarget::Search {
-                resource_type,
-                pairs,
-            },
-            None => GetEntryTarget::Read {
-                resource_type: segments[0].to_string(),
-                id: segments[1].to_string(),
-            },
+        [resource_type] => Ok(GetEntryTarget::Search {
+            resource_type: (*resource_type).to_string(),
+            pairs: pairs(),
         }),
+        // Exactly the address the scope check judges: the storage layer
+        // parsers take the last two segments of an entry URL, so a deeper
+        // path would be judged on one type and read on another.
+        [resource_type, id] => Ok(GetEntryTarget::Read {
+            resource_type: (*resource_type).to_string(),
+            id: (*id).to_string(),
+        }),
+        _ => Err(format!(
+            "GET {url} is not a read, vread, history or search URL: a read is [type]/[id]"
+        )),
     }
 }
 
@@ -3207,6 +3241,7 @@ async fn execute_get_entry<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     compartment: &PatientCompartment,
+    chains: &ChainAccess,
     target: GetEntryTarget,
     strict: bool,
     if_none_match: Option<&str>,
@@ -3229,6 +3264,7 @@ where
                 state,
                 tenant,
                 compartment,
+                chains,
                 &resource_type,
                 pairs,
                 false,
@@ -3272,7 +3308,7 @@ where
                     resource_type: resource_type.clone(),
                     id: id.clone(),
                 }),
-                Err(e) => entry_storage_failure(e),
+                Err(e) => entry_failure(RestError::gone_as_configured(e, state.return_gone())),
             }
         }
         GetEntryTarget::Vread {
@@ -3466,9 +3502,18 @@ fn status_text(code: &str) -> &'static str {
 /// exactly one match rewrites the reference to `Type/id`, zero or several
 /// fail the bundle (#459). They used to pass through into storage verbatim,
 /// where nothing can search or resolve them.
+///
+/// Each lookup is a search on the referenced type and is authorized as
+/// `GET [type]?query` is: the token needs a search grant on that type, and a
+/// grant confined to the launch patient's compartment confines the lookup.
+/// Every reference is judged before any lookup runs, so a token without the
+/// grant is refused whole and learns nothing about the referenced type — not
+/// whether a match exists, how many, nor its id.
 async fn resolve_conditional_references<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
+    principal: Option<&Principal>,
     indexed_entries: &mut [(usize, BundleEntry, Option<String>)],
 ) -> RestResult<()>
 where
@@ -3487,6 +3532,28 @@ where
     }
     if conditionals.is_empty() {
         return Ok(());
+    }
+
+    let mut compartments: HashMap<String, PatientCompartment> = HashMap::new();
+    for reference in conditionals.keys() {
+        let (resource_type, _) = reference.split_once('?').expect("collected with a '?'");
+        if compartments.contains_key(resource_type) {
+            continue;
+        }
+        let compartment = match principal {
+            Some(principal) => {
+                let scope =
+                    SmartScopePolicy::check(principal, resource_type, FhirOperation::Search)
+                        .map_err(|_| RestError::Forbidden {
+                            message: format!(
+                                "Insufficient scope for search on {resource_type} (conditional reference '{reference}')"
+                            ),
+                        })?;
+                PatientCompartment::from_access_scope(Some(&scope))
+            }
+            None => PatientCompartment::unconfined(),
+        };
+        compartments.insert(resource_type.to_string(), compartment);
     }
 
     // Each lookup below is a search, and a search reads the index — which
@@ -3540,6 +3607,12 @@ where
                 message: format!("Conditional reference '{reference}' is not a valid search: {e}"),
             })?
         };
+        // Confined before the chains are resolved, as a type search is.
+        let mut query = query;
+        compartments
+            .get(resource_type)
+            .expect("judged above")
+            .confine_query(fhir_version, &mut query)?;
         // `search()` does not read a chain or `_has` (#1389): resolve them
         // into an `_id` filter first, as a type search does.
         let mut query =
@@ -3729,6 +3802,16 @@ fn bundle_method_to_fhir_operation(method: &BundleMethod) -> FhirOperation {
         BundleMethod::Post => FhirOperation::Create,
         BundleMethod::Put | BundleMethod::Patch => FhirOperation::Update,
         BundleMethod::Delete => FhirOperation::Delete,
+    }
+}
+
+/// The interaction a bundle entry is authorized for: a GET entry whose URL is
+/// a search is a `Search`, as the direct `GET [type]?query` is; every other
+/// GET (read, vread, history) is a `Read`; the writes follow the method.
+fn entry_operation(method: &BundleMethod, get_target: Option<&GetEntryTarget>) -> FhirOperation {
+    match get_target {
+        Some(GetEntryTarget::Search { .. }) => FhirOperation::Search,
+        _ => bundle_method_to_fhir_operation(method),
     }
 }
 
@@ -4206,25 +4289,6 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
-    /// #478: the read-or-search split on a bundle GET url. Instance addresses
-    /// stay reads; type-level urls (with or without a query) are searches.
-    #[test]
-    fn parse_search_entry_url_splits_reads_from_searches() {
-        let (rt, pairs) = parse_search_entry_url("Patient?name=x&gender=female").expect("search");
-        assert_eq!(rt, "Patient");
-        assert_eq!(pairs.len(), 2);
-
-        // Bare type: an unfiltered type search, leading slash tolerated.
-        let (rt, pairs) = parse_search_entry_url("/Patient").expect("bare type search");
-        assert_eq!(rt, "Patient");
-        assert!(pairs.is_empty());
-
-        // Instance reads and deeper paths are not searches.
-        assert!(parse_search_entry_url("Patient/123").is_none());
-        assert!(parse_search_entry_url("Patient/123/_history/1").is_none());
-        assert!(parse_search_entry_url("").is_none());
-    }
-
     /// #2380: every GET entry shape is sorted once, before dispatch. A
     /// `_history` URL of none of the history shapes is an error, not a read of
     /// its first two segments.
@@ -4264,10 +4328,10 @@ mod tests {
             ("Patient", search("Patient", &[])),
             ("/Patient", search("Patient", &[])),
             ("Patient?name=x", search("Patient", &[("name", "x")])),
-            // Reads, whatever follows the id that is not a history.
+            // Reads: exactly [type]/[id].
             ("Patient/p1", read("Patient", "p1")),
+            ("/Patient/p1", read("Patient", "p1")),
             ("Patient/p1?_format=json", read("Patient", "p1")),
-            ("Patient/p1/foo", read("Patient", "p1")),
             // Vreads.
             ("Patient/p1/_history/2", vread("2")),
             ("/Patient/p1/_history/2?_format=json", vread("2")),
@@ -4310,6 +4374,12 @@ mod tests {
 
         for url in [
             "Patient/p1/_history/2/extra",
+            // Judged on the first two segments, executed on the last two:
+            // a deeper path is no read.
+            "Patient/p1/foo",
+            "Patient/any/Observation/obs-1",
+            "Patient/Observation/obs-1",
+            "http://localhost:8080/Patient/p1",
             "_history/x",
             "Patient/_history/x",
             "_history/_history",
@@ -6157,6 +6227,18 @@ mod tests {
     /// mutation URL is canonicalized to its last one or two segments and a GET
     /// URL is passed on as written, so each would act on part of an operation
     /// URL if it were not refused first.
+    #[test]
+    fn a_delete_entry_needs_a_resource_type_of_the_version() {
+        let version = FhirVersion::default_enabled();
+        let refused = admit_bundle_mutation(&BundleMethod::Delete, "p1", None, version)
+            .expect_err("p1 is not a resource type");
+        assert!(
+            matches!(refused, RestError::UnknownResourceType { .. }),
+            "{refused:?}"
+        );
+        assert!(admit_bundle_mutation(&BundleMethod::Delete, "Patient", None, version).is_ok());
+    }
+
     #[test]
     fn parse_bundle_entry_refuses_an_operation_url_on_every_method() {
         for (method, url) in [

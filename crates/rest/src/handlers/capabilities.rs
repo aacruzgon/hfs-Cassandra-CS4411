@@ -23,7 +23,7 @@ use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
 };
-use helios_persistence::search::SearchParameterRegistry;
+use helios_persistence::search::{SearchParameterDefinition, SearchParameterRegistry};
 use helios_persistence::types::SearchParamType;
 use tracing::debug;
 
@@ -204,6 +204,13 @@ where
     // refuse with `501` from this same source.
     let conditionals = super::conditional_support::advertised(state.storage(), version);
 
+    // Bulk Data export, at every level, is listed only where a kick-off can be
+    // served: the handlers answer `501` when it is disabled by config and when
+    // no job store is wired (standalone S3, and the backends whose job store
+    // is a SQLite sidecar in a build without the `sqlite` feature), so the
+    // statement reads the same two things (#3015).
+    let serves_bulk_export = serves_bulk_export(state);
+
     let resources: Vec<serde_json::Value> = resource_types
         .iter()
         .map(|rt| {
@@ -214,6 +221,7 @@ where
                 supports_search,
                 supports_history,
                 supports_contained,
+                serves_bulk_export,
                 &modifier_map,
                 &revinclude_by_target,
                 &serves,
@@ -340,8 +348,11 @@ where
         "rest": [rest_entry]
     });
 
-    // Advertise Bulk Data Export operations when enabled.
-    if state.bulk_export_config().enabled {
+    // Advertise Bulk Data Export operations where they are served. The
+    // bulk-data CapabilityStatement goes with them: `instantiates` says the
+    // statement "must specify the full capability details"
+    // (https://hl7.org/fhir/R4/capabilitystatement-definitions.html#CapabilityStatement.instantiates).
+    if serves_bulk_export {
         operations.push(serde_json::json!({
             "name": "export",
             "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"
@@ -358,8 +369,11 @@ where
             serde_json::json!(["http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"]);
     }
 
-    // Advertise Bulk Data Submit operations when enabled.
-    if state.bulk_submit_config().enabled {
+    // Advertise Bulk Data Submit operations where they are served: both
+    // handlers answer `501` when submit is disabled by config and when no job
+    // store is wired (an S3 deployment whose backend cannot run the submit
+    // worker, such as bucket-per-tenant with no system bucket) (#3015).
+    if serves_bulk_submit(state) {
         operations.push(serde_json::json!({
             "name": "bulk-submit",
             "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/bulk-submit"
@@ -374,11 +388,30 @@ where
     statement
 }
 
+/// Whether this deployment serves Bulk Data `$export`, at any level. It is
+/// what every export handler checks before anything else: export enabled in
+/// config, and a job store wired ([`AppState::with_bulk_export`] wires the
+/// output store and download authorizer with it).
+fn serves_bulk_export<S: ResourceStorage>(state: &AppState<S>) -> bool {
+    state.bulk_export_config().enabled && state.bulk_export_jobs().is_some()
+}
+
+/// Whether this deployment serves `$bulk-submit` and `$bulk-submit-status`:
+/// what both handlers check before anything else, submit enabled in config
+/// and a job store wired.
+fn serves_bulk_submit<S: ResourceStorage>(state: &AppState<S>) -> bool {
+    state.bulk_submit_config().enabled && state.bulk_submit_jobs().is_some()
+}
+
 /// Builds the `rest[0].operation` list, including the SQL on FHIR operations.
 ///
 /// Both data operations are invoked at the system level, so they are declared
-/// here rather than under a resource type. `$sql-run` is always declared when
-/// SOF is enabled; `$sql-export` only when an export controller is wired.
+/// here rather than under a resource type. Each is declared only when what its
+/// handler needs is wired: `$sql-run` a SOF runner, `$sql-export` an export
+/// controller. The server wires both only when SOF is enabled
+/// (`HFS_SOF_ENABLED`). Without a runner `$sql-run` answers `501` for every
+/// run over stored data, and serves only a ViewDefinition run over inline
+/// `resource` data, so it is not declared (#3015).
 ///
 /// `definition` points at *this server's* OperationDefinition rather than the
 /// guide's. Citing the guide's would assert support for every parameter it
@@ -414,11 +447,14 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
             "name": "versions",
             "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
         }),
-        serde_json::json!({
+    ];
+
+    if state.sof_runner().is_some() {
+        ops.push(serde_json::json!({
             "name": "sql-run",
             "definition": format!("/OperationDefinition/{SQL_RUN_DEFINITION_ID}")
-        }),
-    ];
+        }));
+    }
 
     if state.export_controller().is_some() {
         ops.push(serde_json::json!({
@@ -464,6 +500,12 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
 /// `serves` is the storage's [`SearchProvider::serves_search_param`]: the
 /// `searchParam`, `searchInclude` and `searchRevInclude` lists keep only what it
 /// serves.
+///
+/// The per-resource operations are listed only where they are served (#3015):
+/// Patient and Group `$export` when `serves_bulk_export`, and Patient
+/// `$everything` when `supports_search`, since `$everything` is composed over
+/// `search` and answers `501` where the storage cannot search. A type left with
+/// no operation carries no `operation` element.
 #[allow(clippy::too_many_arguments)]
 fn build_resource_capability(
     resource_type: &str,
@@ -472,6 +514,7 @@ fn build_resource_capability(
     supports_search: bool,
     supports_history: bool,
     supports_contained: bool,
+    serves_bulk_export: bool,
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
     revinclude_by_target: &std::collections::HashMap<String, std::collections::BTreeSet<String>>,
     serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
@@ -528,8 +571,8 @@ fn build_resource_capability(
     }
 
     // Advertise real `_include` targets: one "Type:code" per reference param on
-    // this type that the storage serves. Omitted entirely when there is none,
-    // and when the storage does not search (#514).
+    // this type. Omitted entirely when the type has no reference params, and
+    // when the storage does not search (#514).
     if supports_search {
         let search_include = build_search_includes(resource_type, registry, serves);
         if !search_include.is_empty() {
@@ -538,9 +581,8 @@ fn build_resource_capability(
     }
 
     // Advertise real `_revinclude` targets: "Source:code" tokens from other
-    // types' reference params that point at this type and that the storage
-    // serves. Omitted when there is none, and when the storage does not search
-    // (#514).
+    // types' reference params that point at this type. Omitted when the
+    // storage does not search (#514).
     if supports_search && let Some(rev) = revinclude_by_target.get(resource_type) {
         if !rev.is_empty() {
             entry["searchRevInclude"] = serde_json::Value::Array(
@@ -550,27 +592,34 @@ fn build_resource_capability(
     }
     // Bulk Data Access IG: per-resource `$export` operation entries on Patient
     // and Group, in addition to the system-level `$export` advertised at
-    // `rest[0].operation`.
+    // `rest[0].operation`, and Patient `$everything`. Each is listed only
+    // where it is served (#3015).
+    let mut operations = Vec::new();
     match resource_type {
         "Patient" => {
-            entry["operation"] = serde_json::json!([
-                {
+            if serves_bulk_export {
+                operations.push(serde_json::json!({
                     "name": "export",
                     "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"
-                },
-                {
+                }));
+            }
+            if supports_search {
+                operations.push(serde_json::json!({
                     "name": "everything",
                     "definition": "http://hl7.org/fhir/OperationDefinition/Patient-everything"
-                }
-            ]);
+                }));
+            }
         }
-        "Group" => {
-            entry["operation"] = serde_json::json!([{
+        "Group" if serves_bulk_export => {
+            operations.push(serde_json::json!({
                 "name": "export",
                 "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"
-            }]);
+            }));
         }
         _ => {}
+    }
+    if !operations.is_empty() {
+        entry["operation"] = serde_json::Value::Array(operations);
     }
     entry
 }
@@ -580,6 +629,8 @@ fn build_resource_capability(
 /// registry. Control/common params (those starting with `_`) and duplicates are
 /// skipped, and so is every parameter `serves` (the storage's
 /// [`SearchProvider::serves_search_param`]) refuses, common ones included.
+/// A composite is also skipped unless each of its components resolves and is
+/// served ([`composite_components_served`]).
 ///
 /// A common parameter is asked about with the type `/metadata` advertises for
 /// it, except `_list` and `_in`: REST resolves both into an `_id` filter before
@@ -601,7 +652,7 @@ fn build_search_params(
         }
         param["type"]
             .as_str()
-            .and_then(search_param_type_from_code)
+            .and_then(|code| code.parse::<SearchParamType>().ok())
             .is_some_and(|param_type| serves(resource_type, name, param_type))
     });
     let mut seen: std::collections::HashSet<String> = params
@@ -612,6 +663,8 @@ fn build_search_params(
     for def in registry.get_active_params(resource_type) {
         if def.code.starts_with('_')
             || !serves(resource_type, &def.code, def.param_type)
+            || (def.param_type == SearchParamType::Composite
+                && !composite_components_served(resource_type, &def, registry, serves))
             || !seen.insert(def.code.clone())
         {
             continue;
@@ -663,23 +716,31 @@ fn fhir_search_param_type(t: SearchParamType) -> &'static str {
     }
 }
 
-/// The reverse of [`fhir_search_param_type`]: an internal search-parameter type
-/// from its FHIR `searchParam.type` code, for the common parameters, which are
-/// built as JSON.
-fn search_param_type_from_code(code: &str) -> Option<SearchParamType> {
-    [
-        SearchParamType::Number,
-        SearchParamType::Date,
-        SearchParamType::String,
-        SearchParamType::Token,
-        SearchParamType::Reference,
-        SearchParamType::Composite,
-        SearchParamType::Quantity,
-        SearchParamType::Uri,
-        SearchParamType::Special,
-    ]
-    .into_iter()
-    .find(|t| fhir_search_param_type(*t) == code)
+/// Whether the composite `def` can be searched: it names at least one
+/// component, each component resolves in `registry` by its definition URL (as
+/// the search query builder resolves them), and `serves` serves each one.
+///
+/// A composite is searched through its components, so a component the storage
+/// refuses makes every search for the composite fail (MongoDB refuses
+/// `Composition.section-code-text`, whose `section-text` component is
+/// `special`). A component that does not resolve leaves the composite with
+/// fewer components than it defines, which the backends refuse or match
+/// differently from the spec (some R5 and R6 composites name component
+/// definitions the spec bundles do not publish).
+fn composite_components_served(
+    resource_type: &str,
+    def: &SearchParameterDefinition,
+    registry: &SearchParameterRegistry,
+    serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
+) -> bool {
+    def.component.as_deref().is_some_and(|components| {
+        !components.is_empty()
+            && components.iter().all(|component| {
+                registry
+                    .get_by_url(&component.definition)
+                    .is_some_and(|sub| serves(resource_type, &sub.code, sub.param_type))
+            })
+    })
 }
 
 /// Builds the reverse-include index used for `searchRevInclude`: maps each target
@@ -869,6 +930,39 @@ mod tests {
         assert_eq!(
             reindex["definition"],
             format!("/OperationDefinition/{REINDEX_DEFINITION_ID}")
+        );
+    }
+
+    /// `$sql-run` is advertised exactly where a SOF runner is wired: without
+    /// one (`HFS_SOF_ENABLED=false`) the handler answers 501 (#3015).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sql_run_is_advertised_only_where_a_sof_runner_is_wired() {
+        use crate::config::ServerConfig;
+        use crate::handlers::sof::capability::SQL_RUN_DEFINITION_ID;
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use std::sync::Arc;
+
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        backend.init_schema().expect("init schema");
+
+        let without = AppState::new(backend.clone(), ServerConfig::default());
+        assert!(
+            !operation_names(&build_rest_operations(&without)).contains(&"sql-run".to_string()),
+            "a deployment with no SOF runner must not advertise $sql-run"
+        );
+
+        let runner = backend
+            .sof_runner()
+            .expect("SQLite has an in-DB SOF runner");
+        let with = AppState::new(backend, ServerConfig::default()).with_sof_runner(runner);
+        let sql_run = build_rest_operations(&with)
+            .into_iter()
+            .find(|o| o["name"] == "sql-run")
+            .expect("a deployment with a SOF runner advertises $sql-run");
+        assert_eq!(
+            sql_run["definition"],
+            format!("/OperationDefinition/{SQL_RUN_DEFINITION_ID}")
         );
     }
 
@@ -1070,7 +1164,7 @@ mod tests {
     /// (`Patient:general-practitioner`) and a `_revinclude` source
     /// (`Observation:subject`).
     fn resource_entry(resource_type: &str, supports_search: bool) -> serde_json::Value {
-        resource_entry_with(resource_type, supports_search, true)
+        resource_entry_serving(resource_type, supports_search, true, &serves_all)
     }
 
     /// [`resource_entry`], with the storage's `supports_history` answer too.
@@ -1079,19 +1173,40 @@ mod tests {
         supports_search: bool,
         supports_history: bool,
     ) -> serde_json::Value {
-        resource_entry_serving(
+        resource_entry_built(
             resource_type,
             supports_search,
             supports_history,
+            true,
             &serves_all,
         )
     }
 
-    /// [`resource_entry_with`], with the storage's `serves_search_param` too.
+    /// [`resource_entry`], with whether Bulk Data export is served and the
+    /// storage's `serves_search_param` too.
     fn resource_entry_serving(
         resource_type: &str,
         supports_search: bool,
+        serves_bulk_export: bool,
+        serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
+    ) -> serde_json::Value {
+        resource_entry_built(
+            resource_type,
+            supports_search,
+            true,
+            serves_bulk_export,
+            serves,
+        )
+    }
+
+    /// The entry over the registry it builds, with every storage answer given:
+    /// [`resource_entry_with`]'s history and [`resource_entry_serving`]'s
+    /// export and parameters.
+    fn resource_entry_built(
+        resource_type: &str,
+        supports_search: bool,
         supports_history: bool,
+        serves_bulk_export: bool,
         serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
     ) -> serde_json::Value {
         use helios_persistence::search::{SearchParameterDefinition, SearchParameterRegistry};
@@ -1132,6 +1247,7 @@ mod tests {
             supports_search,
             supports_history,
             false,
+            serves_bulk_export,
             &std::collections::HashMap::new(),
             &build_revinclude_index(&reg, serves),
             serves,
@@ -1234,7 +1350,11 @@ mod tests {
         );
         assert_eq!(patient["updateCreate"], true);
         assert_eq!(patient["conditionalCreate"], true);
-        assert!(patient["operation"].is_array(), "Patient keeps `$export`");
+        assert_eq!(
+            resource_operation_names(&patient),
+            ["export"],
+            "Patient keeps `$export` and loses `$everything`"
+        );
 
         assert_eq!(
             interaction_codes(&resource_entry("AuditEvent", false)),
@@ -1296,6 +1416,40 @@ mod tests {
         assert_eq!(with, without);
     }
 
+    fn resource_operation_names(entry: &serde_json::Value) -> Vec<&str> {
+        entry["operation"]
+            .as_array()
+            .map(|ops| ops.iter().filter_map(|o| o["name"].as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Patient and Group `$export` are listed exactly when Bulk Data export is
+    /// served, and Patient `$everything` exactly when the storage searches. A
+    /// type left with no operation carries no `operation` element, rather than
+    /// an empty array (#3015).
+    #[test]
+    fn resource_operations_follow_what_is_served() {
+        for (export, search, patient, group) in [
+            (true, true, vec!["export", "everything"], vec!["export"]),
+            (false, true, vec!["everything"], vec![]),
+            (true, false, vec!["export"], vec!["export"]),
+            (false, false, vec![], vec![]),
+        ] {
+            let case = format!("export={export} search={search}");
+            let patient_entry = resource_entry_serving("Patient", search, export, &serves_all);
+            let group_entry = resource_entry_serving("Group", search, export, &serves_all);
+            assert_eq!(resource_operation_names(&patient_entry), patient, "{case}");
+            assert_eq!(resource_operation_names(&group_entry), group, "{case}");
+            for entry in [&patient_entry, &group_entry] {
+                if resource_operation_names(entry).is_empty() {
+                    assert!(entry.get("operation").is_none(), "{case}: {entry}");
+                }
+            }
+        }
+        let observation = resource_entry_serving("Observation", true, true, &serves_all);
+        assert!(observation.get("operation").is_none(), "{observation}");
+    }
+
     /// Every common parameter's `type` code maps back to a type, so none is
     /// dropped for want of one.
     #[test]
@@ -1303,7 +1457,7 @@ mod tests {
         for version in FhirVersion::enabled_versions() {
             for param in build_common_search_params(true, *version) {
                 let code = param["type"].as_str().expect("type");
-                let param_type = search_param_type_from_code(code).expect(code);
+                let param_type: SearchParamType = code.parse().expect(code);
                 assert_eq!(fhir_search_param_type(param_type), code);
             }
         }
@@ -1374,6 +1528,95 @@ mod tests {
             );
         }
         assert!(names.contains(&"_lastUpdated".to_string()), "{names:?}");
+    }
+
+    /// A composite is listed only when it names components, each resolves in
+    /// the registry by its definition URL, and each is served: a composite with
+    /// a component the storage refuses, or one the registry does not hold, is
+    /// refused or matched on fewer components than it defines.
+    #[test]
+    fn composites_are_listed_only_when_every_component_is_served() {
+        use helios_persistence::search::registry::CompositeComponentDef;
+
+        let mut reg = SearchParameterRegistry::new();
+        for (url, code, param_type) in [
+            (
+                "http://example.org/Obs-code",
+                "code",
+                SearchParamType::Token,
+            ),
+            (
+                "http://example.org/Obs-value",
+                "value",
+                SearchParamType::Quantity,
+            ),
+            (
+                "http://example.org/Obs-text",
+                "text",
+                SearchParamType::Special,
+            ),
+        ] {
+            reg.register(
+                SearchParameterDefinition::new(url, code, param_type, "Observation.id")
+                    .with_base(["Observation"]),
+            )
+            .unwrap();
+        }
+        for (code, components) in [
+            ("code-value", vec!["Obs-code", "Obs-value"]),
+            ("code-text", vec!["Obs-code", "Obs-text"]),
+            ("code-missing", vec!["Obs-code", "Obs-unpublished"]),
+            ("no-components", vec![]),
+        ] {
+            let mut composite = SearchParameterDefinition::new(
+                format!("http://example.org/Obs-{code}"),
+                code,
+                SearchParamType::Composite,
+                "Observation",
+            )
+            .with_base(["Observation"]);
+            composite.component = Some(
+                components
+                    .into_iter()
+                    .map(|c| CompositeComponentDef {
+                        definition: format!("http://example.org/{c}"),
+                        expression: "Observation.id".to_string(),
+                    })
+                    .collect(),
+            );
+            reg.register(composite).unwrap();
+        }
+        let listed = |serves: &dyn Fn(&str, &str, SearchParamType) -> bool| {
+            let params = build_search_params(
+                "Observation",
+                &reg,
+                false,
+                &std::collections::HashMap::new(),
+                serves,
+                FhirVersion::default(),
+            );
+            param_names(&params)
+                .into_iter()
+                .filter(|name| !name.starts_with('_'))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let all = |_: &str, _: &str, _: SearchParamType| true;
+        assert_eq!(
+            listed(&all),
+            ["code", "code-text", "code-value", "text", "value"]
+                .map(String::from)
+                .into()
+        );
+        let no_special = |_: &str, _: &str, t: SearchParamType| t != SearchParamType::Special;
+        assert_eq!(
+            listed(&no_special),
+            ["code", "code-value", "value"].map(String::from).into()
+        );
+        let no_quantity = |_: &str, _: &str, t: SearchParamType| t != SearchParamType::Quantity;
+        assert_eq!(
+            listed(&no_quantity),
+            ["code", "code-text", "text"].map(String::from).into()
+        );
     }
 
     /// A storage that searches yields the same statement for the whole server:

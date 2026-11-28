@@ -59,6 +59,14 @@ fn cursor_value_is_null(cursor: &PageCursor) -> bool {
 /// `last_updated` they would stop the planner from walking its index.
 /// `id_column` is an internal column name: resource pages use `id`, while
 /// index-selected pages use `resource_id` for the identical tie boundary.
+///
+/// The `id` tiebreak runs ascending on a forward page except on an ascending
+/// `last_updated` key, where it runs descending (`KeysetKey::
+/// forward_id_ascending`): `idx_resources_search` is `(tenant_id,
+/// resource_type, last_updated DESC, id ASC)`, so `last_updated ASC, id DESC`
+/// is its backward scan, while `last_updated ASC, id ASC` matched no index
+/// and sorted every remaining row (#2603). `PostgresQueryBuilder::
+/// build_order_by` emits the same tiebreak for the first page.
 fn keyset_page_clauses(
     k: &KeysetKey,
     id_column: &str,
@@ -68,19 +76,23 @@ fn keyset_page_clauses(
     let e = &k.expr;
     let asc = k.direction == crate::types::SortDirection::Ascending;
     let at_missing = k.nullable && cursor_is_null;
-    if backward {
+    // `Previous` mirrors the forward order, tiebreak included.
+    let id_asc = k.forward_id_ascending() != backward;
+    let id_op = if id_asc { ">" } else { "<" };
+    let id_dir = if id_asc { "ASC" } else { "DESC" };
+    let (condition, order) = if backward {
         let condition = if at_missing {
-            format!("({e} IS NOT NULL OR ({e} IS NOT DISTINCT FROM $3 AND {id_column} < $4))")
+            format!("({e} IS NOT NULL OR ({e} IS NOT DISTINCT FROM $3 AND {id_column} {id_op} $4))")
         } else {
             let op = if asc { "<" } else { ">" };
-            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} < $4))")
+            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} {id_op} $4))")
         };
         let nulls = if k.nullable { " NULLS FIRST" } else { "" };
         let dir = if asc { "DESC" } else { "ASC" };
-        (condition, format!("{e} {dir}{nulls}, {id_column} DESC"))
+        (condition, format!("{e} {dir}{nulls}, {id_column} {id_dir}"))
     } else {
         let condition = if at_missing {
-            format!("({e} IS NOT DISTINCT FROM $3 AND {id_column} > $4)")
+            format!("({e} IS NOT DISTINCT FROM $3 AND {id_column} {id_op} $4)")
         } else {
             let op = if asc { ">" } else { "<" };
             let or_missing = if k.nullable {
@@ -88,11 +100,24 @@ fn keyset_page_clauses(
             } else {
                 String::new()
             };
-            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} > $4){or_missing})")
+            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} {id_op} $4){or_missing})")
         };
         let nulls = if k.nullable { " NULLS LAST" } else { "" };
         let dir = if asc { "ASC" } else { "DESC" };
-        (condition, format!("{e} {dir}{nulls}, {id_column} ASC"))
+        (condition, format!("{e} {dir}{nulls}, {id_column} {id_dir}"))
+    };
+    if k.tiebreak_against_key {
+        // A redundant range bound on the key alone. The planner cannot turn
+        // the `OR` above into an index condition, so without it each page
+        // scans `idx_resources_search` from the start of the type and filters
+        // every entry before the cursor (36,022 removed rows on a cursor 36k
+        // deep, or it picks `idx_resources_updated` plus an Incremental Sort);
+        // with it the scan seeks the cursor and removes at most the tie group
+        // already served (#2603). `last_updated` is never NULL here.
+        let seek = if asc != backward { ">=" } else { "<=" };
+        (format!("({e} {seek} $3 AND {condition})"), order)
+    } else {
+        (condition, order)
     }
 }
 
@@ -429,8 +454,8 @@ fn fast_index_pred(
 /// The fast path takes its page from `idx_search_quantity_recent`, which is
 /// keyed `(tenant_id, resource_type, param_name, last_updated DESC,
 /// resource_id)` — the scan streams the parameter slice newest-first and
-/// filters `value_quantity_value` from the payload as it goes, so the `LIMIT`
-/// can stop after 21 matches. Costing that plan needs the *selectivity* of the
+/// filters `value_quantity_value` / `value_quantity_high` (both in the payload
+/// since v56) as it goes, so the `LIMIT` can stop after 21 matches. Costing that plan needs the *selectivity* of the
 /// value predicate, and Postgres has only a table-wide histogram of
 /// `value_quantity_value` — one column shared by every `param_name` of every
 /// resource type. On the benchmark corpus `Observation.value-quantity` tops out
@@ -499,6 +524,20 @@ fn fast_index_pred(
 /// ahead of the sort key in those indexes, so the scan seeks straight to the
 /// value and the `LIMIT` stops after 21 whatever the selectivity. Selectivity
 /// stops mattering, and there is nothing to guard.
+///
+/// # Interval storage (#2602)
+///
+/// A quantity is a closed interval `[value_quantity_value, value_quantity_high]`.
+/// `gt`/`ge`/`eb` now compare the `high` column and `lt`/`le`/`sa` the `value`
+/// column, but the guard is unchanged: it repeats the outer predicate verbatim,
+/// so its `EXISTS` seeks `idx_search_quantity_high` for the former and
+/// `idx_search_quantity` for the latter, and `high` shares the pooled-histogram
+/// problem described above. The ordered scan itself needs v56's rebuilt
+/// `idx_search_quantity_recent`: partial on `value IS NOT NULL OR high IS NOT
+/// NULL` with both bounds in the payload, which the planner can prove for a
+/// `high`-only predicate. On the v20 shape (partial on `value`, no `high`) a
+/// broad `gt` left it, read every match from `idx_search_quantity_high` and
+/// sorted them (0.12 ms -> 211-330 ms at 350k rows per type).
 fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
     let [param] = query.parameters.as_slice() else {
         return false;
@@ -570,6 +609,52 @@ impl PostgresBackend {
         query: &SearchQuery,
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
+        self.search_with_client_tie_cap(
+            client,
+            tenant,
+            query,
+            total,
+            crate::types::DATE_WALK_MAX_TIE_GROUP,
+        )
+        .await
+    }
+
+    /// [`SearchProvider::search`] with the date walk's tie-group cap set by
+    /// the caller instead of `DATE_WALK_MAX_TIE_GROUP` (#2731).
+    ///
+    /// `#[doc(hidden)] pub` only so the integration tests can show the
+    /// fallback past the cap without seeding thousands of equal keys.
+    #[doc(hidden)]
+    pub async fn search_with_date_walk_tie_cap(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        tie_cap: usize,
+    ) -> StorageResult<SearchResult> {
+        reject_contained_missing(query)?;
+        if query.contained != crate::types::ContainedMode::Off {
+            return self.search_contained(tenant, query).await;
+        }
+        let total = if query.wants_total() {
+            Some(self.search_count(tenant, query).await?)
+        } else {
+            None
+        };
+        let client = self.get_client().await?;
+        self.search_with_client_tie_cap(&client, tenant, query, total, tie_cap)
+            .await
+    }
+
+    /// The body of [`Self::search_with_client`], with the date walk's
+    /// tie-group cap as a parameter.
+    async fn search_with_client_tie_cap(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        total: Option<u64>,
+        tie_cap: usize,
+    ) -> StorageResult<SearchResult> {
         reject_unsupported_metadata_modifier(
             query,
             self.supports_native_reverse_chains(tenant, query),
@@ -601,6 +686,33 @@ impl PostgresBackend {
         // Param layout: $1=tenant, $2=type, then (cursor) $3=sort value, $4=id,
         // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
+
+        // #2731: an unfiltered sort by one date parameter walks the date
+        // index in key order instead of computing the key per resource. `None`
+        // means the general statement below serves the page (not eligible, or
+        // the index is missing or still building).
+        let walked = match query.unfiltered_single_date_sort() {
+            Some((directive, desc))
+                if keyset.is_some()
+                    && matches!(
+                        self.index_layout(),
+                        super::schema::IndexLayout::Denormalized
+                    ) =>
+            {
+                self.date_walk_rows(
+                    client,
+                    query,
+                    tenant_id,
+                    &directive.parameter,
+                    desc,
+                    cursor.as_ref(),
+                    count,
+                    tie_cap,
+                )
+                .await?
+            }
+            _ => None,
+        };
 
         let search_filter = if !query.parameters.is_empty()
             || query.compartment.is_some()
@@ -719,12 +831,28 @@ impl PostgresBackend {
         };
 
         // Index eligibility and candidate selection share one database snapshot.
-        let (sql, has_previous) = if let Some(pred) = &fast_index_pred {
+        let (sql, has_previous) = if walked.is_some() {
+            // The walk has its rows already; only the page flag is needed.
+            let has_previous = match &cursor {
+                Some(c) => c.direction() != CursorDirection::Previous,
+                None => query.offset.unwrap_or(0) > 0,
+            };
+            (String::new(), has_previous)
+        } else if let Some(pred) = &fast_index_pred {
             // Eligible sorts share the non-null `last_updated` keyset. Apply
             // the same boundary to index identities, retaining the bind layout.
             let backward = cursor
                 .as_ref()
                 .is_some_and(|c| c.direction() == CursorDirection::Previous);
+            // `fast_index_pred` admits only the default order and a lone
+            // descending `_lastUpdated`, whose tiebreak is `id ASC` forward
+            // (#2603), so the hard-coded first-page order and `outer_order`
+            // below agree with `keyset_page_clauses`.
+            debug_assert!(keyset.as_ref().is_some_and(|k| {
+                k.tiebreak_against_key
+                    && k.direction == crate::types::SortDirection::Descending
+                    && k.forward_id_ascending()
+            }));
             let (boundary, order) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
                 let (condition, order) =
                     keyset_page_clauses(k, "resource_id", cursor_value_is_null(cursor), backward);
@@ -824,12 +952,15 @@ impl PostgresBackend {
             .iter()
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
-        let mut rows = if statement_is_reusable(query) {
-            query_dyn_cached(client, &sql, &param_refs).await
-        } else {
-            client.query(&sql, &param_refs).await
-        }
-        .or_query_error("Failed to execute search")?;
+        let mut rows = match walked {
+            Some(rows) => rows,
+            None => if statement_is_reusable(query) {
+                query_dyn_cached(client, &sql, &param_refs).await
+            } else {
+                client.query(&sql, &param_refs).await
+            }
+            .or_query_error("Failed to execute search")?,
+        };
         // Matching NULL timestamps cannot safely participate in index ordering.
         // Contained memberships normally carry NULL under their parent's identity.
         // The same-statement sentinel preserves unique parent identities and
@@ -1043,7 +1174,11 @@ impl SearchProvider for PostgresBackend {
             .map(|fragment| fragment.params)
             .unwrap_or_default();
         let cursor_clause = if cursor.is_some() {
-            " AND (last_updated < $3 OR (last_updated = $3 AND id > $4))"
+            // The leading `last_updated <= $3` is implied by the `OR`; it only
+            // gives the planner a range to seek to on `idx_resources_search`
+            // instead of filtering every row before the cursor (same shape as
+            // the descending keyset in `keyset_page_clauses`).
+            " AND (last_updated <= $3 AND (last_updated < $3 OR (last_updated = $3 AND id > $4)))"
         } else {
             ""
         };
@@ -1231,6 +1366,21 @@ impl SearchProvider for PostgresBackend {
         param_type: crate::types::SearchParamType,
     ) -> Vec<&'static str> {
         Self::modifiers_for_type(param_type)
+    }
+
+    /// Every parameter except a `special` one the query builder builds no
+    /// condition for, which `search` refuses with `400` rather than widen the
+    /// result (#2508): `near`, and from R5 `contains`, `section-text` and
+    /// `_filter`. `_text` and `_content` are evaluated, and the builder refuses
+    /// a `special` parameter from the same list.
+    fn serves_search_param(
+        &self,
+        _resource_type: &str,
+        code: &str,
+        param_type: crate::types::SearchParamType,
+    ) -> bool {
+        param_type != crate::types::SearchParamType::Special
+            || super::search::query_builder::EVALUATED_SPECIAL_PARAMETERS.contains(&code)
     }
 }
 
@@ -1860,6 +2010,256 @@ pub(super) fn invalid_cursor(cursor: &PageCursor) -> StorageError {
 
 // Helper methods for search implementations
 impl PostgresBackend {
+    /// Whether `index` exists and is fully built. A `CREATE INDEX CONCURRENTLY`
+    /// in progress, or a failed one, leaves it invalid; the planner would not
+    /// use it, and the walk would degrade to a scan of the whole parameter.
+    async fn date_walk_index_is_usable(
+        client: &deadpool_postgres::Client,
+        index: &str,
+    ) -> StorageResult<bool> {
+        let rows = query_dyn_cached(
+            client,
+            "SELECT COALESCE((SELECT i.indisvalid AND i.indisready FROM pg_index i \
+             WHERE i.indexrelid = to_regclass($1::text)), FALSE)",
+            &[&index],
+        )
+        .await
+        .or_query_error("Failed to probe the date index")?;
+        Ok(rows.first().is_some_and(|r| r.get::<_, bool>(0)))
+    }
+
+    /// The rows of an unfiltered sort by one date parameter, read as an
+    /// ordered walk of the date index (#2731); `None` when the index cannot
+    /// serve it and the general statement must.
+    ///
+    /// The page is the resources that have a value, in key order (one row each,
+    /// see [`PostgresQueryBuilder::date_walk_page_sql`]), followed by the ones
+    /// without, in id order. Rows come back in traversal order, up to
+    /// `count + 1`, with the same columns as the general statement and the key
+    /// in column 5. A cursor takes precedence over an offset, as there.
+    ///
+    /// Before the keyed part is read, the equal-key group at the head of the
+    /// page is sized up to `tie_cap` rows (`DATE_WALK_MAX_TIE_GROUP` outside
+    /// tests): the walk would read and sort all of it, so a larger one is
+    /// `None`. The head is the first key from the offset with no cursor, the
+    /// cursor's key, or, backward from a resource with no date, the last key.
+    /// Forward from such a resource only the unkeyed ones are read.
+    #[allow(clippy::too_many_arguments)]
+    async fn date_walk_rows(
+        &self,
+        client: &deadpool_postgres::Client,
+        query: &SearchQuery,
+        tenant_id: &str,
+        parameter: &str,
+        desc: bool,
+        cursor: Option<&PageCursor>,
+        count: usize,
+        tie_cap: usize,
+    ) -> StorageResult<Option<Vec<tokio_postgres::Row>>> {
+        type Params = Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>;
+        let (col, index) = PostgresQueryBuilder::date_walk_column(desc);
+        if !Self::date_walk_index_is_usable(client, index).await? {
+            return Ok(None);
+        }
+        let want = count + 1;
+        let resource_type = &query.resource_type;
+        let base = || -> Params {
+            vec![
+                Box::new(tenant_id.to_string()),
+                Box::new(resource_type.to_string()),
+            ]
+        };
+        let direction = if desc {
+            crate::types::SortDirection::Descending
+        } else {
+            crate::types::SortDirection::Ascending
+        };
+        // The keyed part never has a missing key, so the keyset is not nullable.
+        let key = KeysetKey {
+            expr: format!("si.{col}"),
+            direction,
+            kind: SortValueKind::Timestamp,
+            nullable: false,
+            tiebreak_against_key: false,
+        };
+        let run = |sql: String, params: Params, cacheable: bool| async move {
+            let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                .iter()
+                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            if cacheable {
+                query_dyn_cached(client, &sql, &refs).await
+            } else {
+                client.query(&sql, &refs).await
+            }
+            .or_query_error("Failed to execute date-sort walk")
+        };
+
+        // The keyed part, forward: the order `si.col DIR, si.resource_id ASC`.
+        let forward_order = format!(
+            "si.{col} {}, si.resource_id ASC",
+            if desc { "DESC" } else { "ASC" }
+        );
+        let mut rows: Vec<tokio_postgres::Row> = Vec::new();
+
+        // The tie-group probe: whether the group of the key bound as `$3` in
+        // `params` holds more rows than the walk may read for a page head.
+        let tie_sql = PostgresQueryBuilder::date_walk_tie_group_sql(parameter, desc, tie_cap);
+        let group_too_big = |params: Params| {
+            let sql = tie_sql.clone();
+            async move {
+                let rows = run(sql, params, true).await?;
+                let size: i64 = rows.first().map_or(0, |r| r.get(0));
+                Ok::<bool, crate::error::StorageError>(usize::try_from(size).unwrap_or(0) > tie_cap)
+            }
+        };
+        // The same for the key `offset` rows in from the start (or the end)
+        // of the key order, when there is one.
+        let head_group_too_big = |from_end: bool, offset: usize| async move {
+            let sql =
+                PostgresQueryBuilder::date_walk_head_key_sql(parameter, desc, from_end, offset);
+            let Some(head) = run(sql, base(), offset == 0)
+                .await?
+                .first()
+                .map(|r| r.get::<_, chrono::DateTime<Utc>>(0))
+            else {
+                return Ok(false);
+            };
+            let mut p = base();
+            p.push(Box::new(head));
+            group_too_big(p).await
+        };
+
+        match cursor {
+            Some(cursor) => {
+                let backward = cursor.direction() == CursorDirection::Previous;
+                let missing = cursor_value_is_null(cursor);
+                let id_param = |p: &mut Params| p.push(Box::new(cursor.resource_id().to_string()));
+                if !missing {
+                    let mut p = base();
+                    Self::bind_cursor_value(&mut p, key.kind, false, cursor)?;
+                    if group_too_big(p).await? {
+                        return Ok(None);
+                    }
+                }
+                if missing && !backward {
+                    // Past the keyed part: the rest of the unkeyed ones by id.
+                    let mut p = base();
+                    id_param(&mut p);
+                    let sql = PostgresQueryBuilder::date_walk_tail_sql(
+                        parameter,
+                        desc,
+                        Some(">"),
+                        false,
+                        want,
+                        0,
+                    );
+                    rows = run(sql, p, true).await?;
+                } else {
+                    if missing {
+                        // Backward from an unkeyed resource: the unkeyed ones
+                        // before it, nearest first, then the keyed part from its end.
+                        let mut p = base();
+                        id_param(&mut p);
+                        let sql = PostgresQueryBuilder::date_walk_tail_sql(
+                            parameter,
+                            desc,
+                            Some("<"),
+                            true,
+                            want,
+                            0,
+                        );
+                        rows = run(sql, p, true).await?;
+                    }
+                    if rows.len() < want {
+                        if missing && head_group_too_big(true, 0).await? {
+                            // Backward into the keyed part from its far end.
+                            return Ok(None);
+                        }
+                        let remaining = want - rows.len();
+                        let mut p = base();
+                        let (condition, order) = if missing {
+                            // Everything keyed lies before the cursor; read it
+                            // in the mirror of the forward order.
+                            (
+                                None,
+                                format!(
+                                    "si.{col} {}, si.resource_id DESC",
+                                    if desc { "ASC" } else { "DESC" }
+                                ),
+                            )
+                        } else {
+                            Self::bind_cursor_value(&mut p, key.kind, false, cursor)?;
+                            id_param(&mut p);
+                            let (c, o) =
+                                keyset_page_clauses(&key, "si.resource_id", false, backward);
+                            (Some(c), o)
+                        };
+                        let sql = PostgresQueryBuilder::date_walk_page_sql(
+                            parameter,
+                            desc,
+                            condition.as_deref(),
+                            &order,
+                            remaining,
+                            0,
+                        );
+                        rows.extend(run(sql, p, remaining == want).await?);
+                    }
+                    if !missing && !backward && rows.len() < want {
+                        // Forward from a keyed resource reaches the unkeyed ones.
+                        let sql = PostgresQueryBuilder::date_walk_tail_sql(
+                            parameter,
+                            desc,
+                            None,
+                            false,
+                            want - rows.len(),
+                            0,
+                        );
+                        rows.extend(run(sql, base(), false).await?);
+                    }
+                }
+            }
+            None => {
+                let offset = query.offset.unwrap_or(0) as usize;
+                if head_group_too_big(false, offset).await? {
+                    return Ok(None);
+                }
+                let sql = PostgresQueryBuilder::date_walk_page_sql(
+                    parameter,
+                    desc,
+                    None,
+                    &forward_order,
+                    want,
+                    offset,
+                );
+                rows = run(sql, base(), offset == 0).await?;
+                if rows.len() < want {
+                    // An offset that ended inside the keyed part leaves the
+                    // unkeyed ones from their start; one past it has to know how
+                    // many keyed resources it skipped.
+                    let tail_offset = if offset == 0 || !rows.is_empty() {
+                        0
+                    } else {
+                        let sql = PostgresQueryBuilder::date_walk_keyed_count_sql(parameter, desc);
+                        // One text per parameter and direction: cacheable.
+                        let keyed: i64 = run(sql, base(), true).await?[0].get(0);
+                        offset.saturating_sub(usize::try_from(keyed).unwrap_or(0))
+                    };
+                    let sql = PostgresQueryBuilder::date_walk_tail_sql(
+                        parameter,
+                        desc,
+                        None,
+                        false,
+                        want - rows.len(),
+                        tail_offset,
+                    );
+                    rows.extend(run(sql, base(), false).await?);
+                }
+            }
+        }
+        Ok(Some(rows))
+    }
+
     /// Extract timestamp and ID from a cursor for keyset pagination.
     /// Binds the cursor's boundary sort value as `$3`, typed per the sort key
     /// kind so PostgreSQL compares it correctly against the sort expression.
@@ -1944,6 +2344,7 @@ mod keyset_page_clause_tests {
             direction,
             kind: SortValueKind::Timestamp,
             nullable,
+            tiebreak_against_key: false,
         }
     }
 
@@ -1995,6 +2396,130 @@ mod keyset_page_clause_tests {
         let (previous, order) = keyset_page_clauses(&k, "resource_id", false, true);
         assert_eq!(previous, "(k > $3 OR (k = $3 AND resource_id < $4))");
         assert_eq!(order, "k ASC, resource_id DESC");
+    }
+
+    fn sorted(parameter: &str, direction: SortDirection) -> SearchQuery {
+        let param_type = match parameter {
+            "_lastUpdated" | "birthdate" => Some(crate::types::SearchParamType::Date),
+            _ => Some(crate::types::SearchParamType::Token),
+        };
+        SearchQuery::new("Patient").with_sort(crate::types::SortDirective {
+            parameter: parameter.to_string(),
+            direction,
+            param_type,
+        })
+    }
+
+    fn last_updated(direction: SortDirection) -> KeysetKey {
+        PostgresQueryBuilder::primary_keyset_key(&sorted("_lastUpdated", direction))
+            .expect("one sort key")
+    }
+
+    /// #2603: ascending `last_updated` breaks ties by `id DESC`, the backward
+    /// scan of `idx_resources_search` (`last_updated DESC, id ASC`); its
+    /// `Previous` page is the exact mirror, that index's forward scan.
+    #[test]
+    fn ascending_last_updated_breaks_ties_against_the_key() {
+        let k = last_updated(SortDirection::Ascending);
+        assert!(k.tiebreak_against_key);
+        let (next, order) = keyset_page_clauses(&k, "id", false, false);
+        assert_eq!(
+            next,
+            "(last_updated >= $3 AND (last_updated > $3 OR (last_updated = $3 AND id < $4)))"
+        );
+        assert_eq!(order, "last_updated ASC, id DESC");
+        let (previous, order) = keyset_page_clauses(&k, "id", false, true);
+        assert_eq!(
+            previous,
+            "(last_updated <= $3 AND (last_updated < $3 OR (last_updated = $3 AND id > $4)))"
+        );
+        assert_eq!(order, "last_updated DESC, id ASC");
+        // Index-selected pages share the boundary.
+        let (next, order) = keyset_page_clauses(&k, "resource_id", false, false);
+        assert_eq!(
+            next,
+            "(last_updated >= $3 AND (last_updated > $3 OR (last_updated = $3 AND resource_id < $4)))"
+        );
+        assert_eq!(order, "last_updated ASC, resource_id DESC");
+    }
+
+    /// #2603: descending and default `last_updated` keep `id ASC` forward.
+    #[test]
+    fn descending_last_updated_is_unchanged() {
+        for k in [
+            last_updated(SortDirection::Descending),
+            PostgresQueryBuilder::primary_keyset_key(&SearchQuery::new("Patient"))
+                .expect("default key"),
+        ] {
+            let (next, order) = keyset_page_clauses(&k, "id", false, false);
+            assert_eq!(
+                next,
+                "(last_updated <= $3 AND (last_updated < $3 OR (last_updated = $3 AND id > $4)))"
+            );
+            assert_eq!(order, "last_updated DESC, id ASC");
+            let (previous, order) = keyset_page_clauses(&k, "id", false, true);
+            assert_eq!(
+                previous,
+                "(last_updated >= $3 AND (last_updated > $3 OR (last_updated = $3 AND id < $4)))"
+            );
+            assert_eq!(order, "last_updated ASC, id DESC");
+        }
+    }
+
+    /// #2603: `_id` and nullable keys keep `id ASC` forward in both directions.
+    #[test]
+    fn other_keys_keep_an_ascending_tiebreak() {
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            for parameter in ["_id", "birthdate", "gender"] {
+                let k = PostgresQueryBuilder::primary_keyset_key(&sorted(parameter, direction))
+                    .expect("one sort key");
+                assert!(!k.tiebreak_against_key, "{parameter}");
+                let (next, order) = keyset_page_clauses(&k, "id", false, false);
+                assert!(
+                    next.contains("id > $4"),
+                    "{parameter} {direction:?}: {next}"
+                );
+                assert!(
+                    order.ends_with(", id ASC"),
+                    "{parameter} {direction:?}: {order}"
+                );
+                let (previous, order) = keyset_page_clauses(&k, "id", false, true);
+                assert!(
+                    previous.contains("id < $4"),
+                    "{parameter} {direction:?}: {previous}"
+                );
+                assert!(
+                    order.ends_with(", id DESC"),
+                    "{parameter} {direction:?}: {order}"
+                );
+            }
+        }
+    }
+
+    /// The first page (no cursor) is ordered exactly like the cursor pages
+    /// after it, so it is the prefix of the cursor walk.
+    #[test]
+    fn the_first_page_orders_like_the_cursor_pages() {
+        let mut queries = vec![SearchQuery::new("Patient")];
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            for parameter in ["_lastUpdated", "birthdate", "gender"] {
+                queries.push(sorted(parameter, direction));
+            }
+        }
+        for query in queries {
+            let k = PostgresQueryBuilder::primary_keyset_key(&query).expect("one sort key");
+            let (_, order) = keyset_page_clauses(&k, "id", false, false);
+            assert_eq!(
+                PostgresQueryBuilder::build_order_by(&query),
+                format!("ORDER BY {order}"),
+                "{:?}",
+                query.sort
+            );
+        }
+        assert_eq!(
+            PostgresQueryBuilder::build_order_by(&sorted("_lastUpdated", SortDirection::Ascending)),
+            "ORDER BY last_updated ASC, id DESC"
+        );
     }
 }
 

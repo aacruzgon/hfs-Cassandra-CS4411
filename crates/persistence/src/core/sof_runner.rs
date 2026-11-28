@@ -26,10 +26,12 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::Stream;
 use helios_sof::arrow::record_batch::RecordBatch;
+use helios_sof::sqlquery::{BoundParam, NativeDialect, QueryResult, SqlQueryError};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -114,6 +116,15 @@ pub enum SofError {
     /// (#2048).
     #[error("storage unavailable: {0}")]
     Unavailable(String),
+
+    /// The store stopped a statement of this view at its time limit: the
+    /// budget given by [`SofRunner::with_statement_timeout`], or the
+    /// backend's own statement timeout. The store is healthy and the
+    /// statement was deliberately cancelled, so the handler layer maps this
+    /// variant to `504 Gateway Timeout` with an OperationOutcome code of
+    /// `timeout`, as it does a cancelled CRUD statement (#2577).
+    #[error("statement timed out: {0}")]
+    Timeout(String),
 
     /// A backend-level SQL or driver error.
     #[error("backend error: {0}")]
@@ -400,6 +411,55 @@ pub fn watch_row_producer<T: Send + 'static>(
     });
 }
 
+/// Where the rows of one relation of a [`NativeSqlQuery`] come from.
+#[derive(Debug, Clone)]
+pub enum NativeRelationSource {
+    /// A ViewDefinition (raw JSON), compiled to the backend's SQL.
+    View(Value),
+    /// The SQL of a SQL View Library, reading relations defined before it.
+    Sql(String),
+    /// Rows the caller already holds (a ValueSet expansion or ConceptMap):
+    /// JSON objects keyed by column name, bound as one parameter.
+    Rows {
+        /// Column names with their FHIR type codes, in order.
+        columns: Vec<(String, String)>,
+        /// One JSON object per row.
+        rows: Vec<Value>,
+    },
+}
+
+/// One relation a SQL Query can read: a node of its dependency graph.
+#[derive(Debug, Clone)]
+pub struct NativeRelation {
+    /// Server-chosen relation name, unique in the query.
+    pub name: String,
+    /// What to call this relation in messages (the artifact's name or URL).
+    pub display: String,
+    /// Every `relatedArtifact.label` some SQL of the query reads it under.
+    pub labels: Vec<String>,
+    /// Where its rows come from.
+    pub source: NativeRelationSource,
+}
+
+/// A SQL Query (or SQL View) Library and its resolved dependency graph, to be
+/// run as one statement by a backend that speaks SQL.
+#[derive(Debug, Clone)]
+pub struct NativeSqlQuery {
+    /// The graph's nodes, dependencies before their consumers.
+    pub relations: Vec<NativeRelation>,
+    /// The Library's own SQL.
+    pub sql: String,
+    /// Values for the `:name` parameters the SQL may use.
+    pub bindings: Vec<BoundParam>,
+    /// `patient`, `group`, `_since` and stored-version filters, applied to
+    /// every ViewDefinition relation. `limit` is ignored.
+    pub filters: ViewFilters,
+    /// Rows of the result to return; further rows are dropped, not an error.
+    pub max_rows: usize,
+    /// Time limit for the statement.
+    pub timeout: Duration,
+}
+
 /// Abstraction over in-process and in-DB SQL-on-FHIR execution strategies.
 ///
 /// For row order, collection cells and preview limits by backend and view
@@ -483,6 +543,59 @@ pub trait SofRunner: Send + Sync {
     /// bytewise id order (not `(last_updated, id)`) without a single snapshot
     /// across pages.
     fn for_export_job(&self) -> Option<Arc<dyn SofRunner>> {
+        None
+    }
+
+    /// The SQL database this runner can run a SQL Query Library in, or `None`
+    /// when the backend has no SQL engine of its own (MongoDB, S3).
+    ///
+    /// `Some` means [`run_sql_query`](Self::run_sql_query) is implemented and
+    /// callers must use it: the Library's SQL then runs inside the primary
+    /// database, over the compiled views, with no rows copied out first
+    /// (#2902). A wrapper around a runner must forward both methods.
+    fn native_sql_dialect(&self) -> Option<NativeDialect> {
+        None
+    }
+
+    /// Runs a SQL Query Library and its dependency graph as one read-only
+    /// statement in the primary database.
+    ///
+    /// Each ViewDefinition relation becomes a common table expression holding
+    /// the view's compiled SQL, each SQL View one holding its SQL, and the
+    /// Library's SQL reads them by label, so the database plans the whole
+    /// query: a filter or join of the Library's SQL is applied while the view
+    /// is read, not after it has been materialized.
+    ///
+    /// All caller-written SQL goes through
+    /// [`helios_sof::sqlquery::prepare_native_sql`] first; see that module for
+    /// what it may contain.
+    ///
+    /// Only called when [`native_sql_dialect`](Self::native_sql_dialect) is
+    /// `Some`; the default answers with an internal error.
+    async fn run_sql_query(
+        &self,
+        _tenant: &TenantContext,
+        _query: NativeSqlQuery,
+    ) -> Result<QueryResult, SqlQueryError> {
+        Err(SqlQueryError::Internal(format!(
+            "the {} runner cannot run SQL in the storage backend",
+            self.runner_name()
+        )))
+    }
+
+    /// A runner whose every statement is bounded by `budget`, or `None` when
+    /// this runner has no statement-level deadline to set.
+    ///
+    /// On a backend with no SQL engine, a SQL query (`$sql-run`,
+    /// `$sql-export`) materializes each ViewDefinition it depends on in full
+    /// before its own SQL runs, under one configured time limit. A runner
+    /// that executes views as backend statements runs them under that same
+    /// limit here, so the budget does not stop short at
+    /// the backend's general statement timeout, and a statement it does stop
+    /// ends as [`SofError::Timeout`] (#2577). The PostgreSQL runner sets the
+    /// budget as `SET LOCAL statement_timeout` on the transaction each view
+    /// reads in; the pool's `HFS_PG_STATEMENT_TIMEOUT_MS` is untouched.
+    fn with_statement_timeout(&self, _budget: Duration) -> Option<Arc<dyn SofRunner>> {
         None
     }
 }

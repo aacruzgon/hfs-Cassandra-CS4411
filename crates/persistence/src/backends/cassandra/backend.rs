@@ -18,7 +18,7 @@ use super::config::CassandraConfig;
 use super::errors::{BACKEND_NAME, is_too_many_tombstones, map_driver_error};
 use super::schema;
 use super::session::{CassandraSession, DriverError, PAGE_SIZE, StatementCounts, StatementKind};
-use super::stats::{CasCounters, CasStats};
+use super::stats::{CasCounters, CasStats, RepairCounters, RepairStats};
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::{
@@ -52,7 +52,8 @@ const SELECT_TENANT_TYPES: &str = "SELECT DISTINCT tenant_id, resource_type FROM
 /// tombstone (`schema.cql`, walkthrough G39), so nothing can stop it the same
 /// way. It also lists soft-deleted SearchParameters, and so a tenant whose
 /// SearchParameters are all deleted; the point reads of the reload drop them.
-const SELECT_RESOURCE_KEYS: &str = "SELECT DISTINCT tenant_id, resource_type, id FROM resources";
+pub(super) const SELECT_RESOURCE_KEYS: &str =
+    "SELECT DISTINCT tenant_id, resource_type, id FROM resources";
 
 /// How many SearchParameter reads a reload runs at once.
 const STORED_SEARCH_PARAMETER_READS: usize = 16;
@@ -73,8 +74,12 @@ struct StoredDefinition {
     /// two definitions of one id the later one is the newer version.
     precedence: Precedence,
     /// The [`CassandraBackend::note_seq`] value when this process stored it,
-    /// or 0 when a reload read it. A reload keeps the definitions noted after
-    /// it began (see [`CassandraBackend::load_stored_search_parameters`]).
+    /// or, for a definition a follow put in, the value taken before the read
+    /// it follows ([`CassandraBackend::search_parameter_read_stamp`]); 0 when
+    /// a reload read it. A reload keeps the definitions noted after it began
+    /// (see [`CassandraBackend::load_stored_search_parameters`]), and a
+    /// definition noted at or before a merged reload began is refused
+    /// ([`TenantOverlay::reloaded_since`], ADR-aacruzgon-0099).
     noted_at: u64,
 }
 
@@ -117,6 +122,26 @@ struct Removal {
 struct TenantOverlay {
     defs: Vec<StoredDefinition>,
     removals: Vec<Removal>,
+    /// The latest `since` of a reload merged into this overlay (`None`
+    /// before the first): the [`CassandraBackend::note_seq`] value it took
+    /// before its id scan. A definition noted at or before it comes from a
+    /// read that began before that reload, so it is refused ([`Self::put`])
+    /// unless that reload read its id at an older version
+    /// ([`Self::reload_read`]). That reload says nothing of an id it did not
+    /// list (a delete removes the id's `resources_by_type` row), so this is
+    /// the only thing that keeps a follow of an older read from putting a
+    /// deleted SearchParameter back (ADR-aacruzgon-0099). Kept when the
+    /// overlay holds nothing else, for a tenant whose SearchParameters are
+    /// all gone.
+    reloaded_since: Option<u64>,
+    /// Each id the reload at [`Self::reloaded_since`] read, at the
+    /// `last_updated` it read: a definition it holds, or a row it recorded
+    /// as a removal (not `active`, a body the overlay does not take, or a
+    /// delete marker). A follow noted at or before that reload's `since`
+    /// whose version is newer than the one the reload read of its id was
+    /// read after the reload read it, so it is not held back
+    /// (ADR-aacruzgon-0099, audit F1).
+    reload_read: Vec<(String, chrono::DateTime<chrono::Utc>)>,
 }
 
 impl TenantOverlay {
@@ -154,12 +179,30 @@ impl TenantOverlay {
             .any(|r| r.id == definition.id() && r.at >= definition.last_updated())
     }
 
+    /// Whether the reload at [`Self::reloaded_since`] read `definition`'s
+    /// id at an older version than `definition`'s ([`Self::reload_read`]).
+    fn reload_read_older(&self, definition: &StoredDefinition) -> bool {
+        self.reload_read
+            .iter()
+            .any(|(id, at)| id == definition.id() && *at < definition.last_updated())
+    }
+
     /// Puts `candidate` in as its id's definition, replacing an older version
     /// of the same id. A candidate older than the id's definition, or than a
-    /// removal of the id, is refused. Returns whether the definitions in
+    /// removal of the id, is refused, and so is one noted at or before a
+    /// merged reload began ([`Self::reloaded_since`]), unless that reload
+    /// read the id at an older version than the candidate's: this process's
+    /// own writes are noted when they are put, after any reload already
+    /// merged, so only a follow of a read that began before that reload is
+    /// held back, and only when the reload did not see its id, or saw it at
+    /// the candidate's version or later. Returns whether the definitions in
     /// force changed, which is when the registry must be rebuilt.
     fn put(&mut self, candidate: StoredDefinition) -> bool {
-        if self.removed(&candidate)
+        if (self
+            .reloaded_since
+            .is_some_and(|since| candidate.noted_at <= since)
+            && !self.reload_read_older(&candidate))
+            || self.removed(&candidate)
             || self
                 .defs
                 .iter()
@@ -192,15 +235,57 @@ impl TenantOverlay {
 
     /// Replaces the definitions with what a reload read, given that it began
     /// at `since`:
+    /// - each id the reload read but the overlay does not hold (`removed`: a
+    ///   row not `active`, or one whose body the overlay does not take (a
+    ///   base `url`, or one the loader cannot parse), at its `last_updated`,
+    ///   or a delete marker the reload read because the
+    ///   delete landed between its id scan and its read) is recorded as a
+    ///   removal, so an older read of it, such as a replay's that began
+    ///   before the change (SW19), is refused later as one of this process's
+    ///   own removals is. A delete before the scan leaves no
+    ///   `resources_by_type` row to list, so it is not recorded; a replay's
+    ///   read of it that began before the reload is held back by `since`
+    ///   instead (the last two items, ADR-aacruzgon-0099);
     /// - a definition read is dropped if a removal holds it back (it was read
     ///   before the delete or the update that removed it);
     /// - a removal is forgotten only when the reload read a newer version of
     ///   its id (another instance revived it);
     /// - a definition noted after `since` is kept, unless the reload read a
-    ///   newer version of the same id.
+    ///   newer version of the same id, or a removal holds it back. A follow's
+    ///   definition is noted when its read began, so one whose read began
+    ///   before this reload is dropped, however late it was put, unless the
+    ///   reload read its id at an older version: the follow's read then came
+    ///   after the reload's read of that id (versions have strictly
+    ///   increasing `last_updated`), so it is the newer of the two;
+    /// - `since` becomes [`Self::reloaded_since`] (the later of the two), and
+    ///   when it is this reload's, what it read becomes
+    ///   [`Self::reload_read`], so a follow of a read that began before this
+    ///   reload, put after it merged, is held back by the same rule.
     ///
     /// Returns how many definitions the overlay holds, in force or not.
-    fn merge_reload(&mut self, read: Vec<StoredDefinition>, since: u64) -> usize {
+    fn merge_reload(
+        &mut self,
+        read: Vec<StoredDefinition>,
+        removed: Vec<(String, chrono::DateTime<chrono::Utc>)>,
+        since: u64,
+    ) -> usize {
+        // What this reload read of each id, live or as a removal.
+        let read_now: Vec<(String, chrono::DateTime<chrono::Utc>)> = read
+            .iter()
+            .map(|d| (d.id().to_string(), d.last_updated()))
+            .chain(removed.iter().cloned())
+            .collect();
+        let read_older = |d: &StoredDefinition| {
+            read_now
+                .iter()
+                .any(|(id, at)| id == d.id() && *at < d.last_updated())
+        };
+        for (id, at) in removed {
+            match self.removals.iter_mut().find(|r| r.id == id) {
+                Some(removal) => removal.at = removal.at.max(at),
+                None => self.removals.push(Removal { id, at }),
+            }
+        }
         let mut merged: Vec<StoredDefinition> =
             read.into_iter().filter(|d| !self.removed(d)).collect();
         self.removals.retain(|r| {
@@ -208,7 +293,11 @@ impl TenantOverlay {
                 .iter()
                 .any(|d| d.id() == r.id && d.last_updated() > r.at)
         });
-        for noted in self.defs.iter().filter(|d| d.noted_at > since) {
+        for noted in self
+            .defs
+            .iter()
+            .filter(|d| (d.noted_at > since || read_older(d)) && !self.removed(d))
+        {
             match merged.iter().position(|m| m.id() == noted.id()) {
                 Some(at) if merged[at].last_updated() > noted.last_updated() => {}
                 Some(at) => merged[at] = noted.clone(),
@@ -216,17 +305,35 @@ impl TenantOverlay {
             }
         }
         self.defs = merged;
+        if self.reloaded_since.is_none_or(|was| since >= was) {
+            self.reloaded_since = Some(since);
+            self.reload_read = read_now;
+        }
         self.defs.len()
     }
 
+    /// Whether the overlay holds nothing at all, so its entry can go: no
+    /// definition, no removal, and no merged reload to order a follow against.
     fn is_empty(&self) -> bool {
-        self.defs.is_empty() && self.removals.is_empty()
+        self.defs.is_empty() && self.removals.is_empty() && self.reloaded_since.is_none()
     }
 }
 
 /// Each tenant's stored-SearchParameter overlay, read by the registry
 /// loader. A map lookup cannot fail, so the loader always reports success.
 type StoredByTenant = Arc<RwLock<HashMap<String, TenantOverlay>>>;
+
+/// What a reload of one tenant read, before it is merged
+/// ([`TenantOverlay::merge_reload`]).
+struct ReloadRead {
+    /// The definitions read that the overlay holds.
+    loaded: Vec<StoredDefinition>,
+    /// The ids read that the overlay does not hold, each at the
+    /// `last_updated` read.
+    removed: Vec<(String, chrono::DateTime<chrono::Utc>)>,
+    /// The [`CassandraBackend::note_seq`] value taken before the id scan.
+    since: u64,
+}
 
 /// What [`CassandraBackend::load_all_stored_search_parameters`] loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,8 +406,22 @@ pub struct CassandraBackend {
     /// Counts the SearchParameters this process has noted in the overlay
     /// ([`StoredDefinition::noted_at`]).
     note_seq: AtomicU64,
+    /// Held by each reload of a tenant's overlay from before it takes its
+    /// `since` until it has merged ([`Self::load_stored_search_parameters`]),
+    /// so two reloads in this process never overlap. The overlay orders a
+    /// follow against the last reload merged (ADR-aacruzgon-0099); a reload
+    /// that began first but merged last would put back what it read before a
+    /// delete the other reload saw.
+    reload_lock: tokio::sync::Mutex<()>,
     /// The write engine's outcome counters ([`Self::cas_stats`]).
     pub(super) cas_counters: Arc<CasCounters>,
+    /// Repair on read's counters ([`Self::repair_stats`]).
+    pub(super) repair_counters: Arc<RepairCounters>,
+    /// The sweeper's counters and load limit (sweeper.rs).
+    pub(super) sweeper: super::sweeper::SweeperShared,
+    /// Crash checkpoints a test arms in the write path (ADR-sam-michaels-0006, RV15).
+    #[cfg(test)]
+    pub(super) checkpoints: super::checkpoint::Checkpoints,
 }
 
 impl fmt::Debug for CassandraBackend {
@@ -384,7 +505,12 @@ impl CassandraBackend {
             registries,
             stored_by_tenant,
             note_seq: AtomicU64::new(0),
+            reload_lock: tokio::sync::Mutex::new(()),
             cas_counters: Arc::new(CasCounters::default()),
+            repair_counters: Arc::new(RepairCounters::default()),
+            sweeper: Default::default(),
+            #[cfg(test)]
+            checkpoints: Default::default(),
         })
     }
 
@@ -395,6 +521,11 @@ impl CassandraBackend {
     /// snapshots with [`CasStats::since`].
     pub fn cas_stats(&self) -> CasStats {
         self.cas_counters.snapshot()
+    }
+
+    /// Repair on read's counters since this backend was built: repairs, failures, the rows they planned and the skips by reason (ADR-sam-michaels-0006, RV9). Subtract two snapshots with [`RepairStats::since`].
+    pub fn repair_stats(&self) -> RepairStats {
+        self.repair_counters.snapshot()
     }
 
     /// How many statements of each kind this backend has sent since it was
@@ -711,11 +842,27 @@ impl CassandraBackend {
     /// overlay until the sweeper (Step 5) writes the row. Only a reload that
     /// fell back to the keys of `resources` lists it, and keeps it.
     ///
+    /// **One reload at a time.** A call waits for any reload already running
+    /// in this process, of any tenant, before it takes `since`
+    /// ([`Self::reload_lock`]). The server's startup load and TTL refresh
+    /// already run one after another; the lock keeps it so for any other
+    /// caller.
+    ///
     /// # Errors
     ///
     /// The mapped driver error of the id scan or of any read. The overlay is
     /// unchanged then.
     pub async fn load_stored_search_parameters(&self, tenant_id: &str) -> StorageResult<usize> {
+        let _reload = self.reload_lock.lock().await;
+        let read = self.read_stored_search_parameters(tenant_id).await?;
+        Ok(self.merge_into_overlay(tenant_id, read.loaded, read.removed, read.since))
+    }
+
+    /// The reads of a reload of `tenant_id` ([`Self::load_stored_search_parameters`]):
+    /// `since`, taken before the id scan, then what each listed id's row
+    /// holds, as a definition the overlay holds or as a removal. Changes
+    /// nothing; the merge does.
+    async fn read_stored_search_parameters(&self, tenant_id: &str) -> StorageResult<ReloadRead> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
         use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
@@ -731,24 +878,54 @@ impl CassandraBackend {
             .collect();
         let mut reads = stream::iter(pending).buffer_unordered(STORED_SEARCH_PARAMETER_READS);
         let mut loaded: Vec<StoredDefinition> = Vec::new();
+        // Ids read that the overlay does not hold, each at the `last_updated`
+        // read: a later, older read of one is not put back (SW19).
+        let mut removed = Vec::new();
         while let Some(read) = reads.next().await {
             let stored = match read {
                 Ok(Some(stored)) => stored,
-                // Deleted since the scan, or never finished: not stored.
+                // Deleted between the id scan and this read: the marker's
+                // `deleted_at` is its `last_updated`. A delete before the scan
+                // left no `resources_by_type` row, so it is not listed and
+                // not recorded here (see `TenantOverlay::merge_reload`).
+                Err(StorageError::Resource(ResourceError::Gone {
+                    id,
+                    deleted_at: Some(at),
+                    ..
+                })) => {
+                    removed.push((id, at));
+                    continue;
+                }
+                // Never finished: not stored.
                 Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. })) => continue,
                 Err(error) => return Err(error),
             };
             if !self.registries.create_affects_overlay(stored.content()) {
+                removed.push((stored.id().to_string(), stored.last_modified()));
                 continue;
             }
+            // A body the loader cannot parse is not held either, so it is a
+            // removal at its `last_updated`, as an update or a follow to it
+            // records one (`overlay_definition`): an older version is not put
+            // back, and a follow of a newer one is kept (ADR-aacruzgon-0099).
             let Ok(mut definition) = loader.parse_resource(stored.content()) else {
                 tracing::warn!(
                     tenant_id,
                     id = stored.id(),
                     "stored SearchParameter does not parse; leaving it out of the registry"
                 );
+                removed.push((stored.id().to_string(), stored.last_modified()));
                 continue;
             };
+            // Unreachable while `create_affects_overlay` requires
+            // `"status": "active"`, which the loader maps to `Active`: a body
+            // not active was recorded as a removal above. The branch stays a
+            // guard, and records nothing.
+            debug_assert_eq!(
+                definition.status,
+                SearchParameterStatus::Active,
+                "create_affects_overlay takes only an active SearchParameter"
+            );
             if definition.status != SearchParameterStatus::Active {
                 continue;
             }
@@ -761,22 +938,28 @@ impl CassandraBackend {
             });
         }
 
-        Ok(self.merge_into_overlay(tenant_id, loaded, since))
+        Ok(ReloadRead {
+            loaded,
+            removed,
+            since,
+        })
     }
 
-    /// The end of a reload of `tenant_id` that began at `since` and read
-    /// `loaded` ([`TenantOverlay::merge_reload`]), then the tenant's cached
-    /// registry is dropped. Returns how many definitions the overlay holds.
+    /// The end of a reload of `tenant_id` that began at `since`, read
+    /// `loaded` and saw `removed` ([`TenantOverlay::merge_reload`]), then the
+    /// tenant's cached registry is dropped. Returns how many definitions the
+    /// overlay holds.
     fn merge_into_overlay(
         &self,
         tenant_id: &str,
         loaded: Vec<StoredDefinition>,
+        removed: Vec<(String, chrono::DateTime<chrono::Utc>)>,
         since: u64,
     ) -> usize {
         let count = {
             let mut stored = self.stored_by_tenant.write();
             let overlay = stored.entry(tenant_id.to_string()).or_default();
-            let count = overlay.merge_reload(loaded, since);
+            let count = overlay.merge_reload(loaded, removed, since);
             if overlay.is_empty() {
                 stored.remove(tenant_id);
             }
@@ -809,7 +992,7 @@ impl CassandraBackend {
             .get("id")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        self.put_stored_search_parameter(tenant_id, id, definition, last_updated);
+        self.put_stored_search_parameter(tenant_id, id, definition, last_updated, None);
     }
 
     /// Records that the stored SearchParameter `id` of `tenant_id` now holds
@@ -836,7 +1019,7 @@ impl CassandraBackend {
     ) {
         match self.overlay_definition(resource) {
             Some(definition) => {
-                self.put_stored_search_parameter(tenant_id, id, definition, last_updated);
+                self.put_stored_search_parameter(tenant_id, id, definition, last_updated, None);
             }
             None => self.remove_stored_search_parameter(tenant_id, id, last_updated),
         }
@@ -866,11 +1049,21 @@ impl CassandraBackend {
     /// marker, with no older definition of `id` left, is not recorded again,
     /// so a repeated `delete` of a deleted SearchParameter does not drop the
     /// tenant's registry each time.
+    ///
+    /// `read_at` is [`Self::search_parameter_read_stamp`], taken before `row`
+    /// was read. A definition put in is noted at it, not at the put, so a
+    /// reload of the tenant that began after it wins over `row`, whether it
+    /// merged before this follow or merges after it (ADR-aacruzgon-0099):
+    /// that reload read storage later, and a deleted id it did not list,
+    /// because the delete removed the id's `resources_by_type` row, is not
+    /// put back from `row`. A removal needs no such guard: it is ordered
+    /// against every version of the id by its `last_updated`.
     pub(super) fn follow_stored_search_parameter(
         &self,
         tenant_id: &str,
         id: &str,
         row: Option<&super::read::ResourceRow>,
+        read_at: u64,
     ) {
         let Some(row) = row else {
             return;
@@ -902,7 +1095,26 @@ impl CassandraBackend {
         else {
             return;
         };
-        self.replace_stored_search_parameter(tenant_id, id, &body, row.last_updated);
+        match self.overlay_definition(&body) {
+            Some(definition) => self.put_stored_search_parameter(
+                tenant_id,
+                id,
+                definition,
+                row.last_updated,
+                Some(read_at),
+            ),
+            None => self.remove_stored_search_parameter(tenant_id, id, row.last_updated),
+        }
+    }
+
+    /// The value a caller takes **before** it reads a SearchParameter row it
+    /// will pass to [`Self::follow_stored_search_parameter`] (ADR-aacruzgon-0099).
+    /// It is a [`Self::note_seq`] value of its own, so it orders the read
+    /// against a reload's `since` as a note is ordered: it is above the
+    /// `since` of every reload that began before it, and at or below the
+    /// `since` of every reload that begins after it.
+    pub(super) fn search_parameter_read_stamp(&self) -> u64 {
+        self.note_seq.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// After a SearchParameter write that answered an error once one of its
@@ -925,11 +1137,14 @@ impl CassandraBackend {
         {
             return;
         }
+        let read_at = self.search_parameter_read_stamp();
         match self
             .serial_read_resource_row(key.tenant_id, key.resource_type, key.id)
             .await
         {
-            Ok(row) => self.follow_stored_search_parameter(key.tenant_id, key.id, row.as_ref()),
+            Ok(row) => {
+                self.follow_stored_search_parameter(key.tenant_id, key.id, row.as_ref(), read_at)
+            }
             Err(error) => tracing::warn!(
                 tenant_id = key.tenant_id,
                 id = %key.id,
@@ -963,7 +1178,8 @@ impl CassandraBackend {
         Some(definition)
     }
 
-    /// Puts `definition` in `tenant_id`'s overlay as `id`'s, noted now, and
+    /// Puts `definition` in `tenant_id`'s overlay as `id`'s, noted now, or at
+    /// `read_at` for a follow ([`Self::follow_stored_search_parameter`]), and
     /// drops the tenant's cached registry if the definitions in force changed.
     fn put_stored_search_parameter(
         &self,
@@ -971,10 +1187,14 @@ impl CassandraBackend {
         id: &str,
         definition: SearchParameterDefinition,
         last_updated: chrono::DateTime<chrono::Utc>,
+        read_at: Option<u64>,
     ) {
         let changed = {
             let mut stored = self.stored_by_tenant.write();
-            let noted_at = self.note_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            // Taken under the lock, so after any reload already merged: this
+            // process's own write is never refused as older than a reload.
+            let noted_at =
+                read_at.unwrap_or_else(|| self.note_seq.fetch_add(1, Ordering::SeqCst) + 1);
             stored
                 .entry(tenant_id.to_string())
                 .or_default()
@@ -1006,6 +1226,23 @@ impl CassandraBackend {
         self.registries.invalidate(tenant_id);
     }
 
+    /// Tests only: a reload of `tenant_id` that runs `between` after its
+    /// reads and before its merge, as a follow put while the reload runs is.
+    /// Returns how many definitions the overlay holds after the merge.
+    #[cfg(test)]
+    pub(super) async fn load_stored_search_parameters_around<
+        F: std::future::Future<Output = ()>,
+    >(
+        &self,
+        tenant_id: &str,
+        between: F,
+    ) -> StorageResult<usize> {
+        let _reload = self.reload_lock.lock().await;
+        let read = self.read_stored_search_parameters(tenant_id).await?;
+        between.await;
+        Ok(self.merge_into_overlay(tenant_id, read.loaded, read.removed, read.since))
+    }
+
     /// Tests only: the `since` a reload beginning now takes, as
     /// [`Self::load_stored_search_parameters`] does before its id scan.
     #[cfg(test)]
@@ -1032,7 +1269,7 @@ impl CassandraBackend {
             })
             .into_iter()
             .collect();
-        self.merge_into_overlay(tenant_id, loaded, since);
+        self.merge_into_overlay(tenant_id, loaded, Vec::new(), since);
     }
 
     /// Lists the tables of the configured keyspace and fails unless all ten
@@ -1165,7 +1402,7 @@ async fn verify_local_dc(session: &CassandraSession, local_dc: &str) -> Result<(
 /// Fills the shared base registry: the embedded fallbacks, the spec bundle for
 /// `config.fhir_version`, and any custom SearchParameters in the data
 /// directory, the order every other backend uses.
-fn initialize_search_registry(
+pub(super) fn initialize_search_registry(
     registry: &Arc<RwLock<SearchParameterRegistry>>,
     config: &CassandraConfig,
 ) {
@@ -1656,10 +1893,14 @@ mod reload_rules {
         // The reload begins at since = 1, reads the parameter at 1_000, and
         // the delete (at 2_000) lands before it merges.
         overlay.remove("sp", at(2_000));
-        let count = overlay.merge_reload(vec![stored("http://example.org/sp", "sp", 1_000)], 1);
+        let count = overlay.merge_reload(
+            vec![stored("http://example.org/sp", "sp", 1_000)],
+            Vec::new(),
+            1,
+        );
         assert_eq!(count, 0);
         assert!(in_force(&overlay).is_empty());
-        overlay.merge_reload(Vec::new(), 2);
+        overlay.merge_reload(Vec::new(), Vec::new(), 2);
         assert_eq!(overlay.removals.len(), 1, "a later reload keeps it");
         assert!(
             !overlay.put(noted(stored("http://example.org/sp", "sp", 1_500), 3)),
@@ -1680,6 +1921,7 @@ mod reload_rules {
                 stored("http://example.org/sp", "other", 4_000),
                 stored("http://example.org/x", "stale", 2_000),
             ],
+            Vec::new(),
             5,
         );
         assert_eq!(count, 3, "fresh (noted after 5), other and stale as read");
@@ -1692,16 +1934,179 @@ mod reload_rules {
         );
     }
 
+    /// SW19: a reload that read an id the overlay does not hold (retired by
+    /// another instance, or deleted between the reload's id scan and its
+    /// read) records it as a removal at the version it read, so a replay's
+    /// older read of the id, noted after the reload or during it, is refused;
+    /// a newer version still replaces the removal.
+    #[test]
+    fn a_reload_records_what_it_read_as_retired_against_an_older_read() {
+        let mut overlay = TenantOverlay::default();
+        overlay.put(stored("http://example.org/sp", "sp", 1_000));
+        overlay.merge_reload(Vec::new(), vec![("sp".to_string(), at(2_000))], 0);
+        assert!(in_force(&overlay).is_empty());
+        assert!(
+            !overlay.put(noted(stored("http://example.org/sp", "sp", 1_000), 1)),
+            "the replay's read from before the retirement"
+        );
+        assert!(in_force(&overlay).is_empty());
+        // Noted during a reload that then sees the retirement: dropped too.
+        let mut during = TenantOverlay::default();
+        during.put(noted(stored("http://example.org/sp", "sp", 1_000), 7));
+        during.merge_reload(Vec::new(), vec![("sp".to_string(), at(2_000))], 5);
+        assert!(in_force(&during).is_empty());
+        assert!(
+            overlay.put(noted(stored("http://example.org/sp", "sp", 3_000), 2)),
+            "made active again"
+        );
+        assert_eq!(in_force(&overlay), ["sp"]);
+    }
+
+    /// SW19: a reload that read an id at a version older than a removal this
+    /// process already holds keeps the newer removal, so a read between the
+    /// two is still refused.
+    #[test]
+    fn a_reload_keeps_the_newer_of_two_removals() {
+        let mut overlay = TenantOverlay::default();
+        overlay.put(stored("http://example.org/sp", "sp", 1_000));
+        overlay.remove("sp", at(3_000));
+        overlay.merge_reload(Vec::new(), vec![("sp".to_string(), at(2_000))], 0);
+        assert!(
+            !overlay.put(noted(stored("http://example.org/sp", "sp", 2_500), 1)),
+            "a read older than this process's own removal at 3_000"
+        );
+    }
+
+    /// ADR-aacruzgon-0099: a follow of a read that began before a reload
+    /// (noted at or below its `since`) of an id the reload did not list, as
+    /// a deleted id is not, is dropped when the reload merges after the
+    /// follow, and refused when it is put after the merge. A follow whose
+    /// read began after the reload (the control) is kept in both orders, and
+    /// so is a note of this process's own write.
+    #[test]
+    fn a_follow_of_a_read_older_than_a_reload_loses_to_it() {
+        // The reload is in flight (since = 5) when the follows are put.
+        let mut during = TenantOverlay::default();
+        during.put(noted(stored("http://example.org/a", "stale", 1_000), 4));
+        during.put(noted(stored("http://example.org/b", "fresh", 1_000), 6));
+        let count = during.merge_reload(Vec::new(), Vec::new(), 5);
+        assert_eq!(count, 1);
+        assert_eq!(in_force(&during), ["fresh"], "the stale follow is dropped");
+        assert_eq!(during.reloaded_since, Some(5));
+
+        // The reload (since = 5) merged before the follows are put.
+        let mut after = TenantOverlay::default();
+        after.merge_reload(Vec::new(), Vec::new(), 5);
+        assert!(
+            !after.put(noted(stored("http://example.org/a", "stale", 1_000), 4)),
+            "read before the reload began"
+        );
+        assert!(
+            !after.put(noted(stored("http://example.org/a", "edge", 1_000), 5)),
+            "a stamp equal to since was taken before the reload's load"
+        );
+        assert!(after.put(noted(stored("http://example.org/b", "fresh", 1_000), 6)));
+        assert_eq!(in_force(&after), ["fresh"]);
+
+        // A later reload with an older since never lowers it.
+        after.merge_reload(after.defs.clone(), Vec::new(), 3);
+        assert_eq!(after.reloaded_since, Some(5));
+        assert!(!after.is_empty(), "kept for a tenant with nothing else");
+        assert!(TenantOverlay::default().is_empty());
+    }
+
+    /// ADR-aacruzgon-0099 (audit F1): a follow noted before a reload began,
+    /// of a version newer than the one that reload read of its id, was read
+    /// after the reload read it, so it is kept, whether the reload merged
+    /// first or merges after it. A follow of an id the reload did not see
+    /// (a delete before its scan), or saw at the follow's version or later,
+    /// is still held back, and a delete the reload read after the follow's
+    /// version refuses it; a retirement it read before the follow's version
+    /// does not.
+    #[test]
+    fn a_follow_newer_than_what_the_reload_read_of_its_id_is_kept() {
+        let follow = |url: &str, id: &str, millis: i64| noted(stored(url, id, millis), 4);
+        let reload = || {
+            (
+                vec![
+                    stored("http://example.org/sp", "sp", 1_000),
+                    stored("http://example.org/same", "same", 2_000),
+                ],
+                vec![
+                    ("retired".to_string(), at(1_000)),
+                    ("deleted".to_string(), at(3_000)),
+                ],
+            )
+        };
+
+        // The reload (since = 5) merged before the follows (stamped 4).
+        let mut after = TenantOverlay::default();
+        let (read, removed) = reload();
+        after.merge_reload(read, removed, 5);
+        assert!(
+            after.put(follow("http://example.org/sp", "sp", 2_000)),
+            "newer than the reload's read of sp"
+        );
+        assert!(
+            !after.put(follow("http://example.org/same", "same", 2_000)),
+            "the version the reload read"
+        );
+        assert!(
+            !after.put(follow("http://example.org/unseen", "unseen", 2_000)),
+            "an id the reload did not list"
+        );
+        assert!(
+            after.put(follow("http://example.org/retired", "retired", 2_000)),
+            "made active again after the retirement the reload read"
+        );
+        assert!(
+            !after.put(follow("http://example.org/deleted", "deleted", 2_000)),
+            "older than the delete the reload read"
+        );
+        let mut held = in_force(&after);
+        held.sort();
+        assert_eq!(held, ["retired", "same", "sp"]);
+        let sp = after.defs.iter().find(|d| d.id() == "sp").unwrap();
+        assert_eq!(sp.last_updated(), at(2_000), "the follow's version");
+
+        // The follows put first, then the reload (since = 5) merges.
+        let mut during = TenantOverlay::default();
+        for (url, id) in [
+            ("http://example.org/sp", "sp"),
+            ("http://example.org/same", "same"),
+            ("http://example.org/unseen", "unseen"),
+            ("http://example.org/retired", "retired"),
+            ("http://example.org/deleted", "deleted"),
+        ] {
+            during.put(follow(url, id, 2_000));
+        }
+        let (read, removed) = reload();
+        during.merge_reload(read, removed, 5);
+        let mut held = in_force(&during);
+        held.sort();
+        assert_eq!(held, ["retired", "same", "sp"], "the same outcome");
+        let sp = during.defs.iter().find(|d| d.id() == "sp").unwrap();
+        assert_eq!(sp.last_updated(), at(2_000), "the follow's version");
+    }
+
     /// A removal is forgotten once a reload reads a newer version of its id
     /// (another instance revived it), and that version is in force.
     #[test]
     fn a_reload_of_a_newer_version_supersedes_a_removal() {
         let mut overlay = TenantOverlay::default();
         overlay.remove("sp", at(2_000));
-        overlay.merge_reload(vec![stored("http://example.org/sp", "sp", 1_000)], 0);
+        overlay.merge_reload(
+            vec![stored("http://example.org/sp", "sp", 1_000)],
+            Vec::new(),
+            0,
+        );
         assert!(in_force(&overlay).is_empty(), "older than the removal");
         assert_eq!(overlay.removals.len(), 1);
-        overlay.merge_reload(vec![stored("http://example.org/sp", "sp", 3_000)], 0);
+        overlay.merge_reload(
+            vec![stored("http://example.org/sp", "sp", 3_000)],
+            Vec::new(),
+            0,
+        );
         assert_eq!(in_force(&overlay), ["sp"]);
         assert!(overlay.removals.is_empty());
     }

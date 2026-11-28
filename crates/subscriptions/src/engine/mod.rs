@@ -124,7 +124,9 @@ impl SubscriptionEngine {
             .with_event_history_size(config.event_history_size),
         );
         let evaluator = EventEvaluator::new(Arc::clone(&topic_registry), Arc::clone(&manager));
-        let rest_hook_channel = Arc::new(RestHookChannel::new());
+        let rest_hook_channel = Arc::new(
+            RestHookChannel::new().with_private_endpoints_allowed(config.allow_private_endpoints),
+        );
         let ws_manager = Arc::new(WebSocketManager::new());
         let ws_channel = Arc::new(WebSocketChannel::new(Arc::clone(&ws_manager)));
         let ws_token_manager = Arc::new(WsBindingTokenManager::new(config.ws_token_lifetime_secs));
@@ -145,7 +147,11 @@ impl SubscriptionEngine {
                 channel =
                     channel.with_source_endpoint_resolver(Arc::clone(&public_base_url_for_tenant));
             }
-            Arc::new(channel.with_private_endpoints_allowed(settings.allow_private_endpoints))
+            Arc::new(
+                channel
+                    .with_private_endpoints_allowed(settings.allow_private_endpoints)
+                    .with_credential_hosts(&settings.credential_hosts),
+            )
         });
 
         let status_write_slots = Arc::new(Semaphore::new(config.status_write_concurrency.max(1)));
@@ -325,11 +331,13 @@ impl SubscriptionEngine {
         match event.resource_type {
             "Subscription" => {
                 let snapshot = self.core.handle_subscription_event(&event);
-                if snapshot.is_some() || event.event_type == ResourceEventType::Delete {
-                    self.scheduler
-                        .state
-                        .invalidate_registration(event.tenant_id.as_str(), event.resource_id);
-                }
+                // Every committed Subscription write retires what was queued
+                // for the previous generation: a registration, a delete, or a
+                // rewrite the engine could not register (which retires the
+                // previous registration too).
+                self.scheduler
+                    .state
+                    .invalidate_registration(event.tenant_id.as_str(), event.resource_id);
                 Some(
                     snapshot.filter(|s| s.subscription.status == SubscriptionStatusCode::Requested),
                 )
@@ -488,11 +496,21 @@ impl EngineCore {
                             return Some(snapshot);
                         }
                         Err(e) => {
+                            // The stored resource is the record of truth. When
+                            // the engine cannot represent it, it must hold no
+                            // serving registration for the id either: the
+                            // previous generation would otherwise keep
+                            // delivering with the previous channel while GET
+                            // shows the rewrite (status off, a new endpoint).
+                            let retired = self.manager.deregister(&tenant_id, subscription_id);
+                            self.ws_manager
+                                .remove_all_clients(&tenant_id, subscription_id);
                             warn!(
                                 tenant_id,
                                 subscription_id,
                                 error = %e,
-                                "Failed to register subscription"
+                                retired,
+                                "Failed to register subscription; previous registration retired"
                             );
                         }
                     }
@@ -1356,6 +1374,7 @@ mod tests {
             max_retries: 2,
             error_threshold: 2,
             off_threshold: 4,
+            allow_private_endpoints: true, // receivers are on loopback
             ..Default::default()
         };
         SubscriptionEngine::new(config, base_url.to_string())
@@ -1380,7 +1399,9 @@ mod tests {
             messaging: Some(crate::config::MessagingSettings {
                 source_endpoint: "https://fallback.example/fhir".to_string(),
                 allow_private_endpoints: false,
+                credential_hosts: Vec::new(),
             }),
+            allow_private_endpoints: true, // receivers are on loopback
             ..Default::default()
         };
         let resolver: Arc<dyn Fn(&str) -> String + Send + Sync> =
@@ -1749,6 +1770,58 @@ mod tests {
         assert!(sub.is_some());
     }
 
+    /// A committed rewrite the engine cannot register (here: a topic the
+    /// tenant does not hold) retires the previous registration instead of
+    /// leaving it delivering while the stored resource says otherwise.
+    #[tokio::test]
+    async fn a_rewrite_the_engine_cannot_register_retires_the_previous_registration() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let engine = make_engine("http://localhost:8080");
+        engine.topic_registry().add_topic("t1", encounter_topic());
+        let endpoint = format!("{}/webhook", server.uri());
+        let event = |version: &str, event_type: ResourceEventType, topic: &str| ResourceEvent {
+            tenant_id: TenantId::new("t1"),
+            fhir_version: FhirVersion::default(),
+            resource_type: "Subscription".to_string(),
+            resource_id: "sub-1".to_string(),
+            version_id: version.to_string(),
+            event_type,
+            resource: Some(crate::manager::tests::build_subscription_json(
+                topic,
+                "rest-hook",
+                Some(&endpoint),
+            )),
+            previous_resource: None,
+            timestamp: Utc::now(),
+        };
+
+        engine
+            .on_resource_event(event(
+                "1",
+                ResourceEventType::Create,
+                "http://example.org/topic/encounter-start",
+            ))
+            .await;
+        assert!(engine.manager().get_subscription("t1", "sub-1").is_some());
+
+        engine
+            .on_resource_event(event(
+                "2",
+                ResourceEventType::Update,
+                "http://example.org/topic/not-in-this-tenant",
+            ))
+            .await;
+        assert!(
+            engine.manager().get_subscription("t1", "sub-1").is_none(),
+            "the previous registration must not keep serving"
+        );
+    }
+
     #[tokio::test]
     async fn test_subscription_activation_retries_retryable_handshake_failure() {
         let server = MockServer::start().await;
@@ -1765,6 +1838,7 @@ mod tests {
             handshake_max_attempts: 2,
             handshake_retry_initial_delay: std::time::Duration::from_millis(1),
             handshake_retry_max_delay: std::time::Duration::from_millis(1),
+            allow_private_endpoints: true, // receivers are on loopback
             ..Default::default()
         };
         let engine = SubscriptionEngine::new(config, "http://localhost:8080".to_string());
@@ -1915,6 +1989,7 @@ mod tests {
             max_retries: 1,
             error_threshold: 1,
             off_threshold: 3,
+            allow_private_endpoints: true, // receivers are on loopback
             ..Default::default()
         };
         let engine = SubscriptionEngine::new(config, "http://localhost:8080".to_string());

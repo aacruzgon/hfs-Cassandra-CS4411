@@ -5,9 +5,7 @@
 //! plain `update`'s V3 built from R1 (Step 3 plan D5):
 //!
 //! 1. **Step 1, the operation's own.** `tenant.check_permission(
-//!    Operation::Update, type)`, then the G38 bound on a SearchParameter's
-//!    `code` ([`check_search_parameter_code`]): either refusal comes before
-//!    any statement.
+//!    Operation::Update, type)`, which refuses before any statement.
 //! 2. **R1** ([`CassandraBackend::read_resource_row`]) of `resources`, for
 //!    `K(N)` (G22) and for V3's `data` and `w(N)` (D5). Its version decides
 //!    what happens next ([`r1_case`], walkthrough `:176-180`):
@@ -41,12 +39,9 @@ use serde_json::Value as Json;
 
 use super::backend::CassandraBackend;
 use super::errors::map_driver_error;
-use super::index_keys::IndexKey;
 use super::read::{ResourceRow, SELECT_RESOURCE};
 use super::session::StatementKind;
-use super::write::{
-    CasMiss, CasOutcome, CasPlan, CasRequest, RowKey, check_search_parameter_code, normalized_body,
-};
+use super::write::{CasMiss, CasOutcome, CasPlan, CasRequest, RowKey, normalized_body};
 use crate::error::{ConcurrencyError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
@@ -109,7 +104,6 @@ impl CassandraBackend {
 
         // Step 1.
         tenant.check_permission(Operation::Update, resource_type)?;
-        check_search_parameter_code(resource_type, &resource)?;
 
         let tenant_id = tenant.tenant_id().as_str();
         let Ok(expected) = current.version_id().parse::<i32>() else {
@@ -185,13 +179,12 @@ impl CassandraBackend {
     /// with the attempt's values, or the definite miss, which the caller maps
     /// (`update`) or answers with its next turn (`create_or_update`).
     ///
-    /// The caller has already checked the permission and the G38 bound, and
-    /// has run [`check_earlier_attempts`](Self::check_earlier_attempts) on
-    /// `row`.
+    /// The caller has already checked the permission, and has run
+    /// [`check_earlier_attempts`](Self::check_earlier_attempts) on `row`.
     ///
     /// The plan's V3 is `row` itself: `N`'s `data`, `lu(N)`, `w(N)` and
     /// `K(N)` (D5, G22, G40), and its `fhir_version` is `row`'s (G13). `K(N+1)`
-    /// is the `resources_by_type` row until Step 5.
+    /// comes from the shared extractor ([`CassandraBackend::index_keys_of`]).
     pub(crate) async fn update_attempt(
         &self,
         request: &mut CasRequest<'_>,
@@ -203,7 +196,8 @@ impl CassandraBackend {
         // R2's does (ADR-aacruzgon-0067).
         let previous = request.previous_version(row)?;
         let (body, data) = normalized_body("update", key.resource_type, key.id, resource)?;
-        let plan = CasPlan::update(previous, body, data, vec![IndexKey::ResourcesByType]);
+        let keys = self.index_keys_of(key.tenant_id, key.resource_type, &body);
+        let plan = CasPlan::update(previous, body, data, keys);
         self.run_cas(request, plan).await
     }
 
@@ -281,6 +275,7 @@ mod tests {
             created_at: Some(at),
             deleted_at: deleted.then_some(at),
             fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+            stored_fhir_version: None,
             write_ts: Some(1_000_000),
             write_id: None,
             index_keys: Some(vec![0x01, 0x00]),
@@ -374,7 +369,7 @@ mod node_tests {
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
     use crate::backends::cassandra::index_keys;
-    use crate::backends::cassandra::session::Fault;
+    use crate::backends::cassandra::session::{Fault, TimeoutWriteType};
     use crate::backends::cassandra::write::{
         PreviousVersion, SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, write_ts_of,
     };
@@ -406,6 +401,18 @@ mod node_tests {
                 }
             }
         };
+    }
+
+    /// Like `tenant_context`, for a case that plants another writer's CAS by
+    /// raw CQL, which leaves a version with no intent and no rows (RV22).
+    fn planted_tenant_context(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-planted-update-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
     }
 
     fn tenant_context(case: &str) -> TenantContext {
@@ -499,6 +506,7 @@ mod node_tests {
     /// C2's bind values for moving `Patient/p` from `from` to `from + 1`
     /// with `write_id`, outside the engine (another writer).
     fn c2_values(
+        backend: &CassandraBackend,
         tenant: &TenantContext,
         from: i32,
         write_id: Uuid,
@@ -513,7 +521,11 @@ mod node_tests {
             ),
             Value::from(write_ts_of(lu)),
             Value::from(write_id),
-            Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+            Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                tenant.tenant_id().as_str(),
+                "Patient",
+                &patient("Other"),
+            )))),
             Value::from(tenant.tenant_id().as_str()),
             Value::from("Patient"),
             Value::from("p"),
@@ -533,7 +545,10 @@ mod node_tests {
         backend.session.inject_fault(
             StatementKind::Cas,
             "UPDATE resources",
-            Fault::ApplyLate { before },
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
         );
         let lu = super::super::write::next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50);
@@ -541,7 +556,7 @@ mod node_tests {
             .session
             .rows(
                 UPDATE_RESOURCE_IF_VERSION,
-                c2_values(tenant, from, write_id, lu),
+                c2_values(backend, tenant, from, write_id, lu),
                 StatementKind::Cas,
             )
             .await;
@@ -563,7 +578,10 @@ mod node_tests {
         backend.session.inject_fault(
             StatementKind::Cas,
             "UPDATE resources",
-            Fault::ApplyLate { before },
+            Fault::ApplyLate {
+                before,
+                write_type: TimeoutWriteType::Cas,
+            },
         );
         let lu = super::super::write::next_last_updated(Utc::now(), None)
             + chrono::Duration::milliseconds(50);
@@ -600,7 +618,7 @@ mod node_tests {
     async fn c2_misses_through_update_map_to_a_conflict_or_not_found() {
         let backend = backend_or_skip!();
 
-        let tenant = tenant_context("miss-moved");
+        let tenant = planted_tenant_context("miss-moved");
         let current = create(&backend, &tenant).await;
         let theirs = Uuid::new_v4();
         another_writer_late(&backend, &tenant, 1, theirs, StatementKind::Cas).await;
@@ -627,7 +645,7 @@ mod node_tests {
         assert_eq!(spent.serial_read, 0, "a definite miss needs no R2");
         assert_eq!(current_row(&backend, &tenant).await.write_id, Some(theirs));
 
-        let tenant = tenant_context("miss-deleted");
+        let tenant = planted_tenant_context("miss-deleted");
         let current = create(&backend, &tenant).await;
         another_deleter_late(&backend, &tenant, 1, StatementKind::Cas).await;
         let before = backend.cas_stats();
@@ -662,14 +680,25 @@ mod node_tests {
             .expect("update");
         let spent = backend.statement_counts().since(&before);
         eprintln!("[statements op=update {spent}]");
-        // R1; V3, I1, V1, I2 sent alone; the X1 insert and delete in one
-        // batch, since both rows sit in the `(tenant, Patient)` partition
-        // (IW9 B, IW14); one C2.
+        // R1; V3, I1, V1, I2 sent alone; one C2. K(2) and K(1) hold `k` keys
+        // each (the body changes only `name.family`, a string parameter, which
+        // has no index row, and `meta`, which is not extracted, so both sets
+        // have the same keys), so the index step is one
+        // batch of `k` inserts and `k` deletes: every row's `last_updated`
+        // changed, and the batch is small enough to hold them all (IW9 B,
+        // IW14).
+        let k = row1.keys().unwrap().len() as u64;
+        assert!(k > 1, "the index rows go as a batch");
         assert_eq!(
             (spent.read, spent.serial_read, spent.write, spent.cas),
             (1, 0, 4, 1)
         );
-        assert_eq!((spent.batch, spent.batched), (1, 2), "{spent}");
+        assert_eq!((spent.batch, spent.batched), (1, 2 * k), "{spent}");
+        assert_eq!(
+            current_row(&backend, &tenant).await.keys().unwrap().len() as u64,
+            k,
+            "K(2) has as many keys as K(1)"
+        );
         assert_eq!(spent.total(), 7, "requests: {spent}");
 
         assert_eq!(updated.version_id(), "2");
@@ -743,7 +772,11 @@ mod node_tests {
                     ),
                     Value::from(write_ts_of(lu)),
                     Value::from(writer),
-                    Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+                    Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                        tenant.tenant_id().as_str(),
+                        "Patient",
+                        &patient("Smith"),
+                    )))),
                 ],
                 StatementKind::Cas,
             )
@@ -846,7 +879,7 @@ mod node_tests {
         // Below N, and N's CAS still committing: R2 completes it, and the
         // update goes ahead from R2's row. Another writer's C2 (1 -> 2) is
         // held back by the seam and applied just before the serial read.
-        let tenant = tenant_context("below");
+        let tenant = planted_tenant_context("below");
         create(&backend, &tenant).await;
         let theirs = Uuid::new_v4();
         another_writer_late(&backend, &tenant, 1, theirs, StatementKind::SerialRead).await;
@@ -894,7 +927,7 @@ mod node_tests {
         );
     }
 
-    /// Step 1 refuses before any statement: the permission, and G38's bound.
+    /// Step 1 refuses before any statement: the permission.
     #[tokio::test]
     async fn step_one_refuses_before_any_statement() {
         let backend = backend_or_skip!();
@@ -909,32 +942,6 @@ mod node_tests {
             Err(StorageError::Tenant(
                 TenantError::OperationNotPermitted { .. }
             ))
-        ));
-        let long_code = serde_json::json!({
-            "resourceType": "SearchParameter",
-            "id": "sp",
-            "url": "http://example.org/sp",
-            "status": "active",
-            "code": "c".repeat(129),
-            "base": ["Patient"],
-            "type": "token",
-            "expression": "Patient.gender"
-        });
-        let sp = claimed(&tenant, 1);
-        let sp = StoredResource::from_storage(
-            "SearchParameter",
-            "sp",
-            "1",
-            tenant.tenant_id().clone(),
-            long_code.clone(),
-            sp.created_at(),
-            sp.last_modified(),
-            None,
-            crate::backends::cassandra::test_support::test_fhir_version(),
-        );
-        assert!(matches!(
-            backend.update(&tenant, &sp, long_code).await,
-            Err(StorageError::Validation(_))
         ));
         let spent = backend.statement_counts().since(&before);
         assert_eq!(spent.total(), 0, "{spent}");
@@ -1028,7 +1035,7 @@ mod node_tests {
         // Our C2 applies (1 -> 2) and its reply is lost; another writer's
         // C2 (2 -> 3), held back, lands before R2, and row 2 was never
         // written, since our step 4 never ran.
-        let tenant = tenant_context("undecidable");
+        let tenant = planted_tenant_context("undecidable");
         let current = create(&backend, &tenant).await;
         another_writer_late(
             &backend,
@@ -1091,6 +1098,7 @@ mod node_tests {
             "UPDATE resources",
             Fault::ApplyLate {
                 before: StatementKind::Cas,
+                write_type: TimeoutWriteType::Cas,
             },
         );
         let before = backend.cas_stats();

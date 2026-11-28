@@ -21,7 +21,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -52,7 +52,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Download HFS binary
         uses: actions/download-artifact@v8
@@ -196,7 +196,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Download HFS binary
         uses: actions/download-artifact@v8
@@ -303,7 +303,7 @@ jobs:
         run: |
           MONGO_CONTAINER="mongo-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0.48 --replSet rs0 --bind_ip_all
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 mongo:9.0.8 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
 
@@ -834,7 +834,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Download HFS binary
         uses: actions/download-artifact@v8
@@ -907,7 +907,7 @@ jobs:
         run: |
           MONGO_CONTAINER="mongo-audit-db-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0.48 --replSet rs0 --bind_ip_all
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 mongo:9.0.8 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
 

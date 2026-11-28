@@ -3,12 +3,21 @@
 //! setting that enables the sign-in. The flag is process-wide, so this binary
 //! owns it: one test flips it on, asserts, and flips it back.
 
+mod support;
+
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use helios_persistence::core::SettingsStore;
 use tower::ServiceExt;
 
 fn app() -> Router {
+    app_with(None)
+}
+
+fn app_with(settings: Option<std::sync::Arc<support::InMemorySettingsStore>>) -> Router {
+    let settings =
+        settings.map(|store| store as std::sync::Arc<dyn helios_persistence::core::SettingsStore>);
     helios_ui::mount_with_conformance_source(
         Router::new(),
         "9.9.9",
@@ -19,7 +28,7 @@ fn app() -> Router {
             model: "test-model".to_string(),
         },
         None,
-        None,
+        settings,
         "default".to_string(),
         std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
             std::path::Path::new("../../data"),
@@ -50,7 +59,10 @@ async fn status(method: &str, uri: &str) -> (StatusCode, String) {
     (code, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
-/// The routes whose handlers act on storage themselves (#1619).
+/// The routes that would act for an anonymous caller with the server's own
+/// authority: the ones whose handlers act on storage themselves (#1619) and
+/// the bulk-export pages, whose self-calls fall back to the outbound service
+/// credential.
 const STORAGE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/ui/tenants"),
     ("GET", "/ui/tenants/rows"),
@@ -68,6 +80,25 @@ const STORAGE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/ui/bulk-import/some-id/abort"),
     ("POST", "/ui/bulk-import/some-id/complete"),
     ("POST", "/ui/bulk-import/some-id/edit"),
+    ("POST", "/ui/version"),
+    ("GET", "/ui/sql/export"),
+    ("POST", "/ui/sql/export"),
+    ("GET", "/ui/sql/export/some-id"),
+    ("POST", "/ui/sql/export/some-id/remove"),
+    ("POST", "/ui/sql/views"),
+    ("POST", "/ui/sql/queries"),
+    ("GET", "/ui/bulk-export"),
+    ("GET", "/ui/bulk-export/new"),
+    ("GET", "/ui/bulk-export/active"),
+    ("GET", "/ui/bulk-export/active/some-id"),
+    ("GET", "/ui/bulk-export/active/some-id/detail"),
+    ("GET", "/ui/bulk-export/active/some-id/card"),
+    ("GET", "/ui/bulk-export/active/some-id/download"),
+    ("POST", "/ui/bulk-export"),
+    ("POST", "/ui/bulk-export/active/some-id/cancel"),
+    ("POST", "/ui/bulk-export/active/some-id/retry"),
+    ("POST", "/ui/bulk-export/active/some-id/rerun"),
+    ("POST", "/ui/bulk-export/active/some-id/delete"),
 ];
 
 async fn html(uri: &str) -> String {
@@ -138,7 +169,52 @@ async fn the_shell_says_once_that_no_browser_sign_in_is_configured() {
     assert_eq!(status("GET", "/ui").await.0, StatusCode::OK);
     assert_eq!(status("GET", "/ui/batch").await.0, StatusCode::OK);
 
+    // #2802: the pages that stay open neither write the shared `l2:`
+    // settings document (a rail or chart selection made by a page load) nor
+    // read it (a FHIR version stored before authentication was turned on).
+    let store = std::sync::Arc::new(support::InMemorySettingsStore::new());
+    let seeded = serde_json::json!({
+        "byTenant": {"default": {"dashboard": {"types": ["Encounter"], "window": "24h"}}}
+    });
+    store
+        .put_settings("l2:", seeded.clone(), None)
+        .await
+        .unwrap();
+    for uri in [
+        "/ui?types=Patient&window=7d",
+        "/ui/resources?type=Observation",
+        "/ui/search-parameters?type=Encounter",
+    ] {
+        let response = app_with(Some(store.clone()))
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(store.peek("l2:"), Some(seeded.clone()), "{uri} wrote l2:");
+    }
+    let response = app_with(Some(store.clone()))
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        store.get_settings_calls(),
+        0,
+        "no page reads the shared document for an anonymous caller"
+    );
+
     helios_ui::set_bearer_only_auth(false);
+    // With authentication off the same page load records its selection.
+    let response = app_with(Some(store.clone()))
+        .oneshot(
+            Request::get("/ui?types=Patient&window=7d")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_ne!(store.peek("l2:"), Some(seeded), "auth off: l2: is written");
     let off = html("/ui").await;
     assert!(!off.contains("auth-bearer-only"), "{off}");
     // Without the posture the same routes answer as before: the pages render

@@ -30,6 +30,10 @@ mod sof_prefix_matrix;
 #[path = "common/sof_pr410_views.rs"]
 mod sof_pr410_views;
 
+#[cfg(feature = "R4")]
+#[path = "common/sof_native_sql.rs"]
+mod sof_native_sql;
+
 mod sof_pg_runner_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -151,6 +155,131 @@ mod sof_pg_runner_tests {
                 .await
                 .expect("Failed to create PostgresBackend"),
         )
+    }
+
+    /// #2902 profile: what a selective SQL Query over a large view costs when
+    /// the view must first be read out in full (the least the embedded engine
+    /// does per request, before it inserts and queries the rows) against the
+    /// same query run inside PostgreSQL.
+    ///
+    /// `cargo test -p helios-persistence --features postgres,sqlite --test sof_pg_runner \
+    ///  native_sql_profile -- --ignored --nocapture`, rows via
+    /// `HFS_TEST_NATIVE_SQL_PROFILE_ROWS` (default 50000).
+    #[cfg(feature = "R4")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "profile; needs Docker and takes minutes"]
+    async fn native_sql_profile() {
+        use helios_persistence::core::sof_runner::{
+            NativeRelation, NativeRelationSource, NativeSqlQuery,
+        };
+        use std::time::{Duration, Instant};
+
+        let rows: usize = std::env::var("HFS_TEST_NATIVE_SQL_PROFILE_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50_000);
+        let backend = create_backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new(format!("native-profile-{}", uuid::Uuid::new_v4())),
+            TenantPermissions::full_access(),
+        );
+        let seeded = Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
+        for worker in 0..8usize {
+            let backend = Arc::clone(&backend);
+            let tenant = tenant.clone();
+            tasks.spawn(async move {
+                for i in (worker..rows).step_by(8) {
+                    // One observation in 200 is a body height.
+                    let code = if i % 200 == 0 { "8302-2" } else { "8867-4" };
+                    backend
+                        .create(
+                            &tenant,
+                            "Observation",
+                            json!({"resourceType": "Observation", "id": format!("o{i}"),
+                                "status": "final",
+                                "subject": {"reference": format!("Patient/p{}", i % 1000)},
+                                "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+                                "valueQuantity": {"value": 100 + (i % 90), "unit": "cm"}}),
+                            FhirVersion::R4,
+                        )
+                        .await
+                        .expect("seed observation");
+                }
+            });
+        }
+        while let Some(done) = tasks.join_next().await {
+            done.expect("seed worker");
+        }
+        println!("seeded {rows} observations in {:?}", seeded.elapsed());
+
+        let view = json!({
+            "resourceType": "ViewDefinition", "name": "observation_flat",
+            "resource": "Observation", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "patient_id", "path": "subject.getReferenceKey(Patient)", "type": "string"},
+                {"name": "code", "path": "code.coding.first().code", "type": "code"},
+                {"name": "value", "path": "value.ofType(Quantity).value", "type": "decimal"}
+            ]}]
+        });
+        let runner = backend.sof_runner().expect("runner");
+        let sql = "SELECT patient_id, max(value) AS height FROM obs \
+                   WHERE code = '8302-2' AND value > 150 GROUP BY patient_id";
+        for round in 0..3 {
+            let start = Instant::now();
+            let mut stream = runner
+                .run_view(&tenant, view.clone(), ViewFilters::default())
+                .await
+                .expect("run view");
+            let mut read = 0usize;
+            while let Some(row) = stream.next().await {
+                row.expect("row");
+                read += 1;
+            }
+            let materialize = start.elapsed();
+
+            let start = Instant::now();
+            let result = runner
+                .run_sql_query(
+                    &tenant,
+                    NativeSqlQuery {
+                        relations: vec![NativeRelation {
+                            name: "__sof_node_0".to_string(),
+                            display: "observation_flat".to_string(),
+                            labels: vec!["obs".to_string()],
+                            source: NativeRelationSource::View(view.clone()),
+                        }],
+                        sql: sql.to_string(),
+                        bindings: Vec::new(),
+                        filters: ViewFilters::default(),
+                        max_rows: 100_000,
+                        timeout: Duration::from_secs(300),
+                    },
+                )
+                .await
+                .expect("native query");
+            println!(
+                "round {round}: read the whole view ({read} rows): {materialize:?}; \
+                 query in PostgreSQL ({} rows): {:?}",
+                result.rows.len(),
+                start.elapsed()
+            );
+        }
+    }
+
+    /// #2902: a SQL Query Library runs inside the primary PostgreSQL database.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn sql_queries_run_in_the_primary_database() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("runner");
+        assert_eq!(
+            runner.native_sql_dialect(),
+            Some(helios_sof::sqlquery::NativeDialect::Postgres)
+        );
+        let prefix = format!("native-{}", uuid::Uuid::new_v4());
+        super::sof_native_sql::run_suite(backend.as_ref(), runner, &prefix).await;
     }
 
     #[cfg(all(feature = "R4", feature = "R5"))]
@@ -2689,6 +2818,100 @@ mod export_paging {
             _connection: handle,
             _container: container,
         }
+    }
+
+    /// #2577: a SQL query's statement budget governs the view's statement on
+    /// PostgreSQL. It lifts a shorter session `statement_timeout` (the pool's
+    /// `HFS_PG_STATEMENT_TIMEOUT_MS`) and cuts a longer one; a statement the
+    /// server stops at either ends the view as `SofError::Timeout`, not as a
+    /// backend fault; and the session value is untouched afterwards.
+    #[tokio::test]
+    async fn statement_budget_governs_the_view_statement() {
+        use helios_persistence::core::sof_runner::SofError;
+        use std::time::Duration;
+
+        const ROWS: i32 = 300_000;
+        let fx = start().await;
+        let tenant = tenant();
+        fx.observer
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated)
+                 SELECT $1, 'Observation', md5(g::text) || g::text, '1',
+                        jsonb_build_object('resourceType','Observation','id',md5(g::text) || g::text,'status','final'),
+                        now()
+                 FROM generate_series(1, $2::int) g",
+                &[&tenant.tenant_id().as_str(), &ROWS],
+            )
+            .await
+            .expect("seed observations");
+        // Connections the pool opens from here on carry a session timeout no
+        // read of the type fits in; the observer, already connected, does not.
+        fx.observer
+            .batch_execute("ALTER ROLE postgres SET statement_timeout = '50ms'")
+            .await
+            .expect("set the session statement timeout");
+        let view = json!({"resourceType":"ViewDefinition","resource":"Observation",
+            "select":[{"column":[{"path":"id","name":"id"},{"path":"status","name":"status"}]}]});
+
+        async fn read(
+            runner: &dyn SofRunner,
+            tenant: &TenantContext,
+            view: &Value,
+        ) -> (usize, Option<SofError>) {
+            let mut stream = match runner
+                .run_view(tenant, view.clone(), ViewFilters::default())
+                .await
+            {
+                Ok(stream) => stream,
+                Err(e) => return (0, Some(e)),
+            };
+            let mut rows = 0usize;
+            while let Some(row) = stream.next().await {
+                match row {
+                    Ok(_) => rows += 1,
+                    Err(e) => return (rows, Some(e)),
+                }
+            }
+            (rows, None)
+        }
+
+        // No budget: the session timeout stops the statement, and it is
+        // reported as a timeout.
+        let unbudgeted = PgInDbRunner::new(fx.pool.clone());
+        let (_, failure) = read(&unbudgeted, &tenant, &view).await;
+        assert!(
+            matches!(failure, Some(SofError::Timeout(_))),
+            "the session statement timeout must end the view as a timeout, got {failure:?}"
+        );
+
+        // A budget above the session timeout lifts it for the view's statement.
+        let generous = SofRunner::with_statement_timeout(&unbudgeted, Duration::from_secs(60))
+            .expect("the PostgreSQL runner takes a statement budget");
+        let (rows, failure) = read(generous.as_ref(), &tenant, &view).await;
+        assert!(
+            failure.is_none(),
+            "a 60 s budget must outlive the read: {failure:?}"
+        );
+        assert_eq!(rows, ROWS as usize);
+
+        // A budget below the session timeout cuts the statement at the budget.
+        let tight = SofRunner::with_statement_timeout(&unbudgeted, Duration::from_millis(1))
+            .expect("the PostgreSQL runner takes a statement budget");
+        let (_, failure) = read(tight.as_ref(), &tenant, &view).await;
+        assert!(
+            matches!(failure, Some(SofError::Timeout(_))),
+            "a 1 ms budget must end the view as a timeout, got {failure:?}"
+        );
+
+        // The budget was local to each view's transaction: the pool's
+        // connections still carry the session value.
+        let client = fx.pool.get().await.expect("pool connection");
+        let session: String = client
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .expect("show statement_timeout")
+            .get(0);
+        assert_eq!(session, "50ms", "the budget leaked into the session");
     }
 
     fn tenant() -> TenantContext {

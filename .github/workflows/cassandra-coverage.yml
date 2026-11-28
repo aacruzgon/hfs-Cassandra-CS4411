@@ -44,6 +44,15 @@ env:
   # directory override left on the runner.
   RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
+  # The PC's CI budget (aacruzgon/muster deploy/ci-runner/HOST-CI-BUDGET.md,
+  # ADR-aacruzgon-0088): at most 4 rustc and linker processes per cargo build,
+  # and only file and line debug info, which is enough for a backtrace and
+  # makes the objects, the links and the linkers' page cache much smaller.
+  # At one process per thread (16) and full debug info, several projects'
+  # jobs filled acruzdebian's memory and stalled its disk on 2026-11-24. A
+  # step may set CARGO_BUILD_JOBS lower (cargo clippy (helios-fhir)).
+  CARGO_BUILD_JOBS: 4
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   coverage:
@@ -70,8 +79,11 @@ jobs:
       LLVM_COV_VERSION: 0.9.1
       # What the CI reports name (ci-report.py context): the build profile,
       # and on a pull request its head, not the merge commit.
-      CI_REPORT_PROFILE: test (debug, -C instrument-coverage, CARGO_INCREMENTAL=0)
+      CI_REPORT_PROFILE: test (line-tables-only debug info, -C instrument-coverage, CARGO_INCREMENTAL=0)
       CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The lib test the --lib step skips and the step after it runs alone,
+      # as in the required job (ADR-aacruzgon-0095, 0101).
+      AT_LIMIT_TEST: backends::cassandra::session::node_tests::a_batch_over_the_statement_limit_is_refused_and_sends_nothing
     steps:
       # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
       # the runner's own .env. Two instances on one machine share gh-runner's
@@ -158,11 +170,35 @@ jobs:
           TARGET_DIR: ${{ runner.workspace }}/target/cassandra-coverage
           CAP_GB: 15
         run: |
-          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) cargo-llvm-cov $LLVM_COV_VERSION"
-          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
+          # A reset renames the directory, which is instant, and deletes it in
+          # the background at idle CPU and I/O priority, detached from this
+          # step's output, as aacruzgon/muster's job-started.sh does
+          # (ADR-aacruzgon-0088): the job no longer waits for rm -rf of up to
+          # its cap. Only BFQ and mq-deadline honour the I/O class;
+          # acruzdebian's NVMe disk uses none, so there only the CPU part
+          # counts. Each runner instance has its own _work folder and runs one
+          # job at a time, so nothing else uses these directories now. The
+          # runner stops a delete still running when the job ends, so every
+          # reset step first deletes what such a delete left (*.pruning.*) in
+          # this instance's target/, and names it in the log: a leftover that
+          # comes back run after run is a delete that keeps failing. du has a
+          # time limit: under heavy disk load it can take seconds, and an unknown
+          # size only skips the size check and is reported as unknown, not 0.
+          prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do
+            if [ -e "$left" ]; then
+              echo "Deleting a leftover of an earlier reset, last changed $(stat -c %y -- "$left" 2>/dev/null || echo "at an unknown time"): $left"
+              prune "$left"
+            fi
+          done
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) cargo-llvm-cov $LLVM_COV_VERSION debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
+          size_gb=$(timeout 60 du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
+          # Empty when du timed out (unknown); a missing directory is 0.
+          [ -e "$TARGET_DIR" ] || size_gb=0
           if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
-            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
-            rm -rf "$TARGET_DIR"
+            echo "Resetting $TARGET_DIR (size ${size_gb:-unknown}${size_gb:+ GB}, cap $CAP_GB GB, stamp: $stamp)"
+            doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+            if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
@@ -266,15 +302,80 @@ jobs:
       # With the node's URL, so the node_tests modules in write.rs and
       # backend.rs run instead of skipping. The required job runs the same
       # --lib tests (fmt-clippy-cassandra.yml, ADR-aacruzgon-0054); this run measures
-      # their coverage.
+      # their coverage. The 65,535-statement batch test is skipped here and
+      # runs alone in the next step, as in the required job (ADR-aacruzgon-0095,
+      # 0101): inside this run it timed out on sam-7900x (runs 45840184803 and
+      # 45846259659, 2,703 and 2,563 ms against the node's 2 s
+      # write_request_timeout).
       - name: Backend unit tests (--lib, backends::cassandra) against this node
         run: |
           set -o pipefail
+          # --skip drops every test whose name contains $AT_LIMIT_TEST (libtest
+          # matches skip filters by substring unless --exact, and --exact would
+          # make the backends::cassandra filter exact too), so check that it
+          # drops exactly one. --list needs no node and reuses the build. Its
+          # LLVM_PROFILE_FILE is a scratch path, so the listing's profiles stay
+          # out of $CARGO_LLVM_COV_TARGET_DIR, the one directory the report
+          # reads. cargo's stderr goes to the log, so a failed listing shows
+          # why, and it fails the step.
+          listed() {
+            local list
+            list=$(LLVM_PROFILE_FILE="$RUNNER_TEMP/at-limit-list/list-%p.profraw" \
+              cargo test -p helios-persistence --features cassandra \
+              --lib -- backends::cassandra --list "$@") \
+              || { echo "::error title=At-limit skip::cargo test --list${*:+ $*} failed (exit $?)" >&2; return 1; }
+            grep -c ': test$' <<<"$list" || true
+          }
+          all=$(listed) || exit 1
+          kept=$(listed --skip "${AT_LIMIT_TEST:?}") || exit 1
+          dropped=$(( all - kept ))
+          [ "$dropped" -eq 1 ] \
+            || { echo "::error title=At-limit skip::--skip $AT_LIMIT_TEST drops $dropped lib tests, not 1"; exit 1; }
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-persistence --features cassandra --lib -- backends::cassandra \
-              --show-output 2>&1 \
+              --show-output --skip "${AT_LIMIT_TEST:?}" 2>&1 \
             | tee "$RUNNER_TEMP/ci-report/logs/persistence-lib-tests.log"
+
+      # The batch of exactly 65,535 statements (ADR-aacruzgon-0089), alone on
+      # this node, as the required job runs it (ADR-aacruzgon-0095), so its
+      # lines are still counted: cargo-llvm-cov's LLVM_PROFILE_FILE (show-env)
+      # names each process's own file (%p, %m), and `cargo llvm-cov report`
+      # merges every profile in its directory, this step's with the lib
+      # run's. --exact must run its one test, as in the other --exact steps.
+      # The [at-limit-batch …] line, the batch's time, goes to the report
+      # whether the test passed or failed, then the step exits with the
+      # test's status. Already built above.
+      - name: Backend unit tests (--lib), the 65,535-statement batch test alone against this node
+        run: |
+          set -o pipefail
+          logs="$RUNNER_TEMP/ci-report/logs"
+          mkdir -p "$logs"
+          log="$logs/persistence-lib-at-limit.log"
+          # The test's status, kept so the report below is written whatever it is.
+          status=0
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+            cargo test -p helios-persistence --features cassandra \
+              --lib -- --exact "${AT_LIMIT_TEST:?}" --show-output 2>&1 \
+            | tee "$log" || status=$?
+          clean="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
+          # Report only, on a pass or a failure (a time-out is the case it measures):
+          # a failed report leaves the test's result alone.
+          dir="$RUNNER_TEMP/ci-report/inputs/at-limit"
+          mkdir -p "$dir"
+          {
+            echo "Runner \`${RUNNER_NAME:-?}\`, instrumented build; the node's write_request_timeout is 2000 ms; the test's exit status: $status."
+            echo
+            echo '```'
+            grep -F '[at-limit-batch ' <<<"$clean" || echo "no [at-limit-batch] line"
+            echo '```'
+          } > "$dir/at-limit.md"
+          python3 .github/scripts/ci-report.py add at-limit \
+            "The 65,535-statement batch, alone on the node (report only)" \
+            --markdown "$dir/at-limit.md" || true
+          [ "$status" -eq 0 ] || exit "$status"
+          grep -Eq '^test result: ok\. 1 passed;' <<<"$clean" \
+            || { echo "::error title=At-limit batch test::$AT_LIMIT_TEST did not run exactly once"; exit 1; }
 
       # The test kills hfs with SIGKILL when it drops it (Child::kill), and an
       # instrumented program writes its profile only when it exits. %c asks
@@ -362,6 +463,7 @@ jobs:
           logs="$RUNNER_TEMP/ci-report/logs"
           python3 .github/scripts/ci-report.py tests tests "Tests" \
             "$logs/persistence-tests.log" "$logs/persistence-lib-tests.log" \
+            "$logs/persistence-lib-at-limit.log" \
             "$logs/milestone-a-round-trip.log" "$logs/step3-rest.log" "$logs/readiness.log"
 
       # The report keeps only the backend's files and hfs's main.rs: the

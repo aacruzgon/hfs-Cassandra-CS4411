@@ -52,14 +52,15 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use helios_auth::Principal;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::ViewFilters;
 use helios_sof::sqlquery::SqlQueryError;
 use helios_sof::sqlquery::engine::DeclaredColumn;
 use helios_sof::{
-    AnsiType, ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableRef,
+    AnsiType, ColumnFhirType, ContentType, NativeDialect, QueryResult, TableRef,
     bind_supplied_params, default_for_fhir_type, extract_sqlquery_params_from_json,
-    format_fhir_parameters, parse_sqlquery_library, scan_sql, undeclared_tables,
+    format_fhir_parameters, parse_sqlquery_library_for, scan_sql, undeclared_tables,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -99,6 +100,7 @@ pub struct SqlQueryRunQuery {
 /// `filters` carries the request's `patient`, `group` and `_since` and narrows
 /// every dependency ViewDefinition. `_limit` is not in it and still caps only
 /// the final rows (applied after SQL, unchanged).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_library_subject<S>(
     state: AppState<S>,
     tenant: TenantExtractor,
@@ -107,6 +109,7 @@ pub(super) async fn run_library_subject<S>(
     headers: &HeaderMap,
     library_json: Value,
     filters: ViewFilters,
+    principal: Option<&Principal>,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
@@ -144,10 +147,23 @@ where
         });
     }
 
-    let library = parse_sqlquery_library(&library_json).map_err(sqlquery_err_to_rest)?;
+    let runner = state
+        .sof_runner()
+        .ok_or_else(|| RestError::NotImplemented {
+            feature: "$sql-run is not available: the configured storage backend does not \
+                      provide a SOF runner"
+                .to_string(),
+        })?
+        .clone();
+    // A backend that speaks SQL runs the Library's SQL itself, so the SQL is
+    // read (and parsed) in that database's dialect.
+    let native_sql = runner.native_sql_dialect();
+
+    let library =
+        parse_sqlquery_library_for(&library_json, native_sql).map_err(sqlquery_err_to_rest)?;
 
     // SELECT-only validation of the subject's own SQL.
-    validate_select_only(&library.sql)?;
+    validate_select_only(&library.sql, native_sql)?;
 
     // #841/#842: reject a subject that reads a table no `relatedArtifact
     // [depends-on]` label declares, before spending any work resolving or
@@ -166,15 +182,6 @@ where
         }
     }
 
-    let runner = state
-        .sof_runner()
-        .ok_or_else(|| RestError::NotImplemented {
-            feature: "$sql-run is not available: the configured storage backend does not \
-                      provide a SOF runner"
-                .to_string(),
-        })?
-        .clone();
-
     // Phase 1: resolve the full dependency graph — every ViewDefinition and
     // SQLView Library it reaches, at any depth — before materializing
     // anything. `library_json` was already classified by
@@ -192,6 +199,7 @@ where
         identity: subject_url,
         is_sql_view,
         parameters_empty: library.parameters.is_empty(),
+        native_sql,
         depends_on: &library.depends_on,
         max_depends_on: super::input_limits::max_depends_on(max_vds),
         max_nodes: max_vds,
@@ -202,21 +210,27 @@ where
 
     super::graph::check_max_nodes(&plan, max_vds)?;
 
+    // Every leaf ViewDefinition in the plan reads the resource type it names.
+    super::authz::check_read_scopes(
+        principal,
+        "$sql-run",
+        super::authz::plan_resource_types(&plan),
+    )?;
+
     // Bind Library.parameter values from the supplied `parameters` Parameters.
     let bindings = bind_supplied_params(&library.parameters, params.parameters.as_ref())
         .map_err(sqlquery_err_to_rest)?;
 
     // Phase 2: materialize the plan and run the subject's own SQL, with the
     // same row caps and timeout the pre-graph single-level code enforced.
-    let engine = InMemorySqlEngine::open().map_err(sqlquery_err_to_rest)?;
     let limits = super::graph::ExecLimits {
         max_source_rows_per_vd: state.config().sof_sqlquery_max_source_rows_per_vd,
         max_rows: state.config().sof_sqlquery_max_rows,
         timeout_secs: state.config().sof_sqlquery_timeout_secs,
+        bound_materialization: true,
     };
     let materialized = std::sync::atomic::AtomicUsize::new(0);
     let executed = super::graph::execute_plan_counting(
-        engine,
         &runner,
         tenant.context(),
         &filters,
@@ -380,14 +394,25 @@ fn wants_fhir_binary(format: &str, headers: &HeaderMap) -> bool {
 /// Every statement anywhere in the tree (CTE bodies, parenthesised queries,
 /// either side of a set operation, subqueries) must itself be a query, so
 /// `WITH ... INSERT` and `WITH ... UPDATE` are rejected too (#1702).
-pub(crate) fn validate_select_only(sql: &str) -> Result<(), RestError> {
+///
+/// The SQL is parsed in the dialect of the database that will run it:
+/// PostgreSQL's when the storage backend runs Library SQL in PostgreSQL
+/// (`native`), SQLite's otherwise.
+pub(crate) fn validate_select_only(
+    sql: &str,
+    native: Option<NativeDialect>,
+) -> Result<(), RestError> {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{Statement, visit_statements};
-    use sqlparser::dialect::SQLiteDialect;
+    use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
     use sqlparser::parser::Parser;
 
-    let stmts = Parser::parse_sql(&SQLiteDialect {}, sql).map_err(|e| RestError::BadRequest {
+    let parsed = match native {
+        Some(NativeDialect::Postgres) => Parser::parse_sql(&PostgreSqlDialect {}, sql),
+        Some(NativeDialect::Sqlite) | None => Parser::parse_sql(&SQLiteDialect {}, sql),
+    };
+    let stmts = parsed.map_err(|e| RestError::BadRequest {
         message: format!("SQL parse error: {e}"),
     })?;
     if stmts.len() != 1 {
@@ -582,11 +607,22 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
                  HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
             ),
         },
-        SqlQueryError::Timeout { secs } => RestError::UnprocessableEntity {
-            message: format!("query exceeded {secs}s timeout"),
-        },
+        // The query's own SQL, a SQL View's, or the materialization of a
+        // dependency ran out of HFS_SOF_SQLQUERY_TIMEOUT_SECS: a 504 with code
+        // `timeout`, as a cancelled CRUD statement answers, not a 422 (#2577).
+        SqlQueryError::Timeout { secs } => RestError::SqlQueryTimeout { secs },
         SqlQueryError::NotSelect(msg) => RestError::BadRequest { message: msg },
         SqlQueryError::BindParameter(msg) => RestError::BadRequest { message: msg },
+        // SQL the query may not use when it runs in the primary database
+        // (a table that is not a declared label, a function outside the
+        // allowed set): the caller's to fix.
+        SqlQueryError::Unsupported(msg) => RestError::BadRequest { message: msg },
+        // The primary database refused or failed the SQL (syntax, an unknown
+        // column, a failed cast), with its own message.
+        SqlQueryError::Database(msg) => {
+            warn!(error = %msg, "database error during $sql-run");
+            RestError::UnprocessableEntity { message: msg }
+        }
         SqlQueryError::InvalidIdentifier(name) => RestError::BadRequest {
             message: format!("invalid identifier '{name}'"),
         },
@@ -677,6 +713,33 @@ mod tests {
         );
     }
 
+    /// #2577: a query that ran out of HFS_SOF_SQLQUERY_TIMEOUT_SECS — its own
+    /// SQL, a SQL View's, or a dependency's materialization — is a 504 with an
+    /// OperationOutcome code of `timeout` naming the budget, not a 422 and not
+    /// a 500; and no `Retry-After`, since a prompt retry would only repeat the
+    /// same too-slow query.
+    #[test]
+    fn a_timeout_is_a_504_with_code_timeout() {
+        let rest = sqlquery_err_to_rest(SqlQueryError::Timeout { secs: 30 });
+        assert!(
+            matches!(rest, RestError::SqlQueryTimeout { secs: 30 }),
+            "got {rest:?}"
+        );
+        let (status, code, message) = rest.client_response();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "timeout");
+        assert!(message.contains("30-second"), "names the budget: {message}");
+
+        let response = sqlquery_err_to_rest(SqlQueryError::Timeout { secs: 30 }).into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            !response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "a cancelled query is not retried by waiting"
+        );
+    }
+
     /// #1473: a dependency over the per-dependency cap is a 422 whose
     /// message names the dependency, the cap and the setting, and does not
     /// advise a WHERE/LIMIT clause (that cannot bound a dependency).
@@ -728,7 +791,9 @@ mod tests {
 
     /// The 400 message `validate_select_only` returns for `sql`.
     fn select_only_rejection(sql: &str) -> String {
-        let (status, code, message) = validate_select_only(sql).expect_err(sql).client_response();
+        let (status, code, message) = validate_select_only(sql, None)
+            .expect_err(sql)
+            .client_response();
         assert_eq!(status, StatusCode::BAD_REQUEST, "{sql}");
         assert_eq!(code, "invalid", "{sql}");
         message
@@ -788,7 +853,7 @@ mod tests {
             "SELECT * FROM (SELECT 1 AS a) s WHERE EXISTS (SELECT 1) AND s.a IN (SELECT 1)",
             "SELECT 'INSERT INTO t VALUES (1)' AS s",
         ] {
-            assert!(validate_select_only(sql).is_ok(), "{sql}");
+            assert!(validate_select_only(sql, None).is_ok(), "{sql}");
         }
         assert_eq!(
             select_only_rejection("DELETE FROM t"),

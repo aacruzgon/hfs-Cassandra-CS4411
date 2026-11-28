@@ -42,12 +42,17 @@ use crate::WebState;
 pub struct LoginRuntime {
     /// The session store shared with the REST auth middleware.
     pub sessions: Arc<SessionStore>,
+    /// The server's token validator, so the administrative UI routes decide
+    /// on the session's verified access token rather than on the session
+    /// alone (see [`require_system_scope`]).
+    pub provider: Arc<dyn helios_auth::AuthProvider>,
 }
 
 impl std::fmt::Debug for LoginRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoginRuntime")
             .field("sessions", &self.sessions)
+            .field("provider", &self.provider.name())
             .finish()
     }
 }
@@ -104,14 +109,28 @@ pub(crate) async fn require_session(
     // the session's fate before anything renders.
     let session = match helios_auth::cookie_value(request.headers(), SESSION_COOKIE) {
         Some(id) => match login.sessions.access_token(&id).await {
-            AccessOutcome::Token(_) => login.sessions.get(&id),
+            AccessOutcome::Token(token) => login.sessions.get(&id).map(|session| (session, token)),
             AccessOutcome::NoSession => None,
         },
         None => None,
     };
     match session {
-        Some(session) => {
-            request.extensions_mut().insert(session_principal(&session));
+        Some((session, token)) => {
+            // The verified token is what the FHIR layer will decide on for
+            // the page's self-calls; its scopes and tenant claim are what the
+            // UI's own authority checks read. A token the provider does not
+            // accept leaves an identity-only principal: pages still render,
+            // the API answers their calls 401, and nothing administrative
+            // is granted.
+            let principal = match login
+                .provider
+                .authenticate(&format!("Bearer {token}"))
+                .await
+            {
+                Ok(verified) => verified,
+                Err(_) => session_principal(&session),
+            };
+            request.extensions_mut().insert(principal);
             request.extensions_mut().insert(SignedIn(session.principal));
             next.run(request).await
         }
@@ -159,6 +178,67 @@ fn session_principal(session: &helios_auth::Session) -> helios_auth::Principal {
         expires_at: Utc::now() + chrono::Duration::hours(1),
         custom_claims: serde_json::Map::new(),
         ..Default::default()
+    }
+}
+
+/// The UI routes that act on storage with the server's own authority across
+/// every tenant: the tenant registry and the bulk-import workspace. The JSON
+/// `/admin/tenants` API gates the same operations on a `system/*` scope that
+/// carries the method's permission; these routes are held to the same rule.
+pub(crate) fn is_administrative_path(path: &str) -> bool {
+    path == "/ui/tenants"
+        || path.starts_with("/ui/tenants/")
+        || path == "/ui/bulk-import"
+        || path.starts_with("/ui/bulk-import/")
+}
+
+/// The permission bit an administrative request needs, by method: `r` to
+/// view, `c` to create, `u` to change, `d` to delete or purge.
+fn administrative_permission(method: &axum::http::Method) -> helios_auth::SmartPermissions {
+    use axum::http::Method;
+    use helios_auth::SmartPermissions;
+    match *method {
+        Method::GET | Method::HEAD | Method::OPTIONS => SmartPermissions::READ,
+        Method::POST => SmartPermissions::CREATE,
+        Method::PUT | Method::PATCH => SmartPermissions::UPDATE,
+        _ => SmartPermissions::DELETE,
+    }
+}
+
+/// Middleware: with a login installed, an administrative route is reached
+/// only when the principal [`require_session`] stamped from the session's
+/// verified token carries a `system/*` scope with the method's permission.
+/// Anything else is answered `403` with the shell's notice. Without a login
+/// installed this is a no-op: the bearer-only posture refuses these routes
+/// elsewhere, and with authentication off nothing can be asked.
+pub(crate) async fn require_system_scope(
+    State(state): State<WebState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.login.is_none() || !is_administrative_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+    let permission = administrative_permission(request.method());
+    let allowed = request
+        .extensions()
+        .get::<helios_auth::Principal>()
+        .is_some_and(|principal| principal.scopes.has_system_scope(permission));
+    match allowed {
+        true => next.run(request).await,
+        false => {
+            let locale = request
+                .extensions()
+                .get::<crate::i18n::RequestLocale>()
+                .copied()
+                .unwrap_or_default();
+            (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                crate::i18n::I18n::new(locale).t("auth-admin-scope"),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -368,8 +448,9 @@ mod tests {
 /// REST middleware uses — a token about to lapse is refreshed, a session whose
 /// refresh is dead is dropped — so a page's server-side call runs with exactly
 /// the credential its browser-side calls run with. `None` when no login is
-/// installed or the request carries no valid session; the caller then falls
-/// back to the process's outbound service credential as before.
+/// installed or the request carries no valid session; a data self-call then
+/// carries no credential at all, and only the conformance reads fall back to
+/// the process's outbound service credential (#2692).
 pub(crate) async fn session_authorization(
     state: &WebState,
     headers: &axum::http::HeaderMap,
@@ -384,8 +465,9 @@ pub(crate) async fn session_authorization(
 
 /// A [`crate::Caller`] for this request: the browser's own `Authorization`
 /// when it sent one, else the signed-in session's bearer (#1480), else none —
-/// in which case the conformance source applies the outbound service
-/// credential. The `$sql-export` self-calls run as the user who clicked.
+/// in which case the `$sql-export` self-call carries no credential (#2692),
+/// never the outbound service credential. The `$sql-export` self-calls run
+/// as the user who clicked.
 pub(crate) async fn caller_for(
     state: &WebState,
     headers: &axum::http::HeaderMap,
@@ -400,8 +482,7 @@ pub(crate) async fn caller_for(
 
 /// The credential a page's own server-side self-call carries under the
 /// interactive login (#1480): the browser's `Authorization` when it sent one,
-/// else the signed-in session's bearer, else nothing (the outbound service
-/// credential applies downstream).
+/// else the signed-in session's bearer, else nothing (#2692).
 #[cfg(test)]
 mod selfcall_tests {
     use std::sync::Arc;
@@ -462,7 +543,6 @@ mod selfcall_tests {
             data_dir: None,
             public_base_url: "http://localhost:8080".to_string(),
             self_base_url: "http://localhost:8080".to_string(),
-            outbound_auth: Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
             tenant_path_routing: false,
             fhir_version: helios_fhir::FhirVersion::R4,
             default_tenant: "default".to_string(),
@@ -471,7 +551,29 @@ mod selfcall_tests {
             bulk_provider: None,
             write_observer: None,
             patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            login: sessions.map(|sessions| Arc::new(LoginRuntime { sessions })),
+            login: sessions.map(|sessions| {
+                Arc::new(LoginRuntime {
+                    sessions,
+                    provider: Arc::new(NoScopes),
+                })
+            }),
+        }
+    }
+
+    /// A validator that accepts every bearer as an identity with no scopes.
+    struct NoScopes;
+
+    #[async_trait::async_trait]
+    impl helios_auth::AuthProvider for NoScopes {
+        async fn authenticate(
+            &self,
+            _authorization_header: &str,
+        ) -> Result<helios_auth::Principal, helios_auth::AuthError> {
+            Ok(helios_auth::Principal::default())
+        }
+
+        fn name(&self) -> &str {
+            "no-scopes"
         }
     }
 
@@ -565,9 +667,37 @@ mod selfcall_tests {
             Some("Bearer browser-token")
         );
 
-        // No session: the outbound provider (a no-op here) is all there is.
+        // No session: nothing goes on.
         let sent = built_headers(&state, &HeaderMap::new()).await;
         assert!(sent.get("authorization").is_none());
+    }
+
+    /// #2692: a caller that brought no credential sends nothing on a data
+    /// self-call (`$export`, its manifest and files, the Patient/Group
+    /// lookups, `$bulk-submit`). `WebState` holds no outbound service
+    /// credential at all — only the conformance source does — so there is
+    /// nothing for these self-calls to fall back to.
+    #[tokio::test]
+    async fn forward_identity_sends_nothing_for_an_anonymous_caller() {
+        let state = web_state(None);
+        let sent = built_headers(&state, &HeaderMap::new()).await;
+        assert!(
+            sent.get("authorization").is_none(),
+            "anonymous self-call carried {:?}",
+            sent.get("authorization")
+        );
+
+        // The browser's own credential still rides, unchanged.
+        let mut own = HeaderMap::new();
+        own.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer browser-token"),
+        );
+        let sent = built_headers(&state, &own).await;
+        assert_eq!(
+            sent.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer browser-token")
+        );
     }
 
     async fn import_headers(

@@ -1127,7 +1127,8 @@ async fn create_audit_postgres_storage(
                 "HFS_AUDIT_DATABASE_URL must be a PostgreSQL connection string when primary backend is postgres"
             );
         }
-        let mut backend_config = PostgresBackend::config_from_connection_string(url)?;
+        let mut backend_config =
+            PostgresBackend::config_from_named_connection_string(url, "HFS_AUDIT_DATABASE_URL")?;
         backend_config.fhir_version = server_config.default_fhir_version;
         backend_config.data_dir = server_config.data_dir.clone();
         PostgresBackend::new(backend_config).await?
@@ -1385,11 +1386,11 @@ async fn create_postgres_backend(
             backend_config
         } else {
             info!("Initializing PostgreSQL backend from environment variables");
-            PostgresBackend::config_from_env()
+            PostgresBackend::config_from_env()?
         }
     } else {
         info!("Initializing PostgreSQL backend from environment variables");
-        PostgresBackend::config_from_env()
+        PostgresBackend::config_from_env()?
     };
     backend_config.fhir_version = config.default_fhir_version;
     backend_config.data_dir = config.data_dir.clone();
@@ -1828,11 +1829,13 @@ fn mount_ui(
     // `system/SearchParameter.rs system/CompartmentDefinition.rs` token via
     // the planned `JwtAssertionOutboundAuthProvider` (SMART Backend Services
     // client_credentials + private_key_jwt; see crates/auth/src/outbound.rs)
-    // configured from HFS_UI_* client credentials. The `$sql-export`
-    // self-calls (#833) are the exception: they already carry the
-    // browser's own `Authorization` when it sent one (the `Caller` seam
-    // in `crates/ui/src/conformance.rs`), falling back to this service
-    // token only when the request had none.
+    // configured from HFS_UI_* client credentials. Only those conformance
+    // reads (and `/metadata`) may use this token: every other UI self-call —
+    // tenant data, ViewDefinitions and SQL Libraries, `$sql-run`,
+    // `$sql-export`, `$export`, the Patient/Group lookups — carries the
+    // browser's own credential or the signed-in session's bearer, and none
+    // at all when the request brought neither (#2692), so an anonymous
+    // visitor never acts with this token's authority.
     let self_base_url = format!("http://127.0.0.1:{}", config.port);
     let outbound_auth = AuthConfig::from_env().outbound_provider();
     let patient_name_search = patient_name_search_support(
@@ -1947,6 +1950,7 @@ async fn init_auth_with_audit(
         jwks_url = %redact_url(jwks_url),
         issuer = ?auth_config.expected_issuer,
         audience = ?auth_config.expected_audience,
+        tenant_claim = %auth_config.tenant_claim,
         "Authentication ENABLED"
     );
 
@@ -1955,18 +1959,20 @@ async fn init_auth_with_audit(
     // The web UI's browser login (#1449) shares one session store between the
     // REST auth layer (which turns the session cookie into a bearer) and the
     // UI (which establishes sessions). Built here, before either is mounted.
+    let provider: Arc<dyn helios_auth::AuthProvider> = Arc::new(provider);
     let sessions = init_login_sessions(&auth_config, public_base_url).await?;
     #[cfg(feature = "ui")]
     if let Some(sessions) = &sessions {
         helios_ui::set_interactive_login(helios_ui::LoginRuntime {
             sessions: Arc::clone(sessions),
+            provider: Arc::clone(&provider),
         });
     }
     #[cfg(feature = "ui")]
     helios_ui::set_bearer_only_auth(sessions.is_none());
 
     let auth_state = Arc::new(AuthMiddlewareState {
-        provider: Arc::new(provider),
+        provider,
         config: Arc::new(auth_config.clone()),
         audit_sink,
         audit_source_observer: audit_config.source_observer.clone(),
@@ -3489,13 +3495,28 @@ async fn build_bulk_submit(
     // When a client_id + private key are configured, protected-file fetches use
     // a read-scoped `client_credentials` token; otherwise they surface a recorded
     // manifest-level error.
-    let token_provider: Option<Arc<dyn helios_persistence::core::FileTokenProvider>> =
-        match (cfg.client_id.as_deref(), cfg.private_key.as_deref()) {
-            (Some(client_id), Some(pem)) => {
-                match helios_rest::bulk_submit_oauth::JwtClientCredentialsTokenProvider::new(
+    // Where $bulk-submit may fetch from at all, and where its file token may
+    // go (HFS_BULK_SUBMIT_TRUSTED_PROVIDERS); empty permits every origin.
+    let trusted_providers =
+        helios_rest::bulk_submit_oauth::TrustedProviders::parse(&cfg.trusted_providers)
+            .map_err(|e| anyhow::anyhow!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}"))?;
+    if trusted_providers.is_empty() {
+        tracing::info!(
+            "$bulk-submit fetches from any origin a submitter names; list the Data Providers in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS to confine it"
+        );
+    }
+    #[cfg(feature = "ui")]
+    helios_ui::set_bulk_submit_trusted_providers(&cfg.trusted_providers);
+    let token_provider: Option<Arc<dyn helios_persistence::core::FileTokenProvider>> = match (
+        cfg.client_id.as_deref(),
+        cfg.private_key.as_deref(),
+    ) {
+        (Some(client_id), Some(pem)) => {
+            match helios_rest::bulk_submit_oauth::JwtClientCredentialsTokenProvider::new_with_trusted_providers(
                     client_id,
                     pem,
                     &cfg.signing_alg,
+                    trusted_providers.clone(),
                 ) {
                     Some(p) => Some(p),
                     None => anyhow::bail!(
@@ -3503,9 +3524,9 @@ async fn build_bulk_submit(
                         cfg.signing_alg
                     ),
                 }
-            }
-            _ => None,
-        };
+        }
+        _ => None,
+    };
     // Private keys for JWE `fileEncryptionKey` material addressed to HFS
     // asymmetrically (ECDH-ES*, P-256/P-384). `dir` and the A*KW families use the
     // symmetric key the provider supplies and need no configuration.
@@ -3520,7 +3541,9 @@ async fn build_bulk_submit(
             cfg.outbound_scope.clone(),
         )
         .with_read_timeout(std::time::Duration::from_secs(cfg.fetch_read_timeout_secs))
-        .with_decryption_keys(decryption_keys),
+        .with_decryption_keys(decryption_keys)
+        .with_body_limits(cfg.max_manifest_bytes, cfg.max_encrypted_file_bytes)
+        .with_trusted_providers(trusted_providers),
     );
 
     // SQLite serialises writers, so a fan-out queues batch writes behind one
@@ -3599,6 +3622,8 @@ fn spawn_submit_workers(
         }
     }
     let batch_size = cfg.batch_size;
+    let manifest_fetch_timeout = std::time::Duration::from_secs(cfg.manifest_fetch_timeout_secs);
+    let max_line_bytes = cfg.max_line_bytes;
     // Batches of one file written concurrently; the engine caps it (SQLite
     // keeps one, PostgreSQL half its pool), and the stream driver keeps the
     // file watermark in file order whatever the width.
@@ -3682,7 +3707,9 @@ fn spawn_submit_workers(
                     .with_write_observer(Some(write_observer))
                     .with_file_concurrency(file_concurrency)
                     .with_batch_size(batch_size)
+                    .with_manifest_fetch_timeout(manifest_fetch_timeout)
                     .with_batch_writers(batch_writers)
+                    .with_max_line_bytes(max_line_bytes)
                     .with_skip_unchanged(skip_unchanged)
                     .with_shutdown(shutdown.clone());
             if file_scheduling.independent_tasks {
@@ -4842,6 +4869,19 @@ async fn start_cassandra(
         "Stored SearchParameters loaded"
     );
     spawn_cassandra_search_param_refresh(backend.clone(), &config);
+
+    // The index sweeper (ADR-sam-michaels-0006, SW1): one per process, in
+    // the shutdown-managed worker pool, so shutdown cancels it between
+    // intents (SW3). The backend never starts one itself.
+    if backend.config().sweeper_enabled {
+        let pools = worker_shutdown::pools();
+        let shutdown = pools.token();
+        let sweeper = backend.clone();
+        pools.spawn(async move { sweeper.run_sweeper(shutdown).await });
+        info!("Cassandra index sweeper started");
+    } else {
+        info!("Cassandra index sweeper is off (HFS_CASSANDRA_SWEEPER_ENABLED=false)");
+    }
 
     let ui_tenants: Option<Arc<dyn ResourceStorage>> =
         Some(backend.clone() as Arc<dyn ResourceStorage>);

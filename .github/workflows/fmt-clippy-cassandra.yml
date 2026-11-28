@@ -43,6 +43,15 @@ env:
   # a toolchain older than the workspace rust-version, 1.91.1.
   RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
+  # The PC's CI budget (aacruzgon/muster deploy/ci-runner/HOST-CI-BUDGET.md,
+  # ADR-aacruzgon-0088): at most 4 rustc and linker processes per cargo build,
+  # and only file and line debug info, which is enough for a backtrace and
+  # makes the objects, the links and the linkers' page cache much smaller.
+  # At one process per thread (16) and full debug info, several projects'
+  # jobs filled acruzdebian's memory and stalled its disk on 2026-11-24. A
+  # step may set CARGO_BUILD_JOBS lower (cargo clippy (helios-fhir)).
+  CARGO_BUILD_JOBS: 4
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   fmt:
@@ -200,19 +209,43 @@ jobs:
           TARGET_DIR: ${{ runner.workspace }}/target/clippy
           CAP_GB: 30
         run: |
-          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # A reset renames the directory, which is instant, and deletes it in
+          # the background at idle CPU and I/O priority, detached from this
+          # step's output, as aacruzgon/muster's job-started.sh does
+          # (ADR-aacruzgon-0088): the job no longer waits for rm -rf of up to
+          # its cap. Only BFQ and mq-deadline honour the I/O class;
+          # acruzdebian's NVMe disk uses none, so there only the CPU part
+          # counts. Each runner instance has its own _work folder and runs one
+          # job at a time, so nothing else uses these directories now. The
+          # runner stops a delete still running when the job ends, so every
+          # reset step first deletes what such a delete left (*.pruning.*) in
+          # this instance's target/, and names it in the log: a leftover that
+          # comes back run after run is a delete that keeps failing. du has a
+          # time limit: under heavy disk load it can take seconds, and an unknown
+          # size only skips the size check and is reported as unknown, not 0.
+          prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do
+            if [ -e "$left" ]; then
+              echo "Deleting a leftover of an earlier reset, last changed $(stat -c %y -- "$left" 2>/dev/null || echo "at an unknown time"): $left"
+              prune "$left"
+            fi
+          done
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
-          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
-          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          # Empty when du timed out (unknown); a missing directory is 0.
+          [ -e "$TARGET_DIR" ] || before_bytes=0
+          size_gb=${before_bytes:+$(( (before_bytes + 1073741823) / 1073741824 ))}
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
-          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+          if [ "$old_stamp" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
             if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
-            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain, Cargo.lock or the debug setting"
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
-            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
-            rm -rf "$TARGET_DIR"
+            echo "Resetting $TARGET_DIR (size ${size_gb:-unknown}${size_gb:+ GB}, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+            if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           # The tag cargo writes only into a target dir it creates itself; see
@@ -224,7 +257,7 @@ jobs:
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
-            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_BEFORE_BYTES=$before_bytes"
             echo "TARGET_DIR_RESET=$reset"
             echo "TARGET_DIR_RESET_REASON=$reason"
             echo "TARGET_DIR_CAP_GB=$CAP_GB"
@@ -237,7 +270,9 @@ jobs:
       # ADR-aacruzgon-0086 each acruzdebian instance's, they build one at a
       # time (1 job); under a cap of 32 GiB or more, as acruzdebian's single
       # instance had at 40G, both at once (2 jobs).
-      # Unreadable, unlimited or under 32 GiB keeps 1.
+      # Unreadable, unlimited or under 32 GiB keeps 1. Either way fewer than
+      # the workflow's CARGO_BUILD_JOBS of 4, which this step's output
+      # overrides for the clippy step only.
       - name: Pick the build job count for this runner's memory cap
         id: jobs
         run: |
@@ -342,19 +377,43 @@ jobs:
           TARGET_DIR: ${{ runner.workspace }}/target/clippy
           CAP_GB: 30
         run: |
-          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # A reset renames the directory, which is instant, and deletes it in
+          # the background at idle CPU and I/O priority, detached from this
+          # step's output, as aacruzgon/muster's job-started.sh does
+          # (ADR-aacruzgon-0088): the job no longer waits for rm -rf of up to
+          # its cap. Only BFQ and mq-deadline honour the I/O class;
+          # acruzdebian's NVMe disk uses none, so there only the CPU part
+          # counts. Each runner instance has its own _work folder and runs one
+          # job at a time, so nothing else uses these directories now. The
+          # runner stops a delete still running when the job ends, so every
+          # reset step first deletes what such a delete left (*.pruning.*) in
+          # this instance's target/, and names it in the log: a leftover that
+          # comes back run after run is a delete that keeps failing. du has a
+          # time limit: under heavy disk load it can take seconds, and an unknown
+          # size only skips the size check and is reported as unknown, not 0.
+          prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do
+            if [ -e "$left" ]; then
+              echo "Deleting a leftover of an earlier reset, last changed $(stat -c %y -- "$left" 2>/dev/null || echo "at an unknown time"): $left"
+              prune "$left"
+            fi
+          done
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
-          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
-          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          # Empty when du timed out (unknown); a missing directory is 0.
+          [ -e "$TARGET_DIR" ] || before_bytes=0
+          size_gb=${before_bytes:+$(( (before_bytes + 1073741823) / 1073741824 ))}
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
-          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+          if [ "$old_stamp" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
             if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
-            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain, Cargo.lock or the debug setting"
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
-            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
-            rm -rf "$TARGET_DIR"
+            echo "Resetting $TARGET_DIR (size ${size_gb:-unknown}${size_gb:+ GB}, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+            if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           # The tag cargo writes only into a target dir it creates itself; see
@@ -366,7 +425,7 @@ jobs:
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
-            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_BEFORE_BYTES=$before_bytes"
             echo "TARGET_DIR_RESET=$reset"
             echo "TARGET_DIR_RESET_REASON=$reason"
             echo "TARGET_DIR_CAP_GB=$CAP_GB"
@@ -377,12 +436,13 @@ jobs:
       # CONTRIBUTING.md command (R4, R4B, R5, R6, xml, skip-r6-download);
       # without it, helios-fhir's build script downloads R6 examples from
       # build.fhir.org, because an excluded package gets no --all-features.
-      # Wrapped in ci-report.py build, as in clippy-fhir. 8 jobs on every
-      # runner: 16 on acruzdebian's 40G took 236 s cold against 241 s with 8,
-      # at the same 13.4 GiB peak anon (ADR-aacruzgon-0080).
+      # Wrapped in ci-report.py build, as in clippy-fhir. The workflow's 4
+      # jobs, on every runner (ADR-aacruzgon-0088; 8 before): 16 on
+      # acruzdebian's 40G took 236 s cold against 241 s with 8, at the same
+      # 13.4 GiB peak anon (ADR-aacruzgon-0080). Cold on acruzdebian on
+      # 2026-11-25, 4 took 309 s against 283 s with 8, at the same 13.7 GiB.
       - name: cargo clippy --workspace --exclude helios-fhir --all-targets --all-features
         env:
-          CARGO_BUILD_JOBS: 8
           CI_REPORT_PROFILE: clippy (dev profile, check only)
           # The commit the CI reports name: on a pull request, its head, not
           # the merge commit GITHUB_SHA names.
@@ -468,8 +528,10 @@ jobs:
       # The build profile and the commit the CI reports name (ci-report.py
       # context): on a pull request, its head, not the merge commit
       # GITHUB_SHA names.
-      CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
+      CI_REPORT_PROFILE: dev (line-tables-only debug info, CARGO_INCREMENTAL=0)
       CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The lib test the --lib step skips and the step after it runs alone.
+      AT_LIMIT_TEST: backends::cassandra::session::node_tests::a_batch_over_the_statement_limit_is_refused_and_sends_nothing
     steps:
       # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
       # the runner's own .env. Two instances on one machine share gh-runner's
@@ -526,19 +588,43 @@ jobs:
           TARGET_DIR: ${{ runner.workspace }}/target/cassandra-tests
           CAP_GB: 15
         run: |
-          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # A reset renames the directory, which is instant, and deletes it in
+          # the background at idle CPU and I/O priority, detached from this
+          # step's output, as aacruzgon/muster's job-started.sh does
+          # (ADR-aacruzgon-0088): the job no longer waits for rm -rf of up to
+          # its cap. Only BFQ and mq-deadline honour the I/O class;
+          # acruzdebian's NVMe disk uses none, so there only the CPU part
+          # counts. Each runner instance has its own _work folder and runs one
+          # job at a time, so nothing else uses these directories now. The
+          # runner stops a delete still running when the job ends, so every
+          # reset step first deletes what such a delete left (*.pruning.*) in
+          # this instance's target/, and names it in the log: a leftover that
+          # comes back run after run is a delete that keeps failing. du has a
+          # time limit: under heavy disk load it can take seconds, and an unknown
+          # size only skips the size check and is reported as unknown, not 0.
+          prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do
+            if [ -e "$left" ]; then
+              echo "Deleting a leftover of an earlier reset, last changed $(stat -c %y -- "$left" 2>/dev/null || echo "at an unknown time"): $left"
+              prune "$left"
+            fi
+          done
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
-          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
-          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          # Empty when du timed out (unknown); a missing directory is 0.
+          [ -e "$TARGET_DIR" ] || before_bytes=0
+          size_gb=${before_bytes:+$(( (before_bytes + 1073741823) / 1073741824 ))}
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
-          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+          if [ "$old_stamp" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
             if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
-            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain, Cargo.lock or the debug setting"
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
-            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
-            rm -rf "$TARGET_DIR"
+            echo "Resetting $TARGET_DIR (size ${size_gb:-unknown}${size_gb:+ GB}, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+            if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           # The tag cargo writes only into a target dir it creates itself; see
@@ -550,7 +636,7 @@ jobs:
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
-            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_BEFORE_BYTES=$before_bytes"
             echo "TARGET_DIR_RESET=$reset"
             echo "TARGET_DIR_RESET_REASON=$reason"
             echo "TARGET_DIR_CAP_GB=$CAP_GB"
@@ -720,16 +806,84 @@ jobs:
       # writes 101,000 tombstones (a few seconds) in a keyspace of its own and
       # drops it, so they are opted in on this job's node and no shared one
       # (issues #74 and #79).
-      # Already built above.
+      # Already built above. The 65,535-statement batch test is skipped here
+      # and runs alone in the next step.
       - name: cargo test --lib backends::cassandra against this node
         run: |
           set -o pipefail
+          # --skip drops every test whose name contains $AT_LIMIT_TEST (libtest
+          # matches skip filters by substring unless --exact, and --exact would
+          # make the backends::cassandra filter exact too), so check that it
+          # drops exactly one. --list needs no node and reuses the build.
+          # cargo's stderr goes to the log, so a failed listing shows why, and
+          # it fails the step.
+          listed() {
+            local list
+            list=$(cargo test -p helios-persistence --features cassandra \
+              --lib -- backends::cassandra --list "$@") \
+              || { echo "::error title=At-limit skip::cargo test --list${*:+ $*} failed (exit $?)" >&2; return 1; }
+            grep -c ': test$' <<<"$list" || true
+          }
+          all=$(listed) || exit 1
+          kept=$(listed --skip "${AT_LIMIT_TEST:?}") || exit 1
+          dropped=$(( all - kept ))
+          [ "$dropped" -eq 1 ] \
+            || { echo "::error title=At-limit skip::--skip $AT_LIMIT_TEST drops $dropped lib tests, not 1"; exit 1; }
           mkdir -p "$RUNNER_TEMP/ci-report/logs"
           HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
           HFS_TEST_CASSANDRA_TOMBSTONE_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
             cargo test -p helios-persistence --features cassandra \
-              --lib -- backends::cassandra --show-output 2>&1 \
+              --lib -- backends::cassandra --show-output \
+              --skip "${AT_LIMIT_TEST:?}" 2>&1 \
             | tee "$RUNNER_TEMP/ci-report/logs/persistence-lib-tests.log"
+
+      # The batch of exactly 65,535 statements (ADR-aacruzgon-0089), alone on
+      # this node. The node builds its one mutation inside
+      # write_request_timeout (2 s), from when it begins the request
+      # (cql_start_time: REQUEST in 5.0.9), so the CPU it shares decides the
+      # margin. Inside the lib run above, it timed out in 7 of 8 attempts on
+      # sam-7900x (24 test threads) from 2026-11-25 to 2026-11-26, and in
+      # none of 17 on the Debian runners (16). On the pass, the node's
+      # slowest write (nodetool proxyhistograms) was in the bucket ending at
+      # 1.96 s; on two Debian passes, 0.26 s and 0.32 s. Alone on a node it
+      # took 0.28 to 0.36 s (a Mac, OrbStack, the same Compose file). A
+      # timed-out batch also fails the CQL audit check below, whose log
+      # cannot show what a failed native batch held. In the audit window, as
+      # before, and right after the lib step, so a failure skips the same
+      # steps it did inside it. --exact must run its one test, as in the
+      # other --exact steps. The [at-limit-batch …] line, the batch's time,
+      # goes to the report whether the test passed or failed, then the step
+      # exits with the test's status. Already built above.
+      - name: cargo test --lib, the 65,535-statement batch test alone against this node
+        run: |
+          set -o pipefail
+          logs="$RUNNER_TEMP/ci-report/logs"
+          mkdir -p "$logs"
+          log="$logs/persistence-lib-at-limit.log"
+          # The test's status, kept so the report below is written whatever it is.
+          status=0
+          HFS_TEST_CASSANDRA_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+            cargo test -p helios-persistence --features cassandra \
+              --lib -- --exact "${AT_LIMIT_TEST:?}" --show-output 2>&1 \
+            | tee "$log" || status=$?
+          clean="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
+          # Report only, on a pass or a failure (a time-out is the case it measures):
+          # a failed report leaves the test's result alone.
+          dir="$RUNNER_TEMP/ci-report/inputs/at-limit"
+          mkdir -p "$dir"
+          {
+            echo "Runner \`${RUNNER_NAME:-?}\`; the node's write_request_timeout is 2000 ms; the test's exit status: $status."
+            echo
+            echo '```'
+            grep -F '[at-limit-batch ' <<<"$clean" || echo "no [at-limit-batch] line"
+            echo '```'
+          } > "$dir/at-limit.md"
+          python3 .github/scripts/ci-report.py add at-limit \
+            "The 65,535-statement batch, alone on the node (report only)" \
+            --markdown "$dir/at-limit.md" || true
+          [ "$status" -eq 0 ] || exit "$status"
+          grep -Eq '^test result: ok\. 1 passed;' <<<"$clean" \
+            || { echo "::error title=At-limit batch test::$AT_LIMIT_TEST did not run exactly once"; exit 1; }
 
       # Milestone A (roadmap Step 2, item 2.7): the real hfs binary on this
       # node, POST /Patient then GET /Patient/{id}. Built above. Like every
@@ -857,10 +1011,82 @@ jobs:
             --markdown "$dir/hfs-rest-latency.md" --json "$dir/hfs-rest-latency.json"
           exit "$status"
 
+      # Intent rows the run's tests left in pending_index_writes (R4): every
+      # shard of this hour's bucket and the two before it, for test- tenants,
+      # each set against its resource's current version. Expected near 0: a
+      # finished write or a definite miss deletes its intent. Report only.
+      - name: Report the intent rows left behind
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 3
+        run: python3 .github/scripts/ci-report.py intents intents "Intent rows left in pending_index_writes" "${CASSANDRA_CONTAINER:?}"
+
+      # The post-suite check (ADR-sam-michaels-0006, RV22), required: the job
+      # fails unless its verdict passes, that is no failed scan, a tenant
+      # checked, no defect, no failed outbox re-read and no intent left. After
+      # every suite has exited, one grace-0 sweep
+      # of every test- tenant, the consistency check over every test- tenant
+      # but the test-planted- ones (one shared scan, ADR-sam-michaels-0007),
+      # the intent rows left after the sweep (R4b) and the outbox's
+      # tablestats. It runs while the audit log is on, before the CQL audit
+      # check, so the D6 check covers the sweep's writes (rule (d), IW20 =
+      # RV20). It never runs on a shared node: the test refuses 59042.
+      - name: Post-suite sweep and consistency check
+        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/ci-report/inputs/post-suite"
+          mkdir -p "$dir" "$RUNNER_TEMP/ci-report/logs"
+          log="$RUNNER_TEMP/ci-report/logs/post-suite.log"
+          rc=0
+          HFS_TEST_POST_SUITE_STRICT=1 \
+          HFS_TEST_POST_SUITE_URL="127.0.0.1:$CASSANDRA_HOST_PORT" \
+            cargo test -p helios-persistence --features cassandra --lib -- \
+              --ignored --exact backends::cassandra::sweeper::post_suite::post_suite_sweep_and_check \
+              --nocapture 2>&1 \
+            | tee "$log" || rc=$?
+          python3 .github/scripts/ci-report.py intents post-suite-intents \
+            "Intent rows left after the post-suite sweep (R4b)" "${CASSANDRA_CONTAINER:?}"
+          docker exec -e MAX_HEAP_SIZE=128m "${CASSANDRA_CONTAINER:?}" \
+            nodetool tablestats helios.pending_index_writes > "$dir/outbox-tablestats.txt" \
+            || echo "nodetool tablestats failed" > "$dir/outbox-tablestats.txt"
+          clean="$(sed 's/\x1b\[[0-9;]*m//g' "$log")"
+          {
+            echo "Required (ADR-sam-michaels-0006, RV22): the job fails unless the verdict below passes."
+            echo
+            echo '```'
+            grep -E '\[(post-suite|sweep-pass) ' <<<"$clean" || echo "no [post-suite] line"
+            grep -E '\[post-suite-verdict ' <<<"$clean" || echo "no [post-suite-verdict] line"
+            grep -E '\[index-consistency .* defects=[1-9]' <<<"$clean" || true
+            echo '```'
+            echo
+            echo "\`pending_index_writes\` tablestats:"
+            echo
+            echo '```'
+            cat "$dir/outbox-tablestats.txt"
+            echo '```'
+          } > "$dir/post-suite.md"
+          python3 .github/scripts/ci-report.py add post-suite \
+            "Post-suite sweep and consistency check" --markdown "$dir/post-suite.md"
+          if grep -q 'scan_failed="' <<<"$clean"; then
+            echo "::error title=Post-suite check::the shared index scan failed, so every tenant's check is void: $(grep -oE 'scan_failed="([^"\\]|\\.)*"' <<<"$clean" | head -1)"
+          fi
+          # Required: it fails the job unless the check ran once and passed.
+          if [ "$rc" -eq 0 ] && grep -Eq '^test result: ok\. 1 passed;' <<<"$clean"; then
+            exit 0
+          elif [ "$rc" -ne 0 ] && grep -Eq '^test result: FAILED\. 0 passed; 1 failed;' <<<"$clean"; then
+            echo "::error title=Post-suite check::post_suite_sweep_and_check failed; see the report above"
+          else
+            echo "::error title=Post-suite check::post_suite_sweep_and_check failed or did not run exactly once"
+          fi
+          exit 1
+
       # The exit criterion's check (Step 3 plan D6), after every step that
-      # writes and before the readiness test restarts the node. It stops the
-      # audit log, which flushes it, dumps it with auditlogviewer (in the
-      # image, not on its PATH), and fails if any entry is a CQL DELETE
+      # writes, the post-suite sweep included, and before the readiness test
+      # restarts the node. It stops the audit log, which flushes it, dumps it
+      # with auditlogviewer (in the image, not on its PATH), and fails if any
+      # entry is a CQL DELETE
       # against resources or resource_versions: type DELETE with exactly that
       # scope, or a DELETE … FROM either table in the CQL text of a batch or a
       # failed statement, which carry no scope. resources_by_type (the X1
@@ -893,16 +1119,6 @@ jobs:
           python3 .github/scripts/ci-report.py cql-audit cql-audit \
             "CQL audit log: no DELETE on resources or resource_versions (Step 3 exit criterion)" \
             "$dir/auditlogviewer.txt.gz" --check
-
-      # Intent rows the run's tests left in pending_index_writes (R4): every
-      # shard of this hour's bucket and the two before it, for test- tenants,
-      # each set against its resource's current version. Expected near 0: a
-      # finished write or a definite miss deletes its intent. Report only.
-      - name: Report the intent rows left behind
-        if: ${{ !cancelled() && steps.round-trip.outcome == 'success' }}
-        continue-on-error: true
-        timeout-minutes: 3
-        run: python3 .github/scripts/ci-report.py intents intents "Intent rows left in pending_index_writes" "${CASSANDRA_CONTAINER:?}"
 
       # Before the readiness test, which restarts the node and so resets these
       # metrics: tablestats, tpstats, the per-table latency and tombstone
@@ -947,9 +1163,9 @@ jobs:
           logs="$RUNNER_TEMP/ci-report/logs"
           python3 .github/scripts/ci-report.py tests tests "Tests" \
             "$logs/persistence-tests.log" "$logs/persistence-lib-tests.log" \
-            "$logs/milestone-a-round-trip.log" \
+            "$logs/persistence-lib-at-limit.log" "$logs/milestone-a-round-trip.log" \
             "$logs/boot-time.log" "$logs/latency-backend.log" "$logs/latency-rest.log" \
-            "$logs/readiness.log"
+            "$logs/post-suite.log" "$logs/readiness.log"
           python3 .github/scripts/ci-report.py readiness readiness \
             "Readiness recovery (Step 2 exit criterion)" "$logs/readiness.log"
 
@@ -969,6 +1185,22 @@ jobs:
           python3 .github/scripts/ci-report.py cas cas "CAS outcome counters" \
             "$logs/persistence-tests.log" "$logs/persistence-lib-tests.log" "$logs/latency-backend.log" \
             "$logs/step3-rest.log"
+
+      # Step 5's parsed reports (ADR-sam-michaels-0006, RV21), whatever the
+      # test steps' results: every [index-consistency …] line, counted by log,
+      # with how many ran with registry=changed, which skip the two
+      # fresh-extraction rules (RV14); the post-suite step's line and verdict;
+      # and every [repair case=… …] line. Report only.
+      - name: Report the consistency checks and the repair counters
+        if: always()
+        continue-on-error: true
+        run: |
+          logs="$RUNNER_TEMP/ci-report/logs"
+          python3 .github/scripts/ci-report.py consistency consistency \
+            "Index consistency checks (roadmap 5.4)" \
+            "$logs/persistence-lib-tests.log" "$logs/post-suite.log"
+          python3 .github/scripts/ci-report.py repair repair \
+            "Repair counters (roadmap 5.3)" "$logs/persistence-lib-tests.log"
 
       - name: Cassandra logs
         if: failure()

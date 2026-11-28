@@ -157,7 +157,8 @@ pub use bulk_submit::{
     UnindexedEntry, merge_resource,
 };
 pub use bulk_submit_input::{
-    FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
+    FileTokenError, FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher,
+    submission_output_job_id,
 };
 pub use bulk_submit_output::{submit_artifact_key, submit_artifact_locator};
 pub use bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
@@ -201,7 +202,10 @@ pub use search::{
     is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
-pub use sof_runner::{BatchStream, RowStream, SofError, SofRunner, ViewFilters, ViewRow};
+pub use sof_runner::{
+    BatchStream, NativeRelation, NativeRelationSource, NativeSqlQuery, RowStream, SofError,
+    SofRunner, ViewFilters, ViewRow,
+};
 pub use storage::{
     ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
     ConditionalPatchPreparation, ConditionalPatchResult, ConditionalStorage,

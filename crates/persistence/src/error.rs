@@ -358,6 +358,15 @@ pub enum SearchError {
         max: usize,
     },
 
+    /// A chained or `_has` search reaches a resource type the caller may not
+    /// search, so the whole search is refused (#2501). Raised by the
+    /// caller's [`ChainHopGuard`](crate::search::ChainHopGuard).
+    #[error("{message}")]
+    ChainHopRefused {
+        /// Why the hop is refused, for the client.
+        message: String,
+    },
+
     /// Invalid cursor for pagination.
     #[error("invalid pagination cursor: {cursor}")]
     InvalidCursor {
@@ -753,7 +762,11 @@ pub enum BackendError {
     ConnectionFailed {
         /// Backend identifier.
         backend_name: String,
-        /// Underlying connection error message.
+        /// Human-readable failure detail. Sent to the client verbatim as the
+        /// 503 text, like [`Self::Unavailable`]'s, so a request-path site
+        /// builds it with [`connection_failed`], which logs the driver text
+        /// (a pool error can carry the database file path) and keeps it out
+        /// of the response.
         message: String,
     },
 
@@ -803,6 +816,17 @@ pub enum BackendError {
     #[error("schema migration failed: {message}")]
     MigrationError {
         /// Migration failure detail.
+        message: String,
+    },
+
+    /// The backend's configuration is invalid (an unknown `sslmode`, an
+    /// unreadable certificate file, ...). Raised at startup, before any
+    /// request; the message says what to change.
+    #[error("invalid {backend_name} configuration: {message}")]
+    InvalidConfiguration {
+        /// Backend identifier.
+        backend_name: String,
+        /// What is wrong and how to fix it.
         message: String,
     },
 
@@ -1128,10 +1152,7 @@ pub fn classify_sqlite_error(context: &str, err: rusqlite::Error) -> BackendErro
             backend_name: "sqlite".to_string(),
             message,
         },
-        _ if is_sqlite_busy_or_locked(&err) => BackendError::Unavailable {
-            backend_name: "sqlite".to_string(),
-            message,
-        },
+        _ if is_sqlite_busy_or_locked(&err) => sqlite_unavailable(context, &err),
         _ => BackendError::Internal {
             backend_name: "sqlite".to_string(),
             message,
@@ -1170,6 +1191,122 @@ impl From<r2d2::Error> for StorageError {
         StorageError::Backend(BackendError::PoolExhausted {
             backend_name: "sqlite".to_string(),
         })
+    }
+}
+
+/// Client text for a backend connection that could not be obtained.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+const CONNECTION_FAILED_TEXT: &str = "the database could not be reached; retry the request";
+
+/// Client text for a SQLite database that is busy or locked.
+#[cfg(feature = "sqlite")]
+const SQLITE_BUSY_TEXT: &str = "the database is busy; retry the request";
+
+/// Client text for a PostgreSQL server that is not accepting connections.
+#[cfg(feature = "postgres")]
+const POSTGRES_UNAVAILABLE_TEXT: &str =
+    "the database is not accepting connections; retry the request";
+
+/// `"{context}: {text}"`, or `text` alone when there is no context.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn with_context(context: &str, text: &str) -> String {
+    if context.is_empty() {
+        text.to_string()
+    } else {
+        format!("{context}: {text}")
+    }
+}
+
+/// A [`BackendError::ConnectionFailed`] for a request-path pool acquisition
+/// that failed. The driver's text goes to the log: an r2d2 or deadpool
+/// failure carries the last connect error, and for a file-backed SQLite
+/// database that is the file path. The client learns that the database could
+/// not be reached and that the request is retryable, which is what the 503
+/// is for.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn connection_failed(
+    backend_name: &str,
+    detail: &dyn std::fmt::Display,
+) -> BackendError {
+    tracing::warn!(
+        backend = backend_name,
+        error = %detail,
+        "backend connection could not be obtained"
+    );
+    BackendError::ConnectionFailed {
+        backend_name: backend_name.to_string(),
+        message: CONNECTION_FAILED_TEXT.to_string(),
+    }
+}
+
+/// A [`BackendError::Unavailable`] for `SQLITE_BUSY` / `SQLITE_LOCKED`, with
+/// the driver text in the log and the fixed client text in the message, as
+/// [`mongodb_unavailable`] does for its driver.
+#[cfg(feature = "sqlite")]
+fn sqlite_unavailable(context: &str, detail: &dyn std::fmt::Display) -> BackendError {
+    tracing::warn!(context, error = %detail, "SQLite is busy or locked");
+    BackendError::Unavailable {
+        backend_name: "sqlite".to_string(),
+        message: with_context(context, SQLITE_BUSY_TEXT),
+    }
+}
+
+/// A [`BackendError::Unavailable`] for a PostgreSQL connection-capacity or
+/// shutdown SQLSTATE, with the driver text in the log and the fixed client
+/// text in the message.
+#[cfg(feature = "postgres")]
+fn postgres_unavailable(context: &str, detail: &dyn std::fmt::Display) -> BackendError {
+    tracing::warn!(context, error = %detail, "PostgreSQL is not accepting connections");
+    BackendError::Unavailable {
+        backend_name: "postgres".to_string(),
+        message: with_context(context, POSTGRES_UNAVAILABLE_TEXT),
+    }
+}
+
+/// Client text for an object store that could not be reached.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_UNAVAILABLE_TEXT: &str =
+    "the object store could not be reached; retry the request";
+
+/// Client text for an object store that is throttling requests.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_THROTTLED_TEXT: &str =
+    "the object store is throttling requests; retry the request";
+
+/// Client text for a conditional write the object store refused as conflicting.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_CONFLICT_TEXT: &str =
+    "the object store reported a conflicting concurrent write; retry the request";
+
+/// Client text for a bucket that is missing or not visible to the credentials.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_BUCKET_TEXT: &str =
+    "the object store bucket is not accessible; the server log has the detail";
+
+/// Client text for an object store that refused the server's credentials.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_ACCESS_TEXT: &str =
+    "the object store refused the server's credentials; the server log has the detail";
+
+/// Client text for a request the object store rejected as invalid.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_INVALID_TEXT: &str =
+    "the object store rejected the request as invalid; the server log has the detail";
+
+/// A [`BackendError::Unavailable`] for the S3 backend with the SDK or service
+/// text in the log and a fixed client sentence in the message, as the other
+/// backends do: the detail names the endpoint, the bucket and the provider's
+/// wording, none of which belongs in a 503 body.
+#[cfg(feature = "s3")]
+pub(crate) fn s3_unavailable(
+    what: &str,
+    text: &str,
+    detail: &dyn std::fmt::Display,
+) -> BackendError {
+    tracing::warn!(what, error = %detail, "S3 request failed");
+    BackendError::Unavailable {
+        backend_name: "s3".to_string(),
+        message: text.to_string(),
     }
 }
 
@@ -1232,10 +1369,7 @@ pub fn classify_postgres_error(context: &str, err: tokio_postgres::Error) -> Bac
             || *c == SqlState::CANNOT_CONNECT_NOW
     );
     if unavailable {
-        return BackendError::Unavailable {
-            backend_name: "postgres".to_string(),
-            message,
-        };
+        return postgres_unavailable(context, &err);
     }
 
     BackendError::Internal {
@@ -1750,6 +1884,89 @@ mod tests {
                 matches!(err, BackendError::Unavailable { .. }),
                 "SQLite primary code {code} must classify as Unavailable, got {err:?}"
             );
+        }
+    }
+
+    /// The busy text is the driver's and can name the file; the client gets
+    /// the fixed text, with the context in front, and the driver text goes to
+    /// the log.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_classify_sqlite_busy_leaves_the_driver_text_to_the_log() {
+        let raw = sqlite_failure(5).to_string();
+        let err = classify_sqlite_error("Failed to execute search", sqlite_failure(5));
+        match err {
+            BackendError::Unavailable { message, .. } => {
+                assert_eq!(
+                    message,
+                    "Failed to execute search: the database is busy; retry the request"
+                );
+                assert!(!message.contains(&raw), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        match classify_sqlite_error("", sqlite_failure(6)) {
+            BackendError::Unavailable { message, .. } => {
+                assert_eq!(message, "the database is busy; retry the request");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// The SDK text, the endpoint address and the bucket name stay in the log.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn test_s3_unavailable_leaves_the_detail_to_the_log() {
+        let detail = "connection failed: DispatchFailure(ConnectorError { kind: Io, source: \
+                      hyper::Error(Connect, ConnectError(\"tcp connect error\", Os { code: 111, \
+                      kind: ConnectionRefused }))) bucket hfs-prod-phi endpoint 10.0.3.7:9000";
+        match s3_unavailable("put_object", OBJECT_STORE_UNAVAILABLE_TEXT, &detail) {
+            BackendError::Unavailable {
+                backend_name,
+                message,
+            } => {
+                assert_eq!(backend_name, "s3");
+                assert_eq!(message, OBJECT_STORE_UNAVAILABLE_TEXT);
+                assert!(!message.contains("10.0.3.7"));
+                assert!(!message.contains("hfs-prod-phi"));
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// A pool-acquire failure carries the last connect error, which for a
+    /// file-backed SQLite database is the file path; none of it reaches the
+    /// client.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn test_connection_failed_leaves_the_detail_to_the_log() {
+        let detail =
+            "timed out waiting for connection: unable to open database file: /srv/hfs/secret.db";
+        match connection_failed("sqlite", &detail) {
+            BackendError::ConnectionFailed {
+                backend_name,
+                message,
+            } => {
+                assert_eq!(backend_name, "sqlite");
+                assert_eq!(
+                    message,
+                    "the database could not be reached; retry the request"
+                );
+                assert!(!message.contains("secret"));
+            }
+            other => panic!("expected ConnectionFailed, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn test_postgres_unavailable_is_the_fixed_client_text() {
+        match postgres_unavailable("Failed to count resources", &"db error") {
+            BackendError::Unavailable { message, .. } => assert_eq!(
+                message,
+                "Failed to count resources: the database is not accepting connections; retry the request"
+            ),
+            other => panic!("expected Unavailable, got {other:?}"),
         }
     }
 

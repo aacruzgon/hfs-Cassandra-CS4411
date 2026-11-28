@@ -13,11 +13,14 @@
 //! they are another crate and cannot reach this `cfg(test)` module.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use helios_fhir::FhirVersion;
+use parking_lot::RwLock;
 
 use super::CassandraConfig;
+use super::backend::initialize_search_registry;
+use crate::search::{SearchParameterExtractor, SearchParameterRegistry};
 
 /// The variable that chooses the tests' FHIR version.
 pub(crate) const TEST_FHIR_VERSION_VAR: &str = "HFS_TEST_FHIR_VERSION";
@@ -35,10 +38,16 @@ pub(crate) fn test_fhir_version() -> FhirVersion {
             let value = value.to_string_lossy();
             let version =
                 parse_test_fhir_version(&value).unwrap_or_else(|message| panic!("{message}"));
-            eprintln!(
-                "fhir-versions: {TEST_FHIR_VERSION_VAR}={value} -> {version:?} ({})",
+            // One finished line, printed in one write: `eprintln!` writes
+            // each piece of its format on its own, and under `--nocapture`
+            // libtest's stdout lines, on the same pipe in CI, landed between
+            // the pieces and cut the line (fhir-versions.yml run
+            // 46058677798, attempt 1).
+            let line = format!(
+                "fhir-versions: {TEST_FHIR_VERSION_VAR}={value} -> {version:?} ({})\n",
                 version.as_mime_param()
             );
+            eprint!("{line}");
             version
         }
         None => FhirVersion::default_enabled(),
@@ -75,6 +84,30 @@ pub(crate) fn test_config() -> CassandraConfig {
         fhir_version: test_fhir_version(),
         ..CassandraConfig::default()
     }
+}
+
+/// The registry a test backend loads (`initialize_search_registry` with
+/// [`test_config`]), for tests that extract without a node.
+///
+/// The loaded registry is built once per test binary and cloned for each call,
+/// so a test that registers a parameter changes its own copy only.
+pub(crate) fn test_registry() -> Arc<RwLock<SearchParameterRegistry>> {
+    static LOADED: OnceLock<SearchParameterRegistry> = OnceLock::new();
+    let loaded = LOADED.get_or_init(|| {
+        let registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
+        initialize_search_registry(&registry, &test_config());
+        // Bound first so the read guard is dropped before `registry` is.
+        #[allow(clippy::let_and_return)]
+        let loaded = registry.read().clone();
+        loaded
+    });
+    Arc::new(RwLock::new(loaded.clone()))
+}
+
+/// [`SearchParameterExtractor`] over [`test_registry`], for the version that
+/// registry was loaded for.
+pub(crate) fn test_extractor() -> SearchParameterExtractor {
+    SearchParameterExtractor::new(test_registry(), test_config().fhir_version)
 }
 
 #[cfg(test)]

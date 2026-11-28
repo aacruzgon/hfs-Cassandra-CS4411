@@ -407,6 +407,27 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Bulk Submit ingest](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)                | ✓      | ✓          | ✓       | ○         | ○     | ○             | ✓   |
 | [Bulk Submit REST worker](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)           | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ‡✓  |
 
+**What `/metadata` lists.** Each resource's `searchParam` list keeps only the parameters the
+configured backend's `SearchProvider::serves_search_param` serves (#2593). For the common `_text`
+and `_content` it follows the Special Parameters rows above. `_filter` is not listed on any
+backend, SQLite included: `/metadata` lists no registered parameter whose code starts with `_`
+other than the common ones.
+
+- SQLite, PostgreSQL and Elasticsearch list `_text` and `_content` but no `special` parameter
+  they build no condition for: `Location.near`, and from R5 `Location.contains` and
+  `Composition.section-text`. A search for one answers `400`.
+- MongoDB lists no `special` parameter except `_list`: `_text` and `_content` answer `501` (the
+  ○ cells above), and `near`, `contains` and `section-text` answer `400`.
+- `_list`, and from R5 `_in`, are listed wherever the backend serves `_id`: the REST layer
+  resolves both into an `_id` filter before the backend runs.
+- A composite parameter is listed only when each of its components is in the registry and
+  served. So no backend lists `Composition.section-code-text` (R5 and later), whose
+  `section-text` component no backend evaluates, nor the R5 and R6 composites whose component
+  definitions the spec bundles do not publish (`Ingredient.strength-concentration-ratio` in
+  both, `ResearchStudy.progress-status-state-actual` in R5 only, ...; #2774 lists them).
+- A composite backend answers for the backend its search reaches, so `sqlite-elasticsearch`
+  follows Elasticsearch.
+
 **Notes on partial cells:**
 
 - **Sorting** — SQLite and PostgreSQL sort by any indexed search parameter (string, token,
@@ -420,10 +441,12 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   search-parameter sort with `_id`/`_lastUpdated`/`_score` or with cursor pagination, hence ◐ for
   multiple fields. A MongoDB search-parameter sort with no filter asks the server for only the
   first `offset + _count + 1` ids, so memory follows the page, not the size of the type; it
-  answers 422 when `offset + _count` exceeds 300,000. A MongoDB `:not` or `:missing=true` search
-  with no positive parameter (or with only a compartment) reads the type in batches instead of
-  loading every id; past 300,000 matching ids it falls back to the query plan when one applies,
-  and otherwise answers 422.
+  answers 422 when `offset + _count` exceeds 300,000. A filtered single-parameter sort whose
+  matches exceed 300,000 reads the parameter's rows in sort order and checks them against the
+  search in batches, instead of answering 422; see `mongodb/search-indexes.md`. A MongoDB
+  `:not` or `:missing=true` search with no positive parameter (or with only a compartment) reads
+  the type in batches instead of loading every id; past 300,000 matching ids it falls back to the
+  query plan when one applies, and otherwise answers 422.
 - **`:above` / `:below`** — two mechanisms (◐ = both, conditional on context): (1) hierarchical
   **URI** prefix matching is native to SQLite, PostgreSQL, and Elasticsearch (no external service);
   (2) **token/code** hierarchy (e.g. `code:below=http://snomed.info/sct|73211009`) is resolved at
@@ -685,6 +708,8 @@ SQLite handles CRUD, versioning, history, and transactions. Elasticsearch handle
 
 **Upgrading from a build before #2394.** The Elasticsearch mapping gains `search_params.reference.reference_target` (schema version 3), added to existing indices at startup. Documents indexed before that have no such field, so references stored as absolute URLs (`http(s)://host/fhir/Patient/p1`) are not found by `Type/id` searches or by `_revinclude` until you run `POST /$reindex`. Relative references are unaffected, nothing is lost, and the startup log warns once per affected index. Run `$reindex` once after upgrading.
 
+**Upgrading from a build before #2602.** The mapping also gains `search_params.quantity.high`, `quantity.canonical_high` and `quantity.sort_name` (schema version 4), added in place; no document is rewritten. `Quantity` and `Age` need nothing: filters fall back to `value` for an entry without `high`, and every quantity sort reads `value`. A `Range` with `low != high` also indexes a second, sort-only nested entry (`sort_name` and its upper bound as `value`, no `name`, so no filter or `:missing` sees it) that a descending sort selects. Only `Range` values (`onset-age`, `abatement-age`, `context-quantity`) stored before the upgrade were never indexed, so run `POST /<type>/$reindex` (per tenant) once to make them searchable and sortable by their upper bound. See [Quantity prefix semantics](#sqlite-search-implementation) and the mixed-version notes under "Mixed versions during the upgrade" and [Rolling back from #2602](#rolling-back-from-2602).
+
 ```bash
 # Build with Elasticsearch support
 cargo build --bin hfs --features sqlite,elasticsearch --release
@@ -829,7 +854,7 @@ PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarant
 
 **Prerequisites:** Running PostgreSQL (14+) and Elasticsearch 8.x instances.
 
-**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394:** run `POST /$reindex` once. From a build before #2602, `$reindex` is needed only to make stored `Range` values searchable; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with PostgreSQL and Elasticsearch support
@@ -864,9 +889,29 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
   indexes are described in [MongoDB history indexes](mongodb/history-indexes.md)
 - Transaction bundles with urn:uuid reference resolution (requires replica set; see
   [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
-- Minimum server version: MongoDB 7.0.48 (CVE-2026-118383, a pre-authentication use-after-free in
-  replication, is fixed in 7.0.48; on newer lines use 8.0.37, 8.3.16 or 9.0.7 or later). CI, the
-  benchmark and the tests run `mongo:7.0.48`.
+- Server version: CI, the benchmark and the tests run MongoDB 9.0.8 (`mongo:9.0.8`). The minimum
+  patch levels are 7.0.48, 8.0.37, 8.3.16 or 9.0.7 on their lines (CVE-2026-118383, a
+  pre-authentication use-after-free in replication, is fixed in those releases).
+  - **Allocator setting for 8.x and 9.x in a container.** mongod 8.x and 9.x size tcmalloc's
+    per-CPU caches from the container's memory limit. In a container started without one
+    (Docker's default) `/sys/fs/cgroup/memory.max` holds the text `max`, mongod does not parse it,
+    and the caches get capacity 0, so every allocation takes one shared lock: in the benchmark
+    search ran up to 31% and sql-run up to 65% slower than on 7.0.48
+    ([SERVER-109273](https://jira.mongodb.org/browse/SERVER-109273), open, no fix version). A
+    memory limit (`--memory 16g` gave 32 MB per CPU on 9.0.8) or
+    `-e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760`, as every example here and CI do, avoids
+    it. The official images' `GLIBC_TUNABLES=glibc.pthread.rseq=0` is not the cause; starting with
+    `-e GLIBC_TUNABLES=` (set empty) only works around it, by moving tcmalloc to per-thread
+    caches, and makes mongod log an rseq warning. With the setting, 8.3.17 and 9.0.8 reached or
+    passed 7.0.48 on search and sql-run in the benchmark (single runs). Check it with
+    `db.serverStatus({ tcmalloc: 2 }).tcmalloc.maxPerCPUCacheSizeBytes`, which must be above 0.
+    7.0 uses the older tcmalloc and is not affected.
+  - **Large imports on 8.3 and 9.0.** With default WiredTiger pages an import stalled for 60 s or
+    more several times; starting mongod with
+    `--wiredTigerCollectionConfigString memory_page_max=16MB --wiredTigerIndexConfigString memory_page_max=16MB`
+    (what the benchmark does) removed the stalls with no insert p99 penalty. These strings apply
+    to collections and indexes created after mongod starts with them: a database created earlier keeps its
+    page size and its stalls, and there is no tested migration yet (recreate it and import again).
 - Native search (string, token, reference, date, number, quantity, URI and composite parameters;
   `_text`/`_content` and most modifiers beyond `:exact`/`:contains` are not yet supported;
   chained/`_has` work via the REST-layer resolver)
@@ -895,7 +940,8 @@ cargo build --bin hfs --features mongodb --release
 # Start MongoDB (example using Docker): a single-member replica set, which
 # transaction Bundles need (a standalone server answers them with 501)
 docker run -d --name mongo -p 27017:27017 \
-  mongo:7.0.48 --replSet rs0 --bind_ip_all
+  -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 \
+  mongo:9.0.8 --replSet rs0 --bind_ip_all
 docker exec mongo mongosh --quiet --eval \
   'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 
@@ -1771,7 +1817,7 @@ cargo test -p helios-persistence --features mongodb --test mongodb_tests \
 ```
 
 To find where a lone Bundle aborts on your own hardware and cache size, run the ceiling harness
-(#1976, #2252, #2350). It starts its own `mongo:7.0.48` replica set with the cache you name and prints
+(#1976, #2252, #2350). It starts its own `mongo:9.0.8` replica set with the cache you name and prints
 `V1_CEILING_*` lines: the abort entry, the dirty bytes per entry, the BSON and JSON bytes of a
 Bundle (`V1_CEILING_PAYLOAD`) and, for a control Bundle you give it, whether it commits and where
 it aborts. The knobs are listed at the top of
@@ -1798,7 +1844,7 @@ MongoDB remains the canonical write/read store while Elasticsearch owns delegate
 
 **Prerequisites:** Running MongoDB and Elasticsearch 8.x instances.
 
-**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394:** run `POST /$reindex` once. From a build before #2602, `$reindex` is needed only to make stored `Range` values searchable; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with MongoDB and Elasticsearch support
@@ -1807,7 +1853,8 @@ cargo build --bin hfs --features mongodb,elasticsearch --release
 # Start MongoDB (example using Docker): a single-member replica set, which
 # transaction Bundles need (a standalone server answers them with 501)
 docker run -d --name mongo -p 27017:27017 \
-  mongo:7.0.48 --replSet rs0 --bind_ip_all
+  -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 \
+  mongo:9.0.8 --replSet rs0 --bind_ip_all
 docker exec mongo mongosh --quiet --eval \
   'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 
@@ -1843,7 +1890,7 @@ S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (inge
 
 **Prerequisites:** An AWS S3 bucket (or S3-compatible service) and a running Elasticsearch 8.x instance.
 
-**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394:** run `POST /$reindex` once. From a build before #2602, `$reindex` is needed only to make stored `Range` values searchable; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with S3 and Elasticsearch support
@@ -1939,7 +1986,7 @@ let composite = CompositeStorage::new(composite_config, backends)?
 
 ### Cassandra
 
-In development: create, read, update, delete (soft, with revive), PATCH, vread, conditional read (`If-None-Match`, `If-Modified-Since`) and batch work, and every write is a compare-and-swap; search, history, transactions and conditional create, update, delete and patch (`PATCH [type]?criteria`) answer `501`. `/metadata` lists no search, history or `transaction` interaction; it keeps `vread`, `readHistory: true`, `versioning: versioned` and `conditionalRead: full-support`, and gives `conditionalCreate` and `conditionalUpdate` `false` and `conditionalDelete` `not-supported`, with `conditionalPatch` `false` from R5 (`docs/Cassandra/development-roadmap.md`, Step 7). Standalone only; there is no Cassandra + Elasticsearch mode.
+In development: create, read, update, delete (soft, with revive), PATCH, vread, conditional read (`If-None-Match`, `If-Modified-Since`) and batch work, and every write is a compare-and-swap; search, history, transactions and conditional create, update, delete and patch (`PATCH [type]?criteria`) answer `501`. `/metadata` lists no search, history or `transaction` interaction; it keeps `vread`, `readHistory: true`, `versioning: versioned` and `conditionalRead: full-support`, and gives `conditionalCreate` and `conditionalUpdate` `false` and `conditionalDelete` `not-supported`, with `conditionalPatch` `false` from R5 (`docs/Cassandra/development-roadmap.md`, Step 7). It lists no operation the backend cannot serve (HeliosSoftware/hfs#3015): no Patient or Group `$export`, Patient `$everything`, system `$export`, `$bulk-submit`, `$bulk-submit-status` or `$sql-run`, and no bulk-data `instantiates`; the system level keeps `$meta`, `$meta-add`, `$meta-delete`, `$validate` and `$versions`. Standalone only; there is no Cassandra + Elasticsearch mode.
 
 ```bash
 # Build with Cassandra support
@@ -1956,6 +2003,15 @@ HFS_CASSANDRA_CONTACT_POINTS=127.0.0.1:9042 \
   ./target/release/hfs
 ```
 
+**Keyspaces written before index writes (roadmap row 5.1).** A resource written before row 5.1 has only its `resources_by_type` row. Its next write adds its token, date and URI rows, but nothing adds them to a resource that is never written again, so search would miss it. Drop and reload every keyspace written before row 5.1, once: drop the keyspace, apply the keyspace file it was created with again (`docs/Cassandra/schema/keyspace-single-node.cql`, or `docker/cassandra/keyspace-three-node.cql` for the three-node cluster at RF 3), then `schema.cql`, and load the data again from its source files through the running server (create or update each resource through its REST API), whose write path writes each resource's index rows. The reload writes each resource as new, so the dropped keyspace's earlier versions are not kept, and a resource with no source file is lost; keep a copy of any keyspace you cannot reload (for example `nodetool snapshot`). A direct table import writes no index rows, so each resource loaded that way would be missing from search until its next write (ADR-sam-michaels-0006, RW6). CI starts every run from a fresh keyspace.
+
+**Keyspaces written before the fixes for HeliosSoftware/hfs#2962 and #2965 (PR #136).** Two kinds of index row changed with them, and rows stored before are not rewritten:
+
+- **`instant` values (#2962).** An `instant` value is now indexed as the point `[t, t + 1 ms)` in `date_index` and `date_index_by_end` (ADR-aacruzgon-0092; "Date prefix semantics" below). A row written before keeps one unit of the value's written precision: `2020-01-01T10:00:00Z` stays `[10:00:00.000, 10:00:01.000)`.
+- **System-only tokens (#2965).** An Identifier with a system and no value, or a Coding with a system and no code, now gets a `token_system_index` row with code `''` (ADR-aacruzgon-0091). One written before has no such row, so a `system|` search would miss it once Step 6 serves token search.
+
+The next write of the resource fixes its index rows. Cassandra has no `$reindex`, so reload such a keyspace as above. The tests' consistency check (`consistency.rs`, RV13) compares the stored keys with a fresh extraction, so it reports each such row as drift. A rewrite does not clear that, because the check also re-extracts the older versions, which keep their old key sets; only a reload does.
+
 The connection settings are read by `CassandraConfig::from_env` (`src/backends/cassandra/config.rs`), and an invalid value fails startup:
 
 | Variable | Default | Description |
@@ -1965,10 +2021,51 @@ The connection settings are read by `CassandraConfig::from_env` (`src/backends/c
 | `HFS_CASSANDRA_LOCAL_DC` | `helios-dc1` | Data centre whose nodes serve every request (`LOCAL_QUORUM`, `LOCAL_SERIAL`) |
 | `HFS_CASSANDRA_USERNAME`, `HFS_CASSANDRA_PASSWORD` | unset | `PasswordAuthenticator` credentials; set both or neither |
 | `HFS_CASSANDRA_POOL_SIZE` | `2` | Connections per local node |
-| `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection |
-| `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` | `10000` | The backend's own deadline for one statement |
+| `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection. Keep it below `HFS_CASSANDRA_REQUEST_TIMEOUT_MS`: one attempt to connect to a node that does not answer waits up to this long (`cdrs-tokio` 10.0.0's connection pool) inside a statement's deadline, so with the two equal, startup can fail while one node of three is down. Seen on three 5.0.9 nodes during PR #107's review (2026-11-25): with both at 5,000 ms, `connect` failed 4 of 5 times when it started within about 10 s of the stop; with 2,000 ms it passed 34 of 34. The defaults leave room for a second attempt. A value not shorter than `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` fails startup, naming both values ([ADR-aacruzgon-0100](../../docs/Cassandra/ADR-aacruzgon/2026-11-26/0100-request-timeout-longer-than-connect-timeout.md)). |
+| `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` | `10000` | The backend's own deadline for one statement. It must be longer than `HFS_CASSANDRA_CONNECT_TIMEOUT_MS`, or startup fails. The sweeper grace must be at least twice it, whether or not the sweeper is enabled: with the default grace, a value above `15000` fails startup. |
+| `HFS_CASSANDRA_SWEEPER_ENABLED` | `true` | Whether this hfs process starts the index sweeper with the server (one per process, stopped on shutdown). When `false`, it logs that its sweeper is off, and it does not finish its own writes whose version or index rows failed: another hfs process with the sweeper on, sharing the keyspace, finishes them, or this one's startup scan after a restart with the sweeper on, while the intent rows last (24 h). |
+| `HFS_CASSANDRA_SWEEPER_POLL_INTERVAL_MS` | `5000` | Pause between two polls of pending_index_writes. |
+| `HFS_CASSANDRA_SWEEPER_GRACE_MS` | `30000` | How old an intent must be before the sweeper takes it: at least twice the request timeout, under one hour, and not under the poll interval. |
 
 The Cassandra backend stores no AuditEvents, so `HFS_AUDIT_BACKEND=database` fails at startup; use `file` or `cloudwatch`. It has no per-user settings or login-session store, and no bulk export, bulk submit, `$purge` or `$reindex`; those answer `501`, and web login sessions are held in process. It has no SQL-on-FHIR runner either: the server turns SQL-on-FHIR off at startup with a warning (`$viewdefinition-run` and `$sql-run` answer `501`), and an explicit `HFS_SOF_ENABLED=true` fails startup.
+
+#### Node settings HFS depends on
+
+The backend sizes what it sends to the node with constants compiled into `src/backends/cassandra/`, and some of them assume a setting in the node's `cassandra.yaml`. Size a node for your hardware as you like within the limits below. Lowering a setting below what HFS needs makes the node refuse requests the backend builds, and some of those failures are silent: the write answers success and its index rows stay at the old version until the sweeper's retry gets through (every 5 minutes for 24 hours, [ADR-aacruzgon-0090](../../docs/Cassandra/ADR-aacruzgon/2026-11-25/0090-sweeper-retries-refused-writes.md)) or the resource is next written ([ADR-aacruzgon-0089](../../docs/Cassandra/ADR-aacruzgon/2026-11-25/0089-index-unit-split-at-statement-limit.md)). The defaults below are Cassandra 5.0.9's, as [`docker/cassandra`](../../docker/cassandra/README.md) runs it (`cassandra_latest.yaml`, which sets the same values as the stock `cassandra.yaml` for each of these but `paxos_variant`). Each was checked in the 5.0.9 source and, on 2026-11-25, in `system_views.settings` on a node of that Compose file.
+
+**What the backend fixes in code**
+
+| Constant | Value | What it bounds | Source |
+| --- | --- | --- | --- |
+| `MAX_BATCH_STATEMENTS` (`batch.rs`) | 65,535 | Statements in one batch | The protocol: a BATCH's statement count is a `[short]` (`native_protocol_v5.spec` §4.1.7). Pinned by a const assertion; `CassandraSession::batch` refuses more ([ADR-aacruzgon-0089](../../docs/Cassandra/ADR-aacruzgon/2026-11-25/0089-index-unit-split-at-statement-limit.md)) |
+| `MAX_PIECE_BYTES` (`batch.rs`) | 8 MiB | Wire bytes of one piece of an index unit split for its size | HFS's design ([ADR-aacruzgon-0089](../../docs/Cassandra/ADR-aacruzgon/2026-11-25/0089-index-unit-split-at-statement-limit.md)): half of the node's default message limit, `native_transport_max_message_size` |
+| `MAX_BATCH_BYTES` (`batch.rs`) | 4,864 bytes | Wire bytes of an index batch of several partitions | HFS's design (ADR-sam-michaels-0006, IW11): `batch_size_warn_threshold` (5 KiB) less 256 bytes |
+| `MAX_CAS_PAYLOAD_BYTES` (`write.rs`) | 8 MiB | `data` plus `index_keys` of one compare-and-swap; a larger write is refused with `400` before anything is sent | HFS's design ([ADR-aacruzgon-0053](../../docs/Cassandra/ADR-aacruzgon/2026-11-06/0053-cas-size-bound.md)): half of `max_mutation_size` |
+| `MAX_INDEX_TEXT_BYTES` (`index_keys.rs`) | 1,024 bytes | The longest token system or code, URI or parameter name stored as it is; a longer one is stored as `sha256:` and its digest | HFS's design ([ADR-aacruzgon-0079](../../docs/Cassandra/ADR-aacruzgon/2026-11-17/0079-hash-oversized-index-values.md)): the largest index row, 3,299 wire bytes, fits one batch, far below the 65,535-byte key limit |
+| `SCAN_PAGE_SIZE` (`consistency.rs`) | 1,000 rows | One page of the consistency utility's full scans | Keeps the tombstones one page reads far below `tombstone_failure_threshold` |
+| `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` (`config.rs`) | 10,000 ms | The backend's own deadline for one statement | [ADR-aacruzgon-0031](../../docs/Cassandra/ADR-aacruzgon/2026-11-06/0031-cassandra-config-names.md): above the node's own request timeouts |
+
+**The node settings**
+
+| Setting | 5.0.9 default | HFS needs | Raised | Lowered, and how it shows |
+| --- | --- | --- | --- | --- |
+| `native_transport_max_message_size` | Unset, so `min(max_mutation_size, heap / 10, heap / 40)` (`DatabaseDescriptor.java:903-905`, `:3237-3245`): 16 MiB on a heap of 640 MiB or more; 13,421,772 bytes (12.8 MiB) on a 512 MiB heap, as measured | At least 8 MiB plus about 1 KiB: the largest compare-and-swap (`MAX_CAS_PAYLOAD_BYTES` and its keys) and the largest index piece (`MAX_PIECE_BYTES` and its batch header). So, at the default, a heap of about 321 MiB or more | No effect: the backend caps itself at 8 MiB | The node refuses a larger message as `Invalid` (`OversizedCQLMessageException`, `CQLMessageHandler.java:551`). A compare-and-swap under HFS's 8 MiB bound but over the node's limit answers `500`. An index piece over it is not retried and keeps the intent: the write answers success and its index rows stay at the old version. This is ADR-aacruzgon-0089's failure. The sweeper tries such an intent again every 5 minutes until 24 hours after the write, so it finishes the write once the node's limit is raised within that time, with no restart of HFS ([ADR-aacruzgon-0090](../../docs/Cassandra/ADR-aacruzgon/2026-11-25/0090-sweeper-retries-refused-writes.md)); after that, only the resource's next write does. |
+| `native_transport_max_frame_size` | 16 MiB | Nothing | No effect | No effect. It bounds only the frames of protocol v4 and earlier (`Envelope.java:429`); HFS speaks v5 (`session.rs`, `PROTOCOL_VERSION`), whose messages `native_transport_max_message_size` bounds |
+| `max_mutation_size` | Unset, so half of `commitlog_segment_size` (`DatabaseDescriptor.java:898-899`): 16 MiB | 16 MiB: the 8 MiB compare-and-swap payload is half of it, leaving room for the rest of the row and Paxos's own copy (ADR-aacruzgon-0053) | No effect on what HFS sends | It also lowers the default message limit (above). A compare-and-swap the message limit lets through but the Paxos save refuses answers `503`, an unknown outcome, for a write that can never apply (ADR-aacruzgon-0053) |
+| `commitlog_segment_size` | 32 MiB | 32 MiB, so that `max_mutation_size` is 16 MiB | No effect | As `max_mutation_size` |
+| `batch_size_warn_threshold` | 5 KiB | Nothing: HFS packs every batch of several partitions within 4,864 wire bytes, so the node never warns | No effect | Warnings in the node's log, and in the driver's, for HFS's index batches. Nothing fails unless `batch_size_fail_threshold` is lowered below the batch too (next row) |
+| `batch_size_fail_threshold` | 50 KiB | Above 4,864 bytes, with margin, or `batch_size_warn_threshold` left above it: the node checks this threshold only for a batch already over the warn threshold (`BatchStatement.java:340-352`). A batch of one partition is exempt from both thresholds (`BatchStatement.java:333-335`): that exemption is what lets an oversized unit, and each full piece of a split one, through | No effect | Lowered alone, nothing: HFS's batches stay under the default warn threshold, so this one is never checked. With both thresholds below a batch's data size, the node refuses HFS's batches of several partitions as `Invalid` (it measures less than the wire bytes, without the partition keys): such a write keeps its intent and its index rows stay stale until the sweeper's retry, every 5 minutes for 24 hours, gets through once either threshold is raised |
+| `max_value_size` | 256 MiB | At least 8 MiB, the largest `data` cell a write can store | No effect | It is checked when a cell is read back or sent between nodes (`Cell.java:339`), so a stored resource larger than it can no longer be read |
+| `read_request_timeout`, `write_request_timeout`, `cas_contention_timeout`, `range_request_timeout` | 5,000 ms, 2,000 ms, 1,000 ms, 10,000 ms (both yamls; `Config.java`'s own default for `cas_contention_timeout`, 1,800 ms, applies only when the yaml leaves it out) | Below `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` (10 s), so that the node usually answers first with a typed timeout. Not when a request waits in a queue or behind a stalled node ([ADR-aacruzgon-0081](../../docs/Cassandra/ADR-aacruzgon/2026-11-18/0081-what-step5-design-changes.md)) | At or above 10 s, HFS's own deadline fires first: a compare-and-swap cut off there is an unknown outcome, so expect more `503`s. Raise `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` with them, and above 15 s raise `HFS_CASSANDRA_SWEEPER_GRACE_MS` to at least twice it, or startup fails | More node timeouts under load. The writer's tries (3 per write after the compare-and-swap, 2 re-runs after an unknown outcome) absorb some; the rest answer `503` or `504`, or are left to the sweeper. The batchlog replays a batch after 2 × `write_request_timeout` |
+| `tombstone_failure_threshold` | 100,000 | Well above 1,000: the consistency scans read 1,000 rows a page, and listing the tenants with stored SearchParameters falls back to `resources` when a partition passes it (`backend.rs`, `stored_search_parameter_tenants`; issue #74) | No effect on HFS | Reads of partitions with many deletes are refused sooner (`TooManyTombstones`) |
+| `paxos_variant` | `v2` in `cassandra_latest.yaml` (the stock `cassandra.yaml` leaves it at `v1`) | `v2`, which the design's compare-and-swap rules assume; `docker/cassandra/entrypoint.sh` sets it on every boot and fails the boot if it cannot ([ADR-aacruzgon-0001](../../docs/Cassandra/ADR-aacruzgon/2026-10-13/0001-image-pin-and-paxos-v2.md)) | Not a size | Not a size: keep `v2` |
+
+**Safe to change freely:**
+- the heap, as long as it stays at 640 MiB or more, where the message limit is 16 MiB. Below 640 MiB the limit is heap / 40, and below about 321 MiB it falls under what HFS needs (above);
+- the container's memory limit, the caches, memtables, compaction, and the thread and concurrency settings;
+- the replication factor, through the keyspace files (`docs/Cassandra/schema/keyspace-single-node.cql`, `docker/cassandra/keyspace-three-node.cql`), whose data centre must be the one the nodes report and `HFS_CASSANDRA_LOCAL_DC` names.
+
+The tables' own options (`gc_grace_seconds`, the intent table's `default_time_to_live`) are part of `schema.cql`, not `cassandra.yaml`: change them only through a schema change.
 
 ### How Search Offloading Works
 
@@ -2447,7 +2544,7 @@ first attempt had already deleted the resources. Calling `purge_tenant_data` aga
 the deferral. A Bundle whose resources and history alone do not fit in the cache still fails with
 `500` `too-costly`, as described above.
 
-**Ceiling test.** An ignored test starts its own `mongo:7.0.48` replica set with a small WiredTiger
+**Ceiling test.** An ignored test starts its own `mongo:9.0.8` replica set with a small WiredTiger
 cache and sends one lone synthetic Bundle (`COPIES` copies of a 267-entry fixture, so 15 copies are
 4,005 entries) through one backend per variant, each on a database of its own:
 
@@ -2866,7 +2963,7 @@ cargo test -p helios-persistence --test s3_tests --features s3
 - [x] History provider traits (instance, type, system)
 - [x] Search provider traits (basic, chained, \_include, terminology)
 - [x] Transaction traits (ACID, bundles)
-- [x] `CapabilityProvider` summary trait (not what `/metadata` is built from: the REST layer reads `SearchProvider::supports_search`, `ConditionalStorage::supports_conditional` and the other per-capability methods)
+- [x] `CapabilityProvider` summary trait (not what `/metadata` is built from: the REST layer reads `SearchProvider::supports_search`, `SearchProvider::serves_search_param`, `ConditionalStorage::supports_conditional` and the other per-capability methods)
 
 ### Phase 3: Tenant Isolation
 
@@ -2959,18 +3056,186 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   the search value as written, and filters on the unit code verbatim, so on
   MongoDB `gt60000|http://unitsofmeasure.org|g` matches nothing against data
   stored as `kg`.
+- Cross-unit `Range` values (for example `1 a`..`20 mo`) rely on the UCUM
+  canonical values. They are only correct once the `octofhir-ucum` upgrade
+  described under "Upgrading across the `octofhir-ucum` 0.5 → 0.9 bump" below
+  is in place and the data has been reindexed; before that, a `Range` whose
+  bounds canonicalize wrongly can be dropped as inverted.
 - The eq/ne-vs-comparator precision rule itself (implicit-precision range for
   `eq`/`ne`, exact value for the other comparators) is unified across
-  SQLite, PostgreSQL, Elasticsearch, and MongoDB. The exception is `ap`
-  (approximately equal), whose tolerance is not unified across backends.
+  SQLite, PostgreSQL, Elasticsearch, and MongoDB. `ap` (approximately equal)
+  shares one margin too: `m = max(0.1 * |v|, implicit_precision / 2)`, matching
+  `[v - m, v + m]` (#1390).
 - Date parameters are unaffected by this rule and keep their own
   calendar-precision range comparison.
 
+**Quantity prefix semantics (`Range` targets, #2602):**
+
+A quantity parameter whose expression selects a `Range` (`onset-age`,
+`abatement-age`, `context-quantity`) indexes it as the closed interval
+`[L, H]` from `low` to `high`, with unit and system taken from the bound that
+has a value. A missing bound leaves that side open (stored as the finite
+sentinels `f64::MIN` / `f64::MAX`). A `Quantity` or `Age` is a point, `L = H`,
+so its results are unchanged. A `Range` with `low > high`, or whose bounds
+carry different systems or codes, is skipped with a warning. With `v` the
+search number, `[s, e)` its implicit-precision range, and `m` the `ap` margin:
+
+| Prefix | Matches when the stored interval `[L, H]` ... | For a point `x` |
+|---|---|---|
+| `eq` | lies inside the search range: `s <= L` and `H < e` | `s <= x < e` |
+| `ne` | is not inside it: `L < s` or `H >= e` | `x < s` or `x >= e` |
+| `gt` | extends above `v`: `H > v` | `x > v` |
+| `lt` | extends below `v`: `L < v` | `x < v` |
+| `ge` | `H >= v` | `x >= v` |
+| `le` | `L <= v` | `x <= v` |
+| `sa` | starts after `v`: `L > v` | `x > v` |
+| `eb` | ends before `v`: `H < v` | `x < v` |
+| `ap` | overlaps `[v - m, v + m]`: `L <= v + m` and `H >= v - m` | `v - m <= x <= v + m` |
+
+So `onset-age=45` does not match an `onsetRange` of 40 to 50 years (the
+search range does not contain the whole interval), while `gt45`, `lt45`,
+`ge45`, `le45` and `ap45` all do. Sorting ascending
+uses the low bound and descending the high bound, so a range with no `low`
+sorts first. Composite token+quantity parameters index only `Quantity`/`Age`
+points and `Range` values with `low == high`; a `Range` with `low != high`
+(including one with an open side) is skipped in a composite row.
+
+On SQLite, `_filter` evaluates quantity comparisons against the same interval
+and resolves every Quantity-typed parameter from the search-parameter registry
+(`onset-age`, `abatement-age`, `context-quantity`, `component-value-quantity`,
+custom ones); a builder without a registry falls back to the spec's quantity
+names.
+
+**Upgrading from a build before #2602.** Each backend gains a high bound on the
+quantity row (SQLite schema 49 and PostgreSQL schema 56 migrate and backfill
+`high = value`; MongoDB backfills at startup under search index generation 8, in
+batches by `_id` with progress logging; Elasticsearch adds
+`quantity.high` / `quantity.canonical_high` / `quantity.sort_name`, schema
+version 4, rewriting no document: `Quantity` and `Age` match and sort correctly
+without `$reindex`, since filters fall back to `value` and sorts read it).
+Existing `Quantity` and `Age`
+values keep working unchanged, but `Range` values stored earlier were never
+indexed, so they are searchable only after you run `POST /$reindex` once.
+
+**Mixed versions during the upgrade.** A pre-#2602 instance writes quantity
+rows without an upper bound. On SQLite, PostgreSQL and MongoDB such a row does
+not match `eq`, `gt`, `ge`, `eb` or `ap`, matches `ne` only below the searched
+range, and counts as missing in a descending sort. Per backend:
+
+- **PostgreSQL.** Migration v56 installs, when it upgrades an existing database,
+  a temporary `BEFORE INSERT` trigger,
+  `trg_search_index_quantity_high` (function `hfs_search_index_quantity_high`),
+  that fills `value_quantity_high` (and the canonical one) when an old writer
+  leaves it `NULL`. Its `WHEN` clause means current builds never run it
+  (measured: no cost for current writers; +10-50% on inserts only from an old
+  writer), so a rolling update is safe. A database created by a build that already has
+  v56 has no older writer and gets no trigger and no function. The trigger is temporary: a later
+  migration (v57: `DROP TRIGGER IF EXISTS trg_search_index_quantity_high ON search_index; DROP FUNCTION IF EXISTS hfs_search_index_quantity_high();`)
+  removes it, no earlier than the second release after the one that ships
+  #2602 and only once the upgrade notes forbid skipping that release. Until
+  then, skipping the #2602 release in a rolling update is unsupported.
+  Planned removal: trigger `trg_search_index_quantity_high` (see migration v57 note) — tracked in the follow-up task.
+  To check, `SELECT count(*) FROM search_index WHERE value_quantity_value IS NOT NULL AND value_quantity_high IS NULL`
+  returns 0 once healed.
+- **MongoDB.** The schema version is now 18, so a pre-#2602 binary (schema 17)
+  refuses to start against an upgraded database (a binary already running is
+  not stopped). Every startup of a current build looks for quantity rows
+  without `value_quantity_high` and repairs them in batches, logging a warning
+  with the number of rows healed; a non-zero count means an old writer was
+  active. Rows written by an old instance after the last current instance
+  started are repaired at the next startup, so after stopping the last old
+  instance, restart one current instance. For the effect of
+  `HFS_MONGODB_INDEX_BUILD=off` on the repair, see the index build setting in
+  [search-indexes.md](mongodb/search-indexes.md#hfs_mongodb_index_build).
+  The same `count` check, as `countDocuments({ value_quantity_value: { $exists: true }, value_quantity_high: { $exists: false } })`, returns 0 once healed.
+- **SQLite.** One process per file; an older build is refused by the schema
+  version (49). Never run two builds against one file.
+- **Elasticsearch.** Nothing to do: filters fall back to `value` for a
+  document without `high`, and sorts read `value`. A `Range` stored by a build
+  that lacks the sort-only entry sorts by its low bound until `$reindex`.
+
+#### Rolling back from #2602
+
+SQLite (schema 49) and PostgreSQL (schema 56) refuse to start an older binary
+on an upgraded database, so a rollback needs the schema lowered by hand first.
+Take a backup and stop every HFS instance before running any of this.
+
+SQLite (`DROP COLUMN` needs SQLite 3.35 or later and a column no index uses, so
+drop the indexes first; both columns exist only on `search_index`):
+
+```sql
+DROP INDEX IF EXISTS idx_search_quantity_high;
+DROP INDEX IF EXISTS idx_search_quantity_canonical_high;
+ALTER TABLE search_index DROP COLUMN value_quantity_high;
+ALTER TABLE search_index DROP COLUMN value_quantity_canonical_high;
+UPDATE schema_version SET version = 48;
+```
+
+PostgreSQL (`DROP INDEX CONCURRENTLY` cannot run inside a transaction block;
+the columns exist only on `search_index`):
+
+```sql
+DROP TRIGGER IF EXISTS trg_search_index_quantity_high ON search_index;
+DROP FUNCTION IF EXISTS hfs_search_index_quantity_high();
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_high;
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_canonical_high;
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_range;
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_canonical_range;
+ALTER TABLE search_index DROP COLUMN value_quantity_high;
+ALTER TABLE search_index DROP COLUMN value_quantity_canonical_high;
+-- v56 rebuilt idx_search_quantity_recent with value_quantity_high in its
+-- payload, so DROP COLUMN above dropped it; restore the v20 definition.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_search_quantity_recent
+  ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+  INCLUDE (value_quantity_value, value_quantity_unit)
+  WHERE value_quantity_value IS NOT NULL;
+UPDATE schema_version SET version = 55;
+```
+
+MongoDB: run `mongosh "$HFS_MONGODB_URL" --file crates/persistence/mongodb/quantity-high-rollback.mongosh.js`
+with `HFS_MONGODB_DATABASE` exported (see [Downgrading](mongodb/search-indexes.md#downgrading)).
+The script also lowers the recorded schema version from 18 back to 17, so an
+older binary then runs again.
+**Warning:** an older binary reads a `Range`'s low as a plain point value, and
+an open-low `Range` stores `f64::MIN`. Before running the old binary, delete the
+`Range` rows (`db.search_index.deleteMany({ value_quantity_high: { $exists: true }, $expr: { $ne: ["$value_quantity_high", "$value_quantity_value"] } })`,
+and the same on `search_index_contained`), or run `$reindex` on the old binary.
+
+**Upgrading across the `octofhir-ucum` 0.5 → 0.9 bump:** the UCUM library
+that fills the `*_canonical_value` / `*_canonical_unit` columns (SQLite,
+PostgreSQL) and fields (Elasticsearch) was upgraded. 0.5.2 computed wrong
+canonical factors for many units (`mo` was 219,150 s instead of 2,629,800 s,
+`L` was 1 m³, `%` was 1, plus `mol`, `[oz_av]`, `10*3/uL` and roughly 140
+`X/N`-defined units), and labelled mass as `kg` where 0.9 uses UCUM's base
+unit `g`. Rows indexed by an older build keep the old canonical value and
+unit until they are rewritten, so a cross-unit search (`5|…|mg` against data
+stored as `g`, or any search in months) misses them. Searches in the same
+unit the data was stored in are unaffected, because the raw value/unit branch
+still matches. Run `POST /$reindex` once per tenant after upgrading every
+writer. There is no in-place migration: the SQLite and PostgreSQL rows do not
+keep the UCUM code that canonicalization used, and Elasticsearch documents are
+only rewritten by a reindex. MongoDB does not canonicalize and is unaffected.
+
 **Date prefix semantics (range targets, #1391):**
 
-- Every indexed date value is a range `[start, end)`. A point value such as
-  `birthDate` or `effectiveDateTime` runs to the end of its own precision
-  (`2020-03` is `[2020-03-01, 2020-04-01)`). A `Period`, and a `Timing`'s
+- Every indexed date value is a range `[start, end)`. A `date` or `dateTime`
+  value such as `birthDate` or `effectiveDateTime` runs to the end of its own
+  precision (`2020-03` is `[2020-03-01, 2020-04-01)`). An `instant` value such
+  as `DiagnosticReport.issued` or `Observation.effectiveInstant` is a point, "an
+  interval with an effective width of 0"
+  ([search.html#date](https://hl7.org/fhir/R4/search.html#date)): it runs for
+  one unit of the backend's storage resolution, whatever precision it is
+  written to, so `2020-01-01T10:00:00Z` is `[10:00:00.000, 10:00:00.001)` on
+  SQLite, MongoDB and Elasticsearch and `[10:00:00, 10:00:00.000001)` on
+  PostgreSQL (#2962). The element type comes from the backend's FHIR version
+  (`DiagnosticReport.issued` is a `dateTime` in R6), for a union member that
+  is a plain path to the element, including the `instant` arm of a choice
+  (`Observation.effective`, `effective.ofType(instant)`); a member of any other
+  shape, such as R5's `(start | requestedPeriod.start).first()` for
+  `Appointment.date`, keeps the range of its written precision. A value too
+  coarse to be a valid `instant` (`2020-01-01`) also keeps its range. Rows
+  indexed before #2962 keep the one-unit range until the resource is written
+  again or `$reindex` runs. A `Period`, and a `Timing`'s
   `repeat.boundsPeriod`, is **one** range from its `start` to the end of its
   `end` at that value's precision. A missing `start` or `end` is unbounded,
   stored as the supported-range limit (year 1 / year 9999). One rule for all

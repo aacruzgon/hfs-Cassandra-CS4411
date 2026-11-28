@@ -36,7 +36,12 @@ curl http://localhost:8080/clinic-b/Patient
 | `HFS_DEFAULT_TENANT` | `default` | Tenant ID used when none is specified |
 | `HFS_TENANT_ROUTING_MODE` | `header_only` | How tenant is resolved from the request |
 | `HFS_TENANT_STRICT_VALIDATION` | `false` | Return an error if URL and header tenant disagree |
-| `HFS_JWT_TENANT_CLAIM` | `tenant_id` | JWT claim name for tenant (future use) |
+| `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim carrying the tenant id when authentication is enabled |
+
+With authentication enabled, a token that carries the tenant claim is bound to
+that tenant. It is refused `403` on the cross-tenant admin API
+(`/admin/tenants`, `/console/metrics/tenants`, `/console/metrics/traffic`)
+whatever its scopes; that API takes a `system/*` token with no tenant claim.
 
 ## Implementation Notes
 

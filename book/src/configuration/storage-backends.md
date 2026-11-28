@@ -127,12 +127,16 @@ HFS_CASSANDRA_CONTACT_POINTS=127.0.0.1:9042 \
 | `HFS_CASSANDRA_LOCAL_DC` | `helios-dc1` | Data centre whose nodes serve every request |
 | `HFS_CASSANDRA_USERNAME`, `HFS_CASSANDRA_PASSWORD` | unset | `PasswordAuthenticator` credentials; set both or neither |
 | `HFS_CASSANDRA_POOL_SIZE` | `2` | Connections per local node |
-| `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection |
-| `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` | `10000` | The backend's own deadline for one statement |
+| `HFS_CASSANDRA_CONNECT_TIMEOUT_MS` | `5000` | Bound on opening the session and each connection. Keep it below `HFS_CASSANDRA_REQUEST_TIMEOUT_MS`: with the two equal, startup can fail while one node of three is down. The defaults leave room for a second attempt. A value not shorter than `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` fails startup. |
+| `HFS_CASSANDRA_REQUEST_TIMEOUT_MS` | `10000` | The backend's own deadline for one statement. It must be longer than `HFS_CASSANDRA_CONNECT_TIMEOUT_MS`, or startup fails. The sweeper grace must be at least twice it, whether or not the sweeper is enabled: with the default grace, a value above `15000` fails startup. |
+| `HFS_CASSANDRA_SWEEPER_ENABLED` | `true` | Whether this hfs process starts the index sweeper with the server (one per process, stopped on shutdown). When `false`, it logs that its sweeper is off, and it does not finish its own writes whose version or index rows failed: another hfs process with the sweeper on, sharing the keyspace, finishes them, or this one's startup scan after a restart with the sweeper on, while the intent rows last (24 h). |
+| `HFS_CASSANDRA_SWEEPER_POLL_INTERVAL_MS` | `5000` | Pause between two polls of pending_index_writes. |
+| `HFS_CASSANDRA_SWEEPER_GRACE_MS` | `30000` | How old an intent must be before the sweeper takes it: at least twice the request timeout, under one hour, and not under the poll interval. |
 
 An invalid value fails startup.
 
 - **The schema is applied separately.** The server never creates the keyspace or the tables; at startup it only checks that the ten tables exist. Apply `docs/Cassandra/schema/keyspace-single-node.cql` and then `docs/Cassandra/schema/schema.cql` with `cqlsh` once, before the first start.
+- **Reload a keyspace written before index writes.** A resource written before roadmap row 5.1 (`docs/Cassandra/development-roadmap.md`) has no token, date or URI rows until its next write, so search would miss it. Drop and reload every keyspace written before row 5.1, from its resources' source files, through the running server before search is enabled (see `crates/persistence/README.md`, "Keyspaces written before index writes"). The reload writes each resource as new, so the dropped keyspace's earlier versions are not kept, and a resource with no source file is lost; keep a copy of any keyspace you cannot reload (for example `nodetool snapshot`).
 - **No database audit sink.** The Cassandra backend does not store AuditEvents, so `HFS_AUDIT_BACKEND=database` fails at startup. Use `file` or `cloudwatch`.
 - **Standalone only.** There is no Cassandra + Elasticsearch mode.
 - **No SQL-on-FHIR.** The backend has no in-database SQL-on-FHIR runner, so the server turns SQL-on-FHIR off at startup with a warning, and `$viewdefinition-run` and `$sql-run` answer `501`. Setting `HFS_SOF_ENABLED=true` explicitly fails startup.

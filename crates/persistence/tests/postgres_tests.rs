@@ -59,6 +59,10 @@ mod tenant_id_fidelity_suite;
 #[path = "multitenancy/tenant_existence_suite.rs"]
 mod tenant_existence_suite;
 
+/// TLS connections against a real server (#2746).
+#[path = "tls/postgres_tls.rs"]
+mod postgres_tls;
+
 #[path = "common/sof_terminology_suite.rs"]
 mod sof_terminology_suite;
 
@@ -130,14 +134,32 @@ mod ap_relations_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for `instant` targets (#2962). Same `#[path]`
+/// arrangement.
+#[path = "search/date_instant_suite.rs"]
+mod date_instant_suite;
+
+/// The backend-agnostic suite for quantity `Range` targets (#2602).
+/// Same `#[path]` arrangement.
+#[path = "search/quantity_range_suite.rs"]
+mod quantity_range_suite;
+
 /// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
 /// Same `#[path]` arrangement.
 #[path = "search/sort_missing_suite.rs"]
 mod sort_missing_suite;
 
+/// The backend-agnostic suite for paging through tied `last_updated` (#2603).
+#[path = "search/tiebreak_order_suite.rs"]
+mod tiebreak_order_suite;
+
 /// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
 #[path = "search/sort_meta_suite.rs"]
 mod sort_meta_suite;
+
+/// The backend-agnostic parity suite for the unfiltered date sort (#2731).
+#[path = "search/unfiltered_date_sort_suite.rs"]
+mod unfiltered_date_sort_suite;
 
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
@@ -172,6 +194,11 @@ mod numeric_validation_suite;
 /// `#[path]` arrangement.
 #[path = "search/token_code_system_suite.rs"]
 mod token_code_system_suite;
+
+/// The backend-agnostic `[system]|` on a system-only Identifier or Coding
+/// suite (#2965). Same `#[path]` arrangement.
+#[path = "search/token_system_only_suite.rs"]
+mod token_system_only_suite;
 
 /// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
 /// arrangement.
@@ -2331,6 +2358,20 @@ mod postgres_integration {
         claim_contract::unleased_processing_is_not_claimable(
             &create_backend().await,
             &create_tenant("unleased-processing"),
+        )
+        .await;
+    }
+
+    /// See `claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others`
+    /// (#2760). A database of its own: the shared one carries other tests'
+    /// claimable manifests, and this asserts on what the next claims return.
+    #[tokio::test]
+    async fn postgres_bulk_submit_a_tenant_with_work_in_flight_waits_behind_the_others() {
+        let (backend, _dbname) = isolated_reindex_backend().await;
+        claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others(
+            &backend,
+            &create_tenant("claim-fairness-busy"),
+            &create_tenant("claim-fairness-other"),
         )
         .await;
     }
@@ -6307,6 +6348,18 @@ mod postgres_integration {
              AND param_name IN ('code', 'value-quantity')",
             &[&tenant_id],
         ).await.unwrap();
+        // Fixture rows are written by hand, so give each the upper bound the
+        // storage writer would (a point: high = value, #2602).
+        client
+            .execute(
+                "UPDATE search_index SET value_quantity_high = value_quantity_value,
+             value_quantity_canonical_high = value_quantity_canonical_value
+             WHERE tenant_id = $1 AND value_quantity_value IS NOT NULL
+               AND value_quantity_high IS NULL",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
         client
             .execute(
                 "UPDATE resources SET last_updated = '2020-01-01T00:00:00Z' WHERE tenant_id = $1",
@@ -6668,8 +6721,12 @@ mod postgres_integration {
                         .filter_map(|field| plan[field].as_str())
                         .collect::<Vec<_>>()
                         .join(" ");
-                    let raw = predicates.contains("value_quantity_value");
-                    let canonical = predicates.contains("value_quantity_canonical_value");
+                    // `gt` on a point is `high > v` now (#2602), so a quantity arm is
+                    // recognised by either bound column.
+                    let raw = predicates.contains("value_quantity_value")
+                        || predicates.contains("value_quantity_high");
+                    let canonical = predicates.contains("value_quantity_canonical_value")
+                        || predicates.contains("value_quantity_canonical_high");
                     if converted {
                         assert!(
                             !(raw && canonical),
@@ -6724,6 +6781,18 @@ mod postgres_integration {
                     '2020-01-01T00:00:00Z' FROM generate_series(1, 20000) series",
             &[&tenant_id],
         ).await.unwrap();
+        // Fixture rows are written by hand, so give each the upper bound the
+        // storage writer would (a point: high = value, #2602).
+        client
+            .execute(
+                "UPDATE search_index SET value_quantity_high = value_quantity_value,
+             value_quantity_canonical_high = value_quantity_canonical_value
+             WHERE tenant_id = $1 AND value_quantity_value IS NOT NULL
+               AND value_quantity_high IS NULL",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
         client
             .batch_execute("ANALYZE resources; ANALYZE search_index")
             .await
@@ -6856,6 +6925,168 @@ mod postgres_integration {
             "UCUM-equivalent quantity (1000 mg) should match stored 1 g"
         );
         assert_eq!(result.resources.items[0].id(), "obs-mass-pg");
+    }
+
+    /// An instance older than #2602 keeps writing after the v56 backfill and
+    /// inserts quantity rows with `value_quantity_high` NULL. The temporary
+    /// trigger fills it, so `eq`/`gt`/`ap` and `_sort` still see those rows.
+    #[tokio::test]
+    async fn postgres_integration_old_writer_quantity_rows_are_filled_by_trigger() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
+        };
+
+        // A database the ladder creates has no trigger. The trigger protects an
+        // UPGRADE from a pre-#2602 build, so own a database, take v56 back out of
+        // it (as that build left it) and migrate again, which is the path that
+        // installs the trigger. Dropping the columns drops the indexes built on
+        // them; the old newest-first index is put back as that build had it.
+        let backend = hfs1407_backend(false).await;
+        {
+            let client = backend.get_client().await.unwrap();
+            let triggers: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_trigger
+                     WHERE tgname = 'trg_search_index_quantity_high' AND NOT tgisinternal",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(triggers, 0, "a fresh database has no trigger");
+            client
+                .batch_execute(
+                    "DROP TRIGGER IF EXISTS trg_search_index_quantity_high ON search_index;
+                     DROP FUNCTION IF EXISTS hfs_search_index_quantity_high();
+                     DROP INDEX IF EXISTS idx_search_quantity_high;
+                     DROP INDEX IF EXISTS idx_search_quantity_canonical_high;
+                     DROP INDEX IF EXISTS idx_search_quantity_range;
+                     DROP INDEX IF EXISTS idx_search_quantity_canonical_range;
+                     ALTER TABLE search_index
+                         DROP COLUMN value_quantity_high,
+                         DROP COLUMN value_quantity_canonical_high;
+                     DROP INDEX IF EXISTS idx_search_quantity_recent;
+                     CREATE INDEX idx_search_quantity_recent
+                         ON search_index (tenant_id, resource_type, param_name,
+                                          last_updated DESC, resource_id ASC)
+                         INCLUDE (value_quantity_value, value_quantity_unit)
+                         WHERE value_quantity_value IS NOT NULL;
+                     DELETE FROM schema_version;
+                     INSERT INTO schema_version (version) VALUES (55);",
+                )
+                .await
+                .expect("take v56 back out of the database");
+        }
+        backend
+            .init_schema()
+            .await
+            .expect("migrate v55 to v56 as an upgrade");
+        {
+            let client = backend.get_client().await.unwrap();
+            let triggers: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_trigger
+                     WHERE tgname = 'trg_search_index_quantity_high'
+                       AND tgrelid = 'search_index'::regclass AND NOT tgisinternal",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(triggers, 1, "the upgrade installs the trigger exactly once");
+        }
+        let tenant = create_tenant("old-writer-quantity");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        for (id, value) in [("ow-10", 10), ("ow-20", 20), ("ow-30", 30)] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": "x" }] },
+                        "valueQuantity": { "value": value, "unit": "g", "system": "http://unitsofmeasure.org", "code": "g" }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // Re-insert each quantity row the way an old build does: the same
+        // columns, but no upper bound.
+        let client = backend.get_client().await.unwrap();
+        let moved = client
+            .execute(
+                "WITH d AS (
+                     DELETE FROM search_index
+                     WHERE tenant_id = $1 AND param_name = 'value-quantity'
+                     RETURNING *)
+                 INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                     value_quantity_value, value_quantity_unit, value_quantity_system,
+                     value_quantity_canonical_value, value_quantity_canonical_unit, last_updated)
+                 SELECT tenant_id, resource_type, resource_id, param_name,
+                     value_quantity_value, value_quantity_unit, value_quantity_system,
+                     value_quantity_canonical_value, value_quantity_canonical_unit, last_updated
+                 FROM d",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved, 3);
+        let unfilled: i64 = client
+            .query_one(
+                "SELECT count(*) FROM search_index
+                 WHERE tenant_id = $1 AND param_name = 'value-quantity'
+                   AND (value_quantity_high IS DISTINCT FROM value_quantity_value
+                        OR value_quantity_canonical_high IS DISTINCT FROM value_quantity_canonical_value)",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(unfilled, 0, "the trigger must fill high at insert");
+        drop(client);
+
+        let find = |value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::parse(value)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        for (value, expected) in [
+            ("gt15", vec!["ow-20", "ow-30"]),
+            ("20", vec!["ow-20"]),
+            ("ap20", vec!["ow-20"]),
+        ] {
+            let result = backend.search(&tenant, &find(value)).await.unwrap();
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, expected, "value-quantity={value}");
+        }
+        let sorted =
+            SearchQuery::new("Observation").with_sort(SortDirective::parse("-value-quantity"));
+        let ids: Vec<String> = backend
+            .search(&tenant, &sorted)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ids, ["ow-30", "ow-20", "ow-10"]);
     }
 
     #[tokio::test]
@@ -9039,6 +9270,18 @@ mod postgres_integration {
         client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_reference) SELECT $1,'Observation','quantity-'||n,'patient',CASE WHEN n<=32 THEN 'Patient/anchor' ELSE 'Patient/decoy-'||n END FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
         client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) SELECT $1,'Observation','quantity-'||n,'code','http://loinc.org','8302-2' FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
         client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_quantity_value,value_quantity_unit,value_quantity_canonical_value,value_quantity_canonical_unit) SELECT $1,'Observation','quantity-'||n,'value-quantity',CASE WHEN n<=8 OR n>32 THEN 160 ELSE 90 END,'cm',CASE WHEN n<=8 OR n>32 THEN 1.6 ELSE 0.9 END,'m' FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
+        // Fixture rows are written by hand, so give each the upper bound the
+        // storage writer would (a point: high = value, #2602).
+        client
+            .execute(
+                "UPDATE search_index SET value_quantity_high = value_quantity_value,
+             value_quantity_canonical_high = value_quantity_canonical_value
+             WHERE tenant_id = $1 AND value_quantity_value IS NOT NULL
+               AND value_quantity_high IS NULL",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
         client
             .batch_execute("ANALYZE resources; ANALYZE search_index")
             .await
@@ -9360,9 +9603,10 @@ mod postgres_integration {
              CASE WHEN n <= 165 THEN 'Patient/anchor' ELSE 'Patient/decoy-' || n%12 END \
              FROM generate_series(1, 2165) n", &[&tenant_id]).await.unwrap();
         client.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, composite_group, value_token_system, value_token_code, value_quantity_value) \
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, composite_group, value_token_system, value_token_code, value_quantity_value, value_quantity_high) \
              SELECT $1, 'Observation', 'plan-' || n, 'code-value-quantity', 0, 'http://loinc.org', \
              CASE WHEN n <= 3 OR n > 165 THEN '8302-2' ELSE '1234' END, \
+             CASE WHEN n <= 3 OR n > 165 THEN 164.1 ELSE 50 END, \
              CASE WHEN n <= 3 OR n > 165 THEN 164.1 ELSE 50 END \
              FROM generate_series(1, 2165) n", &[&tenant_id]).await.unwrap();
         // Real Observation writes also index these seven parameter names;
@@ -13073,9 +13317,12 @@ mod postgres_integration {
             .clone()
             .with_sort(SortDirective::parse("_lastUpdated"));
         let asc = backend.search(&tenant, &ascending).await.unwrap();
+        // Three observations share each day; ascending `_lastUpdated` breaks
+        // those ties by `id DESC`, the backward scan of
+        // `idx_resources_search` (#2603).
         assert_eq!(
             page_ids(&asc),
-            vec!["obs-01", "obs-02", "obs-03", "obs-04", "obs-05"]
+            vec!["obs-03", "obs-02", "obs-01", "obs-06", "obs-05"]
         );
         let repeated = explicit.with_parameter(default.parameters[0].clone());
         assert_eq!(
@@ -35506,6 +35753,149 @@ mod postgres_integration {
             .await;
     }
 
+    /// #2962: an `instant` written to the second was indexed as the whole
+    /// second, so `eq…:00.000Z` missed it and `gt…:00.500Z` found it. It is
+    /// the point `[t, t + 1 µs)` now; a `dateTime` keeps its range.
+    #[tokio::test]
+    async fn postgres_integration_date_instant_targets_are_points() {
+        let backend = create_backend().await;
+        super::date_instant_suite::instant_targets_are_points(
+            &backend,
+            &unique_base("date_instant"),
+        )
+        .await;
+    }
+
+    /// [`create_backend`] configured for `version`, with that version's
+    /// search parameters loaded.
+    async fn create_backend_for(version: FhirVersion) -> PostgresBackend {
+        let mut config = create_backend().await.config().clone();
+        config.fhir_version = version;
+        PostgresBackend::new(config)
+            .await
+            .expect("Failed to create PostgresBackend")
+    }
+
+    /// #2962: the backend's configured FHIR version decides which elements
+    /// are `instant`s; R6 makes `DiagnosticReport.issued` a `dateTime`.
+    #[cfg(feature = "R6")]
+    #[tokio::test]
+    async fn postgres_integration_date_instant_types_follow_an_r6_backend() {
+        let backend = create_backend_for(FhirVersion::R6).await;
+        super::date_instant_suite::r6_backend_types_by_r6(
+            &backend,
+            &unique_base("date_instant_r6"),
+        )
+        .await;
+    }
+
+    /// The R4 control for the R6 case.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn postgres_integration_date_instant_types_follow_an_r4_backend() {
+        let backend = create_backend_for(FhirVersion::R4).await;
+        super::date_instant_suite::r4_backend_types_by_r4(
+            &backend,
+            &unique_base("date_instant_r4"),
+        )
+        .await;
+    }
+
+    /// R5's `ImagingSelection.issued`, an `instant` that R4 does not have.
+    #[cfg(feature = "R5")]
+    #[tokio::test]
+    async fn postgres_integration_date_instant_types_follow_an_r5_backend() {
+        let backend = create_backend_for(FhirVersion::R5).await;
+        super::date_instant_suite::r5_backend_types_by_r5(
+            &backend,
+            &unique_base("date_instant_r5"),
+        )
+        .await;
+    }
+
+    /// #2602: `gt`/`ge`/`eb` filter on `value_quantity_high`, so a selective
+    /// one must be served by `idx_search_quantity_high`, not a scan.
+    #[tokio::test]
+    async fn postgres_integration_quantity_high_index_serves_upper_bound_prefixes() {
+        use helios_persistence::backends::postgres::search::query_builder::{
+            PostgresQueryBuilder, SqlParam,
+        };
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("quantity-high-explain");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        client.execute(
+            "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+             SELECT $1, 'Condition', 'qh-' || series, '1',
+                    jsonb_build_object('resourceType', 'Condition', 'id', 'qh-' || series),
+                    '2020-01-01T00:00:00Z', FALSE FROM generate_series(1, 40000) series",
+            &[&tenant_id],
+        ).await.unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+             value_quantity_value, value_quantity_high, last_updated)
+             SELECT $1, 'Condition', 'qh-' || series, 'onset-age',
+                    series % 1000, series % 1000, '2020-01-01T00:00:00Z'
+             FROM generate_series(1, 40000) series",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        client.batch_execute("ANALYZE search_index").await.unwrap();
+        // The predicate is the one the builder really emits for the search, not
+        // a hand-written one: whatever it adds or omits is what must be served.
+        for (prefix, value) in [(SearchPrefix::Gt, "990"), (SearchPrefix::Eb, "10")] {
+            let query = SearchQuery::new("Condition").with_parameter(SearchParameter {
+                name: "onset-age".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
+                .expect("the query builds")
+                .expect("a condition");
+            let mut predicate = PostgresQueryBuilder::single_index_predicate(&fragment.sql)
+                .expect("a lone membership test")
+                .to_string();
+            for (i, param) in fragment.params.iter().enumerate().rev() {
+                let SqlParam::Float(v) = param else {
+                    panic!("unexpected bind {param:?}");
+                };
+                predicate = predicate.replace(&format!("${}", i + 3), &format!("({v:?}::float8)"));
+            }
+            let sql = format!(
+                "EXPLAIN (FORMAT JSON) SELECT resource_id FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Condition' AND {predicate}"
+            );
+            let plan: serde_json::Value =
+                client.query_one(&sql, &[&tenant_id]).await.unwrap().get(0);
+            let text = plan.to_string();
+            assert!(
+                text.contains("idx_search_quantity_high"),
+                "{prefix:?}: expected idx_search_quantity_high: {text}\n{sql}"
+            );
+        }
+    }
+
+    /// #2602: a `Range` was not indexed for quantity parameters. It is one
+    /// closed `[value_quantity_value, value_quantity_high]` interval now.
+    #[tokio::test]
+    async fn postgres_integration_quantity_range_targets_are_intervals() {
+        let backend = create_backend().await;
+        super::quantity_range_suite::quantity_ranges_are_intervals(
+            &backend,
+            &unique_base("quantity_range"),
+        )
+        .await;
+    }
+
     /// #1606: PostgreSQL sorted a missing value as the largest, so it came
     /// first descending. It comes last both ways now.
     #[tokio::test]
@@ -35519,12 +35909,1046 @@ mod postgres_integration {
         .await;
     }
 
+    /// #2603: resources sharing one `last_updated` page forward and back with
+    /// no gap or repeat, in the default, ascending and descending orders.
+    #[tokio::test]
+    async fn postgres_integration_tied_timestamps_page_without_gaps() {
+        let backend = create_backend().await;
+        let pin_backend = backend.clone();
+        super::tiebreak_order_suite::tied_timestamps_page_without_gaps(
+            &backend,
+            &unique_base("tiebreak"),
+            async |tenant_id: &str, resource_type: &str| {
+                let client = pin_backend.get_client().await.unwrap();
+                let at = tie_instant();
+                let changed = client
+                    .execute(
+                        "UPDATE resources SET last_updated = $1 \
+                         WHERE tenant_id = $2 AND resource_type = $3",
+                        &[&at, &tenant_id, &resource_type],
+                    )
+                    .await
+                    .unwrap();
+                assert!(changed > 0, "no {resource_type} rows to pin");
+                client
+                    .execute(
+                        "UPDATE search_index SET last_updated = $1 \
+                         WHERE tenant_id = $2 AND resource_type = $3",
+                        &[&at, &tenant_id, &resource_type],
+                    )
+                    .await
+                    .unwrap();
+            },
+        )
+        .await;
+    }
+
+    /// #2603: the shared tie suite walks unfiltered searches only. A filter
+    /// takes other statements: `active=true` sorted descending (or by
+    /// default) picks its page from `search_index` (`resource_id` keyset, the
+    /// index-selected fast path), and ascending filters `resources` through a
+    /// membership subquery. Both must page through a tie with no gap or
+    /// repeat, forward and back, whatever the page size.
+    #[tokio::test]
+    async fn postgres_integration_filtered_tied_timestamps_page_without_gaps() {
+        use helios_persistence::core::{ResourceStorage, SearchProvider};
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirection,
+            SortDirective,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("tiebreak-filtered");
+        let tenant_id = tenant.tenant_id().as_str();
+        let ids = [
+            "t-5", "t-2", "t-9", "t-1", "t-7", "t-3", "t-8", "t-4", "t-6", "t-0",
+        ];
+        for id in ids {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "active": true}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // A non-matching resource on the same instant must stay out.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "t-off", "active": false}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let client = backend.get_client().await.unwrap();
+        for table in ["resources", "search_index"] {
+            client
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET last_updated = $1 \
+                         WHERE tenant_id = $2 AND resource_type = 'Patient'"
+                    ),
+                    &[&tie_instant(), &tenant_id],
+                )
+                .await
+                .unwrap();
+        }
+        drop(client);
+
+        let query = |sort: Option<SortDirection>, count: u32| {
+            let mut q = SearchQuery::new("Patient")
+                .with_count(count)
+                .with_parameter(SearchParameter {
+                    name: "active".to_string(),
+                    param_type: SearchParamType::Token,
+                    modifier: None,
+                    values: vec![SearchValue::eq("true")],
+                    chain: vec![],
+                    components: vec![],
+                });
+            if let Some(direction) = sort {
+                q = q.with_sort(SortDirective {
+                    parameter: "_lastUpdated".to_string(),
+                    direction,
+                    param_type: None,
+                });
+            }
+            q
+        };
+        let page = async |q: SearchQuery| {
+            let r = backend.search(&tenant, &q).await.unwrap();
+            let ids = r
+                .resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>();
+            (ids, r.resources.page_info)
+        };
+        let mut expected = ids.map(str::to_string).to_vec();
+        expected.sort();
+        for sort in [
+            None,
+            Some(SortDirection::Ascending),
+            Some(SortDirection::Descending),
+        ] {
+            let (single, _) = page(query(sort, 100)).await;
+            let mut sorted = single.clone();
+            sorted.sort();
+            assert_eq!(sorted, expected, "{sort:?}: one full page");
+            for count in 1..=4 {
+                let mut forward = Vec::new();
+                let (mut ids, mut info) = page(query(sort, count)).await;
+                for _ in 0..=expected.len() {
+                    forward.extend(ids.clone());
+                    match info.next_cursor.clone().filter(|_| info.has_next) {
+                        Some(c) => (ids, info) = page(query(sort, count).with_cursor(c)).await,
+                        None => break,
+                    }
+                }
+                assert_eq!(forward, single, "{sort:?} _count={count}: forward walk");
+                let mut backward = ids;
+                for _ in 0..=expected.len() {
+                    match info.previous_cursor.clone().filter(|_| info.has_previous) {
+                        Some(c) => {
+                            let (mut before, before_info) =
+                                page(query(sort, count).with_cursor(c)).await;
+                            before.extend(backward);
+                            backward = before;
+                            info = before_info;
+                        }
+                        None => break,
+                    }
+                }
+                assert_eq!(backward, forward, "{sort:?} _count={count}: walk back");
+            }
+        }
+    }
+
+    /// #2603: a cursor page of `_sort=_lastUpdated` ordered `last_updated ASC,
+    /// id ASC`, which `idx_resources_search` (`last_updated DESC, id ASC`)
+    /// serves in neither direction, so every page sorted all the rows after
+    /// the cursor. Its tiebreak runs `id DESC` now, the index's backward scan;
+    /// the `Previous` page is the mirror, its forward scan. Neither plan may
+    /// sort (not even an Incremental Sort over `idx_resources_updated`, which
+    /// the planner chose before the redundant `last_updated >=`/`<=` bound),
+    /// and each page reads about one page of index entries however deep the
+    /// cursor is: without the bound the scan filtered every entry before it.
+    #[tokio::test]
+    async fn postgres_integration_ascending_last_updated_cursor_pages_do_not_sort() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CursorDirection, SearchQuery, SortDirection, SortDirective,
+        };
+
+        fn nodes<'a>(plan: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            out.push(plan);
+            if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
+        }
+
+        const ROWS: i64 = 4000;
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        // Keep one session for the cached search statements, so they can be
+        // found and EXPLAINed on it.
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let tenant = create_tenant("asc-last-updated-plan");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        // Pairs of resources share one `last_updated`, so the tiebreak matters.
+        // Another type shares the tenant and the instants, as in any real
+        // tenant: with one type only, `idx_resources_updated` (`tenant_id,
+        // last_updated`) is as selective as `idx_resources_search` and the
+        // planner may take it plus an Incremental Sort of each tie group.
+        for resource_type in ["Patient", "Observation"] {
+            client
+                .execute(
+                    "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                     SELECT $1, $3, 'p-' || lpad(series::text, 5, '0'), '1',
+                            jsonb_build_object('resourceType', $3::text, 'id', 'p-' || lpad(series::text, 5, '0')),
+                            TIMESTAMPTZ '2020-01-01T00:00:00Z' + (series / 2) * INTERVAL '1 second',
+                            FALSE FROM generate_series(1, $2::bigint) series",
+                    &[&tenant_id, &ROWS, &resource_type],
+                )
+                .await
+                .unwrap();
+        }
+        client.batch_execute("ANALYZE resources").await.unwrap();
+        drop(client);
+
+        let ascending = || {
+            SearchQuery::new("Patient")
+                .with_count(20)
+                .with_sort(SortDirective {
+                    parameter: "_lastUpdated".to_string(),
+                    direction: SortDirection::Ascending,
+                    param_type: None,
+                })
+        };
+        // The walk the plans are taken from: first page, its next page, and
+        // that page's previous page back.
+        let first = backend.search(&tenant, &ascending()).await.unwrap();
+        let ids = |r: &helios_persistence::core::SearchResult| {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>()
+        };
+        // `series / 2` puts p-00001 alone first, then p-00003 before p-00002.
+        assert_eq!(ids(&first)[..3], ["p-00001", "p-00003", "p-00002"]);
+        let next = backend
+            .search(
+                &tenant,
+                &ascending().with_cursor(first.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        // The tie p-00020/p-00021 straddles the page boundary.
+        assert_eq!(ids(&first)[19], "p-00021");
+        assert_eq!(ids(&next)[0], "p-00020");
+        let back = backend
+            .search(
+                &tenant,
+                &ascending().with_cursor(next.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&back), ids(&first));
+        // The pool's one free session, which prepared the statements above.
+        let client = backend.get_client().await.unwrap();
+
+        // A cursor deep in the type, so a plan that filters its way to the
+        // cursor instead of seeking it would read thousands of entries.
+        let deep_at = "2020-01-01T00:25:00Z"; // series 3000 and 3001
+        let deep_id = "p-03001";
+        for (direction, order, scan) in [
+            (
+                CursorDirection::Next,
+                "ORDER BY last_updated ASC, id DESC",
+                "Backward",
+            ),
+            (
+                CursorDirection::Previous,
+                "ORDER BY last_updated DESC, id ASC",
+                "Forward",
+            ),
+        ] {
+            let statement: String = client
+                .query_one(
+                    "SELECT name FROM pg_prepared_statements
+                     WHERE statement LIKE 'SELECT id, version_id, data, last_updated%'
+                       AND statement LIKE '%FROM resources%'
+                       AND statement LIKE '%' || $1 || '%'
+                       AND cardinality(parameter_types) = 4",
+                    &[&order],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{direction:?}: no cached cursor statement: {e}"))
+                .get(0);
+            // The walk prepared this statement; the deep cursor is bound by
+            // hand rather than walking 150 pages to reach it.
+            // `force_custom_plan` is the backend's default plan cache mode
+            // (`PostgresPlanCacheMode`). A generic plan is not asserted: in
+            // this shared, many-tenant test database it estimates
+            // `tenant_id = $1` at a handful of rows and may pick a bitmap scan
+            // and a top-N sort, which says nothing about a real deployment.
+            client
+                .batch_execute("SET plan_cache_mode = force_custom_plan")
+                .await
+                .unwrap();
+            let plan: serde_json::Value = client
+                .query_one(
+                    &format!(
+                        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{}\" \
+                         ('{tenant_id}', 'Patient', '{deep_at}', '{deep_id}')",
+                        statement.replace('"', "\"\"")
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            eprintln!("[2603] {direction:?}: {plan}");
+            let mut all = vec![];
+            nodes(&plan[0]["Plan"], &mut all);
+            assert!(
+                !all.iter()
+                    .any(|n| n["Node Type"].as_str().is_some_and(|t| t.ends_with("Sort"))),
+                "{direction:?}: the page sorted: {plan}"
+            );
+            let scan_node = all
+                .iter()
+                .find(|n| n["Index Name"] == "idx_resources_search")
+                .unwrap_or_else(|| panic!("{direction:?}: idx_resources_search unused: {plan}"));
+            assert_eq!(scan_node["Scan Direction"], scan, "{direction:?}: {plan}");
+            let read = scan_node["Actual Rows"].as_u64().unwrap()
+                + scan_node["Rows Removed by Filter"].as_u64().unwrap_or(0);
+            assert!(
+                read <= 25,
+                "{direction:?}: read {read} index entries for a 20-row page: {plan}"
+            );
+        }
+        client.batch_execute("RESET plan_cache_mode").await.unwrap();
+    }
+
     /// #1711: an untyped meta-parameter sort fell back to `ORDER BY id`.
     #[tokio::test]
     async fn postgres_integration_meta_params_sort_by_value() {
         let backend = create_backend().await;
         super::sort_meta_suite::meta_params_sort_by_value(&backend, &unique_base("sort_meta"))
             .await;
+    }
+
+    /// #2731: the ordered date-index walk and the general path return the same
+    /// pages, cursors and totals.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_matches_the_general_path() {
+        let backend = create_backend().await;
+        super::unfiltered_date_sort_suite::unfiltered_date_sort_matches_the_general_path(
+            &backend,
+            &unique_base("date_walk"),
+        )
+        .await;
+    }
+
+    /// Seeds `rows` Observations with one `date` index row each (second
+    /// resolution) straight into an isolated database, and analyzes it.
+    async fn seed_date_walk_rows(backend: &PostgresBackend, tenant_id: &str, rows: i64) {
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), '1',
+                        jsonb_build_object('resourceType', 'Observation', 'id', 'o-' || lpad(series::text, 6, '0')),
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z', FALSE
+                 FROM generate_series(1, $2::bigint) series",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                                           value_date, value_date_end, last_updated)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), 'date',
+                        TIMESTAMPTZ '2018-01-01T00:00:00Z' + (series * 7919 % 100000) * INTERVAL '1 minute',
+                        TIMESTAMPTZ '2018-01-01T00:00:00Z' + (series * 7919 % 100000) * INTERVAL '1 minute'
+                            + INTERVAL '1 second',
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, $2::bigint) series",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .batch_execute("ANALYZE resources; ANALYZE search_index")
+            .await
+            .unwrap();
+    }
+
+    /// Seeds `rows` Observations shaped like a real type: four more indexed
+    /// parameters per resource (`code`, `status`, `subject`, `category`), one
+    /// resource in ten without a `date` (`series % 10 = 0`), and one in twenty
+    /// with two `date` rows (`series % 20 = 1`); then analyzes.
+    ///
+    /// The other parameters are what a narrow seed hides: they put several
+    /// rows per resource behind `idx_search_resource` and make the date slice a
+    /// fraction of the table, which is what the planner weighs when it picks
+    /// how to probe a resource for a missing date.
+    async fn seed_realistic_date_walk_rows(backend: &PostgresBackend, tenant_id: &str, rows: i64) {
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), '1',
+                        jsonb_build_object('resourceType', 'Observation', 'id', 'o-' || lpad(series::text, 6, '0')),
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z', FALSE
+                 FROM generate_series(1, $2::bigint) series",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                                           value_date, value_date_end, last_updated)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), 'date',
+                        TIMESTAMPTZ '2018-01-01T00:00:00Z' + (series * 7919 % 100000 + copy * 50000) * INTERVAL '1 minute',
+                        TIMESTAMPTZ '2018-01-01T00:00:00Z' + (series * 7919 % 100000 + copy * 50000) * INTERVAL '1 minute'
+                            + INTERVAL '1 second',
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, $2::bigint) series
+                 CROSS JOIN generate_series(0, 1) copy
+                 WHERE series % 10 <> 0 AND (copy = 0 OR series % 20 = 1)",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                                           value_token_system, value_token_code, value_reference,
+                                           last_updated)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), p.name,
+                        CASE p.name WHEN 'code' THEN 'http://loinc.org'
+                                    WHEN 'category' THEN 'http://terminology.hl7.org/CodeSystem/observation-category'
+                                    ELSE NULL END,
+                        CASE p.name WHEN 'code' THEN 'c-' || (series % 50)
+                                    WHEN 'status' THEN 'final'
+                                    WHEN 'category' THEN 'cat-' || (series % 5)
+                                    ELSE NULL END,
+                        CASE p.name WHEN 'subject' THEN 'Patient/p-' || (series % 500) ELSE NULL END,
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, $2::bigint) series
+                 CROSS JOIN (VALUES ('code'), ('status'), ('subject'), ('category')) p(name)",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .batch_execute("ANALYZE resources; ANALYZE search_index")
+            .await
+            .unwrap();
+    }
+
+    fn date_sort_query(
+        direction: helios_persistence::types::SortDirection,
+    ) -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{SearchParamType, SearchQuery, SortDirective};
+        SearchQuery::new("Observation")
+            .with_count(20)
+            .with_sort(SortDirective {
+                parameter: "date".to_string(),
+                direction,
+                param_type: Some(SearchParamType::Date),
+            })
+    }
+
+    /// #2731: the unfiltered date sort reads the date index in order. No node
+    /// of the plan is a per-resource subplan or a sequential scan of
+    /// `resources`, the right index serves each direction, and a page reads
+    /// about a page of index entries, not the type.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_walks_the_date_index() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SortDirection;
+
+        fn nodes<'a>(plan: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            out.push(plan);
+            if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
+        }
+
+        const ROWS: i64 = 20_000;
+        let backend = hfs1407_backend(false).await;
+        // Keep one session for the cached statements, so they can be found on
+        // the pool's other one.
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let tenant = create_tenant("date-walk-plan");
+        let tenant_id = tenant.tenant_id().as_str();
+        seed_date_walk_rows(&backend, tenant_id, ROWS).await;
+
+        for (direction, order, index) in [
+            (
+                SortDirection::Descending,
+                "ORDER BY si.value_date_end DESC",
+                "idx_search_date_end",
+            ),
+            (
+                SortDirection::Ascending,
+                "ORDER BY si.value_date ASC",
+                "idx_search_date",
+            ),
+        ] {
+            let page = backend
+                .search(&tenant, &date_sort_query(direction))
+                .await
+                .unwrap();
+            assert_eq!(page.resources.items.len(), 20);
+            assert!(page.resources.page_info.has_next);
+
+            let client = backend.get_client().await.unwrap();
+            let statement: String = client
+                .query_one(
+                    "SELECT name FROM pg_prepared_statements
+                     WHERE statement LIKE 'SELECT r.id, r.version_id%'
+                       AND statement LIKE '%FROM search_index si%'
+                       AND statement LIKE '%' || $1 || '%'
+                       AND cardinality(parameter_types) = 2",
+                    &[&order],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{direction:?}: no cached walk statement: {e}"))
+                .get(0);
+            client
+                .batch_execute("SET plan_cache_mode = force_custom_plan")
+                .await
+                .unwrap();
+            let plan: serde_json::Value = client
+                .query_one(
+                    &format!(
+                        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{}\" ('{tenant_id}', 'Observation')",
+                        statement.replace('"', "\"\"")
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            eprintln!("[2731] {direction:?}: {plan}");
+            let mut all = vec![];
+            nodes(&plan[0]["Plan"], &mut all);
+            // The sort key is not a per-resource subplan.
+            assert!(
+                !all.iter().any(|n| n["Parent Relationship"] == "SubPlan"
+                    && n["Index Name"] == "idx_search_resource"),
+                "{direction:?}: a per-resource subplan drives the sort: {plan}"
+            );
+            assert!(
+                !all.iter()
+                    .any(|n| n["Node Type"] == "Seq Scan" && n["Relation Name"] == "resources"),
+                "{direction:?}: sequential scan of resources: {plan}"
+            );
+            let scan = all
+                .iter()
+                .find(|n| n["Index Name"] == index)
+                .unwrap_or_else(|| panic!("{direction:?}: {index} unused: {plan}"));
+            let read = scan["Actual Rows"].as_u64().unwrap()
+                * scan["Actual Loops"].as_u64().unwrap_or(1).max(1);
+            assert!(
+                read <= 200,
+                "{direction:?}: read {read} entries of {index} for a 20-row page of {ROWS}: {plan}"
+            );
+            client.batch_execute("RESET plan_cache_mode").await.unwrap();
+        }
+    }
+
+    /// Every node of an `EXPLAIN (FORMAT JSON)` plan, subplans included.
+    fn date_walk_plan_nodes<'a>(plan: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+        out.push(plan);
+        if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
+            for child in children {
+                date_walk_plan_nodes(child, out);
+            }
+        }
+    }
+
+    /// Index entries a plan node read over all its loops: what it returned
+    /// plus what its filter threw away, both per-loop averages in the plan.
+    fn date_walk_node_reads(node: &serde_json::Value) -> u64 {
+        let per_loop = node["Actual Rows"].as_u64().unwrap_or(0)
+            + node["Rows Removed by Filter"].as_u64().unwrap_or(0)
+            + node["Rows Removed by Index Recheck"].as_u64().unwrap_or(0);
+        per_loop * node["Actual Loops"].as_u64().unwrap_or(1).max(1)
+    }
+
+    /// `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` of a statement the backend
+    /// cached on this session, run with `args` (SQL literals) under the
+    /// `plan_cache_mode` given.
+    async fn explain_cached_date_walk_statement(
+        client: &deadpool_postgres::Client,
+        name: &str,
+        args: &str,
+        plan_cache_mode: &str,
+    ) -> serde_json::Value {
+        client
+            .batch_execute(&format!("SET plan_cache_mode = {plan_cache_mode}"))
+            .await
+            .unwrap();
+        let plan: serde_json::Value = client
+            .query_one(
+                &format!(
+                    "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{}\" ({args})",
+                    name.replace('"', "\"\"")
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        client.batch_execute("RESET plan_cache_mode").await.unwrap();
+        plan
+    }
+
+    /// The plan reads a bounded amount: no date-index node and no sequential
+    /// scan repeated per outer row beyond `max_reads` entries, no sequential
+    /// scan of `resources` or `search_index` at all, and at most `max_blocks`
+    /// buffers in total.
+    fn assert_date_walk_plan_bounded(
+        plan: &serde_json::Value,
+        label: &str,
+        max_reads: u64,
+        max_blocks: u64,
+    ) {
+        let mut all = vec![];
+        date_walk_plan_nodes(&plan[0]["Plan"], &mut all);
+        for node in &all {
+            // Every index, the date ones first among them: a merge join that
+            // scans the type's `idx_search_resource` from its start, or a probe
+            // of the date slice per resource, reads far past a page.
+            if let Some(index) = node["Index Name"].as_str() {
+                let reads = date_walk_node_reads(node);
+                assert!(
+                    reads <= max_reads,
+                    "{label}: {index} read {reads} entries over {} loops: {plan}",
+                    node["Actual Loops"]
+                );
+            }
+            if node["Node Type"] == "Seq Scan" {
+                let relation = node["Relation Name"].as_str().unwrap_or_default();
+                assert!(
+                    relation != "resources" && relation != "search_index",
+                    "{label}: sequential scan of {relation} ({} loops): {plan}",
+                    node["Actual Loops"]
+                );
+            }
+            // A per-resource probe must seek by resource, not scan a slice.
+            // A `Materialize` is the exception: its child reads the slice once
+            // (bounded above) and the rescans are in memory. The planner picks
+            // it for a small slice (386 rows x 210 loops, 6 ms, on the 1,000
+            // resource tenant); bound the in-memory work all the same.
+            if node["Node Type"] == "Materialize" {
+                let rescanned = date_walk_node_reads(node);
+                assert!(
+                    rescanned <= 100 * max_reads,
+                    "{label}: a Materialize rescanned {rescanned} rows: {plan}"
+                );
+            } else if node["Actual Loops"].as_u64().unwrap_or(1) > 1 {
+                let per_loop = node["Actual Rows"].as_u64().unwrap_or(0)
+                    + node["Rows Removed by Filter"].as_u64().unwrap_or(0);
+                assert!(
+                    per_loop <= 64,
+                    "{label}: a {} node repeated {} times reads {per_loop} rows each: {plan}",
+                    node["Node Type"],
+                    node["Actual Loops"]
+                );
+            }
+        }
+        let top = &plan[0]["Plan"];
+        let blocks = top["Shared Hit Blocks"].as_u64().unwrap_or(0)
+            + top["Shared Read Blocks"].as_u64().unwrap_or(0);
+        assert!(
+            blocks <= max_blocks,
+            "{label}: {blocks} buffers for one statement: {plan}"
+        );
+    }
+
+    /// #2731: the two statements of the walk that read past the keyed part
+    /// stay bounded on a realistically shaped type. The tail (resources with
+    /// no date, by id) is probed per resource, so its probe must seek the
+    /// resource's own rows; the keyed count (run only for an `_offset` past
+    /// the keyed part, so on a type of at most `DATE_WALK_MAX_OFFSET` dated
+    /// resources) must read that type's date slice, not the table.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_tail_and_count_stay_bounded() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{CursorValue, PageCursor, SortDirection};
+
+        const BIG: i64 = 20_000;
+        const SMALL: i64 = 1_000;
+        let backend = hfs1407_backend(false).await;
+        // Keep one session for the cached statements, so they can be found on
+        // the pool's other one.
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let big = create_tenant("date-walk-tail-big");
+        let small = create_tenant("date-walk-tail-small");
+        seed_realistic_date_walk_rows(&backend, big.tenant_id().as_str(), BIG).await;
+        seed_realistic_date_walk_rows(&backend, small.tenant_id().as_str(), SMALL).await;
+        let ids = |r: &helios_persistence::core::SearchResult| {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>()
+        };
+        // Dated resources of the small tenant: nine in ten.
+        let small_keyed = (SMALL - SMALL / 10) as u32;
+        assert!(small_keyed as usize + 5 <= helios_persistence::types::DATE_WALK_MAX_OFFSET);
+
+        for (direction, desc) in [
+            (SortDirection::Descending, true),
+            (SortDirection::Ascending, false),
+        ] {
+            // The column filter tells the two directions' statements apart.
+            let column_filter = if desc {
+                "statement LIKE '%value_date_end%'"
+            } else {
+                "statement NOT LIKE '%value_date_end%'"
+            };
+
+            // --- The tail, by cursor on an undated resource, both ways --------
+            for (backward, op, first) in [(false, ">", "o-010010"), (true, "<", "o-009990")] {
+                let cursor = if backward {
+                    PageCursor::previous(vec![CursorValue::Null], "o-010000")
+                } else {
+                    PageCursor::new(vec![CursorValue::Null], "o-010000")
+                };
+                let mut walk = date_sort_query(direction);
+                walk.cursor = Some(cursor.encode());
+                let mut general = walk.clone();
+                general.fhir_version = Some(helios_fhir::FhirVersion::default());
+                let walked = backend.search(&big, &walk).await.unwrap();
+                let on_general = backend.search(&big, &general).await.unwrap();
+                let tag = format!("{direction:?} backward={backward}");
+                assert_eq!(ids(&walked), ids(&on_general), "{tag}: tail page");
+                assert_eq!(ids(&walked).len(), 20, "{tag}: tail page");
+                assert!(
+                    ids(&walked).contains(&first.to_string()),
+                    "{tag}: tail page"
+                );
+
+                let client = backend.get_client().await.unwrap();
+                let tail: String = client
+                    .query_one(
+                        &format!(
+                            "SELECT name FROM pg_prepared_statements
+                             WHERE statement LIKE '%NULL::timestamptz AS sort_key%'
+                               AND statement LIKE '%r.id {op} $3%'
+                               AND {column_filter}
+                               AND cardinality(parameter_types) = 3"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{tag}: no cached tail statement: {e}"))
+                    .get(0);
+                for (tenant, from, mode) in [
+                    (&big, "o-000010", "force_custom_plan"),
+                    (&big, "o-010000", "force_custom_plan"),
+                    (&big, "o-019990", "force_custom_plan"),
+                    (&big, "o-010000", "force_generic_plan"),
+                    (&small, "o-000500", "force_custom_plan"),
+                ] {
+                    let plan = explain_cached_date_walk_statement(
+                        &client,
+                        &tail,
+                        &format!("'{}', 'Observation', '{from}'", tenant.tenant_id().as_str()),
+                        mode,
+                    )
+                    .await;
+                    eprintln!("[2731 tail] {tag} from {from} {mode}: {plan}");
+                    // A 21-row page of a type where one resource in ten has
+                    // no date reads about 210 resources in id order and their
+                    // five or six index rows each (about 1,100), wherever the
+                    // cursor is. Reading from the type's first resource
+                    // instead is 50,000 entries at the middle of 20,000.
+                    assert_date_walk_plan_bounded(
+                        &plan,
+                        &format!("{tag} tail from {from} {mode}"),
+                        2_000,
+                        5_000,
+                    );
+                }
+            }
+
+            // --- The keyed count, from an offset past the keyed part ----------
+            let mut walk = date_sort_query(direction);
+            walk.offset = Some(small_keyed + 5);
+            let mut general = walk.clone();
+            general.fhir_version = Some(helios_fhir::FhirVersion::default());
+            let walked = backend.search(&small, &walk).await.unwrap();
+            let on_general = backend.search(&small, &general).await.unwrap();
+            assert_eq!(ids(&walked), ids(&on_general), "{direction:?}: offset tail");
+            assert_eq!(ids(&walked).len(), 20, "{direction:?}: offset tail");
+
+            let client = backend.get_client().await.unwrap();
+            let count: String = client
+                .query_one(
+                    &format!(
+                        "SELECT name FROM pg_prepared_statements
+                         WHERE statement LIKE 'SELECT COUNT(DISTINCT si.resource_id)%'
+                           AND {column_filter}"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{direction:?}: no cached count statement: {e}"))
+                .get(0);
+            let plan = explain_cached_date_walk_statement(
+                &client,
+                &count,
+                &format!("'{}', 'Observation'", small.tenant_id().as_str()),
+                "force_custom_plan",
+            )
+            .await;
+            eprintln!("[2731 count] {direction:?}: {plan}");
+            // About 950 date rows of the small tenant, each matched to its
+            // resource; never the big tenant's 20,000.
+            assert_date_walk_plan_bounded(&plan, &format!("{direction:?} count"), 2_000, 8_000);
+        }
+    }
+
+    /// #2731: a page whose head falls in an equal-key group larger than the
+    /// tie cap is served by the general statement, with the same page; under
+    /// the cap the walk serves it. Paging by cursor across the edge of such a
+    /// group, in either direction, gives the general path's pages.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_tie_cap_falls_back() {
+        use helios_persistence::core::SearchResult;
+        use helios_persistence::types::SortDirection;
+
+        /// Resources in each of the two equal-key groups.
+        const GROUP: usize = 60;
+        /// Below `GROUP`: a page head in either group exceeds it.
+        const LOW_CAP: usize = 50;
+        const HIGH_CAP: usize = helios_persistence::types::DATE_WALK_MAX_TIE_GROUP;
+
+        type View = (Vec<String>, bool, bool, Option<String>, Option<String>);
+        fn view(r: &SearchResult) -> View {
+            (
+                r.resources
+                    .items
+                    .iter()
+                    .map(|x| x.id().to_string())
+                    .collect(),
+                r.has_next(),
+                r.has_previous(),
+                r.next_cursor().cloned(),
+                r.previous_cursor().cloned(),
+            )
+        }
+
+        let backend = hfs1407_backend(false).await;
+        // Keep one session for the cached statements, so they can be found on
+        // the pool's other one.
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let tenant = create_tenant("date-walk-tie-cap");
+        let tenant_id = tenant.tenant_id().as_str();
+        seed_date_walk_rows(&backend, tenant_id, 300).await;
+        // The first GROUP resources share the latest key, the next GROUP the
+        // earliest: a page head in either direction starts in a group.
+        let client = backend.get_client().await.unwrap();
+        for (first, at) in [
+            (1i64, "2030-01-01T00:00:00Z"),
+            (GROUP as i64 + 1, "2000-01-01T00:00:00Z"),
+        ] {
+            client
+                .execute(
+                    "UPDATE search_index SET value_date = $3::text::timestamptz,
+                            value_date_end = $3::text::timestamptz + INTERVAL '1 second'
+                     WHERE tenant_id = $1 AND param_name = 'date'
+                       AND resource_id BETWEEN 'o-' || lpad($2::bigint::text, 6, '0')
+                                           AND 'o-' || lpad(($2::bigint + $4::bigint - 1)::text, 6, '0')",
+                    &[&tenant_id, &first, &at, &(GROUP as i64)],
+                )
+                .await
+                .unwrap();
+        }
+        client.batch_execute("ANALYZE search_index").await.unwrap();
+        drop(client);
+
+        let general = |q: &helios_persistence::types::SearchQuery| {
+            let mut q = q.clone();
+            q.fhir_version = Some(helios_fhir::FhirVersion::default());
+            q
+        };
+        // Whether this session holds a cached walk page statement.
+        let walk_statements = || async {
+            backend
+                .get_client()
+                .await
+                .unwrap()
+                .query_one(
+                    "SELECT count(*) FROM pg_prepared_statements
+                     WHERE statement LIKE 'SELECT r.id, r.version_id%'
+                       AND statement LIKE '%FROM search_index si%'
+                       AND statement LIKE '%NOT EXISTS (SELECT 1 FROM search_index s2%'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        };
+
+        // --- First pages and an offset into a group: low cap, then high -------
+        for (cap, walked) in [(LOW_CAP, false), (HIGH_CAP, true)] {
+            for direction in [SortDirection::Descending, SortDirection::Ascending] {
+                for offset in [None, Some(10u32)] {
+                    let mut q = date_sort_query(direction);
+                    q.offset = offset;
+                    let on_cap = backend
+                        .search_with_date_walk_tie_cap(&tenant, &q, cap)
+                        .await
+                        .unwrap();
+                    let on_general = backend
+                        .search_with_date_walk_tie_cap(&tenant, &general(&q), cap)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        view(&on_cap),
+                        view(&on_general),
+                        "cap {cap} {direction:?} offset {offset:?}"
+                    );
+                }
+            }
+            // The low cap never reached the walk; the high one did.
+            assert_eq!(walk_statements().await > 0, walked, "cap {cap}");
+        }
+
+        // --- Paging by cursor across the edge of a group ----------------------
+        for direction in [SortDirection::Descending, SortDirection::Ascending] {
+            for count in [7u32, 20] {
+                let tag = format!("{direction:?} count={count}");
+                let mut q = date_sort_query(direction);
+                q.count = Some(count);
+                let page = |q: helios_persistence::types::SearchQuery| {
+                    let backend = &backend;
+                    let tenant = &tenant;
+                    async move {
+                        view(
+                            &backend
+                                .search_with_date_walk_tie_cap(tenant, &q, LOW_CAP)
+                                .await
+                                .unwrap(),
+                        )
+                    }
+                };
+                let mut forward: Vec<(View, View)> = Vec::new();
+                let mut cursor: Option<String> = None;
+                loop {
+                    assert!(forward.len() < 100, "{tag}: forward walk does not end");
+                    let mut current = q.clone();
+                    current.cursor = cursor.clone();
+                    let capped = page(current.clone()).await;
+                    let on_general = page(general(&current)).await;
+                    assert_eq!(capped, on_general, "{tag}: forward page {}", forward.len());
+                    cursor = capped.3.clone();
+                    let more = capped.1;
+                    forward.push((capped, on_general));
+                    if !more {
+                        break;
+                    }
+                }
+                let seen: usize = forward.iter().map(|(p, _)| p.0.len()).sum();
+                assert_eq!(seen, 300, "{tag}: every resource once");
+                // Back from the last page to the first.
+                let mut cursor = forward.last().unwrap().0.4.clone();
+                let mut back = 0;
+                while let Some(current_cursor) = cursor.take() {
+                    assert!(back < 100, "{tag}: backward walk does not end");
+                    let mut current = q.clone();
+                    current.cursor = Some(current_cursor);
+                    let capped = page(current.clone()).await;
+                    let on_general = page(general(&current)).await;
+                    assert_eq!(capped, on_general, "{tag}: backward page {back}");
+                    back += 1;
+                    if capped.2 {
+                        cursor = capped.4.clone();
+                    }
+                }
+                assert_eq!(back, forward.len() - 1, "{tag}: backward page count");
+            }
+        }
+    }
+
+    /// #2731: while the date index is invalid (a concurrent build in progress
+    /// or a failed one) the sort falls back to the general statement, with the
+    /// same page.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_falls_back_without_a_valid_index() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SortDirection;
+
+        let backend = hfs1407_backend(false).await;
+        let tenant = create_tenant("date-walk-fallback");
+        seed_date_walk_rows(&backend, tenant.tenant_id().as_str(), 300).await;
+        let ids = |r: &helios_persistence::core::SearchResult| {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        for (direction, index) in [
+            (SortDirection::Descending, "idx_search_date_end"),
+            (SortDirection::Ascending, "idx_search_date"),
+        ] {
+            let walked = backend
+                .search(&tenant, &date_sort_query(direction))
+                .await
+                .unwrap();
+            // Marks the index invalid, as an interrupted `CREATE INDEX
+            // CONCURRENTLY` leaves it. The database is this test's own.
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE pg_index SET indisvalid = FALSE WHERE indexrelid = $1::text::regclass",
+                    &[&index],
+                )
+                .await
+                .unwrap();
+            drop(client);
+            let general = backend
+                .search(&tenant, &date_sort_query(direction))
+                .await
+                .unwrap();
+            assert_eq!(ids(&general), ids(&walked), "{direction:?}");
+            assert_eq!(
+                general.resources.page_info.has_next,
+                walked.resources.page_info.has_next
+            );
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE pg_index SET indisvalid = TRUE WHERE indexrelid = $1::text::regclass",
+                    &[&index],
+                )
+                .await
+                .unwrap();
+        }
     }
 
     /// #1336: a repeated parameter under `_contained` is a conjunction on one
@@ -35677,6 +37101,18 @@ mod postgres_integration {
         super::token_code_system_suite::system_qualified_tokens_in_chains(
             &backend,
             &unique_base("token_code_system_chain"),
+        )
+        .await;
+    }
+
+    /// #2965: `system|` matches an Identifier with no value and a Coding with
+    /// no code.
+    #[tokio::test]
+    async fn postgres_integration_system_only_tokens_match_system_pipe() {
+        let backend = create_backend().await;
+        super::token_system_only_suite::system_only_tokens_match_system_pipe(
+            &backend,
+            &unique_base("token_system_only"),
         )
         .await;
     }

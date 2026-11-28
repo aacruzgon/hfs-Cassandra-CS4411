@@ -26,11 +26,10 @@ use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, Utc};
 use helios_persistence::backends::cassandra::CassandraBackend;
 use helios_persistence::core::ResourceStorage;
-use helios_persistence::error::{
-    BackendError, ResourceError, StorageError, TenantError, ValidationError,
-};
+use helios_persistence::error::{BackendError, ResourceError, StorageError, TenantError};
 use helios_persistence::tenant::{TenantContext, TenantPermissions};
 use serde_json::json;
+use sha2::Digest;
 
 use crate::backend_skeleton::backend;
 use crate::cassandra_node::{
@@ -400,11 +399,66 @@ async fn cassandra_create_writes_every_cell_and_no_null() {
     assert_eq!(col::<i64>(row, "write_ts"), ts);
     let write_id: uuid::Uuid = row.get_r_by_name("write_id").unwrap();
     let index_keys = col::<Blob>(row, "index_keys").into_vec();
-    assert_eq!(
-        index_keys,
-        vec![0x01, 0x01, 0x01],
-        "K(1) = {{resources_by_type}}"
+    // Format 1 (`schema.cql`): the format byte, a one-byte row count, then
+    // rows each led by a table tag. The set holds the `resources_by_type`
+    // key (tag 1, first as the set is sorted) and the extracted keys of the
+    // body's `gender` and `birthDate`, so how many there are depends on the
+    // FHIR version's search parameters.
+    assert_eq!(index_keys[0], 0x01, "format 1");
+    assert!(
+        (2..0x80).contains(&index_keys[1]),
+        "K(1) holds more than the resources_by_type key: {index_keys:?}"
     );
+    assert_eq!(index_keys[2], 0x01, "K(1) holds the resources_by_type key");
+    // The body's `gender` and `birthDate` are read from their own tables,
+    // since the blob is private to the crate.
+    let tenant_id = tenant.tenant_id().as_str();
+    let rows = query(
+        &cql,
+        "SELECT id, version_id FROM token_code_index \
+         WHERE tenant_id = ? AND resource_type = 'Patient' AND param = 'gender' AND code = 'male'",
+        vec![Value::from(tenant_id)],
+        Consistency::LocalQuorum,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "the gender token row");
+    assert_eq!(col::<String>(&rows[0], "id"), "cells");
+    assert_eq!(col::<i32>(&rows[0], "version_id"), 1);
+    // `gender` is a `code` element, so its row in the `system|code` table
+    // carries the implicit system (IW2).
+    let rows = query(
+        &cql,
+        "SELECT id, version_id FROM token_system_code_index \
+         WHERE tenant_id = ? AND resource_type = 'Patient' AND param = 'gender' \
+         AND system = ? AND code = 'male'",
+        vec![
+            Value::from(tenant_id),
+            Value::from(helios_persistence::search::IMPLICIT_TOKEN_SYSTEM),
+        ],
+        Consistency::LocalQuorum,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "the gender system|code token row");
+    assert_eq!(col::<String>(&rows[0], "id"), "cells");
+    assert_eq!(col::<i32>(&rows[0], "version_id"), 1);
+    let rows = query(
+        &cql,
+        "SELECT id, start, end, version_id FROM date_index \
+         WHERE tenant_id = ? AND resource_type = 'Patient' AND param = 'birthdate'",
+        vec![Value::from(tenant_id)],
+        Consistency::LocalQuorum,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "the birthdate date row");
+    assert_eq!(col::<String>(&rows[0], "id"), "cells");
+    let start: DateTime<Utc> = col(&rows[0], "start");
+    let end: DateTime<Utc> = col(&rows[0], "end");
+    assert_eq!(start.timestamp_millis(), 325_987_200_000, "1980-05-01Z");
+    assert_eq!(
+        end.timestamp_millis(),
+        start.timestamp_millis() + 86_400_000
+    );
+    assert_eq!(col::<i32>(&rows[0], "version_id"), 1);
 
     // `resource_versions` row 1: V1 at ts(1), deleted_at unset (not null).
     let mut version_key = key(&tenant, "Patient", "cells");
@@ -570,9 +624,9 @@ async fn cassandra_create_checks_permission_before_writing() {
 }
 
 #[tokio::test]
-async fn cassandra_search_parameter_code_is_bounded_at_128_bytes() {
-    let node = node_or_skip!("cassandra_search_parameter_code_is_bounded_at_128_bytes");
-    let (backend, _cql) = setup(node).await;
+async fn cassandra_search_parameter_code_is_not_refused_for_its_length() {
+    let node = node_or_skip!("cassandra_search_parameter_code_is_not_refused_for_its_length");
+    let (backend, cql) = setup(node).await;
     let tenant = unique_tenant("sp-code");
     let search_parameter = |id: &str, code: String| {
         json!({
@@ -589,34 +643,44 @@ async fn cassandra_search_parameter_code_is_bounded_at_128_bytes() {
         })
     };
     let version = crate::cassandra_node::test_fhir_version();
-    match backend
-        .create(
-            &tenant,
-            "SearchParameter",
-            search_parameter("long", "c".repeat(129)),
-            version,
-        )
-        .await
-    {
-        Err(StorageError::Validation(ValidationError::InvalidResource { details, .. })) => {
-            assert_eq!(details[0].path, "SearchParameter.code");
-        }
-        other => panic!("expected InvalidResource, got {other:?}"),
-    }
-    assert!(
+    for (id, length) in [("c129", 129), ("c2000", 2_000)] {
+        let code = "c".repeat(length);
         backend
-            .read(&tenant, "SearchParameter", "long")
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter(id, code.clone()),
+                version,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("a {length}-byte code is stored: {error:?}"));
+        let stored = backend
+            .read(&tenant, "SearchParameter", id)
             .await
             .unwrap()
-            .is_none()
-    );
-    backend
-        .create(
-            &tenant,
-            "SearchParameter",
-            search_parameter("max", "c".repeat(128)),
-            version,
-        )
-        .await
-        .expect("a 128-byte code is stored");
+            .expect("the SearchParameter is stored");
+        assert_eq!(stored.content()["code"], code, "{length} bytes, unchanged");
+    }
+
+    // The 2,000-byte code is the `code` parameter's value in its own index
+    // row, stored as `sha256:` and the hex of its SHA-256 (ADR-aacruzgon-0079).
+    let hex: String = sha2::Sha256::digest("c".repeat(2_000).as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let rows = query(
+        &cql,
+        "SELECT id FROM token_code_index \
+         WHERE tenant_id = ? AND resource_type = ? AND param = ? AND code = ?",
+        vec![
+            Value::from(tenant.tenant_id().as_str()),
+            Value::from("SearchParameter"),
+            Value::from("code"),
+            Value::from(format!("sha256:{hex}")),
+        ],
+        Consistency::LocalQuorum,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "the hashed code's own index row");
+    assert_eq!(col::<String>(&rows[0], "id"), "c2000");
 }

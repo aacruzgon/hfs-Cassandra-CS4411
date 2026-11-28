@@ -43,6 +43,15 @@ env:
   # above any directory override left on the runner.
   RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
+  # The PC's CI budget (aacruzgon/muster deploy/ci-runner/HOST-CI-BUDGET.md,
+  # ADR-aacruzgon-0088): at most 4 rustc and linker processes per cargo build,
+  # and only file and line debug info, which is enough for a backtrace and
+  # makes the objects, the links and the linkers' page cache much smaller.
+  # At one process per thread (16) and full debug info, several projects'
+  # jobs filled acruzdebian's memory and stalled its disk on 2026-11-24. A
+  # step may set CARGO_BUILD_JOBS lower (cargo clippy (helios-fhir)).
+  CARGO_BUILD_JOBS: 4
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   # R5 as the only version the backend's own crate enables, not R5 with R4:
@@ -87,19 +96,43 @@ jobs:
           TARGET_DIR: ${{ runner.workspace }}/target/fhir-versions-r5
           CAP_GB: 10
         run: |
-          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # A reset renames the directory, which is instant, and deletes it in
+          # the background at idle CPU and I/O priority, detached from this
+          # step's output, as aacruzgon/muster's job-started.sh does
+          # (ADR-aacruzgon-0088): the job no longer waits for rm -rf of up to
+          # its cap. Only BFQ and mq-deadline honour the I/O class;
+          # acruzdebian's NVMe disk uses none, so there only the CPU part
+          # counts. Each runner instance has its own _work folder and runs one
+          # job at a time, so nothing else uses these directories now. The
+          # runner stops a delete still running when the job ends, so every
+          # reset step first deletes what such a delete left (*.pruning.*) in
+          # this instance's target/, and names it in the log: a leftover that
+          # comes back run after run is a delete that keeps failing. du has a
+          # time limit: under heavy disk load it can take seconds, and an unknown
+          # size only skips the size check and is reported as unknown, not 0.
+          prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do
+            if [ -e "$left" ]; then
+              echo "Deleting a leftover of an earlier reset, last changed $(stat -c %y -- "$left" 2>/dev/null || echo "at an unknown time"): $left"
+              prune "$left"
+            fi
+          done
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
-          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
-          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          # Empty when du timed out (unknown); a missing directory is 0.
+          [ -e "$TARGET_DIR" ] || before_bytes=0
+          size_gb=${before_bytes:+$(( (before_bytes + 1073741823) / 1073741824 ))}
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
-          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+          if [ "$old_stamp" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
             if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
-            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain, Cargo.lock or the debug setting"
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
-            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
-            rm -rf "$TARGET_DIR"
+            echo "Resetting $TARGET_DIR (size ${size_gb:-unknown}${size_gb:+ GB}, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+            if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           # The tag cargo writes only into a target dir it creates itself; see
@@ -111,7 +144,7 @@ jobs:
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
-            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_BEFORE_BYTES=$before_bytes"
             echo "TARGET_DIR_RESET=$reset"
             echo "TARGET_DIR_RESET_REASON=$reason"
             echo "TARGET_DIR_CAP_GB=$CAP_GB"
@@ -191,19 +224,43 @@ jobs:
           TARGET_DIR: ${{ runner.workspace }}/target/fhir-versions-r6
           CAP_GB: 10
         run: |
-          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # A reset renames the directory, which is instant, and deletes it in
+          # the background at idle CPU and I/O priority, detached from this
+          # step's output, as aacruzgon/muster's job-started.sh does
+          # (ADR-aacruzgon-0088): the job no longer waits for rm -rf of up to
+          # its cap. Only BFQ and mq-deadline honour the I/O class;
+          # acruzdebian's NVMe disk uses none, so there only the CPU part
+          # counts. Each runner instance has its own _work folder and runs one
+          # job at a time, so nothing else uses these directories now. The
+          # runner stops a delete still running when the job ends, so every
+          # reset step first deletes what such a delete left (*.pruning.*) in
+          # this instance's target/, and names it in the log: a leftover that
+          # comes back run after run is a delete that keeps failing. du has a
+          # time limit: under heavy disk load it can take seconds, and an unknown
+          # size only skips the size check and is reported as unknown, not 0.
+          prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do
+            if [ -e "$left" ]; then
+              echo "Deleting a leftover of an earlier reset, last changed $(stat -c %y -- "$left" 2>/dev/null || echo "at an unknown time"): $left"
+              prune "$left"
+            fi
+          done
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
-          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
-          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          # Empty when du timed out (unknown); a missing directory is 0.
+          [ -e "$TARGET_DIR" ] || before_bytes=0
+          size_gb=${before_bytes:+$(( (before_bytes + 1073741823) / 1073741824 ))}
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
-          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+          if [ "$old_stamp" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
             if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
-            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain, Cargo.lock or the debug setting"
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
-            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
-            rm -rf "$TARGET_DIR"
+            echo "Resetting $TARGET_DIR (size ${size_gb:-unknown}${size_gb:+ GB}, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+            if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           # The tag cargo writes only into a target dir it creates itself; see
@@ -215,7 +272,7 @@ jobs:
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
-            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_BEFORE_BYTES=$before_bytes"
             echo "TARGET_DIR_RESET=$reset"
             echo "TARGET_DIR_RESET_REASON=$reason"
             echo "TARGET_DIR_CAP_GB=$CAP_GB"
@@ -301,8 +358,14 @@ jobs:
       # reuse exactly what the build step built.
       PERSISTENCE_FEATURES: cassandra,sqlite,R4,R4B,R5,R6,helios-fhir/skip-r6-download
       HFS_FEATURES: R4,R4B,R5,R6,cassandra,sqlite,helios-fhir/skip-r6-download
-      CI_REPORT_PROFILE: dev (debug, CARGO_INCREMENTAL=0)
+      CI_REPORT_PROFILE: dev (line-tables-only debug info, CARGO_INCREMENTAL=0)
       CI_REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The lib test every lib run below skips: the batch of exactly 65,535
+      # statements (ADR-aacruzgon-0089), which the required job runs alone
+      # in a step of its own (fmt-clippy-cassandra.yml). Under a whole lib
+      # run it timed out on sam-7900x (R4 lib, run 45783764882 on main), and
+      # it binds the FHIR version only as a column's text.
+      AT_LIMIT_TEST: backends::cassandra::session::node_tests::a_batch_over_the_statement_limit_is_refused_and_sends_nothing
     steps:
       # This runner instance's slot (ADR-aacruzgon-0086): HFS_CI_SLOT, from
       # the runner's own .env. Two instances on one machine share gh-runner's
@@ -360,19 +423,43 @@ jobs:
           TARGET_DIR: ${{ runner.workspace }}/target/fhir-versions-all
           CAP_GB: 25
         run: |
-          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          # A reset renames the directory, which is instant, and deletes it in
+          # the background at idle CPU and I/O priority, detached from this
+          # step's output, as aacruzgon/muster's job-started.sh does
+          # (ADR-aacruzgon-0088): the job no longer waits for rm -rf of up to
+          # its cap. Only BFQ and mq-deadline honour the I/O class;
+          # acruzdebian's NVMe disk uses none, so there only the CPU part
+          # counts. Each runner instance has its own _work folder and runs one
+          # job at a time, so nothing else uses these directories now. The
+          # runner stops a delete still running when the job ends, so every
+          # reset step first deletes what such a delete left (*.pruning.*) in
+          # this instance's target/, and names it in the log: a leftover that
+          # comes back run after run is a delete that keeps failing. du has a
+          # time limit: under heavy disk load it can take seconds, and an unknown
+          # size only skips the size check and is reported as unknown, not 0.
+          prune() { nice -n 19 ionice -t -c 3 rm -rf -- "$@" </dev/null >/dev/null 2>&1 & }
+          for left in "${TARGET_DIR%/*}"/*.pruning.*; do
+            if [ -e "$left" ]; then
+              echo "Deleting a leftover of an earlier reset, last changed $(stat -c %y -- "$left" 2>/dev/null || echo "at an unknown time"): $left"
+              prune "$left"
+            fi
+          done
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16) debug=${CARGO_PROFILE_DEV_DEBUG:-default}"
           # One du, in bytes; size_gb rounds up, as du --block-size=1G does.
-          before_bytes=$(du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
-          size_gb=$(( (${before_bytes:-0} + 1073741823) / 1073741824 ))
+          before_bytes=$(timeout 60 du -s --block-size=1 "$TARGET_DIR" 2>/dev/null | cut -f1)
+          # Empty when du timed out (unknown); a missing directory is 0.
+          [ -e "$TARGET_DIR" ] || before_bytes=0
+          size_gb=${before_bytes:+$(( (before_bytes + 1073741823) / 1073741824 ))}
           old_stamp=$(cat "$TARGET_DIR/.stamp" 2>/dev/null || true)
           reset=no reason=
-          if [ "$old_stamp" != "$stamp" ] || [ "$size_gb" -gt "$CAP_GB" ]; then
+          if [ "$old_stamp" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
             if [ -z "$old_stamp" ]; then reason="no stamp: a new or emptied directory"
-            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain or Cargo.lock"
+            elif [ "$old_stamp" != "$stamp" ]; then reason="stamp changed: the toolchain, Cargo.lock or the debug setting"
             else reason="$size_gb GB, over the $CAP_GB GB cap"; fi
             reset=yes
-            echo "Resetting $TARGET_DIR (size $size_gb GB, cap $CAP_GB GB, stamp: $stamp; $reason)"
-            rm -rf "$TARGET_DIR"
+            echo "Resetting $TARGET_DIR (size ${size_gb:-unknown}${size_gb:+ GB}, cap $CAP_GB GB, stamp: $stamp; $reason)"
+            doomed="$TARGET_DIR.pruning.$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+            if [ -d "$TARGET_DIR" ] && mv -T -- "$TARGET_DIR" "$doomed"; then prune "$doomed"; else rm -rf "$TARGET_DIR"; fi
           fi
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           # The tag cargo writes only into a target dir it creates itself; see
@@ -384,7 +471,7 @@ jobs:
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
           # For the build-size report (.github/scripts/build-size-report.py).
           {
-            echo "TARGET_DIR_BEFORE_BYTES=${before_bytes:-0}"
+            echo "TARGET_DIR_BEFORE_BYTES=$before_bytes"
             echo "TARGET_DIR_RESET=$reset"
             echo "TARGET_DIR_RESET_REASON=$reason"
             echo "TARGET_DIR_CAP_GB=$CAP_GB"
@@ -440,9 +527,22 @@ jobs:
       # For each version, the three suites, each against this node and each
       # into its own log, $RUNNER_TEMP/ci-report/logs/fhir-<version>-<suite>.log,
       # which ends with `exit=<status>` for the report below:
-      #   lib    the backend's unit tests (--lib backends::cassandra); its
+      #   lib    the backend's unit tests (--lib backends::cassandra), all
+      #          but $AT_LIMIT_TEST (see the job's env); its
       #          restart_tests skip without HFS_TEST_CASSANDRA_RESTART_*,
-      #          which this job never sets
+      #          which this job never sets. R6's run, the last, also sets
+      #          HFS_TEST_CASSANDRA_LARGE=1 for the full-size byte-cut test
+      #          (ADR-aacruzgon-0089), once per CI run: it leaves about 98,000
+      #          index rows and as many tombstones on this job's node, and the
+      #          lib tests' scans of whole index tables would pay for them in
+      #          every later lib run. After it, only R6's tests and rest
+      #          suites run: they read the token tables only by partition, and
+      #          their one scan, the SELECT DISTINCT over resources_by_type's
+      #          partition keys, meets a single partition of the test's own
+      #          tenant. The step fails R6's lib run if its log lacks the
+      #          test's [piece-bytes line: the test passes as `not run:`
+      #          without the variable, so a lost variable would otherwise
+      #          drop it and stay green
       #   tests  tests/cassandra_tests.rs and backend_capability_contract.rs;
       #          --no-fail-fast, so a failure in the first binary does not
       #          keep the second from running
@@ -479,14 +579,43 @@ jobs:
               echo "::error title=FHIR versions::$version rest did not run exactly its three tests"
               status=1
             fi
+            if [ "$version" = R6 ] && [ "$suite" = lib ] && [ "$status" -eq 0 ] \
+              && ! grep -Fq '[piece-bytes code_len=' "$log"; then
+              echo "::error title=FHIR versions::R6 lib did not run the_largest_update_of_one_partition_is_cut_by_bytes_and_lands (HFS_TEST_CASSANDRA_LARGE=1)"
+              status=1
+            fi
             echo "exit=$status" | tee -a "$log"
             echo "::endgroup::"
             if [ "$status" -ne 0 ]; then failed+=("$version $suite (exit $status)"); fi
           }
+          # --skip drops every test whose name contains $AT_LIMIT_TEST (libtest
+          # matches skip filters by substring unless --exact, and --exact would
+          # make the backends::cassandra filter exact too), so check once that
+          # it drops exactly one. The list does not depend on the version:
+          # HFS_TEST_FHIR_VERSION is read only at run time. cargo's stderr goes
+          # to the log, so a failed listing shows why, and it is a failure.
+          listed() {
+            local list
+            list=$(cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
+              --lib -- backends::cassandra --list "$@") \
+              || { echo "::error title=FHIR versions::cargo test --list${*:+ $*} failed (exit $?)" >&2; return 1; }
+            grep -c ': test$' <<<"$list" || true
+          }
+          if all=$(listed) && kept=$(listed --skip "${AT_LIMIT_TEST:?}"); then
+            dropped=$(( all - kept ))
+            if [ "$dropped" -ne 1 ]; then
+              echo "::error title=FHIR versions::--skip $AT_LIMIT_TEST drops $dropped lib tests, not 1"
+              failed+=("lib skip (drops $dropped)")
+            fi
+          else
+            failed+=("lib skip guard (cargo test --list failed)")
+          fi
           for version in R4 R4B R5 R6; do
-            run_suite "$version" lib \
+            large=()
+            if [ "$version" = R6 ]; then large=(env HFS_TEST_CASSANDRA_LARGE=1); fi
+            run_suite "$version" lib "${large[@]}" \
               cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
-                --lib -- backends::cassandra --nocapture
+                --lib -- backends::cassandra --nocapture --skip "${AT_LIMIT_TEST:?}"
             run_suite "$version" tests \
               cargo test -p helios-persistence --no-default-features --features "$PERSISTENCE_FEATURES" \
                 --test cassandra_tests --test backend_capability_contract --no-fail-fast -- --nocapture

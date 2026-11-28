@@ -27,8 +27,12 @@ use crate::types::{
 };
 
 use super::SqliteBackend;
+use super::search::query_builder::{
+    DateTailRange, DateTieProbe, DateWalkRange, date_walk_index, date_walk_keyed_count_sql,
+    date_walk_page_sql, date_walk_tail_sql, date_walk_tie_probe_sql,
+};
 use super::search::{
-    KeysetKey, QueryBuilder, SortValueKind, SqlParam, is_parameter_rows,
+    DEFAULT_ORDER_BY, KeysetKey, QueryBuilder, SortValueKind, SqlParam, is_parameter_rows,
     membership_exists_predicate,
 };
 
@@ -348,23 +352,33 @@ fn cursor_value_is_null(cursor: &PageCursor) -> bool {
 /// mirror: the reversed order puts missing values first, so from a present
 /// value none of them qualify (a comparison with NULL is never true), and
 /// from a missing one every present value lies before it.
+///
+/// The `id` tiebreak is ascending forward (descending on `Previous`), except
+/// on the `last_updated` key, where it takes that key's direction
+/// ([`KeysetKey::id_follows_direction`]): `idx_resources_reindex`
+/// `(tenant_id, resource_type, last_updated, id)` then serves the order
+/// forward or backward with no temp B-tree (#2603).
 fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (String, String) {
     let e = &k.expr;
     let asc = k.direction == crate::types::SortDirection::Ascending;
     let at_missing = k.nullable && cursor_is_null;
+    let id_desc = k.id_tiebreak_direction() == "DESC";
     if backward {
+        // The mirror of the forward walk: reversed key and tiebreak.
+        let (id_op, id_dir) = if id_desc { (">", "ASC") } else { ("<", "DESC") };
         let condition = if at_missing {
-            format!("({e} IS NOT NULL OR ({e} IS ?3 AND id < ?4))")
+            format!("({e} IS NOT NULL OR ({e} IS ?3 AND id {id_op} ?4))")
         } else {
             let op = if asc { "<" } else { ">" };
-            format!("({e} {op} ?3 OR ({e} = ?3 AND id < ?4))")
+            format!("({e} {op} ?3 OR ({e} = ?3 AND id {id_op} ?4))")
         };
         let nulls = if k.nullable { " NULLS FIRST" } else { "" };
         let dir = if asc { "DESC" } else { "ASC" };
-        (condition, format!("{e} {dir}{nulls}, id DESC"))
+        (condition, format!("{e} {dir}{nulls}, id {id_dir}"))
     } else {
+        let (id_op, id_dir) = if id_desc { ("<", "DESC") } else { (">", "ASC") };
         let condition = if at_missing {
-            format!("({e} IS ?3 AND id > ?4)")
+            format!("({e} IS ?3 AND id {id_op} ?4)")
         } else {
             let op = if asc { ">" } else { "<" };
             let or_missing = if k.nullable {
@@ -372,11 +386,11 @@ fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (
             } else {
                 String::new()
             };
-            format!("({e} {op} ?3 OR ({e} = ?3 AND id > ?4){or_missing})")
+            format!("({e} {op} ?3 OR ({e} = ?3 AND id {id_op} ?4){or_missing})")
         };
         let nulls = if k.nullable { " NULLS LAST" } else { "" };
         let dir = if asc { "ASC" } else { "DESC" };
-        (condition, format!("{e} {dir}{nulls}, id ASC"))
+        (condition, format!("{e} {dir}{nulls}, id {id_dir}"))
     }
 }
 
@@ -399,6 +413,36 @@ impl SqliteBackend {
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
         self.search_with_connection_probe(conn, tenant, query, total, probe_enabled())
+    }
+
+    /// The tenant's search-parameter registry for a query that carries a
+    /// `_filter`, the only clause that classifies parameters by registered
+    /// type; `None` for every other query, so they pay nothing.
+    ///
+    /// On a cache miss the tenant's stored overlay is read from `conn`, the
+    /// connection this search already holds, instead of asking the pool for a
+    /// second one (the #787 hazard, and a deadlock on a one-connection pool).
+    /// A failed read yields `None`: `_filter` then uses the name-list fallback.
+    pub(crate) fn filter_registry(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>> {
+        if !query.parameters.iter().any(|p| p.name == "_filter") {
+            return None;
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        if let Some(registry) = self.tenant_registries().cached(tenant_id) {
+            return Some(registry);
+        }
+        let stored = super::backend::load_tenant_stored_params_with_conn(
+            conn,
+            self.config().fhir_version,
+            tenant_id,
+        )
+        .ok()?;
+        Some(self.tenant_registries().build_and_cache(tenant_id, stored))
     }
 
     /// [`Self::search_with_connection`] with the bounded probe forced on or
@@ -457,10 +501,53 @@ impl SqliteBackend {
         // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
+        // An unfiltered sort by one date parameter reads the date index in
+        // order instead of computing the key of every resource of the type
+        // (#2731). It needs the index: a bulk rebuild drops it for its
+        // duration, and the correlated-subquery statement below serves then.
+        if let Some((directive, desc)) = query.unfiltered_single_date_sort()
+            && date_walk_index_present(conn, desc)
+        {
+            match walk_date_page(
+                conn,
+                tenant_id,
+                resource_type,
+                &directive.parameter,
+                desc,
+                cursor.as_ref(),
+                query.offset.unwrap_or(0) as usize,
+                count,
+                tie_group_cap(),
+            ) {
+                Ok(Some((raw_rows, has_previous))) => {
+                    return assemble_page(
+                        tenant,
+                        resource_type,
+                        raw_rows,
+                        cursor.as_ref(),
+                        true,
+                        count,
+                        has_previous,
+                        total,
+                    );
+                }
+                // The page starts in an equal-key group too large to walk: the
+                // general statement below serves it.
+                Ok(None) => {}
+                // The index was dropped between the probe and the prepare.
+                Err(error) if error.to_string().contains("no such index") => {}
+                Err(error) => return Err(error),
+            }
+        }
+
         let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
             let builder = QueryBuilder::new(tenant_id, resource_type)
                 .with_param_offset(param_offset)
                 .with_composite_rewrite(composite_rewrite);
+            let builder = match self.filter_registry(conn, tenant, query) {
+                Some(registry) => builder.with_registry(registry),
+                None => builder,
+            };
             let fragment = builder.build(query)?;
             if !fragment.sql.is_empty() {
                 Some(fragment)
@@ -522,9 +609,10 @@ impl SqliteBackend {
             None => "id, version_id, data, last_updated, fhir_version".to_string(),
         };
 
-        // ORDER BY for the first-page / offset paths.
+        // ORDER BY for the first-page / offset paths: the same order the
+        // keyset pages continue (see `keyset_page_clauses`).
         let order_by = if query.sort.is_empty() {
-            "ORDER BY last_updated DESC, id ASC".to_string()
+            DEFAULT_ORDER_BY.to_string()
         } else {
             QueryBuilder::new(tenant_id, resource_type).build_order_by(query)
         };
@@ -545,10 +633,10 @@ impl SqliteBackend {
                                  (SELECT rowid AS rk, last_updated AS lu, id AS rid \
                                   FROM resources INDEXED BY idx_resources_reindex \
                                   WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                                  ORDER BY last_updated DESC, id ASC LIMIT {window}) AS w \
+                                  {DEFAULT_ORDER_BY} LIMIT {window}) AS w \
                                  CROSS JOIN resources ON resources.rowid = w.rk \
                                  WHERE {exists} \
-                                 ORDER BY w.lu DESC, w.rid ASC LIMIT {lim}",
+                                 ORDER BY w.lu DESC, w.rid DESC LIMIT {lim}",
                                 lim = count + 1,
                             )
                         })
@@ -663,96 +751,351 @@ impl SqliteBackend {
             None => run(&sql)?,
         };
 
-        // Parse rows, carrying the sort key for cursor construction.
-        let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
-        for (id, version_id, data, last_updated_str, fhir_version_str, sort_key) in raw_rows {
-            let json_data: serde_json::Value = serde_json::from_slice(&data)
-                .map_err(|e| internal_error(format!("Failed to deserialize resource: {}", e)))?;
-
-            let last_updated = chrono::DateTime::parse_from_rfc3339(&last_updated_str)
-                .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
-                .with_timezone(&Utc);
-
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
-
-            let resource = StoredResource::from_storage(
-                resource_type.clone(),
-                id,
-                version_id,
-                tenant.tenant_id().clone(),
-                json_data,
-                last_updated,
-                last_updated,
-                None,
-                fhir_version,
-            );
-
-            parsed.push((resource, sort_key));
-        }
-
-        let backward = cursor
-            .as_ref()
-            .is_some_and(|c| c.direction() == CursorDirection::Previous);
-
-        // Forward: the extra row (if any) is the *last* one and proves a next page.
-        // Backward: rows arrive in reversed order, so the extra row is also the
-        // last one fetched but it is the *farthest* from the cursor — it belongs to
-        // page N-2, not to the page we return — and it proves a previous page. It
-        // must be dropped before `reverse()` restores the sort order. See #1079
-        // and the Elasticsearch `backward` branch (#1015).
-        let (has_next, has_previous) = if backward {
-            let has_previous = parsed.len() > count;
-            if has_previous {
-                parsed.pop();
-            }
-            parsed.reverse();
-            (!parsed.is_empty(), has_previous)
-        } else {
-            let has_next = parsed.len() > count;
-            if has_next {
-                parsed.pop();
-            }
-            (has_next, has_previous)
-        };
-
-        // A sort with no keyset (multi-field) pages by offset, which is what
-        // the REST layer's `next` link falls back to without a cursor. A
-        // cursor minted here would be ignored on the way back in and return
-        // the first page again (#1606, as MongoDB since #1058).
-        let next_cursor = if has_next && keyset.is_some() {
-            parsed.last().map(|(r, sk)| {
-                PageCursor::new(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
-            })
-        } else {
-            None
-        };
-        let previous_cursor = if has_previous && keyset.is_some() {
-            parsed.first().map(|(r, sk)| {
-                PageCursor::previous(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
-            })
-        } else {
-            None
-        };
-
-        let resources: Vec<StoredResource> = parsed.into_iter().map(|(r, _)| r).collect();
-        let page_info = PageInfo {
-            next_cursor,
-            previous_cursor,
-            total,
-            has_next,
+        assemble_page(
+            tenant,
+            resource_type,
+            raw_rows,
+            cursor.as_ref(),
+            keyset.is_some(),
+            count,
             has_previous,
-        };
-
-        let page = Page::new(resources, page_info);
-
-        Ok(SearchResult {
-            resources: page,
-            included: Vec::new(),
             total,
-            scores: Default::default(),
-        })
+        )
     }
+}
+
+/// Parses the page statement's rows into a [`SearchResult`]: the extra row's
+/// `has_next` / `has_previous`, the cursors from the sort key, the total.
+#[allow(clippy::too_many_arguments)]
+fn assemble_page(
+    tenant: &TenantContext,
+    resource_type: &str,
+    raw_rows: Vec<RawRow>,
+    cursor: Option<&PageCursor>,
+    has_keyset: bool,
+    count: usize,
+    has_previous: bool,
+    total: Option<u64>,
+) -> StorageResult<SearchResult> {
+    // Parse rows, carrying the sort key for cursor construction.
+    let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
+    for (id, version_id, data, last_updated_str, fhir_version_str, sort_key) in raw_rows {
+        let json_data: serde_json::Value = serde_json::from_slice(&data)
+            .map_err(|e| internal_error(format!("Failed to deserialize resource: {}", e)))?;
+
+        let last_updated = chrono::DateTime::parse_from_rfc3339(&last_updated_str)
+            .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
+            .with_timezone(&Utc);
+
+        let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+        let resource = StoredResource::from_storage(
+            resource_type.to_string(),
+            id,
+            version_id,
+            tenant.tenant_id().clone(),
+            json_data,
+            last_updated,
+            last_updated,
+            None,
+            fhir_version,
+        );
+
+        parsed.push((resource, sort_key));
+    }
+
+    let backward = cursor.is_some_and(|c| c.direction() == CursorDirection::Previous);
+
+    // Forward: the extra row (if any) is the *last* one and proves a next page.
+    // Backward: rows arrive in reversed order, so the extra row is also the
+    // last one fetched but it is the *farthest* from the cursor — it belongs to
+    // page N-2, not to the page we return — and it proves a previous page. It
+    // must be dropped before `reverse()` restores the sort order. See #1079
+    // and the Elasticsearch `backward` branch (#1015).
+    let (has_next, has_previous) = if backward {
+        let has_previous = parsed.len() > count;
+        if has_previous {
+            parsed.pop();
+        }
+        parsed.reverse();
+        (!parsed.is_empty(), has_previous)
+    } else {
+        let has_next = parsed.len() > count;
+        if has_next {
+            parsed.pop();
+        }
+        (has_next, has_previous)
+    };
+
+    // A sort with no keyset (multi-field) pages by offset, which is what
+    // the REST layer's `next` link falls back to without a cursor. A
+    // cursor minted here would be ignored on the way back in and return
+    // the first page again (#1606, as MongoDB since #1058).
+    let next_cursor = if has_next && has_keyset {
+        parsed.last().map(|(r, sk)| {
+            PageCursor::new(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
+        })
+    } else {
+        None
+    };
+    let previous_cursor = if has_previous && has_keyset {
+        parsed.first().map(|(r, sk)| {
+            PageCursor::previous(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
+        })
+    } else {
+        None
+    };
+
+    let resources: Vec<StoredResource> = parsed.into_iter().map(|(r, _)| r).collect();
+    let page_info = PageInfo {
+        next_cursor,
+        previous_cursor,
+        total,
+        has_next,
+        has_previous,
+    };
+
+    let page = Page::new(resources, page_info);
+
+    Ok(SearchResult {
+        resources: page,
+        included: Vec::new(),
+        total,
+        scores: Default::default(),
+    })
+}
+
+/// The equal-key group size the date walk tolerates: the constant, or what a
+/// test sets for its own thread.
+fn tie_group_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = tests::TIE_CAP.with(|cap| cap.get()) {
+        return cap;
+    }
+    crate::types::DATE_WALK_MAX_TIE_GROUP
+}
+
+/// Whether the index the date walk reads exists. A bulk rebuild drops the
+/// value indexes for its duration (`BULK_REBUILD_DROPPED_INDEXES`); without
+/// them the walk would scan `search_index`, so the caller keeps the correlated
+/// subquery.
+fn date_walk_index_present(conn: &rusqlite::Connection, desc: bool) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [date_walk_index(desc)],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// One page of an unfiltered date sort read from the date index (#2731): the
+/// resources with a value in key order, then those without in `id` order, the
+/// order of the correlated-subquery sort. Returns the page rows (`count + 1`
+/// at most, the extra one proving a further page) and `has_previous`.
+///
+/// An `_offset` past every resource with a value places the offset of the
+/// tail from a `COUNT` of them, which is linear in the resources of the type
+/// (as the correlated sort was). An `_offset` above `DATE_WALK_MAX_OFFSET` never
+/// reaches here: `unfiltered_single_date_sort` refuses it and the general
+/// statement serves the page.
+///
+/// `None` means the page starts in an equal-key group of more than `tie_cap`
+/// rows, which the walk would read, probe and sort whole for every page; the
+/// caller serves it with the general statement. Only the group the page
+/// starts at is measured: with an `_offset` (at most `DATE_WALK_MAX_OFFSET`)
+/// the page can start in a later group that this does not see.
+#[allow(clippy::too_many_arguments)]
+fn walk_date_page(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource_type: &str,
+    param: &str,
+    desc: bool,
+    cursor: Option<&PageCursor>,
+    offset: usize,
+    count: usize,
+    tie_cap: usize,
+) -> StorageResult<Option<(Vec<RawRow>, bool)>> {
+    let probe = match cursor {
+        None => Some(DateTieProbe::Head { reverse: false }),
+        Some(cursor) => {
+            let backward = cursor.direction() == CursorDirection::Previous;
+            match (backward, cursor_value_is_null(cursor)) {
+                // Forward from a resource with no value: only the tail.
+                (false, true) => None,
+                // Backward from one: reads the keyed resources from the end.
+                (true, true) => Some(DateTieProbe::Head { reverse: true }),
+                _ => Some(DateTieProbe::Value),
+            }
+        }
+    };
+    if let Some(probe) = probe {
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        if probe == DateTieProbe::Value
+            && let Some(cursor) = cursor
+        {
+            bind_cursor_value(&mut bound, SortValueKind::Timestamp, cursor)?;
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|p| p.as_ref()).collect();
+        let group: i64 = conn
+            .query_row(
+                &date_walk_tie_probe_sql(param, desc, probe, tie_cap),
+                refs.as_slice(),
+                |row| row.get(0),
+            )
+            .or_query_error("Failed to measure the date tie group")?;
+        if group as usize > tie_cap {
+            return Ok(None);
+        }
+    }
+    walk_date_rows(
+        conn,
+        tenant_id,
+        resource_type,
+        param,
+        desc,
+        cursor,
+        offset,
+        count,
+    )
+    .map(Some)
+}
+
+/// The rows of [`walk_date_page`] once its first group is known to be small.
+#[allow(clippy::too_many_arguments)]
+fn walk_date_rows(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource_type: &str,
+    param: &str,
+    desc: bool,
+    cursor: Option<&PageCursor>,
+    offset: usize,
+    count: usize,
+) -> StorageResult<(Vec<RawRow>, bool)> {
+    type Bound = Vec<Box<dyn rusqlite::ToSql>>;
+    let limit = count + 1;
+    let run = |sql: &str, bound: Bound| -> StorageResult<Vec<RawRow>> {
+        let mut all: Bound = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        all.extend(bound);
+        let refs: Vec<&dyn rusqlite::ToSql> = all.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn
+            .prepare(sql)
+            .or_query_error("Failed to prepare search query")?;
+        stmt.query_map(refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?.map(CursorValue::String),
+            ))
+        })
+        .or_query_error("Failed to execute search")?
+        .collect::<Result<Vec<_>, _>>()
+        .or_query_error("Failed to read row")
+    };
+    let walk = |range: DateWalkRange, limit: usize, offset: usize, bound: Bound| {
+        run(
+            &date_walk_page_sql(param, desc, range, limit, offset),
+            bound,
+        )
+    };
+    let tail = |range: DateTailRange, limit: usize, offset: usize, bound: Bound| {
+        run(
+            &date_walk_tail_sql(param, desc, range, limit, offset),
+            bound,
+        )
+    };
+
+    let Some(cursor) = cursor else {
+        let mut rows = walk(DateWalkRange::All, limit, offset, Vec::new())?;
+        if rows.len() < limit {
+            // Rows came back, so the keyed set ends at `offset + rows.len()`
+            // and the tail starts at its own first row; with none, it ended
+            // at or before `offset`.
+            let keyed = if rows.is_empty() && offset > 0 {
+                let sql = date_walk_keyed_count_sql(param, desc);
+                run_count(conn, &sql, tenant_id, resource_type)?.min(offset)
+            } else {
+                offset + rows.len()
+            };
+            let more = tail(
+                DateTailRange::All,
+                limit - rows.len(),
+                offset.saturating_sub(keyed),
+                Vec::new(),
+            )?;
+            rows.extend(more);
+        }
+        return Ok((rows, offset > 0));
+    };
+
+    let backward = cursor.direction() == CursorDirection::Previous;
+    let at_missing = cursor_value_is_null(cursor);
+    let mut bound: Bound = Vec::new();
+    if !at_missing {
+        bind_cursor_value(&mut bound, SortValueKind::Timestamp, cursor)?;
+    }
+    let id = || -> Box<dyn rusqlite::ToSql> { Box::new(cursor.resource_id().to_string()) };
+    let rows = match (backward, at_missing) {
+        // Forward from a resource with a value: the rest of the keyed
+        // resources, then the tail.
+        (false, false) => {
+            bound.push(id());
+            let mut rows = walk(DateWalkRange::After, limit, 0, bound)?;
+            if rows.len() < limit {
+                rows.extend(tail(DateTailRange::All, limit - rows.len(), 0, Vec::new())?);
+            }
+            rows
+        }
+        // Forward from one without: the rest of the tail by id.
+        (false, true) => tail(DateTailRange::After, limit, 0, vec![id()])?,
+        // Backward from a resource with a value: only keyed resources lie
+        // before it.
+        (true, false) => {
+            bound.push(id());
+            walk(DateWalkRange::Before, limit, 0, bound)?
+        }
+        // Backward from one without: the tail before it by id, then every
+        // keyed resource, the order reversed.
+        (true, true) => {
+            let mut rows = tail(DateTailRange::Before, limit, 0, vec![id()])?;
+            if rows.len() < limit {
+                rows.extend(walk(
+                    DateWalkRange::Reversed,
+                    limit - rows.len(),
+                    0,
+                    Vec::new(),
+                )?);
+            }
+            rows
+        }
+    };
+    Ok((rows, !backward))
+}
+
+/// A single `COUNT(*)` statement bound to `?1` tenant and `?2` type.
+fn run_count(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    tenant_id: &str,
+    resource_type: &str,
+) -> StorageResult<usize> {
+    conn.query_row(sql, params![tenant_id, resource_type], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|n| n.max(0) as usize)
+    .or_query_error("Failed to count resources with a value")
 }
 
 /// One `resources` row as the page statements return it, with its sort key.
@@ -800,7 +1143,8 @@ pub(crate) enum FirstPagePlan {
 /// index rows (`SELECT … FROM (<rows> LIMIT 2001)`, a seek that stops early).
 /// Any shape other than one plain parameter membership, and any probe error,
 /// is [`FirstPagePlan::Planner`]: the result of every plan is the same set in
-/// the same `ORDER BY last_updated DESC, id` order, so this only chooses cost.
+/// the same `ORDER BY last_updated DESC, id DESC` order, so this only chooses
+/// cost.
 ///
 /// Only the tests call it; the production path reaches the same plans through
 /// the probe's own keys.
@@ -929,9 +1273,17 @@ fn search_ids_on(
     tenant: &TenantContext,
     query: &SearchQuery,
     cursor: Option<PageCursor>,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<Page<String>> {
     with_composite_rewrite(conn, query, |rewrite| {
-        search_ids_on_plan(conn, tenant, query, cursor.clone(), rewrite)
+        search_ids_on_plan(
+            conn,
+            tenant,
+            query,
+            cursor.clone(),
+            rewrite,
+            registry.clone(),
+        )
     })
 }
 
@@ -941,15 +1293,19 @@ fn search_ids_on_plan(
     query: &SearchQuery,
     cursor: Option<PageCursor>,
     composite_rewrite: bool,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<Page<String>> {
     let tenant_id = tenant.tenant_id().as_str();
     let resource_type = &query.resource_type;
     let param_offset = if cursor.is_some() { 4 } else { 2 };
     let search_filter = if !query.parameters.is_empty() {
-        let fragment = QueryBuilder::new(tenant_id, resource_type)
+        let mut builder = QueryBuilder::new(tenant_id, resource_type)
             .with_param_offset(param_offset)
-            .with_composite_rewrite(composite_rewrite)
-            .build(query)?;
+            .with_composite_rewrite(composite_rewrite);
+        if let Some(registry) = registry {
+            builder = builder.with_registry(registry);
+        }
+        let fragment = builder.build(query)?;
         if fragment.sql.is_empty() {
             None
         } else {
@@ -965,17 +1321,20 @@ fn search_ids_on_plan(
     let search_params = search_filter
         .map(|fragment| fragment.params)
         .unwrap_or_default();
+    // The same order and forward keyset as a default `search`, whose cursors
+    // these interleave with.
     let cursor_clause = if cursor.is_some() {
-        " AND (last_updated < ?3 OR (last_updated = ?3 AND id > ?4))"
+        let (condition, _) = keyset_page_clauses(&KeysetKey::default_last_updated(), false, false);
+        format!(" AND {condition}")
     } else {
-        ""
+        String::new()
     };
     let count = query.count.unwrap_or(100) as usize;
     let version_clause = fhir_version_clause(query, "fhir_version");
     let sql = format!(
         "SELECT id, last_updated FROM resources \
              WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}{filter_clause}{cursor_clause} \
-             ORDER BY last_updated DESC, id ASC LIMIT {}",
+             {DEFAULT_ORDER_BY} LIMIT {}",
         count + 1
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -1046,9 +1405,10 @@ fn search_reference_values_on(
     tenant: &TenantContext,
     query: &SearchQuery,
     reference_param: &str,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<Vec<String>> {
     reject_legacy_composites(conn, tenant, query)?;
-    let (sql, params) = reference_values_statement(tenant, query, reference_param)?;
+    let (sql, params) = reference_values_statement(tenant, query, reference_param, registry)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn
         .prepare(&sql)
@@ -1066,6 +1426,7 @@ fn reference_values_statement(
     tenant: &TenantContext,
     query: &SearchQuery,
     reference_param: &str,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
     let tenant_id = tenant.tenant_id().as_str();
     let resource_type = &query.resource_type;
@@ -1073,11 +1434,11 @@ fn reference_values_statement(
     let fragment = if query.parameters.is_empty() {
         None
     } else {
-        Some(
-            QueryBuilder::new(tenant_id, resource_type)
-                .with_param_offset(2)
-                .build(query)?,
-        )
+        let mut builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
+        if let Some(registry) = registry {
+            builder = builder.with_registry(registry);
+        }
+        Some(builder.build(query)?)
     };
     let filter = fragment
         .as_ref()
@@ -1123,9 +1484,10 @@ fn search_count_on(
     conn: &rusqlite::Connection,
     tenant: &TenantContext,
     query: &SearchQuery,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<u64> {
     with_composite_rewrite(conn, query, |rewrite| {
-        search_count_on_plan(conn, tenant, query, rewrite)
+        search_count_on_plan(conn, tenant, query, rewrite, registry.clone())
     })
 }
 
@@ -1134,6 +1496,7 @@ fn search_count_on_plan(
     tenant: &TenantContext,
     query: &SearchQuery,
     composite_rewrite: bool,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<u64> {
     reject_legacy_composites(conn, tenant, query)?;
     let tenant_id = tenant.tenant_id().as_str();
@@ -1144,9 +1507,12 @@ fn search_count_on_plan(
     let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query.parameters.is_empty()
         || query.compartment.is_some()
     {
-        let builder = QueryBuilder::new(tenant_id, resource_type)
+        let mut builder = QueryBuilder::new(tenant_id, resource_type)
             .with_param_offset(2)
             .with_composite_rewrite(composite_rewrite);
+        if let Some(registry) = registry {
+            builder = builder.with_registry(registry);
+        }
         let fragment = builder.build(query)?;
 
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -1265,8 +1631,17 @@ impl SearchProvider for SqliteBackend {
         reject_unsupported_metadata_modifier(query)?;
         let tenant = tenant.clone();
         let query = query.clone();
-        self.run_blocking(move |conn| search_ids_on(conn, &tenant, &query, cursor))
-            .await
+        let this = self.clone();
+        self.run_blocking(move |conn| {
+            search_ids_on(
+                conn,
+                &tenant,
+                &query,
+                cursor,
+                this.filter_registry(conn, &tenant, &query),
+            )
+        })
+        .await
     }
 
     async fn search_count(
@@ -1286,8 +1661,16 @@ impl SearchProvider for SqliteBackend {
 
         let tenant = tenant.clone();
         let query = query.clone();
-        self.run_blocking(move |conn| search_count_on(conn, &tenant, &query))
-            .await
+        let this = self.clone();
+        self.run_blocking(move |conn| {
+            search_count_on(
+                conn,
+                &tenant,
+                &query,
+                this.filter_registry(conn, &tenant, &query),
+            )
+        })
+        .await
     }
 
     async fn search_reference_values(
@@ -1318,8 +1701,15 @@ impl SearchProvider for SqliteBackend {
         let tenant = tenant.clone();
         let query = query.clone();
         let reference_param = reference_param.to_string();
+        let this = self.clone();
         self.run_blocking(move |conn| {
-            search_reference_values_on(conn, &tenant, &query, &reference_param)
+            search_reference_values_on(
+                conn,
+                &tenant,
+                &query,
+                &reference_param,
+                this.filter_registry(conn, &tenant, &query),
+            )
         })
         .await
         .map(Some)
@@ -1341,6 +1731,21 @@ impl SearchProvider for SqliteBackend {
         param_type: crate::types::SearchParamType,
     ) -> Vec<&'static str> {
         Self::modifiers_for_type(param_type)
+    }
+
+    /// Every parameter except a `special` one the query builder builds no
+    /// condition for, which `search` refuses with `400` rather than widen the
+    /// result (#866): `near`, and from R5 `contains` and `section-text`.
+    /// `_text`, `_content` and `_filter` are evaluated, and the builder refuses
+    /// a `special` parameter from the same list.
+    fn serves_search_param(
+        &self,
+        _resource_type: &str,
+        code: &str,
+        param_type: crate::types::SearchParamType,
+    ) -> bool {
+        param_type != crate::types::SearchParamType::Special
+            || super::search::query_builder::EVALUATED_SPECIAL_PARAMETERS.contains(&code)
     }
 }
 
@@ -2091,6 +2496,310 @@ mod tests {
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         assert!(bind_cursor_value(&mut params, SortValueKind::Timestamp, &ok).is_ok());
+    }
+
+    fn last_updated_key(direction: crate::types::SortDirection) -> KeysetKey {
+        KeysetKey {
+            direction,
+            ..KeysetKey::default_last_updated()
+        }
+    }
+
+    /// #2603: on `last_updated` descending (the default order) the id
+    /// tiebreak is descending too, and `Previous` walks the exact mirror.
+    #[test]
+    fn descending_last_updated_keyset_breaks_ties_by_id_descending() {
+        use crate::types::SortDirection;
+        for key in [
+            KeysetKey::default_last_updated(),
+            last_updated_key(SortDirection::Descending),
+        ] {
+            assert_eq!(
+                keyset_page_clauses(&key, false, false),
+                (
+                    "(last_updated < ?3 OR (last_updated = ?3 AND id < ?4))".to_string(),
+                    "last_updated DESC, id DESC".to_string()
+                )
+            );
+            assert_eq!(
+                keyset_page_clauses(&key, false, true),
+                (
+                    "(last_updated > ?3 OR (last_updated = ?3 AND id > ?4))".to_string(),
+                    "last_updated ASC, id ASC".to_string()
+                )
+            );
+        }
+        // The first page emits the order the cursor pages continue.
+        let (_, order) = keyset_page_clauses(&KeysetKey::default_last_updated(), false, false);
+        assert_eq!(DEFAULT_ORDER_BY, format!("ORDER BY {order}"));
+    }
+
+    /// Ascending `last_updated` keeps `id ASC` forward and its mirror back.
+    #[test]
+    fn ascending_last_updated_keyset_is_unchanged() {
+        let key = last_updated_key(crate::types::SortDirection::Ascending);
+        assert_eq!(
+            keyset_page_clauses(&key, false, false),
+            (
+                "(last_updated > ?3 OR (last_updated = ?3 AND id > ?4))".to_string(),
+                "last_updated ASC, id ASC".to_string()
+            )
+        );
+        assert_eq!(
+            keyset_page_clauses(&key, false, true),
+            (
+                "(last_updated < ?3 OR (last_updated = ?3 AND id < ?4))".to_string(),
+                "last_updated DESC, id DESC".to_string()
+            )
+        );
+    }
+
+    /// #2603: the default and `-_lastUpdated` orders walk
+    /// `idx_resources_reindex` (backward) with no temp B-tree, on the first
+    /// page, a next page and a previous page alike, and the early-exit
+    /// window's inner walk does too.
+    #[tokio::test]
+    async fn descending_last_updated_pages_need_no_temp_btree() {
+        use crate::types::{SortDirection, SortDirective};
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 0..6 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        let plan_of = |sql: &str| -> Vec<String> {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let assert_walks_the_index = |sql: &str| {
+            let plan = plan_of(sql);
+            assert!(
+                !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                "{sql}\n{plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("idx_resources_reindex")),
+                "{sql}\n{plan:#?}"
+            );
+        };
+        let page = |query: &SearchQuery| -> (String, SearchResult) {
+            TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+            let result = backend
+                .search_with_connection_probe(&conn, &tenant, query, None, false)
+                .unwrap();
+            let sql = TRACED_SQL
+                .with(|traced| {
+                    traced
+                        .borrow()
+                        .iter()
+                        .find(|sql| sql.starts_with("SELECT id, version_id, data"))
+                        .cloned()
+                })
+                .expect("the page statement");
+            (sql, result)
+        };
+
+        let mut descending = SearchQuery::new("Patient");
+        descending.sort = vec![SortDirective {
+            parameter: "_lastUpdated".to_string(),
+            direction: SortDirection::Descending,
+            param_type: None,
+        }];
+        for query in [SearchQuery::new("Patient"), descending] {
+            let mut query = query;
+            query.count = Some(2);
+            let (first_sql, first) = page(&query);
+            assert!(
+                first_sql.contains("last_updated DESC, id DESC"),
+                "{first_sql}"
+            );
+            assert_walks_the_index(&first_sql);
+
+            query.cursor = first.resources.page_info.next_cursor.clone();
+            assert!(query.cursor.is_some());
+            let (next_sql, next) = page(&query);
+            assert!(next_sql.contains("id < '"), "{next_sql}");
+            assert_walks_the_index(&next_sql);
+
+            query.cursor = next.resources.page_info.previous_cursor.clone();
+            assert!(query.cursor.is_some());
+            let (previous_sql, previous) = page(&query);
+            assert!(
+                previous_sql.contains("last_updated ASC, id ASC"),
+                "{previous_sql}"
+            );
+            assert_walks_the_index(&previous_sql);
+            let ids = |r: &SearchResult| -> Vec<String> {
+                r.resources
+                    .items
+                    .iter()
+                    .map(|x| x.id().to_string())
+                    .collect()
+            };
+            assert_eq!(ids(&previous), ids(&first));
+        }
+
+        // The window's inner walk, as `search_with_connection_plan` writes it.
+        assert_walks_the_index(&format!(
+            "SELECT rowid AS rk, last_updated AS lu, id AS rid \
+             FROM resources INDEXED BY idx_resources_reindex \
+             WHERE tenant_id = 'test-tenant' AND resource_type = 'Patient' AND is_deleted = 0 \
+             {DEFAULT_ORDER_BY} LIMIT 512"
+        ));
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::empty(),
+            None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+        )
+        .unwrap();
+    }
+
+    /// #2603, the filtered side of the shared tie-order suite: with every
+    /// match on one `last_updated`, a filtered search pages through the ties
+    /// in one order whatever the page size, with the probe on (its
+    /// list-driven first page) or off, and `search_ids` walks the same order.
+    #[tokio::test]
+    async fn filtered_tied_timestamps_page_in_one_order() {
+        use crate::core::SearchProvider;
+        use crate::types::{SearchParamType, SearchPrefix};
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for id in [
+            "t-5", "t-2", "t-9", "t-1", "t-7", "t-3", "t-8", "t-4", "t-6",
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "active": true}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "t-0", "active": false}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let conn = backend.get_connection().unwrap();
+        conn.execute(
+            "UPDATE resources SET last_updated = '2001-02-03T04:05:06.789012+00:00' \
+             WHERE resource_type = 'Patient'",
+            [],
+        )
+        .unwrap();
+        let query = |count: u32| {
+            let mut query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "active".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: None,
+                values: vec![SearchValue::new(SearchPrefix::Eq, "true")],
+                chain: vec![],
+                components: vec![],
+            });
+            query.count = Some(count);
+            query
+        };
+        let ids = |r: &SearchResult| -> Vec<String> {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect()
+        };
+        // Newest first, then `id DESC` among the ties.
+        let expected: Vec<String> = [
+            "t-9", "t-8", "t-7", "t-6", "t-5", "t-4", "t-3", "t-2", "t-1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for probe in [false, true] {
+            let single = backend
+                .search_with_connection_probe(&conn, &tenant, &query(100), None, probe)
+                .unwrap();
+            assert_eq!(ids(&single), expected, "probe={probe}");
+            for count in 1..=4 {
+                let mut walked = Vec::new();
+                let mut q = query(count);
+                loop {
+                    let page = backend
+                        .search_with_connection_probe(&conn, &tenant, &q, None, probe)
+                        .unwrap();
+                    walked.extend(ids(&page));
+                    match page.resources.page_info.next_cursor {
+                        Some(cursor) => q.cursor = Some(cursor),
+                        None => break,
+                    }
+                }
+                assert_eq!(walked, expected, "probe={probe} _count={count}");
+            }
+        }
+        drop(conn);
+
+        // `search_ids` interleaves with `search` cursors: same order.
+        for count in 1..=4 {
+            let mut walked = Vec::new();
+            let mut q = query(count);
+            loop {
+                let page = backend.search_ids(&tenant, &q).await.unwrap();
+                walked.extend(page.items.iter().cloned());
+                match page.page_info.next_cursor {
+                    Some(cursor) => q.cursor = Some(cursor),
+                    None => break,
+                }
+            }
+            assert_eq!(walked, expected, "search_ids _count={count}");
+        }
+    }
+
+    /// Keys other than `last_updated` keep the `id ASC` tiebreak whatever
+    /// their direction.
+    #[test]
+    fn other_keyset_keys_keep_the_ascending_id_tiebreak() {
+        let key = KeysetKey {
+            expr: "x".to_string(),
+            direction: crate::types::SortDirection::Descending,
+            kind: SortValueKind::Text,
+            nullable: true,
+            id_follows_direction: false,
+        };
+        assert_eq!(
+            keyset_page_clauses(&key, false, false),
+            (
+                "(x < ?3 OR (x = ?3 AND id > ?4) OR x IS NULL)".to_string(),
+                "x DESC NULLS LAST, id ASC".to_string()
+            )
+        );
+        assert_eq!(
+            keyset_page_clauses(&key, true, true),
+            (
+                "(x IS NOT NULL OR (x IS ?3 AND id < ?4))".to_string(),
+                "x ASC NULLS FIRST, id DESC".to_string()
+            )
+        );
     }
 
     fn create_test_backend() -> SqliteBackend {
@@ -3377,7 +4086,7 @@ mod tests {
             chain: vec![],
             components: vec![],
         });
-        let (sql, params) = reference_values_statement(&tenant, &query, "patient").unwrap();
+        let (sql, params) = reference_values_statement(&tenant, &query, "patient", None).unwrap();
         let conn = backend.get_connection().unwrap();
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -3437,7 +4146,7 @@ mod tests {
             let sql = format!(
                 "EXPLAIN QUERY PLAN SELECT id FROM resources \
              WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-             AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+             AND rowid IN ({}) {DEFAULT_ORDER_BY} LIMIT 101",
                 fragment.sql
             );
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -3894,7 +4603,7 @@ mod tests {
             let rows_sql = format!(
                 "EXPLAIN QUERY PLAN SELECT id FROM resources \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                 AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+                 AND rowid IN ({}) {DEFAULT_ORDER_BY} LIMIT 101",
                 fragment.sql
             );
             let plan = plan_of(&rows_sql, &params);
@@ -3939,6 +4648,10 @@ mod tests {
     thread_local! {
         static TRACED_SQL: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// Equal-key group size the date walk tolerates on this thread; `None`
+        /// is the production constant.
+        pub(super) static TIE_CAP: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// `Connection::trace_v2` callback: keeps each statement as it starts,
@@ -3948,6 +4661,390 @@ mod tests {
             && let Some(sql) = statement.expanded_sql()
         {
             TRACED_SQL.with(|traced| traced.borrow_mut().push(sql));
+        }
+    }
+
+    /// Seeds Observations for the date-walk tests: several date rows per
+    /// resource (a Period and a DateTime), ties, and resources with no date.
+    async fn seed_date_walk(backend: &SqliteBackend, tenant: &TenantContext) {
+        for i in 0..9usize {
+            let mut resource = json!({
+                "resourceType": "Observation",
+                "id": format!("w{i}"),
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "X"}]},
+            });
+            match i % 3 {
+                0 => {
+                    resource["effectiveDateTime"] =
+                        json!(format!("20{:02}-03-01T10:00:00Z", 10 + i % 4))
+                }
+                1 => {
+                    resource["effectivePeriod"] = json!({
+                        "start": format!("20{:02}-01-01T00:00:00Z", 10 + i % 4),
+                        "end": format!("20{:02}-06-01T00:00:00Z", 12 + i % 4),
+                    })
+                }
+                _ => {}
+            }
+            backend
+                .create(tenant, "Observation", resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    fn date_sort_query(desc: bool, count: usize) -> SearchQuery {
+        use crate::types::{SortDirection, SortDirective};
+        let mut query = SearchQuery::new("Observation");
+        query.sort = vec![SortDirective {
+            parameter: "date".to_string(),
+            direction: if desc {
+                SortDirection::Descending
+            } else {
+                SortDirection::Ascending
+            },
+            param_type: Some(SearchParamType::Date),
+        }];
+        query.count = Some(count as u32);
+        query
+    }
+
+    /// #2731: an unfiltered date sort reads `idx_search_date_end` (descending)
+    /// or `idx_search_date` (ascending) in order, with no correlated subquery
+    /// over `resources` and no scan of `resources` or `search_index`.
+    #[tokio::test]
+    async fn unfiltered_date_sort_walks_the_date_index() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_date_walk(&backend, &tenant).await;
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        let mut tail_seen = false;
+        for (desc, index) in [(true, "idx_search_date_end"), (false, "idx_search_date")] {
+            let query = date_sort_query(desc, 2);
+            let mut pages = Vec::new();
+            let mut cursor_query = query.clone();
+            for _ in 0..3 {
+                TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+                let result = backend
+                    .search_with_connection_probe(&conn, &tenant, &cursor_query, None, false)
+                    .unwrap();
+                let sql = TRACED_SQL
+                    .with(|traced| {
+                        traced
+                            .borrow()
+                            .iter()
+                            .find(|sql| sql.starts_with("SELECT r.id, r.version_id"))
+                            .cloned()
+                    })
+                    .expect("the date walk statement");
+                let plan: Vec<String> = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert!(
+                    plan.iter().any(
+                        |line| line.contains(&format!("USING COVERING INDEX {index}"))
+                            || line.contains(&format!("USING INDEX {index}"))
+                    ),
+                    "{sql}\n{plan:#?}"
+                );
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|line| line.contains("CORRELATED SCALAR SUBQUERY")
+                            && line.contains("resources")),
+                    "{sql}\n{plan:#?}"
+                );
+                assert!(
+                    !plan.iter().any(|line| line.starts_with("SCAN resources")
+                        || line.starts_with("SCAN r")
+                        || line.starts_with("SCAN search_index")
+                        || line.starts_with("SCAN si")),
+                    "{sql}\n{plan:#?}"
+                );
+                // The key order comes from the index; only the ties on it are
+                // ordered by id, so the sort stops with the page.
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|line| line.contains("USE TEMP B-TREE FOR ORDER BY")),
+                    "{sql}\n{plan:#?}"
+                );
+                // The tail (resources with no value) runs when a page is
+                // short; its probe must seek by resource, not read the
+                // parameter's whole index for each one.
+                let tail = TRACED_SQL.with(|traced| {
+                    traced
+                        .borrow()
+                        .iter()
+                        .find(|sql| sql.starts_with("SELECT id, version_id"))
+                        .cloned()
+                });
+                if let Some(tail) = tail {
+                    tail_seen = true;
+                    assert_seeks_by_resource(&conn, &tail);
+                }
+                pages.push(result.resources.items.len());
+                match result.resources.page_info.next_cursor {
+                    Some(next) => cursor_query.cursor = Some(next),
+                    None => break,
+                }
+            }
+            assert_eq!(pages[0], 2);
+
+            // An `_offset` past every resource with a value counts them.
+            let mut past = date_sort_query(desc, 2);
+            past.offset = Some(8);
+            TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+            backend
+                .search_with_connection_probe(&conn, &tenant, &past, None, false)
+                .unwrap();
+            let count = TRACED_SQL
+                .with(|traced| {
+                    traced
+                        .borrow()
+                        .iter()
+                        .find(|sql| sql.starts_with("SELECT COUNT(*) FROM resources"))
+                        .cloned()
+                })
+                .expect("the count of resources with a value");
+            assert_seeks_by_resource(&conn, &count);
+        }
+        assert!(tail_seen, "no page reached the resources with no value");
+    }
+
+    /// The `search_index` probes of `sql` (the tail or the count of the date
+    /// walk) seek `idx_search_composite` by `resource_key`; the partial date
+    /// indexes have no such prefix and would be read whole per resource, which
+    /// made the descending tail and count quadratic (#2731).
+    fn assert_seeks_by_resource(conn: &rusqlite::Connection, sql: &str) {
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let probes: Vec<&String> = plan
+            .iter()
+            .filter(|line| line.contains("search_index") || line.starts_with("SEARCH s "))
+            .collect();
+        assert!(
+            !probes.is_empty(),
+            "{sql}
+{plan:#?}"
+        );
+        for line in probes {
+            assert!(
+                line.contains("resource_key=?"),
+                "probe without resource_key: {line}
+{sql}
+{plan:#?}"
+            );
+            assert!(
+                !line.contains("idx_search_date"),
+                "probe on a date index: {line}
+{sql}
+{plan:#?}"
+            );
+        }
+        assert!(
+            !plan.iter().any(|line| line.contains("USE TEMP B-TREE")),
+            "{sql}
+{plan:#?}"
+        );
+    }
+
+    /// #2731: with the date index gone (a bulk rebuild drops it), the page is
+    /// the correlated-subquery statement again, and the same one.
+    #[tokio::test]
+    async fn unfiltered_date_sort_falls_back_without_the_date_index() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_date_walk(&backend, &tenant).await;
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        let ids = |r: &SearchResult| -> Vec<String> {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect()
+        };
+        for (desc, index) in [(true, "idx_search_date_end"), (false, "idx_search_date")] {
+            let query = date_sort_query(desc, 20);
+            let walked = backend
+                .search_with_connection_probe(&conn, &tenant, &query, None, false)
+                .unwrap();
+            conn.execute(&format!("DROP INDEX {index}"), []).unwrap();
+            TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+            let fallback = backend
+                .search_with_connection_probe(&conn, &tenant, &query, None, false)
+                .unwrap();
+            let walked_sql = TRACED_SQL.with(|traced| {
+                traced
+                    .borrow()
+                    .iter()
+                    .any(|sql| sql.contains("FROM search_index si CROSS JOIN resources r"))
+            });
+            assert!(!walked_sql, "the walk ran without {index}");
+            assert_eq!(ids(&walked), ids(&fallback), "{index}");
+            assert_eq!(ids(&walked).len(), 9);
+        }
+    }
+
+    /// Seeds `ties` Observations at one instant (the latest) and `others` at
+    /// distinct earlier ones, so the head of a descending sort is one big
+    /// equal-key group.
+    async fn seed_date_ties(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        ties: usize,
+        others: usize,
+    ) {
+        for i in 0..ties + others {
+            let instant = if i < ties {
+                "2030-01-01T00:00:00Z".to_string()
+            } else {
+                format!("20{:02}-01-01T00:00:00Z", 10 + (i - ties))
+            };
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({"resourceType": "Observation", "id": format!("t{i:03}"),
+                           "status": "final", "effectiveDateTime": instant}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Every id of an unfiltered date sort, one cursor page at a time.
+    fn date_sort_ids(
+        backend: &SqliteBackend,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut paged = query.clone();
+        loop {
+            let result = backend
+                .search_with_connection_probe(conn, tenant, &paged, None, false)
+                .unwrap();
+            ids.extend(result.resources.items.iter().map(|r| r.id().to_string()));
+            match result.resources.page_info.next_cursor {
+                Some(next) => paged.cursor = Some(next),
+                None => return ids,
+            }
+        }
+    }
+
+    fn walk_statement_ran() -> bool {
+        TRACED_SQL.with(|traced| {
+            traced
+                .borrow()
+                .iter()
+                .any(|sql| sql.contains("FROM search_index si CROSS JOIN resources r"))
+        })
+    }
+
+    /// #2731: a page that starts in an equal-key group above the tolerated size
+    /// is served by the general statement, with the same ids and order; below
+    /// it the walk serves it. A cursor paging through the big group and out of
+    /// it gives the same list on either path.
+    #[tokio::test]
+    async fn a_large_equal_key_group_is_served_by_the_general_statement() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_date_ties(&backend, &tenant, 12, 6).await;
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        for desc in [true, false] {
+            let general = {
+                let mut query = date_sort_query(desc, 100);
+                query.fhir_version = Some(FhirVersion::default());
+                date_sort_ids(&backend, &conn, &tenant, &query)
+            };
+            assert_eq!(general.len(), 18);
+            for (cap, walked) in [(5usize, false), (100, true)] {
+                TIE_CAP.with(|c| c.set(Some(cap)));
+                // The first page starts in the 12 ties when descending, and in
+                // the single earliest rows when ascending.
+                TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+                let first = backend
+                    .search_with_connection_probe(
+                        &conn,
+                        &tenant,
+                        &date_sort_query(desc, 5),
+                        None,
+                        false,
+                    )
+                    .unwrap();
+                let expect_walk = walked || !desc;
+                assert_eq!(walk_statement_ran(), expect_walk, "desc={desc} cap={cap}");
+                let first: Vec<String> = first
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect();
+                assert_eq!(first, general[..5], "desc={desc} cap={cap}");
+                // Paged by cursor across the group boundary: the same list.
+                let paged = date_sort_ids(&backend, &conn, &tenant, &date_sort_query(desc, 5));
+                assert_eq!(paged, general, "desc={desc} cap={cap}");
+            }
+            TIE_CAP.with(|c| c.set(None));
+        }
+    }
+
+    /// #2731: an `_offset` up to `DATE_WALK_MAX_OFFSET` is walked; one past it
+    /// is served by the general statement.
+    #[tokio::test]
+    async fn an_offset_past_the_cap_is_served_by_the_general_statement() {
+        use crate::types::DATE_WALK_MAX_OFFSET;
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_date_walk(&backend, &tenant).await;
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        for desc in [true, false] {
+            for (offset, walked) in [
+                (DATE_WALK_MAX_OFFSET, true),
+                (DATE_WALK_MAX_OFFSET + 1, false),
+            ] {
+                let mut query = date_sort_query(desc, 2);
+                query.offset = Some(offset as u32);
+                TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+                let page = backend
+                    .search_with_connection_probe(&conn, &tenant, &query, None, false)
+                    .unwrap();
+                assert_eq!(walk_statement_ran(), walked, "desc={desc} offset={offset}");
+                assert!(page.resources.items.is_empty(), "past the 9 resources");
+            }
         }
     }
 
@@ -4080,7 +5177,7 @@ mod tests {
             let sql = format!(
                 "EXPLAIN QUERY PLAN SELECT id FROM resources \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                 AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+                 AND rowid IN ({}) {DEFAULT_ORDER_BY} LIMIT 101",
                 fragment.sql
             );
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -4997,8 +6094,8 @@ mod tests {
             }
             let query = SearchQuery::new("Observation").with_parameter(cvq(&values));
             assert_eq!(
-                search_count_on_plan(&conn, &tenant, &query, false).unwrap(),
-                search_count_on_plan(&conn, &tenant, &query, true).unwrap(),
+                search_count_on_plan(&conn, &tenant, &query, false, None).unwrap(),
+                search_count_on_plan(&conn, &tenant, &query, true, None).unwrap(),
                 "{values:?} total"
             );
         }
@@ -5081,8 +6178,8 @@ mod tests {
         let forced = backend.search_with_connection_plan(&conn, &tenant, &query, None, false, true);
         assert!(forced.unwrap_err().to_string().contains("no such index"));
         assert_eq!(
-            search_count_on(&conn, &tenant, &query).unwrap(),
-            search_count_on_plan(&conn, &tenant, &query, false).unwrap()
+            search_count_on(&conn, &tenant, &query, None).unwrap(),
+            search_count_on_plan(&conn, &tenant, &query, false, None).unwrap()
         );
     }
 

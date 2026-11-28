@@ -1,0 +1,87 @@
+# ADR-aacruzgon-0089: An index unit over the native protocol's 65,535 statements, or over 8 MiB of statements, is split into batches of whole rows (amends ADR-sam-michaels-0006, IW11)
+
+- **Date:** 2026-11-25
+- **Status:** accepted
+- **Context:**
+    - **The rule.** ADR-sam-michaels-0006 IW11 (`0006-step-5-design.md:253`) says: "A unit (one partition's rows) is never split; a unit too big on its own goes alone." IW9 B makes the unit, every insert and delete of one partition, so that Cassandra applies it as one mutation on each replica. Above all, once its batch has reached a quorum, an update alone never lets `count` see an updated resource's two `resources_by_type` rows.
+    - **What broke it (F1 of the PR #108 review, comment [7153189844](https://github.com/aacruzgon/hfs-Cassandra-CS4411/pull/108#issuecomment-7153189844), 2026-11-24).** A unit has no upper bound on its statements. `token_system_index`'s partition is `(tenant, type, param, system)`, so every value of one parameter with one real system shares a unit, and an update deletes and inserts each one. A BATCH frame's statement count is a `[short]`, a 2-byte unsigned integer (`native_protocol_v5.spec`, sections 3 and 4.1.7), and `cdrs-tokio` writes it as `self.queries.len() as CIntShort`, an `i16` (`cassandra-protocol-5.0.0/src/frame/message_batch.rs:56`). So 65,535 statements is the most a batch can carry; at 65,536 the count wraps to 0, and the node reads the first statement's bytes as the consistency.
+    - **Reproduced, a single node, both heads.** The review worker reproduced it on its own 5.0.9 node, R4, with a Patient whose identifiers all share one system (`.agent-share/pr108-review/logs/f1/`). On `139610858` (before the fix): a create of 65,536 identifiers answered `Ok("1")` with no `token_system_index` row written and the intent kept; an update from 32,768 to 32,768 identifiers (65,536 statements) answered `Ok("2")`, with the 32,768 rows still tagged version 1, so the tag check hides them, and the intent kept. The node logged `ProtocolException: Unknown code 256 for a consistency level` for the create (`old-create_65536.log`). The update's node-log window in the same logs, seconds later, is empty, because `NoSpamLogger` holds back a repeat within the minute. The first review's own update run reported the same exception, but its saved log holds no node output. A create of 65,535, and an update from 32,767 to 32,768 (65,535 statements), went through. #107's sweeper would replay the same failing unit until the intent's 24 h TTL (SW18). #106's repair would not heal it either. For a resource of more than 64 keys, RV1 (`repair.rs`, `MAX_FULL_REPAIR_KEYS`) touches only the rows a search found. It moves each found row whose key `K(current)` still produces to R1's `last_updated`, and deletes each one it no longer produces. So it fixes only the rows that searches return, one page at a time, and the rest wait for the sweeper.
+    - **Sam's first fix, `d8aee59ba` (2026-11-25).** `index_batches` (`write.rs`) cut each unit's statements into consecutive pieces of at most `MAX_BATCH_STATEMENTS` (`batch.rs`, `u16::MAX`), in statement order (inserts, then deletes), and packed the pieces as units. A `debug_assert!` checks that the `resources_by_type` unit, at most two statements, is never split. On `6d28231ce` every case above writes its rows at the new version and clears the intent, and so does an update from 32,768 to 32,769 (65,537 statements). The same five cases on three 5.0.9 nodes at RF 3 (`acruzdebian`, read back at `QUORUM`, `logs/3n-new/f1-*.log`) give the same results. The old head was not run on three nodes with these cases; its three-node run (`logs/3n/`) was the lib suites only.
+    - **The first fix missed the byte limit.** The independent audit of the PR #108 fixes (2026-11-25) built the largest update one partition can take. It used a 64-byte tenant (`MAX_TENANT_ID_LEN`), a 64-character id, and 32,768 identifiers of one system, with codes of 46 characters, the longest the 8 MiB CAS bound accepts under R4 (`cas_payload_bytes` 8,356,034). It then updated them to 32,768 new codes. The 65,536-statement unit's first 65,535-statement piece is a 17,366,788-byte message. The node refused it: `OversizedCQLMessageException: CQL Message of size 17366788 bytes exceeds allowed maximum of 16777216 bytes`. The update answered `Ok("2")`, with 32,767 `token_system_index` rows left at version 1, `post_cas_failures=1` and the intent kept: F1's failure again.
+        - **The limit that bites.** It is the node's limit on one native-protocol message: `native_transport_max_message_size`, unset in 5.0.9 (`Config.java:288`), so the default applies: 16 MiB on that node, as its message says, and less on a heap under 640 MiB (see Consequences). A single-partition batch is exempt from `batch_size_fail_threshold` (`BatchStatement.java:333-335`). `max_mutation_size` (16 MiB, half of `commitlog_segment_size`) is not the limit either, because a mutation counts the partition key once, while the wire carries it with every statement.
+        - **Why the review missed it.** The review's long case used codes of at most five characters.
+        - **Reproduced again.** This session's node test `the_largest_update_of_one_partition_is_cut_by_bytes_and_lands`, with the byte cut removed, gets the same 17,366,788-byte refusal and `post_cas_failures=1`.
+    - **Why it is a decision.** The split deviates from IW11 as written, and IW11 is in Sam's log, which only Sam edits (CLAUDE.md, "Decision records"). The follow-up comment ([7166593743](https://github.com/aacruzgon/hfs-Cassandra-CS4411/pull/108#issuecomment-7166593743)) asked for it to be recorded before merge. Alan co-authors the rest of PR #108, so the amendment is recorded here.
+- **Decision:**
+    - **The split.** A unit of more than 65,535 statements, or of more than 8 MiB of statements by `wire_bytes`, is split into consecutive pieces:
+        - each piece is whole rows, all at `USING TIMESTAMP ts(V)`, in the unit's statement order;
+        - each piece is as long as both limits allow. `MAX_PIECE_BYTES` is 8 MiB, half the node's default 16 MiB message limit (less on a heap under 640 MiB; see Consequences) and the same as `MAX_CAS_PAYLOAD_BYTES`; whichever limit ends first ends the piece;
+        - a lone statement over the byte budget still goes, alone;
+        - a full piece is a batch of its own, and a small last piece is packed like any unit;
+        - every other unit is still sent whole, and the `resources_by_type` unit is never split.
+    - **The session's guard.** `MAX_BATCH_STATEMENTS` is pinned at 65,535 by a const assertion. `CassandraSession::batch` refuses a batch of more statements, as `DriverError::TooManyStatements`, before counting or sending anything. The writer reads that refusal as permanent (`Refused`, then `WriteFailure::Permanent`), so it does not retry and keeps the intent.
+    - **The IW11 amendment.** This amends ADR-sam-michaels-0006 IW11 to read: "A unit (one partition's rows) is never split for its bytes against the 4,864-byte bound; a unit too big on its own goes alone. A unit of more than 65,535 statements, the protocol's limit, or of more than 8 MiB of statements, half the node's message limit, is split into pieces of whole rows (ADR-aacruzgon-0089)."
+- **Alternatives considered:**
+    - **Refuse such a write at step 1, before any statement, as `MAX_CAS_PAYLOAD_BYTES` does (ADR-aacruzgon-0053).** It is simpler, and it keeps "a unit is never split" true. It lost because an update reaches the limits before a create does: an update deletes and inserts each value. A resource with 32,768 to 65,535 values in one partition could then be created but never updated, and for long values the byte limit is reached with even fewer. A smaller bound at step 1, leaving room for the update, would refuse resources that store and index fine today.
+    - **Leave IW11 as written, with the oversized unit as one batch.** This is the state before `d8aee59ba`: the write answers success with stale index rows and a kept intent that no sweeper pass can finish. Not acceptable.
+    - **Split by statement count alone.** This is `d8aee59ba`'s first form. It lost to the audit's reproduction above: a valid update makes a 65,535-statement piece over the node's default 16 MiB message limit.
+    - **A byte budget near 16 MiB, or a much smaller one.**
+        - At 16 MiB, nothing is left for the frame's own bytes or for a node configured lower.
+        - A smaller budget only adds pieces, and so widens the window below.
+        - 8 MiB is half the limit, and it matches the CAS bound the same request already meets.
+    - **Raise `native_transport_max_message_size` on the nodes.** It lost because it is a per-cluster change the backend cannot assume, and the backend should work on a default node.
+- **Consequences:**
+    - **What it gives up.** One partition's rows no longer apply as one mutation when its unit is split. Between the pieces, a reader of that token partition can see some rows new and some old. That is the window two different partitions of one write already have, so a search can briefly miss or double such a resource. It is closed once every piece lands, or by the sweeper if one fails.
+    - **What it keeps.**
+        - Every piece carries the same `ts(V)`, so their order does not matter, and an insert and a delete of the same key still resolve as before.
+        - Any failed or unconfirmed piece keeps the intent, and the sweeper replays the whole delta (SW18).
+        - `count` is unaffected, because it reads `resources_by_type`, whose unit is never split.
+    - **Where it can happen.** Only in a partition whose statements in one write are more than 65,535, or more than 8 MiB. At the largest rows (a 64-byte tenant, a 64-character id, 46-character codes: 269 wire bytes per insert and 261 per delete, 265 on average over the update's unit), the byte budget ends a piece at about 31,200 statements of inserts, or about 32,100 once deletes join; with short rows the count ends it first. The fixtures' largest unit is far below both. G30 (hot and huge partitions) is unchanged.
+    - **Creates are covered.** The cut applies to every unit, so a create's is cut too: the node test's create, 32,768 inserts of 8.81 MB, goes as two pieces. Computed from the measured sizes (255 CAS bytes per identifier at 46-character codes, and 223 wire bytes per insert plus the code's length: 269 at 46 characters, 237 at 14), the 8 MiB CAS bound keeps a create's 65,535-statement count-cut piece under 16 MiB, by under 10% at its largest (about 15.5 MB, with codes of about 14 characters). So no create was found to fail under the count cut alone, but the margin is thin, and the byte budget removes it.
+    - **Tied to the node's message limit.** The 8 MiB budget, like `MAX_CAS_PAYLOAD_BYTES`, assumes `native_transport_max_message_size` is at least 8 MiB plus about 1 KiB. Unset, the node takes `min(max_mutation_size, heap / 10, heap / 40)` (`DatabaseDescriptor.java:903-905`, `:3237-3245`). That is 16 MiB on a heap of 640 MiB or more, and 13,421,772 bytes on a 512 MiB heap, as measured on 2026-11-25. On a heap under about 321 MiB it falls below the budget. `crates/persistence/README.md`, "Node settings HFS depends on", lists this and the node's other limits HFS relies on.
+    - **Tests:**
+        - `a_unit_over_the_statement_limit_is_split_and_the_type_unit_never_is` (`write.rs`, Sam's): fails with the split removed (the review's N1).
+        - The const assertion on `MAX_BATCH_STATEMENTS` (`batch.rs`): a larger limit does not compile (the review's N2 survived every test before it).
+        - `a_piece_ends_at_the_statement_count_or_the_byte_budget` (`batch.rs`, pure): the count cut, the byte cut and the lone oversized statement.
+        - `a_unit_over_the_piece_bytes_is_split_by_bytes` (`write.rs`, pure): whole rows in order, each full piece at the budget, the type unit whole.
+        - `a_unit_over_the_piece_bytes_lands_and_a_count_cut_piece_is_refused` (`write.rs`, node, every run): a hand-built unit of 65,536 copies of one 269-byte insert. The node refuses its 65,535-statement count-cut piece (17 MB) as `Invalid`, which shows the default 16 MiB limit on a real node, and the byte cut's pieces all land. It leaves one row. Without the byte cut it fails (`Err(Permanent)`, a 17,628,915-byte batch).
+        - `the_largest_update_of_one_partition_is_cut_by_bytes_and_lands` (`write.rs`, node): the audit's case, create and update. Without the byte cut it fails with the node's `OversizedCQLMessageException` and `post_cas_failures=1`.
+            - **It is gated:** it runs only with `HFS_TEST_CASSANDRA_LARGE=1`, and prints `not run: …` otherwise.
+            - **Why:** each run leaves about 98,000 index rows and as many tombstones, which the lib tests' whole-table scans would pay for in every later run on the same node.
+            - **Where CI runs it:** once per run, in the FHIR versions job's R6 lib run, the last lib run on that job's own node.
+        - `a_batch_over_the_statement_limit_is_refused_and_sends_nothing` (`session.rs`, node): a batch of exactly 65,535 statements (all of one row, so it leaves one row behind) is sent and applied, so refusing at `>=` fails; 65,536 are refused with nothing sent.
+        - `a_batch_over_the_statement_limit_is_refused_and_not_retried` (`batch.rs`, pure): the refusal is `Refused`.
+        - `a_batch_over_the_statement_limit_fails_as_permanent` (`write.rs`, node): `send_index_batch` answers `Permanent` after one try, not `TriesExhausted`.
+    - **To revisit.** If Step 8 adds bucketing for huge partitions (G30), a bucketed table would reach the limits later or never; the split stays as the backstop.
+- **AI involvement:** Claude Code (Claude Opus 5.5), in four sessions run by Alan.
+    - **The review worker** found F1 by reading `index_batches` and the driver's `message_batch.rs`. It reproduced F1 on a single node on both heads, and on three nodes on the new head, with scratch tests that were never committed. It proposed the split, or refusing at step 1, and recommended the split.
+    - **Sam** wrote the statement-count split (`d8aee59ba`) and its unit test.
+    - **The follow-up review** found that nothing pinned the limit (N2), and that the design text still said a unit is never split.
+    - **This session, the co-author worker for PR #108:**
+        - pinned the limit;
+        - added the session's refusal and its node test;
+        - fixed the doc comments;
+        - drafted v1 of this entry, which Alan approved.
+    - **The independent audit of those commits,** by a reviewer this session did not brief, found:
+        - B1, the byte limit, which it reproduced on its own node;
+        - S1, the refusal read as `Retry`;
+        - S2, no test at exactly 65,535;
+        - M1 and M2, two wrong sentences in v1's Context;
+        - M3, three wrong doc comments.
+    - **Alan** decided to cut pieces at 8 MiB too, and to fix every finding.
+    - **This session, again:**
+        - checked each finding against the logs and the code. M2's suggested wording was wrong as well: RV1 moves the found rows it still produces, it does not only delete;
+        - wrote the byte cut, the `TooManyStatements` variant and the tests;
+        - rewrote this entry as v2, which Alan reviewed before commit.
+    - **Verified:**
+        - the protocol spec (`native_protocol_v5.spec`, sections 3 and 4.1.7) and `cassandra-protocol-5.0.0/src/frame/message_batch.rs:56`, read;
+        - `Config.java:288` and the node's own `OversizedCQLMessageException` message;
+        - the review's F1 logs and the audit's logs, read;
+        - #106's `repair.rs` (RV1) and #107's sweeper handling of `Permanent`, read;
+        - the lib and `cassandra_tests` suites, run on a single 5.0.9 node;
+        - each new test, killed by a hand mutation of what it guards.
+- **Links:**
+    - PR #108 (`cassandra/step5-extraction`): `d8aee59ba` (Sam's split), and this session's commits there: the doc comments in `write.rs`, the pinned limit and the session's refusal, and the 8 MiB byte cut;
+    - review comments [7153189844](https://github.com/aacruzgon/hfs-Cassandra-CS4411/pull/108#issuecomment-7153189844) (F1) and [7166593743](https://github.com/aacruzgon/hfs-Cassandra-CS4411/pull/108#issuecomment-7166593743) (the follow-up);
+    - amends [ADR-sam-michaels-0006](../../ADR-sam-michaels/2026-11-16/0006-step-5-design.md) IW11 (and the "never split" wording of IW9 B);
+    - roadmap row 5.1 and §6 "Concurrent index batches"; `cassandra-discussion.md`, write path step 5; `walkthrough.md` section 2, "Index rows".

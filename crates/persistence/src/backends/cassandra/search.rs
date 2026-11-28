@@ -1,11 +1,14 @@
 //! [`SearchProvider`] and [`SearchCapabilityProvider`] for
 //! [`CassandraBackend`].
 //!
-//! `search` and `search_count` are Step 6's; until then they return
-//! `UnsupportedCapability` (501), and `supports_search` is `false`, so
-//! `/metadata` lists no `search-type` and no search parameters (roadmap Step 7,
-//! ADR-aacruzgon-0085). `search_param_registry` is real from Step 2 on, because
-//! the CapabilityStatement, batch, compartment, `$everything`, bulk export and
+//! `search` and `search_count` validate the query (row 6.1), then serve
+//! `_id`, `_lastUpdated`, the unfiltered type search and every parameter
+//! whose module has landed; a parameter whose module has not answers 501.
+//! `supports_search` stays `false` until Step 6's last commit declares
+//! `BasicSearch`, so `/metadata` lists no `search-type` and no search
+//! parameters (roadmap Step 7, ADR-aacruzgon-0085, 0104).
+//! `search_param_registry` is real from Step 2 on, because the
+//! CapabilityStatement, batch, compartment, `$everything`, bulk export and
 //! SQL-on-FHIR all call it, with or without search (roadmap Step 2, item 2.3).
 //!
 //! The capability declaration is the design's: token, date and URI
@@ -33,7 +36,11 @@
 //! module issue before it merges.
 
 mod date;
+mod engine;
+mod last_updated;
 mod paging;
+mod planner;
+mod residual;
 mod token;
 mod uri;
 
@@ -41,27 +48,35 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cdrs_tokio::types::IntoRustByName;
+use cdrs_tokio::types::rows::Row;
+use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, Utc};
-use futures::stream::BoxStream;
+use futures::future;
+use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use parking_lot::{Mutex, RwLock};
 
 use super::backend::CassandraBackend;
-use super::errors::unsupported;
+use super::errors::{BACKEND_NAME, map_driver_error, unsupported};
 use super::index_keys::IndexKey;
 use super::read::ResourceRow;
-use super::session::CassandraSession;
+use super::repair::{RepairContext, StaleIndexRow};
+use super::session::{CassandraSession, StatementKind};
 use crate::core::capabilities::{
     GlobalSearchCapabilities, ResourceSearchCapabilities, SearchCapabilityProvider,
 };
 use crate::core::{SearchProvider, SearchResult};
-use crate::error::{SearchError, StorageResult};
+use crate::error::{BackendError, SearchError, StorageError, StorageResult};
 use crate::search::{ExtractedValue, SearchParameterDefinition, SearchParameterRegistry};
 use crate::tenant::TenantContext;
 use crate::types::{
-    PaginationCapability, ResultModeCapability, SearchParamFullCapability, SearchParamType,
-    SearchQuery, SpecialSearchParam,
+    IncludeType, Page, PageInfo, PaginationCapability, ResultModeCapability,
+    SearchParamFullCapability, SearchParamType, SearchQuery, SortDirection, SpecialSearchParam,
+    StoredResource, SummaryMode,
 };
+use last_updated::{LastUpdatedFilter, Slice};
 use paging::{Order, OrderKey, Position};
+use planner::{Checks, Compiled, Driver};
 
 /// One index row as read, for the tag check and for repair.
 ///
@@ -69,7 +84,6 @@ use paging::{Order, OrderKey, Position};
 /// again: a stored value is already what `index_text` produced
 /// (ADR-aacruzgon-0079). The fields are the arguments of
 /// [`StaleIndexRow::new`](super::repair::StaleIndexRow::new).
-#[allow(dead_code)] // The search engine (#128) reads it; until then only the modules' types do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FoundRow {
     pub(crate) key: IndexKey,
@@ -83,7 +97,6 @@ pub(crate) struct FoundRow {
 /// One resource a plan's stream yields: where it sits in the stream's order,
 /// its id, and every index row of it read at that order key (for example its
 /// rows in both the named system's and the `IMPLICIT` partition).
-#[allow(dead_code)] // The search engine (#128) reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Candidate {
     pub(crate) order: OrderKey,
@@ -96,7 +109,6 @@ pub(crate) struct Candidate {
 /// tenant's registry, on the write path's large-stack thread in debug
 /// builds), which the date and compartment residuals both read. `extracted`
 /// is empty when no residual needs it.
-#[allow(dead_code)] // The search engine (#128) builds it.
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedResource {
     pub(crate) row: ResourceRow,
@@ -107,7 +119,7 @@ pub(crate) struct LoadedResource {
 /// fixed order (walkthrough 5.8, ADR-aacruzgon-0027), most specific first.
 /// The planner takes the lowest across the whole query; ties go by query
 /// order.
-#[allow(dead_code)] // The modules' plans return it once they exist.
+#[allow(dead_code)] // The modules' plans (#130–#132) return the token, URI and date ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Drive {
     /// The framework's own `_id` plan (walkthrough 5.4).
@@ -135,14 +147,12 @@ pub(crate) enum Drive {
 /// candidate. Modules never do: neither their index reads nor their
 /// `contains` point reads are candidates point-read. A search is of one
 /// resource type, so the id alone tells candidates apart.
-#[allow(dead_code)] // The search engine (#128) charges it.
 #[derive(Debug)]
 pub(crate) struct CandidateBudget {
     max: usize,
     seen: Mutex<HashSet<String>>,
 }
 
-#[allow(dead_code)] // The search engine (#128) charges it.
 impl CandidateBudget {
     pub(crate) fn new(max: usize) -> Self {
         Self {
@@ -166,22 +176,52 @@ impl CandidateBudget {
     }
 
     /// How many distinct candidates have been charged.
+    #[allow(dead_code)] // Only tests read it.
     pub(crate) fn used(&self) -> usize {
         self.seen.lock().len()
     }
 }
 
+/// Index rows a plan read but could not decode. A plan skips such a row,
+/// never returns it and never fails the search for it, and records it here;
+/// the framework hands each one to the request's repair context, which logs
+/// and counts it (`RepairContext::skip_undecodable`, `repair.rs`).
+#[derive(Debug, Default)]
+pub(crate) struct Undecodable(Mutex<Vec<(&'static str, String)>>);
+
+impl Undecodable {
+    /// Records one row of `table` that could not be decoded. `error` is
+    /// logged as is, so it must name no indexed value: a token code or a URI
+    /// can be an identifier.
+    #[allow(dead_code)] // The modules' plans (#130–#132) call it.
+    pub(crate) fn skip(&self, table: &'static str, error: impl Into<String>) {
+        self.0.lock().push((table, error.into()));
+    }
+
+    /// Hands every recorded row to `repairs`.
+    fn drain_into(&self, repairs: &mut RepairContext) {
+        for (table, error) in self.0.lock().drain(..) {
+            repairs.skip_undecodable(table, &error);
+        }
+    }
+}
+
 /// What every read of a search needs.
-#[allow(dead_code)] // The search engine (#128) builds it.
+#[allow(dead_code)] // The modules' plans (#130–#132) read `session`, `budget`, `batch_rows` and `undecodable`.
 pub(crate) struct ReadCtx<'a> {
     pub(crate) tenant: &'a TenantContext,
     pub(crate) resource_type: &'a str,
     pub(crate) session: &'a CassandraSession,
     pub(crate) budget: &'a CandidateBudget,
+    /// Rows each index read asks for (`LIMIT`): a batch size, not the page
+    /// size (walkthrough 5.1, step 6), the same for every plan.
+    pub(crate) batch_rows: usize,
+    /// Where a plan records an index row it could not decode.
+    pub(crate) undecodable: &'a Undecodable,
 }
 
 /// What a module's `compile` gets besides the parameter itself.
-#[allow(dead_code)] // The search engine (#128) builds it.
+#[allow(dead_code)] // The modules' `compile` (#130–#132) reads it.
 pub(crate) struct CompileCtx<'a> {
     pub(crate) resource_type: &'a str,
     /// The parameter's registered definition, when the tenant's registry has
@@ -190,7 +230,7 @@ pub(crate) struct CompileCtx<'a> {
 }
 
 /// One parameter of a search, compiled by its module (ADR-anastasiabryz-0001).
-#[allow(dead_code)] // The modules implement it and the search engine (#128) calls it.
+#[allow(dead_code)] // `param` is for the modules' messages (#130–#132).
 #[async_trait]
 pub(crate) trait ParamPlan: Send + Sync {
     /// The parameter's name.
@@ -213,8 +253,12 @@ pub(crate) trait ParamPlan: Send + Sync {
 
     /// Its candidates strictly after `from`, in `from`'s order, merged across
     /// its partitions and OR values and collapsed on the order key. Each CQL
-    /// read takes a `LIMIT` batch (a batch size, not the page size) through
-    /// [`CassandraSession::rows`].
+    /// read asks for `ctx.batch_rows` rows (`LIMIT`, a batch size, not the
+    /// page size) through [`CassandraSession::rows`]. An index row it cannot
+    /// decode is skipped and recorded in `ctx.undecodable`.
+    ///
+    /// Only the driving plan streams. A date plan drives only in a search of
+    /// dates alone (G20); beside any other parameter, it is a residual.
     fn stream<'a>(
         &'a self,
         ctx: &'a ReadCtx<'a>,
@@ -224,6 +268,11 @@ pub(crate) trait ParamPlan: Send + Sync {
     /// Whether a candidate another plan drives matches this parameter: the
     /// clustering point reads at `last_updated = ? AND id = ?`, one per
     /// partition and per OR value, ORed (walkthrough 5.8).
+    ///
+    /// The framework calls it for token and URI plans only. A date plan
+    /// beside another parameter is checked by its `residual(loaded, None)`
+    /// alone, since the date tables have no `last_updated` to point-read, so
+    /// its `contains` is never called and can return `true`.
     async fn contains(
         &self,
         ctx: &ReadCtx<'_>,
@@ -233,6 +282,16 @@ pub(crate) trait ParamPlan: Send + Sync {
 
     /// The residual check on the loaded resource. Default: it matches.
     ///
+    /// It decides from its arguments alone. A resumed page compiles a new
+    /// plan, and the framework checks several candidates at once
+    /// (ADR-anastasiabryz-0005), so state kept in the plan between calls is
+    /// lost or raced.
+    ///
+    /// `loaded.extracted` holds the resource's values, extracted once per
+    /// candidate after the tag check, and only when a residual reads values:
+    /// a compartment, or a date parameter other than `_lastUpdated`.
+    /// Otherwise it is empty.
+    ///
     /// `at` is where the candidate sits in the stream's order: `Some` only
     /// for the plan that drives the search, and `None` for a plan checked
     /// beside another driver. Without it, two rows of one resource give a
@@ -241,8 +300,10 @@ pub(crate) trait ParamPlan: Send + Sync {
     /// ADR-aacruzgon-0027) within a page, on a resumed page and across
     /// `ne`'s two tables. Whether the date plan's `residual` is where the
     /// rule is enforced stays Diya's call for 6b (#128, open choice 4).
-    /// Within one page, a resource appears once in any case (bundle.html's
-    /// `bdl-7`, in R4, R4B and R5). A check beside the driver gets `None`,
+    /// Within one page, the framework keeps a resource once whatever the
+    /// residuals return, as the spec requires (bundle.html#bundle-unique and
+    /// `bdl-7`, in R4, R4B and R5); across pages, the rule is the driving
+    /// plan's. A check beside the driver gets `None`,
     /// not the driver's position: a second date judged by the first date's
     /// position would drop a real match.
     fn residual(&self, _loaded: &LoadedResource, _at: Option<&OrderKey>) -> bool {
@@ -276,6 +337,112 @@ fn special_params() -> Vec<SpecialSearchParam> {
     ]
 }
 
+/// Entry validation, which `search()` and `search_count()` both run before
+/// anything is read (roadmap Step 6, "Entry validation in order";
+/// `coverage.md` section 6). The first refusal wins, in this order:
+///
+/// 1. the shared gates, so a value is refused here as on every backend:
+///    `validate_date_values` (400 `InvalidDateValue`),
+///    `validate_value_presence` (400 `EmptyValue`) and
+///    `reject_unsupported_metadata_modifier` (400 `UnsupportedModifier`);
+/// 2. `_text` and `_content` (501 `TextSearchNotAvailable`) and `_filter`
+///    (501 `UnsupportedCapability`), by name and before the type check,
+///    which would otherwise answer 400 for R4's string-typed `_text` and
+///    `_content` (C10, C11);
+/// 3. a parameter type other than token, date and URI (400
+///    `UnsupportedParameterType`);
+/// 4. any modifier (400 `UnsupportedModifier`);
+/// 5. `_include` or `_revinclude` (501 `IncludeNotSupported`);
+/// 6. `_offset`, and a `_sort` other than the search's native order (400
+///    `QueryParseError`; C9).
+///
+/// `query.compartment` and `query.fhir_version` are residual filters and are
+/// never refused (ADR-aacruzgon-0026).
+pub(super) fn validate(query: &SearchQuery) -> StorageResult<()> {
+    crate::search::validate_date_values(query)?;
+    crate::search::validate_value_presence(query)?;
+    crate::search::reject_unsupported_metadata_modifier(query)?;
+
+    for param in &query.parameters {
+        match param.name.as_str() {
+            "_text" | "_content" => return Err(SearchError::TextSearchNotAvailable.into()),
+            "_filter" => return Err(unsupported("_filter")),
+            _ => {}
+        }
+    }
+
+    if let Some(param) = query
+        .parameters
+        .iter()
+        .find(|param| !SUPPORTED_PARAM_TYPES.contains(&param.param_type))
+    {
+        return Err(SearchError::UnsupportedParameterType {
+            param_type: param.param_type.to_string(),
+        }
+        .into());
+    }
+
+    if let Some((param, modifier)) = query
+        .parameters
+        .iter()
+        .find_map(|param| param.modifier.as_ref().map(|modifier| (param, modifier)))
+    {
+        return Err(SearchError::UnsupportedModifier {
+            modifier: modifier.to_string(),
+            param_type: param.param_type.to_string(),
+        }
+        .into());
+    }
+
+    if let Some(include) = query.includes.first() {
+        let operation = match include.include_type {
+            IncludeType::Include => "_include",
+            IncludeType::Revinclude => "_revinclude",
+        };
+        return Err(SearchError::IncludeNotSupported {
+            operation: operation.to_string(),
+        }
+        .into());
+    }
+
+    if query.offset.is_some() {
+        return Err(SearchError::QueryParseError {
+            message: "_offset is not supported: Cassandra pages by cursor only".to_string(),
+        }
+        .into());
+    }
+    if !sort_is_native(query) {
+        return Err(SearchError::QueryParseError {
+            message: "_sort is not supported: Cassandra returns its native order only \
+                      (none, or -_lastUpdated where that is the order)"
+                .to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Whether `query`'s `_sort` asks for the order the search returns anyway
+/// (C9): no `_sort`, or exactly `-_lastUpdated` when the order is
+/// `(last_updated DESC, id DESC)`. That is every search except a date-only
+/// one sliced on a date table: one whose parameters are all dates, none of
+/// them `_lastUpdated` (which, when present, is sliced instead; G20).
+fn sort_is_native(query: &SearchQuery) -> bool {
+    match query.sort.as_slice() {
+        [] => true,
+        [sort] => {
+            let date_table = !query.parameters.is_empty()
+                && query.parameters.iter().all(|param| {
+                    param.param_type == SearchParamType::Date && param.name != "_lastUpdated"
+                });
+            sort.parameter == "_lastUpdated"
+                && sort.direction == SortDirection::Descending
+                && !date_table
+        }
+        _ => false,
+    }
+}
+
 fn pagination() -> Vec<PaginationCapability> {
     vec![
         PaginationCapability::Count,
@@ -302,18 +469,88 @@ impl SearchProvider for CassandraBackend {
 
     async fn search(
         &self,
-        _tenant: &TenantContext,
-        _query: &SearchQuery,
+        tenant: &TenantContext,
+        query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
-        Err(unsupported("search"))
+        validate(query)?;
+        let Some(plan) = Plan::of(query) else {
+            return Err(unsupported("search"));
+        };
+        // `_count=0` behaves as `_summary=count` (`cassandra-discussion.md`,
+        // "`_count=0` and `count`"): a total and no entries, so no page is
+        // read. REST turns `_summary=count` into `_total=accurate`.
+        let count_only = query.count == Some(0) || query.summary == Some(SummaryMode::Count);
+        let mut result = if count_only {
+            SearchResult::new(Page::new(Vec::new(), PageInfo::end()))
+        } else {
+            match &plan {
+                Plan::Unfiltered | Plan::TypeScan => {
+                    self.type_search(tenant, query, &Checks::none()).await?
+                }
+                Plan::Ids(ids) => self.id_search(tenant, query, ids, &Checks::none()).await?,
+                Plan::Modules => {
+                    let compiled = self.compile_modules(tenant, query)?;
+                    let driver = choose_driver(query, &compiled);
+                    let checks = Checks::besides(&compiled, driver);
+                    match driver {
+                        Driver::Plan(index) => {
+                            let plan = compiled[index].plan.as_ref();
+                            self.plan_search(tenant, query, plan, &checks).await?
+                        }
+                        Driver::Ids => {
+                            self.id_search(tenant, query, &id_set(query), &checks)
+                                .await?
+                        }
+                        Driver::TypeScan => self.type_search(tenant, query, &checks).await?,
+                    }
+                }
+            }
+        };
+        // The page as usual, plus one `search_count` of the same query
+        // (walkthrough 5.9); `_total=none` or absent computes none.
+        if count_only || query.wants_total() {
+            result.total = Some(self.search_count(tenant, query).await?);
+        }
+        Ok(result)
     }
 
     async fn search_count(
         &self,
-        _tenant: &TenantContext,
-        _query: &SearchQuery,
+        tenant: &TenantContext,
+        query: &SearchQuery,
     ) -> StorageResult<u64> {
-        Err(unsupported("search_count"))
+        validate(query)?;
+        match Plan::of(query) {
+            Some(Plan::Unfiltered) => match query.stored_fhir_version() {
+                // `count(tenant, Some(type))`, no tag check (walkthrough 5.9, G7).
+                None => {
+                    self.count_resources(tenant, Some(&query.resource_type))
+                        .await
+                }
+                Some(version) => {
+                    self.count_type_version(tenant, &query.resource_type, version)
+                        .await
+                }
+            },
+            // The stream of 5.1 run to the end, with tag checks, under the
+            // cap; a filtered `search_count` queues no repairs (5.9).
+            Some(Plan::TypeScan) => self.type_count(tenant, query, &Checks::none()).await,
+            Some(Plan::Ids(ids)) => self.id_count(tenant, query, &ids, &Checks::none()).await,
+            Some(Plan::Modules) => {
+                let compiled = self.compile_modules(tenant, query)?;
+                let driver = choose_driver(query, &compiled);
+                let checks = Checks::besides(&compiled, driver);
+                match driver {
+                    Driver::Plan(index) => {
+                        let plan = compiled[index].plan.as_ref();
+                        self.plan_count(tenant, query, plan, &checks).await
+                    }
+                    Driver::Ids => self.id_count(tenant, query, &id_set(query), &checks).await,
+                    Driver::TypeScan => self.type_count(tenant, query, &checks).await,
+                }
+            }
+            None => Err(unsupported("search_count")),
+        }
     }
 
     /// The tenant's registry: the shared base plus that tenant's stored
@@ -423,6 +660,28 @@ mod tests {
         // (#133, Alan's audit point 2).
         let _residual: fn(&NoMatches, &LoadedResource, Option<&OrderKey>) -> bool =
             <NoMatches as ParamPlan>::residual;
+        // The default residual matches, with a position or without.
+        let loaded = LoadedResource {
+            row: crate::backends::cassandra::read::ResourceRow {
+                version_id: 1,
+                data: None,
+                last_updated: Utc::now(),
+                created_at: None,
+                deleted_at: None,
+                fhir_version: crate::backends::cassandra::test_support::test_fhir_version(),
+                stored_fhir_version: None,
+                write_ts: None,
+                write_id: None,
+                index_keys: None,
+            },
+            extracted: Vec::new(),
+        };
+        let at = OrderKey {
+            at: Utc::now(),
+            table: None,
+        };
+        assert!(plan.residual(&loaded, None));
+        assert!(plan.residual(&loaded, Some(&at)));
     }
 
     #[test]
@@ -479,6 +738,2321 @@ mod tests {
                 ),
                 "{module}::compile should refuse until its issue lands"
             );
+        }
+    }
+}
+
+/// The candidate cap until `HFS_CASSANDRA_SEARCH_MAX_CANDIDATES` is read from
+/// the configuration (ADR-anastasiabryz-0002; the setting goes in Sam's
+/// `config.rs`).
+const DEFAULT_MAX_CANDIDATES: usize = 100_000;
+
+/// The cap a search runs under: [`DEFAULT_MAX_CANDIDATES`], or in a test the
+/// value [`TEST_MAX_CANDIDATES`] holds on the test's thread, so a test can
+/// reach the cap with a handful of resources.
+fn max_candidates() -> usize {
+    #[cfg(test)]
+    if let Some(max) = TEST_MAX_CANDIDATES.with(std::cell::Cell::get) {
+        return max;
+    }
+    DEFAULT_MAX_CANDIDATES
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's cap. A `#[tokio::test]` runs its future on its own thread,
+    /// so this never leaks into another test.
+    static TEST_MAX_CANDIDATES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+/// Rows one index read asks for: a batch size, not the page size
+/// (walkthrough 5.1, step 6).
+const BATCH_ROWS: usize = 100;
+/// Reads in flight at once, for each stage of a search: the R1 point reads,
+/// fed across batch and slice boundaries, and then the other parameters'
+/// checks, whose `contains` are point reads too. Alan's measurements on #133
+/// (2026-11-27) put 100,000 candidates past the 30 s request timeout at 8 in
+/// flight on three nodes with a 1–2 ms network round trip; 32 in flight kept
+/// a 2× margin at every level measured (ADR-anastasiabryz-0005).
+const R1_CONCURRENCY: usize = 32;
+
+/// Walkthrough 5.6's read of `resources_by_type`, without its keyset and
+/// `LIMIT` (added per read).
+const SELECT_TYPE_ROWS: &str = "SELECT last_updated, id, version_id, fhir_version \
+     FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?";
+
+/// A search with no parameters, chains, `_has`, `_list` or compartment: the
+/// unfiltered type search of walkthrough 5.6. A compartment (a compartment
+/// search, or any search under a `patient/` scope) is a residual filter
+/// (5.11, G33), so a search with one is never unfiltered: answering it from
+/// `resources_by_type` alone would return the whole type.
+fn is_unfiltered(query: &SearchQuery) -> bool {
+    query.parameters.is_empty()
+        && query.reverse_chains.is_empty()
+        && query.list.is_empty()
+        && query.compartment.is_none()
+}
+
+/// What the engine can answer so far, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Plan {
+    /// No parameters: walkthrough 5.6.
+    Unfiltered,
+    /// `resources_by_type` scanned with checks: `_lastUpdated` slices
+    /// (walkthrough 5.5), a compartment (5.11), or both.
+    TypeScan,
+    /// `_id` parameters, and maybe `_lastUpdated`: point reads of these ids,
+    /// the intersection of every `_id` parameter's values (walkthrough 5.4,
+    /// G37), with `_lastUpdated` a residual on `resources.last_updated`.
+    Ids(Vec<String>),
+    /// Token, URI or date parameters: compiled by their modules, and the
+    /// driver chosen by the planner (C5, G20).
+    Modules,
+}
+
+impl Plan {
+    /// `None` for a query the engine does not serve: chains, `_has` or
+    /// `_list`. A compartment is a residual on any plan but `Unfiltered`,
+    /// which has none.
+    fn of(query: &SearchQuery) -> Option<Self> {
+        if is_unfiltered(query) {
+            return Some(Plan::Unfiltered);
+        }
+        if !query.reverse_chains.is_empty() || !query.list.is_empty() {
+            return None;
+        }
+        if !query
+            .parameters
+            .iter()
+            .all(|param| param.name == "_id" || param.name == last_updated::PARAM)
+        {
+            return Some(Plan::Modules);
+        }
+        if query.parameters.iter().all(|param| param.name != "_id") {
+            return Some(Plan::TypeScan);
+        }
+        Some(Plan::Ids(id_set(query)))
+    }
+}
+
+/// The ids an `_id` search reads: several `_id` parameters are ANDed, so
+/// their sets are intersected before any read (G37). Each value is compared
+/// whole with the id, so `_id=sys|abc` reads an id that cannot exist (C2).
+fn id_set(query: &SearchQuery) -> Vec<String> {
+    let mut sets = query
+        .parameters
+        .iter()
+        .filter(|param| param.name == "_id")
+        .map(|param| {
+            param
+                .values
+                .iter()
+                .map(|value| value.value.clone())
+                .collect::<std::collections::BTreeSet<String>>()
+        });
+    let Some(first) = sets.next() else {
+        return Vec::new();
+    };
+    sets.fold(first, |kept, set| {
+        kept.intersection(&set).cloned().collect()
+    })
+    .into_iter()
+    .collect()
+}
+
+/// `search_count` with no filters and a FHIR version named (G34): the whole
+/// partition's `fhir_version` column, counted in Rust.
+const SELECT_TYPE_VERSIONS: &str =
+    "SELECT fhir_version FROM resources_by_type WHERE tenant_id = ? AND resource_type = ?";
+/// Rows per page of that scan.
+const VERSION_SCAN_PAGE: i32 = 5000;
+
+fn internal(message: String) -> StorageError {
+    StorageError::Backend(BackendError::Internal {
+        backend_name: BACKEND_NAME.to_string(),
+        message,
+        source: None,
+    })
+}
+
+/// What a `resources_by_type` scan found: the resources it kept, in order,
+/// and how many rows passed every check.
+#[derive(Debug, Default)]
+struct TypeScan {
+    kept: Vec<(DateTime<Utc>, StoredResource)>,
+    matched: usize,
+}
+
+/// One row of `resources_by_type`.
+#[derive(Debug, Clone)]
+struct TypeRow {
+    last_updated: DateTime<Utc>,
+    id: String,
+    /// The row's tag; `None` only for a row written without one.
+    version_id: Option<i32>,
+    /// The resource's `fhir_version`, as `resources` stores it (G34).
+    fhir_version: Option<String>,
+}
+
+impl TypeRow {
+    fn decode(row: &Row) -> StorageResult<Self> {
+        let field = |name: &str, error: cdrs_tokio::error::Error| {
+            internal(format!("search: resources_by_type.{name}: {error}"))
+        };
+        Ok(Self {
+            last_updated: row
+                .get_r_by_name("last_updated")
+                .map_err(|error| field("last_updated", error))?,
+            id: row
+                .get_r_by_name("id")
+                .map_err(|error| field("id", error))?,
+            version_id: row
+                .get_by_name("version_id")
+                .map_err(|error| field("version_id", error))?,
+            fhir_version: row
+                .get_by_name("fhir_version")
+                .map_err(|error| field("fhir_version", error))?,
+        })
+    }
+}
+
+/// The resource an R1 row holds, as a search returns it.
+fn stored_resource(
+    tenant: &TenantContext,
+    resource_type: &str,
+    id: &str,
+    row: &ResourceRow,
+) -> StorageResult<StoredResource> {
+    let data = row
+        .data
+        .as_deref()
+        .ok_or_else(|| internal("search: a live resources row has no data".to_string()))?;
+    let content = serde_json::from_str(data)
+        .map_err(|error| internal(format!("search: stored JSON: {error}")))?;
+    Ok(StoredResource::from_storage(
+        resource_type,
+        id,
+        row.version_id.to_string(),
+        tenant.tenant_id().clone(),
+        content,
+        row.created_at.unwrap_or(row.last_updated),
+        row.last_updated,
+        None,
+        row.fhir_version,
+    ))
+}
+
+impl CassandraBackend {
+    /// `GET /Patient`, or `_lastUpdated` alone: one partition of
+    /// `resources_by_type`, keyset-paged from the cursor, each row
+    /// tag-checked against R1 (walkthrough 5.1, 5.5, 5.6). One repair context
+    /// for the response, run once at its end, on success and on
+    /// `TooManyResults` (`repair.rs`, "Step 6's contract").
+    async fn type_search(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        checks: &Checks<'_>,
+    ) -> StorageResult<SearchResult> {
+        let position = paging::decode(query.cursor.as_deref(), Order::Default)?;
+        let filter = LastUpdatedFilter::of(query)?;
+        let budget = CandidateBudget::new(max_candidates());
+        let mut repairs = RepairContext::new(tenant.tenant_id().as_str());
+        let page = self
+            .type_page(
+                tenant,
+                query,
+                checks,
+                &filter,
+                position,
+                &budget,
+                &mut repairs,
+            )
+            .await;
+        if matches!(
+            &page,
+            Ok(_) | Err(StorageError::Search(SearchError::TooManyResults { .. }))
+        ) {
+            repairs.run(self).await;
+        }
+        page
+    }
+
+    /// The page itself: up to `_count + 1` kept resources; the extra one
+    /// decides whether `next` exists.
+    #[allow(clippy::too_many_arguments)]
+    async fn type_page(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        checks: &Checks<'_>,
+        filter: &LastUpdatedFilter,
+        position: Position,
+        budget: &CandidateBudget,
+        repairs: &mut RepairContext,
+    ) -> StorageResult<SearchResult> {
+        let page_size = query.count.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
+        if page_size == 0 {
+            return Ok(SearchResult::new(Page::new(Vec::new(), PageInfo::end())));
+        }
+        let scan = self
+            .type_scan(
+                tenant,
+                query,
+                checks,
+                filter,
+                position,
+                budget,
+                repairs,
+                Some(page_size + 1),
+            )
+            .await?;
+        finish_page(scan.kept, page_size)
+    }
+
+    /// Reads `filter`'s slices of `resources_by_type`, newest first, in
+    /// batches after `position`, and tag-checks each row that passes
+    /// `filter` and the FHIR version (walkthrough 5.1). With `keep` set,
+    /// returns the first `keep` kept resources; with `None`, reads to the
+    /// end and only counts them (`search_count`, 5.9).
+    #[allow(clippy::too_many_arguments)]
+    async fn type_scan(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        checks: &Checks<'_>,
+        filter: &LastUpdatedFilter,
+        position: Position,
+        budget: &CandidateBudget,
+        repairs: &mut RepairContext,
+        keep: Option<usize>,
+    ) -> StorageResult<TypeScan> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = query.resource_type.as_str();
+        let wanted_version = query.stored_fhir_version();
+        let undecodable = Undecodable::default();
+        let ctx = ReadCtx {
+            tenant,
+            resource_type,
+            session: &self.session,
+            budget,
+            batch_rows: BATCH_ROWS,
+            undecodable: &undecodable,
+        };
+
+        // One stream of rows across every batch and slice, so up to
+        // `R1_CONCURRENCY` R1 reads stay in flight across their boundaries
+        // instead of draining at each one (ADR-anastasiabryz-0005).
+        let candidates = self
+            .type_row_stream(tenant_id, resource_type, filter.slices(), position)
+            // Checks on the row's own columns, before any point read:
+            // `_lastUpdated`'s exact predicate (5.5), and another FHIR
+            // version dropped (G34).
+            .filter(|row| {
+                future::ready(row.as_ref().map_or(true, |row| {
+                    filter.matches(row.last_updated)
+                        && match wanted_version {
+                            Some(wanted) => row
+                                .fhir_version
+                                .as_deref()
+                                .is_none_or(|stored| stored == wanted),
+                            None => true,
+                        }
+                }))
+            });
+        // R1, `R1_CONCURRENCY` in flight.
+        let read = candidates
+            .map(|row| async move {
+                let row = row?;
+                budget.charge(&row.id)?;
+                let r1 = self
+                    .read_resource_row(tenant_id, resource_type, &row.id)
+                    .await?;
+                Ok::<_, StorageError>((row, r1))
+            })
+            .buffered(R1_CONCURRENCY);
+        // In order: the tag check, which queues what it hides for repair,
+        // and the FHIR version on R1 (G34).
+        let tagged = read.filter_map(|read| {
+            let tagged = read.and_then(|(row, r1)| match r1 {
+                Some(r1) if !r1.is_deleted() && Some(r1.version_id) == row.version_id => {
+                    if !query.matches_fhir_version(r1.fhir_version) {
+                        return Ok(None);
+                    }
+                    let resource = stored_resource(tenant, resource_type, &row.id, &r1)?;
+                    Ok(Some((row, r1, resource)))
+                }
+                r1 => {
+                    queue_hidden(repairs, resource_type, &row, r1);
+                    Ok(None)
+                }
+            });
+            future::ready(tagged.transpose())
+        });
+        // The other parameters' checks, whose `contains` are point reads,
+        // also `R1_CONCURRENCY` in flight and in order (ADR-anastasiabryz-0005).
+        let ctx = &ctx;
+        let mut checked = tagged
+            .map(|tagged| async move {
+                let (row, r1, resource) = tagged?;
+                let loaded = self.loaded(ctx, query, r1, &resource);
+                let passes = self.passes(ctx, query, checks, &loaded, &row.id).await?;
+                Ok::<_, StorageError>(passes.then_some((row, resource)))
+            })
+            .buffered(R1_CONCURRENCY);
+
+        let mut scan = TypeScan::default();
+        while let Some(checked_row) = checked.next().await {
+            let Some((row, resource)) = checked_row? else {
+                continue;
+            };
+            scan.matched += 1;
+            if let Some(keep) = keep {
+                scan.kept.push((row.last_updated, resource));
+                if scan.kept.len() >= keep {
+                    break;
+                }
+            }
+        }
+        drop(checked);
+        undecodable.drain_into(repairs);
+        Ok(scan)
+    }
+
+    /// `_id=a,b,c`: R1 for each id, concurrently, under the cap; no index
+    /// table and no tag check, since the `resources` row is the truth. The
+    /// live ones are sorted by `(last_updated DESC, id DESC)` and cut at the
+    /// cursor (walkthrough 5.4). No repairs: nothing reads an index row.
+    async fn id_search(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        ids: &[String],
+        checks: &Checks<'_>,
+    ) -> StorageResult<SearchResult> {
+        let position = paging::decode(query.cursor.as_deref(), Order::Default)?;
+        let page_size = query.count.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
+        if page_size == 0 {
+            return Ok(SearchResult::new(Page::new(Vec::new(), PageInfo::end())));
+        }
+        let filter = LastUpdatedFilter::of(query)?;
+        let budget = CandidateBudget::new(max_candidates());
+        let mut found = self
+            .live_by_id(tenant, query, ids, checks, &filter, &budget)
+            .await?;
+        if let Position::After { at, id, .. } = &position {
+            found.retain(|(lu, resource)| (*lu, resource.id()) < (*at, id.as_str()));
+        }
+        found.truncate(page_size + 1);
+        finish_page(found, page_size)
+    }
+
+    /// R1 for one candidate, charged to the cap first (G27).
+    async fn charged_r1(
+        &self,
+        budget: &CandidateBudget,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<(String, Option<ResourceRow>)> {
+        budget.charge(id)?;
+        let r1 = self.read_resource_row(tenant_id, resource_type, id).await?;
+        Ok((id.to_string(), r1))
+    }
+
+    /// The live resources among `ids`, in `(last_updated DESC, id DESC)`
+    /// order, with `_lastUpdated` (a residual on `resources.last_updated`)
+    /// and the query's FHIR version applied (G34). Every id read is a
+    /// candidate point-read, charged to `budget` (G27).
+    async fn live_by_id(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        ids: &[String],
+        checks: &Checks<'_>,
+        filter: &LastUpdatedFilter,
+        budget: &CandidateBudget,
+    ) -> StorageResult<Vec<(DateTime<Utc>, StoredResource)>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = query.resource_type.as_str();
+        let undecodable = Undecodable::default();
+        let ctx = ReadCtx {
+            tenant,
+            resource_type,
+            session: &self.session,
+            budget,
+            batch_rows: BATCH_ROWS,
+            undecodable: &undecodable,
+        };
+        // Futures do nothing until polled, so building them all first starts
+        // no read; `buffered` polls `R1_CONCURRENCY` at a time.
+        let reads: Vec<_> = ids
+            .iter()
+            .map(|id| self.charged_r1(budget, tenant_id, resource_type, id))
+            .collect();
+        let live = stream::iter(reads)
+            .buffered(R1_CONCURRENCY)
+            .filter_map(|read| {
+                let live = read.and_then(|(id, r1)| {
+                    let Some(r1) = r1.filter(|r1| {
+                        !r1.is_deleted()
+                            && filter.matches(r1.last_updated)
+                            && query.matches_fhir_version(r1.fhir_version)
+                    }) else {
+                        return Ok(None);
+                    };
+                    let resource = stored_resource(tenant, resource_type, &id, &r1)?;
+                    Ok(Some((id, r1, resource)))
+                });
+                future::ready(live.transpose())
+            });
+        // The other parameters' checks, `R1_CONCURRENCY` in flight
+        // (ADR-anastasiabryz-0005).
+        let ctx = &ctx;
+        let mut checked = live
+            .map(|live| async move {
+                let (id, r1, resource) = live?;
+                let last_updated = r1.last_updated;
+                let loaded = self.loaded(ctx, query, r1, &resource);
+                let passes = self.passes(ctx, query, checks, &loaded, &id).await?;
+                Ok::<_, StorageError>(passes.then_some((last_updated, resource)))
+            })
+            .buffered(R1_CONCURRENCY);
+        let mut found = Vec::new();
+        while let Some(checked) = checked.next().await {
+            if let Some(kept) = checked? {
+                found.push(kept);
+            }
+        }
+        drop(checked);
+        // `_id` runs no repair phase; handing them over logs them.
+        undecodable.drain_into(&mut RepairContext::new(tenant_id));
+        found.sort_by(|(a_lu, a), (b_lu, b)| (b_lu, b.id()).cmp(&(a_lu, a.id())));
+        Ok(found)
+    }
+}
+
+impl CassandraBackend {
+    /// Each token, URI and date parameter of `query`, in query order,
+    /// compiled by its module (ADR-anastasiabryz-0001) with its registered
+    /// definition: the type's own, or a common parameter's under
+    /// `Resource`. A module that has not landed refuses its parameter, so
+    /// the search answers 501 (`token.rs`, `uri.rs`, `date.rs`).
+    fn compile_modules(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Vec<Compiled>> {
+        let registry = self.registries.for_tenant(tenant.tenant_id().as_str());
+        let registry = registry.read();
+        let resource_type = query.resource_type.as_str();
+        query
+            .parameters
+            .iter()
+            .filter(|param| param.name != "_id" && param.name != last_updated::PARAM)
+            .map(|param| {
+                let definition = registry
+                    .get_param(resource_type, &param.name)
+                    .or_else(|| registry.get_param("Resource", &param.name));
+                let ctx = CompileCtx {
+                    resource_type,
+                    definition: definition.as_deref(),
+                };
+                let plan = match param.param_type {
+                    SearchParamType::Token => token::compile(param, &ctx),
+                    SearchParamType::Uri => uri::compile(param, &ctx),
+                    SearchParamType::Date => date::compile(param, &ctx),
+                    // `validate` refused every other type first.
+                    other => Err(SearchError::UnsupportedParameterType {
+                        param_type: other.to_string(),
+                    }
+                    .into()),
+                }?;
+                Ok(Compiled {
+                    plan,
+                    is_date: param.param_type == SearchParamType::Date,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The planner's driver for `query`'s compiled module parameters.
+fn choose_driver(query: &SearchQuery, compiled: &[Compiled]) -> Driver {
+    let has_ids = query.parameters.iter().any(|param| param.name == "_id");
+    let has_last_updated = query
+        .parameters
+        .iter()
+        .any(|param| param.name == last_updated::PARAM);
+    planner::choose(compiled, has_ids, has_last_updated)
+}
+
+/// Whether a residual reads the loaded resource's values: a compartment, or
+/// a date parameter (as a residual, or as the driver's own `residual`).
+fn needs_values(query: &SearchQuery) -> bool {
+    query.compartment.is_some()
+        || query.parameters.iter().any(|param| {
+            param.param_type == SearchParamType::Date && param.name != last_updated::PARAM
+        })
+}
+
+impl CassandraBackend {
+    /// A tag-checked R1 for the residuals: extracted once when a residual
+    /// reads values ([`needs_values`]), and with no values otherwise.
+    fn loaded(
+        &self,
+        ctx: &ReadCtx<'_>,
+        query: &SearchQuery,
+        r1: ResourceRow,
+        resource: &StoredResource,
+    ) -> LoadedResource {
+        if needs_values(query) {
+            self.load_for_residuals(
+                ctx.tenant.tenant_id().as_str(),
+                ctx.resource_type,
+                r1,
+                resource.content(),
+            )
+        } else {
+            LoadedResource {
+                row: r1,
+                extracted: Vec::new(),
+            }
+        }
+    }
+
+    /// The checks every tag-checked candidate passes besides its driver
+    /// (walkthrough 5.8): the compartment (5.11) and each date residual on
+    /// the loaded resource first, then each other token or URI parameter's
+    /// clustering point read at `resources.last_updated`, which is not a
+    /// candidate point-read and so is not charged to the cap
+    /// (ADR-anastasiabryz-0001).
+    async fn passes(
+        &self,
+        ctx: &ReadCtx<'_>,
+        query: &SearchQuery,
+        checks: &Checks<'_>,
+        loaded: &LoadedResource,
+        id: &str,
+    ) -> StorageResult<bool> {
+        if let Some(compartment) = &query.compartment
+            && !residual::in_compartment(loaded, compartment)
+        {
+            return Ok(false);
+        }
+        if !checks
+            .residuals
+            .iter()
+            .all(|plan| plan.residual(loaded, None))
+        {
+            return Ok(false);
+        }
+        for plan in &checks.contains {
+            if !plan.contains(ctx, loaded.row.last_updated, id).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// A filtered `search_count` on `resources_by_type`: the stream of 5.1
+    /// run to the end, with tag checks, under the cap; it queues no repairs
+    /// (walkthrough 5.9).
+    async fn type_count(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        checks: &Checks<'_>,
+    ) -> StorageResult<u64> {
+        let filter = LastUpdatedFilter::of(query)?;
+        let budget = CandidateBudget::new(max_candidates());
+        let mut unrun = RepairContext::new(tenant.tenant_id().as_str());
+        let scan = self
+            .type_scan(
+                tenant,
+                query,
+                checks,
+                &filter,
+                Position::First(Order::Default),
+                &budget,
+                &mut unrun,
+                None,
+            )
+            .await?;
+        Ok(scan.matched as u64)
+    }
+
+    /// An `_id` count: every live id that passes, under the cap; no repairs
+    /// (walkthrough 5.4, 5.9).
+    async fn id_count(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        ids: &[String],
+        checks: &Checks<'_>,
+    ) -> StorageResult<u64> {
+        let filter = LastUpdatedFilter::of(query)?;
+        let budget = CandidateBudget::new(max_candidates());
+        let found = self
+            .live_by_id(tenant, query, ids, checks, &filter, &budget)
+            .await?;
+        Ok(found.len() as u64)
+    }
+}
+
+/// A page from up to `page_size + 1` kept resources, in the default order:
+/// the extra one decides whether `next` exists, and `next` is minted from
+/// the last resource of the page (walkthrough 5.1, step 6; 5.10).
+fn finish_page(
+    kept: Vec<(DateTime<Utc>, StoredResource)>,
+    page_size: usize,
+) -> StorageResult<SearchResult> {
+    let kept = kept
+        .into_iter()
+        .map(|(at, resource)| (OrderKey { at, table: None }, resource))
+        .collect();
+    finish_page_in(kept, page_size, Order::Default)
+}
+
+/// [`finish_page`] in any order: `next` is minted with the last resource's
+/// own order key, so a date-order page's cursor names its table.
+fn finish_page_in(
+    mut kept: Vec<(OrderKey, StoredResource)>,
+    page_size: usize,
+    order: Order,
+) -> StorageResult<SearchResult> {
+    let has_next = kept.len() > page_size;
+    kept.truncate(page_size);
+    let next_cursor = match kept.last() {
+        Some((key, resource)) if has_next => Some(paging::mint(
+            &Candidate {
+                order: key.clone(),
+                id: resource.id().to_string(),
+                rows: Vec::new(),
+            },
+            order,
+        )?),
+        _ => None,
+    };
+    let page_info = PageInfo {
+        next_cursor,
+        has_next,
+        ..PageInfo::end()
+    };
+    let items = kept.into_iter().map(|(_, resource)| resource).collect();
+    Ok(SearchResult::new(Page::new(items, page_info)))
+}
+
+impl CassandraBackend {
+    /// `search_count` with no filters and `query.fhir_version` set: the rows
+    /// of `(tenant, resource_type)` whose `fhir_version` is `version`, read
+    /// from `resources_by_type` alone, with no point reads (walkthrough 5.9,
+    /// G34). Like `count`, it has no tag check.
+    async fn count_type_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        version: &str,
+    ) -> StorageResult<u64> {
+        let rows = self
+            .session
+            .rows_paged_keeping(
+                SELECT_TYPE_VERSIONS,
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from(resource_type),
+                ],
+                StatementKind::Read,
+                VERSION_SCAN_PAGE,
+                |row| {
+                    IntoRustByName::<String>::get_by_name(row, "fhir_version")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|stored| stored == version)
+                },
+            )
+            .await
+            .map_err(|error| StorageError::Backend(map_driver_error(&error, "count")))?;
+        Ok(rows.len() as u64)
+    }
+
+    /// Every `resources_by_type` row of `slices`, in order, strictly after
+    /// `position`: one stream across the batches of each slice and across
+    /// the slices, each batch read with `type_rows`'s keyset. A slice wholly
+    /// above the cursor is skipped, since it holds nothing after it.
+    fn type_row_stream<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        resource_type: &'a str,
+        slices: &'a [Slice],
+        position: Position,
+    ) -> BoxStream<'a, StorageResult<TypeRow>> {
+        struct State<'s> {
+            slices: std::slice::Iter<'s, Slice>,
+            current: Option<Slice>,
+            after: Position,
+        }
+        let state = State {
+            slices: slices.iter(),
+            current: None,
+            after: position,
+        };
+        stream::try_unfold(state, move |mut state| async move {
+            loop {
+                let slice = match state.current {
+                    Some(slice) => slice,
+                    None => {
+                        let Some(&slice) = state.slices.next() else {
+                            return Ok::<_, StorageError>(None);
+                        };
+                        if let Position::After { at, .. } = &state.after
+                            && slice.from.is_some_and(|from| from > *at)
+                        {
+                            continue;
+                        }
+                        state.current = Some(slice);
+                        slice
+                    }
+                };
+                let rows = self
+                    .type_rows(tenant_id, resource_type, &slice, &state.after)
+                    .await?;
+                let Some(last) = rows.last() else {
+                    state.current = None;
+                    continue;
+                };
+                if rows.len() < BATCH_ROWS {
+                    state.current = None;
+                }
+                state.after = Position::After {
+                    order: Order::Default,
+                    at: last.last_updated,
+                    id: last.id.clone(),
+                    table: None,
+                };
+                return Ok(Some((rows, state)));
+            }
+        })
+        .map_ok(|rows| stream::iter(rows.into_iter().map(Ok)))
+        .try_flatten()
+        .boxed()
+    }
+
+    /// One batch of `slice`'s rows strictly after `after` (walkthrough 5.5,
+    /// L1 and L2). The node takes one end bound per query (G19), so the
+    /// slice's upper bound and the cursor are never sent together: the
+    /// bound alone when it is at or below the cursor's `last_updated`
+    /// (every row below it is then below the cursor too), the cursor alone
+    /// otherwise. A lower bound goes with either.
+    async fn type_rows(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        slice: &Slice,
+        after: &Position,
+    ) -> StorageResult<Vec<TypeRow>> {
+        let mut values = vec![Value::from(tenant_id), Value::from(resource_type)];
+        let mut cql = SELECT_TYPE_ROWS.to_string();
+        if let Some(from) = slice.from {
+            cql.push_str(" AND last_updated >= ?");
+            values.push(Value::from(from));
+        }
+        match (slice.until, after) {
+            (Some(until), Position::After { at, .. }) if until <= *at => {
+                cql.push_str(" AND last_updated < ?");
+                values.push(Value::from(until));
+            }
+            (_, Position::After { .. }) => {
+                let (relation, bound) = paging::keyset(after).expect("a position after a row");
+                cql.push_str(" AND ");
+                cql.push_str(relation);
+                values.extend(bound);
+            }
+            (Some(until), Position::First(_)) => {
+                cql.push_str(" AND last_updated < ?");
+                values.push(Value::from(until));
+            }
+            (None, Position::First(_)) => {}
+        }
+        cql.push_str(" LIMIT ?");
+        values.push(Value::from(BATCH_ROWS as i32));
+        let rows = self
+            .session
+            .rows(&cql, values, StatementKind::Read)
+            .await
+            .map_err(|error| StorageError::Backend(map_driver_error(&error, "search")))?;
+        rows.iter().map(TypeRow::decode).collect()
+    }
+}
+
+/// A `resources_by_type` row the tag check hid: queued for repair with the
+/// tag check's own R1, or counted as undecodable when it has no tag
+/// (`repair.rs`, "Step 6's contract").
+fn queue_hidden(
+    repairs: &mut RepairContext,
+    resource_type: &str,
+    row: &TypeRow,
+    r1: Option<ResourceRow>,
+) {
+    let Some(tag) = row.version_id else {
+        repairs.skip_undecodable("resources_by_type", "an index row with no version_id tag");
+        return;
+    };
+    match StaleIndexRow::new(IndexKey::ResourcesByType, Some(row.last_updated), tag) {
+        Ok(stale) => repairs.queue(resource_type, &row.id, r1, vec![stale]),
+        Err(error) => repairs.skip_undecodable("resources_by_type", &error),
+    }
+}
+
+/// Entry validation (roadmap row 6.1): each documented refusal, its error,
+/// and the order the refusals run in (`coverage.md` section 6).
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::error::{BackendError, StorageError};
+    use crate::types::{
+        CompartmentMembership, IncludeDirective, SearchModifier, SearchParameter, SearchValue,
+        SortDirective,
+    };
+
+    fn param(name: &str, param_type: SearchParamType, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type,
+            values: vec![SearchValue::parse(value)],
+            ..Default::default()
+        }
+    }
+
+    fn with_modifier(mut param: SearchParameter, modifier: SearchModifier) -> SearchParameter {
+        param.modifier = Some(modifier);
+        param
+    }
+
+    fn query(params: Vec<SearchParameter>) -> SearchQuery {
+        params
+            .into_iter()
+            .fold(SearchQuery::new("Patient"), SearchQuery::with_parameter)
+    }
+
+    fn gender() -> SearchParameter {
+        param("gender", SearchParamType::Token, "female")
+    }
+
+    fn birthdate() -> SearchParameter {
+        param("birthdate", SearchParamType::Date, "ge1980-01-01")
+    }
+
+    fn refusal(query: &SearchQuery) -> StorageError {
+        validate(query).expect_err("validate should refuse this query")
+    }
+
+    fn include(include_type: IncludeType) -> IncludeDirective {
+        IncludeDirective {
+            include_type,
+            source_type: "Observation".to_string(),
+            search_param: "patient".to_string(),
+            target_type: None,
+            iterate: false,
+        }
+    }
+
+    #[test]
+    fn a_served_query_passes() {
+        let mut served = query(vec![
+            gender(),
+            birthdate(),
+            param("_profile", SearchParamType::Uri, "http://example.org/p"),
+            param("_id", SearchParamType::Token, "abc"),
+            param("_lastUpdated", SearchParamType::Date, "gt2020-01-01"),
+        ]);
+        // Residual filters, never refused (ADR-aacruzgon-0026).
+        served.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string()],
+            reference: "Patient/123".to_string(),
+        });
+        validate(&served).unwrap();
+        validate(&SearchQuery::new("Patient")).unwrap();
+    }
+
+    #[test]
+    fn the_shared_gates_refuse_first() {
+        let bad_date = param("birthdate", SearchParamType::Date, "not-a-date");
+        assert!(matches!(
+            refusal(&query(vec![bad_date])),
+            StorageError::Search(SearchError::InvalidDateValue { .. })
+        ));
+        let empty = param("gender", SearchParamType::Token, "");
+        assert!(matches!(
+            refusal(&query(vec![empty])),
+            StorageError::Search(SearchError::EmptyValue { .. })
+        ));
+        let last_updated_not = with_modifier(
+            param("_lastUpdated", SearchParamType::Date, "gt2020-01-01"),
+            SearchModifier::Not,
+        );
+        assert!(matches!(
+            refusal(&query(vec![last_updated_not])),
+            StorageError::Search(SearchError::UnsupportedModifier { .. })
+        ));
+    }
+
+    #[test]
+    fn text_and_content_are_501_by_name_before_the_type_check() {
+        for name in ["_text", "_content"] {
+            // R4 types both as string, which the type check would refuse
+            // with 400 if it ran first (C10).
+            let text = param(name, SearchParamType::String, "fever");
+            assert!(
+                matches!(
+                    refusal(&query(vec![text])),
+                    StorageError::Search(SearchError::TextSearchNotAvailable)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_is_501_unsupported_capability_before_the_type_check() {
+        let filter = param("_filter", SearchParamType::String, "name eq smith");
+        assert!(matches!(
+            refusal(&query(vec![filter])),
+            StorageError::Backend(BackendError::UnsupportedCapability { .. })
+        ));
+    }
+
+    #[test]
+    fn every_other_parameter_type_is_400() {
+        for (name, param_type, value) in [
+            ("name", SearchParamType::String, "smith"),
+            (
+                "general-practitioner",
+                SearchParamType::Reference,
+                "Practitioner/1",
+            ),
+            ("value-quantity", SearchParamType::Quantity, "5.4"),
+            (
+                "code-value-quantity",
+                SearchParamType::Composite,
+                "8480-6$100",
+            ),
+            ("probability", SearchParamType::Number, "0.8"),
+            ("near", SearchParamType::Special, "1|2|3|km"),
+        ] {
+            match refusal(&query(vec![gender(), param(name, param_type, value)])) {
+                StorageError::Search(SearchError::UnsupportedParameterType {
+                    param_type: found,
+                }) => {
+                    assert_eq!(found, param_type.to_string(), "{name}");
+                }
+                other => panic!("{name}: expected UnsupportedParameterType, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_modifier_is_400() {
+        for (served, modifier) in [
+            (gender(), SearchModifier::Missing),
+            (gender(), SearchModifier::Not),
+            (gender(), SearchModifier::Text),
+            (gender(), SearchModifier::OfType),
+            (gender(), SearchModifier::CodeText),
+            (gender(), SearchModifier::TextAdvanced),
+            (birthdate(), SearchModifier::Missing),
+            (
+                param("_profile", SearchParamType::Uri, "http://x"),
+                SearchModifier::Below,
+            ),
+            (
+                param("_profile", SearchParamType::Uri, "http://x"),
+                SearchModifier::Above,
+            ),
+            (
+                param("_profile", SearchParamType::Uri, "http://x"),
+                SearchModifier::Contains,
+            ),
+            (
+                param("_id", SearchParamType::Token, "abc"),
+                SearchModifier::Not,
+            ),
+            (
+                param("_id", SearchParamType::Token, "abc"),
+                SearchModifier::Missing,
+            ),
+        ] {
+            let name = served.name.clone();
+            match refusal(&query(vec![with_modifier(served, modifier.clone())])) {
+                StorageError::Search(SearchError::UnsupportedModifier {
+                    modifier: found, ..
+                }) => {
+                    assert_eq!(found, modifier.to_string(), "{name}");
+                }
+                other => panic!("{name}:{modifier}: expected UnsupportedModifier, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn include_and_revinclude_are_501() {
+        for (include_type, operation) in [
+            (IncludeType::Include, "_include"),
+            (IncludeType::Revinclude, "_revinclude"),
+        ] {
+            match refusal(&query(vec![gender()]).with_include(include(include_type))) {
+                StorageError::Search(SearchError::IncludeNotSupported { operation: found }) => {
+                    assert_eq!(found, operation);
+                }
+                other => panic!("{operation}: expected IncludeNotSupported, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn offset_is_400() {
+        let mut offset = query(vec![gender()]);
+        offset.offset = Some(20);
+        assert!(matches!(
+            refusal(&offset),
+            StorageError::Search(SearchError::QueryParseError { .. })
+        ));
+    }
+
+    #[test]
+    fn only_the_native_sort_is_accepted() {
+        let sorted = |params: Vec<SearchParameter>, sorts: &[&str]| {
+            sorts.iter().fold(query(params), |q, sort| {
+                q.with_sort(SortDirective::parse(sort))
+            })
+        };
+        // The default order is (last_updated DESC, id DESC).
+        validate(&sorted(vec![gender()], &["-_lastUpdated"])).unwrap();
+        validate(&sorted(vec![], &["-_lastUpdated"])).unwrap();
+        // With _lastUpdated present, a date-only search slices it (G20).
+        validate(&sorted(
+            vec![
+                birthdate(),
+                param("_lastUpdated", SearchParamType::Date, "gt2020-01-01"),
+            ],
+            &["-_lastUpdated"],
+        ))
+        .unwrap();
+
+        for (case, refused) in [
+            ("_sort=birthdate", sorted(vec![gender()], &["birthdate"])),
+            (
+                "_sort=_lastUpdated",
+                sorted(vec![gender()], &["_lastUpdated"]),
+            ),
+            (
+                "two sorts",
+                sorted(vec![gender()], &["-_lastUpdated", "_id"]),
+            ),
+            // A date-only search on a date table is in its table's order.
+            ("date-only", sorted(vec![birthdate()], &["-_lastUpdated"])),
+        ] {
+            assert!(
+                matches!(
+                    refusal(&refused),
+                    StorageError::Search(SearchError::QueryParseError { .. })
+                ),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusals_run_in_the_documented_order() {
+        let string = param("name", SearchParamType::String, "smith");
+        let bad_date = param("birthdate", SearchParamType::Date, "not-a-date");
+        let text = param("_text", SearchParamType::String, "fever");
+        let modified = with_modifier(gender(), SearchModifier::Missing);
+
+        // A date value, before a type.
+        assert!(matches!(
+            refusal(&query(vec![string.clone(), bad_date])),
+            StorageError::Search(SearchError::InvalidDateValue { .. })
+        ));
+        // _text by name, before a type that comes earlier in the query.
+        assert!(matches!(
+            refusal(&query(vec![string.clone(), text])),
+            StorageError::Search(SearchError::TextSearchNotAvailable)
+        ));
+        // A type, before a modifier that comes earlier in the query.
+        assert!(matches!(
+            refusal(&query(vec![modified.clone(), string])),
+            StorageError::Search(SearchError::UnsupportedParameterType { .. })
+        ));
+        // A modifier, before an include.
+        let modified_with_include =
+            query(vec![modified]).with_include(include(IncludeType::Include));
+        assert!(matches!(
+            refusal(&modified_with_include),
+            StorageError::Search(SearchError::UnsupportedModifier { .. })
+        ));
+        // An include, before _offset and _sort.
+        let mut include_and_offset = query(vec![gender()])
+            .with_include(include(IncludeType::Revinclude))
+            .with_sort(SortDirective::parse("birthdate"));
+        include_and_offset.offset = Some(5);
+        assert!(matches!(
+            refusal(&include_and_offset),
+            StorageError::Search(SearchError::IncludeNotSupported { .. })
+        ));
+    }
+}
+
+/// Which queries the engine answers so far, and the `_id` sets it reads.
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use crate::types::{SearchParameter, SearchValue};
+
+    fn ids(values: &[&str]) -> SearchParameter {
+        SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            values: values.iter().map(|value| SearchValue::eq(*value)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn query(params: Vec<SearchParameter>) -> SearchQuery {
+        params
+            .into_iter()
+            .fold(SearchQuery::new("Patient"), SearchQuery::with_parameter)
+    }
+
+    fn plan_ids(params: Vec<SearchParameter>) -> Vec<String> {
+        match Plan::of(&query(params)) {
+            Some(Plan::Ids(ids)) => ids,
+            other => panic!("expected Plan::Ids, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn several_id_parameters_are_intersected_before_any_read() {
+        // G37: `_id=a,b&_id=b` reads `b` only; disjoint sets read nothing.
+        assert_eq!(plan_ids(vec![ids(&["a", "b", "a"])]), ["a", "b"]);
+        assert_eq!(plan_ids(vec![ids(&["a", "b"]), ids(&["b"])]), ["b"]);
+        assert!(plan_ids(vec![ids(&["a"]), ids(&["b"])]).is_empty());
+        // C2: compared whole, so the pipe is part of the id read.
+        assert_eq!(plan_ids(vec![ids(&["sys|abc"])]), ["sys|abc"]);
+    }
+
+    #[test]
+    fn only_the_queries_the_engine_serves_are_planned() {
+        assert_eq!(
+            Plan::of(&SearchQuery::new("Patient")),
+            Some(Plan::Unfiltered)
+        );
+        let gender = SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("female")],
+            ..Default::default()
+        };
+        assert_eq!(
+            Plan::of(&query(vec![ids(&["a"]), gender])),
+            Some(Plan::Modules)
+        );
+        let mut in_compartment = query(vec![ids(&["a"])]);
+        in_compartment.compartment = Some(crate::types::CompartmentMembership {
+            params: vec!["link".to_string()],
+            reference: "Patient/p".to_string(),
+        });
+        assert_eq!(
+            Plan::of(&in_compartment),
+            Some(Plan::Ids(vec!["a".to_string()])),
+            "a compartment is a residual on the _id plan"
+        );
+        let mut whole_type = SearchQuery::new("Patient");
+        whole_type.compartment = in_compartment.compartment.clone();
+        assert_eq!(
+            Plan::of(&whole_type),
+            Some(Plan::TypeScan),
+            "never Unfiltered, whose count has no residuals"
+        );
+    }
+}
+
+/// `search()` and `search_count()` on a backend connected to the node at
+/// `HFS_TEST_CASSANDRA_URL` (skipped when unset).
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+    use crate::backends::cassandra::test_support::test_config;
+    use crate::error::{BackendError, StorageError};
+    use crate::tenant::{TenantId, TenantPermissions};
+
+    async fn backend() -> Option<CassandraBackend> {
+        let url = std::env::var("HFS_TEST_CASSANDRA_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())?;
+        Some(
+            CassandraBackend::connect(crate::backends::cassandra::CassandraConfig {
+                contact_points: vec![url],
+                ..test_config()
+            })
+            .await
+            .expect("connect"),
+        )
+    }
+
+    /// Both validate first, so a refused query gets its own error, and a
+    /// query the engine does not serve yet still gets 501.
+    #[tokio::test]
+    async fn search_and_search_count_validate_before_anything_else() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = TenantContext::new(
+            TenantId::new(format!("test-validation-{}", uuid::Uuid::new_v4().simple())),
+            TenantPermissions::full_access(),
+        );
+        let mut refused = SearchQuery::new("Patient");
+        refused.offset = Some(20);
+        // A token parameter: served by 6a, so still 501 until it lands.
+        let served = SearchQuery::new("Patient").with_parameter(crate::types::SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![crate::types::SearchValue::eq("female")],
+            ..Default::default()
+        });
+
+        assert!(matches!(
+            backend.search(&tenant, &refused).await,
+            Err(StorageError::Search(SearchError::QueryParseError { .. }))
+        ));
+        assert!(matches!(
+            backend.search_count(&tenant, &refused).await,
+            Err(StorageError::Search(SearchError::QueryParseError { .. }))
+        ));
+        assert!(matches!(
+            backend.search(&tenant, &served).await,
+            Err(StorageError::Backend(
+                BackendError::UnsupportedCapability { .. }
+            ))
+        ));
+        assert!(matches!(
+            backend.search_count(&tenant, &served).await,
+            Err(StorageError::Backend(
+                BackendError::UnsupportedCapability { .. }
+            ))
+        ));
+    }
+
+    fn fresh_tenant(label: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!("{label}-{}", uuid::Uuid::new_v4().simple())),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    async fn create_patients(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        n: usize,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            let stored = crate::core::ResourceStorage::create(
+                backend,
+                tenant,
+                "Patient",
+                serde_json::json!({ "resourceType": "Patient" }),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
+            .await
+            .expect("create");
+            ids.push(stored.id().to_string());
+        }
+        ids
+    }
+
+    /// Every page of `query`, following `next` to the end.
+    async fn every_page(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        mut query: SearchQuery,
+    ) -> Vec<SearchResult> {
+        let mut pages = Vec::new();
+        loop {
+            let page = backend.search(tenant, &query).await.expect("search");
+            let next = page.resources.page_info.next_cursor.clone();
+            pages.push(page);
+            match next {
+                Some(cursor) => query.cursor = Some(cursor),
+                None => break,
+            }
+        }
+        pages
+    }
+
+    /// More rows than one index read returns (`BATCH_ROWS`): the type scan's
+    /// one stream crosses its batch boundaries, on one page and on pages
+    /// that end mid-batch, and the count reads to the end
+    /// (ADR-anastasiabryz-0005).
+    #[tokio::test]
+    async fn an_unfiltered_search_streams_across_batch_boundaries() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-batches");
+        let n = 2 * BATCH_ROWS + 5;
+        let ids: std::collections::BTreeSet<String> = create_patients(&backend, &tenant, n)
+            .await
+            .into_iter()
+            .collect();
+
+        let one = every_page(
+            &backend,
+            &tenant,
+            SearchQuery::new("Patient").with_count(1000),
+        )
+        .await;
+        assert_eq!(one.len(), 1, "one page");
+        let found: std::collections::BTreeSet<String> = one[0]
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        assert_eq!(one[0].resources.items.len(), n, "no row read twice");
+        assert_eq!(found, ids, "every Patient, across three batches");
+
+        let pages = every_page(
+            &backend,
+            &tenant,
+            SearchQuery::new("Patient").with_count(90),
+        )
+        .await;
+        let sizes: Vec<usize> = pages.iter().map(|page| page.resources.len()).collect();
+        assert_eq!(sizes, [90, 90, 25], "pages end mid-batch");
+        let paged: Vec<String> = pages
+            .iter()
+            .flat_map(|page| &page.resources.items)
+            .map(|resource| resource.id().to_string())
+            .collect();
+        assert_eq!(
+            paged
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ids,
+            "no gap"
+        );
+        assert_eq!(paged.len(), n, "no duplicate");
+
+        // A `_lastUpdated` count runs the type scan to the end (an
+        // unfiltered count uses `count` instead).
+        let since = last_updated(&[&["gt2000-01-01".to_string()]]);
+        assert_eq!(
+            backend.search_count(&tenant, &since).await.unwrap(),
+            n as u64
+        );
+    }
+
+    /// `GET /Patient?_count=10` over 25 Patients, 3 of them deleted: 10, 10
+    /// and 2, newest first, each live one once; `next` on every page but
+    /// the last; no `previous` (walkthrough 5.6, 5.10).
+    #[tokio::test]
+    async fn an_unfiltered_search_pages_every_live_resource_once() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-unfiltered");
+        let ids = create_patients(&backend, &tenant, 25).await;
+        for id in &ids[..3] {
+            crate::core::ResourceStorage::delete(&backend, &tenant, "Patient", id)
+                .await
+                .expect("delete");
+        }
+        let live: std::collections::BTreeSet<String> = ids[3..].iter().cloned().collect();
+
+        let pages = every_page(
+            &backend,
+            &tenant,
+            SearchQuery::new("Patient").with_count(10),
+        )
+        .await;
+        let sizes: Vec<usize> = pages.iter().map(|page| page.resources.len()).collect();
+        assert_eq!(sizes, [10, 10, 2]);
+        for (n, page) in pages.iter().enumerate() {
+            let info = &page.resources.page_info;
+            assert_eq!(info.has_next, n < 2, "page {n}: has_next");
+            assert_eq!(info.next_cursor.is_some(), n < 2, "page {n}: next");
+            assert!(info.previous_cursor.is_none(), "page {n}: no previous");
+        }
+        let found: Vec<&StoredResource> = pages
+            .iter()
+            .flat_map(|page| &page.resources.items)
+            .collect();
+        let distinct: std::collections::BTreeSet<String> = found
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        assert_eq!(found.len(), distinct.len(), "no resource on two pages");
+        assert_eq!(distinct, live, "every live Patient, no deleted one");
+        assert!(
+            found
+                .windows(2)
+                .all(|pair| (pair[0].last_modified(), pair[0].id())
+                    >= (pair[1].last_modified(), pair[1].id())),
+            "newest first: (last_updated DESC, id DESC)"
+        );
+    }
+
+    /// An index row with no `resources` row is a candidate the tag check
+    /// hides: it is never returned. Planted, so the tenant is
+    /// `test-planted-` (#127).
+    #[tokio::test]
+    async fn an_orphan_index_row_is_hidden() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-planted-search-orphan");
+        let ids = create_patients(&backend, &tenant, 3).await;
+        backend
+            .session
+            .execute(
+                "INSERT INTO resources_by_type \
+                 (tenant_id, resource_type, last_updated, id, version_id, fhir_version) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from(Utc::now() + chrono::Duration::hours(1)),
+                    Value::from("orphan"),
+                    Value::from(1_i32),
+                    Value::from("4.0"),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect("plant");
+
+        let page = backend
+            .search(&tenant, &SearchQuery::new("Patient"))
+            .await
+            .expect("search");
+        let found: std::collections::BTreeSet<String> = page
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        assert_eq!(found, ids.into_iter().collect());
+        assert!(page.resources.page_info.next_cursor.is_none());
+    }
+
+    /// A cursor `mint` did not make is 400 `InvalidCursor` (`coverage.md`
+    /// section 5).
+    #[tokio::test]
+    async fn a_malformed_cursor_is_invalid() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let mut query = SearchQuery::new("Patient");
+        query.cursor = Some("garbage".to_string());
+        assert!(matches!(
+            backend
+                .search(&fresh_tenant("test-search-cursor"), &query)
+                .await,
+            Err(StorageError::Search(SearchError::InvalidCursor { .. }))
+        ));
+    }
+
+    /// Plants a `resources_by_type` row with no `resources` row behind it.
+    async fn plant_type_row(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        id: &str,
+        fhir_version: &str,
+    ) {
+        backend
+            .session
+            .execute(
+                "INSERT INTO resources_by_type \
+                 (tenant_id, resource_type, last_updated, id, version_id, fhir_version) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from(Utc::now()),
+                    Value::from(id),
+                    Value::from(1_i32),
+                    Value::from(fhir_version),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect("plant");
+    }
+
+    /// `search_count` with no filters is `count(tenant, Some(type))`: the
+    /// live rows of `resources_by_type`, with no tag check, so a planted
+    /// orphan row counts too (walkthrough 5.9, G7). With a FHIR version
+    /// named, only that version's rows count (G34). Planted, so the tenant
+    /// is `test-planted-` (#127).
+    #[tokio::test]
+    async fn an_unfiltered_count_counts_the_type_and_its_version() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-planted-search-count");
+        let ids = create_patients(&backend, &tenant, 5).await;
+        crate::core::ResourceStorage::delete(&backend, &tenant, "Patient", &ids[0])
+            .await
+            .expect("delete");
+        // Two rows of a version no resource here has.
+        plant_type_row(&backend, &tenant, "other-1", "0.0-planted").await;
+        plant_type_row(&backend, &tenant, "other-2", "0.0-planted").await;
+
+        let all = SearchQuery::new("Patient");
+        assert_eq!(
+            backend.search_count(&tenant, &all).await.unwrap(),
+            6,
+            "4 live + 2 planted"
+        );
+
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        let one_version = SearchQuery::new("Patient").with_fhir_version(version);
+        assert_eq!(
+            backend.search_count(&tenant, &one_version).await.unwrap(),
+            4,
+            "only the live rows of {version:?}"
+        );
+        assert_eq!(
+            backend
+                .search_count(&fresh_tenant("test-search-count-empty"), &all)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A `resources_by_type` row of a live resource, tagged with a version
+    /// it no longer has, is stale: the type scan's tag check hides it, so
+    /// the resource comes back once, from its live row, and queues the stale
+    /// row for repair (walkthrough 5.1, step 4). Planted, so the tenant is
+    /// `test-planted-` (#127).
+    #[tokio::test]
+    async fn a_stale_type_row_of_a_live_resource_is_hidden_and_repaired() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-planted-search-stale-tag");
+        let ids = create_patients(&backend, &tenant, 2).await;
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        backend
+            .session
+            .execute(
+                "INSERT INTO resources_by_type \
+                 (tenant_id, resource_type, last_updated, id, version_id, fhir_version) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from(Utc::now() + chrono::Duration::hours(1)),
+                    Value::from(ids[0].as_str()),
+                    Value::from(99_i32),
+                    Value::from(version.as_mime_param()),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect("plant");
+        let before = backend.repair_stats();
+
+        let page = backend
+            .search(&tenant, &SearchQuery::new("Patient").with_count(10))
+            .await
+            .expect("search");
+        let mut found: Vec<String> = page
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        found.sort();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(found, expected, "each Patient once, the stale row hidden");
+        let ran = backend.repair_stats().since(&before);
+        assert_eq!(ran.queued, 1, "the stale row was queued: {ran:?}");
+    }
+
+    /// With a FHIR version named, the type scan drops another version's
+    /// `resources_by_type` rows on the row's own column, before any point
+    /// read (G34): a planted row of another version is never read, so it is
+    /// not queued, while the same search without a version reads it.
+    /// Planted, so the tenant is `test-planted-` (#127).
+    #[tokio::test]
+    async fn a_version_filter_drops_other_versions_rows_before_reading_them() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-planted-search-version-page");
+        let ids = create_patients(&backend, &tenant, 2).await;
+        plant_type_row(&backend, &tenant, "other-version", "0.0-planted").await;
+        let version = crate::backends::cassandra::test_support::test_fhir_version();
+        let page_ids = |page: &SearchResult| -> std::collections::BTreeSet<String> {
+            page.resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect()
+        };
+
+        let before = backend.repair_stats();
+        let one_version = SearchQuery::new("Patient")
+            .with_fhir_version(version)
+            .with_count(10);
+        let page = backend.search(&tenant, &one_version).await.expect("search");
+        assert_eq!(page_ids(&page), ids.iter().cloned().collect());
+        assert_eq!(
+            backend.repair_stats().since(&before).queued,
+            0,
+            "the other version's row was never read"
+        );
+
+        let before = backend.repair_stats();
+        let any_version = SearchQuery::new("Patient").with_count(10);
+        let page = backend.search(&tenant, &any_version).await.expect("search");
+        assert_eq!(page_ids(&page), ids.iter().cloned().collect());
+        assert_eq!(
+            backend.repair_stats().since(&before).queued,
+            1,
+            "without a version, the row is read and hidden as an orphan"
+        );
+    }
+
+    /// Observations of three kinds: members of `Patient/p1` through
+    /// `subject`, through `performer` or through a versioned reference, and
+    /// non-members (another patient, no reference). Oldest first.
+    async fn create_observations(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+    ) -> Vec<(String, bool)> {
+        let bodies = [
+            (
+                serde_json::json!({ "subject": { "reference": "Patient/p1" } }),
+                true,
+            ),
+            (
+                serde_json::json!({ "subject": { "reference": "Patient/p2" } }),
+                false,
+            ),
+            (
+                serde_json::json!({ "performer": [{ "reference": "Patient/p1" }] }),
+                true,
+            ),
+            (serde_json::json!({}), false),
+            (
+                serde_json::json!({ "subject": { "reference": "Patient/p1/_history/3" } }),
+                true,
+            ),
+            (
+                serde_json::json!({ "subject": { "reference": "Patient/p11" } }),
+                false,
+            ),
+        ];
+        let mut made = Vec::new();
+        for (mut body, member) in bodies {
+            body["resourceType"] = serde_json::json!("Observation");
+            body["status"] = serde_json::json!("final");
+            let stored = crate::core::ResourceStorage::create(
+                backend,
+                tenant,
+                "Observation",
+                body,
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
+            .await
+            .expect("create");
+            made.push((stored.id().to_string(), member));
+        }
+        made
+    }
+
+    fn in_p1(mut query: SearchQuery) -> SearchQuery {
+        query.compartment = Some(crate::types::CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        query
+    }
+
+    /// `GET /Patient/p1/Observation`, and any search under a `patient/`
+    /// scope: only members, newest first, paged through the cursor and
+    /// counted, never the whole type (walkthrough 5.11, G33).
+    #[tokio::test]
+    async fn a_compartment_search_returns_and_counts_only_members() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-compartment");
+        let made = create_observations(&backend, &tenant).await;
+        let members: Vec<&str> = made
+            .iter()
+            .filter(|(_, member)| *member)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let mut expected = Vec::new();
+        for id in &members {
+            let resource = crate::core::ResourceStorage::read(&backend, &tenant, "Observation", id)
+                .await
+                .unwrap()
+                .unwrap();
+            expected.push((resource.last_modified(), id.to_string()));
+        }
+        expected.sort_by(|a, b| b.cmp(a));
+        let expected: Vec<String> = expected.into_iter().map(|(_, id)| id).collect();
+
+        let query = in_p1(SearchQuery::new("Observation"));
+        let pages = every_page(&backend, &tenant, query.clone().with_count(1)).await;
+        let found: Vec<String> = pages.iter().flat_map(ids_of).collect();
+        assert_eq!(found, expected, "members only, newest first, one a page");
+        assert_eq!(pages.len(), 3);
+
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 3);
+        let mut total = query.clone();
+        total.total = Some(crate::types::TotalMode::Accurate);
+        assert_eq!(
+            backend.search(&tenant, &total).await.unwrap().total,
+            Some(3)
+        );
+
+        // A compartment with no params has no members.
+        let mut no_params = query;
+        no_params.compartment.as_mut().unwrap().params.clear();
+        assert!(ids_of(&backend.search(&tenant, &no_params).await.unwrap()).is_empty());
+        assert_eq!(backend.search_count(&tenant, &no_params).await.unwrap(), 0);
+    }
+
+    /// The compartment is a residual on the `_id` and `_lastUpdated` plans
+    /// too: `_id` naming a member and a non-member returns the member.
+    #[tokio::test]
+    async fn a_compartment_filters_the_id_and_last_updated_plans() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-compartment-plans");
+        let made = create_observations(&backend, &tenant).await;
+        let (member, other) = (made[0].0.as_str(), made[1].0.as_str());
+
+        let mut by_id = id_query(&[member, other]);
+        by_id.resource_type = "Observation".to_string();
+        assert_eq!(
+            ids_of(&backend.search(&tenant, &in_p1(by_id)).await.unwrap()),
+            [member]
+        );
+
+        let mut since = last_updated(&[&["ge2000-01-01".to_string()]]);
+        since.resource_type = "Observation".to_string();
+        assert_eq!(
+            backend.search_count(&tenant, &in_p1(since)).await.unwrap(),
+            3
+        );
+    }
+
+    /// `_total=accurate` (and `estimate`) adds the count to the page;
+    /// `_total=none` or absent adds none; `_count=0` and `_summary=count`
+    /// give the total and no entries (walkthrough 5.9).
+    #[tokio::test]
+    async fn totals_and_count_zero_carry_the_count() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-total");
+        create_patients(&backend, &tenant, 7).await;
+        let page_of = |total: Option<crate::types::TotalMode>| {
+            let mut query = SearchQuery::new("Patient").with_count(3);
+            query.total = total;
+            query
+        };
+
+        for total in [
+            crate::types::TotalMode::Accurate,
+            crate::types::TotalMode::Estimate,
+        ] {
+            let result = backend
+                .search(&tenant, &page_of(Some(total)))
+                .await
+                .unwrap();
+            assert_eq!(result.resources.len(), 3, "{total:?}: the page as usual");
+            assert_eq!(result.total, Some(7), "{total:?}");
+        }
+        for total in [None, Some(crate::types::TotalMode::None)] {
+            let result = backend.search(&tenant, &page_of(total)).await.unwrap();
+            assert_eq!(result.resources.len(), 3);
+            assert_eq!(result.total, None, "{total:?}: no total computed");
+        }
+
+        let count_zero = SearchQuery::new("Patient").with_count(0);
+        let mut summary_count = SearchQuery::new("Patient");
+        summary_count.summary = Some(SummaryMode::Count);
+        summary_count.total = Some(crate::types::TotalMode::Accurate);
+        for (case, query) in [("_count=0", count_zero), ("_summary=count", summary_count)] {
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert!(result.resources.is_empty(), "{case}: no entries");
+            assert!(
+                result.resources.page_info.next_cursor.is_none(),
+                "{case}: no next"
+            );
+            assert_eq!(result.total, Some(7), "{case}");
+        }
+    }
+
+    /// `ids` in the default order, `(last_updated DESC, id DESC)`, from
+    /// their stored `last_updated` (two creates can share a millisecond).
+    async fn newest_first(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+        ids: &[&str],
+    ) -> Vec<String> {
+        let mut keyed = Vec::new();
+        for id in ids {
+            let resource = crate::core::ResourceStorage::read(backend, tenant, "Patient", id)
+                .await
+                .expect("read")
+                .expect("live");
+            keyed.push((resource.last_modified(), id.to_string()));
+        }
+        keyed.sort_by(|a, b| b.cmp(a));
+        keyed.into_iter().map(|(_, id)| id).collect()
+    }
+
+    fn id_query(values: &[&str]) -> SearchQuery {
+        SearchQuery::new("Patient").with_parameter(crate::types::SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            values: values
+                .iter()
+                .map(|value| crate::types::SearchValue::eq(*value))
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    fn ids_of(result: &SearchResult) -> Vec<String> {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect()
+    }
+
+    /// `_id=a,b,c`: live ids only (a deleted one, an unknown one and a
+    /// piped value match nothing), newest first; several `_id` parameters
+    /// are ANDed (walkthrough 5.4, G37, C2).
+    #[tokio::test]
+    async fn an_id_search_reads_each_id_and_returns_the_live_ones_newest_first() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-id");
+        let created = create_patients(&backend, &tenant, 4).await;
+        crate::core::ResourceStorage::delete(&backend, &tenant, "Patient", &created[3])
+            .await
+            .expect("delete");
+        let [a, b, c, gone] =
+            [&created[0], &created[1], &created[2], &created[3]].map(String::as_str);
+
+        let result = backend
+            .search(&tenant, &id_query(&[a, b, c, gone, "no-such-id"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(&result),
+            newest_first(&backend, &tenant, &[a, b, c]).await
+        );
+        assert!(result.resources.page_info.next_cursor.is_none());
+
+        let anded = id_query(&[a, b]).with_parameter(id_query(&[b]).parameters.remove(0));
+        assert_eq!(ids_of(&backend.search(&tenant, &anded).await.unwrap()), [b]);
+        let disjoint = id_query(&[a]).with_parameter(id_query(&[b]).parameters.remove(0));
+        assert!(ids_of(&backend.search(&tenant, &disjoint).await.unwrap()).is_empty());
+
+        let piped = format!("sys|{a}");
+        assert!(ids_of(&backend.search(&tenant, &id_query(&[&piped])).await.unwrap()).is_empty());
+    }
+
+    /// `_id` with 5 ids, 2 a page: pages of 2, 2 and 1 through the cursor,
+    /// each id once; `search_count` and `_total` count the live ones.
+    #[tokio::test]
+    async fn an_id_search_pages_and_counts() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-id-paging");
+        let created = create_patients(&backend, &tenant, 5).await;
+        let values: Vec<&str> = created.iter().map(String::as_str).collect();
+
+        let pages = every_page(&backend, &tenant, id_query(&values).with_count(2)).await;
+        let sizes: Vec<usize> = pages.iter().map(|page| page.resources.len()).collect();
+        assert_eq!(sizes, [2, 2, 1]);
+        let mut found: Vec<String> = pages.iter().flat_map(ids_of).collect();
+        let expected = newest_first(&backend, &tenant, &values).await;
+        assert_eq!(found, expected, "newest first, each once");
+        found.sort();
+        found.dedup();
+        assert_eq!(found.len(), 5);
+
+        let mut with_unknown = values.clone();
+        with_unknown.push("no-such-id");
+        let query = id_query(&with_unknown);
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 5);
+        let mut total = query.with_count(2);
+        total.total = Some(crate::types::TotalMode::Accurate);
+        assert_eq!(
+            backend.search(&tenant, &total).await.unwrap().total,
+            Some(5)
+        );
+    }
+
+    /// 5 Patients a few milliseconds apart, oldest first, with their stored
+    /// `last_updated`.
+    async fn create_spaced(
+        backend: &CassandraBackend,
+        tenant: &TenantContext,
+    ) -> Vec<(String, String)> {
+        let mut made = Vec::new();
+        for _ in 0..5 {
+            let stored = crate::core::ResourceStorage::create(
+                backend,
+                tenant,
+                "Patient",
+                serde_json::json!({ "resourceType": "Patient" }),
+                crate::backends::cassandra::test_support::test_fhir_version(),
+            )
+            .await
+            .expect("create");
+            made.push((
+                stored
+                    .last_modified()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                stored.id().to_string(),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        made
+    }
+
+    fn last_updated(values: &[&[String]]) -> SearchQuery {
+        values
+            .iter()
+            .fold(SearchQuery::new("Patient"), |query, values| {
+                query.with_parameter(crate::types::SearchParameter {
+                    name: "_lastUpdated".to_string(),
+                    param_type: SearchParamType::Date,
+                    values: values
+                        .iter()
+                        .map(|value| crate::types::SearchValue::parse(value))
+                        .collect(),
+                    ..Default::default()
+                })
+            })
+    }
+
+    /// Each prefix on `resources_by_type` (walkthrough 5.5; `coverage.md`
+    /// section 3), a comma list, two `_lastUpdated` ANDed, and `_id` with
+    /// `_lastUpdated` as a residual: the right resources, newest first.
+    #[tokio::test]
+    async fn last_updated_slices_return_the_matching_resources_newest_first() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-last-updated");
+        let made = create_spaced(&backend, &tenant).await;
+        let t = |n: usize| made[n].0.clone();
+        let ids = |ns: &[usize]| -> Vec<String> { ns.iter().map(|&n| made[n].1.clone()).collect() };
+        let found = |query: SearchQuery| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move { ids_of(&backend.search(tenant, &query.with_count(50)).await.unwrap()) }
+        };
+
+        for (prefix, expected) in [
+            ("eq", vec![2]),
+            ("ge", vec![4, 3, 2]),
+            ("gt", vec![4, 3]),
+            ("sa", vec![4, 3]),
+            ("le", vec![2, 1, 0]),
+            ("lt", vec![1, 0]),
+            ("eb", vec![1, 0]),
+            ("ne", vec![4, 3, 1, 0]),
+        ] {
+            assert_eq!(
+                found(last_updated(&[&[format!("{prefix}{}", t(2))]])).await,
+                ids(&expected),
+                "_lastUpdated={prefix}t2"
+            );
+        }
+        assert_eq!(
+            found(last_updated(&[&[
+                format!("eq{}", t(1)),
+                format!("eq{}", t(3))
+            ]]))
+            .await,
+            ids(&[3, 1]),
+            "a comma list"
+        );
+        assert_eq!(
+            found(last_updated(&[
+                &[format!("ge{}", t(1))],
+                &[format!("lt{}", t(3))]
+            ]))
+            .await,
+            ids(&[2, 1]),
+            "two parameters, ANDed"
+        );
+        let mut with_ids = last_updated(&[&[format!("ge{}", t(2))]]);
+        with_ids.parameters.extend(
+            id_query(&made.iter().map(|(_, id)| id.as_str()).collect::<Vec<_>>()).parameters,
+        );
+        assert_eq!(
+            found(with_ids).await,
+            ids(&[4, 3, 2]),
+            "_id drives, _lastUpdated is a residual"
+        );
+    }
+
+    /// `ne` read one resource a page: the cursor carries the read from the
+    /// slice above the value into the slice below it, each resource once;
+    /// `search_count` and `_total` count the matches.
+    #[tokio::test]
+    async fn last_updated_ne_pages_across_its_two_slices_and_counts() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-last-updated-ne");
+        let made = create_spaced(&backend, &tenant).await;
+        let ne = last_updated(&[&[format!("ne{}", made[2].0)]]);
+
+        let pages = every_page(&backend, &tenant, ne.clone().with_count(1)).await;
+        let found: Vec<String> = pages.iter().flat_map(ids_of).collect();
+        let expected: Vec<String> = [4, 3, 1, 0].iter().map(|&n| made[n].1.clone()).collect();
+        assert_eq!(found, expected);
+        assert_eq!(pages.len(), 4, "one a page, no empty last page");
+
+        assert_eq!(backend.search_count(&tenant, &ne).await.unwrap(), 4);
+        let mut total = ne.with_count(2);
+        total.total = Some(crate::types::TotalMode::Accurate);
+        assert_eq!(
+            backend.search(&tenant, &total).await.unwrap().total,
+            Some(4)
+        );
+    }
+
+    /// Sets this test's candidate cap until dropped.
+    struct TestCap;
+
+    impl TestCap {
+        fn set(max: usize) -> Self {
+            TEST_MAX_CANDIDATES.with(|cap| cap.set(Some(max)));
+            TestCap
+        }
+    }
+
+    impl Drop for TestCap {
+        fn drop(&mut self) {
+            TEST_MAX_CANDIDATES.with(|cap| cap.set(None));
+        }
+    }
+
+    fn is_too_many(result: &StorageResult<impl std::fmt::Debug>, count: usize, max: usize) -> bool {
+        matches!(
+            result,
+            Err(StorageError::Search(SearchError::TooManyResults { count: c, max: m }))
+                if *c == count && *m == max
+        )
+    }
+
+    /// Past the cap, a search or a filtered count fails with 422
+    /// `TooManyResults`, never a partial page or count; a page that fills
+    /// before the cap is returned. `count`'s path, an unfiltered
+    /// `search_count`, has no point reads, so no cap (G7, G27).
+    #[tokio::test]
+    async fn past_the_cap_a_search_or_count_is_too_many_results() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-cap");
+        let ids = create_patients(&backend, &tenant, 6).await;
+        let _cap = TestCap::set(3);
+
+        let whole = SearchQuery::new("Patient").with_count(10);
+        assert!(
+            is_too_many(&backend.search(&tenant, &whole).await, 4, 3),
+            "the 4th point read is past 3"
+        );
+        // 2 kept and 1 more to decide `next`: 3 point reads, at the cap.
+        let page = backend
+            .search(&tenant, &SearchQuery::new("Patient").with_count(2))
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), 2);
+        assert!(page.resources.page_info.next_cursor.is_some());
+
+        let filtered = last_updated(&[&["ge2000-01-01".to_string()]]);
+        assert!(is_too_many(
+            &backend.search_count(&tenant, &filtered).await,
+            4,
+            3
+        ));
+        let values: Vec<&str> = ids.iter().map(String::as_str).collect();
+        assert!(is_too_many(
+            &backend.search(&tenant, &id_query(&values)).await,
+            4,
+            3
+        ));
+        assert!(is_too_many(
+            &backend.search_count(&tenant, &id_query(&values)).await,
+            4,
+            3
+        ));
+
+        assert_eq!(
+            backend
+                .search_count(&tenant, &SearchQuery::new("Patient"))
+                .await
+                .unwrap(),
+            6,
+            "count reads no resources, so it runs under no cap"
+        );
+    }
+
+    /// A compartment count past the cap is 422, never a count of the
+    /// members found so far (walkthrough 5.11, "Cap").
+    #[tokio::test]
+    async fn a_compartment_count_past_the_cap_is_too_many_results() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-cap-compartment");
+        create_observations(&backend, &tenant).await;
+        let _cap = TestCap::set(2);
+        let query = in_p1(SearchQuery::new("Observation"));
+        assert!(is_too_many(
+            &backend.search_count(&tenant, &query).await,
+            3,
+            2
+        ));
+        assert!(is_too_many(
+            &backend.search(&tenant, &query.with_count(10)).await,
+            3,
+            2
+        ));
+    }
+
+    /// The repairs a search queued run on `TooManyResults` as on success
+    /// (`repair.rs`, "Step 6's contract"): here an orphan row, read first,
+    /// is queued and its repair skipped for having no `resources` row.
+    /// Planted, so the tenant is `test-planted-` (#127).
+    #[tokio::test]
+    async fn repairs_still_run_when_the_cap_is_reached() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-planted-search-cap-repair");
+        create_patients(&backend, &tenant, 3).await;
+        backend
+            .session
+            .execute(
+                "INSERT INTO resources_by_type \
+                 (tenant_id, resource_type, last_updated, id, version_id, fhir_version) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                vec![
+                    Value::from(tenant.tenant_id().as_str()),
+                    Value::from("Patient"),
+                    Value::from(Utc::now() + chrono::Duration::hours(1)),
+                    Value::from("orphan"),
+                    Value::from(1_i32),
+                    Value::from("4.0"),
+                ],
+                StatementKind::Write,
+            )
+            .await
+            .expect("plant");
+        let _cap = TestCap::set(2);
+        let before = backend.repair_stats();
+
+        let result = backend
+            .search(&tenant, &SearchQuery::new("Patient").with_count(10))
+            .await;
+        assert!(is_too_many(&result, 3, 2), "{result:?}");
+        let ran = backend.repair_stats().since(&before);
+        assert_eq!(
+            ran.queued, 1,
+            "the orphan was queued and the repair phase ran"
+        );
+        assert_eq!(ran.skipped_no_row, 1);
+    }
+
+    /// The planner compiles each parameter through its own module: until a
+    /// module lands, its `compile` refuses, so the search answers 501 naming
+    /// that module's issue; `search_count` the same.
+    #[tokio::test]
+    async fn each_parameter_type_is_compiled_by_its_module() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-modules");
+        let one = |name: &str, param_type: SearchParamType, value: &str| {
+            SearchQuery::new("Patient").with_parameter(crate::types::SearchParameter {
+                name: name.to_string(),
+                param_type,
+                values: vec![crate::types::SearchValue::parse(value)],
+                ..Default::default()
+            })
+        };
+        for (query, issue) in [
+            (one("gender", SearchParamType::Token, "female"), "#130"),
+            (one("_tag", SearchParamType::Token, "http://x|y"), "#130"),
+            (
+                one("_profile", SearchParamType::Uri, "http://example.org/p"),
+                "#131",
+            ),
+            (
+                one("birthdate", SearchParamType::Date, "ge1980-01-01"),
+                "#132",
+            ),
+        ] {
+            let name = query.parameters[0].name.clone();
+            for result in [
+                backend.search(&tenant, &query).await.map(|_| ()),
+                backend.search_count(&tenant, &query).await.map(|_| ()),
+            ] {
+                match result {
+                    Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                        capability,
+                        ..
+                    })) => assert!(capability.contains(issue), "{name}: {capability}"),
+                    other => panic!("{name}: expected its module's 501, got {other:?}"),
+                }
+            }
         }
     }
 }

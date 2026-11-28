@@ -250,7 +250,7 @@ async fn pending_version_needs_an_intent_with_the_rows_write_id() {
 
     let node = node_or_skip!("pending_version_needs_an_intent_with_the_rows_write_id");
     let session = node.session().await;
-    let tenant = unique_tenant("pending-version");
+    let tenant = unique_tenant("planted-pending-version");
     let tenant_id = tenant.tenant_id().as_str();
     // `pending_version` reads this hour's and the previous hour's bucket,
     // in the backend's format (`bucket_of`, `write.rs`), and every shard.

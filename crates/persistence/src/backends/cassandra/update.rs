@@ -368,7 +368,7 @@ mod node_tests {
 
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
-    use crate::backends::cassandra::index_keys::{self, IndexKey};
+    use crate::backends::cassandra::index_keys;
     use crate::backends::cassandra::session::{Fault, TimeoutWriteType};
     use crate::backends::cassandra::write::{
         PreviousVersion, SOFT_DELETE_RESOURCE_IF_VERSION, UPDATE_RESOURCE_IF_VERSION, write_ts_of,
@@ -401,6 +401,18 @@ mod node_tests {
                 }
             }
         };
+    }
+
+    /// Like `tenant_context`, for a case that plants another writer's CAS by
+    /// raw CQL, which leaves a version with no intent and no rows (RV22).
+    fn planted_tenant_context(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-planted-update-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
     }
 
     fn tenant_context(case: &str) -> TenantContext {
@@ -494,6 +506,7 @@ mod node_tests {
     /// C2's bind values for moving `Patient/p` from `from` to `from + 1`
     /// with `write_id`, outside the engine (another writer).
     fn c2_values(
+        backend: &CassandraBackend,
         tenant: &TenantContext,
         from: i32,
         write_id: Uuid,
@@ -508,7 +521,11 @@ mod node_tests {
             ),
             Value::from(write_ts_of(lu)),
             Value::from(write_id),
-            Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+            Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                tenant.tenant_id().as_str(),
+                "Patient",
+                &patient("Other"),
+            )))),
             Value::from(tenant.tenant_id().as_str()),
             Value::from("Patient"),
             Value::from("p"),
@@ -539,7 +556,7 @@ mod node_tests {
             .session
             .rows(
                 UPDATE_RESOURCE_IF_VERSION,
-                c2_values(tenant, from, write_id, lu),
+                c2_values(backend, tenant, from, write_id, lu),
                 StatementKind::Cas,
             )
             .await;
@@ -601,7 +618,7 @@ mod node_tests {
     async fn c2_misses_through_update_map_to_a_conflict_or_not_found() {
         let backend = backend_or_skip!();
 
-        let tenant = tenant_context("miss-moved");
+        let tenant = planted_tenant_context("miss-moved");
         let current = create(&backend, &tenant).await;
         let theirs = Uuid::new_v4();
         another_writer_late(&backend, &tenant, 1, theirs, StatementKind::Cas).await;
@@ -628,7 +645,7 @@ mod node_tests {
         assert_eq!(spent.serial_read, 0, "a definite miss needs no R2");
         assert_eq!(current_row(&backend, &tenant).await.write_id, Some(theirs));
 
-        let tenant = tenant_context("miss-deleted");
+        let tenant = planted_tenant_context("miss-deleted");
         let current = create(&backend, &tenant).await;
         another_deleter_late(&backend, &tenant, 1, StatementKind::Cas).await;
         let before = backend.cas_stats();
@@ -755,7 +772,11 @@ mod node_tests {
                     ),
                     Value::from(write_ts_of(lu)),
                     Value::from(writer),
-                    Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+                    Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                        tenant.tenant_id().as_str(),
+                        "Patient",
+                        &patient("Smith"),
+                    )))),
                 ],
                 StatementKind::Cas,
             )
@@ -858,7 +879,7 @@ mod node_tests {
         // Below N, and N's CAS still committing: R2 completes it, and the
         // update goes ahead from R2's row. Another writer's C2 (1 -> 2) is
         // held back by the seam and applied just before the serial read.
-        let tenant = tenant_context("below");
+        let tenant = planted_tenant_context("below");
         create(&backend, &tenant).await;
         let theirs = Uuid::new_v4();
         another_writer_late(&backend, &tenant, 1, theirs, StatementKind::SerialRead).await;
@@ -1014,7 +1035,7 @@ mod node_tests {
         // Our C2 applies (1 -> 2) and its reply is lost; another writer's
         // C2 (2 -> 3), held back, lands before R2, and row 2 was never
         // written, since our step 4 never ran.
-        let tenant = tenant_context("undecidable");
+        let tenant = planted_tenant_context("undecidable");
         let current = create(&backend, &tenant).await;
         another_writer_late(
             &backend,

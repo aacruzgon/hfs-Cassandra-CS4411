@@ -202,6 +202,16 @@ where
         .map_err(|error| format!("{name}: {error:?}"))
 }
 
+/// `tenant/type/id` of a row the scan could not decode, `?` for each column that could not be read either.
+fn row_identity(
+    tenant_id: Result<String, String>,
+    resource_type: Result<String, String>,
+    id: Result<String, String>,
+) -> String {
+    let part = |column: Result<String, String>| column.unwrap_or_else(|_| "?".to_string());
+    format!("{}/{}/{}", part(tenant_id), part(resource_type), part(id))
+}
+
 /// An index row of `table`, decoded.
 fn decode_scanned(table: &'static str, row: &Row) -> Result<ScannedRow, String> {
     let text = |name: &str| column::<String>(row, name);
@@ -279,7 +289,8 @@ impl IndexScan {
     /// Counts every row read (a `Cell` in the keep closure) and holds only
     /// rows whose tenant starts with `test-` and passes `keep`. A failed
     /// page or an undecodable kept row ends the scan with `failed` set,
-    /// `what` = `"scan <table>"`, `error` = the error's `{:?}`.
+    /// `what` = `"scan <table>"`, `error` = the error's `{:?}`; for an
+    /// undecodable row the error names the row (`tenant/type/id`).
     pub(crate) async fn take(
         backend: &CassandraBackend,
         keep: impl Fn(&str) -> bool + Send + Sync + 'static,
@@ -352,7 +363,13 @@ impl IndexScan {
                         .or_default()
                         .push(scanned),
                     Err(error) => {
-                        scan.failed = Some((format!("scan {table}"), error));
+                        let identity = row_identity(
+                            column(row, "tenant_id"),
+                            column(row, "resource_type"),
+                            column(row, "id"),
+                        );
+                        scan.failed =
+                            Some((format!("scan {table}"), format!("{identity}: {error}")));
                         return scan;
                     }
                 }
@@ -369,6 +386,18 @@ impl IndexScan {
     /// Rows read from all seven tables, every tenant's.
     pub(crate) fn scanned(&self) -> usize {
         self.scanned
+    }
+
+    /// The kept rows of `tenant_id`, in scan order; empty when it has none.
+    pub(crate) fn rows_of(&self, tenant_id: &str) -> &[ScannedRow] {
+        self.rows.get(tenant_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// The first read that failed, `(what, error)`, when the scan stopped early.
+    pub(crate) fn failed(&self) -> Option<(&str, &str)> {
+        self.failed
+            .as_ref()
+            .map(|(what, error)| (what.as_str(), error.as_str()))
     }
 
     /// The kept tenants with at least one scanned row, sorted.
@@ -422,7 +451,8 @@ pub(crate) enum Defect {
         stored: Vec<IndexKey>,
         fresh: Vec<IndexKey>,
     },
-    /// Rule 4: a delete marker's stored set is not the empty set `0x01 0x00`.
+    /// Rule 4: a delete marker's stored set (a marker version row, or a
+    /// deleted `resources` row) is not the empty set `0x01 0x00`.
     MarkerNotEmpty {
         resource_type: String,
         id: String,
@@ -1031,6 +1061,20 @@ fn check_subject(
         }
     }
 
+    // Rule 4: a deleted resource's stored set is the empty set. This needs no
+    // extraction, so it runs under either registry.
+    if !live {
+        let blob = subject.row.index_keys.as_deref().unwrap_or(&[]);
+        if blob != index_keys::EMPTY {
+            report.defects.push(Defect::MarkerNotEmpty {
+                resource_type: resource_type.clone(),
+                id: id.clone(),
+                version_id: current,
+                blob: blob.to_vec(),
+            });
+        }
+    }
+
     // Rule 6: a stored `write_ts` is the write time of its own `last_updated`.
     // This needs no scan, so it runs whatever the scan did.
     let own_write_ts = std::iter::once((
@@ -1451,6 +1495,19 @@ mod tests {
     use crate::backends::cassandra::test_support::test_fhir_version;
     use crate::core::ResourceStorage;
 
+    /// RI1: a failed scan names the row.
+    #[test]
+    fn a_failed_scan_names_the_row() {
+        assert_eq!(
+            row_identity(Ok("test-a".into()), Ok("Patient".into()), Ok("p".into())),
+            "test-a/Patient/p"
+        );
+        assert_eq!(
+            row_identity(Ok("test-a".into()), Err("e".into()), Err("e".into())),
+            "test-a/?/?"
+        );
+    }
+
     fn row(version_id: i32) -> ScannedRow {
         ScannedRow {
             table: "resources_by_type",
@@ -1587,6 +1644,8 @@ mod tests {
     const PLANT_RESOURCE_NO_TS: &str = "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, created_at, fhir_version, index_keys, deleted_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0) IF NOT EXISTS";
     /// The same with no `data` column either.
     const PLANT_RESOURCE_NO_TS_NO_DATA: &str = "INSERT INTO resources (tenant_id, resource_type, id, version_id, last_updated, created_at, fhir_version, index_keys, deleted_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, 0) IF NOT EXISTS";
+    /// A deleted current row: `deleted_at` is set and `write_ts` is given.
+    const PLANT_RESOURCE_DELETED: &str = "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, created_at, fhir_version, write_ts, index_keys, deleted_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS";
     /// Its version row, with no `write_ts` column.
     const PLANT_VERSION_NO_TS: &str = "INSERT INTO resource_versions (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version, index_keys) VALUES (?, ?, ?, 1, ?, ?, ?, ?) USING TIMESTAMP ?";
     /// A live current version row with no `write_ts` and no `data` column.
@@ -1802,6 +1861,7 @@ mod tests {
             "malformed-data-in-both-rows",
             "malformed-data-undecodable-sets",
             "write-ts-behind",
+            "deleted-row-with-keys",
         ];
         let version = test_fhir_version();
 
@@ -1970,9 +2030,56 @@ mod tests {
             .unwrap()
             .write_ts
             .expect("write_ts");
+        // R1 and the marker row hold the same keys (rule 5 stays quiet), so
+        // each reports once.
         let blob = index_keys::encode(&[planted_uri()]);
         plant_resource_keys(&backend, &t, blob.clone(), 2).await;
         plant_version_keys(&backend, &t, 2, blob, ts2 + 1).await;
+
+        // deleted-row-with-keys: R1 is deleted but holds the body's real key
+        // set; the current version row is live with the same body and blob,
+        // and no index row exists, so only the empty-set rule sees it.
+        let t = tenant_of("deleted-row-with-keys");
+        let lu = ms(1_700_000_000_000);
+        let body = patient().to_string();
+        let blob = Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+            &t,
+            "Patient",
+            &patient(),
+        ))));
+        let fhir = Value::from(version.as_mime_param());
+        plant_cas(
+            &backend,
+            PLANT_RESOURCE_DELETED,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(body.as_str()),
+                Value::from(lu),
+                Value::from(lu),
+                fhir.clone(),
+                Value::from(write_ts_of(lu)),
+                blob.clone(),
+                Value::from(lu),
+            ],
+        )
+        .await;
+        plant(
+            &backend,
+            PLANT_VERSION_NO_TS,
+            vec![
+                Value::from(t.as_str()),
+                Value::from("Patient"),
+                Value::from("p"),
+                Value::from(body.as_str()),
+                Value::from(lu),
+                fhir,
+                blob,
+                Value::from(write_ts_of(lu)),
+            ],
+        )
+        .await;
 
         // missing-version-row
         let t = tenant_of("missing-version-row");
@@ -2531,11 +2638,24 @@ mod tests {
             }
 
             let report = check("marker-not-empty", registry).await;
+            assert_eq!(
+                report.kinds(),
+                under(&["marker_not_empty", "marker_not_empty"]),
+                "{report}"
+            );
+            for defect in &report.defects {
+                let Defect::MarkerNotEmpty { version_id, .. } = defect else {
+                    unreachable!()
+                };
+                assert_eq!(*version_id, 2);
+            }
+
+            let report = check("deleted-row-with-keys", registry).await;
             assert_eq!(report.kinds(), under(&["marker_not_empty"]), "{report}");
             let Defect::MarkerNotEmpty { version_id, .. } = &report.defects[0] else {
                 unreachable!()
             };
-            assert_eq!(*version_id, 2);
+            assert_eq!(*version_id, 1);
 
             let report = check("missing-version-row", registry).await;
             assert_eq!(

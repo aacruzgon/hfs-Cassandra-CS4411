@@ -1642,7 +1642,7 @@ mod node_tests {
     }
 
     fn tenant(case: &str) -> String {
-        format!("test-batch-{case}-{}", Uuid::new_v4().simple())
+        format!("test-planted-batch-{case}-{}", Uuid::new_v4().simple())
     }
 
     fn at(millis: i64) -> DateTime<Utc> {

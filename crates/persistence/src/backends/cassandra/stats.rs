@@ -8,10 +8,11 @@
 //! before and after what it measures, and prints [`CasStats::since`] as
 //! `key=value` pairs (its `Display`).
 //!
-//! The five extraction and payload counters at the end of [`CasStats`] are
-//! the writer's step 1 (roadmap row 5.1).
 //! [`RepairStats`] counts repair on read (`repair.rs`), read with
 //! [`CassandraBackend::repair_stats`](super::CassandraBackend::repair_stats).
+//!
+//! The five extraction and payload counters at the end of [`CasStats`] are
+//! the writer's step 1 (roadmap row 5.1).
 //!
 //! The statements themselves are counted per kind in `session.rs`
 //! ([`StatementCounts`](super::StatementCounts), report R5).

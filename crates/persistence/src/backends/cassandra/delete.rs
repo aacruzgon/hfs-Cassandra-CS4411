@@ -478,6 +478,18 @@ mod node_tests {
         )
     }
 
+    /// Like `tenant_context`, for a case that plants another writer's CAS or
+    /// a stored version row by raw CQL (RV22).
+    fn planted_tenant_context(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-planted-delete-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
+    }
+
     fn tenant_context(case: &str) -> TenantContext {
         TenantContext::new(
             TenantId::new(format!("test-delete-{case}-{}", Uuid::new_v4().simple())),
@@ -521,12 +533,8 @@ mod node_tests {
         let row = r1(backend, tenant).await.expect("a row to update");
         let (json, data) = normalized_body("update", "Patient", "p", patient("p")).unwrap();
         let mut request = backend.cas_request("update", key(tenant));
-        let plan = CasPlan::update(
-            PreviousVersion::from_row(&row).unwrap(),
-            json,
-            data,
-            vec![IndexKey::ResourcesByType],
-        );
+        let keys = backend.index_keys_of(tenant, "Patient", &json);
+        let plan = CasPlan::update(PreviousVersion::from_row(&row).unwrap(), json, data, keys);
         match backend.run_cas(&mut request, plan).await.unwrap() {
             CasOutcome::Applied(_) => {}
             other => panic!("the other writer's update: {other:?}"),
@@ -1394,7 +1402,7 @@ mod node_tests {
         );
 
         // Past V, row V without a write_id: undecidable, 504, no retry.
-        let tenant = tenant_context("undecidable");
+        let tenant = planted_tenant_context("undecidable");
         create(&backend, &tenant, "p").await;
         backend
             .session
@@ -1634,6 +1642,18 @@ mod node_tests {
         );
     }
 
+    /// Like `hardening_tenant`, for a case that plants an undecodable key
+    /// set by raw CQL (RV22).
+    fn planted_hardening_tenant(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-planted-s3-hardening-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
+    }
+
     /// Fresh `test-` tenants for the hardening tests (ADR-aacruzgon-0020).
     fn hardening_tenant(case: &str) -> TenantContext {
         TenantContext::new(
@@ -1866,7 +1886,7 @@ mod node_tests {
             eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
             return;
         };
-        let tenant = hardening_tenant("later-r1-undecodable");
+        let tenant = planted_hardening_tenant("later-r1-undecodable");
         let t = tenant.tenant_id().as_str();
         create(&backend, &tenant, "p").await;
         backend

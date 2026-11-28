@@ -366,7 +366,7 @@ mod node_tests {
 
     use super::*;
     use crate::backends::cassandra::CassandraConfig;
-    use crate::backends::cassandra::index_keys::{self, IndexKey};
+    use crate::backends::cassandra::index_keys;
     use crate::backends::cassandra::session::{Fault, StatementKind, TimeoutWriteType};
     use crate::backends::cassandra::write::{
         INSERT_VERSION, PreviousVersion, REVIVE_RESOURCE_IF_VERSION,
@@ -409,6 +409,18 @@ mod node_tests {
 
     fn tenant_context(case: &str) -> TenantContext {
         tenant_with(case, TenantPermissions::full_access())
+    }
+
+    /// Like `tenant_context`, for a case that plants another writer's CAS by
+    /// raw CQL, which leaves a version with no intent and no rows (RV22).
+    fn planted_tenant_context(case: &str) -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!(
+                "test-planted-upsert-{case}-{}",
+                Uuid::new_v4().simple()
+            )),
+            TenantPermissions::full_access(),
+        )
     }
 
     fn tenant_with(case: &str, permissions: TenantPermissions) -> TenantContext {
@@ -571,7 +583,11 @@ mod node_tests {
             ),
             Value::from(write_ts_of(lu)),
             Value::from(write_id),
-            Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+            Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                tenant.tenant_id().as_str(),
+                "Patient",
+                &patient("Theirs"),
+            )))),
             Value::from(tenant.tenant_id().as_str()),
             Value::from("Patient"),
             Value::from("p"),
@@ -587,6 +603,11 @@ mod node_tests {
     /// A marker at version 2: create, then delete.
     async fn deleted(backend: &CassandraBackend, case: &str) -> TenantContext {
         let tenant = tenant_context(case);
+        deleted_in(backend, tenant).await
+    }
+
+    /// `deleted` in a tenant the caller made.
+    async fn deleted_in(backend: &CassandraBackend, tenant: TenantContext) -> TenantContext {
         put(backend, &tenant, patient("Smith")).await.unwrap();
         delete(backend, &tenant).await;
         tenant
@@ -983,7 +1004,7 @@ mod node_tests {
             (Fault::TimeOutWithoutApplying, true),
             (Fault::FailWithWriteFailure, false),
         ] {
-            let tenant = deleted(&backend, "c4-undecidable").await;
+            let tenant = deleted_in(&backend, planted_tenant_context("c4-undecidable")).await;
             another_writer_late(
                 &backend,
                 &tenant,
@@ -1060,7 +1081,11 @@ mod node_tests {
                     ),
                     Value::from(write_ts_of(lu)),
                     Value::from(theirs),
-                    Value::from(Blob::from(index_keys::encode(&[IndexKey::ResourcesByType]))),
+                    Value::from(Blob::from(index_keys::encode(&backend.index_keys_of(
+                        tenant.tenant_id().as_str(),
+                        "Patient",
+                        &patient("Theirs"),
+                    )))),
                     Value::from(write_ts_of(lu)),
                 ],
                 StatementKind::Write,
@@ -1424,11 +1449,11 @@ mod node_tests {
         );
     }
 
-    /// Fresh `test-` tenants for the hardening tests (ADR-aacruzgon-0020).
-    fn hardening_tenant(case: &str) -> TenantContext {
+    /// Fresh `test-planted-` tenants for the hardening tests that plant an undecodable key set by raw CQL (ADR-aacruzgon-0020, RV22).
+    fn planted_hardening_tenant(case: &str) -> TenantContext {
         TenantContext::new(
             TenantId::new(format!(
-                "test-s3-hardening-{case}-{}",
+                "test-planted-s3-hardening-{case}-{}",
                 Uuid::new_v4().simple()
             )),
             TenantPermissions::full_access(),
@@ -1518,7 +1543,7 @@ mod node_tests {
     #[tokio::test]
     async fn a_later_turns_undecodable_live_row_after_an_unknown_outcome_is_503() {
         let backend = backend_or_skip!();
-        let tenant = hardening_tenant("upsert-undecodable-live");
+        let tenant = planted_hardening_tenant("upsert-undecodable-live");
         put(&backend, &tenant, patient("One")).await.unwrap();
         another_writer_late(
             &backend,
@@ -1575,7 +1600,7 @@ mod node_tests {
     #[tokio::test]
     async fn a_later_turns_undecodable_marker_after_an_unknown_outcome_is_503() {
         let backend = backend_or_skip!();
-        let tenant = hardening_tenant("upsert-undecodable-marker");
+        let tenant = planted_hardening_tenant("upsert-undecodable-marker");
         put(&backend, &tenant, patient("One")).await.unwrap();
         another_delete_late(&backend, &tenant, 1, StatementKind::SerialRead).await;
         backend

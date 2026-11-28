@@ -192,7 +192,9 @@ impl CassandraBackend {
             }
             let resource = stored_resource(tenant, resource_type, &candidate.id, &r1)?;
             let loaded = self.loaded(&ctx, query, r1, &resource);
-            if !driver.residual(&loaded)
+            // Only the driver gets the candidate's position
+            // (ADR-anastasiabryz-0001); every other plan's residual is a check.
+            if !driver.residual(&loaded, Some(&candidate.order))
                 || !self
                     .passes(&ctx, query, checks, &loaded, &candidate.id)
                     .await?
@@ -396,6 +398,10 @@ mod node_tests {
         ) -> StorageResult<bool> {
             unreachable!("the fake plan only drives")
         }
+        /// The driver gets the position of a candidate it streamed.
+        fn residual(&self, _loaded: &super::super::LoadedResource, at: Option<&OrderKey>) -> bool {
+            at.is_some_and(|at| self.0.iter().any(|candidate| &candidate.order == at))
+        }
     }
 
     fn date_candidate(at: DateTime<Utc>, id: &str, version_id: i32) -> Candidate {
@@ -580,7 +586,8 @@ mod node_tests {
         ) -> StorageResult<bool> {
             unreachable!("a date beside another parameter is a residual")
         }
-        fn residual(&self, loaded: &super::super::LoadedResource) -> bool {
+        fn residual(&self, loaded: &super::super::LoadedResource, at: Option<&OrderKey>) -> bool {
+            assert!(at.is_none(), "a check beside the driver gets no position");
             loaded
                 .row
                 .data

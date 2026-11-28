@@ -49,7 +49,8 @@ use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
 use chrono::{DateTime, Utc};
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::future;
+use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use parking_lot::{Mutex, RwLock};
 
 use super::backend::CassandraBackend;
@@ -693,8 +694,13 @@ thread_local! {
 /// Rows one index read asks for: a batch size, not the page size
 /// (walkthrough 5.1, step 6).
 const BATCH_ROWS: usize = 100;
-/// R1 point reads in flight at once, for one batch of index rows.
-const R1_CONCURRENCY: usize = 8;
+/// Reads in flight at once, for each stage of a search: the R1 point reads,
+/// fed across batch and slice boundaries, and then the other parameters'
+/// checks, whose `contains` are point reads too. Alan's measurements on #133
+/// (2026-11-27) put 100,000 candidates past the 30 s request timeout at 8 in
+/// flight on three nodes with a 1–2 ms network round trip; 32 in flight kept
+/// a 2× margin at every level measured (ADR-anastasiabryz-0005).
+const R1_CONCURRENCY: usize = 32;
 
 /// Walkthrough 5.6's read of `resources_by_type`, without its keyset and
 /// `LIMIT` (added per read).
@@ -957,34 +963,16 @@ impl CassandraBackend {
             budget,
         };
 
-        let mut scan = TypeScan::default();
-        let mut after = position;
-        'reading: for slice in filter.slices() {
-            // A slice wholly above the cursor holds nothing after it.
-            if let Position::After { at, .. } = &after
-                && slice.from.is_some_and(|from| from > *at)
-            {
-                continue;
-            }
-            loop {
-                let rows = self
-                    .type_rows(tenant_id, resource_type, slice, &after)
-                    .await?;
-                let Some(last) = rows.last() else {
-                    break;
-                };
-                let more = rows.len() == BATCH_ROWS;
-                after = Position::After {
-                    order: Order::Default,
-                    at: last.last_updated,
-                    id: last.id.clone(),
-                    table: None,
-                };
-
-                // Checks on the row's own columns, before any point read:
-                // `_lastUpdated`'s exact predicate (5.5), and another FHIR
-                // version dropped (G34).
-                let candidates = rows.into_iter().filter(|row| {
+        // One stream of rows across every batch and slice, so up to
+        // `R1_CONCURRENCY` R1 reads stay in flight across their boundaries
+        // instead of draining at each one (ADR-anastasiabryz-0005).
+        let candidates = self
+            .type_row_stream(tenant_id, resource_type, filter.slices(), position)
+            // Checks on the row's own columns, before any point read:
+            // `_lastUpdated`'s exact predicate (5.5), and another FHIR
+            // version dropped (G34).
+            .filter(|row| {
+                future::ready(row.as_ref().map_or(true, |row| {
                     filter.matches(row.last_updated)
                         && match wanted_version {
                             Some(wanted) => row
@@ -993,40 +981,58 @@ impl CassandraBackend {
                                 .is_none_or(|stored| stored == wanted),
                             None => true,
                         }
-                });
-                let mut checked = stream::iter(candidates)
-                    .map(|row| async move {
-                        budget.charge(&row.id)?;
-                        let r1 = self
-                            .read_resource_row(tenant_id, resource_type, &row.id)
-                            .await?;
-                        Ok::<_, StorageError>((row, r1))
-                    })
-                    .buffered(R1_CONCURRENCY);
-                while let Some(checked_row) = checked.next().await {
-                    let (row, r1) = checked_row?;
-                    match r1 {
-                        Some(r1) if !r1.is_deleted() && Some(r1.version_id) == row.version_id => {
-                            if !query.matches_fhir_version(r1.fhir_version) {
-                                continue;
-                            }
-                            let resource = stored_resource(tenant, resource_type, &row.id, &r1)?;
-                            let loaded = self.loaded(&ctx, query, r1, &resource);
-                            if !self.passes(&ctx, query, checks, &loaded, &row.id).await? {
-                                continue;
-                            }
-                            scan.matched += 1;
-                            if let Some(keep) = keep {
-                                scan.kept.push((row.last_updated, resource));
-                                if scan.kept.len() >= keep {
-                                    break 'reading;
-                                }
-                            }
-                        }
-                        r1 => queue_hidden(repairs, resource_type, &row, r1),
+                }))
+            });
+        // R1, `R1_CONCURRENCY` in flight.
+        let read = candidates
+            .map(|row| async move {
+                let row = row?;
+                budget.charge(&row.id)?;
+                let r1 = self
+                    .read_resource_row(tenant_id, resource_type, &row.id)
+                    .await?;
+                Ok::<_, StorageError>((row, r1))
+            })
+            .buffered(R1_CONCURRENCY);
+        // In order: the tag check, which queues what it hides for repair,
+        // and the FHIR version on R1 (G34).
+        let tagged = read.filter_map(|read| {
+            let tagged = read.and_then(|(row, r1)| match r1 {
+                Some(r1) if !r1.is_deleted() && Some(r1.version_id) == row.version_id => {
+                    if !query.matches_fhir_version(r1.fhir_version) {
+                        return Ok(None);
                     }
+                    let resource = stored_resource(tenant, resource_type, &row.id, &r1)?;
+                    Ok(Some((row, r1, resource)))
                 }
-                if !more {
+                r1 => {
+                    queue_hidden(repairs, resource_type, &row, r1);
+                    Ok(None)
+                }
+            });
+            future::ready(tagged.transpose())
+        });
+        // The other parameters' checks, whose `contains` are point reads,
+        // also `R1_CONCURRENCY` in flight and in order (ADR-anastasiabryz-0005).
+        let ctx = &ctx;
+        let mut checked = tagged
+            .map(|tagged| async move {
+                let (row, r1, resource) = tagged?;
+                let loaded = self.loaded(ctx, query, r1, &resource);
+                let passes = self.passes(ctx, query, checks, &loaded, &row.id).await?;
+                Ok::<_, StorageError>(passes.then_some((row, resource)))
+            })
+            .buffered(R1_CONCURRENCY);
+
+        let mut scan = TypeScan::default();
+        while let Some(checked_row) = checked.next().await {
+            let Some((row, resource)) = checked_row? else {
+                continue;
+            };
+            scan.matched += 1;
+            if let Some(keep) = keep {
+                scan.kept.push((row.last_updated, resource));
+                if scan.kept.len() >= keep {
                     break;
                 }
             }
@@ -1063,16 +1069,16 @@ impl CassandraBackend {
     }
 
     /// R1 for one candidate, charged to the cap first (G27).
-    async fn charged_r1<'a>(
+    async fn charged_r1(
         &self,
         budget: &CandidateBudget,
         tenant_id: &str,
         resource_type: &str,
-        id: &'a str,
-    ) -> StorageResult<(&'a str, Option<ResourceRow>)> {
+        id: &str,
+    ) -> StorageResult<(String, Option<ResourceRow>)> {
         budget.charge(id)?;
         let r1 = self.read_resource_row(tenant_id, resource_type, id).await?;
-        Ok((id, r1))
+        Ok((id.to_string(), r1))
     }
 
     /// The live resources among `ids`, in `(last_updated DESC, id DESC)`
@@ -1102,24 +1108,39 @@ impl CassandraBackend {
             .iter()
             .map(|id| self.charged_r1(budget, tenant_id, resource_type, id))
             .collect();
-        let mut reads = stream::iter(reads).buffered(R1_CONCURRENCY);
+        let live = stream::iter(reads)
+            .buffered(R1_CONCURRENCY)
+            .filter_map(|read| {
+                let live = read.and_then(|(id, r1)| {
+                    let Some(r1) = r1.filter(|r1| {
+                        !r1.is_deleted()
+                            && filter.matches(r1.last_updated)
+                            && query.matches_fhir_version(r1.fhir_version)
+                    }) else {
+                        return Ok(None);
+                    };
+                    let resource = stored_resource(tenant, resource_type, &id, &r1)?;
+                    Ok(Some((id, r1, resource)))
+                });
+                future::ready(live.transpose())
+            });
+        // The other parameters' checks, `R1_CONCURRENCY` in flight
+        // (ADR-anastasiabryz-0005).
+        let ctx = &ctx;
+        let mut checked = live
+            .map(|live| async move {
+                let (id, r1, resource) = live?;
+                let last_updated = r1.last_updated;
+                let loaded = self.loaded(ctx, query, r1, &resource);
+                let passes = self.passes(ctx, query, checks, &loaded, &id).await?;
+                Ok::<_, StorageError>(passes.then_some((last_updated, resource)))
+            })
+            .buffered(R1_CONCURRENCY);
         let mut found = Vec::new();
-        while let Some(read) = reads.next().await {
-            let (id, r1) = read?;
-            let Some(r1) = r1.filter(|r1| {
-                !r1.is_deleted()
-                    && filter.matches(r1.last_updated)
-                    && query.matches_fhir_version(r1.fhir_version)
-            }) else {
-                continue;
-            };
-            let last_updated = r1.last_updated;
-            let resource = stored_resource(tenant, resource_type, id, &r1)?;
-            let loaded = self.loaded(&ctx, query, r1, &resource);
-            if !self.passes(&ctx, query, checks, &loaded, id).await? {
-                continue;
+        while let Some(checked) = checked.next().await {
+            if let Some(kept) = checked? {
+                found.push(kept);
             }
-            found.push((last_updated, resource));
         }
         found.sort_by(|(a_lu, a), (b_lu, b)| (b_lu, b.id()).cmp(&(a_lu, a.id())));
         Ok(found)
@@ -1368,6 +1389,68 @@ impl CassandraBackend {
             .await
             .map_err(|error| StorageError::Backend(map_driver_error(&error, "count")))?;
         Ok(rows.len() as u64)
+    }
+
+    /// Every `resources_by_type` row of `slices`, in order, strictly after
+    /// `position`: one stream across the batches of each slice and across
+    /// the slices, each batch read with `type_rows`'s keyset. A slice wholly
+    /// above the cursor is skipped, since it holds nothing after it.
+    fn type_row_stream<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        resource_type: &'a str,
+        slices: &'a [Slice],
+        position: Position,
+    ) -> BoxStream<'a, StorageResult<TypeRow>> {
+        struct State<'s> {
+            slices: std::slice::Iter<'s, Slice>,
+            current: Option<Slice>,
+            after: Position,
+        }
+        let state = State {
+            slices: slices.iter(),
+            current: None,
+            after: position,
+        };
+        stream::try_unfold(state, move |mut state| async move {
+            loop {
+                let slice = match state.current {
+                    Some(slice) => slice,
+                    None => {
+                        let Some(&slice) = state.slices.next() else {
+                            return Ok::<_, StorageError>(None);
+                        };
+                        if let Position::After { at, .. } = &state.after
+                            && slice.from.is_some_and(|from| from > *at)
+                        {
+                            continue;
+                        }
+                        state.current = Some(slice);
+                        slice
+                    }
+                };
+                let rows = self
+                    .type_rows(tenant_id, resource_type, &slice, &state.after)
+                    .await?;
+                let Some(last) = rows.last() else {
+                    state.current = None;
+                    continue;
+                };
+                if rows.len() < BATCH_ROWS {
+                    state.current = None;
+                }
+                state.after = Position::After {
+                    order: Order::Default,
+                    at: last.last_updated,
+                    id: last.id.clone(),
+                    table: None,
+                };
+                return Ok(Some((rows, state)));
+            }
+        })
+        .map_ok(|rows| stream::iter(rows.into_iter().map(Ok)))
+        .try_flatten()
+        .boxed()
     }
 
     /// One batch of `slice`'s rows strictly after `after` (walkthrough 5.5,
@@ -1921,6 +2004,71 @@ mod node_tests {
             }
         }
         pages
+    }
+
+    /// More rows than one index read returns (`BATCH_ROWS`): the type scan's
+    /// one stream crosses its batch boundaries, on one page and on pages
+    /// that end mid-batch, and the count reads to the end
+    /// (ADR-anastasiabryz-0005).
+    #[tokio::test]
+    async fn an_unfiltered_search_streams_across_batch_boundaries() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-search-batches");
+        let n = 2 * BATCH_ROWS + 5;
+        let ids: std::collections::BTreeSet<String> = create_patients(&backend, &tenant, n)
+            .await
+            .into_iter()
+            .collect();
+
+        let one = every_page(
+            &backend,
+            &tenant,
+            SearchQuery::new("Patient").with_count(1000),
+        )
+        .await;
+        assert_eq!(one.len(), 1, "one page");
+        let found: std::collections::BTreeSet<String> = one[0]
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        assert_eq!(one[0].resources.items.len(), n, "no row read twice");
+        assert_eq!(found, ids, "every Patient, across three batches");
+
+        let pages = every_page(
+            &backend,
+            &tenant,
+            SearchQuery::new("Patient").with_count(90),
+        )
+        .await;
+        let sizes: Vec<usize> = pages.iter().map(|page| page.resources.len()).collect();
+        assert_eq!(sizes, [90, 90, 25], "pages end mid-batch");
+        let paged: Vec<String> = pages
+            .iter()
+            .flat_map(|page| &page.resources.items)
+            .map(|resource| resource.id().to_string())
+            .collect();
+        assert_eq!(
+            paged
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ids,
+            "no gap"
+        );
+        assert_eq!(paged.len(), n, "no duplicate");
+
+        // A `_lastUpdated` count runs the type scan to the end (an
+        // unfiltered count uses `count` instead).
+        let since = last_updated(&[&["gt2000-01-01".to_string()]]);
+        assert_eq!(
+            backend.search_count(&tenant, &since).await.unwrap(),
+            n as u64
+        );
     }
 
     /// `GET /Patient?_count=10` over 25 Patients, 3 of them deleted: 10, 10

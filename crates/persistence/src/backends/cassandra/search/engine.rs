@@ -10,21 +10,26 @@
 //!    otherwise is stale and is queued for repair with this R1 (`repair.rs`,
 //!    "Step 6's contract"), so a hidden candidate and a kept one with a
 //!    leftover row are both repaired;
-//! 3. applies the residuals: the FHIR version (G34), `_lastUpdated` on
-//!    `resources.last_updated` (5.8), the compartment (5.11) and the plan's
-//!    own `residual`, from one extraction that is made only when a residual
-//!    reads values (a compartment, or a date parameter);
-//! 4. stops at `_count + 1` kept, and mints `next` in the plan's order.
+//! 3. applies the residuals on R1's columns: the FHIR version (G34) and
+//!    `_lastUpdated` on `resources.last_updated` (5.8);
+//! 4. checks the candidate against the rest of the search: the driving
+//!    plan's own `residual`, the compartment (5.11), and every other
+//!    parameter (`planner::Checks`, walkthrough 5.8), from one extraction
+//!    that is made only when a residual reads values (a compartment, or a
+//!    date parameter);
+//! 5. stops at `_count + 1` kept, and mints `next` in the plan's order.
 //!
-//! A candidate repeated with the same order key, or a resource already kept
-//! on this page, is kept once. The planner (`planner.rs`) picks the driver;
-//! the other plans of an AND come next (6.3f).
+//! Steps 1 and 4 make reads, so each keeps up to `R1_CONCURRENCY` in flight;
+//! steps 2 and 3 run in stream order between them, and the results stay in
+//! that order (ADR-anastasiabryz-0005). A candidate repeated with the same
+//! order key, or a resource already kept on this page, is kept once. The
+//! planner (`planner.rs`) picks the driver and the checks.
 //!
 //! This is the framework's own file (ADR-anastasiabryz-0001; #128).
 
 use std::collections::HashSet;
 
-use futures::StreamExt;
+use futures::{StreamExt, future};
 
 use super::last_updated::LastUpdatedFilter;
 use super::paging::{self, OrderKey};
@@ -137,10 +142,8 @@ impl CassandraBackend {
             budget,
         };
 
-        let mut scan = PlanScan::default();
-        let mut previous: Option<(OrderKey, String)> = None;
-        let mut kept_ids: HashSet<String> = HashSet::new();
-        let mut checked = driver
+        // R1, `R1_CONCURRENCY` in flight.
+        let read = driver
             .stream(&ctx, position)
             .map(|candidate| async move {
                 let candidate = candidate?;
@@ -151,57 +154,82 @@ impl CassandraBackend {
                 Ok::<_, StorageError>((candidate, r1))
             })
             .buffered(R1_CONCURRENCY);
+        // In order: a repeat of the previous candidate collapsed, the tag
+        // check, which queues every stale row for repair, and the residuals
+        // on R1's own columns.
+        let mut previous: Option<(OrderKey, String)> = None;
+        let tagged = read.filter_map(|read| {
+            let tagged = read.and_then(|(candidate, r1)| {
+                let key = (candidate.order.clone(), candidate.id.clone());
+                if previous.as_ref() == Some(&key) {
+                    return Ok(None);
+                }
+                previous = Some(key);
 
+                // The tag check (5.1, step 4).
+                let live_version = r1
+                    .as_ref()
+                    .filter(|r1| !r1.is_deleted())
+                    .map(|r1| r1.version_id);
+                let stale: Vec<StaleIndexRow> = candidate
+                    .rows
+                    .iter()
+                    .filter(|row| Some(row.version_id) != live_version)
+                    .filter_map(|row| {
+                        StaleIndexRow::new(row.key.clone(), row.last_updated, row.version_id)
+                            .map_err(|error| repairs.skip_undecodable(table_of(&row.key), &error))
+                            .ok()
+                    })
+                    .collect();
+                let tagged = candidate
+                    .rows
+                    .iter()
+                    .any(|row| Some(row.version_id) == live_version);
+                if !stale.is_empty() {
+                    repairs.queue(resource_type, &candidate.id, r1.clone(), stale);
+                }
+                let Some(r1) = r1.filter(|_| tagged) else {
+                    return Ok(None);
+                };
+
+                // The residuals on R1's columns (5.1, step 5).
+                if !query.matches_fhir_version(r1.fhir_version) || !filter.matches(r1.last_updated)
+                {
+                    return Ok(None);
+                }
+                let resource = stored_resource(tenant, resource_type, &candidate.id, &r1)?;
+                Ok(Some((candidate, r1, resource)))
+            });
+            future::ready(tagged.transpose())
+        });
+        // The driver's residual and every other parameter's check, whose
+        // `contains` are point reads, also `R1_CONCURRENCY` in flight and in
+        // order (ADR-anastasiabryz-0005). Only the driver gets the
+        // candidate's position (ADR-anastasiabryz-0001); every other plan's
+        // residual is a check.
+        let ctx = &ctx;
+        let mut checked = tagged
+            .map(|tagged| async move {
+                let (candidate, r1, resource) = tagged?;
+                let loaded = self.loaded(ctx, query, r1, &resource);
+                let passes = driver.residual(&loaded, Some(&candidate.order))
+                    && self
+                        .passes(ctx, query, checks, &loaded, &candidate.id)
+                        .await?;
+                Ok::<_, StorageError>(passes.then_some((candidate, resource)))
+            })
+            .buffered(R1_CONCURRENCY);
+
+        let mut scan = PlanScan::default();
+        let mut kept_ids: HashSet<String> = HashSet::new();
         while let Some(next) = checked.next().await {
-            let (candidate, r1) = next?;
-            let key = (candidate.order.clone(), candidate.id.clone());
-            if previous.as_ref() == Some(&key) || kept_ids.contains(&candidate.id) {
-                continue;
-            }
-            previous = Some(key);
-
-            // The tag check (5.1, step 4).
-            let live_version = r1
-                .as_ref()
-                .filter(|r1| !r1.is_deleted())
-                .map(|r1| r1.version_id);
-            let stale: Vec<StaleIndexRow> = candidate
-                .rows
-                .iter()
-                .filter(|row| Some(row.version_id) != live_version)
-                .filter_map(|row| {
-                    StaleIndexRow::new(row.key.clone(), row.last_updated, row.version_id)
-                        .map_err(|error| repairs.skip_undecodable(table_of(&row.key), &error))
-                        .ok()
-                })
-                .collect();
-            let tagged = candidate
-                .rows
-                .iter()
-                .any(|row| Some(row.version_id) == live_version);
-            if !stale.is_empty() {
-                repairs.queue(resource_type, &candidate.id, r1.clone(), stale);
-            }
-            let Some(r1) = r1.filter(|_| tagged) else {
+            let Some((candidate, resource)) = next? else {
                 continue;
             };
-
-            // The residuals (5.1, step 5).
-            if !query.matches_fhir_version(r1.fhir_version) || !filter.matches(r1.last_updated) {
+            // A resource already kept on this page is kept once.
+            if kept_ids.contains(&candidate.id) {
                 continue;
             }
-            let resource = stored_resource(tenant, resource_type, &candidate.id, &r1)?;
-            let loaded = self.loaded(&ctx, query, r1, &resource);
-            // Only the driver gets the candidate's position
-            // (ADR-anastasiabryz-0001); every other plan's residual is a check.
-            if !driver.residual(&loaded, Some(&candidate.order))
-                || !self
-                    .passes(&ctx, query, checks, &loaded, &candidate.id)
-                    .await?
-            {
-                continue;
-            }
-
             scan.matched += 1;
             if let Some(keep) = keep {
                 kept_ids.insert(candidate.id.clone());
@@ -716,6 +744,106 @@ mod node_tests {
             .await
             .unwrap();
         assert!(page_ids(&page).is_empty());
+    }
+
+    /// A check that counts how many of its `contains` reads are in flight
+    /// at once; each takes a few milliseconds, like a point read.
+    #[derive(Default)]
+    struct Slow {
+        in_flight: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Slow {
+        fn most(&self) -> usize {
+            self.most.swap(0, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ParamPlan for Slow {
+        fn param(&self) -> &str {
+            "fake-slow"
+        }
+        fn drive(&self) -> super::super::Drive {
+            super::super::Drive::Shared
+        }
+        fn stream<'a>(
+            &'a self,
+            _ctx: &'a ReadCtx<'a>,
+            _from: &'a Position,
+        ) -> BoxStream<'a, StorageResult<Candidate>> {
+            unreachable!("the fake check never drives")
+        }
+        async fn contains(
+            &self,
+            _ctx: &ReadCtx<'_>,
+            _last_updated: DateTime<Utc>,
+            _id: &str,
+        ) -> StorageResult<bool> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.most.fetch_max(now, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            self.in_flight.fetch_sub(1, SeqCst);
+            Ok(true)
+        }
+    }
+
+    /// The other parameters' checks are point reads too, so they run
+    /// `R1_CONCURRENCY` at a time like R1, not one candidate at a time,
+    /// whether a module plan or `_id` drives (ADR-anastasiabryz-0005). The
+    /// page still comes out in order.
+    #[tokio::test]
+    async fn and_checks_run_concurrently() {
+        let Some(backend) = backend().await else {
+            eprintln!("skipping: HFS_TEST_CASSANDRA_URL is not set");
+            return;
+        };
+        let tenant = fresh_tenant("test-engine-and-concurrent");
+        let ids: Vec<String> = create_patients(&backend, &tenant, 40)
+            .await
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        let slow = Slow::default();
+        let checks = Checks {
+            contains: vec![&slow],
+            residuals: Vec::new(),
+        };
+        let query = SearchQuery::new("Patient").with_count(100);
+
+        let page = backend
+            .plan_search(&tenant, &query, &TypeRowsPlan, &checks)
+            .await
+            .unwrap();
+        assert_eq!(page.resources.items.len(), 40);
+        let most = slow.most();
+        assert!(
+            (8..=R1_CONCURRENCY).contains(&most),
+            "a module plan drives: {most} checks in flight at most"
+        );
+
+        let page = backend
+            .id_search(&tenant, &query, &ids, &checks)
+            .await
+            .unwrap();
+        assert_eq!(page.resources.items.len(), 40);
+        let found: Vec<(DateTime<Utc>, String)> = page
+            .resources
+            .items
+            .iter()
+            .map(|resource| (resource.last_modified(), resource.id().to_string()))
+            .collect();
+        assert!(
+            found.windows(2).all(|pair| pair[0] >= pair[1]),
+            "newest first"
+        );
+        let most = slow.most();
+        assert!(
+            (8..=R1_CONCURRENCY).contains(&most),
+            "_id drives: {most} checks in flight at most"
+        );
     }
 
     /// AND pages through the cursor like any search: 2 a page over the 3

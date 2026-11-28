@@ -35743,6 +35743,92 @@ mod postgres_integration {
         .await;
     }
 
+    #[tokio::test]
+    async fn postgres_integration_step6b_date_period_prefixes() {
+        let backend = create_backend().await;
+        super::date_period_suite::date_period_prefixes(&backend, &unique_base("step6b_period"))
+            .await;
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn postgres_integration_step6b_date_final_millisecond() {
+        use crate::seeding::SeedingStorage;
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("date-final-millisecond");
+        let last = "9999-12-31T23:59:59.999Z";
+        let previous = "9999-12-31T23:59:59.998Z";
+
+        for (id, performed) in [("final-ms", last), ("previous-ms", previous)] {
+            backend
+                .seed_create(
+                    &tenant,
+                    "Procedure",
+                    json!({
+                        "id": id,
+                        "status": "completed",
+                        "subject": {"reference": "Patient/date-boundary"},
+                        "performedDateTime": performed,
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed boundary Procedure");
+        }
+
+        let expected: [(&str, [&[&str]; 2]); 9] = [
+            ("eq", [&["previous-ms"], &["final-ms"]]),
+            ("ne", [&["final-ms"], &["previous-ms"]]),
+            ("gt", [&["final-ms"], &[]]),
+            ("lt", [&[], &["previous-ms"]]),
+            ("ge", [&["final-ms", "previous-ms"], &["final-ms"]]),
+            ("le", [&["previous-ms"], &["final-ms", "previous-ms"]]),
+            ("sa", [&["final-ms"], &[]]),
+            ("eb", [&[], &["previous-ms"]]),
+            (
+                "ap",
+                [&["final-ms", "previous-ms"], &["final-ms", "previous-ms"]],
+            ),
+        ];
+        for (prefix, (raw, expected)) in expected
+            .into_iter()
+            .flat_map(|(prefix, matches)| {
+                [previous, last]
+                    .into_iter()
+                    .zip(matches)
+                    .map(move |case| (prefix, case))
+            })
+            .chain([
+                ("ap", ("9999-12-31T23:59:49.998Z", &["previous-ms"][..])),
+                ("eq", ("9999", &["final-ms", "previous-ms"][..])),
+                ("ne", ("9999", &[][..])),
+                ("sa", ("9999", &[][..])),
+            ])
+        {
+            let value = format!("{prefix}{raw}");
+            let query = SearchQuery::new("Procedure").with_parameter(SearchParameter {
+                name: "date".to_string(),
+                param_type: SearchParamType::Date,
+                values: vec![SearchValue::parse(&value)],
+                ..Default::default()
+            });
+            let result = backend.search(&tenant, &query).await.expect("date search");
+            let mut ids: Vec<_> = result
+                .resources
+                .items
+                .iter()
+                .map(|item| item.id())
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(ids, expected, "date={value}");
+        }
+    }
+
     /// #1391: a Period was indexed as two unrelated points, so `eq`/`ap`
     /// over-matched, `sa`/`eb` could match on the wrong end and an open end
     /// was an instant. It is one `[value_date, value_date_end)` range now.

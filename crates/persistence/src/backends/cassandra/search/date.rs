@@ -1,12 +1,15 @@
+use std::borrow::Cow;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 
 use cdrs_tokio::types::{rows::Row, value::Value};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
 use super::super::session::{CassandraSession, DriverError, StatementKind};
 
-use crate::search::date_value::{FhirDateValue, RangePredicate, StorageResolution};
+use crate::search::date_value::{
+    FhirDateValue, RangeCondition, RangePredicate, StorageResolution, open_end,
+};
 use crate::types::SearchPrefix;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -107,29 +110,100 @@ impl DateSlice {
     }
 }
 
+fn exclusive_date_limit() -> DateTime<Utc> {
+    open_end(StorageResolution::Millis) + TimeDelta::milliseconds(1)
+}
+
+/// The parser clips queries reaching the end of year 9999 to its last
+/// nanosecond. Keep the last millisecond in that half-open query range.
+fn date_query(value: &FhirDateValue) -> Cow<'_, FhirDateValue> {
+    let limit = exclusive_date_limit();
+    if value.end == limit - TimeDelta::nanoseconds(1) {
+        let mut adjusted = value.clone();
+        adjusted.end = limit;
+        Cow::Owned(adjusted)
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
 /// Choose a superset of matching rows. The reader must still apply the shared
 /// range predicate to every row. Slice order also sets the table order for ne.
 fn date_slices(value: &FhirDateValue, prefix: SearchPrefix) -> Vec<DateSlice> {
     use DateIndex::{End, Start};
     use SearchPrefix::*;
 
+    let value = date_query(value);
     let (start, end) = value.range_at(StorageResolution::Millis);
+    // The encoder can clamp a value's end to its start at the final
+    // millisecond. Read rows at that end so matching can restore their width.
+    let end_after = |bound| {
+        if bound == open_end(StorageResolution::Millis) {
+            Included(bound)
+        } else {
+            Excluded(bound)
+        }
+    };
     match prefix {
         Eq => vec![DateSlice::new(Start, Included(start), Excluded(end))],
         Ne => vec![
             DateSlice::new(Start, Unbounded, Excluded(start)),
-            DateSlice::new(End, Excluded(end), Unbounded),
+            DateSlice::new(End, end_after(end), Unbounded),
         ],
-        Gt => vec![DateSlice::new(End, Excluded(end), Unbounded)],
+        Gt => vec![DateSlice::new(End, end_after(end), Unbounded)],
         Lt => vec![DateSlice::new(Start, Unbounded, Excluded(start))],
-        Ge => vec![DateSlice::new(End, Excluded(start), Unbounded)],
+        Ge => vec![DateSlice::new(End, end_after(start), Unbounded)],
         Le => vec![DateSlice::new(Start, Unbounded, Excluded(end))],
         Sa => vec![DateSlice::new(Start, Included(end), Unbounded)],
         Eb => vec![DateSlice::new(End, Unbounded, Included(start))],
-        Ap => {
-            let (_, high) = value.approx_window(StorageResolution::Millis);
-            vec![DateSlice::new(Start, Unbounded, Excluded(high))]
+        Ap => vec![DateSlice::new(
+            Start,
+            Unbounded,
+            Excluded(approx_upper(&value, end)),
+        )],
+    }
+}
+
+/// Keep the shared approximation margin. Allow its exclusive upper bound
+/// one millisecond beyond the last storable timestamp when the margin reaches
+/// that far, so the window can cover the entire final millisecond.
+fn approx_upper(value: &FhirDateValue, query_end: DateTime<Utc>) -> DateTime<Utc> {
+    let limit = exclusive_date_limit();
+    value
+        .approx_margin()
+        .after(query_end)
+        .unwrap_or(limit)
+        .min(limit)
+}
+
+#[derive(Clone)]
+struct DateRangePredicate(RangePredicate);
+
+impl DateRangePredicate {
+    fn new(value: &FhirDateValue, prefix: SearchPrefix) -> Self {
+        let value = date_query(value);
+        let mut predicate = value.range_predicate(prefix, StorageResolution::Millis);
+        if prefix == SearchPrefix::Ap {
+            let (_, end) = value.range_at(StorageResolution::Millis);
+            let upper = approx_upper(&value, end);
+            for condition in predicate.any_of.iter_mut().flatten() {
+                if let RangeCondition::StartBefore(high) = condition {
+                    *high = upper;
+                }
+            }
         }
+        Self(predicate)
+    }
+
+    fn matches(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
+        // Keep the stored endpoints for slices, cursor positions and repair
+        // keys. Restore one unit of precision only for range comparisons.
+        let end = if start == end && end == open_end(StorageResolution::Millis) {
+            exclusive_date_limit()
+        } else {
+            end
+        };
+        self.0.matches(start, end)
     }
 }
 
@@ -163,14 +237,14 @@ fn merge_date_slices<T, K: Ord + Copy>(
 }
 
 struct DatePlan {
-    slices: Vec<(DateSlice, RangePredicate)>,
+    slices: Vec<(DateSlice, DateRangePredicate)>,
 }
 
 impl DatePlan {
     fn new(values: &[(SearchPrefix, FhirDateValue)]) -> Self {
         let mut slices = Vec::new();
         for (prefix, value) in values {
-            let predicate = value.range_predicate(*prefix, StorageResolution::Millis);
+            let predicate = DateRangePredicate::new(value, *prefix);
             slices.extend(
                 date_slices(value, *prefix)
                     .into_iter()
@@ -251,9 +325,7 @@ fn date_prefixes_select_the_documented_slices() {
 
 #[test]
 fn date_slices_cover_every_matching_range_at_precision_boundaries() {
-    use chrono::TimeDelta;
-
-    use crate::search::date_value::{open_end, open_start};
+    use crate::search::date_value::open_start;
 
     let resolution = StorageResolution::Millis;
     let millisecond = TimeDelta::milliseconds(1);
@@ -310,6 +382,72 @@ fn date_slices_cover_every_matching_range_at_precision_boundaries() {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+const FINAL_MILLISECONDS: [&str; 2] = ["9999-12-31T23:59:59.998Z", "9999-12-31T23:59:59.999Z"];
+
+#[cfg(test)]
+fn final_millisecond_cases() -> impl Iterator<Item = (SearchPrefix, &'static str, &'static [usize])>
+{
+    use SearchPrefix::*;
+
+    // The expected matches are fixture indices for a query at .998Z and .999Z.
+    let cases: [(SearchPrefix, [&'static [usize]; 2]); 9] = [
+        (Eq, [&[0], &[1]]),
+        (Ne, [&[1], &[0]]),
+        (Gt, [&[1], &[]]),
+        (Lt, [&[], &[0]]),
+        (Ge, [&[0, 1], &[1]]),
+        (Le, [&[0], &[0, 1]]),
+        (Sa, [&[1], &[]]),
+        (Eb, [&[], &[0]]),
+        (Ap, [&[0, 1], &[0, 1]]),
+    ];
+    cases
+        .into_iter()
+        .flat_map(|(prefix, expected)| {
+            FINAL_MILLISECONDS
+                .into_iter()
+                .zip(expected)
+                .map(move |(raw, matches)| (prefix, raw, matches))
+        })
+        .chain([
+            (Ap, "9999-12-31T23:59:49.998Z", &[0][..]),
+            (Eq, "9999", &[0, 1][..]),
+            (Ne, "9999", &[][..]),
+            (Sa, "9999", &[][..]),
+        ])
+}
+
+#[test]
+fn date_slice_keeps_the_final_indexed_millisecond() {
+    use crate::search::{IndexValue, date_value::indexed_range};
+
+    let [previous, last] = FINAL_MILLISECONDS
+        .map(|raw| indexed_range(&IndexValue::date(raw), StorageResolution::Millis).unwrap());
+    assert_eq!(last.0, last.1);
+    assert_eq!(previous.1, last.0);
+
+    for (prefix, raw, expected) in final_millisecond_cases() {
+        let value = FhirDateValue::parse(raw).unwrap();
+        let predicate = DateRangePredicate::new(&value, prefix);
+        let plan = DatePlan::new(&[(prefix, value)]);
+        let found: Vec<_> = [previous, last]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, range)| plan.first_match(&[range]).map(|_| i))
+            .collect();
+        assert_eq!(found, expected, "{prefix:?}{raw}");
+
+        for (i, (start, end)) in [previous, last].into_iter().enumerate() {
+            assert_eq!(
+                predicate.matches(start, end),
+                expected.contains(&i),
+                "residual {prefix:?}{raw} for fixture {i}"
+            );
         }
     }
 }
@@ -415,7 +553,7 @@ async fn date_slices_read_written_rows_and_resume_on_both_tables() {
     }
 
     let slice = &date_slices(&value, SearchPrefix::Ge)[0];
-    let predicate = value.range_predicate(SearchPrefix::Ge, StorageResolution::Millis);
+    let predicate = DateRangePredicate::new(&value, SearchPrefix::Ge);
     let first = slice
         .read(&backend.session, partition, None, 1)
         .await
@@ -440,6 +578,51 @@ async fn date_slices_read_written_rows_and_resume_on_both_tables() {
 
     #[cfg(feature = "R4")]
     if test_support::test_fhir_version() == helios_fhir::FhirVersion::R4 {
+        let mut procedure_ids = Vec::new();
+        for performed in FINAL_MILLISECONDS {
+            let resource = backend
+                .create(
+                    &tenant,
+                    "Procedure",
+                    json!({
+                        "resourceType": "Procedure",
+                        "status": "completed",
+                        "subject": {"reference": "Patient/date-boundary"},
+                        "performedDateTime": performed,
+                    }),
+                    test_support::test_fhir_version(),
+                )
+                .await
+                .expect("create boundary Procedure");
+            procedure_ids.push(resource.id().to_string());
+        }
+        let partition = [tenant.tenant_id().as_str(), "Procedure", "date"];
+        for (prefix, raw, expected) in final_millisecond_cases() {
+            let plan = DatePlan::new(&[(prefix, FhirDateValue::parse(raw).unwrap())]);
+            let mut found = Vec::new();
+            for (slice, predicate) in plan.slices {
+                for row in slice
+                    .read(&backend.session, partition, None, 10)
+                    .await
+                    .unwrap()
+                {
+                    let start: DateTime<Utc> = row.get_r_by_name("start").unwrap();
+                    let end: DateTime<Utc> = row.get_r_by_name("end").unwrap();
+                    if predicate.matches(start, end) {
+                        let id: String = row.get_r_by_name("id").unwrap();
+                        found.push(id);
+                    }
+                }
+            }
+            let mut expected: Vec<_> = expected
+                .iter()
+                .map(|&i| procedure_ids[i].as_str())
+                .collect();
+            found.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(found, expected, "{prefix:?}{raw}");
+        }
+
         let mut encounter_ids = Vec::new();
         for period in [
             json!({"start": "2020-03-10", "end": "2020-03-20"}),
@@ -477,7 +660,7 @@ async fn date_slices_read_written_rows_and_resume_on_both_tables() {
             (Ap, &[0, 1, 2]),
         ];
         for (prefix, expected) in cases {
-            let predicate = value.range_predicate(prefix, StorageResolution::Millis);
+            let predicate = DateRangePredicate::new(&value, prefix);
             let mut found = std::collections::BTreeSet::new();
             for slice in date_slices(&value, prefix) {
                 for row in slice

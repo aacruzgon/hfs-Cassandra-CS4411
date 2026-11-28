@@ -171,12 +171,17 @@ fn test_fhir_version() -> Option<helios_fhir::FhirVersion> {
                 enabled.join(", ")
             )
         });
-        eprintln!(
+        // One finished line, printed in one write, as the persistence tests'
+        // printer does: `eprintln!` writes each piece of its format on its
+        // own, and libtest's stdout lines can land between them under
+        // `--nocapture`.
+        let line = format!(
             "fhir-versions: {FHIR_VERSION_VAR}={value} -> {version:?} ({}), \
-             passed to hfs as HFS_DEFAULT_FHIR_VERSION={}",
+             passed to hfs as HFS_DEFAULT_FHIR_VERSION={}\n",
             version.as_mime_param(),
             version.as_str()
         );
+        eprint!("{line}");
         Some(version)
     })
 }

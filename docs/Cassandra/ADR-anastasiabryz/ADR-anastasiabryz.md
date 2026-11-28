@@ -47,3 +47,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0003](2026-11-26/0003-declare-date-and-cursor-with-basic-search.md) | 2026-11-26 | `DateSearch` and `CursorPagination` are declared in Step 6's last commit, with `BasicSearch`, not at 6b and 6d | accepted |
 | [0004](2026-11-27/0004-cursor-decode-accepts-only-minted-cursors.md) | 2026-11-27 | `paging::decode` accepts only a cursor `mint` could have made: forward, with a `null` bucket slot and the instant written exactly as `mint` writes it | accepted |
 | [0005](2026-11-27/0005-reads-in-flight-per-search.md) | 2026-11-27 | A search keeps up to 32 reads in flight, for its R1 reads and for its AND checks, fed from one stream across batches and slices; amends 0002 | accepted |
+| [0006](2026-11-28/0006-cursor-is-a-keyset-not-the-paging-state.md) | 2026-11-28 | A search cursor is a keyset, the last resource's `(last_updated, id)`, never the driver's paging state | accepted |

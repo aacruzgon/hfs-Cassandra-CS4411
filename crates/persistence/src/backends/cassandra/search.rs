@@ -237,12 +237,14 @@ pub(crate) trait ParamPlan: Send + Sync {
     /// for the plan that drives the search, and `None` for a plan checked
     /// beside another driver. Without it, two rows of one resource give a
     /// date plan identical inputs. With it, the driving date plan can apply
-    /// walkthrough 5.7's "first matching row" rule, as Diya decides it for
-    /// 6b (#128, open choice 4), within a page, on a resumed page and across
-    /// `ne`'s two tables. Within one page, a resource appears once in any
-    /// case (bundle.html's `bdl-7`, in R4, R4B and R5). A check beside the
-    /// driver gets `None`, not the driver's position: a second date judged
-    /// by the first date's position would drop a real match.
+    /// walkthrough 5.7's "first matching row" rule (the design's,
+    /// ADR-aacruzgon-0027) within a page, on a resumed page and across
+    /// `ne`'s two tables. Whether the date plan's `residual` is where the
+    /// rule is enforced stays Diya's call for 6b (#128, open choice 4).
+    /// Within one page, a resource appears once in any case (bundle.html's
+    /// `bdl-7`, in R4, R4B and R5). A check beside the driver gets `None`,
+    /// not the driver's position: a second date judged by the first date's
+    /// position would drop a real match.
     fn residual(&self, _loaded: &LoadedResource, _at: Option<&OrderKey>) -> bool {
         true
     }

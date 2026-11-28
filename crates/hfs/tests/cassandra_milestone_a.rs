@@ -1273,10 +1273,33 @@ async fn batch_if_match_through_rest(rest: &Rest<'_>, suffix: &str) {
 /// `transaction`. Step 7 (ADR-aacruzgon-0085): no history interaction on any
 /// resource or at system level, since the backend refuses all three, while
 /// `vread`, `readHistory: true` and `versioning: versioned` stay
-/// (ADR-aacruzgon-0025; https://hl7.org/fhir/R4/http.html#capabilities); and,
-/// until Step 6 declares `BasicSearch`, no `search-type`, `searchParam`,
-/// `searchInclude` or `searchRevInclude` on any type, since every search
-/// answers 501.
+/// (ADR-aacruzgon-0025; https://hl7.org/fhir/R4/http.html#capabilities); and
+/// no `search-type`, `searchParam`, `searchInclude` or `searchRevInclude` on
+/// any type.
+///
+/// The search rows follow the declaration, not what a search answers.
+/// `supports_search()` is the declared `BasicSearch`, which the backend
+/// declares only in Step 6's last commit, Step 7's phase 4, together with
+/// `DateSearch`, `CursorPagination` and the `serves_search_param` override
+/// (ADR-aacruzgon-0085 and 0104). Declared any earlier, `BasicSearch` would
+/// list `search-type` and every registered parameter, string and reference
+/// ones included, though the statement says what the server supports
+/// (https://hl7.org/fhir/R4/http.html: "Servers SHALL provide a Capability
+/// Statement that specifies which interactions and resources are
+/// supported", the same in R4B and R5). Phase 4 changes the
+/// `CS-4:no-search-*` rows below.
+///
+/// Until then a search still reaches `search()`: the REST search handler
+/// does not read `supports_search()`. It answers 501 while `search()`
+/// refuses it; once the framework (#128) serves it, its results, or the
+/// documented 400, 422 or 501 for what Cassandra refuses (roadmap row 6.1;
+/// `cassandra-discussion.md`, "Capabilities and rejection"). REST's own
+/// checks answer 400 before `search()` runs, whatever the backend: a
+/// modifier the parameter's type does not allow, since a server SHALL reject
+/// an unsupported modifier (https://hl7.org/fhir/R4/search.html#modifiers),
+/// and an unknown parameter under `Prefer: handling=strict`, which a server
+/// SHOULD honour (https://hl7.org/fhir/R4/search.html#errors). R4B and R5
+/// give both rules too.
 async fn metadata_through_rest(rest: &Rest<'_>) {
     let hfs = rest.hfs;
     let metadata = rest.get("metadata").await;

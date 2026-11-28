@@ -42,4 +42,6 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 
 | ADR | Date | Title | Status |
 | --- | --- | --- | --- |
-| | | | |
+| [0001](2026-11-26/0001-search-module-interface.md) | 2026-11-26 | The Cassandra search modules implement one `ParamPlan` trait; the framework plans, intersects and counts, and only `paging.rs` touches cursors | accepted |
+| [0002](2026-11-26/0002-candidate-cap-value-and-setting.md) | 2026-11-26 | The candidate cap is `HFS_CASSANDRA_SEARCH_MAX_CANDIDATES`, default 100,000 distinct R1 reads per page or count | accepted |
+| [0003](2026-11-26/0003-declare-date-and-cursor-with-basic-search.md) | 2026-11-26 | `DateSearch` and `CursorPagination` are declared in Step 6's last commit, with `BasicSearch`, not at 6b and 6d | accepted |

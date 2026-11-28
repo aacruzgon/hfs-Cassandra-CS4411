@@ -13,25 +13,242 @@
 //! `_security`, `_count` and cursor paging, `_total`; no `_include`,
 //! `_revinclude`, offset paging or sorting (`cassandra-discussion.md`,
 //! "Structs and enums": `SearchParamFullCapability`, `PaginationCapability`).
+//!
+//! # The interface the per-type modules implement
+//!
+//! Step 6 is written by several people in parallel (#127): this file is the
+//! framework (#128), and `search/token.rs` (6a, #130), `search/date.rs` (6b,
+//! #132), `search/uri.rs` (6c, #131) and `search/paging.rs` (6d, #129) plug
+//! into it. The contract is ADR-anastasiabryz-0001:
+//!
+//! - each module turns one [`SearchParameter`](crate::types::SearchParameter), with all its comma values,
+//!   into a [`ParamPlan`] through its `compile` function;
+//! - the framework picks the driving plan by [`Drive`] (C5's order), streams
+//!   its [`Candidate`]s, checks the others with [`ParamPlan::contains`], runs
+//!   the tag check, the residuals ([`ParamPlan::residual`]) and the candidate
+//!   cap ([`CandidateBudget`]), and queues repair (walkthrough 5.1, 5.8);
+//! - only `paging.rs` encodes or decodes a cursor.
+//!
+//! A change to this contract goes through #128 and is announced on every
+//! module issue before it merges.
 
+mod date;
+mod paging;
+mod token;
+mod uri;
+
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
+use chrono::{DateTime, Utc};
+use futures::stream::BoxStream;
+use parking_lot::{Mutex, RwLock};
 
 use super::backend::CassandraBackend;
 use super::errors::unsupported;
+use super::index_keys::IndexKey;
+use super::read::ResourceRow;
+use super::session::CassandraSession;
 use crate::core::capabilities::{
     GlobalSearchCapabilities, ResourceSearchCapabilities, SearchCapabilityProvider,
 };
 use crate::core::{SearchProvider, SearchResult};
-use crate::error::StorageResult;
-use crate::search::SearchParameterRegistry;
+use crate::error::{SearchError, StorageResult};
+use crate::search::{ExtractedValue, SearchParameterDefinition, SearchParameterRegistry};
 use crate::tenant::TenantContext;
 use crate::types::{
     PaginationCapability, ResultModeCapability, SearchParamFullCapability, SearchParamType,
     SearchQuery, SpecialSearchParam,
 };
+use paging::{Order, OrderKey, Position};
+
+/// One index row as read, for the tag check and for repair.
+///
+/// `key` is built from the stored columns, never passed through `index_text`
+/// again: a stored value is already what `index_text` produced
+/// (ADR-aacruzgon-0079). The fields are the arguments of
+/// [`StaleIndexRow::new`](super::repair::StaleIndexRow::new).
+#[allow(dead_code)] // The search engine (#128) reads it; until then only the modules' types do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FoundRow {
+    pub(crate) key: IndexKey,
+    /// The row's `last_updated`; `None` for `date_index` and
+    /// `date_index_by_end`, whose key has none.
+    pub(crate) last_updated: Option<DateTime<Utc>>,
+    /// The row's tag, checked against `resources.version_id`.
+    pub(crate) version_id: i32,
+}
+
+/// One resource a plan's stream yields: where it sits in the stream's order,
+/// its id, and every index row of it read at that order key (for example its
+/// rows in both the named system's and the `IMPLICIT` partition).
+#[allow(dead_code)] // The search engine (#128) reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    pub(crate) order: OrderKey,
+    pub(crate) id: String,
+    pub(crate) rows: Vec<FoundRow>,
+}
+
+/// A candidate after the tag check: its R1 row, and the values the framework
+/// extracted from it once (under the resource's own `fhir_version` and the
+/// tenant's registry, on the write path's large-stack thread in debug
+/// builds), which the date and compartment residuals both read. `extracted`
+/// is empty when no residual needs it.
+#[allow(dead_code)] // The search engine (#128) builds it.
+#[derive(Debug, Clone)]
+pub(crate) struct LoadedResource {
+    pub(crate) row: ResourceRow,
+    pub(crate) extracted: Vec<ExtractedValue>,
+}
+
+/// How strongly a plan can drive a search with several parameters: C5's
+/// fixed order (walkthrough 5.8, ADR-aacruzgon-0027), most specific first.
+/// The planner takes the lowest across the whole query; ties go by query
+/// order.
+#[allow(dead_code)] // The modules' plans return it once they exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Drive {
+    /// The framework's own `_id` plan (walkthrough 5.4).
+    Id,
+    /// Token `system|code` and `|code`.
+    SystemCode,
+    /// URI: a canonical resource's own `url` (walkthrough 5.8's list).
+    IdentityUri,
+    /// Token `code`; `_profile`, `_source` and every other URI.
+    Shared,
+    /// Token `system|`.
+    SystemOnly,
+    /// The framework's `_lastUpdated` plan (5.5): drives only when nothing
+    /// above is present.
+    LastUpdated,
+    /// Date: drives only when every parameter is a date (G20); otherwise it
+    /// is a residual.
+    DateOnly,
+}
+
+/// Counts the distinct candidates a search point-reads (R1) for one page or
+/// one `search_count`, against the candidate cap (G27, ADR-anastasiabryz-0002).
+///
+/// Only the framework charges it, at the one place R1 is read for a
+/// candidate. Modules never do: neither their index reads nor their
+/// `contains` point reads are candidates point-read. A search is of one
+/// resource type, so the id alone tells candidates apart.
+#[allow(dead_code)] // The search engine (#128) charges it.
+#[derive(Debug)]
+pub(crate) struct CandidateBudget {
+    max: usize,
+    seen: Mutex<HashSet<String>>,
+}
+
+#[allow(dead_code)] // The search engine (#128) charges it.
+impl CandidateBudget {
+    pub(crate) fn new(max: usize) -> Self {
+        Self {
+            max,
+            seen: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Counts one R1 read of `id`; reading the same id again costs nothing.
+    /// Past the cap it is `TooManyResults`, which REST answers with 422.
+    pub(crate) fn charge(&self, id: &str) -> Result<(), SearchError> {
+        let mut seen = self.seen.lock();
+        seen.insert(id.to_string());
+        if seen.len() > self.max {
+            return Err(SearchError::TooManyResults {
+                count: seen.len(),
+                max: self.max,
+            });
+        }
+        Ok(())
+    }
+
+    /// How many distinct candidates have been charged.
+    pub(crate) fn used(&self) -> usize {
+        self.seen.lock().len()
+    }
+}
+
+/// What every read of a search needs.
+#[allow(dead_code)] // The search engine (#128) builds it.
+pub(crate) struct ReadCtx<'a> {
+    pub(crate) tenant: &'a TenantContext,
+    pub(crate) resource_type: &'a str,
+    pub(crate) session: &'a CassandraSession,
+    pub(crate) budget: &'a CandidateBudget,
+}
+
+/// What a module's `compile` gets besides the parameter itself.
+#[allow(dead_code)] // The search engine (#128) builds it.
+pub(crate) struct CompileCtx<'a> {
+    pub(crate) resource_type: &'a str,
+    /// The parameter's registered definition, when the tenant's registry has
+    /// one (an identity URI is recognised by its expression, walkthrough 5.8).
+    pub(crate) definition: Option<&'a SearchParameterDefinition>,
+}
+
+/// One parameter of a search, compiled by its module (ADR-anastasiabryz-0001).
+#[allow(dead_code)] // The modules implement it and the search engine (#128) calls it.
+#[async_trait]
+pub(crate) trait ParamPlan: Send + Sync {
+    /// The parameter's name.
+    fn param(&self) -> &str;
+
+    /// Its rank as a driver.
+    fn drive(&self) -> Drive;
+
+    /// The order its stream is in, which the framework passes to
+    /// `paging::decode` for the request's cursor and uses to start the first
+    /// page (#128, item 4: "the plan says which"). Default:
+    /// `(last_updated DESC, id DESC)`; a date plan returns its table's order.
+    ///
+    /// The framework reads it from the plan that drives the search only. A
+    /// date plan beside a token, or a second date, still returns its date
+    /// order, and the framework ignores it.
+    fn order(&self) -> Order {
+        Order::Default
+    }
+
+    /// Its candidates strictly after `from`, in `from`'s order, merged across
+    /// its partitions and OR values and collapsed on the order key. Each CQL
+    /// read takes a `LIMIT` batch (a batch size, not the page size) through
+    /// [`CassandraSession::rows`].
+    fn stream<'a>(
+        &'a self,
+        ctx: &'a ReadCtx<'a>,
+        from: &'a Position,
+    ) -> BoxStream<'a, StorageResult<Candidate>>;
+
+    /// Whether a candidate another plan drives matches this parameter: the
+    /// clustering point reads at `last_updated = ? AND id = ?`, one per
+    /// partition and per OR value, ORed (walkthrough 5.8).
+    async fn contains(
+        &self,
+        ctx: &ReadCtx<'_>,
+        last_updated: DateTime<Utc>,
+        id: &str,
+    ) -> StorageResult<bool>;
+
+    /// The residual check on the loaded resource. Default: it matches.
+    ///
+    /// `at` is where the candidate sits in the stream's order: `Some` only
+    /// for the plan that drives the search, and `None` for a plan checked
+    /// beside another driver. Without it, two rows of one resource give a
+    /// date plan identical inputs. With it, the driving date plan can apply
+    /// walkthrough 5.7's "first matching row" rule (the design's,
+    /// ADR-aacruzgon-0027) within a page, on a resumed page and across
+    /// `ne`'s two tables. Whether the date plan's `residual` is where the
+    /// rule is enforced stays Diya's call for 6b (#128, open choice 4).
+    /// Within one page, a resource appears once in any case (bundle.html's
+    /// `bdl-7`, in R4, R4B and R5). A check beside the driver gets `None`,
+    /// not the driver's position: a second date judged by the first date's
+    /// position would drop a real match.
+    fn residual(&self, _loaded: &LoadedResource, _at: Option<&OrderKey>) -> bool {
+        true
+    }
+}
 
 /// The parameter types Cassandra serves (design, scope table).
 pub(super) const SUPPORTED_PARAM_TYPES: [SearchParamType; 3] = [
@@ -152,5 +369,116 @@ impl SearchCapabilityProvider for CassandraBackend {
         GlobalSearchCapabilities::new()
             .with_special_params(special_params())
             .with_pagination(pagination())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+
+    use super::*;
+    use crate::error::BackendError;
+    use crate::error::StorageError;
+    use crate::types::SearchParameter;
+
+    /// A plan that matches nothing: proves a module can implement
+    /// [`ParamPlan`] as written (the interface PR's compile-only check).
+    struct NoMatches;
+
+    #[async_trait]
+    impl ParamPlan for NoMatches {
+        fn param(&self) -> &str {
+            "status"
+        }
+
+        fn drive(&self) -> Drive {
+            Drive::Shared
+        }
+
+        fn stream<'a>(
+            &'a self,
+            _ctx: &'a ReadCtx<'a>,
+            _from: &'a Position,
+        ) -> BoxStream<'a, StorageResult<Candidate>> {
+            futures::stream::empty().boxed()
+        }
+
+        async fn contains(
+            &self,
+            _ctx: &ReadCtx<'_>,
+            _last_updated: DateTime<Utc>,
+            _id: &str,
+        ) -> StorageResult<bool> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn a_module_can_implement_the_plan_trait() {
+        let plan: Box<dyn ParamPlan> = Box::new(NoMatches);
+        assert_eq!(plan.param(), "status");
+        assert_eq!(plan.drive(), Drive::Shared);
+        assert_eq!(plan.order(), Order::Default);
+        // `residual` takes the candidate's position, `None` beside a driver
+        // (#133, Alan's audit point 2).
+        let _residual: fn(&NoMatches, &LoadedResource, Option<&OrderKey>) -> bool =
+            <NoMatches as ParamPlan>::residual;
+    }
+
+    #[test]
+    fn drive_ranks_in_c5_order() {
+        let ranks = [
+            Drive::Id,
+            Drive::SystemCode,
+            Drive::IdentityUri,
+            Drive::Shared,
+            Drive::SystemOnly,
+            Drive::LastUpdated,
+            Drive::DateOnly,
+        ];
+        assert!(ranks.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(ranks.iter().min(), Some(&Drive::Id));
+    }
+
+    #[test]
+    fn the_budget_counts_distinct_candidates_and_stops_past_the_cap() {
+        let budget = CandidateBudget::new(2);
+        budget.charge("a").unwrap();
+        budget.charge("a").unwrap();
+        budget.charge("b").unwrap();
+        assert_eq!(budget.used(), 2);
+        let error = budget.charge("c").unwrap_err();
+        assert!(matches!(
+            error,
+            SearchError::TooManyResults { count: 3, max: 2 }
+        ));
+    }
+
+    #[test]
+    fn every_module_stub_refuses_until_its_issue_lands() {
+        let param = SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            ..Default::default()
+        };
+        let ctx = CompileCtx {
+            resource_type: "Observation",
+            definition: None,
+        };
+        for (module, compiled) in [
+            ("token", token::compile(&param, &ctx)),
+            ("uri", uri::compile(&param, &ctx)),
+            ("date", date::compile(&param, &ctx)),
+        ] {
+            assert!(
+                matches!(
+                    compiled,
+                    Err(StorageError::Backend(
+                        BackendError::UnsupportedCapability { .. }
+                    ))
+                ),
+                "{module}::compile should refuse until its issue lands"
+            );
+        }
     }
 }
